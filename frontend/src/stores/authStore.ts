@@ -7,6 +7,7 @@ interface AuthState {
   token: string | null
   isAuthenticated: boolean
   isLoading: boolean
+  isInitialized: boolean  // 是否已初始化
   
   // Actions
   login: (email: string, password: string) => Promise<void>
@@ -23,6 +24,7 @@ export const useAuthStore = create<AuthState>()(
       token: null,
       isAuthenticated: false,
       isLoading: false,
+      isInitialized: false,
       
       login: async (email: string, password: string) => {
         set({ isLoading: true })
@@ -33,6 +35,7 @@ export const useAuthStore = create<AuthState>()(
             token: response.access_token,
             isAuthenticated: true,
             isLoading: false,
+            isInitialized: true,
           })
         } catch (error) {
           set({ isLoading: false })
@@ -49,6 +52,7 @@ export const useAuthStore = create<AuthState>()(
             token: response.access_token,
             isAuthenticated: true,
             isLoading: false,
+            isInitialized: true,
           })
         } catch (error) {
           set({ isLoading: false })
@@ -61,6 +65,7 @@ export const useAuthStore = create<AuthState>()(
           user: null,
           token: null,
           isAuthenticated: false,
+          isInitialized: true,
         })
       },
       
@@ -72,23 +77,47 @@ export const useAuthStore = create<AuthState>()(
       },
       
       checkAuth: async () => {
-        const token = get().token
+        const { token, user } = get()
+        
+        // 如果没有 token，直接设为未认证
         if (!token) {
-          set({ isAuthenticated: false })
+          set({ isAuthenticated: false, isInitialized: true })
           return
         }
         
+        // 如果已有用户信息，先设为已认证（乐观更新）
+        if (user) {
+          set({ isAuthenticated: true, isInitialized: true })
+        }
+        
+        // 后台验证 token 有效性（不阻塞）
         try {
-          const user = await authApi.me()
-          set({ user, isAuthenticated: true })
+          const userData = await authApi.me()
+          set({ user: userData, isAuthenticated: true, isInitialized: true })
         } catch {
-          set({ user: null, token: null, isAuthenticated: false })
+          // token 无效，清除状态
+          set({ user: null, token: null, isAuthenticated: false, isInitialized: true })
         }
       },
     }),
     {
       name: 'auth-storage',
-      partialize: (state) => ({ token: state.token }),
+      // 持久化 token 和 user
+      partialize: (state) => ({ 
+        token: state.token,
+        user: state.user,
+      }),
+      // hydration 完成后的回调
+      onRehydrateStorage: () => (state) => {
+        // hydration 完成后，如果有 token 和 user，立即设置为已认证
+        if (state?.token && state?.user) {
+          state.isAuthenticated = true
+          state.isInitialized = true
+        } else if (state) {
+          // 如果没有有效数据，也设置为已初始化
+          state.isInitialized = true
+        }
+      },
     }
   )
 )

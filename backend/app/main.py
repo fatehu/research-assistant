@@ -9,7 +9,7 @@ import sys
 
 from app.config import settings
 from app.core.database import create_tables
-from app.api import auth, users, chat, health
+from app.api import auth, users, chat, health, knowledge
 
 
 # 配置日志
@@ -59,6 +59,7 @@ app.include_router(health.router, tags=["健康检查"])
 app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
 app.include_router(users.router, prefix="/api/users", tags=["用户"])
 app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
+app.include_router(knowledge.router, prefix="/api/knowledge", tags=["知识库"])
 
 
 @app.get("/")

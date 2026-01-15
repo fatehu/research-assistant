@@ -1,9 +1,7 @@
-version: '3.8'
-
 services:
-  # PostgreSQL 数据库
+  # PostgreSQL 数据库 (带 pgvector 向量扩展)
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg16
     container_name: research_postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-research_user}
@@ -11,6 +9,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-research_assistant}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
     healthcheck:

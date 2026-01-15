@@ -37,6 +37,7 @@ class User(Base):
     
     # 关系
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
+    knowledge_bases = relationship("KnowledgeBase", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<User {self.username}>"

@@ -27,7 +27,7 @@ class MessageCreate(MessageBase):
 
 class MessageResponse(BaseModel):
     """消息响应模式"""
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     
     id: int
     conversation_id: int
@@ -38,7 +38,7 @@ class MessageResponse(BaseModel):
     action: Optional[str] = None
     action_input: Optional[dict] = None
     observation: Optional[str] = None
-    metadata_: Optional[dict] = Field(None, alias="metadata")
+    metadata: Optional[dict] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
@@ -91,6 +91,7 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[int] = None
     llm_provider: Optional[str] = None  # 临时指定 LLM
     stream: bool = True  # 是否流式返回
+    use_tools: Optional[bool] = None  # 是否使用工具（None=自动检测）
 
 
 class ChatStreamResponse(BaseModel):

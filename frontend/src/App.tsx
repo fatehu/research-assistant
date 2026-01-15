@@ -1,14 +1,26 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { Spin } from 'antd'
 import { useAuthStore } from '@/stores/authStore'
 import MainLayout from '@/components/layout/MainLayout'
 import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import ChatPage from '@/pages/chat/ChatPage'
+import KnowledgePage from '@/pages/knowledge/KnowledgePage'
 
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
-  const { isAuthenticated } = useAuthStore()
+  const { isAuthenticated, isInitialized } = useAuthStore()
+  
+  // 等待初始化完成
+  if (!isInitialized) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-slate-900">
+        <Spin size="large" />
+      </div>
+    )
+  }
   
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
@@ -19,7 +31,16 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
 
 // 公共路由组件（已登录用户重定向到首页）
 const PublicRoute = ({ children }: { children: React.ReactNode }) => {
-  const { isAuthenticated } = useAuthStore()
+  const { isAuthenticated, isInitialized } = useAuthStore()
+  
+  // 等待初始化完成
+  if (!isInitialized) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-slate-900">
+        <Spin size="large" />
+      </div>
+    )
+  }
   
   if (isAuthenticated) {
     return <Navigate to="/dashboard" replace />
@@ -29,6 +50,15 @@ const PublicRoute = ({ children }: { children: React.ReactNode }) => {
 }
 
 function App() {
+  const { checkAuth, isInitialized } = useAuthStore()
+  
+  // 应用启动时验证认证状态
+  useEffect(() => {
+    if (!isInitialized) {
+      checkAuth()
+    }
+  }, [checkAuth, isInitialized])
+  
   return (
     <BrowserRouter>
       <Routes>
@@ -63,6 +93,8 @@ function App() {
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="chat" element={<ChatPage />} />
           <Route path="chat/:conversationId" element={<ChatPage />} />
+          <Route path="knowledge" element={<KnowledgePage />} />
+          <Route path="knowledge/:kbId" element={<KnowledgePage />} />
         </Route>
         
         {/* 404 */}

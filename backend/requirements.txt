@@ -1,20 +1,19 @@
 # FastAPI 核心
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
 python-multipart==0.0.9
-pydantic==2.6.1
-pydantic-settings==2.1.0
-email-validator==2.1.0
+pydantic==2.9.0
+pydantic-settings==2.5.0
+email-validator==2.2.0
 
 # 数据库
-sqlalchemy==2.0.25
+sqlalchemy==2.0.35
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
-alembic==1.13.1
+alembic==1.13.3
 
 # Redis
-redis==5.0.1
-aioredis==2.0.1
+redis==5.1.0
 
 # 认证
 python-jose[cryptography]==3.3.0
@@ -22,18 +21,26 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.1.2
 
 # LLM 集成
-openai==1.12.0
-httpx==0.26.0
+openai==1.50.0
+httpx==0.27.0
 
 # 工具
 python-dotenv==1.0.1
-tenacity==8.2.3
+tenacity==9.0.0
 
 # SSE 流式响应
-sse-starlette==2.0.0
+sse-starlette==2.1.0
 
 # 日志
 loguru==0.7.2
 
 # 其他
 aiofiles==23.2.1
+
+# 阶段2: 知识库相关
+pypdf==4.0.0
+pdfplumber==0.10.3
+beautifulsoup4==4.12.3
+numpy==1.26.4
+pgvector==0.3.5
+

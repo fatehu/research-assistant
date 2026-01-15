@@ -14,13 +14,35 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.conversation import Conversation, Message, MessageRole, MessageType
+from app.models.knowledge import KnowledgeBase
 from app.schemas.chat import (
     ConversationCreate, ConversationResponse, ConversationListResponse,
     MessageResponse, ChatRequest
 )
 from app.services.llm_service import LLMService
+from app.services.agent_tools import get_tool_registry
 
 router = APIRouter()
+
+
+def message_to_response(msg: Message) -> MessageResponse:
+    """将 Message 模型转换为 MessageResponse，处理 Enum 类型"""
+    return MessageResponse(
+        id=msg.id,
+        conversation_id=msg.conversation_id,
+        role=msg.role.value if hasattr(msg.role, 'value') else str(msg.role),
+        content=msg.content,
+        message_type=msg.message_type.value if hasattr(msg.message_type, 'value') else str(msg.message_type),
+        thought=msg.thought,
+        action=msg.action,
+        action_input=msg.action_input,
+        observation=msg.observation,
+        metadata=msg.metadata_,
+        prompt_tokens=msg.prompt_tokens or 0,
+        completion_tokens=msg.completion_tokens or 0,
+        total_tokens=msg.total_tokens or 0,
+        created_at=msg.created_at,
+    )
 
 
 @router.get("/conversations", response_model=List[ConversationListResponse])
@@ -168,7 +190,7 @@ async def get_conversation(
         is_archived=conversation.is_archived,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
-        messages=[MessageResponse.model_validate(msg) for msg in conversation.messages]
+        messages=[message_to_response(msg) for msg in conversation.messages]
     )
 
 
@@ -234,7 +256,7 @@ async def send_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """发送消息（支持流式响应）"""
+    """发送消息（支持流式响应和工具调用）"""
     # 获取或创建对话
     if request.conversation_id:
         result = await db.execute(
@@ -299,52 +321,119 @@ async def send_message(
     # 保存对话ID用于流式响应
     conversation_id = conversation.id
     
+    # 检查用户是否有知识库（用于决定是否启用工具）
+    kb_result = await db.execute(
+        select(func.count(KnowledgeBase.id)).where(KnowledgeBase.user_id == current_user.id)
+    )
+    has_knowledge_bases = (kb_result.scalar() or 0) > 0
+    
+    # 是否使用工具
+    use_tools = request.use_tools if hasattr(request, 'use_tools') else has_knowledge_bases
+    
     if request.stream:
         # 流式响应
         async def generate():
             full_content = ""
             thought = ""
-            action = ""
-            observation = ""
             
             try:
                 # 发送开始事件
                 yield f"data: {json.dumps({'event': 'start', 'data': {'conversation_id': conversation_id, 'message_id': user_message.id}})}\n\n"
                 
-                async for chunk in llm_service.react_chat_stream(messages):
-                    chunk_type = chunk["type"]
-                    chunk_data = chunk["data"]
-                    
-                    if chunk_type == "content":
-                        full_content += chunk_data
-                        yield f"data: {json.dumps({'event': 'content', 'data': chunk_data})}\n\n"
-                    elif chunk_type == "thought":
-                        thought = chunk_data
-                        yield f"data: {json.dumps({'event': 'thought', 'data': chunk_data})}\n\n"
-                    elif chunk_type == "action":
-                        action = chunk_data
-                        yield f"data: {json.dumps({'event': 'action', 'data': chunk_data})}\n\n"
-                    elif chunk_type == "observation":
-                        observation = chunk_data
-                        yield f"data: {json.dumps({'event': 'observation', 'data': chunk_data})}\n\n"
-                    elif chunk_type == "done":
-                        # 保存助手消息 - 使用新的数据库会话
-                        from app.core.database import async_session_factory
-                        async with async_session_factory() as save_db:
-                            assistant_message = Message(
-                                conversation_id=conversation_id,
-                                role=MessageRole.ASSISTANT,
-                                content=full_content,
-                                message_type=MessageType.TEXT,
-                                thought=thought if thought else None,
-                                action=action if action else None,
-                                observation=observation if observation else None,
-                            )
-                            save_db.add(assistant_message)
-                            await save_db.commit()
-                            await save_db.refresh(assistant_message)
+                if use_tools:
+                    # 使用带工具的 ReAct 聊天
+                    from app.core.database import async_session_factory
+                    async with async_session_factory() as tool_db:
+                        tool_registry = get_tool_registry(tool_db, current_user.id)
+                        tools_desc = tool_registry.get_tools_description()
+                        
+                        async for chunk in llm_service.react_chat_with_tools_stream(
+                            messages,
+                            tools_desc,
+                            tool_registry.execute
+                        ):
+                            chunk_type = chunk["type"]
+                            chunk_data = chunk["data"]
                             
-                            yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id}})}\n\n"
+                            if chunk_type == "start":
+                                yield f"data: {json.dumps({'event': 'model_info', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "thinking_start":
+                                yield f"data: {json.dumps({'event': 'thinking_start', 'data': ''})}\n\n"
+                            elif chunk_type == "thinking":
+                                yield f"data: {json.dumps({'event': 'thinking', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "thought":
+                                thought = chunk_data
+                                yield f"data: {json.dumps({'event': 'thought', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "action":
+                                yield f"data: {json.dumps({'event': 'action', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "observation":
+                                yield f"data: {json.dumps({'event': 'observation', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "content":
+                                full_content = chunk_data  # 使用完整内容
+                                yield f"data: {json.dumps({'event': 'content', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "error":
+                                yield f"data: {json.dumps({'event': 'error', 'data': chunk_data})}\n\n"
+                            elif chunk_type == "done":
+                                if isinstance(chunk_data, dict):
+                                    if chunk_data.get("thought"):
+                                        thought = chunk_data["thought"]
+                                    if chunk_data.get("answer"):
+                                        full_content = chunk_data["answer"]
+                                
+                                # 保存助手消息
+                                async with async_session_factory() as save_db:
+                                    assistant_message = Message(
+                                        conversation_id=conversation_id,
+                                        role=MessageRole.ASSISTANT,
+                                        content=full_content,
+                                        message_type=MessageType.TEXT,
+                                        thought=thought if thought else None,
+                                    )
+                                    save_db.add(assistant_message)
+                                    await save_db.commit()
+                                    await save_db.refresh(assistant_message)
+                                    
+                                    yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id, 'thought': thought, 'answer': full_content}})}\n\n"
+                else:
+                    # 使用普通 ReAct 聊天（无工具）
+                    async for chunk in llm_service.react_chat_stream(messages):
+                        chunk_type = chunk["type"]
+                        chunk_data = chunk["data"]
+                        
+                        if chunk_type == "start":
+                            yield f"data: {json.dumps({'event': 'model_info', 'data': chunk_data})}\n\n"
+                        elif chunk_type == "thinking_start":
+                            yield f"data: {json.dumps({'event': 'thinking_start', 'data': ''})}\n\n"
+                        elif chunk_type == "thinking":
+                            yield f"data: {json.dumps({'event': 'thinking', 'data': chunk_data})}\n\n"
+                        elif chunk_type == "thought":
+                            thought = chunk_data
+                            yield f"data: {json.dumps({'event': 'thought', 'data': chunk_data})}\n\n"
+                        elif chunk_type == "content":
+                            full_content += chunk_data
+                            yield f"data: {json.dumps({'event': 'content', 'data': chunk_data})}\n\n"
+                        elif chunk_type == "done":
+                            if isinstance(chunk_data, dict):
+                                if chunk_data.get("thought"):
+                                    thought = chunk_data["thought"]
+                                if chunk_data.get("answer") and not full_content:
+                                    full_content = chunk_data["answer"]
+                            
+                            # 保存助手消息
+                            from app.core.database import async_session_factory
+                            async with async_session_factory() as save_db:
+                                assistant_message = Message(
+                                    conversation_id=conversation_id,
+                                    role=MessageRole.ASSISTANT,
+                                    content=full_content,
+                                    message_type=MessageType.TEXT,
+                                    thought=thought if thought else None,
+                                )
+                                save_db.add(assistant_message)
+                                await save_db.commit()
+                                await save_db.refresh(assistant_message)
+                                
+                                yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id, 'thought': thought, 'answer': full_content}})}\n\n"
                 
             except Exception as e:
                 logger.error(f"流式响应错误: {e}")
@@ -379,7 +468,7 @@ async def send_message(
             
             return {
                 "conversation_id": conversation.id,
-                "message": MessageResponse.model_validate(assistant_message),
+                "message": message_to_response(assistant_message),
                 "usage": response["usage"]
             }
             
@@ -423,4 +512,4 @@ async def get_messages(
     )
     messages = result.scalars().all()
     
-    return [MessageResponse.model_validate(msg) for msg in messages]
+    return [message_to_response(msg) for msg in messages]

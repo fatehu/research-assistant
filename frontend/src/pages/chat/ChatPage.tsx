@@ -1,28 +1,28 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams, useLocation } from 'react-router-dom'
-import { Input, Button, Spin, Empty, Collapse, Tag, message, Tooltip } from 'antd'
+import { useParams, useNavigate } from 'react-router-dom'
+import { Input, Button, Spin, message, Tooltip, Avatar } from 'antd'
 import {
   SendOutlined,
   RobotOutlined,
   UserOutlined,
   BulbOutlined,
-  ThunderboltOutlined,
-  EyeOutlined,
   LoadingOutlined,
   CopyOutlined,
   ReloadOutlined,
-  DeleteOutlined,
+  ExpandOutlined,
+  CompressOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import remarkGfm from 'remark-gfm'
 import { useChatStore } from '@/stores/chatStore'
 import type { Message } from '@/services/api'
 
 const { TextArea } = Input
 
-// Markdown 代码块渲染组件
+// 代码块组件
 const CodeBlock = ({ className, children }: { className?: string; children: React.ReactNode }) => {
   const match = /language-(\w+)/.exec(className || '')
   const language = match ? match[1] : ''
@@ -33,203 +33,221 @@ const CodeBlock = ({ className, children }: { className?: string; children: Reac
     message.success('代码已复制')
   }
   
-  return match ? (
-    <div className="relative group my-4">
-      <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+  if (!match) {
+    return (
+      <code className="bg-slate-800 text-emerald-400 px-1.5 py-0.5 rounded text-sm font-mono">
+        {children}
+      </code>
+    )
+  }
+  
+  return (
+    <div className="relative group my-4 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2 bg-slate-800 border-b border-slate-700">
+        <span className="text-xs text-slate-400 font-mono">{language}</span>
         <Button
+          type="text"
           size="small"
           icon={<CopyOutlined />}
           onClick={handleCopy}
-          className="text-gray-400 hover:text-white"
+          className="text-slate-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
         />
       </div>
       <SyntaxHighlighter
         language={language}
         style={oneDark}
         customStyle={{
-          borderRadius: '0.5rem',
+          margin: 0,
+          borderRadius: 0,
           padding: '1rem',
           fontSize: '0.875rem',
+          background: '#1e293b',
         }}
       >
         {code}
       </SyntaxHighlighter>
     </div>
-  ) : (
-    <code className="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-sm">
-      {children}
-    </code>
   )
 }
 
-// ReAct 过程展示组件
-const ReActProcess = ({
-  thought,
-  action,
-  observation,
-  isStreaming = false,
-}: {
-  thought?: string
-  action?: string
-  observation?: string
-  isStreaming?: boolean
+// 思考过程面板
+const ThinkingPanel = ({ 
+  thought, 
+  isThinking,
+  isExpanded,
+  onToggle 
+}: { 
+  thought: string
+  isThinking: boolean
+  isExpanded: boolean
+  onToggle: () => void
 }) => {
-  if (!thought && !action && !observation) return null
-  
-  const items = []
-  
-  if (thought) {
-    items.push({
-      key: 'thought',
-      label: (
-        <div className="flex items-center gap-2 text-yellow-400">
-          <BulbOutlined />
-          <span>思考过程</span>
-          {isStreaming && <LoadingOutlined className="text-xs" />}
-        </div>
-      ),
-      children: (
-        <div className="text-gray-300 text-sm whitespace-pre-wrap">
-          {thought}
-        </div>
-      ),
-    })
-  }
-  
-  if (action) {
-    items.push({
-      key: 'action',
-      label: (
-        <div className="flex items-center gap-2 text-blue-400">
-          <ThunderboltOutlined />
-          <span>执行动作</span>
-        </div>
-      ),
-      children: (
-        <div className="text-gray-300 text-sm">
-          <Tag color="blue">{action}</Tag>
-        </div>
-      ),
-    })
-  }
-  
-  if (observation) {
-    items.push({
-      key: 'observation',
-      label: (
-        <div className="flex items-center gap-2 text-green-400">
-          <EyeOutlined />
-          <span>观察结果</span>
-        </div>
-      ),
-      children: (
-        <div className="text-gray-300 text-sm whitespace-pre-wrap">
-          {observation}
-        </div>
-      ),
-    })
-  }
+  if (!thought && !isThinking) return null
   
   return (
-    <Collapse
-      items={items}
-      defaultActiveKey={isStreaming ? ['thought'] : []}
-      ghost
-      size="small"
-      className="react-process-collapse mb-3"
-    />
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      className="mb-3"
+    >
+      <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 overflow-hidden">
+        {/* 头部 */}
+        <div 
+          className="flex items-center justify-between px-4 py-2.5 bg-amber-500/10 cursor-pointer"
+          onClick={onToggle}
+        >
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-amber-500/20 flex items-center justify-center">
+              <BulbOutlined className="text-amber-400 text-sm" />
+            </div>
+            <span className="text-amber-400 font-medium text-sm">思考过程</span>
+            {isThinking && (
+              <div className="flex items-center gap-1.5 ml-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                <span className="text-xs text-amber-400/70">思考中...</span>
+              </div>
+            )}
+          </div>
+          <Button
+            type="text"
+            size="small"
+            icon={isExpanded ? <CompressOutlined /> : <ExpandOutlined />}
+            className="text-amber-400/70 hover:text-amber-400"
+          />
+        </div>
+        
+        {/* 内容 */}
+        <AnimatePresence>
+          {isExpanded && (
+            <motion.div
+              initial={{ height: 0 }}
+              animate={{ height: 'auto' }}
+              exit={{ height: 0 }}
+              className="overflow-hidden"
+            >
+              <div className="px-4 py-3 max-h-60 overflow-y-auto">
+                <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed">
+                  {thought || '正在分析问题...'}
+                </pre>
+                {isThinking && (
+                  <span className="inline-block w-2 h-4 bg-amber-400 animate-pulse ml-1" />
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </motion.div>
   )
 }
 
-// 消息气泡组件
+// 消息气泡
 const MessageBubble = ({
-  message,
+  msg,
   isStreaming = false,
   streamingContent = '',
   streamingThought = '',
-  streamingAction = '',
+  isThinking = false,
 }: {
-  message: Message
+  msg: Message
   isStreaming?: boolean
   streamingContent?: string
   streamingThought?: string
-  streamingAction?: string
+  isThinking?: boolean
 }) => {
-  const isUser = message.role === 'user'
-  const content = isStreaming ? streamingContent : message.content
-  const thought = isStreaming ? streamingThought : message.thought
-  const action = isStreaming ? streamingAction : message.action
+  const isUser = msg.role === 'user'
+  const content = isStreaming ? streamingContent : msg.content
+  const thought = isStreaming ? streamingThought : msg.thought
+  const [thoughtExpanded, setThoughtExpanded] = useState(true)
+  
+  const handleCopy = () => {
+    navigator.clipboard.writeText(content)
+    message.success('已复制')
+  }
   
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`flex gap-3 ${isUser ? 'flex-row-reverse' : ''}`}
+      className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''}`}
     >
       {/* 头像 */}
-      <div
-        className={`w-8 h-8 rounded-lg flex-shrink-0 flex items-center justify-center ${
-          isUser
-            ? 'bg-gradient-to-br from-blue-500 to-purple-500'
-            : 'bg-gradient-to-br from-green-500 to-teal-500'
-        }`}
-      >
-        {isUser ? (
-          <UserOutlined className="text-white text-sm" />
-        ) : (
-          <RobotOutlined className="text-white text-sm" />
-        )}
+      <div className="flex-shrink-0 pt-1">
+        <Avatar
+          size={40}
+          icon={isUser ? <UserOutlined /> : <RobotOutlined />}
+          className={isUser 
+            ? 'bg-gradient-to-br from-blue-500 to-indigo-600' 
+            : 'bg-gradient-to-br from-emerald-500 to-teal-600'
+          }
+        />
       </div>
       
-      {/* 消息内容 */}
-      <div
-        className={`max-w-[80%] ${isUser ? 'items-end' : 'items-start'}`}
-      >
-        {/* ReAct 过程 */}
-        {!isUser && (thought || action || message.observation) && (
-          <ReActProcess
-            thought={thought}
-            action={action}
-            observation={message.observation}
-            isStreaming={isStreaming}
+      {/* 内容区 */}
+      <div className={`flex-1 max-w-[85%] ${isUser ? 'flex flex-col items-end' : ''}`}>
+        {/* 思考过程面板 (仅 AI 消息) */}
+        {!isUser && (thought || isThinking) && (
+          <ThinkingPanel
+            thought={thought || ''}
+            isThinking={isThinking}
+            isExpanded={thoughtExpanded}
+            onToggle={() => setThoughtExpanded(!thoughtExpanded)}
           />
         )}
         
         {/* 消息内容 */}
         <div
-          className={`rounded-2xl px-4 py-3 ${
+          className={`group relative rounded-2xl px-5 py-4 ${
             isUser
-              ? 'bg-gradient-to-br from-blue-500 to-blue-600 text-white'
-              : 'glass-card'
+              ? 'bg-gradient-to-br from-blue-500 to-indigo-600 text-white'
+              : 'bg-slate-800/80 border border-slate-700/50'
           }`}
         >
           {isUser ? (
-            <p className="text-sm whitespace-pre-wrap">{content}</p>
+            <p className="text-[15px] whitespace-pre-wrap leading-relaxed">{content}</p>
           ) : (
-            <div className="prose prose-invert prose-sm max-w-none">
-              <ReactMarkdown
-                components={{
-                  code: ({ className, children }) => (
-                    <CodeBlock className={className}>{children}</CodeBlock>
-                  ),
-                }}
-              >
-                {content || (isStreaming ? '正在思考...' : '')}
-              </ReactMarkdown>
-              {isStreaming && content && (
-                <span className="inline-block w-2 h-4 bg-blue-400 animate-pulse ml-1" />
+            <>
+              <div className="prose prose-invert prose-slate max-w-none prose-p:my-2 prose-headings:my-3 prose-li:my-0.5 prose-pre:my-2">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    code: ({ className, children }) => (
+                      <CodeBlock className={className}>{children}</CodeBlock>
+                    ),
+                  }}
+                >
+                  {content || (isStreaming ? '' : '')}
+                </ReactMarkdown>
+                {isStreaming && content && (
+                  <span className="inline-block w-2 h-5 bg-emerald-400 animate-pulse ml-0.5 -mb-1" />
+                )}
+                {isStreaming && !content && isThinking && (
+                  <span className="text-slate-500 italic">等待回答...</span>
+                )}
+              </div>
+              
+              {/* 操作按钮 */}
+              {!isStreaming && content && (
+                <div className="absolute -bottom-8 right-0 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+                  <Tooltip title="复制">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<CopyOutlined />}
+                      onClick={handleCopy}
+                      className="text-slate-500 hover:text-white"
+                    />
+                  </Tooltip>
+                </div>
               )}
-            </div>
+            </>
           )}
         </div>
         
         {/* 时间戳 */}
-        <div
-          className={`text-xs text-gray-600 mt-1 ${
-            isUser ? 'text-right' : 'text-left'
-          }`}
-        >
-          {new Date(message.created_at).toLocaleTimeString('zh-CN', {
+        <div className={`text-xs text-slate-500 mt-2 ${isUser ? 'text-right' : ''}`}>
+          {new Date(msg.created_at).toLocaleTimeString('zh-CN', {
             hour: '2-digit',
             minute: '2-digit',
           })}
@@ -239,46 +257,127 @@ const MessageBubble = ({
   )
 }
 
+// 空状态欢迎页
+const EmptyState = ({ onQuickPrompt }: { onQuickPrompt: (prompt: string) => void }) => {
+  const prompts = [
+    { icon: '🔬', text: '解释深度学习中的注意力机制' },
+    { icon: '📊', text: '如何设计一个对照实验？' },
+    { icon: '📝', text: '帮我写一段论文摘要' },
+    { icon: '💡', text: 'Transformer 和 RNN 有什么区别？' },
+  ]
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 30 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="flex flex-col items-center justify-center py-16 px-4"
+    >
+      {/* Logo */}
+      <div className="relative mb-8">
+        <div className="w-24 h-24 rounded-3xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-2xl shadow-emerald-500/25">
+          <RobotOutlined className="text-5xl text-white" />
+        </div>
+        <div className="absolute -bottom-1 -right-1 w-8 h-8 rounded-xl bg-amber-400 flex items-center justify-center">
+          <BulbOutlined className="text-amber-900" />
+        </div>
+      </div>
+      
+      {/* 标题 */}
+      <h1 className="text-3xl font-bold text-white mb-3">
+        AI 科研助手
+      </h1>
+      <p className="text-slate-400 text-center max-w-md mb-10 leading-relaxed">
+        我可以帮助你解答科研问题、分析实验数据、撰写学术论文。
+        <br />
+        <span className="text-emerald-400">你可以看到我的完整思考过程</span>
+      </p>
+      
+      {/* 快捷提示 */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
+        {prompts.map((prompt, index) => (
+          <motion.button
+            key={index}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.1 + index * 0.05 }}
+            onClick={() => onQuickPrompt(prompt.text)}
+            className="flex items-center gap-3 p-4 rounded-xl bg-slate-800/50 border border-slate-700/50 hover:bg-slate-700/50 hover:border-slate-600 transition-all text-left group"
+          >
+            <span className="text-2xl">{prompt.icon}</span>
+            <span className="text-sm text-slate-300 group-hover:text-white transition-colors">
+              {prompt.text}
+            </span>
+          </motion.button>
+        ))}
+      </div>
+    </motion.div>
+  )
+}
+
 // 主聊天页面
 const ChatPage = () => {
   const { conversationId } = useParams()
-  const location = useLocation()
+  const navigate = useNavigate()
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
   
   const {
     messages,
     currentConversation,
     isLoading,
     isSending,
+    isThinking,
     streamingContent,
     streamingThought,
-    streamingAction,
     selectConversation,
-    createConversation,
     sendMessage,
+    clearCurrentConversation,
   } = useChatStore()
   
   const [inputValue, setInputValue] = useState('')
+  const [loadError, setLoadError] = useState<string | null>(null)
   
   // 加载对话
   useEffect(() => {
+    const loadConversation = async () => {
+      if (conversationId) {
+        setLoadError(null)
+        try {
+          await selectConversation(parseInt(conversationId))
+          setLoadError(null)  // 成功后确保清除错误
+        } catch (error: any) {
+          console.error('加载对话失败:', error)
+          // 提供更详细的错误信息
+          if (error?.response?.status === 404) {
+            setLoadError('对话不存在或已被删除')
+          } else if (error?.response?.status === 401) {
+            setLoadError('登录已过期，请重新登录')
+          } else {
+            setLoadError('加载对话失败，请刷新重试')
+          }
+        }
+      } else {
+        setLoadError(null)
+        clearCurrentConversation()
+      }
+    }
+    
+    loadConversation()
+  }, [conversationId]) // 只依赖 conversationId
+  
+  // 重新加载对话
+  const handleReload = async () => {
     if (conversationId) {
-      selectConversation(parseInt(conversationId))
+      setLoadError(null)
+      try {
+        await selectConversation(parseInt(conversationId))
+      } catch (error) {
+        console.error('重新加载对话失败:', error)
+        setLoadError('加载对话失败，请刷新重试')
+      }
     }
-  }, [conversationId, selectConversation])
+  }
   
-  // 处理初始消息（从 Dashboard 快速输入跳转）
-  useEffect(() => {
-    const initialMessage = location.state?.initialMessage
-    if (initialMessage && conversationId) {
-      handleSend(initialMessage)
-      // 清除 state 防止重复发送
-      window.history.replaceState({}, document.title)
-    }
-  }, [conversationId, location.state])
-  
-  // 自动滚动到底部
+  // 自动滚动
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingContent])
@@ -291,13 +390,24 @@ const ChatPage = () => {
     setInputValue('')
     
     try {
-      await sendMessage(messageContent)
+      // 直接发送消息，如果没有对话后端会自动创建
+      const newConvId = await sendMessage(messageContent)
+      
+      // 如果是新创建的对话，更新 URL
+      if (newConvId && !conversationId) {
+        navigate(`/chat/${newConvId}`, { replace: true })
+      }
     } catch (error) {
       message.error('发送失败，请重试')
     }
   }
   
-  // 处理按键
+  // 快捷提示
+  const handleQuickPrompt = (prompt: string) => {
+    setInputValue(prompt)
+  }
+  
+  // 按键处理
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -305,137 +415,91 @@ const ChatPage = () => {
     }
   }
   
-  // 复制消息
-  const handleCopyMessage = (content: string) => {
-    navigator.clipboard.writeText(content)
-    message.success('已复制到剪贴板')
-  }
-  
   return (
-    <div className="h-full flex flex-col">
-      {/* 消息列表区域 */}
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-4xl mx-auto space-y-6">
+    <div className="h-full flex flex-col bg-gradient-to-b from-slate-900 to-slate-950">
+      {/* 消息区域 */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-4xl mx-auto px-4 py-6">
           {isLoading ? (
-            <div className="flex justify-center py-12">
-              <Spin size="large" tip="加载中..." />
+            <div className="flex justify-center py-20">
+              <Spin size="large" />
+            </div>
+          ) : loadError ? (
+            <div className="flex flex-col items-center justify-center py-20">
+              <div className="text-red-400 mb-4">{loadError}</div>
+              <Button onClick={handleReload}>
+                重新加载
+              </Button>
             </div>
           ) : messages.length === 0 ? (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col items-center justify-center py-20"
-            >
-              <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center mb-6 shadow-lg shadow-blue-500/25">
-                <RobotOutlined className="text-4xl text-white" />
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-2">
-                开始新对话
-              </h2>
-              <p className="text-gray-400 text-center max-w-md mb-6">
-                我是你的科研助手，可以帮助你解答问题、分析数据、撰写论文。
-                试着问我任何问题吧！
-              </p>
-              
-              {/* 快捷提问 */}
-              <div className="grid grid-cols-2 gap-3 max-w-lg">
-                {[
-                  '解释什么是注意力机制？',
-                  '如何提高模型训练效率？',
-                  '帮我设计一个实验方案',
-                  '综述深度学习最新进展',
-                ].map((prompt, index) => (
-                  <motion.button
-                    key={index}
-                    initial={{ opacity: 0, scale: 0.9 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    transition={{ delay: index * 0.1 }}
-                    onClick={() => setInputValue(prompt)}
-                    className="p-3 rounded-xl glass-card text-sm text-gray-300 hover:text-white hover:border-blue-500/50 transition-all text-left"
-                  >
-                    {prompt}
-                  </motion.button>
-                ))}
-              </div>
-            </motion.div>
+            <EmptyState onQuickPrompt={handleQuickPrompt} />
           ) : (
-            <>
-              <AnimatePresence>
-                {messages.map((msg, index) => (
-                  <MessageBubble key={msg.id || index} message={msg} />
+            <div className="space-y-8">
+              <AnimatePresence mode="popLayout">
+                {messages.map((msg, idx) => (
+                  <MessageBubble key={msg.id || idx} msg={msg} />
                 ))}
               </AnimatePresence>
               
               {/* 流式响应 */}
               {isSending && (
                 <MessageBubble
-                  message={{
+                  msg={{
                     id: -1,
                     conversation_id: currentConversation?.id || 0,
                     role: 'assistant',
                     content: streamingContent,
                     message_type: 'text',
                     thought: streamingThought,
-                    action: streamingAction,
                     created_at: new Date().toISOString(),
                   }}
                   isStreaming={true}
                   streamingContent={streamingContent}
                   streamingThought={streamingThought}
-                  streamingAction={streamingAction}
+                  isThinking={isThinking}
                 />
               )}
-            </>
+              
+              <div ref={messagesEndRef} />
+            </div>
           )}
-          <div ref={messagesEndRef} />
         </div>
       </div>
       
       {/* 输入区域 */}
-      <div className="border-t border-white/5 bg-gradient-to-t from-slate-900/50 to-transparent backdrop-blur-xl">
+      <div className="border-t border-slate-800 bg-slate-900/80 backdrop-blur-xl">
         <div className="max-w-4xl mx-auto p-4">
           <div className="relative">
             <TextArea
-              ref={inputRef as any}
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="输入你的问题... (Enter 发送，Shift+Enter 换行)"
+              placeholder="输入问题，按 Enter 发送..."
               autoSize={{ minRows: 1, maxRows: 6 }}
-              className="pr-24 text-base resize-none"
+              className="pr-28 text-base bg-slate-800 border-slate-700 rounded-xl resize-none"
               disabled={isSending}
             />
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
-              {inputValue.trim() && (
-                <Tooltip title="清空">
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<DeleteOutlined />}
-                    onClick={() => setInputValue('')}
-                    className="text-gray-500 hover:text-white"
-                  />
-                </Tooltip>
-              )}
               <Button
                 type="primary"
                 icon={isSending ? <LoadingOutlined /> : <SendOutlined />}
                 onClick={() => handleSend()}
                 disabled={!inputValue.trim() || isSending}
+                className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-lg"
               >
                 发送
               </Button>
             </div>
           </div>
           
-          {/* 提示信息 */}
-          <div className="flex items-center justify-between mt-2 text-xs text-gray-600">
-            <span>
-              当前模型: {currentConversation?.llm_model || 'DeepSeek V3'}
+          {/* 底部信息 */}
+          <div className="flex items-center justify-between mt-2 text-xs text-slate-500">
+            <span className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-emerald-400" />
+              {currentConversation?.llm_provider || 'DeepSeek'} · 
+              {currentConversation?.llm_model || 'deepseek-chat'}
             </span>
-            <span>
-              {messages.length > 0 && `共 ${messages.length} 条消息`}
-            </span>
+            <span>Shift + Enter 换行</span>
           </div>
         </div>
       </div>

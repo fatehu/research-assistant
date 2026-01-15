@@ -63,6 +63,14 @@ a:hover {
   border-right: 1px solid rgba(255, 255, 255, 0.05);
 }
 
+/* 侧边栏 flex 布局 */
+.ant-layout-sider-children {
+  display: flex !important;
+  flex-direction: column !important;
+  height: 100% !important;
+  overflow: hidden !important;
+}
+
 .ant-menu {
   background: transparent !important;
 }
@@ -387,4 +395,186 @@ a:hover {
 
 .typing-cursor {
   animation: blink 1s infinite;
+}
+
+/* 滚动条细化 */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* 侧边栏滚动区域 - 优化滚动体验 */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(71, 85, 105, 0.5) transparent;
+}
+
+.sidebar-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.4);
+  border-radius: 4px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(71, 85, 105, 0.7);
+}
+
+/* 选中菜单项的 emerald 主题 */
+.ant-menu-item-selected {
+  background: rgba(16, 185, 129, 0.15) !important;
+  color: #34d399 !important;
+}
+
+.ant-menu-item-selected::after {
+  border-right-color: #10b981 !important;
+}
+
+/* 主按钮 emerald 主题 */
+.ant-btn-primary {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+  border: none !important;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25) !important;
+}
+
+.ant-btn-primary:hover {
+  background: linear-gradient(135deg, #34d399 0%, #10b981 100%) !important;
+  box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35) !important;
+}
+
+.ant-btn-primary:disabled {
+  background: rgba(16, 185, 129, 0.3) !important;
+  color: rgba(255, 255, 255, 0.5) !important;
+}
+
+/* 输入框聚焦 emerald */
+.ant-input:focus, .ant-input-affix-wrapper:focus,
+.ant-input-affix-wrapper-focused {
+  border-color: #10b981 !important;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.1) !important;
+}
+
+/* 消息输入框 */
+.ant-input-textarea textarea:focus {
+  border-color: #10b981 !important;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.1) !important;
+}
+
+/* Modal 确认按钮 */
+.ant-modal-confirm-btns .ant-btn-primary {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+}
+
+/* 危险按钮 */
+.ant-btn-dangerous {
+  color: #f87171 !important;
+  border-color: #f87171 !important;
+}
+
+.ant-btn-dangerous:hover {
+  color: #fca5a5 !important;
+  border-color: #fca5a5 !important;
+  background: rgba(248, 113, 113, 0.1) !important;
+}
+
+/* Dropdown 危险项 */
+.ant-dropdown-menu-item-danger {
+  color: #f87171 !important;
+}
+
+.ant-dropdown-menu-item-danger:hover {
+  background: rgba(248, 113, 113, 0.1) !important;
+}
+
+/* 思考面板动画 */
+@keyframes thinking-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+.thinking-indicator {
+  animation: thinking-pulse 1.5s ease-in-out infinite;
+}
+
+/* 对话项悬浮效果 */
+.conversation-item {
+  transition: all 0.2s ease;
+}
+
+.conversation-item:hover {
+  transform: translateX(4px);
+}
+
+/* 代码块优化 */
+pre code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Monaco', monospace !important;
+}
+
+/* Avatar 样式 */
+.ant-avatar {
+  border: 2px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Spin 样式 */
+.ant-spin-dot-item {
+  background-color: #10b981 !important;
+}
+
+/* 链接 hover */
+.prose a:hover {
+  color: #34d399 !important;
+}
+
+/* 引用块 */
+.prose blockquote {
+  border-left-color: #10b981 !important;
+}
+
+/* 表格 */
+.prose table {
+  border-collapse: collapse;
+}
+
+.prose th {
+  background: rgba(16, 185, 129, 0.1) !important;
+}
+
+.prose td, .prose th {
+  border-color: rgba(255, 255, 255, 0.1) !important;
+  padding: 0.75rem 1rem !important;
+}
+
+/* 加载状态 */
+.loading-shimmer {
+  background: linear-gradient(90deg, 
+    rgba(255,255,255,0) 0%, 
+    rgba(255,255,255,0.05) 50%, 
+    rgba(255,255,255,0) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
 }

@@ -94,6 +94,91 @@ export interface LLMProvider {
   available: boolean
 }
 
+// ========== 知识库类型 ==========
+
+export interface KnowledgeBase {
+  id: number
+  user_id: number
+  name: string
+  description?: string
+  embedding_model: string
+  embedding_dimension: number
+  chunk_size: number
+  chunk_overlap: number
+  document_count: number
+  total_chunks: number
+  total_tokens: number
+  is_public: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeBaseCreate {
+  name: string
+  description?: string
+  embedding_model?: string
+  chunk_size?: number
+  chunk_overlap?: number
+}
+
+export interface Document {
+  id: number
+  knowledge_base_id: number
+  filename: string
+  original_filename: string
+  file_size: number
+  file_type: string
+  status: 'pending' | 'processing' | 'completed' | 'failed'
+  error_message?: string
+  chunk_count: number
+  token_count: number
+  char_count: number
+  created_at: string
+  updated_at: string
+  processed_at?: string
+  content?: string
+}
+
+export interface DocumentChunk {
+  id: number
+  document_id: number
+  chunk_index: number
+  content: string
+  start_char: number
+  end_char: number
+  token_count: number
+  char_count: number
+  created_at: string
+}
+
+export interface SearchResult {
+  chunk_id: number
+  document_id: number
+  knowledge_base_id: number
+  document_name: string
+  knowledge_base_name: string
+  content: string
+  score: number
+  chunk_index: number
+  metadata: Record<string, unknown>
+}
+
+export interface SearchResponse {
+  query: string
+  results: SearchResult[]
+  total: number
+  search_time_ms: number
+}
+
+export interface ProcessingStatus {
+  document_id: number
+  status: string
+  progress: number
+  message: string
+  chunk_count: number
+  error?: string
+}
+
 // 认证 API
 export const authApi = {
   login: async (email: string, password: string): Promise<AuthResponse> => {
@@ -235,6 +320,99 @@ export const chatApi = {
         }
       }
     }
+  },
+}
+
+// ========== 知识库 API ==========
+
+export const knowledgeApi = {
+  // 知识库 CRUD
+  getKnowledgeBases: async (skip = 0, limit = 20): Promise<{ items: KnowledgeBase[]; total: number }> => {
+    const response = await api.get('/api/knowledge/knowledge-bases', {
+      params: { skip, limit },
+    })
+    return response.data
+  },
+  
+  createKnowledgeBase: async (data: KnowledgeBaseCreate): Promise<KnowledgeBase> => {
+    const response = await api.post('/api/knowledge/knowledge-bases', data)
+    return response.data
+  },
+  
+  getKnowledgeBase: async (kbId: number): Promise<KnowledgeBase> => {
+    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}`)
+    return response.data
+  },
+  
+  updateKnowledgeBase: async (kbId: number, data: Partial<KnowledgeBaseCreate>): Promise<KnowledgeBase> => {
+    const response = await api.put(`/api/knowledge/knowledge-bases/${kbId}`, data)
+    return response.data
+  },
+  
+  deleteKnowledgeBase: async (kbId: number): Promise<void> => {
+    await api.delete(`/api/knowledge/knowledge-bases/${kbId}`)
+  },
+  
+  // 文档管理
+  getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
+    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents`, {
+      params: { skip, limit },
+    })
+    return response.data
+  },
+  
+  uploadDocument: async (kbId: number, file: File): Promise<Document> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    
+    const response = await api.post(
+      `/api/knowledge/knowledge-bases/${kbId}/documents/upload`,
+      formData,
+      {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      }
+    )
+    return response.data
+  },
+  
+  getDocument: async (kbId: number, docId: number): Promise<Document> => {
+    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
+    return response.data
+  },
+  
+  deleteDocument: async (kbId: number, docId: number): Promise<void> => {
+    await api.delete(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
+  },
+  
+  getDocumentStatus: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
+    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/status`)
+    return response.data
+  },
+  
+  // 分片
+  getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
+    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
+      params: { skip, limit },
+    })
+    return response.data
+  },
+  
+  // 搜索
+  search: async (
+    query: string,
+    knowledgeBaseIds?: number[],
+    topK = 5,
+    scoreThreshold = 0.5
+  ): Promise<SearchResponse> => {
+    const response = await api.post('/api/knowledge/search', {
+      query,
+      knowledge_base_ids: knowledgeBaseIds,
+      top_k: topK,
+      score_threshold: scoreThreshold,
+    })
+    return response.data
   },
 }
 

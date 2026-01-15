@@ -2,21 +2,32 @@
 
 基于 ReAct Agent 的综合科研助手平台，支持多厂商 LLM，提供智能对话、知识库管理、文献检索等功能。
 
-## 🚀 阶段 1 功能（已完成）
+## 🚀 功能特性
 
+### 阶段 1（已完成）
 - ✅ **用户认证系统** - JWT 认证，注册/登录/退出
 - ✅ **Dashboard 工作台** - 快速输入、统计概览、最近对话
 - ✅ **AI 对话聊天** - 流式响应、ReAct 思考过程展示
 - ✅ **多厂商 LLM 支持** - DeepSeek（默认）、OpenAI、阿里云通义、Ollama
 - ✅ **暗色主题 UI** - 玻璃态效果、流畅动画
 
+### 阶段 2（已完成）
+- ✅ **向量知识库** - 创建、管理多个知识库
+- ✅ **文档上传处理** - 支持 PDF、TXT、Markdown、HTML
+- ✅ **智能分片** - 自动文本分割，保持语义完整性
+- ✅ **向量存储** - pgvector 高效向量存储与检索
+- ✅ **语义搜索** - 基于 HNSW 索引的快速相似度搜索
+- ✅ **Agent 工具** - 对话中自动调用知识库搜索
+- ✅ **阿里云 Embedding** - text-embedding-v2 模型（1536维）
+
 ## 🛠️ 技术栈
 
 ### 后端
 - **框架**: FastAPI + SQLAlchemy + Alembic
-- **数据库**: PostgreSQL + Redis
+- **数据库**: PostgreSQL + pgvector + Redis
 - **认证**: JWT (python-jose)
 - **LLM**: OpenAI 兼容接口（多厂商）
+- **Embedding**: 阿里云 text-embedding-v2
 
 ### 前端
 - **框架**: React 18 + TypeScript + Vite
@@ -24,6 +35,11 @@
 - **状态管理**: Zustand
 - **动画**: Framer Motion
 - **Markdown**: react-markdown + react-syntax-highlighter
+
+### 向量数据库
+- **pgvector**: PostgreSQL 向量扩展
+- **索引**: HNSW (Hierarchical Navigable Small World)
+- **距离函数**: 余弦距离 (Cosine Distance)
 
 ## 📦 快速开始
 
@@ -180,7 +196,30 @@ research-assistant/
 | POST | `/api/chat/conversations` | 创建新对话 |
 | GET | `/api/chat/conversations/{id}` | 获取对话详情 |
 | DELETE | `/api/chat/conversations/{id}` | 删除对话 |
-| POST | `/api/chat/send` | 发送消息（支持 SSE 流式） |
+| POST | `/api/chat/send` | 发送消息（支持 SSE 流式 + Agent 工具） |
+
+### 知识库
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/knowledge/knowledge-bases` | 获取知识库列表 |
+| POST | `/api/knowledge/knowledge-bases` | 创建知识库 |
+| GET | `/api/knowledge/knowledge-bases/{id}` | 获取知识库详情 |
+| PUT | `/api/knowledge/knowledge-bases/{id}` | 更新知识库 |
+| DELETE | `/api/knowledge/knowledge-bases/{id}` | 删除知识库 |
+
+### 文档
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| GET | `/api/knowledge/knowledge-bases/{kb_id}/documents` | 获取文档列表 |
+| POST | `/api/knowledge/knowledge-bases/{kb_id}/documents/upload` | 上传文档 |
+| GET | `/api/knowledge/knowledge-bases/{kb_id}/documents/{doc_id}` | 获取文档详情 |
+| DELETE | `/api/knowledge/knowledge-bases/{kb_id}/documents/{doc_id}` | 删除文档 |
+| GET | `/api/knowledge/knowledge-bases/{kb_id}/documents/{doc_id}/status` | 处理状态 |
+
+### 向量搜索
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | `/api/knowledge/search` | 语义向量搜索 |
 
 ### 健康检查
 | 方法 | 路径 | 描述 |
@@ -222,18 +261,25 @@ ALIYUN_API_KEY=sk-xxx
 ALIYUN_MODEL=qwen-plus
 ```
 
-### Embedding 配置（阶段2使用）
+### Embedding 配置（阿里云 text-embedding-v2）
 
 ```env
+# Embedding 服务
 EMBEDDING_PROVIDER=aliyun
 ALIYUN_EMBEDDING_API_KEY=your-api-key
 ALIYUN_EMBEDDING_MODEL=text-embedding-v2
 ```
 
+**text-embedding-v2 参数：**
+- 向量维度：1536
+- 最大输入：2048 tokens
+- 支持语言：中文、英文
+- [API 文档](https://help.aliyun.com/zh/dashscope/developer-reference/text-embedding-api-details)
+
 ## 📝 开发计划
 
 - [x] **阶段 1**: 基础框架 + 用户认证 + Dashboard + 基本 Agent 聊天
-- [ ] **阶段 2**: 向量知识库模块
+- [x] **阶段 2**: 向量知识库模块 (pgvector)
 - [ ] **阶段 3**: 文献管理模块
 - [ ] **阶段 4**: 论文编写助手
 - [ ] **阶段 5**: 代码实验室
