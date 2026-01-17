@@ -63,6 +63,7 @@ services:
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-aliyun}
       - ALIYUN_EMBEDDING_API_KEY=${ALIYUN_EMBEDDING_API_KEY}
       - ALIYUN_EMBEDDING_MODEL=${ALIYUN_EMBEDDING_MODEL:-text-embedding-v2}
+      - SERPER_API_KEY=${SERPER_API_KEY}
     ports:
       - "8000:8000"
     volumes:

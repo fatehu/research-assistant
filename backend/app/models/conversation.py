@@ -68,7 +68,8 @@ class Message(Base):
     message_type = Column(Enum(MessageType), default=MessageType.TEXT)
     
     # ReAct 相关
-    thought = Column(Text, nullable=True)  # 思考内容
+    thought = Column(Text, nullable=True)  # 最终思考内容（摘要）
+    react_steps = Column(JSON, nullable=True)  # 完整的ReAct推理步骤
     action = Column(String(200), nullable=True)  # 动作名称
     action_input = Column(JSON, nullable=True)  # 动作输入
     observation = Column(Text, nullable=True)  # 观察结果

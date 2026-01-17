@@ -11,16 +11,276 @@ import {
   ReloadOutlined,
   ExpandOutlined,
   CompressOutlined,
+  ToolOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  SearchOutlined,
+  CalculatorOutlined,
+  ClockCircleOutlined,
+  FileTextOutlined,
+  SwapOutlined,
+  GlobalOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import remarkGfm from 'remark-gfm'
-import { useChatStore } from '@/stores/chatStore'
+import { useChatStore, IterationStep } from '@/stores/chatStore'
 import type { Message } from '@/services/api'
 
 const { TextArea } = Input
+
+// 工具图标映射
+const toolIcons: Record<string, React.ReactNode> = {
+  knowledge_search: <SearchOutlined />,
+  web_search: <GlobalOutlined />,
+  calculator: <CalculatorOutlined />,
+  datetime: <ClockCircleOutlined />,
+  text_analysis: <FileTextOutlined />,
+  unit_converter: <SwapOutlined />,
+}
+
+// 工具名称映射
+const toolNames: Record<string, string> = {
+  knowledge_search: '知识库搜索',
+  web_search: '网络搜索',
+  calculator: '计算器',
+  datetime: '日期时间',
+  text_analysis: '文本分析',
+  unit_converter: '单位转换',
+}
+
+// ReAct 推理过程面板 - 更精美的设计
+const ReActPanel = ({ 
+  steps,
+  currentIteration,
+  isThinking,
+  currentThought,
+  currentToolCall,
+}: { 
+  steps: IterationStep[]
+  currentIteration: number
+  isThinking: boolean
+  currentThought: string
+  currentToolCall: { tool: string; input: Record<string, any> } | null
+}) => {
+  const [expanded, setExpanded] = useState(true)
+  
+  // 如果没有任何内容，不显示
+  if (steps.length === 0 && !isThinking && !currentToolCall) return null
+  
+  // 按迭代分组步骤
+  const iterations: IterationStep[][] = []
+  let currentGroup: IterationStep[] = []
+  
+  steps.forEach((step, index) => {
+    currentGroup.push(step)
+    if (step.type === 'observation' || index === steps.length - 1) {
+      if (currentGroup.length > 0) {
+        iterations.push([...currentGroup])
+        currentGroup = []
+      }
+    }
+  })
+  
+  if (currentGroup.length > 0) {
+    iterations.push(currentGroup)
+  }
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -5 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="mb-4"
+    >
+      <div className="rounded-xl bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-slate-700/50 overflow-hidden shadow-lg">
+        {/* 头部 - 渐变背景 */}
+        <div 
+          className="flex items-center justify-between px-4 py-3 bg-gradient-to-r from-purple-500/10 via-blue-500/10 to-emerald-500/10 cursor-pointer"
+          onClick={() => setExpanded(!expanded)}
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center shadow-lg">
+              <BulbOutlined className="text-white text-sm" />
+            </div>
+            <div>
+              <div className="text-sm font-medium text-white">推理过程</div>
+              <div className="text-xs text-slate-400">
+                {currentIteration > 0 ? `第 ${currentIteration} 轮推理` : '准备中'}
+                {(isThinking || currentToolCall) && (
+                  <span className="ml-2 text-emerald-400">
+                    <LoadingOutlined className="animate-spin mr-1" />
+                    {currentToolCall ? '执行工具中' : '思考中'}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {steps.length > 0 && (
+              <span className="text-xs text-slate-400 bg-slate-700/50 px-2 py-1 rounded-full">
+                {steps.length} 步
+              </span>
+            )}
+            <Button
+              type="text"
+              size="small"
+              icon={expanded ? <CompressOutlined /> : <ExpandOutlined />}
+              className="text-slate-400 hover:text-white"
+            />
+          </div>
+        </div>
+        
+        {/* 内容 */}
+        <AnimatePresence>
+          {expanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden"
+            >
+              <div className="px-4 py-3 space-y-4 max-h-96 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700">
+                {/* 显示所有迭代 */}
+                {iterations.map((iterSteps, iterIndex) => (
+                  <div key={iterIndex}>
+                    {/* 迭代分隔线 */}
+                    {iterIndex > 0 && (
+                      <div className="flex items-center gap-3 py-2 my-2">
+                        <div className="flex-1 h-px bg-gradient-to-r from-transparent via-slate-600 to-transparent" />
+                        <span className="text-xs text-slate-500 px-2">第 {iterIndex + 1} 轮</span>
+                        <div className="flex-1 h-px bg-gradient-to-r from-transparent via-slate-600 to-transparent" />
+                      </div>
+                    )}
+                    
+                    <div className="space-y-3">
+                      {iterSteps.map((step) => (
+                        <motion.div 
+                          key={step.timestamp}
+                          initial={{ opacity: 0, x: -10 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          className="relative pl-6"
+                        >
+                          {/* 时间线 */}
+                          <div className="absolute left-0 top-0 bottom-0 w-px bg-slate-700" />
+                          
+                          {step.type === 'thought' && (
+                            <div className="relative">
+                              <div className="absolute -left-6 top-1 w-3 h-3 rounded-full bg-amber-500 border-2 border-slate-800" />
+                              <div className="bg-amber-500/10 rounded-lg p-3 border border-amber-500/20">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <BulbOutlined className="text-amber-400" />
+                                  <span className="text-xs font-medium text-amber-400">思考</span>
+                                </div>
+                                <p className="text-sm text-slate-300 leading-relaxed">
+                                  {step.content}
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                          
+                          {step.type === 'action' && (
+                            <div className="relative">
+                              <div className="absolute -left-6 top-1 w-3 h-3 rounded-full bg-blue-500 border-2 border-slate-800" />
+                              <div className="bg-blue-500/10 rounded-lg p-3 border border-blue-500/20">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <span className="text-blue-400">
+                                    {toolIcons[step.tool || ''] || <ToolOutlined />}
+                                  </span>
+                                  <span className="text-xs font-medium text-blue-400">
+                                    调用 {toolNames[step.tool || ''] || step.tool}
+                                  </span>
+                                </div>
+                                <code className="text-xs text-slate-400 bg-slate-800/80 px-2 py-1 rounded block overflow-x-auto">
+                                  {JSON.stringify(step.toolInput, null, 2)}
+                                </code>
+                              </div>
+                            </div>
+                          )}
+                          
+                          {step.type === 'observation' && (
+                            <div className="relative">
+                              <div className={`absolute -left-6 top-1 w-3 h-3 rounded-full border-2 border-slate-800 ${step.success ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                              <div className={`rounded-lg p-3 border ${step.success ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
+                                <div className="flex items-center gap-2 mb-2">
+                                  {step.success ? (
+                                    <CheckCircleOutlined className="text-emerald-400" />
+                                  ) : (
+                                    <CloseCircleOutlined className="text-red-400" />
+                                  )}
+                                  <span className={`text-xs font-medium ${step.success ? 'text-emerald-400' : 'text-red-400'}`}>
+                                    工具返回
+                                  </span>
+                                </div>
+                                <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">
+                                  {step.content.length > 300 ? step.content.slice(0, 300) + '...' : step.content}
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                        </motion.div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+                
+                {/* 当前正在进行的思考 */}
+                {isThinking && currentThought && (
+                  <motion.div 
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="relative pl-6"
+                  >
+                    <div className="absolute left-0 top-0 bottom-0 w-px bg-slate-700" />
+                    <div className="absolute -left-6 top-1 w-3 h-3 rounded-full bg-amber-500 border-2 border-slate-800 animate-pulse" />
+                    <div className="bg-amber-500/10 rounded-lg p-3 border border-amber-500/20">
+                      <div className="flex items-center gap-2 mb-2">
+                        <BulbOutlined className="text-amber-400 animate-pulse" />
+                        <span className="text-xs font-medium text-amber-400">思考中...</span>
+                      </div>
+                      <p className="text-sm text-slate-300 leading-relaxed">
+                        {currentThought}
+                        <span className="inline-block w-2 h-4 bg-amber-400 animate-pulse ml-1 rounded-sm" />
+                      </p>
+                    </div>
+                  </motion.div>
+                )}
+                
+                {/* 当前正在执行的工具 */}
+                {currentToolCall && (
+                  <motion.div 
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="relative pl-6"
+                  >
+                    <div className="absolute left-0 top-0 bottom-0 w-px bg-slate-700" />
+                    <div className="absolute -left-6 top-1 w-3 h-3 rounded-full bg-blue-500 border-2 border-slate-800 animate-pulse" />
+                    <div className="bg-blue-500/10 rounded-lg p-3 border border-blue-500/20">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-blue-400 animate-pulse">
+                          {toolIcons[currentToolCall.tool] || <ToolOutlined />}
+                        </span>
+                        <span className="text-xs font-medium text-blue-400">
+                          正在执行 {toolNames[currentToolCall.tool] || currentToolCall.tool}...
+                        </span>
+                        <LoadingOutlined className="text-blue-400 animate-spin" />
+                      </div>
+                      <code className="text-xs text-slate-400 bg-slate-800/80 px-2 py-1 rounded block">
+                        {JSON.stringify(currentToolCall.input)}
+                      </code>
+                    </div>
+                  </motion.div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </motion.div>
+  )
+}
 
 // 代码块组件
 const CodeBlock = ({ className, children }: { className?: string; children: React.ReactNode }) => {
@@ -70,7 +330,7 @@ const CodeBlock = ({ className, children }: { className?: string; children: Reac
   )
 }
 
-// 思考过程面板
+// 思考过程面板（仅显示最终思考）
 const ThinkingPanel = ({ 
   thought, 
   isThinking,
@@ -86,53 +346,46 @@ const ThinkingPanel = ({
   
   return (
     <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0 }}
-      className="mb-3"
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.2 }}
+      className="mb-2"
     >
-      <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 overflow-hidden">
-        {/* 头部 */}
+      <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 overflow-hidden">
+        {/* 头部 - 可点击展开/收起 */}
         <div 
-          className="flex items-center justify-between px-4 py-2.5 bg-amber-500/10 cursor-pointer"
+          className="flex items-center justify-between px-3 py-2 cursor-pointer hover:bg-amber-500/10 transition-colors"
           onClick={onToggle}
         >
           <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-lg bg-amber-500/20 flex items-center justify-center">
-              <BulbOutlined className="text-amber-400 text-sm" />
-            </div>
-            <span className="text-amber-400 font-medium text-sm">思考过程</span>
+            <BulbOutlined className="text-amber-400 text-sm" />
+            <span className="text-amber-400/90 text-xs font-medium">最终思考</span>
             {isThinking && (
-              <div className="flex items-center gap-1.5 ml-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                <span className="text-xs text-amber-400/70">思考中...</span>
-              </div>
+              <span className="flex items-center gap-1 text-xs text-amber-400/60">
+                <LoadingOutlined className="animate-spin" />
+                思考中
+              </span>
             )}
           </div>
-          <Button
-            type="text"
-            size="small"
-            icon={isExpanded ? <CompressOutlined /> : <ExpandOutlined />}
-            className="text-amber-400/70 hover:text-amber-400"
-          />
+          <span className="text-amber-400/50 text-xs">
+            {isExpanded ? '收起' : '展开'}
+          </span>
         </div>
         
         {/* 内容 */}
         <AnimatePresence>
           {isExpanded && (
             <motion.div
-              initial={{ height: 0 }}
-              animate={{ height: 'auto' }}
-              exit={{ height: 0 }}
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
               className="overflow-hidden"
             >
-              <div className="px-4 py-3 max-h-60 overflow-y-auto">
-                <pre className="text-sm text-slate-300 whitespace-pre-wrap font-sans leading-relaxed">
+              <div className="px-3 py-2 border-t border-amber-500/10 max-h-40 overflow-y-auto">
+                <p className="text-xs text-slate-400 whitespace-pre-wrap leading-relaxed">
                   {thought || '正在分析问题...'}
-                </pre>
-                {isThinking && (
-                  <span className="inline-block w-2 h-4 bg-amber-400 animate-pulse ml-1" />
-                )}
+                </p>
               </div>
             </motion.div>
           )}
@@ -142,7 +395,143 @@ const ThinkingPanel = ({
   )
 }
 
-// 消息气泡
+// 历史消息的 ReAct 推理过程面板
+const HistoryReActPanel = ({ 
+  steps 
+}: { 
+  steps: Array<{
+    type: string
+    iteration: number
+    content?: string
+    tool?: string
+    input?: Record<string, unknown>
+    output?: string
+    success?: boolean
+  }>
+}) => {
+  const [expanded, setExpanded] = useState(false)
+  
+  if (!steps || steps.length === 0) return null
+  
+  // 统计信息
+  const totalIterations = Math.max(...steps.map(s => s.iteration || 1))
+  const toolCalls = steps.filter(s => s.type === 'action').length
+  
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      className="mb-3"
+    >
+      <div className="rounded-xl bg-gradient-to-br from-slate-800/60 to-slate-900/60 border border-slate-700/50 overflow-hidden">
+        {/* 头部 */}
+        <div 
+          className="flex items-center justify-between px-4 py-2.5 cursor-pointer hover:bg-slate-700/30 transition-colors"
+          onClick={() => setExpanded(!expanded)}
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-500/80 to-blue-500/80 flex items-center justify-center">
+              <BulbOutlined className="text-white text-xs" />
+            </div>
+            <div>
+              <span className="text-sm font-medium text-slate-300">推理过程</span>
+              <span className="ml-2 text-xs text-slate-500">
+                {totalIterations} 轮迭代 · {toolCalls} 次工具调用
+              </span>
+            </div>
+          </div>
+          <Button
+            type="text"
+            size="small"
+            icon={expanded ? <CompressOutlined /> : <ExpandOutlined />}
+            className="text-slate-400 hover:text-white"
+          />
+        </div>
+        
+        {/* 内容 */}
+        <AnimatePresence>
+          {expanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden"
+            >
+              <div className="px-4 py-3 border-t border-slate-700/50 space-y-3 max-h-80 overflow-y-auto">
+                {steps.map((step, index) => (
+                  <div key={index} className="relative pl-5">
+                    {/* 时间线 */}
+                    <div className="absolute left-0 top-0 bottom-0 w-px bg-slate-700" />
+                    
+                    {step.type === 'thought' && (
+                      <div className="relative">
+                        <div className="absolute -left-5 top-1.5 w-2.5 h-2.5 rounded-full bg-amber-500 border-2 border-slate-800" />
+                        <div className="bg-amber-500/10 rounded-lg p-2.5 border border-amber-500/20">
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <BulbOutlined className="text-amber-400 text-xs" />
+                            <span className="text-xs font-medium text-amber-400">
+                              第 {step.iteration} 轮思考
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-400 leading-relaxed">
+                            {step.content}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                    
+                    {step.type === 'action' && (
+                      <div className="relative">
+                        <div className="absolute -left-5 top-1.5 w-2.5 h-2.5 rounded-full bg-blue-500 border-2 border-slate-800" />
+                        <div className="bg-blue-500/10 rounded-lg p-2.5 border border-blue-500/20">
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <span className="text-blue-400 text-xs">
+                              {toolIcons[step.tool || ''] || <ToolOutlined />}
+                            </span>
+                            <span className="text-xs font-medium text-blue-400">
+                              调用 {toolNames[step.tool || ''] || step.tool}
+                            </span>
+                          </div>
+                          <code className="text-[10px] text-slate-500 bg-slate-800/60 px-2 py-1 rounded block overflow-x-auto">
+                            {JSON.stringify(step.input)}
+                          </code>
+                        </div>
+                      </div>
+                    )}
+                    
+                    {step.type === 'observation' && (
+                      <div className="relative">
+                        <div className={`absolute -left-5 top-1.5 w-2.5 h-2.5 rounded-full border-2 border-slate-800 ${step.success ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                        <div className={`rounded-lg p-2.5 border ${step.success ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
+                          <div className="flex items-center gap-2 mb-1.5">
+                            {step.success ? (
+                              <CheckCircleOutlined className="text-emerald-400 text-xs" />
+                            ) : (
+                              <CloseCircleOutlined className="text-red-400 text-xs" />
+                            )}
+                            <span className={`text-xs font-medium ${step.success ? 'text-emerald-400' : 'text-red-400'}`}>
+                              工具返回
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-400 leading-relaxed whitespace-pre-wrap">
+                            {(step.output || '').length > 300 ? (step.output || '').slice(0, 300) + '...' : step.output}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </motion.div>
+  )
+}
+
+// 消息气泡 - 美化版
 const MessageBubble = ({
   msg,
   isStreaming = false,
@@ -158,100 +547,162 @@ const MessageBubble = ({
 }) => {
   const isUser = msg.role === 'user'
   const content = isStreaming ? streamingContent : msg.content
-  const thought = isStreaming ? streamingThought : msg.thought
-  const [thoughtExpanded, setThoughtExpanded] = useState(true)
+  const thought = isStreaming ? '' : msg.thought
+  const reactSteps = isStreaming ? undefined : msg.react_steps
+  const [thoughtExpanded, setThoughtExpanded] = useState(false)
+  
+  // 调试：打印 react_steps 信息
+  if (!isUser && !isStreaming) {
+    console.log('[MessageBubble] msg.id:', msg.id, 'react_steps:', reactSteps, 'thought:', thought?.slice(0, 50))
+  }
   
   const handleCopy = () => {
     navigator.clipboard.writeText(content)
-    message.success('已复制')
+    message.success('已复制到剪贴板')
   }
   
   return (
     <motion.div
-      initial={{ opacity: 0, y: 20 }}
+      initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, ease: 'easeOut' }}
       className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''}`}
     >
       {/* 头像 */}
-      <div className="flex-shrink-0 pt-1">
-        <Avatar
-          size={40}
-          icon={isUser ? <UserOutlined /> : <RobotOutlined />}
-          className={isUser 
-            ? 'bg-gradient-to-br from-blue-500 to-indigo-600' 
-            : 'bg-gradient-to-br from-emerald-500 to-teal-600'
-          }
-        />
+      <div className="flex-shrink-0">
+        {isUser ? (
+          <Avatar
+            size={40}
+            icon={<UserOutlined />}
+            className="bg-gradient-to-br from-blue-500 to-indigo-600 shadow-lg shadow-blue-500/30"
+          />
+        ) : (
+          <div className="w-10 h-10 rounded-full bg-gradient-to-br from-emerald-500 via-teal-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-emerald-500/30">
+            <RobotOutlined className="text-white text-lg" />
+          </div>
+        )}
       </div>
       
       {/* 内容区 */}
       <div className={`flex-1 max-w-[85%] ${isUser ? 'flex flex-col items-end' : ''}`}>
-        {/* 思考过程面板 (仅 AI 消息) */}
-        {!isUser && (thought || isThinking) && (
+        {/* 角色标签 */}
+        <div className={`flex items-center gap-2 mb-2 ${isUser ? 'flex-row-reverse' : ''}`}>
+          <span className={`text-sm font-medium ${isUser ? 'text-blue-400' : 'text-emerald-400'}`}>
+            {isUser ? '你' : 'AI 助手'}
+          </span>
+          <span className="text-xs text-slate-500">
+            {new Date(msg.created_at).toLocaleTimeString('zh-CN', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}
+          </span>
+        </div>
+        
+        {/* ReAct 推理过程面板 (历史 AI 消息) */}
+        {!isUser && !isStreaming && reactSteps && reactSteps.length > 0 && (
+          <HistoryReActPanel steps={reactSteps} />
+        )}
+        
+        {/* 最终思考面板 (与推理过程并行显示) */}
+        {!isUser && !isStreaming && thought && (
           <ThinkingPanel
-            thought={thought || ''}
-            isThinking={isThinking}
+            thought={thought}
+            isThinking={false}
             isExpanded={thoughtExpanded}
             onToggle={() => setThoughtExpanded(!thoughtExpanded)}
           />
         )}
         
         {/* 消息内容 */}
-        <div
-          className={`group relative rounded-2xl px-5 py-4 ${
-            isUser
-              ? 'bg-gradient-to-br from-blue-500 to-indigo-600 text-white'
-              : 'bg-slate-800/80 border border-slate-700/50'
-          }`}
-        >
-          {isUser ? (
+        {isUser ? (
+          // 用户消息 - 简洁风格
+          <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-3 rounded-2xl rounded-tr-md shadow-lg shadow-blue-500/20">
             <p className="text-[15px] whitespace-pre-wrap leading-relaxed">{content}</p>
-          ) : (
-            <>
-              <div className="prose prose-invert prose-slate max-w-none prose-p:my-2 prose-headings:my-3 prose-li:my-0.5 prose-pre:my-2">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    code: ({ className, children }) => (
-                      <CodeBlock className={className}>{children}</CodeBlock>
-                    ),
-                  }}
-                >
-                  {content || (isStreaming ? '' : '')}
-                </ReactMarkdown>
-                {isStreaming && content && (
-                  <span className="inline-block w-2 h-5 bg-emerald-400 animate-pulse ml-0.5 -mb-1" />
-                )}
-                {isStreaming && !content && isThinking && (
-                  <span className="text-slate-500 italic">等待回答...</span>
+          </div>
+        ) : (
+          // AI消息 - 精美卡片风格
+          <div className="relative">
+            {/* 渐变边框效果 */}
+            <div className="absolute -inset-0.5 bg-gradient-to-r from-emerald-500/20 via-teal-500/20 to-cyan-500/20 rounded-2xl blur-sm" />
+            
+            <div className="relative bg-slate-800/90 backdrop-blur-xl border border-slate-700/50 rounded-2xl rounded-tl-md overflow-hidden">
+              {/* 顶部渐变装饰 */}
+              <div className="h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500" />
+              
+              <div className="p-5">
+                {content ? (
+                  <>
+                    <div className="prose prose-invert prose-slate max-w-none
+                      prose-p:my-3 prose-p:leading-relaxed prose-p:text-slate-200
+                      prose-headings:mt-6 prose-headings:mb-3 prose-headings:text-white prose-headings:font-semibold
+                      prose-h1:text-xl prose-h2:text-lg prose-h3:text-base
+                      prose-li:my-1 prose-li:text-slate-200
+                      prose-ul:my-3 prose-ol:my-3
+                      prose-pre:my-4 prose-pre:bg-slate-900 prose-pre:border prose-pre:border-slate-700/50 prose-pre:rounded-xl
+                      prose-code:text-emerald-400 prose-code:bg-slate-900/80 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:text-sm prose-code:font-mono
+                      prose-strong:text-white prose-strong:font-semibold
+                      prose-em:text-slate-300 prose-em:italic
+                      prose-a:text-blue-400 prose-a:no-underline hover:prose-a:text-blue-300 hover:prose-a:underline
+                      prose-blockquote:border-l-4 prose-blockquote:border-emerald-500/50 prose-blockquote:bg-slate-900/50 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:rounded-r-lg
+                      prose-hr:border-slate-700 prose-hr:my-6
+                      prose-table:border prose-table:border-slate-700 prose-th:bg-slate-800 prose-th:px-3 prose-th:py-2 prose-td:px-3 prose-td:py-2 prose-td:border-t prose-td:border-slate-700
+                      text-[15px] leading-relaxed">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          code: ({ className, children }) => (
+                            <CodeBlock className={className}>{children}</CodeBlock>
+                          ),
+                        }}
+                      >
+                        {content}
+                      </ReactMarkdown>
+                    </div>
+                    
+                    {/* 流式输出光标 */}
+                    {isStreaming && (
+                      <span className="inline-block w-2 h-5 bg-emerald-400 animate-pulse ml-1 -mb-1 rounded-sm" />
+                    )}
+                  </>
+                ) : isStreaming ? (
+                  <div className="flex items-center gap-3 py-2">
+                    <div className="flex gap-1">
+                      <span className="w-2 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <span className="w-2 h-2 bg-teal-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <span className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </div>
+                    <span className="text-sm text-slate-400">
+                      {isThinking ? '正在思考...' : '正在生成回答...'}
+                    </span>
+                  </div>
+                ) : null}
+                
+                {/* 操作栏 */}
+                {!isStreaming && content && (
+                  <div className="flex items-center gap-3 mt-4 pt-4 border-t border-slate-700/50">
+                    <Tooltip title="复制内容">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<CopyOutlined />}
+                        onClick={handleCopy}
+                        className="text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 rounded-lg transition-all"
+                      >
+                        复制
+                      </Button>
+                    </Tooltip>
+                    
+                    {/* 可以添加更多操作按钮 */}
+                    <div className="flex-1" />
+                    <span className="text-xs text-slate-600">
+                      AI 生成内容，仅供参考
+                    </span>
+                  </div>
                 )}
               </div>
-              
-              {/* 操作按钮 */}
-              {!isStreaming && content && (
-                <div className="absolute -bottom-8 right-0 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
-                  <Tooltip title="复制">
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<CopyOutlined />}
-                      onClick={handleCopy}
-                      className="text-slate-500 hover:text-white"
-                    />
-                  </Tooltip>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-        
-        {/* 时间戳 */}
-        <div className={`text-xs text-slate-500 mt-2 ${isUser ? 'text-right' : ''}`}>
-          {new Date(msg.created_at).toLocaleTimeString('zh-CN', {
-            hour: '2-digit',
-            minute: '2-digit',
-          })}
-        </div>
+            </div>
+          </div>
+        )}
       </div>
     </motion.div>
   )
@@ -261,36 +712,60 @@ const MessageBubble = ({
 const EmptyState = ({ onQuickPrompt }: { onQuickPrompt: (prompt: string) => void }) => {
   const prompts = [
     { icon: '🔬', text: '解释深度学习中的注意力机制' },
-    { icon: '📊', text: '如何设计一个对照实验？' },
-    { icon: '📝', text: '帮我写一段论文摘要' },
-    { icon: '💡', text: 'Transformer 和 RNN 有什么区别？' },
+    { icon: '📊', text: '计算 sin(45°) + cos(60°) 的值' },
+    { icon: '📝', text: '搜索我知识库中关于机器学习的内容' },
+    { icon: '💡', text: '帮我把 100 华氏度转换成摄氏度' },
+  ]
+  
+  const tools = [
+    { icon: <SearchOutlined />, name: '知识库搜索', desc: '检索上传的文档' },
+    { icon: <GlobalOutlined />, name: '网络搜索', desc: '搜索互联网' },
+    { icon: <CalculatorOutlined />, name: '计算器', desc: '数学运算' },
+    { icon: <ClockCircleOutlined />, name: '日期时间', desc: '获取当前时间' },
+    { icon: <SwapOutlined />, name: '单位转换', desc: '长度/重量/温度' },
   ]
   
   return (
     <motion.div
       initial={{ opacity: 0, y: 30 }}
       animate={{ opacity: 1, y: 0 }}
-      className="flex flex-col items-center justify-center py-16 px-4"
+      className="flex flex-col items-center justify-center py-12 px-4"
     >
       {/* Logo */}
-      <div className="relative mb-8">
-        <div className="w-24 h-24 rounded-3xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-2xl shadow-emerald-500/25">
-          <RobotOutlined className="text-5xl text-white" />
+      <div className="relative mb-6">
+        <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-emerald-400 via-teal-500 to-cyan-600 flex items-center justify-center shadow-2xl shadow-emerald-500/25">
+          <RobotOutlined className="text-4xl text-white" />
         </div>
-        <div className="absolute -bottom-1 -right-1 w-8 h-8 rounded-xl bg-amber-400 flex items-center justify-center">
-          <BulbOutlined className="text-amber-900" />
+        <div className="absolute -bottom-1 -right-1 w-7 h-7 rounded-xl bg-amber-400 flex items-center justify-center">
+          <BulbOutlined className="text-amber-900 text-sm" />
         </div>
       </div>
       
       {/* 标题 */}
-      <h1 className="text-3xl font-bold text-white mb-3">
+      <h1 className="text-2xl font-bold text-white mb-2">
         AI 科研助手
       </h1>
-      <p className="text-slate-400 text-center max-w-md mb-10 leading-relaxed">
-        我可以帮助你解答科研问题、分析实验数据、撰写学术论文。
+      <p className="text-slate-400 text-center max-w-md mb-6 text-sm leading-relaxed">
+        我可以帮助你解答科研问题、分析数据、检索知识库
         <br />
-        <span className="text-emerald-400">你可以看到我的完整思考过程</span>
+        <span className="text-emerald-400">支持工具调用，可以看到完整思考过程</span>
       </p>
+      
+      {/* 可用工具 */}
+      <div className="flex flex-wrap justify-center gap-2 mb-8">
+        {tools.map((tool, index) => (
+          <motion.div
+            key={index}
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.05 * index }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-xs"
+          >
+            <span className="text-blue-400">{tool.icon}</span>
+            <span className="text-slate-300">{tool.name}</span>
+          </motion.div>
+        ))}
+      </div>
       
       {/* 快捷提示 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
@@ -328,6 +803,10 @@ const ChatPage = () => {
     isThinking,
     streamingContent,
     streamingThought,
+    iterationSteps,
+    currentIteration,
+    toolCalls,
+    currentToolCall,
     selectConversation,
     sendMessage,
     clearCurrentConversation,
@@ -416,25 +895,26 @@ const ChatPage = () => {
   }
   
   return (
-    <div className="h-full flex flex-col bg-gradient-to-b from-slate-900 to-slate-950">
+    <div className="h-full flex flex-col bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950">
       {/* 消息区域 */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="max-w-4xl mx-auto px-4 py-6">
+      <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+        <div className="max-w-3xl mx-auto px-4 py-6">
           {isLoading ? (
-            <div className="flex justify-center py-20">
+            <div className="flex flex-col items-center justify-center py-20">
               <Spin size="large" />
+              <p className="text-slate-500 mt-4">加载对话中...</p>
             </div>
           ) : loadError ? (
             <div className="flex flex-col items-center justify-center py-20">
               <div className="text-red-400 mb-4">{loadError}</div>
-              <Button onClick={handleReload}>
+              <Button onClick={handleReload} icon={<ReloadOutlined />}>
                 重新加载
               </Button>
             </div>
           ) : messages.length === 0 ? (
             <EmptyState onQuickPrompt={handleQuickPrompt} />
           ) : (
-            <div className="space-y-8">
+            <div className="space-y-6">
               <AnimatePresence mode="popLayout">
                 {messages.map((msg, idx) => (
                   <MessageBubble key={msg.id || idx} msg={msg} />
@@ -443,21 +923,34 @@ const ChatPage = () => {
               
               {/* 流式响应 */}
               {isSending && (
-                <MessageBubble
-                  msg={{
-                    id: -1,
-                    conversation_id: currentConversation?.id || 0,
-                    role: 'assistant',
-                    content: streamingContent,
-                    message_type: 'text',
-                    thought: streamingThought,
-                    created_at: new Date().toISOString(),
-                  }}
-                  isStreaming={true}
-                  streamingContent={streamingContent}
-                  streamingThought={streamingThought}
-                  isThinking={isThinking}
-                />
+                <div>
+                  {/* ReAct 推理过程面板 */}
+                  <ReActPanel 
+                    steps={iterationSteps}
+                    currentIteration={currentIteration}
+                    isThinking={isThinking}
+                    currentThought={streamingThought}
+                    currentToolCall={currentToolCall}
+                  />
+                  
+                  {/* 只有当有内容时才显示消息气泡 */}
+                  {(streamingContent || (!isThinking && !currentToolCall && iterationSteps.length === 0)) && (
+                    <MessageBubble
+                      msg={{
+                        id: -1,
+                        conversation_id: currentConversation?.id || 0,
+                        role: 'assistant',
+                        content: streamingContent,
+                        message_type: 'text',
+                        created_at: new Date().toISOString(),
+                      }}
+                      isStreaming={true}
+                      streamingContent={streamingContent}
+                      streamingThought=""
+                      isThinking={false}
+                    />
+                  )}
+                </div>
               )}
               
               <div ref={messagesEndRef} />
@@ -467,39 +960,44 @@ const ChatPage = () => {
       </div>
       
       {/* 输入区域 */}
-      <div className="border-t border-slate-800 bg-slate-900/80 backdrop-blur-xl">
-        <div className="max-w-4xl mx-auto p-4">
-          <div className="relative">
-            <TextArea
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="输入问题，按 Enter 发送..."
-              autoSize={{ minRows: 1, maxRows: 6 }}
-              className="pr-28 text-base bg-slate-800 border-slate-700 rounded-xl resize-none"
-              disabled={isSending}
-            />
-            <div className="absolute right-2 bottom-2 flex items-center gap-2">
-              <Button
-                type="primary"
-                icon={isSending ? <LoadingOutlined /> : <SendOutlined />}
-                onClick={() => handleSend()}
-                disabled={!inputValue.trim() || isSending}
-                className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-lg"
-              >
-                发送
-              </Button>
+      <div className="border-t border-slate-800/50 bg-slate-900/90 backdrop-blur-xl">
+        <div className="max-w-3xl mx-auto p-4">
+          <div className="relative flex items-end gap-3">
+            <div className="flex-1 relative">
+              <TextArea
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="输入问题，按 Enter 发送..."
+                autoSize={{ minRows: 1, maxRows: 6 }}
+                className="text-base bg-slate-800/80 border-slate-700/50 rounded-xl resize-none 
+                  focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20
+                  placeholder:text-slate-500"
+                disabled={isSending}
+              />
             </div>
+            <Button
+              type="primary"
+              size="large"
+              icon={isSending ? <LoadingOutlined /> : <SendOutlined />}
+              onClick={() => handleSend()}
+              disabled={!inputValue.trim() || isSending}
+              className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-xl h-10 px-5
+                shadow-lg shadow-emerald-500/20 disabled:opacity-50"
+            >
+              {isSending ? '发送中' : '发送'}
+            </Button>
           </div>
           
           {/* 底部信息 */}
-          <div className="flex items-center justify-between mt-2 text-xs text-slate-500">
+          <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
             <span className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400" />
-              {currentConversation?.llm_provider || 'DeepSeek'} · 
-              {currentConversation?.llm_model || 'deepseek-chat'}
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="text-slate-400">
+                {currentConversation?.llm_provider || 'DeepSeek'}
+              </span>
             </span>
-            <span>Shift + Enter 换行</span>
+            <span className="text-slate-600">Shift + Enter 换行 · Enter 发送</span>
           </div>
         </div>
       </div>

@@ -35,6 +35,7 @@ class MessageResponse(BaseModel):
     content: str
     message_type: str
     thought: Optional[str] = None
+    react_steps: Optional[List[dict]] = None  # ReAct 推理步骤
     action: Optional[str] = None
     action_input: Optional[dict] = None
     observation: Optional[str] = None

@@ -1,6 +1,26 @@
 import { create } from 'zustand'
 import { chatApi, Conversation, Message } from '@/services/api'
 
+// 工具调用信息
+export interface ToolCall {
+  tool: string
+  input: Record<string, any>
+  output?: string
+  success?: boolean
+  timestamp: number
+}
+
+// 迭代步骤
+export interface IterationStep {
+  type: 'thought' | 'action' | 'observation'
+  content: string
+  tool?: string
+  toolInput?: Record<string, any>
+  toolOutput?: string
+  success?: boolean
+  timestamp: number
+}
+
 interface ChatState {
   // 对话列表
   conversations: Conversation[]
@@ -16,6 +36,12 @@ interface ChatState {
   streamingContent: string
   streamingThought: string
   isThinking: boolean  // 是否正在思考中
+  
+  // ReAct 迭代状态
+  iterationSteps: IterationStep[]  // 所有迭代步骤
+  currentIteration: number  // 当前迭代次数
+  toolCalls: ToolCall[]
+  currentToolCall: ToolCall | null
   
   // Actions
   fetchConversations: () => Promise<void>
@@ -37,6 +63,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streamingContent: '',
   streamingThought: '',
   isThinking: false,
+  iterationSteps: [],
+  currentIteration: 0,
+  toolCalls: [],
+  currentToolCall: null,
   
   fetchConversations: async () => {
     // 防止重复加载
@@ -131,13 +161,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isThinking: true,
       streamingContent: '',
       streamingThought: '',
+      iterationSteps: [],  // 重置迭代步骤
+      currentIteration: 0,
+      toolCalls: [],
+      currentToolCall: null,
     }))
     
     let newConversationId: number | undefined = undefined
     
     try {
       let fullContent = ''
-      let fullThought = ''
+      let currentThought = ''  // 当前迭代的思考
       
       await chatApi.sendMessageStream(
         message,
@@ -164,21 +198,80 @@ export const useChatStore = create<ChatState>((set, get) => ({
               break
               
             case 'thinking_start':
-              set({ isThinking: true })
+              // 新一轮迭代开始
+              set((state) => ({ 
+                isThinking: true,
+                currentIteration: state.currentIteration + 1,
+              }))
+              currentThought = ''  // 重置当前思考
               break
               
             case 'thinking':
               // 流式思考内容
-              fullThought += data
-              set({ streamingThought: fullThought })
+              currentThought += data
+              set({ streamingThought: currentThought })
               break
               
             case 'thought':
-              // 思考完成
-              fullThought = data
-              set({ 
-                streamingThought: fullThought,
-                isThinking: false 
+              // 思考完成，记录到迭代步骤
+              currentThought = data
+              set((state) => ({ 
+                streamingThought: currentThought,
+                isThinking: false,
+                iterationSteps: [...state.iterationSteps, {
+                  type: 'thought',
+                  content: data,
+                  timestamp: Date.now(),
+                }]
+              }))
+              break
+            
+            case 'action':
+              // 工具调用开始
+              const toolCall = {
+                tool: data.tool,
+                input: data.input,
+                timestamp: Date.now(),
+              }
+              set((state) => ({
+                currentToolCall: toolCall,
+                toolCalls: [...state.toolCalls, toolCall],
+                isThinking: false,
+                iterationSteps: [...state.iterationSteps, {
+                  type: 'action',
+                  content: `调用工具: ${data.tool}`,
+                  tool: data.tool,
+                  toolInput: data.input,
+                  timestamp: Date.now(),
+                }]
+              }))
+              break
+            
+            case 'observation':
+              // 工具调用结果
+              set((state) => {
+                const updatedToolCalls = [...state.toolCalls]
+                const lastIndex = updatedToolCalls.length - 1
+                if (lastIndex >= 0) {
+                  updatedToolCalls[lastIndex] = {
+                    ...updatedToolCalls[lastIndex],
+                    output: data.output,
+                    success: data.success,
+                  }
+                }
+                return {
+                  toolCalls: updatedToolCalls,
+                  currentToolCall: null,
+                  isThinking: true,  // 继续思考
+                  iterationSteps: [...state.iterationSteps, {
+                    type: 'observation',
+                    content: data.output,
+                    tool: data.tool,
+                    toolOutput: data.output,
+                    success: data.success,
+                    timestamp: Date.now(),
+                  }]
+                }
               })
               break
               
@@ -199,7 +292,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 role: 'assistant',
                 content: fullContent || data.answer || '',
                 message_type: 'text',
-                thought: fullThought || data.thought || undefined,
+                thought: currentThought || data.thought || undefined,
+                react_steps: data.react_steps || undefined,  // 保存ReAct步骤
                 created_at: new Date().toISOString(),
               }
               
@@ -209,6 +303,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 isThinking: false,
                 streamingContent: '',
                 streamingThought: '',
+                iterationSteps: [],  // 清空迭代步骤
+                currentIteration: 0,
+                toolCalls: [],  // 清空工具调用记录
+                currentToolCall: null,
               }))
               
               // 刷新对话列表（新对话或更新标题）
@@ -216,7 +314,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
               break
               
             case 'error':
-              set({ isSending: false, isThinking: false })
+              set({ 
+                isSending: false, 
+                isThinking: false, 
+                iterationSteps: [],
+                currentIteration: 0,
+                toolCalls: [], 
+                currentToolCall: null 
+              })
               throw new Error(data)
           }
         }
@@ -224,7 +329,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       
       return newConversationId
     } catch (error) {
-      set({ isSending: false, isThinking: false })
+      set({ 
+        isSending: false, 
+        isThinking: false, 
+        iterationSteps: [],
+        currentIteration: 0,
+        toolCalls: [], 
+        currentToolCall: null 
+      })
       throw error
     }
   },
@@ -235,6 +347,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: [],
       streamingContent: '',
       streamingThought: '',
+      iterationSteps: [],
+      currentIteration: 0,
+      toolCalls: [],
+      currentToolCall: null,
     })
   },
 }))

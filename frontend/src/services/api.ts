@@ -70,6 +70,16 @@ export interface Conversation {
   last_message?: string
 }
 
+export interface ReactStep {
+  type: 'thought' | 'action' | 'observation'
+  iteration: number
+  content?: string
+  tool?: string
+  input?: Record<string, unknown>
+  output?: string
+  success?: boolean
+}
+
 export interface Message {
   id: number
   conversation_id: number
@@ -77,6 +87,7 @@ export interface Message {
   content: string
   message_type: string
   thought?: string
+  react_steps?: ReactStep[]
   action?: string
   action_input?: Record<string, unknown>
   observation?: string

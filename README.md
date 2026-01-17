@@ -17,8 +17,52 @@
 - ✅ **智能分片** - 自动文本分割，保持语义完整性
 - ✅ **向量存储** - pgvector 高效向量存储与检索
 - ✅ **语义搜索** - 基于 HNSW 索引的快速相似度搜索
-- ✅ **Agent 工具** - 对话中自动调用知识库搜索
 - ✅ **阿里云 Embedding** - text-embedding-v2 模型（1536维）
+
+### ReAct Agent 框架（已完成）
+- ✅ **ReAct 推理框架** - Reasoning + Acting 循环
+- ✅ **工具调用系统** - 自动选择和执行工具
+- ✅ **思考过程可视化** - 展示 AI 的完整推理链
+- ✅ **推理过程持久化** - 保存完整的 ReAct 步骤到数据库
+- ✅ **多轮迭代显示** - 前端展示完整的多轮推理过程
+- ✅ **精美 UI 设计** - 卡片式消息、渐变边框、时间线展示
+- ✅ **多工具支持**:
+  - 📚 **知识库搜索** - 检索用户上传的文档
+  - 🌐 **网络搜索** - Serper API (Google搜索) + DuckDuckGo 备用
+  - 🧮 **计算器** - 数学计算（三角函数、对数等）
+  - 📅 **日期时间** - 获取当前时间
+  - 📊 **文本分析** - 字数统计、关键词提取
+  - 🔄 **单位转换** - 长度、重量、温度等
+
+## 🤖 ReAct Agent 工作原理
+
+ReAct (Reasoning + Acting) 是一种让 AI 能够进行推理和使用工具的框架：
+
+```
+用户问题 → 思考(Thought) → 行动(Action) → 观察(Observation) → ... → 最终回答(Answer)
+```
+
+### 示例流程
+
+**用户**: "帮我搜索知识库中关于 Transformer 的内容，然后计算 sin(45°)"
+
+**Agent 执行过程**:
+
+1. **Thought**: 用户需要两件事：搜索知识库和数学计算。先搜索知识库。
+
+2. **Action**: `{"tool": "knowledge_search", "input": {"query": "Transformer"}}`
+
+3. **Observation**: 找到 3 条相关结果...
+
+4. **Thought**: 知识库搜索完成，现在进行计算。
+
+5. **Action**: `{"tool": "calculator", "input": {"expression": "sin(radians(45))"}}`
+
+6. **Observation**: 计算结果: 0.7071067812
+
+7. **Answer**: 
+   - 知识库中找到关于 Transformer 的内容...
+   - sin(45°) = 0.707
 
 ## 🛠️ 技术栈
 
