@@ -822,6 +822,160 @@ class UnitConverterTool(Tool):
             )
 
 
+class LiteratureSearchTool(Tool):
+    """学术文献搜索工具 - 使用 Semantic Scholar 和 arXiv API"""
+    name = "literature_search"
+    description = "搜索学术论文和文献。可以搜索 Semantic Scholar 或 arXiv 数据库，获取论文标题、摘要、作者、引用数等信息。适用于学术研究、文献综述、找相关论文等场景。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜索关键词，可以是论文标题、作者名、研究主题等"
+            },
+            "source": {
+                "type": "string",
+                "description": "数据源: semantic_scholar (默认，更全面) 或 arxiv (预印本，更新快)",
+                "enum": ["semantic_scholar", "arxiv"],
+                "default": "semantic_scholar"
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "返回结果数量，默认5",
+                "default": 5
+            },
+            "year_start": {
+                "type": "integer",
+                "description": "起始年份过滤（可选）"
+            },
+            "year_end": {
+                "type": "integer",
+                "description": "结束年份过滤（可选）"
+            }
+        },
+        "required": ["query"]
+    }
+    
+    def __init__(self):
+        from app.services.literature_service import get_literature_service
+        self.service = get_literature_service()
+    
+    async def execute(
+        self,
+        query: str,
+        source: str = "semantic_scholar",
+        max_results: int = 5,
+        year_start: int = None,
+        year_end: int = None
+    ) -> ToolResult:
+        """执行学术文献搜索"""
+        logger.info(f"[LiteratureSearch] 搜索: {query}, source={source}")
+        
+        try:
+            kwargs = {}
+            if year_start and year_end:
+                kwargs["year_range"] = (year_start, year_end)
+            
+            result = await self.service.search(
+                query=query,
+                source=source,
+                limit=max_results,
+                **kwargs
+            )
+            
+            if "error" in result:
+                return ToolResult(
+                    success=False,
+                    output=f"搜索失败: {result['error']}",
+                    error=result["error"]
+                )
+            
+            papers = result.get("papers", [])
+            
+            if not papers:
+                return ToolResult(
+                    success=True,
+                    output=f"未找到关于 '{query}' 的学术论文。",
+                    data={"papers": [], "query": query, "source": source}
+                )
+            
+            # 格式化输出
+            output = self._format_results(query, source, papers)
+            
+            return ToolResult(
+                success=True,
+                output=output,
+                data={
+                    "papers": [self._paper_to_dict(p) for p in papers],
+                    "query": query,
+                    "source": source,
+                    "total": result.get("total", len(papers))
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"[LiteratureSearch] 搜索错误: {e}")
+            return ToolResult(
+                success=False,
+                output=f"文献搜索错误: {str(e)}",
+                error=str(e)
+            )
+    
+    def _format_results(self, query: str, source: str, papers: list) -> str:
+        """格式化搜索结果"""
+        source_name = "Semantic Scholar" if source == "semantic_scholar" else "arXiv"
+        output_parts = [f"在 {source_name} 搜索 '{query}' 的结果：\n"]
+        
+        for i, paper in enumerate(papers, 1):
+            # 作者列表
+            authors = paper.authors[:3] if paper.authors else []
+            author_str = ", ".join([a.get("name", "") for a in authors])
+            if len(paper.authors) > 3:
+                author_str += " 等"
+            
+            output_parts.append(f"\n【{i}】{paper.title}")
+            if paper.year:
+                output_parts.append(f" ({paper.year})")
+            output_parts.append(f"\n作者: {author_str or '未知'}")
+            
+            if paper.venue:
+                output_parts.append(f"\n发表: {paper.venue}")
+            
+            if paper.citation_count > 0:
+                output_parts.append(f"\n引用数: {paper.citation_count}")
+            
+            if paper.abstract:
+                # 截断摘要
+                abstract = paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract
+                output_parts.append(f"\n摘要: {abstract}")
+            
+            if paper.url:
+                output_parts.append(f"\n链接: {paper.url}")
+            
+            output_parts.append("\n")
+        
+        return "".join(output_parts)
+    
+    def _paper_to_dict(self, paper) -> dict:
+        """将论文对象转换为字典"""
+        return {
+            "source": paper.source,
+            "external_id": paper.external_id,
+            "title": paper.title,
+            "abstract": paper.abstract,
+            "authors": paper.authors,
+            "year": paper.year,
+            "venue": paper.venue,
+            "citation_count": paper.citation_count,
+            "reference_count": paper.reference_count,
+            "url": paper.url,
+            "pdf_url": paper.pdf_url,
+            "arxiv_id": paper.arxiv_id,
+            "doi": paper.doi,
+            "fields_of_study": paper.fields_of_study
+        }
+
+
 class ToolRegistry:
     """工具注册表"""
     
@@ -842,6 +996,7 @@ class ToolRegistry:
         self.register(DateTimeTool())
         self.register(TextAnalysisTool())
         self.register(UnitConverterTool())
+        self.register(LiteratureSearchTool())
     
     def register(self, tool: Tool):
         """注册工具"""

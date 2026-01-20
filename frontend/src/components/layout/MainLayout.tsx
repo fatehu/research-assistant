@@ -21,6 +21,7 @@ import {
   InboxOutlined,
   DownOutlined,
   RightOutlined,
+  BookOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAuthStore } from '@/stores/authStore'
@@ -211,10 +212,9 @@ const MainLayout = () => {
       label: '知识库',
     },
     {
-      key: '/papers',
-      icon: <FileTextOutlined />,
+      key: '/literature',
+      icon: <BookOutlined />,
       label: '文献管理',
-      disabled: true,
     },
     {
       key: '/code',
@@ -364,6 +364,7 @@ const MainLayout = () => {
             selectedKeys={[
               location.pathname.startsWith('/chat') ? '/chat' : 
               location.pathname.startsWith('/knowledge') ? '/knowledge' : 
+              location.pathname.startsWith('/literature') ? '/literature' : 
               location.pathname
             ]}
             items={menuItems}

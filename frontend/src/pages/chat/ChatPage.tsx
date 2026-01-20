@@ -551,11 +551,6 @@ const MessageBubble = ({
   const reactSteps = isStreaming ? undefined : msg.react_steps
   const [thoughtExpanded, setThoughtExpanded] = useState(false)
   
-  // 调试：打印 react_steps 信息
-  if (!isUser && !isStreaming) {
-    console.log('[MessageBubble] msg.id:', msg.id, 'react_steps:', reactSteps, 'thought:', thought?.slice(0, 50))
-  }
-  
   const handleCopy = () => {
     navigator.clipboard.writeText(content)
     message.success('已复制到剪贴板')

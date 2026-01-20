@@ -7,10 +7,20 @@ from app.schemas.chat import (
     MessageCreate, MessageResponse, ChatRequest, ChatStreamResponse,
     ReActStep
 )
+from app.schemas.literature import (
+    PaperResponse, PaperCreate, PaperUpdate,
+    PaperSearchResult, PaperSearchResponse,
+    CollectionResponse, CollectionCreate, CollectionUpdate,
+    CitationGraphResponse, GraphNode, GraphEdge
+)
 
 __all__ = [
     "UserCreate", "UserLogin", "UserResponse", "UserUpdate", "Token", "TokenData",
     "ConversationCreate", "ConversationResponse", "ConversationListResponse",
     "MessageCreate", "MessageResponse", "ChatRequest", "ChatStreamResponse",
-    "ReActStep"
+    "ReActStep",
+    "PaperResponse", "PaperCreate", "PaperUpdate",
+    "PaperSearchResult", "PaperSearchResponse",
+    "CollectionResponse", "CollectionCreate", "CollectionUpdate",
+    "CitationGraphResponse", "GraphNode", "GraphEdge"
 ]

@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     aliyun_embedding_api_key: str = ""
     aliyun_embedding_model: str = "text-embedding-v2"
     
+    # ReAct Agent 配置
+    react_max_iterations: int = 5  # 最大迭代次数
+    
     def get_llm_config(self, provider: str = None):
         """获取 LLM 配置"""
         provider = provider or self.default_llm_provider

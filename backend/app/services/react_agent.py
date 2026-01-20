@@ -10,6 +10,7 @@ from datetime import datetime
 from enum import Enum
 from loguru import logger
 
+from app.config import settings
 from app.services.llm_service import LLMService
 from app.services.agent_tools import ToolRegistry, ToolResult
 
@@ -44,7 +45,7 @@ class AgentContext:
     steps: List[AgentStep] = field(default_factory=list)
     state: AgentState = AgentState.IDLE
     iteration: int = 0
-    max_iterations: int = 5
+    max_iterations: int = field(default_factory=lambda: settings.react_max_iterations)
     final_answer: str = ""
     error: Optional[str] = None
 
@@ -119,11 +120,11 @@ class ReActAgent:
         self,
         llm_service: LLMService,
         tool_registry: ToolRegistry,
-        max_iterations: int = 5,
+        max_iterations: int = None,
     ):
         self.llm = llm_service
         self.tools = tool_registry
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else settings.react_max_iterations
     
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
@@ -674,7 +675,10 @@ class ReActAgent:
 def create_react_agent(
     llm_service: LLMService,
     tool_registry: ToolRegistry,
-    max_iterations: int = 5,
+    max_iterations: int = None,
 ) -> ReActAgent:
     """创建 ReAct Agent 实例"""
+    if max_iterations is None:
+        max_iterations = settings.react_max_iterations
+    logger.info(f"[ReAct] 创建 Agent, 最大迭代次数: {max_iterations}")
     return ReActAgent(llm_service, tool_registry, max_iterations)

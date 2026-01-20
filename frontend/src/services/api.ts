@@ -427,6 +427,285 @@ export const knowledgeApi = {
   },
 }
 
+// ========== 文献管理类型 ==========
+
+export interface PaperAuthor {
+  name: string
+  authorId?: string
+  affiliations?: string[]
+}
+
+export interface Paper {
+  id: number
+  user_id: number
+  semantic_scholar_id?: string
+  arxiv_id?: string
+  doi?: string
+  title: string
+  abstract?: string
+  authors: PaperAuthor[]
+  year?: number
+  venue?: string
+  citation_count: number
+  reference_count: number
+  influential_citation_count: number
+  url?: string
+  pdf_url?: string
+  arxiv_url?: string
+  pdf_path?: string
+  pdf_downloaded: boolean
+  knowledge_base_id?: number
+  document_id?: number
+  fields_of_study: string[]
+  tags: string[]
+  is_read: boolean
+  read_at?: string
+  notes?: string
+  rating?: number
+  source: string
+  published_date?: string
+  created_at: string
+  updated_at: string
+  collection_ids: number[]
+}
+
+export interface PaperSearchResult {
+  source: string
+  external_id: string
+  title: string
+  abstract?: string
+  authors: PaperAuthor[]
+  year?: number
+  venue?: string
+  citation_count: number
+  reference_count: number
+  url?: string
+  pdf_url?: string
+  arxiv_id?: string
+  doi?: string
+  fields_of_study: string[]
+  is_saved: boolean
+  saved_paper_id?: number
+}
+
+export interface PaperSearchResponse {
+  total: number
+  offset: number
+  papers: PaperSearchResult[]
+  query: string
+  source: string
+}
+
+export interface PaperCollection {
+  id: number
+  user_id: number
+  name: string
+  description?: string
+  color: string
+  icon: string
+  collection_type: string
+  is_default: boolean
+  paper_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface GraphNode {
+  id: string
+  title: string
+  year?: number
+  citations: number
+  authors: string[]
+  level: number
+  type: string
+}
+
+export interface GraphEdge {
+  from: string
+  to: string
+  type: string
+}
+
+export interface CitationGraph {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  center_id: string
+}
+
+export interface SearchHistory {
+  id: number
+  query: string
+  source: string
+  result_count: number
+  filters: Record<string, unknown>
+  created_at: string
+}
+
+// ========== 文献管理 API ==========
+
+export const literatureApi = {
+  // 初始化
+  init: async (): Promise<{ message: string }> => {
+    const response = await api.post('/api/literature/init')
+    return response.data
+  },
+
+  // 搜索论文
+  searchPapers: async (params: {
+    query: string
+    source?: string
+    limit?: number
+    offset?: number
+    year_start?: number
+    year_end?: number
+    fields?: string
+    open_access?: boolean
+  }): Promise<PaperSearchResponse> => {
+    const response = await api.get('/api/literature/search', { params })
+    return response.data
+  },
+
+  // 获取搜索历史
+  getSearchHistory: async (limit = 20): Promise<SearchHistory[]> => {
+    const response = await api.get('/api/literature/search/history', {
+      params: { limit },
+    })
+    return response.data
+  },
+
+  // 获取论文列表
+  getPapers: async (params?: {
+    collection_id?: number
+    is_read?: boolean
+    tag?: string
+    search?: string
+    sort_by?: string
+    sort_order?: string
+    limit?: number
+    offset?: number
+  }): Promise<Paper[]> => {
+    const response = await api.get('/api/literature/papers', { params })
+    return response.data
+  },
+
+  // 获取论文详情
+  getPaper: async (paperId: number): Promise<Paper> => {
+    const response = await api.get(`/api/literature/papers/${paperId}`)
+    return response.data
+  },
+
+  // 保存论文
+  savePaper: async (data: {
+    source: string
+    external_id: string
+    title: string
+    abstract?: string
+    authors?: PaperAuthor[]
+    year?: number
+    venue?: string
+    citation_count?: number
+    reference_count?: number
+    url?: string
+    pdf_url?: string
+    arxiv_id?: string
+    doi?: string
+    fields_of_study?: string[]
+    raw_data?: Record<string, unknown>
+    collection_ids?: number[]
+  }): Promise<Paper> => {
+    const response = await api.post('/api/literature/papers', data)
+    return response.data
+  },
+
+  // 更新论文
+  updatePaper: async (
+    paperId: number,
+    data: {
+      title?: string
+      abstract?: string
+      notes?: string
+      tags?: string[]
+      rating?: number
+      is_read?: boolean
+    }
+  ): Promise<Paper> => {
+    const response = await api.patch(`/api/literature/papers/${paperId}`, data)
+    return response.data
+  },
+
+  // 删除论文
+  deletePaper: async (paperId: number): Promise<void> => {
+    await api.delete(`/api/literature/papers/${paperId}`)
+  },
+
+  // 下载 PDF
+  downloadPdf: async (
+    paperId: number,
+    knowledgeBaseId?: number
+  ): Promise<{ message: string; pdf_path: string }> => {
+    const response = await api.post(`/api/literature/papers/${paperId}/download-pdf`, null, {
+      params: { knowledge_base_id: knowledgeBaseId },
+    })
+    return response.data
+  },
+
+  // 收藏夹管理
+  getCollections: async (): Promise<PaperCollection[]> => {
+    const response = await api.get('/api/literature/collections')
+    return response.data
+  },
+
+  createCollection: async (data: {
+    name: string
+    description?: string
+    color?: string
+    icon?: string
+    collection_type?: string
+  }): Promise<PaperCollection> => {
+    const response = await api.post('/api/literature/collections', data)
+    return response.data
+  },
+
+  updateCollection: async (
+    collectionId: number,
+    data: {
+      name?: string
+      description?: string
+      color?: string
+      icon?: string
+    }
+  ): Promise<PaperCollection> => {
+    const response = await api.patch(`/api/literature/collections/${collectionId}`, data)
+    return response.data
+  },
+
+  deleteCollection: async (collectionId: number): Promise<void> => {
+    await api.delete(`/api/literature/collections/${collectionId}`)
+  },
+
+  addPaperToCollection: async (paperId: number, collectionIds: number[]): Promise<void> => {
+    await api.post('/api/literature/collections/add-paper', {
+      paper_id: paperId,
+      collection_ids: collectionIds,
+    })
+  },
+
+  removePaperFromCollection: async (paperId: number, collectionId: number): Promise<void> => {
+    await api.post('/api/literature/collections/remove-paper', {
+      paper_id: paperId,
+      collection_id: collectionId,
+    })
+  },
+
+  // 引用图谱
+  getCitationGraph: async (paperId: number, maxNodes = 20): Promise<CitationGraph> => {
+    const response = await api.get(`/api/literature/graph/${paperId}`, {
+      params: { max_nodes: maxNodes },
+    })
+    return response.data
+  },
+}
+
 // 辅助函数
 function getToken(): string {
   const authStorage = localStorage.getItem('auth-storage')
