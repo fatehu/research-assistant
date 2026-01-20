@@ -340,7 +340,7 @@ class ArxivService:
             sort_by: 排序方式
             sort_order: 排序顺序
         """
-        logger.info(f"[arXiv] 搜索论文: {query}, limit={limit}")
+        logger.info(f"[arXiv] 搜索论文: {query}, limit={limit}, offset={offset}")
         
         # 构建查询
         search_query = f"all:{query}"
@@ -364,10 +364,12 @@ class ArxivService:
                     logger.error(f"[arXiv] API 错误: {response.status_code}")
                     return {"total": 0, "papers": [], "error": f"API error: {response.status_code}"}
                 
-                papers = self._parse_atom_feed(response.text)
+                papers, total = self._parse_atom_feed_with_total(response.text)
+                
+                logger.info(f"[arXiv] 搜索完成: total={total}, offset={offset}, 返回={len(papers)}篇")
                 
                 return {
-                    "total": len(papers),  # arXiv API 不返回总数
+                    "total": total,
                     "offset": offset,
                     "papers": papers
                 }
@@ -412,26 +414,42 @@ class ArxivService:
     
     def _parse_atom_feed(self, xml_text: str) -> List[PaperResult]:
         """解析 arXiv Atom feed"""
+        papers, _ = self._parse_atom_feed_with_total(xml_text)
+        return papers
+    
+    def _parse_atom_feed_with_total(self, xml_text: str) -> tuple[List[PaperResult], int]:
+        """解析 arXiv Atom feed，同时返回论文列表和总数"""
         papers = []
+        total = 0
         
         # 定义命名空间
         namespaces = {
             'atom': 'http://www.w3.org/2005/Atom',
-            'arxiv': 'http://arxiv.org/schemas/atom'
+            'arxiv': 'http://arxiv.org/schemas/atom',
+            'opensearch': 'http://a9.com/-/spec/opensearch/1.1/'
         }
         
         try:
             root = ET.fromstring(xml_text)
+            
+            # 获取总数
+            total_elem = root.find('opensearch:totalResults', namespaces)
+            if total_elem is not None and total_elem.text:
+                total = int(total_elem.text)
             
             for entry in root.findall('atom:entry', namespaces):
                 paper = self._parse_entry(entry, namespaces)
                 if paper:
                     papers.append(paper)
             
+            # 如果没有找到 opensearch:totalResults，使用返回的数量作为 fallback
+            if total == 0:
+                total = len(papers)
+            
         except Exception as e:
             logger.error(f"[arXiv] 解析 XML 错误: {e}")
         
-        return papers
+        return papers, total
     
     def _parse_entry(self, entry, namespaces) -> Optional[PaperResult]:
         """解析单个论文条目"""
@@ -559,6 +577,8 @@ class PubMedService:
                 id_list = search_data.get("esearchresult", {}).get("idlist", [])
                 total = int(search_data.get("esearchresult", {}).get("count", 0))
                 
+                logger.info(f"[PubMed] 搜索ID: total={total}, 获取到{len(id_list)}个ID, offset={offset}")
+                
                 if not id_list:
                     return {"total": 0, "papers": [], "offset": offset}
                 
@@ -577,6 +597,8 @@ class PubMedService:
                 
                 papers = self._parse_pubmed_xml(fetch_resp.text)
                 
+                logger.info(f"[PubMed] 搜索完成: total={total}, offset={offset}, 返回={len(papers)}篇")
+                
                 return {
                     "total": total,
                     "offset": offset,
@@ -592,8 +614,10 @@ class PubMedService:
         papers = []
         try:
             root = ET.fromstring(xml_text)
+            articles = root.findall(".//PubmedArticle")
+            logger.info(f"[PubMed] 找到 {len(articles)} 篇文章待解析")
             
-            for article in root.findall(".//PubmedArticle"):
+            for article in articles:
                 try:
                     medline = article.find(".//MedlineCitation")
                     if medline is None:
@@ -659,6 +683,7 @@ class PubMedService:
         except Exception as e:
             logger.error(f"[PubMed] XML 解析错误: {e}")
         
+        logger.info(f"[PubMed] 成功解析 {len(papers)} 篇论文")
         return papers
 
 

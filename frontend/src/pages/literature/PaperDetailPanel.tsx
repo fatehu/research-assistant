@@ -1,20 +1,19 @@
 import { useState } from 'react'
 import { 
-  Button, Tag, Space, Divider, Rate, Input, message, Tooltip, 
-  Popconfirm, Select, Descriptions, Typography, Collapse 
+  Button, Tag, Space, Rate, Input, message, Tooltip, 
+  Select
 } from 'antd'
 import {
   LinkOutlined, DownloadOutlined, BookOutlined, CalendarOutlined,
   TeamOutlined, StarOutlined, EditOutlined, SaveOutlined,
   NodeIndexOutlined, CopyOutlined, CheckOutlined, FileTextOutlined,
-  FolderAddOutlined, DeleteOutlined, EyeOutlined, TagsOutlined
+  FolderAddOutlined, EyeOutlined, TagsOutlined, FireOutlined,
+  CloseOutlined
 } from '@ant-design/icons'
-import { Paper, PaperCollection } from '@/services/api'
+import { Paper } from '@/services/api'
 import { useLiteratureStore } from '@/stores/literatureStore'
 
 const { TextArea } = Input
-const { Text, Paragraph, Title } = Typography
-const { Panel } = Collapse
 
 interface PaperDetailPanelProps {
   paper: Paper
@@ -35,6 +34,7 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
   const [editingTags, setEditingTags] = useState(false)
   const [tags, setTags] = useState<string[]>(paper.tags || [])
   const [newTag, setNewTag] = useState('')
+  const [abstractExpanded, setAbstractExpanded] = useState(false)
 
   // 更新阅读状态
   const handleToggleRead = async () => {
@@ -144,17 +144,21 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
   )
 
   return (
-    <div className="space-y-4">
-      {/* 标题和基本操作 */}
+    <div className="space-y-5 text-slate-300">
+      {/* 标题 */}
       <div>
-        <Title level={5} className="mb-2">{paper.title}</Title>
+        <h3 className="text-lg font-semibold text-slate-100 leading-snug mb-3">
+          {paper.title}
+        </h3>
         
-        <Space wrap className="mb-3">
+        {/* 操作按钮 */}
+        <div className="flex flex-wrap gap-2 mb-4">
           <Button 
             type={paper.is_read ? 'default' : 'primary'}
             icon={paper.is_read ? <CheckOutlined /> : <EyeOutlined />}
             onClick={handleToggleRead}
             size="small"
+            className={paper.is_read ? '!bg-emerald-500/20 !border-emerald-500/30 !text-emerald-400' : ''}
           >
             {paper.is_read ? '已读' : '标记已读'}
           </Button>
@@ -164,6 +168,7 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
               icon={<NodeIndexOutlined />}
               onClick={onShowGraph}
               size="small"
+              className="!border-slate-600 !text-slate-300"
             >
               引用图谱
             </Button>
@@ -173,206 +178,253 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
             icon={<CopyOutlined />}
             onClick={handleCopyCitation}
             size="small"
+            className="!border-slate-600 !text-slate-300"
           >
             复制引用
           </Button>
-        </Space>
+        </div>
 
-        <div className="flex items-center gap-2">
-          <span className="text-gray-500">评分:</span>
+        {/* 评分 */}
+        <div className="flex items-center gap-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/50">
+          <span className="text-slate-500 text-sm">评分</span>
           <Rate 
             value={paper.rating || 0} 
             onChange={handleRatingChange}
             allowClear
+            className="!text-yellow-400"
           />
         </div>
       </div>
 
-      <Divider className="my-3" />
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
 
       {/* 作者信息 */}
-      <div>
-        <div className="text-gray-500 text-sm mb-1">
-          <TeamOutlined className="mr-1" />
-          作者
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 text-slate-500 text-sm">
+          <TeamOutlined className="text-emerald-500/60" />
+          <span>作者</span>
         </div>
-        <div className="text-sm">
+        <div className="text-sm text-slate-300 leading-relaxed">
           {paper.authors?.map((author, i) => (
             <span key={i}>
               {author.name}
               {i < paper.authors.length - 1 && ', '}
             </span>
-          )) || '未知'}
+          )) || <span className="text-slate-500">未知</span>}
         </div>
       </div>
 
       {/* 发表信息 */}
-      <Descriptions column={1} size="small">
+      <div className="grid grid-cols-2 gap-3">
         {paper.year && (
-          <Descriptions.Item label={<><CalendarOutlined /> 年份</>}>
-            {paper.year}
-          </Descriptions.Item>
-        )}
-        {paper.venue && (
-          <Descriptions.Item label={<><BookOutlined /> 发表</>}>
-            {paper.venue}
-          </Descriptions.Item>
-        )}
-        {paper.citation_count > 0 && (
-          <Descriptions.Item label={<><StarOutlined /> 引用数</>}>
-            {paper.citation_count}
-            {paper.influential_citation_count > 0 && (
-              <span className="text-gray-400 ml-2">
-                (有影响力: {paper.influential_citation_count})
-              </span>
-            )}
-          </Descriptions.Item>
-        )}
-      </Descriptions>
-
-      {/* 链接 */}
-      <div className="space-y-2">
-        {paper.url && (
-          <Button 
-            type="link" 
-            icon={<LinkOutlined />} 
-            href={paper.url} 
-            target="_blank"
-            className="p-0"
-          >
-            论文主页
-          </Button>
-        )}
-        {paper.pdf_url && (
-          <div className="flex items-center gap-2">
-            <Button 
-              type="link" 
-              icon={<FileTextOutlined />} 
-              href={paper.pdf_url} 
-              target="_blank"
-              className="p-0"
-            >
-              PDF 链接
-            </Button>
-            {!paper.pdf_downloaded && (
-              <Button
-                size="small"
-                icon={<DownloadOutlined />}
-                onClick={handleDownloadPdf}
-              >
-                下载
-              </Button>
-            )}
-            {paper.pdf_downloaded && (
-              <Tag color="success">已下载</Tag>
-            )}
+          <div className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50">
+            <div className="flex items-center gap-1 text-slate-500 text-xs mb-1">
+              <CalendarOutlined className="text-blue-400/60" />
+              年份
+            </div>
+            <div className="text-slate-200 font-medium">{paper.year}</div>
           </div>
         )}
-        {paper.arxiv_id && (
-          <Button 
-            type="link" 
-            icon={<LinkOutlined />} 
-            href={`https://arxiv.org/abs/${paper.arxiv_id}`} 
-            target="_blank"
-            className="p-0"
-          >
-            arXiv: {paper.arxiv_id}
-          </Button>
+        {paper.venue && (
+          <div className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50">
+            <div className="flex items-center gap-1 text-slate-500 text-xs mb-1">
+              <BookOutlined className="text-purple-400/60" />
+              发表
+            </div>
+            <div className="text-slate-200 font-medium text-sm truncate" title={paper.venue}>
+              {paper.venue}
+            </div>
+          </div>
         )}
-        {paper.doi && (
-          <Button 
-            type="link" 
-            icon={<LinkOutlined />} 
-            href={`https://doi.org/${paper.doi}`} 
-            target="_blank"
-            className="p-0"
-          >
-            DOI: {paper.doi}
-          </Button>
+        {paper.citation_count > 0 && (
+          <div className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50">
+            <div className="flex items-center gap-1 text-slate-500 text-xs mb-1">
+              <FireOutlined className="text-orange-400/60" />
+              引用数
+            </div>
+            <div className="text-slate-200 font-medium">
+              {paper.citation_count}
+              {paper.influential_citation_count > 0 && (
+                <span className="text-slate-500 text-xs ml-1">
+                  ({paper.influential_citation_count} 有影响力)
+                </span>
+              )}
+            </div>
+          </div>
         )}
       </div>
 
-      <Divider className="my-3" />
+      {/* 链接 */}
+      <div className="space-y-2">
+        <div className="text-slate-500 text-sm">链接</div>
+        <div className="flex flex-wrap gap-2">
+          {paper.url && (
+            <Button 
+              type="link" 
+              icon={<LinkOutlined />} 
+              href={paper.url} 
+              target="_blank"
+              className="!p-0 !text-emerald-400 hover:!text-emerald-300"
+            >
+              论文主页
+            </Button>
+          )}
+          {paper.pdf_url && (
+            <div className="flex items-center gap-2">
+              <Button 
+                type="link" 
+                icon={<FileTextOutlined />} 
+                href={paper.pdf_url} 
+                target="_blank"
+                className="!p-0 !text-emerald-400 hover:!text-emerald-300"
+              >
+                PDF
+              </Button>
+              {!paper.pdf_downloaded ? (
+                <Button
+                  size="small"
+                  icon={<DownloadOutlined />}
+                  onClick={handleDownloadPdf}
+                  className="!border-slate-600 !text-slate-300"
+                >
+                  下载
+                </Button>
+              ) : (
+                <Tag className="!bg-green-500/10 !border-green-500/20 !text-green-400 !m-0">
+                  已下载
+                </Tag>
+              )}
+            </div>
+          )}
+          {paper.arxiv_id && (
+            <Button 
+              type="link" 
+              icon={<LinkOutlined />} 
+              href={`https://arxiv.org/abs/${paper.arxiv_id}`} 
+              target="_blank"
+              className="!p-0 !text-orange-400 hover:!text-orange-300"
+            >
+              arXiv
+            </Button>
+          )}
+          {paper.doi && (
+            <Button 
+              type="link" 
+              icon={<LinkOutlined />} 
+              href={`https://doi.org/${paper.doi}`} 
+              target="_blank"
+              className="!p-0 !text-cyan-400 hover:!text-cyan-300"
+            >
+              DOI
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
 
       {/* 摘要 */}
-      <Collapse defaultActiveKey={['abstract']} ghost>
-        <Panel header="摘要" key="abstract">
-          {paper.abstract ? (
-            <Paragraph 
-              ellipsis={{ rows: 6, expandable: true, symbol: '展开' }}
-              className="text-sm text-gray-600"
-            >
+      <div className="space-y-2">
+        <div className="text-slate-500 text-sm">摘要</div>
+        {paper.abstract ? (
+          <div className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50">
+            <p className={`text-sm text-slate-400 leading-relaxed ${!abstractExpanded ? 'line-clamp-4' : ''}`}>
               {paper.abstract}
-            </Paragraph>
-          ) : (
-            <Text type="secondary">无摘要</Text>
-          )}
-        </Panel>
-      </Collapse>
+            </p>
+            {paper.abstract.length > 200 && (
+              <button 
+                onClick={() => setAbstractExpanded(!abstractExpanded)}
+                className="text-emerald-400 text-sm mt-2 hover:text-emerald-300"
+              >
+                {abstractExpanded ? '收起' : '展开全部'}
+              </button>
+            )}
+          </div>
+        ) : (
+          <p className="text-slate-500 text-sm">无摘要</p>
+        )}
+      </div>
 
       {/* 研究领域 */}
       {paper.fields_of_study && paper.fields_of_study.length > 0 && (
-        <div>
-          <div className="text-gray-500 text-sm mb-2">研究领域</div>
-          <Space wrap>
+        <div className="space-y-2">
+          <div className="text-slate-500 text-sm">研究领域</div>
+          <div className="flex flex-wrap gap-1.5">
             {paper.fields_of_study.map((field, i) => (
-              <Tag key={i} color="blue">{field}</Tag>
+              <Tag key={i} className="!bg-blue-500/10 !border-blue-500/20 !text-blue-300">
+                {field}
+              </Tag>
             ))}
-          </Space>
+          </div>
         </div>
       )}
 
-      <Divider className="my-3" />
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
 
       {/* 收藏夹 */}
-      <div>
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-gray-500 text-sm">
-            <FolderAddOutlined className="mr-1" />
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="flex items-center gap-2 text-slate-500 text-sm">
+            <FolderAddOutlined />
             收藏夹
           </span>
           {availableCollections.length > 0 && (
             <Select
               placeholder="添加到..."
               size="small"
-              style={{ width: 120 }}
+              style={{ width: 140 }}
               onChange={handleAddToCollection}
               value={undefined}
+              className="[&_.ant-select-selector]:!bg-slate-800/50 [&_.ant-select-selector]:!border-slate-600"
             >
               {availableCollections.map(c => (
                 <Select.Option key={c.id} value={c.id}>
-                  <span 
-                    className="inline-block w-2 h-2 rounded mr-1" 
-                    style={{ backgroundColor: c.color }}
-                  />
-                  {c.name}
+                  <span className="flex items-center gap-2">
+                    <span 
+                      className="w-2 h-2 rounded" 
+                      style={{ backgroundColor: c.color }}
+                    />
+                    {c.name}
+                  </span>
                 </Select.Option>
               ))}
             </Select>
           )}
         </div>
         
-        <Space wrap>
-          {addedCollections.map(c => (
-            <Tag 
-              key={c.id}
-              closable={!c.is_default}
-              onClose={() => handleRemoveFromCollection(c.id)}
-              color={c.color}
-            >
-              {c.name}
-            </Tag>
-          ))}
-        </Space>
+        <div className="flex flex-wrap gap-1.5">
+          {addedCollections.length > 0 ? (
+            addedCollections.map(c => (
+              <Tag 
+                key={c.id}
+                closable={!c.is_default}
+                onClose={() => handleRemoveFromCollection(c.id)}
+                style={{ 
+                  backgroundColor: `${c.color}20`,
+                  borderColor: `${c.color}40`,
+                  color: c.color
+                }}
+              >
+                {c.name}
+              </Tag>
+            ))
+          ) : (
+            <span className="text-slate-500 text-sm">未添加到任何收藏夹</span>
+          )}
+        </div>
       </div>
 
-      <Divider className="my-3" />
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
 
       {/* 标签 */}
-      <div>
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-gray-500 text-sm">
-            <TagsOutlined className="mr-1" />
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="flex items-center gap-2 text-slate-500 text-sm">
+            <TagsOutlined />
             标签
           </span>
           {!editingTags ? (
@@ -384,28 +436,38 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
                 setTags(paper.tags || [])
                 setEditingTags(true)
               }}
+              className="!text-slate-400 hover:!text-emerald-400"
             />
           ) : (
             <Space>
-              <Button size="small" onClick={() => setEditingTags(false)}>取消</Button>
-              <Button type="primary" size="small" onClick={handleSaveTags}>保存</Button>
+              <Button 
+                size="small" 
+                onClick={() => setEditingTags(false)}
+                className="!border-slate-600 !text-slate-300"
+              >
+                取消
+              </Button>
+              <Button type="primary" size="small" onClick={handleSaveTags}>
+                保存
+              </Button>
             </Space>
           )}
         </div>
         
         {editingTags ? (
-          <div>
-            <Space wrap className="mb-2">
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-1.5">
               {tags.map(tag => (
                 <Tag 
                   key={tag}
                   closable
                   onClose={() => handleRemoveTag(tag)}
+                  className="!bg-slate-700/50 !border-slate-600 !text-slate-300"
                 >
                   {tag}
                 </Tag>
               ))}
-            </Space>
+            </div>
             <Input.Search
               placeholder="添加标签"
               value={newTag}
@@ -413,26 +475,32 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
               onSearch={handleAddTag}
               enterButton="添加"
               size="small"
+              className="[&_.ant-input]:!bg-slate-800/50 [&_.ant-input]:!border-slate-600"
             />
           </div>
         ) : (
-          <Space wrap>
+          <div className="flex flex-wrap gap-1.5">
             {paper.tags?.length > 0 ? (
-              paper.tags.map(tag => <Tag key={tag}>{tag}</Tag>)
+              paper.tags.map(tag => (
+                <Tag key={tag} className="!bg-slate-700/50 !border-slate-600 !text-slate-300">
+                  {tag}
+                </Tag>
+              ))
             ) : (
-              <Text type="secondary" className="text-sm">暂无标签</Text>
+              <span className="text-slate-500 text-sm">暂无标签</span>
             )}
-          </Space>
+          </div>
         )}
       </div>
 
-      <Divider className="my-3" />
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
 
       {/* 笔记 */}
-      <div>
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-gray-500 text-sm">
-            <EditOutlined className="mr-1" />
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="flex items-center gap-2 text-slate-500 text-sm">
+            <EditOutlined />
             笔记
           </span>
           {!editingNotes ? (
@@ -444,10 +512,17 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
                 setNotes(paper.notes || '')
                 setEditingNotes(true)
               }}
+              className="!text-slate-400 hover:!text-emerald-400"
             />
           ) : (
             <Space>
-              <Button size="small" onClick={() => setEditingNotes(false)}>取消</Button>
+              <Button 
+                size="small" 
+                onClick={() => setEditingNotes(false)}
+                className="!border-slate-600 !text-slate-300"
+              >
+                取消
+              </Button>
               <Button 
                 type="primary" 
                 size="small" 
@@ -466,23 +541,37 @@ export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPane
             onChange={e => setNotes(e.target.value)}
             rows={4}
             placeholder="添加你的笔记..."
+            className="!bg-slate-800/50 !border-slate-600 !text-slate-300"
           />
         ) : (
-          <div className="text-sm text-gray-600 bg-gray-50 p-3 rounded">
-            {paper.notes || <Text type="secondary">暂无笔记</Text>}
+          <div className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 min-h-[60px]">
+            {paper.notes ? (
+              <p className="text-sm text-slate-400 whitespace-pre-wrap">{paper.notes}</p>
+            ) : (
+              <p className="text-slate-500 text-sm">暂无笔记</p>
+            )}
           </div>
         )}
       </div>
 
       {/* 元信息 */}
-      <Divider className="my-3" />
-      
-      <div className="text-xs text-gray-400">
-        <div>来源: {paper.source === 'semantic_scholar' ? 'Semantic Scholar' : paper.source}</div>
-        <div>添加时间: {new Date(paper.created_at).toLocaleString()}</div>
-        {paper.read_at && (
-          <div>阅读时间: {new Date(paper.read_at).toLocaleString()}</div>
-        )}
+      <div className="pt-2 border-t border-slate-700/50">
+        <div className="text-xs text-slate-500 space-y-1">
+          <div className="flex justify-between">
+            <span>来源</span>
+            <span className="text-slate-400">{paper.source === 'semantic_scholar' ? 'Semantic Scholar' : paper.source}</span>
+          </div>
+          <div className="flex justify-between">
+            <span>添加时间</span>
+            <span className="text-slate-400">{new Date(paper.created_at).toLocaleString('zh-CN')}</span>
+          </div>
+          {paper.read_at && (
+            <div className="flex justify-between">
+              <span>阅读时间</span>
+              <span className="text-slate-400">{new Date(paper.read_at).toLocaleString('zh-CN')}</span>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )

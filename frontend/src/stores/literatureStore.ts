@@ -18,7 +18,10 @@ interface LiteratureState {
   searchQuery: string
   searchSource: string
   searchTotal: number
+  searchOffset: number
   searchLoading: boolean
+  searchLoadingMore: boolean
+  searchHasMore: boolean
   
   // 收藏夹
   collections: PaperCollection[]
@@ -50,6 +53,7 @@ interface LiteratureState {
     year_start?: number
     year_end?: number
   }) => Promise<void>
+  loadMoreSearchResults: () => Promise<void>
   clearSearch: () => void
   loadSearchHistory: () => Promise<void>
   
@@ -94,7 +98,10 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   searchQuery: '',
   searchSource: 'semantic_scholar',
   searchTotal: 0,
+  searchOffset: 0,
   searchLoading: false,
+  searchLoadingMore: false,
+  searchHasMore: false,
   collections: [],
   selectedCollectionId: null,
   collectionsLoading: false,
@@ -119,19 +126,25 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
 
   // 搜索论文
   searchPapers: async (query, source = 'semantic_scholar', options = {}) => {
-    set({ searchLoading: true, searchQuery: query, searchSource: source })
+    const limit = options.limit || 20
+    set({ searchLoading: true, searchQuery: query, searchSource: source, searchOffset: 0 })
     try {
       const response = await literatureApi.searchPapers({
         query,
         source,
-        limit: options.limit || 20,
-        offset: options.offset || 0,
+        limit,
+        offset: 0,
         year_start: options.year_start,
         year_end: options.year_end,
       })
+      const newOffset = response.papers.length
+      // 只要还有更多数据且本次返回了数据就允许继续加载
+      const hasMore = newOffset < response.total && response.papers.length > 0
       set({
         searchResults: response.papers,
         searchTotal: response.total,
+        searchOffset: newOffset,
+        searchHasMore: hasMore,
         searchLoading: false,
       })
     } catch (error) {
@@ -141,8 +154,37 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
     }
   },
 
+  // 加载更多搜索结果
+  loadMoreSearchResults: async () => {
+    const { searchQuery, searchSource, searchOffset, searchTotal, searchLoadingMore, searchHasMore } = get()
+    if (searchLoadingMore || !searchHasMore) return
+    
+    const limit = 20
+    set({ searchLoadingMore: true })
+    try {
+      const response = await literatureApi.searchPapers({
+        query: searchQuery,
+        source: searchSource,
+        limit,
+        offset: searchOffset,
+      })
+      const newOffset = searchOffset + response.papers.length
+      // 如果返回0条数据或已达到total，则没有更多
+      const hasMore = response.papers.length > 0 && newOffset < searchTotal
+      set(state => ({
+        searchResults: [...state.searchResults, ...response.papers],
+        searchOffset: newOffset,
+        searchHasMore: hasMore,
+        searchLoadingMore: false,
+      }))
+    } catch (error) {
+      console.error('Load more failed:', error)
+      set({ searchLoadingMore: false })
+    }
+  },
+
   clearSearch: () => {
-    set({ searchResults: [], searchQuery: '', searchTotal: 0 })
+    set({ searchResults: [], searchQuery: '', searchTotal: 0, searchOffset: 0, searchHasMore: false })
   },
 
   loadSearchHistory: async () => {
