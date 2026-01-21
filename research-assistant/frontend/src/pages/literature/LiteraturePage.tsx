@@ -508,6 +508,16 @@ export default function LiteraturePage() {
 
         {/* 操作 */}
         <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity" onClick={e => e.stopPropagation()}>
+          <Tooltip title="引用图谱">
+            <Button 
+              type="text" 
+              size="small"
+              icon={<NodeIndexOutlined />}
+              onClick={() => handleShowGraph(paper)}
+              disabled={!paper.semantic_scholar_id}
+              className="!text-slate-400 hover:!text-emerald-400"
+            />
+          </Tooltip>
           <Tooltip title="删除">
             <Button 
               type="text" 
@@ -806,6 +816,33 @@ export default function LiteraturePage() {
               )}
             </div>
           )}
+
+          {/* 引用图谱 Tab */}
+          {activeTab === 'graph' && (
+            <div className="absolute inset-0">
+              {graphLoading ? (
+                <div className="h-full flex flex-col items-center justify-center">
+                  <Spin size="large" />
+                  <p className="text-slate-500 mt-4">加载引用图谱...</p>
+                </div>
+              ) : citationGraph ? (
+                <CitationGraph 
+                  data={citationGraph} 
+                  onNodeClick={(nodeId) => {
+                    console.log('Node clicked:', nodeId)
+                  }}
+                />
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center">
+                  <div className="w-20 h-20 rounded-full bg-slate-800/50 flex items-center justify-center mb-4">
+                    <NodeIndexOutlined className="text-4xl text-slate-600" />
+                  </div>
+                  <p className="text-slate-400 text-lg mb-2">选择一篇论文查看引用图谱</p>
+                  <p className="text-slate-500 text-sm">引用图谱展示论文间的引用关系网络</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -827,6 +864,7 @@ export default function LiteraturePage() {
         {selectedPaper && (
           <PaperDetailPanel 
             paper={selectedPaper}
+            onShowGraph={() => handleShowGraph(selectedPaper)}
           />
         )}
       </Drawer>

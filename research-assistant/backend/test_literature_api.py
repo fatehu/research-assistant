@@ -370,6 +370,32 @@ class LiteratureAPITester:
         print_info("论文已从收藏夹移除")
         return True
     
+    # ========== 引用图谱测试 ==========
+    
+    def test_citation_graph(self) -> bool:
+        """测试引用图谱"""
+        if not self.paper_id:
+            print_warning("没有论文ID，跳过")
+            return True
+        
+        resp = self._request('GET', f'/api/literature/graph/{self.paper_id}', params={
+            'max_nodes': 10
+        })
+        
+        if resp.status_code == 400:
+            print_warning("论文没有 Semantic Scholar ID，无法获取图谱")
+            return True
+        
+        if resp.status_code != 200:
+            print_error(f"获取图谱失败: {resp.text}")
+            return False
+        
+        graph = resp.json()
+        print_info(f"图谱节点: {len(graph['nodes'])}")
+        print_info(f"图谱边: {len(graph['edges'])}")
+        print_info(f"中心节点: {graph['center_id'][:20]}...")
+        return True
+    
     # ========== 清理测试 ==========
     
     def test_delete_collection(self) -> bool:
@@ -421,6 +447,9 @@ class LiteratureAPITester:
         self._test("创建收藏夹", self.test_create_collection)
         self._test("添加论文到收藏夹", self.test_add_paper_to_collection)
         self._test("从收藏夹移除论文", self.test_remove_paper_from_collection)
+        
+        # 引用图谱
+        self._test("引用图谱", self.test_citation_graph)
         
         # 清理
         self._test("删除收藏夹", self.test_delete_collection)

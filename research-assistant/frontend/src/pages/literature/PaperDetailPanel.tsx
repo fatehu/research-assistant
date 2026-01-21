@@ -6,7 +6,7 @@ import {
 import {
   LinkOutlined, DownloadOutlined, BookOutlined, CalendarOutlined,
   TeamOutlined, StarOutlined, EditOutlined, SaveOutlined,
-  CopyOutlined, CheckOutlined, FileTextOutlined,
+  NodeIndexOutlined, CopyOutlined, CheckOutlined, FileTextOutlined,
   FolderAddOutlined, EyeOutlined, TagsOutlined, FireOutlined,
   CloseOutlined
 } from '@ant-design/icons'
@@ -17,9 +17,10 @@ const { TextArea } = Input
 
 interface PaperDetailPanelProps {
   paper: Paper
+  onShowGraph?: () => void
 }
 
-export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
+export default function PaperDetailPanel({ paper, onShowGraph }: PaperDetailPanelProps) {
   const { 
     collections, 
     updatePaper, 
@@ -161,6 +162,17 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
           >
             {paper.is_read ? '已读' : '标记已读'}
           </Button>
+          
+          {paper.semantic_scholar_id && (
+            <Button
+              icon={<NodeIndexOutlined />}
+              onClick={onShowGraph}
+              size="small"
+              className="!border-slate-600 !text-slate-300"
+            >
+              引用图谱
+            </Button>
+          )}
           
           <Button
             icon={<CopyOutlined />}

@@ -1,0 +1,49 @@
+# --- 敏感信息 (非常重要) ---
+.env
+.env.local
+.env.*.local
+*.log
+
+# --- 操作系统文件 ---
+.DS_Store
+Thumbs.db
+
+# --- 后端相关 (Node.js/Python 等通用) ---
+# 如果后端是 Node.js
+backend/node_modules/
+backend/dist/
+backend/.npm
+# 如果后端是 Python
+backend/__pycache__/
+backend/*.py[cod]
+backend/$py.class
+backend/venv/
+backend/.venv/
+backend/env/
+
+# --- 前端相关 (React/Vue/Next.js) ---
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/.cache/
+
+# --- Docker 相关 ---
+.docker/
+# 如果 docker 数据持久化到了本地目录，也需要忽略
+# data/
+
+# --- 编辑器相关 ---
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -10,7 +10,8 @@ from app.schemas.chat import (
 from app.schemas.literature import (
     PaperResponse, PaperCreate, PaperUpdate,
     PaperSearchResult, PaperSearchResponse,
-    CollectionResponse, CollectionCreate, CollectionUpdate
+    CollectionResponse, CollectionCreate, CollectionUpdate,
+    CitationGraphResponse, GraphNode, GraphEdge
 )
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "ReActStep",
     "PaperResponse", "PaperCreate", "PaperUpdate",
     "PaperSearchResult", "PaperSearchResponse",
-    "CollectionResponse", "CollectionCreate", "CollectionUpdate"
+    "CollectionResponse", "CollectionCreate", "CollectionUpdate",
+    "CitationGraphResponse", "GraphNode", "GraphEdge"
 ]
