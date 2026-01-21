@@ -70,13 +70,14 @@ const ReActPanel = ({
   // 如果没有任何内容，不显示
   if (steps.length === 0 && !isThinking && !currentToolCall) return null
   
-  // 按迭代分组步骤
+  // 按迭代分组步骤 - 使用 observation 作为每轮结束的标志
   const iterations: IterationStep[][] = []
   let currentGroup: IterationStep[] = []
   
   steps.forEach((step, index) => {
     currentGroup.push(step)
-    if (step.type === 'observation' || index === steps.length - 1) {
+    // 当遇到 observation 时，结束当前轮
+    if (step.type === 'observation') {
       if (currentGroup.length > 0) {
         iterations.push([...currentGroup])
         currentGroup = []
@@ -84,6 +85,7 @@ const ReActPanel = ({
     }
   })
   
+  // 如果还有未完成的步骤（正在进行的轮次）
   if (currentGroup.length > 0) {
     iterations.push(currentGroup)
   }
@@ -146,11 +148,11 @@ const ReActPanel = ({
                 {/* 显示所有迭代 */}
                 {iterations.map((iterSteps, iterIndex) => (
                   <div key={iterIndex}>
-                    {/* 迭代分隔线 */}
+                    {/* 迭代分隔线 - 从第二轮开始显示分隔线 */}
                     {iterIndex > 0 && (
                       <div className="flex items-center gap-3 py-2 my-2">
                         <div className="flex-1 h-px bg-gradient-to-r from-transparent via-slate-600 to-transparent" />
-                        <span className="text-xs text-slate-500 px-2">第 {iterIndex + 1} 轮</span>
+                        <span className="text-xs text-slate-500 px-2">第 {iterIndex + 1} 轮推理</span>
                         <div className="flex-1 h-px bg-gradient-to-r from-transparent via-slate-600 to-transparent" />
                       </div>
                     )}
@@ -830,24 +832,58 @@ const ChatPage = () => {
   
   // 处理从首页传来的初始消息或从搜索结果跳转
   const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null)
+  const [conversationLoaded, setConversationLoaded] = useState(false)  // 追踪对话是否已加载
   
+  // 加载对话
+  useEffect(() => {
+    const loadConversation = async () => {
+      setConversationLoaded(false)  // 开始加载时重置
+      if (conversationId) {
+        setLoadError(null)
+        try {
+          await selectConversation(parseInt(conversationId))
+          setLoadError(null)
+          setConversationLoaded(true)  // 加载完成
+        } catch (error: any) {
+          console.error('加载对话失败:', error)
+          if (error?.response?.status === 404) {
+            setLoadError('对话不存在或已被删除')
+          } else if (error?.response?.status === 401) {
+            setLoadError('登录已过期，请重新登录')
+          } else {
+            setLoadError('加载对话失败，请刷新重试')
+          }
+        }
+      } else {
+        setLoadError(null)
+        clearCurrentConversation()
+        setConversationLoaded(true)  // 新对话也算加载完成
+      }
+    }
+    
+    loadConversation()
+  }, [conversationId])
+  
+  // 处理从首页传来的初始消息 - 必须在对话加载完成后执行
   useEffect(() => {
     const state = location.state as { initialMessage?: string; highlightMessageId?: number } | null
     
-    // 处理初始消息
-    if (state?.initialMessage && conversationId && !initialMessageSent.current && !isLoading) {
+    // 处理初始消息 - 只有当对话加载完成且没有发送过初始消息时才发送
+    if (state?.initialMessage && conversationId && conversationLoaded && !initialMessageSent.current && !isSending) {
       initialMessageSent.current = true
+      console.log('[ChatPage] 发送初始消息:', state.initialMessage)
       // 发送初始消息
       sendMessage(state.initialMessage).catch(err => {
         console.error('发送初始消息失败:', err)
         message.error('发送失败，请重试')
+        initialMessageSent.current = false  // 失败时允许重试
       })
       // 清除 location state，防止刷新页面时重复发送
       navigate(location.pathname, { replace: true, state: {} })
     }
     
     // 处理消息高亮
-    if (state?.highlightMessageId && !isLoading && messages.length > 0) {
+    if (state?.highlightMessageId && conversationLoaded && messages.length > 0) {
       setHighlightedMessageId(state.highlightMessageId)
       // 清除 location state
       navigate(location.pathname, { replace: true, state: {} })
@@ -865,40 +901,12 @@ const ChatPage = () => {
         setHighlightedMessageId(null)
       }, 3000)
     }
-  }, [conversationId, location.state, isLoading, messages.length])
+  }, [conversationId, location.state, conversationLoaded, messages.length, isSending])
   
   // 重置 initialMessageSent 当 conversationId 改变时
   useEffect(() => {
     initialMessageSent.current = false
   }, [conversationId])
-  
-  // 加载对话
-  useEffect(() => {
-    const loadConversation = async () => {
-      if (conversationId) {
-        setLoadError(null)
-        try {
-          await selectConversation(parseInt(conversationId))
-          setLoadError(null)  // 成功后确保清除错误
-        } catch (error: any) {
-          console.error('加载对话失败:', error)
-          // 提供更详细的错误信息
-          if (error?.response?.status === 404) {
-            setLoadError('对话不存在或已被删除')
-          } else if (error?.response?.status === 401) {
-            setLoadError('登录已过期，请重新登录')
-          } else {
-            setLoadError('加载对话失败，请刷新重试')
-          }
-        }
-      } else {
-        setLoadError(null)
-        clearCurrentConversation()
-      }
-    }
-    
-    loadConversation()
-  }, [conversationId]) // 只依赖 conversationId
   
   // 重新加载对话
   const handleReload = async () => {

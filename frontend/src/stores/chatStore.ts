@@ -143,7 +143,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
   
   sendMessage: async (message: string): Promise<number | undefined> => {
-    const { currentConversation, fetchConversations } = get()
+    const { currentConversation, fetchConversations, isSending } = get()
+    
+    // 防止重复发送
+    if (isSending) {
+      console.log('[ChatStore] 消息正在发送中，跳过重复请求')
+      return undefined
+    }
     
     // 创建用户消息
     const userMessage: Message = {
@@ -158,11 +164,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((state) => ({
       messages: [...state.messages, userMessage],
       isSending: true,
-      isThinking: true,
+      isThinking: false,  // 初始不是思考状态，等待 thinking_start 事件
       streamingContent: '',
       streamingThought: '',
       iterationSteps: [],  // 重置迭代步骤
-      currentIteration: 0,
+      currentIteration: 0,  // 重置为0，thinking_start时会变为1（表示第1轮）
       toolCalls: [],
       currentToolCall: null,
     }))
