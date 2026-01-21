@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Outlet, useNavigate, useLocation, useParams } from 'react-router-dom'
 import { Layout, Menu, Input, Avatar, Dropdown, Button, Tooltip, Modal, Empty, Badge } from 'antd'
 import {
@@ -22,6 +22,7 @@ import {
   DownOutlined,
   RightOutlined,
   BookOutlined,
+  LoadingOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAuthStore } from '@/stores/authStore'
@@ -188,11 +189,80 @@ const MainLayout = () => {
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null)
   const [historyExpanded, setHistoryExpanded] = useState(true)
   
+  // 搜索相关状态
+  const [searchValue, setSearchValue] = useState('')
+  const [searchResults, setSearchResults] = useState<Array<{
+    message_id: number
+    conversation_id: number
+    conversation_title: string
+    role: string
+    content_snippet: string
+    created_at: string
+  }>>([])
+  const [showSearchResults, setShowSearchResults] = useState(false)
+  const [isSearching, setIsSearching] = useState(false)
+  const searchInputRef = useRef<any>(null)
+  const searchContainerRef = useRef<HTMLDivElement>(null)
+  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  
   const { user, logout } = useAuthStore()
   const { conversations, fetchConversations, deleteConversation } = useChatStore()
   
   useEffect(() => {
     fetchConversations()
+  }, [])
+  
+  // 搜索消息（防抖）
+  const handleSearch = async (value: string) => {
+    setSearchValue(value)
+    
+    // 清除之前的定时器
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current)
+    }
+    
+    if (!value.trim()) {
+      setSearchResults([])
+      setShowSearchResults(false)
+      return
+    }
+    
+    // 防抖：300ms后执行搜索
+    searchTimeoutRef.current = setTimeout(async () => {
+      setIsSearching(true)
+      try {
+        const { chatApi } = await import('@/services/api')
+        const response = await chatApi.searchMessages(value.trim(), 20)
+        setSearchResults(response.results)
+        setShowSearchResults(true)
+      } catch (error) {
+        console.error('搜索失败:', error)
+        setSearchResults([])
+      } finally {
+        setIsSearching(false)
+      }
+    }, 300)
+  }
+  
+  // 选择搜索结果 - 跳转到对话并定位到消息
+  const handleSelectSearchResult = (result: typeof searchResults[0]) => {
+    navigate(`/chat/${result.conversation_id}`, { 
+      state: { highlightMessageId: result.message_id } 
+    })
+    setSearchValue('')
+    setSearchResults([])
+    setShowSearchResults(false)
+  }
+  
+  // 点击外部关闭搜索结果
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+        setShowSearchResults(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
   
   const menuItems = [
@@ -461,14 +531,89 @@ const MainLayout = () => {
       {/* 主内容区 */}
       <Layout className="bg-slate-950">
         {/* 顶部栏 */}
-        <Header className="h-14 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl">
+        <Header className="h-14 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl" style={{ zIndex: 100 }}>
           {/* 搜索 */}
-          <div className="flex-1 max-w-md">
+          <div className="flex-1 max-w-md relative" ref={searchContainerRef}>
             <Input
-              prefix={<SearchOutlined className="text-slate-500" />}
-              placeholder="搜索..."
+              ref={searchInputRef}
+              prefix={isSearching ? <LoadingOutlined className="text-emerald-400" /> : <SearchOutlined className="text-slate-500" />}
+              placeholder="搜索历史消息..."
+              value={searchValue}
+              onChange={(e) => handleSearch(e.target.value)}
+              onFocus={() => searchValue && searchResults.length > 0 && setShowSearchResults(true)}
               className="bg-slate-800/50 border-slate-700/50 rounded-lg hover:border-slate-600"
+              allowClear
             />
+            {/* 搜索结果下拉 */}
+            <AnimatePresence>
+              {showSearchResults && searchResults.length > 0 && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="absolute top-full left-0 right-0 mt-2 bg-slate-800 border border-slate-700 rounded-xl shadow-2xl max-h-96 overflow-y-auto"
+                  style={{ zIndex: 9999 }}
+                >
+                  <div className="p-2">
+                    <div className="text-xs text-slate-500 px-3 py-2 border-b border-slate-700/50 mb-1">
+                      找到 {searchResults.length} 条相关消息
+                    </div>
+                    {searchResults.map((result) => (
+                      <div
+                        key={`${result.conversation_id}-${result.message_id}`}
+                        onClick={() => handleSelectSearchResult(result)}
+                        className="flex items-start gap-3 px-3 py-3 rounded-lg cursor-pointer hover:bg-slate-700/50 transition-colors group"
+                      >
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                          result.role === 'user' ? 'bg-blue-500/20' : 'bg-emerald-500/20'
+                        }`}>
+                          {result.role === 'user' ? (
+                            <UserOutlined className="text-blue-400 text-sm" />
+                          ) : (
+                            <MessageOutlined className="text-emerald-400 text-sm" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-xs font-medium text-emerald-400 truncate max-w-[150px]">
+                              {result.conversation_title}
+                            </span>
+                            <span className="text-xs text-slate-600">·</span>
+                            <span className="text-xs text-slate-500">
+                              {result.role === 'user' ? '你' : 'AI'}
+                            </span>
+                          </div>
+                          <div className="text-sm text-slate-300 line-clamp-2 leading-relaxed">
+                            {result.content_snippet}
+                          </div>
+                          <div className="text-xs text-slate-600 mt-1">
+                            {dayjs(result.created_at).fromNow()}
+                          </div>
+                        </div>
+                        <div className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-500">
+                          <RightOutlined className="text-xs" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+              {showSearchResults && searchValue && !isSearching && searchResults.length === 0 && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="absolute top-full left-0 right-0 mt-2 bg-slate-800 border border-slate-700 rounded-xl shadow-2xl p-6"
+                  style={{ zIndex: 9999 }}
+                >
+                  <div className="text-center">
+                    <InboxOutlined className="text-3xl text-slate-600 mb-2" />
+                    <div className="text-slate-500 text-sm">未找到相关消息</div>
+                    <div className="text-slate-600 text-xs mt-1">尝试使用不同的关键词</div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
           
           {/* 右侧 */}

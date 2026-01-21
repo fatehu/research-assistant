@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { Input, Button, Spin, message, Tooltip, Avatar } from 'antd'
 import {
   SendOutlined,
@@ -538,12 +538,14 @@ const MessageBubble = ({
   streamingContent = '',
   streamingThought = '',
   isThinking = false,
+  isHighlighted = false,
 }: {
   msg: Message
   isStreaming?: boolean
   streamingContent?: string
   streamingThought?: string
   isThinking?: boolean
+  isHighlighted?: boolean
 }) => {
   const isUser = msg.role === 'user'
   const content = isStreaming ? streamingContent : msg.content
@@ -558,11 +560,25 @@ const MessageBubble = ({
   
   return (
     <motion.div
+      id={`message-${msg.id}`}
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.3, ease: 'easeOut' }}
-      className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''}`}
+      className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''} ${
+        isHighlighted ? 'relative' : ''
+      }`}
     >
+      {/* 高亮效果 */}
+      {isHighlighted && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="absolute inset-0 -mx-4 -my-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 pointer-events-none"
+          style={{ zIndex: -1 }}
+        />
+      )}
+      
       {/* 头像 */}
       <div className="flex-shrink-0">
         {isUser ? (
@@ -788,7 +804,9 @@ const EmptyState = ({ onQuickPrompt }: { onQuickPrompt: (prompt: string) => void
 const ChatPage = () => {
   const { conversationId } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const initialMessageSent = useRef(false) // 跟踪是否已发送初始消息
   
   const {
     messages,
@@ -809,6 +827,50 @@ const ChatPage = () => {
   
   const [inputValue, setInputValue] = useState('')
   const [loadError, setLoadError] = useState<string | null>(null)
+  
+  // 处理从首页传来的初始消息或从搜索结果跳转
+  const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null)
+  
+  useEffect(() => {
+    const state = location.state as { initialMessage?: string; highlightMessageId?: number } | null
+    
+    // 处理初始消息
+    if (state?.initialMessage && conversationId && !initialMessageSent.current && !isLoading) {
+      initialMessageSent.current = true
+      // 发送初始消息
+      sendMessage(state.initialMessage).catch(err => {
+        console.error('发送初始消息失败:', err)
+        message.error('发送失败，请重试')
+      })
+      // 清除 location state，防止刷新页面时重复发送
+      navigate(location.pathname, { replace: true, state: {} })
+    }
+    
+    // 处理消息高亮
+    if (state?.highlightMessageId && !isLoading && messages.length > 0) {
+      setHighlightedMessageId(state.highlightMessageId)
+      // 清除 location state
+      navigate(location.pathname, { replace: true, state: {} })
+      
+      // 滚动到对应消息
+      setTimeout(() => {
+        const messageElement = document.getElementById(`message-${state.highlightMessageId}`)
+        if (messageElement) {
+          messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }
+      }, 100)
+      
+      // 3秒后取消高亮
+      setTimeout(() => {
+        setHighlightedMessageId(null)
+      }, 3000)
+    }
+  }, [conversationId, location.state, isLoading, messages.length])
+  
+  // 重置 initialMessageSent 当 conversationId 改变时
+  useEffect(() => {
+    initialMessageSent.current = false
+  }, [conversationId])
   
   // 加载对话
   useEffect(() => {
@@ -912,7 +974,11 @@ const ChatPage = () => {
             <div className="space-y-6">
               <AnimatePresence mode="popLayout">
                 {messages.map((msg, idx) => (
-                  <MessageBubble key={msg.id || idx} msg={msg} />
+                  <MessageBubble 
+                    key={msg.id || idx} 
+                    msg={msg} 
+                    isHighlighted={highlightedMessageId === msg.id}
+                  />
                 ))}
               </AnimatePresence>
               

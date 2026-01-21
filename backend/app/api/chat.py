@@ -125,6 +125,72 @@ async def list_conversations(
     return conversations
 
 
+@router.get("/messages/search")
+async def search_messages(
+    q: str = Query(..., min_length=1, max_length=200, description="搜索关键词"),
+    limit: int = Query(20, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """搜索用户的历史消息"""
+    search_term = f"%{q}%"
+    
+    # 搜索消息内容，同时获取对话标题
+    query = (
+        select(
+            Message.id,
+            Message.conversation_id,
+            Message.role,
+            Message.content,
+            Message.created_at,
+            Conversation.title.label("conversation_title")
+        )
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.user_id == current_user.id,
+            Conversation.is_archived == 0,
+            Message.content.ilike(search_term)
+        )
+        .order_by(desc(Message.created_at))
+        .limit(limit)
+    )
+    
+    result = await db.execute(query)
+    rows = result.all()
+    
+    results = []
+    for row in rows:
+        # 找到匹配文本的位置，提取上下文片段
+        content = row.content
+        q_lower = q.lower()
+        content_lower = content.lower()
+        match_pos = content_lower.find(q_lower)
+        
+        # 提取匹配位置周围的文本片段（前后各50个字符）
+        start = max(0, match_pos - 50)
+        end = min(len(content), match_pos + len(q) + 50)
+        snippet = content[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(content):
+            snippet = snippet + "..."
+        
+        results.append({
+            "message_id": row.id,
+            "conversation_id": row.conversation_id,
+            "conversation_title": row.conversation_title or "新对话",
+            "role": row.role.value if hasattr(row.role, 'value') else str(row.role),
+            "content_snippet": snippet,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        })
+    
+    return {
+        "query": q,
+        "total": len(results),
+        "results": results
+    }
+
+
 @router.post("/conversations", response_model=ConversationResponse)
 async def create_conversation(
     data: ConversationCreate,

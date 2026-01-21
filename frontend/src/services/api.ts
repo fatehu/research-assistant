@@ -332,6 +332,25 @@ export const chatApi = {
       }
     }
   },
+  
+  // 搜索消息
+  searchMessages: async (query: string, limit = 20): Promise<{
+    query: string
+    total: number
+    results: Array<{
+      message_id: number
+      conversation_id: number
+      conversation_title: string
+      role: string
+      content_snippet: string
+      created_at: string
+    }>
+  }> => {
+    const response = await api.get('/api/chat/messages/search', {
+      params: { q: query, limit },
+    })
+    return response.data
+  },
 }
 
 // ========== 知识库 API ==========
