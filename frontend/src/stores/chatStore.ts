@@ -43,6 +43,9 @@ interface ChatState {
   toolCalls: ToolCall[]
   currentToolCall: ToolCall | null
   
+  // 停止控制
+  abortController: AbortController | null
+  
   // Actions
   fetchConversations: () => Promise<void>
   createConversation: (title?: string) => Promise<Conversation>
@@ -50,6 +53,7 @@ interface ChatState {
   deleteConversation: (conversationId: number) => Promise<void>
   archiveConversation: (conversationId: number) => Promise<void>
   sendMessage: (message: string) => Promise<number | undefined>  // 返回新对话ID（如果有）
+  stopGeneration: () => void  // 停止生成
   clearCurrentConversation: () => void
 }
 
@@ -67,6 +71,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentIteration: 0,
   toolCalls: [],
   currentToolCall: null,
+  abortController: null,
   
   fetchConversations: async () => {
     // 防止重复加载
@@ -147,9 +152,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     
     // 防止重复发送
     if (isSending) {
-      console.log('[ChatStore] 消息正在发送中，跳过重复请求')
       return undefined
     }
+    
+    // 创建 AbortController
+    const abortController = new AbortController()
     
     // 创建用户消息
     const userMessage: Message = {
@@ -171,6 +178,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       currentIteration: 0,  // 重置为0，thinking_start时会变为1（表示第1轮）
       toolCalls: [],
       currentToolCall: null,
+      abortController,  // 保存 AbortController
     }))
     
     let newConversationId: number | undefined = undefined
@@ -290,6 +298,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
               })
               break
               
+            case 'stopped':
+              // 停止事件 - 由 stopGeneration 处理，这里只是确保状态被清理
+              set((state) => {
+                // 只有当还在发送状态时才重置（防止覆盖 stopGeneration 的处理结果）
+                if (state.isSending) {
+                  return {
+                    isSending: false,
+                    isThinking: false,
+                    streamingContent: '',
+                    streamingThought: '',
+                    iterationSteps: [],
+                    currentIteration: 0,
+                    toolCalls: [],
+                    currentToolCall: null,
+                    abortController: null,
+                  }
+                }
+                return state
+              })
+              break
+              
             case 'done':
               // 完成，添加助手消息
               const assistantMessage: Message = {
@@ -313,6 +342,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 currentIteration: 0,
                 toolCalls: [],  // 清空工具调用记录
                 currentToolCall: null,
+                abortController: null,
               }))
               
               // 刷新对话列表（新对话或更新标题）
@@ -326,25 +356,136 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 iterationSteps: [],
                 currentIteration: 0,
                 toolCalls: [], 
-                currentToolCall: null 
+                currentToolCall: null,
+                abortController: null,
               })
               throw new Error(data)
           }
-        }
+        },
+        abortController
       )
       
       return newConversationId
     } catch (error) {
+      // 如果是中止错误，不需要额外处理（已由 stopGeneration 处理）
+      if (error instanceof Error && error.name === 'AbortError') {
+        return newConversationId
+      }
+      
+      // 其他错误，重置状态
       set({ 
         isSending: false, 
         isThinking: false, 
         iterationSteps: [],
         currentIteration: 0,
         toolCalls: [], 
-        currentToolCall: null 
+        currentToolCall: null,
+        abortController: null,
       })
       throw error
     }
+  },
+  
+  stopGeneration: () => {
+    const state = get()
+    const { abortController, isSending, currentConversation, streamingContent, streamingThought, iterationSteps } = state
+    
+    if (!abortController || !isSending) {
+      return
+    }
+    
+    // 立即设置 isSending 为 false，防止重复调用和 race condition
+    set({ isSending: false })
+    
+    // 保存当前内容
+    const stoppedContent = streamingContent || ''
+    const stoppedThought = streamingThought || ''
+    const stoppedSteps = [...(iterationSteps || [])]
+    
+    // 构建停止消息
+    let finalContent = ''
+    if (stoppedContent) {
+      finalContent = stoppedContent + '\n\n[已停止生成]'
+    } else if (stoppedThought) {
+      finalContent = '[思考中被停止]\n\n' + stoppedThought
+    } else if (stoppedSteps.length > 0) {
+      finalContent = '[推理过程中被停止]'
+    }
+    
+    // 只有在有内容且有对话ID时才保存
+    const conversationId = currentConversation?.id
+    if ((finalContent || stoppedSteps.length > 0) && conversationId) {
+      const reactSteps = stoppedSteps.length > 0 ? stoppedSteps.map((step, idx) => ({
+        type: step.type,
+        iteration: Math.floor(idx / 3) + 1,
+        content: step.content,
+        tool: step.tool,
+        input: step.toolInput,
+        output: step.toolOutput,
+        success: step.success,
+      })) : undefined
+      
+      // 保存到数据库
+      chatApi.saveStoppedMessage({
+        conversation_id: conversationId,
+        content: finalContent || '[已停止生成]',
+        thought: stoppedThought || undefined,
+        react_steps: reactSteps,
+      }).then((savedMessage) => {
+        // 使用数据库返回的消息更新 store
+        set((currentState) => ({
+          messages: [...currentState.messages, savedMessage],
+          isThinking: false,
+          streamingContent: '',
+          streamingThought: '',
+          iterationSteps: [],
+          currentIteration: 0,
+          toolCalls: [],
+          currentToolCall: null,
+          abortController: null,
+        }))
+      }).catch((error) => {
+        console.error('[ChatStore] 保存消息到数据库失败:', error)
+        // 即使保存失败，也在本地添加消息
+        const localMessage: Message = {
+          id: Date.now() + 1,
+          conversation_id: conversationId,
+          role: 'assistant',
+          content: finalContent || '[已停止生成]',
+          message_type: 'text',
+          thought: stoppedThought || undefined,
+          react_steps: reactSteps,
+          created_at: new Date().toISOString(),
+        }
+        
+        set((currentState) => ({
+          messages: [...currentState.messages, localMessage],
+          isThinking: false,
+          streamingContent: '',
+          streamingThought: '',
+          iterationSteps: [],
+          currentIteration: 0,
+          toolCalls: [],
+          currentToolCall: null,
+          abortController: null,
+        }))
+      })
+    } else {
+      // 没有内容需要保存
+      set({
+        isThinking: false,
+        streamingContent: '',
+        streamingThought: '',
+        iterationSteps: [],
+        currentIteration: 0,
+        toolCalls: [],
+        currentToolCall: null,
+        abortController: null,
+      })
+    }
+    
+    // 最后中止请求
+    abortController.abort()
   },
   
   clearCurrentConversation: () => {
@@ -357,6 +498,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       currentIteration: 0,
       toolCalls: [],
       currentToolCall: null,
+      abortController: null,
     })
   },
 }))

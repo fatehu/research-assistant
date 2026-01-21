@@ -101,3 +101,11 @@ class ChatStreamResponse(BaseModel):
     data: Any
     conversation_id: Optional[int] = None
     message_id: Optional[int] = None
+
+
+class SaveStoppedMessageRequest(BaseModel):
+    """保存停止消息的请求"""
+    conversation_id: int
+    content: str
+    thought: Optional[str] = None
+    react_steps: Optional[List[dict]] = None

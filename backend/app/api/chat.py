@@ -17,7 +17,7 @@ from app.models.conversation import Conversation, Message, MessageRole, MessageT
 from app.models.knowledge import KnowledgeBase
 from app.schemas.chat import (
     ConversationCreate, ConversationResponse, ConversationListResponse,
-    MessageResponse, ChatRequest
+    MessageResponse, ChatRequest, SaveStoppedMessageRequest
 )
 from app.services.llm_service import LLMService
 from app.services.agent_tools import get_tool_registry
@@ -606,3 +606,43 @@ async def get_messages(
     messages = result.scalars().all()
     
     return [message_to_response(msg) for msg in messages]
+
+
+@router.post("/messages/stopped", response_model=MessageResponse)
+async def save_stopped_message(
+    request: SaveStoppedMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """保存被停止的消息"""
+    # 验证对话所有权
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == request.conversation_id,
+            Conversation.user_id == current_user.id
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="对话不存在"
+        )
+    
+    # 创建停止的消息
+    message = Message(
+        conversation_id=request.conversation_id,
+        role=MessageRole.ASSISTANT,
+        content=request.content,
+        message_type=MessageType.TEXT,
+        thought=request.thought,
+        react_steps=request.react_steps,
+    )
+    
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+    
+    logger.info(f"保存停止消息: conv={request.conversation_id}, msg={message.id}")
+    
+    return message_to_response(message)

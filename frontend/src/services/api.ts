@@ -286,50 +286,61 @@ export const chatApi = {
   sendMessageStream: async (
     message: string,
     conversationId?: number,
-    onEvent?: (event: string, data: unknown) => void
+    onEvent?: (event: string, data: unknown) => void,
+    abortController?: AbortController
   ): Promise<void> => {
-    const response = await fetch(`${API_BASE_URL}/api/chat/send`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${getToken()}`,
-      },
-      body: JSON.stringify({
-        message,
-        conversation_id: conversationId,
-        stream: true,
-      }),
-    })
-    
-    if (!response.ok) {
-      const error = await response.json()
-      throw new Error(error.detail || '发送失败')
-    }
-    
-    const reader = response.body?.getReader()
-    if (!reader) throw new Error('无法读取响应')
-    
-    const decoder = new TextDecoder()
-    let buffer = ''
-    
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chat/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${getToken()}`,
+        },
+        body: JSON.stringify({
+          message,
+          conversation_id: conversationId,
+          stream: true,
+        }),
+        signal: abortController?.signal,
+      })
       
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.detail || '发送失败')
+      }
       
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            onEvent?.(data.event, data.data)
-          } catch {
-            // 忽略解析错误
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('无法读取响应')
+      
+      const decoder = new TextDecoder()
+      let buffer = ''
+      
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6))
+              onEvent?.(data.event, data.data)
+            } catch {
+              // 忽略解析错误
+            }
           }
         }
       }
+    } catch (error) {
+      // 如果是中止错误，触发 stopped 事件
+      if (error instanceof Error && error.name === 'AbortError') {
+        onEvent?.('stopped', { aborted: true })
+        return
+      }
+      throw error
     }
   },
   
@@ -349,6 +360,25 @@ export const chatApi = {
     const response = await api.get('/api/chat/messages/search', {
       params: { q: query, limit },
     })
+    return response.data
+  },
+  
+  // 保存停止的消息
+  saveStoppedMessage: async (data: {
+    conversation_id: number
+    content: string
+    thought?: string
+    react_steps?: Array<{
+      type: string
+      iteration: number
+      content?: string
+      tool?: string
+      input?: Record<string, unknown>
+      output?: string
+      success?: boolean
+    }>
+  }): Promise<Message> => {
+    const response = await api.post('/api/chat/messages/stopped', data)
     return response.data
   },
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, forwardRef } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { Input, Button, Spin, message, Tooltip, Avatar } from 'antd'
 import {
@@ -20,6 +20,7 @@ import {
   FileTextOutlined,
   SwapOutlined,
   GlobalOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
@@ -534,21 +535,21 @@ const HistoryReActPanel = ({
 }
 
 // 消息气泡 - 美化版
-const MessageBubble = ({
-  msg,
-  isStreaming = false,
-  streamingContent = '',
-  streamingThought = '',
-  isThinking = false,
-  isHighlighted = false,
-}: {
+const MessageBubble = forwardRef<HTMLDivElement, {
   msg: Message
   isStreaming?: boolean
   streamingContent?: string
   streamingThought?: string
   isThinking?: boolean
   isHighlighted?: boolean
-}) => {
+}>(({
+  msg,
+  isStreaming = false,
+  streamingContent = '',
+  streamingThought = '',
+  isThinking = false,
+  isHighlighted = false,
+}, ref) => {
   const isUser = msg.role === 'user'
   const content = isStreaming ? streamingContent : msg.content
   const thought = isStreaming ? '' : msg.thought
@@ -562,6 +563,7 @@ const MessageBubble = ({
   
   return (
     <motion.div
+      ref={ref}
       id={`message-${msg.id}`}
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
@@ -719,7 +721,10 @@ const MessageBubble = ({
       </div>
     </motion.div>
   )
-}
+})
+
+// 添加displayName以便调试
+MessageBubble.displayName = 'MessageBubble'
 
 // 空状态欢迎页
 const EmptyState = ({ onQuickPrompt }: { onQuickPrompt: (prompt: string) => void }) => {
@@ -824,6 +829,7 @@ const ChatPage = () => {
     currentToolCall,
     selectConversation,
     sendMessage,
+    stopGeneration,
     clearCurrentConversation,
   } = useChatStore()
   
@@ -837,6 +843,12 @@ const ChatPage = () => {
   // 加载对话
   useEffect(() => {
     const loadConversation = async () => {
+      // 如果正在发送消息，不重新加载（防止覆盖本地消息）
+      if (isSending) {
+        setConversationLoaded(true)
+        return
+      }
+      
       setConversationLoaded(false)  // 开始加载时重置
       if (conversationId) {
         setLoadError(null)
@@ -871,7 +883,6 @@ const ChatPage = () => {
     // 处理初始消息 - 只有当对话加载完成且没有发送过初始消息时才发送
     if (state?.initialMessage && conversationId && conversationLoaded && !initialMessageSent.current && !isSending) {
       initialMessageSent.current = true
-      console.log('[ChatPage] 发送初始消息:', state.initialMessage)
       // 发送初始消息
       sendMessage(state.initialMessage).catch(err => {
         console.error('发送初始消息失败:', err)
@@ -1045,28 +1056,44 @@ const ChatPage = () => {
                 disabled={isSending}
               />
             </div>
-            <Button
-              type="primary"
-              size="large"
-              icon={isSending ? <LoadingOutlined /> : <SendOutlined />}
-              onClick={() => handleSend()}
-              disabled={!inputValue.trim() || isSending}
-              className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-xl h-10 px-5
-                shadow-lg shadow-emerald-500/20 disabled:opacity-50"
-            >
-              {isSending ? '发送中' : '发送'}
-            </Button>
+            {isSending ? (
+              <Button
+                type="primary"
+                size="large"
+                danger
+                icon={<StopOutlined />}
+                onClick={stopGeneration}
+                className="bg-red-500 hover:bg-red-600 border-none rounded-xl h-10 px-5
+                  shadow-lg shadow-red-500/20"
+              >
+                停止
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                size="large"
+                icon={<SendOutlined />}
+                onClick={() => handleSend()}
+                disabled={!inputValue.trim()}
+                className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-xl h-10 px-5
+                  shadow-lg shadow-emerald-500/20 disabled:opacity-50"
+              >
+                发送
+              </Button>
+            )}
           </div>
           
           {/* 底部信息 */}
           <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
             <span className="flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className={`w-1.5 h-1.5 rounded-full ${isSending ? 'bg-amber-400' : 'bg-emerald-400'} animate-pulse`} />
               <span className="text-slate-400">
-                {currentConversation?.llm_provider || 'DeepSeek'}
+                {isSending ? '正在生成...' : (currentConversation?.llm_provider || 'DeepSeek')}
               </span>
             </span>
-            <span className="text-slate-600">Shift + Enter 换行 · Enter 发送</span>
+            <span className="text-slate-600">
+              {isSending ? '点击停止按钮可中止生成' : 'Shift + Enter 换行 · Enter 发送'}
+            </span>
           </div>
         </div>
       </div>
