@@ -12,6 +12,7 @@
   "dependencies": {
     "@ant-design/icons": "^5.2.6",
     "@ant-design/pro-components": "^2.6.43",
+    "@monaco-editor/react": "^4.6.0",
     "antd": "^5.13.2",
     "axios": "^1.6.7",
     "dayjs": "^1.11.10",

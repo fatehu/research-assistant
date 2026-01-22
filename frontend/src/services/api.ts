@@ -6,6 +6,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000
 // 创建 axios 实例
 const api = axios.create({
   baseURL: API_BASE_URL,
+  timeout: 30000,  // 30 秒超时
   headers: {
     'Content-Type': 'application/json',
   },
@@ -722,6 +723,138 @@ export const literatureApi = {
       paper_id: paperId,
       collection_id: collectionId,
     })
+  },
+}
+
+// ========== 代码实验室类型 ==========
+
+export interface CellOutput {
+  output_type: 'stream' | 'execute_result' | 'display_data' | 'error'
+  content: any
+  mime_type?: string
+}
+
+export interface Cell {
+  id: string
+  cell_type: 'code' | 'markdown'
+  source: string
+  outputs: CellOutput[]
+  execution_count: number | null
+  metadata: Record<string, any>
+}
+
+export interface Notebook {
+  id: string
+  user_id: number
+  title: string
+  description?: string
+  cells: Cell[]
+  created_at: string
+  updated_at: string
+  execution_count: number
+}
+
+export interface ExecuteRequest {
+  code: string
+  cell_id?: string
+  timeout?: number
+}
+
+export interface ExecuteResponse {
+  success: boolean
+  outputs: CellOutput[]
+  execution_count: number
+  execution_time_ms: number
+}
+
+// ========== 代码实验室 API ==========
+
+export const codelabApi = {
+  // 获取 Notebook 列表
+  listNotebooks: async (): Promise<Notebook[]> => {
+    const response = await api.get('/api/codelab/notebooks')
+    return response.data
+  },
+
+  // 创建 Notebook
+  createNotebook: async (data: { title?: string; description?: string }): Promise<Notebook> => {
+    const response = await api.post('/api/codelab/notebooks', data)
+    return response.data
+  },
+
+  // 获取 Notebook 详情
+  getNotebook: async (notebookId: string): Promise<Notebook> => {
+    const response = await api.get(`/api/codelab/notebooks/${notebookId}`)
+    return response.data
+  },
+
+  // 更新 Notebook
+  updateNotebook: async (
+    notebookId: string,
+    data: { title?: string; description?: string; cells?: Cell[] }
+  ): Promise<Notebook> => {
+    const response = await api.patch(`/api/codelab/notebooks/${notebookId}`, data)
+    return response.data
+  },
+
+  // 删除 Notebook
+  deleteNotebook: async (notebookId: string): Promise<void> => {
+    await api.delete(`/api/codelab/notebooks/${notebookId}`)
+  },
+
+  // 执行代码单元格
+  executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
+    const response = await api.post(`/api/codelab/notebooks/${notebookId}/execute`, data)
+    return response.data
+  },
+
+  // 直接执行代码（不保存）
+  executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
+    const response = await api.post('/api/codelab/execute', data)
+    return response.data
+  },
+
+  // 添加单元格
+  addCell: async (notebookId: string, cellType: 'code' | 'markdown', index?: number): Promise<Cell> => {
+    const response = await api.post(`/api/codelab/notebooks/${notebookId}/cells`, null, {
+      params: { cell_type: cellType, index },
+    })
+    return response.data
+  },
+
+  // 删除单元格
+  deleteCell: async (notebookId: string, cellId: string): Promise<void> => {
+    await api.delete(`/api/codelab/notebooks/${notebookId}/cells/${cellId}`)
+  },
+
+  // 运行所有单元格
+  runAll: async (notebookId: string): Promise<{ message: string; results: any[] }> => {
+    const response = await api.post(`/api/codelab/notebooks/${notebookId}/run-all`)
+    return response.data
+  },
+
+  // 重启内核（清除所有变量状态）
+  restartKernel: async (notebookId: string): Promise<{ message: string }> => {
+    const response = await api.post(`/api/codelab/notebooks/${notebookId}/restart-kernel`)
+    return response.data
+  },
+
+  // 获取内核状态
+  getKernelStatus: async (notebookId: string): Promise<{
+    status: 'running' | 'stopped'
+    execution_count: number
+    created_at?: string
+    last_used_at?: string
+    variables: Record<string, string>
+  }> => {
+    const response = await api.get(`/api/codelab/notebooks/${notebookId}/kernel-status`)
+    return response.data
+  },
+
+  // 中断内核执行
+  interruptKernel: async (notebookId: string): Promise<{ message: string }> => {
+    const response = await api.post(`/api/codelab/notebooks/${notebookId}/interrupt`)
+    return response.data
   },
 }
 

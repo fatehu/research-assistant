@@ -290,7 +290,7 @@ const MainLayout = () => {
       key: '/code',
       icon: <CodeOutlined />,
       label: '代码实验室',
-      disabled: true,
+      disabled: false,
     },
     {
       key: '/feed',

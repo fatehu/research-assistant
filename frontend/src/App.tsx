@@ -9,6 +9,7 @@ import DashboardPage from '@/pages/dashboard/DashboardPage'
 import ChatPage from '@/pages/chat/ChatPage'
 import KnowledgePage from '@/pages/knowledge/KnowledgePage'
 import { LiteraturePage } from '@/pages/literature'
+import { CodeLabPage } from '@/pages/codelab'
 
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
@@ -97,6 +98,8 @@ function App() {
           <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="knowledge/:kbId" element={<KnowledgePage />} />
           <Route path="literature" element={<LiteraturePage />} />
+          <Route path="code" element={<CodeLabPage />} />
+          <Route path="code/:notebookId" element={<CodeLabPage />} />
         </Route>
         
         {/* 404 */}

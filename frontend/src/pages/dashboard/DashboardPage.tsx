@@ -89,8 +89,8 @@ const DashboardPage = () => {
       desc: '论文搜索与收藏',
       gradient: 'from-blue-500 to-indigo-600',
       shadow: 'shadow-blue-500/20',
-      path: '/papers',
-      disabled: true,
+      path: '/literature',
+      disabled: false,
     },
     {
       icon: <ExperimentOutlined className="text-2xl" />,
@@ -99,7 +99,7 @@ const DashboardPage = () => {
       gradient: 'from-amber-500 to-orange-600',
       shadow: 'shadow-amber-500/20',
       path: '/code',
-      disabled: true,
+      disabled: false,
     },
   ]
   
