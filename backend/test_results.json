@@ -1,0 +1,96 @@
+{
+  "passed": 15,
+  "failed": 0,
+  "tests": [
+    {
+      "name": "健康检查",
+      "passed": true,
+      "detail": "",
+      "time": "2026-01-22T15:57:05.331071"
+    },
+    {
+      "name": "用户注册",
+      "passed": true,
+      "detail": "",
+      "time": "2026-01-22T15:57:05.734701"
+    },
+    {
+      "name": "获取 Notebook 列表",
+      "passed": true,
+      "detail": "共 0 个",
+      "time": "2026-01-22T15:57:05.741978"
+    },
+    {
+      "name": "创建 Notebook",
+      "passed": true,
+      "detail": "ID: 1870caad-308c-4932-afb3-168f9288d15f",
+      "time": "2026-01-22T15:57:05.794337"
+    },
+    {
+      "name": "获取 Notebook 详情",
+      "passed": true,
+      "detail": "包含 1 个单元格",
+      "time": "2026-01-22T15:57:05.801275"
+    },
+    {
+      "name": "简单代码执行",
+      "passed": true,
+      "detail": "执行时间: 869ms",
+      "time": "2026-01-22T15:57:06.725456"
+    },
+    {
+      "name": "NumPy 代码执行",
+      "passed": true,
+      "detail": "执行时间: 600ms",
+      "time": "2026-01-22T15:57:07.335823"
+    },
+    {
+      "name": "Pandas 代码执行",
+      "passed": true,
+      "detail": "执行时间: 1247ms",
+      "time": "2026-01-22T15:57:08.618627"
+    },
+    {
+      "name": "Matplotlib 绘图",
+      "passed": true,
+      "detail": "成功生成图表",
+      "time": "2026-01-22T15:57:09.416612"
+    },
+    {
+      "name": "错误处理",
+      "passed": true,
+      "detail": "正确捕获了除零错误",
+      "time": "2026-01-22T15:57:09.679526"
+    },
+    {
+      "name": "超时处理",
+      "passed": true,
+      "detail": "正确处理超时，耗时 3.0s",
+      "time": "2026-01-22T15:57:12.713169"
+    },
+    {
+      "name": "更新 Notebook",
+      "passed": true,
+      "detail": "",
+      "time": "2026-01-22T15:57:12.731753"
+    },
+    {
+      "name": "添加单元格",
+      "passed": true,
+      "detail": "新单元格 ID: 7ef6bf22...",
+      "time": "2026-01-22T15:57:12.738628"
+    },
+    {
+      "name": "运行所有单元格",
+      "passed": true,
+      "detail": "已执行 1 个单元格",
+      "time": "2026-01-22T15:57:13.488094"
+    },
+    {
+      "name": "删除 Notebook",
+      "passed": true,
+      "detail": "",
+      "time": "2026-01-22T15:57:13.493156"
+    }
+  ]
+}
