@@ -33,6 +33,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.notebook_service import NotebookService
+from app.config import settings
 
 router = APIRouter()
 
@@ -79,7 +80,10 @@ class ExecuteRequest(BaseModel):
     """代码执行请求"""
     code: str
     cell_id: Optional[str] = None
-    timeout: int = 30  # 执行超时（秒）
+    timeout: int = None  # 执行超时（秒），默认使用配置值
+    
+    def get_timeout(self) -> int:
+        return self.timeout if self.timeout is not None else settings.code_execution_timeout
 
 class ExecuteResponse(BaseModel):
     """代码执行响应"""
@@ -395,7 +399,7 @@ class KernelManager:
         self._kernels: Dict[str, PythonKernel] = {}
         self._lock = threading.Lock()
         self._cleanup_interval = 3600  # 1小时清理一次不活跃的内核
-        self._kernel_timeout = 7200  # 2小时不活跃则销毁内核
+        self._kernel_timeout = settings.kernel_idle_timeout  # 使用配置的超时值
         
         # 启动后台清理任务
         self._start_cleanup_task()
@@ -660,7 +664,7 @@ async def execute_cell(
     kernel = kernel_manager.get_or_create_kernel(notebook_id)
     
     # 在内核中执行代码
-    result = kernel.execute(request.code, request.timeout)
+    result = kernel.execute(request.code, request.get_timeout())
     
     # 序列化输出
     serialized_outputs = []
@@ -709,7 +713,7 @@ async def execute_code_directly(
     """直接执行代码（使用临时内核，不保存状态）"""
     # 创建一个临时内核
     temp_kernel = PythonKernel(f"temp_{uuid.uuid4()}")
-    result = temp_kernel.execute(request.code, request.timeout)
+    result = temp_kernel.execute(request.code, request.get_timeout())
     
     return ExecuteResponse(
         success=result['success'],
@@ -783,7 +787,7 @@ async def run_all_cells(
     for cell in notebook['cells']:
         if cell['cell_type'] == 'code' and cell['source'].strip():
             # 执行代码
-            result = kernel.execute(cell['source'], timeout=30)
+            result = kernel.execute(cell['source'], timeout=settings.code_execution_timeout)
             
             # 序列化输出
             serialized_outputs = []
@@ -966,9 +970,9 @@ async def get_agent_context(
     kernel = kernel_manager.get_kernel(notebook_id)
     variables = kernel.get_variables() if kernel else {}
     
-    # 获取最近的输出
+    # 获取最近的输出（使用配置的 Cell 数量）
     recent_outputs = []
-    for cell in notebook.get("cells", [])[-5:]:  # 最近 5 个 cell
+    for cell in notebook.get("cells", [])[-settings.notebook_context_output_cells:]:
         if cell.get("outputs"):
             recent_outputs.append({
                 "cell_id": cell["id"],
@@ -1094,30 +1098,31 @@ async def notebook_agent_chat(
             agent = ReActAgent(
                 llm_service=llm_service,
                 tool_registry=tool_registry,
-                max_iterations=10
+                max_iterations=settings.react_max_iterations
             )
             
-            # 构建 Notebook 单元格概要
+            # 构建 Notebook 单元格概要（使用配置的上下文参数）
             cells = notebook.get('cells', [])
             code_cells = [c for c in cells if c.get('cell_type') == 'code']
             cell_summary_parts = []
-            for i, cell in enumerate(code_cells[-5:]):  # 最近 5 个代码单元格
-                source = cell.get('source', '')[:200]
+            max_cell_length = settings.notebook_context_cell_max_length
+            for i, cell in enumerate(code_cells[-settings.notebook_context_cells:]):
+                source = cell.get('source', '')[:max_cell_length]
                 has_output = bool(cell.get('outputs'))
                 exec_count = cell.get('execution_count')
                 cell_summary_parts.append(
-                    f"[Cell {exec_count or '?'}] {source}{'...' if len(cell.get('source', '')) > 200 else ''}"
+                    f"[Cell {exec_count or '?'}] {source}{'...' if len(cell.get('source', '')) > max_cell_length else ''}"
                     f"{' (有输出)' if has_output else ''}"
                 )
             cells_summary = "\n".join(cell_summary_parts) if cell_summary_parts else "（无代码单元格）"
             
-            # 获取当前变量状态
+            # 获取当前变量状态（使用配置的变量数量限制）
             kernel = kernel_manager.get_kernel(notebook_id)
             variables_info = ""
             if kernel:
                 variables = kernel.get_variables()
                 if variables:
-                    var_items = list(variables.items())[:15]
+                    var_items = list(variables.items())[:settings.notebook_context_variables]
                     variables_info = "\n当前变量：\n" + "\n".join([f"- {k}: {v}" for k, v in var_items])
             
             # 构建系统消息，包含完整 Notebook 上下文
@@ -1193,7 +1198,8 @@ async def notebook_agent_chat(
                 elif event_type == "observation":
                     # data 是字典 {"tool": "...", "success": ..., "output": ..., "data": ...}
                     success = event_data.get("success", False) if isinstance(event_data, dict) else False
-                    output = event_data.get("output", "")[:500] if isinstance(event_data, dict) else str(event_data)[:500]
+                    max_output_len = settings.react_output_max_length
+                    output = event_data.get("output", "")[:max_output_len] if isinstance(event_data, dict) else str(event_data)[:max_output_len]
                     tool_data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
                     
                     # 检查是否有 notebook 更新

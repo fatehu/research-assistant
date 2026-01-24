@@ -84,10 +84,16 @@ class LLMService:
         self,
         messages: List[Dict[str, str]],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        temperature: float = None,
+        max_tokens: int = None,
     ) -> Dict[str, Any]:
         """非流式对话"""
+        # 使用配置的默认值
+        if temperature is None:
+            temperature = settings.llm_temperature
+        if max_tokens is None:
+            max_tokens = settings.llm_max_tokens
+            
         full_messages = []
         if system_prompt:
             full_messages.append({"role": "system", "content": system_prompt})
@@ -119,10 +125,16 @@ class LLMService:
         self,
         messages: List[Dict[str, str]],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
+        temperature: float = None,
+        max_tokens: int = None,
     ) -> AsyncGenerator[str, None]:
         """流式对话"""
+        # 使用配置的默认值
+        if temperature is None:
+            temperature = settings.llm_temperature
+        if max_tokens is None:
+            max_tokens = settings.llm_max_tokens
+            
         full_messages = []
         if system_prompt:
             full_messages.append({"role": "system", "content": system_prompt})

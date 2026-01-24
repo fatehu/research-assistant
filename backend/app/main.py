@@ -27,6 +27,20 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 启动 {settings.app_name} v{settings.app_version}")
     logger.info(f"📦 默认 LLM 提供商: {settings.default_llm_provider}")
     
+    # 打印关键配置（验证环境变量是否生效）
+    logger.info("=" * 50)
+    logger.info("📋 当前配置:")
+    logger.info(f"  LLM_TEMPERATURE: {settings.llm_temperature}")
+    logger.info(f"  LLM_MAX_TOKENS: {settings.llm_max_tokens}")
+    logger.info(f"  REACT_MAX_ITERATIONS: {settings.react_max_iterations}")
+    logger.info(f"  REACT_OUTPUT_MAX_LENGTH: {settings.react_output_max_length}")
+    logger.info(f"  CODE_EXECUTION_TIMEOUT: {settings.code_execution_timeout}s")
+    logger.info(f"  KERNEL_IDLE_TIMEOUT: {settings.kernel_idle_timeout}s")
+    logger.info(f"  NOTEBOOK_CONTEXT_CELLS: {settings.notebook_context_cells}")
+    logger.info(f"  NOTEBOOK_CONTEXT_CELL_MAX_LENGTH: {settings.notebook_context_cell_max_length}")
+    logger.info(f"  NOTEBOOK_CONTEXT_VARIABLES: {settings.notebook_context_variables}")
+    logger.info("=" * 50)
+    
     # 启动时创建表
     await create_tables()
     

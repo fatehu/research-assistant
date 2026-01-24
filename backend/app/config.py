@@ -1,5 +1,7 @@
 """
 应用配置管理
+
+所有可配置参数通过环境变量管理，支持 .env 文件
 """
 from functools import lru_cache
 from typing import Literal
@@ -14,23 +16,23 @@ class Settings(BaseSettings):
         extra="ignore"
     )
     
-    # 应用配置
+    # ========== 应用基础配置 ==========
     app_name: str = "AI科研助手"
     app_version: str = "1.0.0"
     debug: bool = True
     
-    # 数据库
+    # ========== 数据库配置 ==========
     database_url: str = "postgresql://research_user:research_password_123@localhost:5432/research_assistant"
     
-    # Redis
+    # ========== Redis 配置 ==========
     redis_url: str = "redis://localhost:6379/0"
     
-    # JWT 配置
+    # ========== JWT 配置 ==========
     secret_key: str = "your-super-secret-key-change-this-in-production-min-32-chars"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440  # 24小时
     
-    # LLM 配置
+    # ========== LLM 提供商配置 ==========
     default_llm_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "deepseek"
     
     # DeepSeek
@@ -52,13 +54,30 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     
-    # Embedding - 阿里云
+    # ========== Embedding 配置 ==========
     embedding_provider: str = "aliyun"
     aliyun_embedding_api_key: str = ""
     aliyun_embedding_model: str = "text-embedding-v2"
     
-    # ReAct Agent 配置
-    react_max_iterations: int = 5  # 最大迭代次数
+    # ========== LLM 推理参数 ==========
+    llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)
+    llm_max_tokens: int = 4096             # LLM 最大输出 tokens
+    
+    # ========== ReAct Agent 配置 ==========
+    react_max_iterations: int = 10          # Agent 最大推理迭代次数
+    react_temperature: float = 0.7          # Agent 推理温度
+    react_output_max_length: int = 500      # 工具输出显示的最大长度
+    
+    # ========== 代码执行配置 ==========
+    code_execution_timeout: int = 30        # 单次代码执行超时（秒）
+    kernel_idle_timeout: int = 7200         # 内核空闲超时（秒），默认 2 小时
+    
+    # ========== Notebook 上下文配置 ==========
+    # 这些参数控制 Agent 获取的 Notebook 上下文范围
+    notebook_context_cells: int = 5               # 包含的最近 Cell 数量
+    notebook_context_cell_max_length: int = 200   # 单个 Cell 代码预览最大字符数
+    notebook_context_variables: int = 15          # 包含的最大变量数量
+    notebook_context_output_cells: int = 5        # recent_outputs 包含的 Cell 数量
     
     def get_llm_config(self, provider: str = None):
         """获取 LLM 配置"""

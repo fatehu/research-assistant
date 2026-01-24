@@ -53,3 +53,33 @@ async def llm_health_check():
         "default_provider": settings.default_llm_provider,
         "providers": providers_status
     }
+
+
+@router.get("/health/config")
+async def config_check():
+    """
+    查看当前生效的配置
+    用于验证环境变量是否正确加载
+    """
+    return {
+        "llm": {
+            "provider": settings.default_llm_provider,
+            "temperature": settings.llm_temperature,
+            "max_tokens": settings.llm_max_tokens,
+        },
+        "react_agent": {
+            "max_iterations": settings.react_max_iterations,
+            "temperature": settings.react_temperature,
+            "output_max_length": settings.react_output_max_length,
+        },
+        "code_execution": {
+            "timeout_seconds": settings.code_execution_timeout,
+            "kernel_idle_timeout_seconds": settings.kernel_idle_timeout,
+        },
+        "notebook_context": {
+            "cells": settings.notebook_context_cells,
+            "cell_max_length": settings.notebook_context_cell_max_length,
+            "variables": settings.notebook_context_variables,
+            "output_cells": settings.notebook_context_output_cells,
+        },
+    }
