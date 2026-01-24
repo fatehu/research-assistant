@@ -893,16 +893,28 @@ export interface AgentChatRequest {
   message: string
   include_context?: boolean
   include_variables?: boolean
+  user_authorized?: boolean  // 是否授权 AI 操作 Notebook
   stream?: boolean
 }
 
 export interface AgentChatEvent {
-  type: 'content' | 'done' | 'error'
+  type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'answer' | 'start' | 'authorization_required'
   content?: string
   code_blocks?: AgentCodeBlock[]
   suggested_action?: string
   suggested_code?: string
   error?: string
+  tool?: string
+  input?: Record<string, any>
+  success?: boolean
+  output?: string
+  action?: string  // 需要授权的操作
+  provider?: string
+  model?: string
+  notebook_updated?: boolean  // Notebook 是否有更新（新增 Cell）
+  cell_id?: string  // 新创建的 Cell ID
+  new_cell?: Cell   // 新创建的完整 Cell 数据
+  updated_cell?: Cell  // 更新的 Cell 数据
 }
 
 // ========== Notebook Agent API ==========

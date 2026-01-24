@@ -9,7 +9,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Button, Input, Tooltip, Spin, message, Popconfirm, Tag } from 'antd'
+import { Button, Input, Tooltip, Spin, message, Popconfirm, Tag, Switch } from 'antd'
 import {
   RobotOutlined, SendOutlined, CloseOutlined, DeleteOutlined, CopyOutlined,
   CodeOutlined, PlayCircleOutlined, ExpandOutlined, CompressOutlined,
@@ -31,6 +31,9 @@ interface NotebookAgentPanelProps {
   onRunCode?: (code: string) => void
   onFocusCell?: (cellIndex: number) => void
   onClearOutputs?: () => void
+  onRefreshNotebook?: () => void  // 刷新 Notebook 数据
+  onAddCell?: (cell: Cell) => void  // 直接添加新 Cell（实时更新）
+  onUpdateCell?: (cell: Cell) => void  // 更新 Cell（实时更新）
   isVisible: boolean
   onClose: () => void
   onToggleExpand?: () => void
@@ -49,7 +52,7 @@ const quickActions = [
 ]
 
 const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
-  notebookId, onInsertCode, onRunCode, onFocusCell, onClearOutputs,
+  notebookId, onInsertCode, onRunCode, onFocusCell, onClearOutputs, onRefreshNotebook, onAddCell, onUpdateCell,
   isVisible, onClose, onToggleExpand, isExpanded = false,
   currentCellIndex = 0, cells = [],
 }) => {
@@ -58,6 +61,8 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const [isAuthorized, setIsAuthorized] = useState(false)  // 授权状态
+  const [pendingAuthAction, setPendingAuthAction] = useState<string | null>(null)
   
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<any>(null)
@@ -96,7 +101,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
     }
   }
 
-  const sendMessage = async (content: string) => {
+  const sendMessage = async (content: string, authorized: boolean = isAuthorized) => {
     if (!content.trim() || isLoading) return
 
     const userMessage: AgentMessage = {
@@ -120,11 +125,42 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
       await agentApi.chat(
         notebookId,
-        { message: content.trim(), include_context: true, include_variables: true, stream: true },
+        { message: content.trim(), include_context: true, include_variables: true, user_authorized: authorized, stream: true },
         (event) => {
           if (event.type === 'content') {
             fullContent += event.content
             setStreamingContent(fullContent)
+          } else if (event.type === 'thought') {
+            // 可选：显示思考过程
+            fullContent += `\n💭 *${event.content}*\n`
+            setStreamingContent(fullContent)
+          } else if (event.type === 'action') {
+            // 显示工具调用
+            fullContent += `\n🔧 调用工具: ${event.tool}\n`
+            setStreamingContent(fullContent)
+          } else if (event.type === 'observation') {
+            // 显示工具结果
+            const status = event.success ? '✅' : '❌'
+            fullContent += `\n${status} 结果: ${event.output?.substring(0, 200)}${event.output && event.output.length > 200 ? '...' : ''}\n`
+            setStreamingContent(fullContent)
+            
+            // 如果有新 Cell，直接添加到 Notebook（实时更新）
+            if (event.notebook_updated && event.new_cell && onAddCell) {
+              onAddCell(event.new_cell)
+            } else if (event.notebook_updated && event.updated_cell && onUpdateCell) {
+              // 更新已存在的 Cell
+              onUpdateCell(event.updated_cell)
+            } else if (event.notebook_updated && onRefreshNotebook) {
+              // 降级：刷新整个 Notebook
+              onRefreshNotebook()
+            }
+          } else if (event.type === 'answer') {
+            fullContent = event.content || fullContent
+            setStreamingContent(fullContent)
+          } else if (event.type === 'authorization_required') {
+            // 需要授权
+            setPendingAuthAction(event.action || 'unknown')
+            message.warning(`操作需要授权: ${event.action}`)
           } else if (event.type === 'done') {
             codeBlocks = event.code_blocks || []
             const assistantMessage: AgentMessage = {
@@ -275,10 +311,23 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
                 {onClearOutputs && <Tooltip title="清除所有输出"><Button type="text" size="small" icon={<ClearOutlined />} onClick={onClearOutputs} className="text-slate-400 hover:text-amber-400" /></Tooltip>}
               </div>
             </div>
-            <div className="flex gap-2 flex-wrap">
-              <Tag color="green" className="text-xs">{contextInfo.codeCount} 代码</Tag>
-              <Tag color="blue" className="text-xs">{contextInfo.mdCount} Markdown</Tag>
-              {contextInfo.hasOutputs && <Tag color="orange" className="text-xs">有输出</Tag>}
+            <div className="flex items-center justify-between">
+              <div className="flex gap-2 flex-wrap">
+                <Tag color="green" className="text-xs">{contextInfo.codeCount} 代码</Tag>
+                <Tag color="blue" className="text-xs">{contextInfo.mdCount} Markdown</Tag>
+                {contextInfo.hasOutputs && <Tag color="orange" className="text-xs">有输出</Tag>}
+              </div>
+              <Tooltip title={isAuthorized ? 'AI 可以执行代码、安装包、操作单元格' : '开启后 AI 可以直接操作 Notebook'}>
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-500 text-xs">允许 AI 操作</span>
+                  <Switch 
+                    size="small" 
+                    checked={isAuthorized} 
+                    onChange={setIsAuthorized}
+                    className={isAuthorized ? 'bg-emerald-500' : ''}
+                  />
+                </div>
+              </Tooltip>
             </div>
           </div>
         )}

@@ -977,18 +977,36 @@ class LiteratureSearchTool(Tool):
 
 
 class ToolRegistry:
-    """工具注册表"""
+    """工具注册表 - 支持 Notebook 工具扩展"""
     
-    def __init__(self, db: AsyncSession, user_id: int):
+    def __init__(
+        self, 
+        db: AsyncSession = None, 
+        user_id: int = None,
+        # Notebook 上下文参数
+        notebook_id: str = None,
+        kernel_manager = None,
+        notebooks_store: dict = None,
+        user_authorized: bool = False  # 用户是否授权 Agent 操作 Notebook
+    ):
         self.db = db
         self.user_id = user_id
+        self.notebook_id = notebook_id
+        self.kernel_manager = kernel_manager
+        self.notebooks_store = notebooks_store
+        self.user_authorized = user_authorized
         self._tools: Dict[str, Tool] = {}
         self._register_default_tools()
+        
+        # 如果提供了 Notebook 上下文，注册 Notebook 工具
+        if notebook_id and kernel_manager:
+            self._register_notebook_tools()
     
     def _register_default_tools(self):
         """注册默认工具"""
         # 知识库搜索（需要数据库和用户ID）
-        self.register(KnowledgeSearchTool(self.db, self.user_id))
+        if self.db and self.user_id:
+            self.register(KnowledgeSearchTool(self.db, self.user_id))
         
         # 通用工具（无需特殊依赖）
         self.register(WebSearchTool())
@@ -997,6 +1015,57 @@ class ToolRegistry:
         self.register(TextAnalysisTool())
         self.register(UnitConverterTool())
         self.register(LiteratureSearchTool())
+    
+    def _register_notebook_tools(self):
+        """注册 Notebook 专用工具"""
+        try:
+            from app.services.notebook_tools import (
+                NotebookExecuteTool,
+                NotebookVariablesTool,
+                NotebookCellTool,
+                PipInstallTool,
+                WebScrapeTool,
+                CodeAnalysisTool,
+                EnhancedLiteratureSearchTool,
+            )
+            
+            # 核心执行工具 - 需要内核和授权，执行后自动创建 Cell
+            self.register(NotebookExecuteTool(
+                kernel_manager=self.kernel_manager,
+                notebook_id=self.notebook_id,
+                notebooks_store=self.notebooks_store,
+                user_authorized=self.user_authorized
+            ))
+            
+            # 变量查看工具 - 只读，无需授权
+            self.register(NotebookVariablesTool(
+                kernel_manager=self.kernel_manager,
+                notebook_id=self.notebook_id
+            ))
+            
+            # 单元格操作工具 - 修改操作需要授权
+            if self.notebooks_store is not None:
+                self.register(NotebookCellTool(
+                    notebooks_store=self.notebooks_store,
+                    notebook_id=self.notebook_id,
+                    user_authorized=self.user_authorized
+                ))
+            
+            # pip 安装工具 - 需要授权
+            self.register(PipInstallTool(user_authorized=self.user_authorized))
+            
+            # 网页爬取工具 - 无需授权
+            self.register(WebScrapeTool())
+            
+            # 代码分析工具 - 无需授权
+            self.register(CodeAnalysisTool())
+            
+            # 增强的文献搜索工具
+            self.register(EnhancedLiteratureSearchTool())
+            
+            logger.info(f"已注册 Notebook 工具集，授权状态: {self.user_authorized}")
+        except ImportError as e:
+            logger.warning(f"无法导入 Notebook 工具: {e}")
     
     def register(self, tool: Tool):
         """注册工具"""

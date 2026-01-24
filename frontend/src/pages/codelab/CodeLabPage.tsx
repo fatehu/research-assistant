@@ -741,6 +741,43 @@ const CodeLabPage = () => {
     message.success('所有输出已清除')
   }, [currentNotebook])
 
+  // AI 添加新 Cell（实时更新）
+  const handleAgentAddCell = useCallback((newCell: Cell) => {
+    if (!currentNotebook) return
+    startTransition(() => {
+      setCurrentNotebook(prev => {
+        if (!prev) return prev
+        // 检查是否已存在该 cell（避免重复添加）
+        const exists = prev.cells.some(c => c.id === newCell.id)
+        if (exists) return prev
+        return {
+          ...prev,
+          cells: [...prev.cells, newCell],
+        }
+      })
+      // 自动滚动到新 Cell
+      setTimeout(() => {
+        setSelectedCellIndex(currentNotebook.cells.length)
+      }, 100)
+    })
+  }, [currentNotebook])
+
+  // AI 更新 Cell（实时更新）
+  const handleAgentUpdateCell = useCallback((updatedCell: Cell) => {
+    if (!currentNotebook) return
+    startTransition(() => {
+      setCurrentNotebook(prev => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          cells: prev.cells.map(c => 
+            c.id === updatedCell.id ? { ...c, ...updatedCell } : c
+          ),
+        }
+      })
+    })
+  }, [currentNotebook])
+
   // 初始化加载
   useEffect(() => { loadNotebooks() }, [loadNotebooks])
 
@@ -947,6 +984,9 @@ const CodeLabPage = () => {
         onRunCode={handleAgentRunCode}
         onFocusCell={handleAgentFocusCell}
         onClearOutputs={handleAgentClearOutputs}
+        onAddCell={handleAgentAddCell}
+        onUpdateCell={handleAgentUpdateCell}
+        onRefreshNotebook={() => loadNotebook(currentNotebook.id)}
         currentCellIndex={selectedCellIndex}
         cells={currentNotebook.cells}
       />

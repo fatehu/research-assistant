@@ -40,6 +40,7 @@ class User(Base):
     knowledge_bases = relationship("KnowledgeBase", back_populates="user", cascade="all, delete-orphan")
     papers = relationship("Paper", back_populates="user", cascade="all, delete-orphan")
     paper_collections = relationship("PaperCollection", back_populates="user", cascade="all, delete-orphan")
+    notebooks = relationship("Notebook", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<User {self.username}>"

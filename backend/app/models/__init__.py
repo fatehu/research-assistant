@@ -5,6 +5,7 @@ from app.models.user import User
 from app.models.conversation import Conversation, Message
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.models.literature import Paper, PaperCollection, PaperSearchHistory
+from app.models.notebook import Notebook, NotebookCell
 
 __all__ = [
     "User", 
@@ -16,4 +17,6 @@ __all__ = [
     "Paper",
     "PaperCollection",
     "PaperSearchHistory",
+    "Notebook",
+    "NotebookCell",
 ]

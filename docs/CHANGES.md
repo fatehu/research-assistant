@@ -397,7 +397,106 @@ const deferredCells = useDeferredValue(cells)
 
 ## 版本信息
 
-- 更新日期: 2026-01-23
+- 更新日期: 2026-01-24
 - React 版本: 18.x
 - TypeScript 版本: 5.x
 - Ant Design 版本: 5.x
+
+---
+
+## 2026-01-24 更新：数据库持久化
+
+### 新增功能
+
+1. **Notebook 数据库持久化** - Notebook 和 Cell 数据保存到数据库，重启后不丢失
+2. **混合存储策略** - 数据库持久化 + 内存缓存，兼顾持久性和性能
+3. **AI 执行代码实时更新** - Agent 执行代码后 Cell 立即显示在 Notebook 中
+
+### 新增文件
+
+```
+backend/
+├── app/
+│   ├── models/
+│   │   └── notebook.py           # Notebook 和 NotebookCell 数据库模型
+│   └── services/
+│       └── notebook_service.py   # Notebook 数据库操作服务
+└── alembic/
+    └── versions/
+        └── 005_notebook.py       # 数据库迁移文件
+```
+
+### 数据库表结构
+
+**notebooks 表**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | VARCHAR(36) | 主键 (UUID) |
+| user_id | INTEGER | 用户 ID (外键) |
+| title | VARCHAR(255) | 标题 |
+| description | TEXT | 描述 |
+| execution_count | INTEGER | 执行计数 |
+| metadata | JSON | 元数据 |
+| created_at | DATETIME | 创建时间 |
+| updated_at | DATETIME | 更新时间 |
+
+**notebook_cells 表**
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | VARCHAR(36) | 主键 (UUID) |
+| notebook_id | VARCHAR(36) | Notebook ID (外键) |
+| cell_type | VARCHAR(20) | 类型 (code/markdown) |
+| source | TEXT | 源代码 |
+| execution_count | INTEGER | 执行计数 |
+| outputs | JSON | 输出数据 |
+| metadata | JSON | 元数据 |
+| position | INTEGER | 位置索引 |
+
+### 部署步骤
+
+```bash
+# 1. 重建容器
+docker-compose down -v
+docker-compose up --build -d
+
+# 2. 运行数据库迁移
+docker-compose exec backend alembic upgrade head
+
+# 3. 验证
+curl http://localhost:8000/api/health
+```
+
+### 存储策略说明
+
+```
+用户请求 → API 端点
+    ↓
+┌───────────────────────────────────────┐
+│  get_notebook_cached(db, id, user)    │
+│  1. 查内存缓存 (_notebooks_cache)      │
+│  2. 缓存未命中 → 查数据库              │
+│  3. 加载到缓存                         │
+└───────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────┐
+│  写操作: create/update/delete          │
+│  1. 更新数据库 (NotebookService)       │
+│  2. 同步到缓存 (_notebooks_cache)      │
+└───────────────────────────────────────┘
+```
+
+### Agent 工具实时更新
+
+```
+Agent 调用 notebook_execute
+    ↓
+NotebookExecuteTool.execute()
+  - 执行代码
+  - 创建新 Cell 并保存到缓存
+    ↓
+observation 事件返回 new_cell 数据
+    ↓
+前端 onAddCell() 直接追加到 UI
+    ↓
+用户立即看到新 Cell（无需刷新）
+```

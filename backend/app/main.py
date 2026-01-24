@@ -9,7 +9,7 @@ import sys
 
 from app.config import settings
 from app.core.database import create_tables
-from app.api import auth, users, chat, health, knowledge, literature, codelab, agent
+from app.api import auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent
 
 
 # 配置日志
@@ -63,6 +63,7 @@ app.include_router(knowledge.router, prefix="/api/knowledge", tags=["知识库"]
 app.include_router(literature.router, prefix="/api", tags=["文献管理"])
 app.include_router(codelab.router, prefix="/api/codelab", tags=["代码实验室"])
 app.include_router(agent.router, prefix="/api/codelab", tags=["Notebook Agent"])
+app.include_router(notebook_agent.router, prefix="/api/codelab", tags=["Notebook ReAct Agent"])
 
 
 @app.get("/")

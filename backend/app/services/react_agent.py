@@ -403,7 +403,8 @@ class ReActAgent:
                                 "data": {
                                     "tool": tool_name,
                                     "success": result.success,
-                                    "output": result.output[:2000]
+                                    "output": result.output[:2000],
+                                    "data": result.data  # 包含 notebook_updated, cell_id 等
                                 }
                             }
                             
@@ -438,7 +439,8 @@ class ReActAgent:
                                 "data": {
                                     "tool": tool_name if 'tool_name' in dir() else "unknown",
                                     "success": False,
-                                    "output": f"工具执行失败: {str(e)}"
+                                    "output": f"工具执行失败: {str(e)}",
+                                    "data": {}
                                 }
                             }
                             action_content = ""
@@ -526,7 +528,8 @@ class ReActAgent:
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": result.output[:2000]
+                            "output": result.output[:2000],
+                            "data": result.data
                         }
                     }
                     
@@ -568,7 +571,8 @@ class ReActAgent:
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": result.output[:2000]
+                            "output": result.output[:2000],
+                            "data": result.data
                         }
                     }
                     
@@ -636,7 +640,8 @@ class ReActAgent:
                 "data": {
                     "tool": tool_name,
                     "success": result.success,
-                    "output": result.output[:2000]
+                    "output": result.output[:2000],
+                    "data": result.data
                 }
             })
             
