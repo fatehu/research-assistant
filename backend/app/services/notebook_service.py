@@ -65,6 +65,9 @@ class NotebookService:
             updated_at=now,
         )
         
+        # 准备单元格数据
+        cells_data = []
+        
         # 添加初始单元格
         if initial_cells:
             for i, cell_data in enumerate(initial_cells):
@@ -79,6 +82,7 @@ class NotebookService:
                     position=i,
                 )
                 notebook.cells.append(cell)
+                cells_data.append(cell.to_dict())
         else:
             # 默认单元格
             default_cell = NotebookCell(
@@ -90,12 +94,24 @@ class NotebookService:
                 position=0,
             )
             notebook.cells.append(default_cell)
+            cells_data.append(default_cell.to_dict())
         
         self.db.add(notebook)
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 直接构建返回字典，避免 lazy load 问题
+        # 保持与 to_dict() 相同的格式：ISO 格式字符串
+        return {
+            "id": notebook_id,
+            "user_id": user_id,
+            "title": title,
+            "description": description,
+            "execution_count": 0,
+            "metadata": {},
+            "cells": cells_data,
+            "created_at": now.isoformat() if now else None,
+            "updated_at": now.isoformat() if now else None,
+        }
     
     async def update_notebook(self, notebook_id: str, user_id: int, 
                             title: str = None, description: str = None) -> Optional[Dict]:
@@ -111,9 +127,9 @@ class NotebookService:
         notebook.updated_at = datetime.utcnow()
         
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据（包括 cells）
+        return await self.get_notebook(notebook_id, user_id)
     
     async def delete_notebook(self, notebook_id: str, user_id: int) -> bool:
         """删除 Notebook"""
@@ -154,9 +170,9 @@ class NotebookService:
         notebook.updated_at = datetime.utcnow()
         
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def update_cell(self, notebook_id: str, user_id: int, cell_id: str,
                          source: str = None, cell_type: str = None,
@@ -181,9 +197,9 @@ class NotebookService:
         
         notebook.updated_at = datetime.utcnow()
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def delete_cell(self, notebook_id: str, user_id: int, cell_id: str) -> Optional[Dict]:
         """删除单元格"""
@@ -202,9 +218,9 @@ class NotebookService:
             await self.db.delete(cell_to_delete)
             notebook.updated_at = datetime.utcnow()
             await self.db.commit()
-            await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def move_cell(self, notebook_id: str, user_id: int, 
                        cell_id: str, new_index: int) -> Optional[Dict]:
@@ -223,7 +239,7 @@ class NotebookService:
                 break
         
         if not target_cell:
-            return notebook.to_dict()
+            return await self.get_notebook(notebook_id, user_id)
         
         # 更新位置
         if new_index > old_index:
@@ -241,9 +257,9 @@ class NotebookService:
         notebook.updated_at = datetime.utcnow()
         
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def update_execution_count(self, notebook_id: str, user_id: int, 
                                     execution_count: int) -> Optional[Dict]:
@@ -257,7 +273,8 @@ class NotebookService:
         
         await self.db.commit()
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def save_cell_execution(self, notebook_id: str, user_id: int, cell_id: str,
                                  outputs: List, execution_count: int) -> Optional[Dict]:
@@ -293,9 +310,9 @@ class NotebookService:
         notebook.updated_at = datetime.utcnow()
         
         await self.db.commit()
-        await self.db.refresh(notebook)
         
-        return notebook.to_dict()
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
 
 
 async def get_notebook_service(db: AsyncSession) -> NotebookService:

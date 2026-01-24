@@ -406,7 +406,8 @@ async def save_paper(
             )
         )
         default_result = await db.execute(default_stmt)
-        default_collection = default_result.scalar_one_or_none()
+        # 使用 scalars().first() 来安全处理可能存在的多个默认收藏夹
+        default_collection = default_result.scalars().first()
         
         if default_collection:
             collection_ids = [default_collection.id]
@@ -932,15 +933,76 @@ async def init_user_literature(
     current_user: User = Depends(get_current_user)
 ):
     """初始化用户的文献管理（创建默认收藏夹）"""
-    # 检查是否已有默认收藏夹
+    # 检查是否已有默认收藏夹（使用 FOR UPDATE 锁定防止并发问题）
     stmt = select(PaperCollection).where(
         and_(
             PaperCollection.user_id == current_user.id,
             PaperCollection.is_default == True
         )
-    )
+    ).with_for_update(skip_locked=True)
     result = await db.execute(stmt)
-    if result.scalar_one_or_none():
+    existing_defaults = result.scalars().all()
+    
+    # 如果已有默认收藏夹
+    if existing_defaults:
+        # 如果有重复的默认收藏夹，清理掉多余的
+        if len(existing_defaults) > 1:
+            logger.warning(f"[Literature API] 用户 {current_user.id} 有 {len(existing_defaults)} 个默认收藏夹，正在清理...")
+            # 保留第一个（最早创建的），删除其他的
+            keep_id = existing_defaults[0].id
+            for coll in existing_defaults[1:]:
+                # 将该收藏夹中的论文移到保留的默认收藏夹
+                # 先获取该收藏夹中的论文
+                paper_stmt = select(paper_collection_association.c.paper_id).where(
+                    paper_collection_association.c.collection_id == coll.id
+                )
+                paper_result = await db.execute(paper_stmt)
+                paper_ids = [row[0] for row in paper_result.fetchall()]
+                
+                # 将论文添加到保留的收藏夹（如果不存在）
+                for paper_id in paper_ids:
+                    exists_stmt = select(paper_collection_association).where(
+                        and_(
+                            paper_collection_association.c.paper_id == paper_id,
+                            paper_collection_association.c.collection_id == keep_id
+                        )
+                    )
+                    exists_result = await db.execute(exists_stmt)
+                    if not exists_result.first():
+                        await db.execute(
+                            paper_collection_association.insert().values(
+                                paper_id=paper_id,
+                                collection_id=keep_id
+                            )
+                        )
+                
+                # 删除多余收藏夹中的关联
+                await db.execute(
+                    delete(paper_collection_association).where(
+                        paper_collection_association.c.collection_id == coll.id
+                    )
+                )
+                
+                # 删除多余的收藏夹
+                await db.delete(coll)
+            
+            # 更新保留的收藏夹的论文计数
+            count_stmt = select(func.count()).select_from(paper_collection_association).where(
+                paper_collection_association.c.collection_id == keep_id
+            )
+            count_result = await db.execute(count_stmt)
+            paper_count = count_result.scalar() or 0
+            
+            await db.execute(
+                PaperCollection.__table__.update().where(
+                    PaperCollection.id == keep_id
+                ).values(paper_count=paper_count)
+            )
+            
+            await db.commit()
+            logger.info(f"[Literature API] 已清理用户 {current_user.id} 的重复默认收藏夹")
+            return {"message": "已初始化，并清理了重复的默认收藏夹"}
+        
         return {"message": "已初始化"}
     
     # 创建默认收藏夹
@@ -983,6 +1045,20 @@ async def init_user_literature(
     for coll in default_collections:
         db.add(coll)
     
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        # 如果提交失败（可能是并发创建），检查是否已存在
+        await db.rollback()
+        check_stmt = select(PaperCollection).where(
+            and_(
+                PaperCollection.user_id == current_user.id,
+                PaperCollection.is_default == True
+            )
+        )
+        check_result = await db.execute(check_stmt)
+        if check_result.scalars().first():
+            return {"message": "已初始化"}
+        raise e
     
     return {"message": "初始化成功", "collections_created": len(default_collections)}

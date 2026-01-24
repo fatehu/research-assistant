@@ -536,7 +536,22 @@ async def list_notebooks(
 ):
     """获取用户的所有 Notebook"""
     notebooks = await get_user_notebooks_cached(db, current_user.id)
-    return sorted(notebooks, key=lambda x: x['updated_at'], reverse=True)
+    
+    # 定义排序键函数，处理 datetime 对象和 ISO 字符串的混合情况
+    def sort_key(x):
+        val = x.get('updated_at')
+        if val is None:
+            return datetime.min
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val.replace('Z', '+00:00'))
+            except (ValueError, AttributeError):
+                return datetime.min
+        return datetime.min
+    
+    return sorted(notebooks, key=sort_key, reverse=True)
 
 
 @router.post("/notebooks", response_model=NotebookResponse)
