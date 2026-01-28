@@ -1,5 +1,5 @@
 """
-FastAPI 主入口文件
+FastAPI 主入口文件 - 多角色系统扩展版
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -9,7 +9,10 @@ import sys
 
 from app.config import settings
 from app.core.database import create_tables
-from app.api import auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent
+from app.api import (
+    auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent,
+    admin, mentor, student, invitations, share, announcements
+)
 
 
 # 配置日志
@@ -53,7 +56,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="基于 ReAct Agent 的综合科研助手平台",
+    description="基于 ReAct Agent 的综合科研助手平台 - 多角色系统",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -68,7 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由
+# 注册原有路由
 app.include_router(health.router, tags=["健康检查"])
 app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
 app.include_router(users.router, prefix="/api/users", tags=["用户"])
@@ -79,6 +82,14 @@ app.include_router(codelab.router, prefix="/api/codelab", tags=["代码实验室
 app.include_router(agent.router, prefix="/api/codelab", tags=["Notebook Agent"])
 app.include_router(notebook_agent.router, prefix="/api/codelab", tags=["Notebook ReAct Agent"])
 
+# === 注册多角色系统路由 ===
+app.include_router(admin.router, prefix="/api/admin", tags=["管理员"])
+app.include_router(mentor.router, prefix="/api/mentor", tags=["导师"])
+app.include_router(student.router, prefix="/api/student", tags=["学生"])
+app.include_router(invitations.router, prefix="/api/invitations", tags=["邀请管理"])
+app.include_router(share.router, prefix="/api/share", tags=["资源共享"])
+app.include_router(announcements.router, prefix="/api/announcements", tags=["公告管理"])
+
 
 @app.get("/")
 async def root():
@@ -87,5 +98,12 @@ async def root():
         "name": settings.app_name,
         "version": settings.app_version,
         "status": "running",
-        "docs": "/docs"
+        "docs": "/docs",
+        "features": [
+            "multi-role-system",
+            "mentor-student-relation",
+            "research-groups",
+            "resource-sharing",
+            "announcements"
+        ]
     }

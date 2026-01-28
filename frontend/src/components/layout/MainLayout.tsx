@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { Outlet, useNavigate, useLocation, useParams } from 'react-router-dom'
-import { Layout, Menu, Input, Avatar, Dropdown, Button, Tooltip, Modal, Empty, Badge } from 'antd'
+import { Layout, Menu, Input, Avatar, Dropdown, Button, Tooltip, Modal, Empty, Badge, Divider } from 'antd'
 import {
   HomeOutlined,
   MessageOutlined,
@@ -23,6 +23,12 @@ import {
   RightOutlined,
   BookOutlined,
   LoadingOutlined,
+  TeamOutlined,
+  CrownOutlined,
+  SolutionOutlined,
+  UsergroupAddOutlined,
+  NotificationOutlined,
+  ShareAltOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAuthStore } from '@/stores/authStore'
@@ -180,6 +186,23 @@ const CollapsibleGroup = ({
   )
 }
 
+// 角色标签组件
+const RoleBadge = ({ role }: { role: string }) => {
+  const roleConfig = {
+    admin: { label: '管理员', color: 'bg-gradient-to-r from-amber-500 to-orange-500', icon: <CrownOutlined /> },
+    mentor: { label: '导师', color: 'bg-gradient-to-r from-blue-500 to-indigo-500', icon: <SolutionOutlined /> },
+    student: { label: '学生', color: 'bg-gradient-to-r from-emerald-500 to-teal-500', icon: <UserOutlined /> },
+  }
+  const config = roleConfig[role as keyof typeof roleConfig] || roleConfig.student
+  
+  return (
+    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-white ${config.color}`}>
+      {config.icon}
+      <span>{config.label}</span>
+    </div>
+  )
+}
+
 const MainLayout = () => {
   const navigate = useNavigate()
   const location = useLocation()
@@ -265,7 +288,8 @@ const MainLayout = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
   
-  const menuItems = [
+  // 基础菜单项
+  const baseMenuItems = [
     {
       key: '/dashboard',
       icon: <HomeOutlined />,
@@ -299,8 +323,113 @@ const MainLayout = () => {
       disabled: true,
     },
   ]
+
+  // 角色专属菜单项
+  const roleMenuItems = useMemo(() => {
+    const userRole = user?.role || 'student'
+    const items: any[] = []
+
+    if (userRole === 'admin') {
+      items.push({
+        key: 'admin-divider',
+        type: 'divider',
+      })
+      items.push({
+        key: 'admin-group',
+        label: '系统管理',
+        type: 'group',
+        children: [
+          {
+            key: '/admin/users',
+            icon: <TeamOutlined />,
+            label: '用户管理',
+          },
+          {
+            key: '/admin/statistics',
+            icon: <SettingOutlined />,
+            label: '系统统计',
+          },
+        ],
+      })
+    }
+
+    if (userRole === 'mentor') {
+      items.push({
+        key: 'mentor-divider',
+        type: 'divider',
+      })
+      items.push({
+        key: 'mentor-group',
+        label: '导师中心',
+        type: 'group',
+        children: [
+          {
+            key: '/mentor/students',
+            icon: <UsergroupAddOutlined />,
+            label: '学生管理',
+          },
+          {
+            key: '/mentor/groups',
+            icon: <TeamOutlined />,
+            label: '研究组',
+          },
+          {
+            key: '/mentor/announcements',
+            icon: <NotificationOutlined />,
+            label: '公告管理',
+          },
+          {
+            key: '/mentor/shares',
+            icon: <ShareAltOutlined />,
+            label: '资源共享',
+          },
+        ],
+      })
+    }
+
+    if (userRole === 'student') {
+      items.push({
+        key: 'student-divider',
+        type: 'divider',
+      })
+      items.push({
+        key: 'student-group',
+        label: '学习中心',
+        type: 'group',
+        children: [
+          {
+            key: '/student/mentor',
+            icon: <SolutionOutlined />,
+            label: '我的导师',
+          },
+          {
+            key: '/student/shared',
+            icon: <ShareAltOutlined />,
+            label: '共享资源',
+          },
+          {
+            key: '/student/announcements',
+            icon: <NotificationOutlined />,
+            label: '公告通知',
+          },
+        ],
+      })
+    }
+
+    return items
+  }, [user?.role])
+
+  // 合并菜单项
+  const menuItems = [...baseMenuItems, ...roleMenuItems]
   
   const userMenuItems = [
+    {
+      key: 'role',
+      icon: <CrownOutlined />,
+      label: <RoleBadge role={user?.role || 'student'} />,
+      disabled: true,
+    },
+    { type: 'divider' as const },
     {
       key: 'profile',
       icon: <UserOutlined />,
@@ -328,6 +457,10 @@ const MainLayout = () => {
     if (key === 'logout') {
       logout()
       navigate('/login')
+    } else if (key === 'profile') {
+      navigate('/profile')
+    } else if (key === 'settings') {
+      navigate('/settings')
     }
   }
   
@@ -349,173 +482,213 @@ const MainLayout = () => {
     }
   }
   
-  const showDeleteModal = (id: number) => {
-    setDeleteTarget(id)
+  const showDeleteModal = (convId: number) => {
+    setDeleteTarget(convId)
     setDeleteModalVisible(true)
   }
   
   // 按日期分组对话
-  const groupedConversations = conversations.reduce((groups, conv) => {
-    const date = dayjs(conv.updated_at)
-    const today = dayjs().startOf('day')
+  const groupedConversations = useMemo(() => {
+    const groups: Record<string, Conversation[]> = {
+      '今天': [],
+      '昨天': [],
+      '过去7天': [],
+      '更早': [],
+    }
+    
+    const now = dayjs()
+    const today = now.startOf('day')
     const yesterday = today.subtract(1, 'day')
     const weekAgo = today.subtract(7, 'day')
     
-    let group: string
-    if (date.isAfter(today)) {
-      group = '今天'
-    } else if (date.isAfter(yesterday)) {
-      group = '昨天'
-    } else if (date.isAfter(weekAgo)) {
-      group = '最近 7 天'
-    } else {
-      group = '更早'
-    }
+    conversations.forEach((conv) => {
+      const convDate = dayjs(conv.updated_at)
+      if (convDate.isAfter(today)) {
+        groups['今天'].push(conv)
+      } else if (convDate.isAfter(yesterday)) {
+        groups['昨天'].push(conv)
+      } else if (convDate.isAfter(weekAgo)) {
+        groups['过去7天'].push(conv)
+      } else {
+        groups['更早'].push(conv)
+      }
+    })
     
-    if (!groups[group]) {
-      groups[group] = []
-    }
-    groups[group].push(conv)
     return groups
-  }, {} as Record<string, Conversation[]>)
+  }, [conversations])
   
-  const groupOrder = ['今天', '昨天', '最近 7 天', '更早']
+  const groupOrder = ['今天', '昨天', '过去7天', '更早']
   
+  // 获取当前选中的菜单键
+  const selectedKey = useMemo(() => {
+    const path = location.pathname
+    // 精确匹配
+    if (menuItems.some(item => item.key === path)) {
+      return path
+    }
+    // 检查子菜单
+    for (const item of menuItems) {
+      if ('children' in item && item.children) {
+        const found = item.children.find((child: any) => child.key === path || path.startsWith(child.key + '/'))
+        if (found) return found.key
+      }
+    }
+    // 前缀匹配
+    if (path.startsWith('/chat')) return '/chat'
+    if (path.startsWith('/knowledge')) return '/knowledge'
+    if (path.startsWith('/code')) return '/code'
+    if (path.startsWith('/admin')) return '/admin/users'
+    if (path.startsWith('/mentor')) return '/mentor/students'
+    if (path.startsWith('/student')) return '/student/mentor'
+    return '/dashboard'
+  }, [location.pathname, menuItems])
+
   return (
-    <Layout className="h-screen">
+    <Layout className="h-screen bg-slate-950">
       {/* 侧边栏 */}
       <Sider
-        trigger={null}
-        collapsible
-        collapsed={collapsed}
         width={280}
         collapsedWidth={72}
-        className="!flex !flex-col h-screen"
-        style={{ background: 'linear-gradient(180deg, #0f172a 0%, #1e293b 100%)' }}
+        collapsed={collapsed}
+        className="bg-slate-900/95 border-r border-white/5 flex flex-col"
+        style={{ 
+          height: '100vh',
+          position: 'fixed',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          zIndex: 100,
+          display: 'flex',
+          flexDirection: 'column',
+        }}
       >
-        {/* Logo - 固定高度 */}
-        <div className="h-16 flex items-center justify-center border-b border-white/5 px-4 flex-shrink-0">
-          <motion.div className="flex items-center gap-3" initial={false}>
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
-              <span className="text-white font-bold text-sm">AI</span>
+        {/* Logo区域 - 固定 */}
+        <div className="h-14 flex items-center justify-center px-4 border-b border-white/5 flex-shrink-0">
+          {!collapsed ? (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="flex items-center gap-3"
+            >
+              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center">
+                <span className="text-white font-bold text-lg">R</span>
+              </div>
+              <span className="text-white font-semibold text-lg tracking-tight">研究助手</span>
+            </motion.div>
+          ) : (
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center">
+              <span className="text-white font-bold text-lg">R</span>
             </div>
-            <AnimatePresence>
-              {!collapsed && (
-                <motion.span
-                  initial={{ opacity: 0, width: 0 }}
-                  animate={{ opacity: 1, width: 'auto' }}
-                  exit={{ opacity: 0, width: 0 }}
-                  className="text-white font-semibold text-lg whitespace-nowrap overflow-hidden"
-                >
-                  科研助手
-                </motion.span>
-              )}
-            </AnimatePresence>
-          </motion.div>
+          )}
         </div>
         
-        {/* 新建对话按钮 - 固定高度 */}
+        {/* 新对话按钮 - 固定 */}
         <div className="p-3 flex-shrink-0">
           <Button
             type="primary"
             icon={<PlusOutlined />}
             onClick={handleNewChat}
-            className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 border-none hover:from-emerald-600 hover:to-teal-700 rounded-xl h-10"
-            size={collapsed ? 'middle' : 'large'}
+            className={`w-full h-10 bg-gradient-to-r from-emerald-500 to-cyan-500 border-0 rounded-xl font-medium ${
+              collapsed ? 'px-0' : ''
+            }`}
           >
-            {!collapsed && '新建对话'}
+            {!collapsed && '新对话'}
           </Button>
         </div>
         
-        {/* 主菜单 - 固定高度 */}
-        <div className="flex-shrink-0">
+        {/* 可滚动区域 */}
+        <div className="flex-1 overflow-y-auto flex flex-col min-h-0">
+          {/* 导航菜单 */}
           <Menu
             mode="inline"
-            selectedKeys={[
-              location.pathname.startsWith('/chat') ? '/chat' : 
-              location.pathname.startsWith('/knowledge') ? '/knowledge' : 
-              location.pathname.startsWith('/literature') ? '/literature' : 
-              location.pathname
-            ]}
-            items={menuItems}
+            selectedKeys={[selectedKey]}
             onClick={handleMenuClick}
-            className="border-none bg-transparent"
+            items={menuItems}
+            className="bg-transparent border-none px-2"
+            style={{
+              '--ant-menu-item-bg': 'transparent',
+              '--ant-menu-item-active-bg': 'rgba(16, 185, 129, 0.1)',
+              '--ant-menu-item-selected-bg': 'rgba(16, 185, 129, 0.15)',
+              '--ant-menu-item-color': 'rgb(148, 163, 184)',
+              '--ant-menu-item-hover-color': 'rgb(255, 255, 255)',
+              '--ant-menu-item-selected-color': 'rgb(52, 211, 153)',
+            } as React.CSSProperties}
           />
-        </div>
-        
-        {/* 历史对话区域 - 可滚动 */}
-        {!collapsed && (
-          <div className="flex-1 flex flex-col overflow-hidden px-3 mt-2">
-            {/* 历史对话头部 */}
-            <div 
-              className="flex items-center gap-2 text-xs text-slate-500 mb-2 px-1 py-1 rounded-lg cursor-pointer hover:bg-white/5 transition-all flex-shrink-0"
-              onClick={() => setHistoryExpanded(!historyExpanded)}
-            >
-              <motion.div
-                animate={{ rotate: historyExpanded ? 0 : -90 }}
-                transition={{ duration: 0.2 }}
-              >
-                <DownOutlined className="text-xs" />
-              </motion.div>
-              <HistoryOutlined />
-              <span>历史对话</span>
-              <Badge 
-                count={conversations.length} 
-                size="small"
-                className="ml-auto"
-                style={{ 
-                  backgroundColor: 'rgba(71, 85, 105, 0.5)',
-                  color: 'rgba(148, 163, 184, 1)',
-                  boxShadow: 'none',
-                }}
-              />
-            </div>
-            
-            {/* 对话列表 - 关键滚动区域 */}
-            {historyExpanded && (
+          
+          {/* 对话历史 - 仅在展开时显示 */}
+          {!collapsed && (
+            <div className="flex-1 flex flex-col min-h-0 mt-2 border-t border-white/5 pt-2">
+              {/* 历史标题 */}
               <div 
-                className="flex-1 overflow-y-auto pb-4"
-                style={{
-                  scrollbarWidth: 'thin',
-                  scrollbarColor: 'rgba(100, 116, 139, 0.5) transparent',
-                }}
+                className="flex items-center gap-2 px-4 py-2 text-slate-400 text-sm cursor-pointer hover:text-slate-300 transition-colors flex-shrink-0"
+                onClick={() => setHistoryExpanded(!historyExpanded)}
               >
-                {conversations.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-8 text-slate-500">
-                    <InboxOutlined className="text-3xl mb-2 opacity-50" />
-                    <span className="text-xs">暂无对话</span>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    {groupOrder.map((group) => {
-                      const convs = groupedConversations[group]
-                      if (!convs || convs.length === 0) return null
-                      
-                      return (
-                        <CollapsibleGroup
-                          key={group}
-                          title={group}
-                          count={convs.length}
-                          defaultExpanded={group === '今天' || group === '昨天'}
-                        >
-                          {convs.map((conv) => (
-                            <ConversationItem
-                              key={conv.id}
-                              conv={conv}
-                              isActive={conversationId ? parseInt(conversationId) === conv.id : false}
-                              onClick={() => navigate(`/chat/${conv.id}`)}
-                              onDelete={() => showDeleteModal(conv.id)}
-                            />
-                          ))}
-                        </CollapsibleGroup>
-                      )
-                    })}
-                  </div>
-                )}
+                <motion.div
+                  animate={{ rotate: historyExpanded ? 0 : -90 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <DownOutlined className="text-xs" />
+                </motion.div>
+                <HistoryOutlined />
+                <span>历史对话</span>
+                <Badge 
+                  count={conversations.length} 
+                  size="small"
+                  className="ml-auto"
+                  style={{ 
+                    backgroundColor: 'rgba(71, 85, 105, 0.5)',
+                    color: 'rgba(148, 163, 184, 1)',
+                    boxShadow: 'none',
+                  }}
+                />
               </div>
-            )}
-          </div>
-        )}
+              
+              {/* 对话列表 - 关键滚动区域 */}
+              {historyExpanded && (
+                <div 
+                  className="flex-1 overflow-y-auto pb-4"
+                  style={{
+                    scrollbarWidth: 'thin',
+                    scrollbarColor: 'rgba(100, 116, 139, 0.5) transparent',
+                  }}
+                >
+                  {conversations.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-8 text-slate-500">
+                      <InboxOutlined className="text-3xl mb-2 opacity-50" />
+                      <span className="text-xs">暂无对话</span>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {groupOrder.map((group) => {
+                        const convs = groupedConversations[group]
+                        if (!convs || convs.length === 0) return null
+                        
+                        return (
+                          <CollapsibleGroup
+                            key={group}
+                            title={group}
+                            count={convs.length}
+                            defaultExpanded={group === '今天' || group === '昨天'}
+                          >
+                            {convs.map((conv) => (
+                              <ConversationItem
+                                key={conv.id}
+                                conv={conv}
+                                isActive={conversationId ? parseInt(conversationId) === conv.id : false}
+                                onClick={() => navigate(`/chat/${conv.id}`)}
+                                onDelete={() => showDeleteModal(conv.id)}
+                              />
+                            ))}
+                          </CollapsibleGroup>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
         
         {/* 折叠按钮 - 固定在底部 */}
         <div className="p-3 border-t border-white/5 flex-shrink-0">
@@ -529,7 +702,7 @@ const MainLayout = () => {
       </Sider>
       
       {/* 主内容区 */}
-      <Layout className="bg-slate-950">
+      <Layout className="bg-slate-950" style={{ marginLeft: collapsed ? 72 : 280, transition: 'margin-left 0.2s' }}>
         {/* 顶部栏 */}
         <Header className="h-14 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl" style={{ zIndex: 100 }}>
           {/* 搜索 */}
@@ -633,9 +806,13 @@ const MainLayout = () => {
                 <Avatar
                   size={36}
                   icon={<UserOutlined />}
+                  src={user?.avatar}
                   className="bg-gradient-to-br from-blue-500 to-indigo-600"
                 />
-                <span className="text-slate-300 hidden md:inline">{user?.username}</span>
+                <div className="hidden md:flex flex-col">
+                  <span className="text-slate-300 text-sm leading-tight">{user?.username}</span>
+                  <span className="text-slate-500 text-xs leading-tight">{user?.role === 'admin' ? '管理员' : user?.role === 'mentor' ? '导师' : '学生'}</span>
+                </div>
               </div>
             </Dropdown>
           </div>

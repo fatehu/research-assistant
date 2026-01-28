@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 
+from app.models.role import UserRole
+
 
 class UserBase(BaseModel):
     """用户基础模式"""
@@ -31,6 +33,8 @@ class UserUpdate(BaseModel):
     avatar: Optional[str] = None
     preferred_llm_provider: Optional[str] = None
     preferences: Optional[dict] = None
+    department: Optional[str] = None
+    research_direction: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -48,6 +52,12 @@ class UserResponse(BaseModel):
     preferences: dict
     created_at: datetime
     last_login: Optional[datetime] = None
+    # 角色相关
+    role: UserRole = UserRole.STUDENT
+    mentor_id: Optional[int] = None
+    department: Optional[str] = None
+    research_direction: Optional[str] = None
+    joined_at: Optional[datetime] = None
 
 
 class Token(BaseModel):

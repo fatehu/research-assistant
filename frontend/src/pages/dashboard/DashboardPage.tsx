@@ -13,11 +13,17 @@ import {
   LoadingOutlined,
   ArrowRightOutlined,
   ClockCircleOutlined,
+  TeamOutlined,
+  UserOutlined,
+  CrownOutlined,
 } from '@ant-design/icons'
 import { motion } from 'framer-motion'
 import { useAuthStore } from '@/stores/authStore'
 import { useChatStore } from '@/stores/chatStore'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
+import { useMentorshipStore } from '@/stores/mentorshipStore'
+import { RoleBadge } from '@/components/ui'
+import { StudentActivities } from '@/components/team/MentorDashboard'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import 'dayjs/locale/zh-cn'
@@ -29,15 +35,34 @@ const { TextArea } = Input
 
 const DashboardPage = () => {
   const navigate = useNavigate()
-  const { user } = useAuthStore()
+  const { user, isMentor, isStudent, isAdmin } = useAuthStore()
   const { conversations, createConversation, isSending } = useChatStore()
   const { knowledgeBases, totalKnowledgeBases, fetchKnowledgeBases } = useKnowledgeStore()
+  const { 
+    myMentorship, 
+    myStudents, 
+    studentActivities,
+    pendingCount,
+    fetchMyMentorship,
+    fetchPendingRequests,
+    fetchMyStudents,
+    fetchPendingCount,
+  } = useMentorshipStore()
   const [quickInput, setQuickInput] = useState('')
   
-  // 获取知识库列表
+  // 获取知识库列表和角色相关数据
   useEffect(() => {
     fetchKnowledgeBases()
-  }, [])
+    
+    // 根据角色加载数据
+    if (isStudent()) {
+      fetchMyMentorship()
+    } else if (isMentor()) {
+      fetchPendingRequests()
+      fetchMyStudents()
+      fetchPendingCount()
+    }
+  }, [user?.role])
   
   // 计算知识库总文档数
   const totalDocuments = knowledgeBases.reduce((sum, kb) => sum + kb.document_count, 0)
@@ -64,7 +89,7 @@ const DashboardPage = () => {
     }
   }
   
-  // 快捷入口卡片
+  // 快捷入口卡片（根据角色调整）
   const quickAccessCards = [
     {
       icon: <MessageOutlined className="text-2xl" />,
@@ -75,31 +100,29 @@ const DashboardPage = () => {
       path: '/chat',
     },
     {
+      icon: <TeamOutlined className="text-2xl" />,
+      title: isMentor() ? '学生管理' : '我的团队',
+      desc: isMentor() ? '管理指导关系' : '选择导师',
+      gradient: 'from-violet-500 to-purple-600',
+      shadow: 'shadow-violet-500/20',
+      path: '/student/mentor',
+      badge: isMentor() && pendingCount > 0 ? pendingCount : undefined,
+    },
+    {
       icon: <DatabaseOutlined className="text-2xl" />,
       title: '知识库',
       desc: '文档管理与检索',
-      gradient: 'from-violet-500 to-purple-600',
-      shadow: 'shadow-violet-500/20',
+      gradient: 'from-blue-500 to-indigo-600',
+      shadow: 'shadow-blue-500/20',
       path: '/knowledge',
-      disabled: false,  // 已启用
     },
     {
       icon: <BookOutlined className="text-2xl" />,
       title: '文献管理',
       desc: '论文搜索与收藏',
-      gradient: 'from-blue-500 to-indigo-600',
-      shadow: 'shadow-blue-500/20',
-      path: '/literature',
-      disabled: false,
-    },
-    {
-      icon: <ExperimentOutlined className="text-2xl" />,
-      title: '代码实验',
-      desc: '在线运行代码',
       gradient: 'from-amber-500 to-orange-600',
       shadow: 'shadow-amber-500/20',
-      path: '/code',
-      disabled: false,
+      path: '/literature',
     },
   ]
   
@@ -136,15 +159,31 @@ const DashboardPage = () => {
                     <ThunderboltOutlined className="text-emerald-400" />
                   </div>
                   <span className="text-slate-400 text-sm font-medium">科研助手 · 智能工作台</span>
+                  {user?.role && (
+                    <RoleBadge role={user.role} />
+                  )}
                 </div>
                 
                 <h1 className="text-3xl font-bold text-white mb-2">
                   {getGreeting()}，{user?.full_name || user?.username}
                 </h1>
                 <p className="text-slate-400 mb-8 text-base">
-                  我可以帮你解答科研问题、分析数据、撰写论文。
-                  {totalDocuments > 0 && (
-                    <span className="text-emerald-400"> 已接入你的 {totalDocuments} 篇知识文档！</span>
+                  {isMentor() && myStudents.length > 0 ? (
+                    <>
+                      你目前指导 <span className="text-emerald-400">{myStudents.length}</span> 名学生
+                      {pendingCount > 0 && (
+                        <span className="text-amber-400">，有 {pendingCount} 份待处理申请</span>
+                      )}
+                    </>
+                  ) : isStudent() && !myMentorship ? (
+                    <>还没有选择导师？前往 <span className="text-violet-400 cursor-pointer hover:underline" onClick={() => navigate('/student/mentor')}>我的导师</span> 找到合适的导师</>
+                  ) : (
+                    <>
+                      我可以帮你解答科研问题、分析数据、撰写论文。
+                      {totalDocuments > 0 && (
+                        <span className="text-emerald-400"> 已接入你的 {totalDocuments} 篇知识文档！</span>
+                      )}
+                    </>
                   )}
                 </p>
                 
@@ -205,8 +244,20 @@ const DashboardPage = () => {
             {[
               { title: '对话总数', value: conversations.length, icon: <MessageOutlined />, color: '#10b981' },
               { title: '知识文档', value: totalDocuments, icon: <FileTextOutlined />, color: '#8b5cf6', suffix: '篇' },
-              { title: '知识库', value: totalKnowledgeBases, icon: <DatabaseOutlined />, color: '#3b82f6', suffix: '个' },
-              { title: '代码运行', value: 0, icon: <ExperimentOutlined />, color: '#f59e0b', suffix: '次' },
+              { 
+                title: isMentor() ? '我的学生' : '知识库', 
+                value: isMentor() ? myStudents.length : totalKnowledgeBases, 
+                icon: isMentor() ? <UserOutlined /> : <DatabaseOutlined />, 
+                color: '#3b82f6', 
+                suffix: isMentor() ? '人' : '个' 
+              },
+              { 
+                title: isMentor() ? '待处理申请' : '代码运行', 
+                value: isMentor() ? pendingCount : 0, 
+                icon: isMentor() ? <ClockCircleOutlined /> : <ExperimentOutlined />, 
+                color: isMentor() && pendingCount > 0 ? '#f59e0b' : '#f59e0b', 
+                suffix: isMentor() ? '份' : '次' 
+              },
             ].map((stat, index) => (
               <Col xs={12} sm={6} key={index}>
                 <motion.div
@@ -246,18 +297,20 @@ const DashboardPage = () => {
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ delay: 0.25 + index * 0.05 }}
-                  whileHover={{ scale: card.disabled ? 1 : 1.02, y: card.disabled ? 0 : -4 }}
-                  whileTap={{ scale: card.disabled ? 1 : 0.98 }}
+                  whileHover={{ scale: 1.02, y: -4 }}
+                  whileTap={{ scale: 0.98 }}
                 >
                   <Card
-                    className={`rounded-2xl cursor-pointer transition-all duration-300 h-full ${
-                      card.disabled
-                        ? 'opacity-40 cursor-not-allowed border-slate-800 bg-slate-800/20'
-                        : 'border-slate-700/50 bg-slate-800/40 hover:border-emerald-500/30'
-                    }`}
-                    onClick={() => !card.disabled && navigate(card.path)}
+                    className="rounded-2xl cursor-pointer transition-all duration-300 h-full border-slate-700/50 bg-slate-800/40 hover:border-emerald-500/30"
+                    onClick={() => navigate(card.path)}
                   >
-                    <div className="flex flex-col items-center text-center py-4">
+                    <div className="flex flex-col items-center text-center py-4 relative">
+                      {/* 徽章 */}
+                      {card.badge && (
+                        <div className="absolute -top-2 -right-2 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center text-white text-xs font-bold shadow-lg">
+                          {card.badge}
+                        </div>
+                      )}
                       <div
                         className={`w-14 h-14 rounded-2xl bg-gradient-to-br ${card.gradient} flex items-center justify-center text-white mb-4 ${card.shadow} shadow-lg`}
                       >
@@ -265,11 +318,6 @@ const DashboardPage = () => {
                       </div>
                       <h3 className="text-white font-semibold mb-1">{card.title}</h3>
                       <p className="text-slate-500 text-sm">{card.desc}</p>
-                      {card.disabled && (
-                        <span className="text-xs text-slate-600 mt-3 bg-slate-800 px-2 py-1 rounded-full">
-                          即将开放
-                        </span>
-                      )}
                     </div>
                   </Card>
                 </motion.div>
@@ -277,6 +325,32 @@ const DashboardPage = () => {
             ))}
           </Row>
         </motion.div>
+
+        {/* 导师专属：学生活动 */}
+        {isMentor() && studentActivities.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.25 }}
+          >
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center gap-2">
+                <UserOutlined className="text-violet-400" />
+                <h2 className="text-lg font-semibold text-white">学生动态</h2>
+              </div>
+              <Button 
+                type="text" 
+                className="text-slate-400 hover:text-violet-400"
+                onClick={() => navigate('/student/mentor')}
+              >
+                查看全部 <ArrowRightOutlined />
+              </Button>
+            </div>
+            <Card className="rounded-2xl border-slate-800 bg-slate-800/30">
+              <StudentActivities activities={studentActivities.slice(0, 5)} />
+            </Card>
+          </motion.div>
+        )}
         
         {/* 最近对话 */}
         <motion.div

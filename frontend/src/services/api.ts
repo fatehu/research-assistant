@@ -1075,4 +1075,565 @@ function getToken(): string {
   return ''
 }
 
+// ========== 角色系统类型定义 ==========
+
+export enum UserRole {
+  ADMIN = 'admin',
+  MENTOR = 'mentor', 
+  STUDENT = 'student',
+}
+
+export enum InvitationStatus {
+  PENDING = 'pending',
+  ACCEPTED = 'accepted',
+  REJECTED = 'rejected',
+  CANCELLED = 'cancelled',
+}
+
+export enum ShareType {
+  KNOWLEDGE_BASE = 'knowledge_base',
+  PAPER_COLLECTION = 'paper_collection',
+  NOTEBOOK = 'notebook',
+}
+
+export enum SharePermission {
+  READ = 'read',
+  WRITE = 'write',
+  ADMIN = 'admin',
+}
+
+// 师生关系状态
+export enum MentorshipStatus {
+  NONE = 'none',           // 无导师
+  PENDING = 'pending',     // 申请中
+  ACTIVE = 'active',       // 已建立关系
+  INVITED = 'invited',     // 被邀请
+}
+
+// 用户信息（扩展了角色字段）
+export interface UserWithRole {
+  id: number
+  email: string
+  username: string
+  full_name?: string
+  avatar?: string
+  bio?: string
+  role: UserRole
+  mentor_id?: number
+  department?: string
+  research_direction?: string
+  joined_at?: string
+  is_active: boolean
+  created_at: string
+  last_login?: string
+}
+
+// 学生详情（含统计）
+export interface StudentDetail extends UserWithRole {
+  conversation_count: number
+  knowledge_base_count: number
+  paper_count: number
+  notebook_count: number
+}
+
+// 研究组
+export interface ResearchGroup {
+  id: number
+  name: string
+  description?: string
+  mentor_id: number
+  avatar?: string
+  is_active: boolean
+  max_members: number
+  member_count?: number
+  members?: GroupMember[]
+  created_at: string
+}
+
+// 组成员
+export interface GroupMember {
+  id: number
+  group_id: number
+  user_id: number
+  role: string
+  joined_at: string
+  user?: UserWithRole
+}
+
+// 邀请
+export interface Invitation {
+  id: number
+  type: 'invite' | 'apply'
+  from_user_id: number
+  to_user_id: number
+  group_id?: number
+  message?: string
+  status: InvitationStatus
+  responded_at?: string
+  created_at: string
+  expires_at?: string
+  from_user?: UserWithRole
+  to_user?: UserWithRole
+  group?: ResearchGroup
+}
+
+// 共享资源
+export interface SharedResource {
+  id: number
+  resource_type: ShareType
+  resource_id: number
+  owner_id: number
+  shared_with_type: 'user' | 'group' | 'all_students'
+  shared_with_id?: number
+  permission: SharePermission
+  created_at: string
+  expires_at?: string
+  owner?: UserWithRole
+  resource_name?: string
+}
+
+// 公告
+export interface Announcement {
+  id: number
+  mentor_id: number
+  group_id?: number
+  title: string
+  content: string
+  is_pinned: boolean
+  is_active: boolean
+  created_at: string
+  updated_at: string
+  mentor?: UserWithRole
+  group?: ResearchGroup
+  is_read?: boolean
+  read_count?: number
+}
+
+// 系统统计
+export interface SystemStatistics {
+  total_users: number
+  admin_count: number
+  mentor_count: number
+  student_count: number
+  active_users: number
+  total_conversations: number
+  total_knowledge_bases: number
+  total_papers: number
+  total_notebooks: number
+}
+
+// ========== 管理员 API ==========
+
+export const adminApi = {
+  // 获取所有用户
+  getUsers: async (params?: {
+    skip?: number
+    limit?: number
+    role?: UserRole
+    search?: string
+    is_active?: boolean
+  }): Promise<UserWithRole[]> => {
+    const response = await api.get('/api/admin/users', { params })
+    return response.data
+  },
+
+  // 获取用户详情
+  getUser: async (userId: number): Promise<UserWithRole> => {
+    const response = await api.get(`/api/admin/users/${userId}`)
+    return response.data
+  },
+
+  // 更新用户角色
+  updateUserRole: async (userId: number, role: UserRole): Promise<UserWithRole> => {
+    const response = await api.put(`/api/admin/users/${userId}/role`, { role })
+    return response.data
+  },
+
+  // 切换用户激活状态
+  toggleUserActive: async (userId: number): Promise<{ is_active: boolean }> => {
+    const response = await api.put(`/api/admin/users/${userId}/toggle-active`)
+    return response.data
+  },
+
+  // 删除用户
+  deleteUser: async (userId: number): Promise<void> => {
+    await api.delete(`/api/admin/users/${userId}`)
+  },
+
+  // 获取系统统计
+  getStatistics: async (): Promise<SystemStatistics> => {
+    const response = await api.get('/api/admin/statistics')
+    return response.data
+  },
+
+  // 设置用户导师
+  setUserMentor: async (userId: number, mentorId: number | null): Promise<UserWithRole> => {
+    const response = await api.put(`/api/admin/users/${userId}/mentor`, { mentor_id: mentorId })
+    return response.data
+  },
+}
+
+// ========== 导师 API ==========
+
+export const mentorApi = {
+  // 获取我的学生列表
+  getStudents: async (): Promise<StudentDetail[]> => {
+    const response = await api.get('/api/mentor/students')
+    return response.data
+  },
+
+  // 获取学生详情
+  getStudentDetail: async (studentId: number): Promise<StudentDetail> => {
+    const response = await api.get(`/api/mentor/students/${studentId}`)
+    return response.data
+  },
+
+  // 邀请学生
+  inviteStudent: async (email: string, message?: string): Promise<Invitation> => {
+    const response = await api.post('/api/mentor/students/invite', { email, message })
+    return response.data
+  },
+
+  // 移除学生
+  removeStudent: async (studentId: number): Promise<void> => {
+    await api.delete(`/api/mentor/students/${studentId}`)
+  },
+
+  // 获取发出的邀请
+  getSentInvitations: async (): Promise<Invitation[]> => {
+    const response = await api.get('/api/mentor/invitations/sent')
+    return response.data
+  },
+
+  // 取消邀请
+  cancelInvitation: async (invitationId: number): Promise<void> => {
+    await api.delete(`/api/mentor/invitations/${invitationId}`)
+  },
+
+  // 处理学生申请
+  handleApplication: async (invitationId: number, accept: boolean): Promise<void> => {
+    const response = await api.post(`/api/mentor/applications/${invitationId}/${accept ? 'accept' : 'reject'}`)
+    return response.data
+  },
+
+  // 获取研究组列表
+  getGroups: async (): Promise<ResearchGroup[]> => {
+    const response = await api.get('/api/mentor/groups')
+    return response.data
+  },
+
+  // 创建研究组
+  createGroup: async (data: {
+    name: string
+    description?: string
+    max_members?: number
+  }): Promise<ResearchGroup> => {
+    const response = await api.post('/api/mentor/groups', data)
+    return response.data
+  },
+
+  // 更新研究组
+  updateGroup: async (groupId: number, data: {
+    name?: string
+    description?: string
+    max_members?: number
+    is_active?: boolean
+  }): Promise<ResearchGroup> => {
+    const response = await api.put(`/api/mentor/groups/${groupId}`, data)
+    return response.data
+  },
+
+  // 删除研究组
+  deleteGroup: async (groupId: number): Promise<void> => {
+    await api.delete(`/api/mentor/groups/${groupId}`)
+  },
+
+  // 获取组成员
+  getGroupMembers: async (groupId: number): Promise<GroupMember[]> => {
+    const response = await api.get(`/api/mentor/groups/${groupId}/members`)
+    return response.data
+  },
+
+  // 添加组成员
+  addGroupMember: async (groupId: number, userId: number): Promise<GroupMember> => {
+    const response = await api.post(`/api/mentor/groups/${groupId}/members`, { user_id: userId })
+    return response.data
+  },
+
+  // 移除组成员
+  removeGroupMember: async (groupId: number, userId: number): Promise<void> => {
+    await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`)
+  },
+}
+
+// ========== 学生 API ==========
+
+export const studentApi = {
+  // 获取我的导师
+  getMentor: async (): Promise<UserWithRole | null> => {
+    try {
+      const response = await api.get('/api/student/mentor')
+      return response.data
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return null
+      }
+      throw error
+    }
+  },
+
+  // 搜索导师
+  searchMentors: async (query: string): Promise<UserWithRole[]> => {
+    const response = await api.get('/api/student/mentors/search', { params: { query } })
+    return response.data
+  },
+
+  // 申请导师
+  applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
+    const response = await api.post('/api/student/mentor/apply', { mentor_id: mentorId, message })
+    return response.data
+  },
+
+  // 离开导师
+  leaveMentor: async (): Promise<void> => {
+    await api.delete('/api/student/mentor/leave')
+  },
+
+  // 获取我的申请
+  getMyApplications: async (): Promise<Invitation[]> => {
+    const response = await api.get('/api/student/applications')
+    return response.data
+  },
+
+  // 取消申请
+  cancelApplication: async (invitationId: number): Promise<void> => {
+    await api.delete(`/api/student/applications/${invitationId}`)
+  },
+
+  // 获取收到的邀请
+  getReceivedInvitations: async (): Promise<Invitation[]> => {
+    const response = await api.get('/api/student/invitations')
+    return response.data
+  },
+
+  // 接受邀请
+  acceptInvitation: async (invitationId: number): Promise<void> => {
+    await api.post(`/api/student/invitations/${invitationId}/accept`)
+  },
+
+  // 拒绝邀请
+  rejectInvitation: async (invitationId: number): Promise<void> => {
+    await api.post(`/api/student/invitations/${invitationId}/reject`)
+  },
+
+  // 获取我加入的研究组
+  getMyGroups: async (): Promise<ResearchGroup[]> => {
+    const response = await api.get('/api/student/groups')
+    return response.data
+  },
+}
+
+// ========== 邀请 API ==========
+
+export const invitationApi = {
+  // 获取我的所有邀请（收到和发出的）
+  getAll: async (): Promise<Invitation[]> => {
+    const response = await api.get('/api/invitations')
+    return response.data
+  },
+
+  // 接受邀请
+  accept: async (invitationId: number): Promise<void> => {
+    await api.post(`/api/invitations/${invitationId}/accept`)
+  },
+
+  // 拒绝邀请
+  reject: async (invitationId: number): Promise<void> => {
+    await api.post(`/api/invitations/${invitationId}/reject`)
+  },
+
+  // 取消邀请
+  cancel: async (invitationId: number): Promise<void> => {
+    await api.delete(`/api/invitations/${invitationId}`)
+  },
+}
+
+// ========== 共享资源 API ==========
+
+export const shareApi = {
+  // 获取共享给我的资源
+  getSharedWithMe: async (): Promise<SharedResource[]> => {
+    const response = await api.get('/api/share/received')
+    return response.data
+  },
+
+  // 获取我共享出去的资源
+  getMyShares: async (): Promise<SharedResource[]> => {
+    const response = await api.get('/api/share/sent')
+    return response.data
+  },
+
+  // 共享资源
+  shareResource: async (data: {
+    resource_type: ShareType
+    resource_id: number
+    shared_with_type: 'user' | 'group' | 'all_students'
+    shared_with_id?: number
+    permission?: SharePermission
+    expires_at?: string
+  }): Promise<SharedResource> => {
+    const response = await api.post('/api/share', data)
+    return response.data
+  },
+
+  // 更新共享权限
+  updatePermission: async (shareId: number, permission: SharePermission): Promise<SharedResource> => {
+    const response = await api.put(`/api/share/${shareId}`, { permission })
+    return response.data
+  },
+
+  // 取消共享
+  removeShare: async (shareId: number): Promise<void> => {
+    await api.delete(`/api/share/${shareId}`)
+  },
+}
+
+// ========== 公告 API ==========
+
+export const announcementApi = {
+  // 获取公告列表（学生看到的）
+  getAnnouncements: async (): Promise<Announcement[]> => {
+    const response = await api.get('/api/announcements')
+    return response.data
+  },
+
+  // 获取我发布的公告（导师）
+  getMyAnnouncements: async (): Promise<Announcement[]> => {
+    const response = await api.get('/api/announcements/my')
+    return response.data
+  },
+
+  // 创建公告
+  createAnnouncement: async (data: {
+    title: string
+    content: string
+    group_id?: number
+    is_pinned?: boolean
+  }): Promise<Announcement> => {
+    const response = await api.post('/api/announcements', data)
+    return response.data
+  },
+
+  // 更新公告
+  updateAnnouncement: async (announcementId: number, data: {
+    title?: string
+    content?: string
+    is_pinned?: boolean
+    is_active?: boolean
+  }): Promise<Announcement> => {
+    const response = await api.put(`/api/announcements/${announcementId}`, data)
+    return response.data
+  },
+
+  // 删除公告
+  deleteAnnouncement: async (announcementId: number): Promise<void> => {
+    await api.delete(`/api/announcements/${announcementId}`)
+  },
+
+  // 标记已读
+  markAsRead: async (announcementId: number): Promise<void> => {
+    await api.post(`/api/announcements/${announcementId}/read`)
+  },
+
+  // 获取公告阅读统计
+  getReadStats: async (announcementId: number): Promise<{
+    total_count: number
+    read_count: number
+    readers: Array<{ user_id: number; username: string; read_at: string }>
+  }> => {
+    const response = await api.get(`/api/announcements/${announcementId}/stats`)
+    return response.data
+  },
+}
+
+// ========== 师生关系 API ==========
+
+export const mentorshipApi = {
+  // 获取当前师生关系状态
+  getStatus: async (): Promise<{
+    status: MentorshipStatus
+    mentor?: UserWithRole
+    pendingInvitations?: Invitation[]
+    pendingApplications?: Invitation[]
+  }> => {
+    try {
+      const mentor = await studentApi.getMentor()
+      if (mentor) {
+        return { status: MentorshipStatus.ACTIVE, mentor }
+      }
+      
+      // 检查是否有待处理的邀请或申请
+      const invitations = await invitationApi.getAll()
+      const pendingInvitations = invitations.filter(i => i.type === 'invite' && i.status === 'pending')
+      const pendingApplications = invitations.filter(i => i.type === 'apply' && i.status === 'pending')
+      
+      if (pendingInvitations.length > 0) {
+        return { status: MentorshipStatus.INVITED, pendingInvitations }
+      }
+      if (pendingApplications.length > 0) {
+        return { status: MentorshipStatus.PENDING, pendingApplications }
+      }
+      
+      return { status: MentorshipStatus.NONE }
+    } catch (error) {
+      return { status: MentorshipStatus.NONE }
+    }
+  },
+
+  // 获取导师信息
+  getMentor: async (): Promise<UserWithRole | null> => {
+    return studentApi.getMentor()
+  },
+
+  // 搜索可用导师
+  searchMentors: async (query: string): Promise<UserWithRole[]> => {
+    return studentApi.searchMentors(query)
+  },
+
+  // 申请成为某导师的学生
+  applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
+    return studentApi.applyToMentor(mentorId, message)
+  },
+
+  // 离开当前导师
+  leaveMentor: async (): Promise<void> => {
+    return studentApi.leaveMentor()
+  },
+
+  // 接受导师邀请
+  acceptInvitation: async (invitationId: number): Promise<void> => {
+    return studentApi.acceptInvitation(invitationId)
+  },
+
+  // 拒绝导师邀请
+  rejectInvitation: async (invitationId: number): Promise<void> => {
+    return studentApi.rejectInvitation(invitationId)
+  },
+
+  // 取消申请
+  cancelApplication: async (invitationId: number): Promise<void> => {
+    return studentApi.cancelApplication(invitationId)
+  },
+
+  // 获取我的申请列表
+  getMyApplications: async (): Promise<Invitation[]> => {
+    return studentApi.getMyApplications()
+  },
+
+  // 获取收到的邀请
+  getReceivedInvitations: async (): Promise<Invitation[]> => {
+    return studentApi.getReceivedInvitations()
+  },
+}
+
 export default api

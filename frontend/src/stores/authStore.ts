@@ -1,13 +1,40 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { authApi, User } from '@/services/api'
+import { authApi } from '@/services/api'
+
+// 用户角色枚举
+export enum UserRole {
+  ADMIN = 'admin',
+  MENTOR = 'mentor',
+  STUDENT = 'student',
+}
+
+// 用户接口（扩展了角色字段）
+export interface User {
+  id: number
+  email: string
+  username: string
+  full_name?: string
+  avatar?: string
+  bio?: string
+  role: UserRole  // 新增：用户角色
+  mentor_id?: number  // 新增：导师ID（学生才有）
+  department?: string  // 新增：所属院系
+  research_direction?: string  // 新增：研究方向
+  joined_at?: string  // 新增：加入导师组时间
+  is_active: boolean
+  preferred_llm_provider: string
+  preferences: Record<string, unknown>
+  created_at: string
+  last_login?: string
+}
 
 interface AuthState {
   user: User | null
   token: string | null
   isAuthenticated: boolean
   isLoading: boolean
-  isInitialized: boolean  // 是否已初始化
+  isInitialized: boolean
   
   // Actions
   login: (email: string, password: string) => Promise<void>
@@ -15,6 +42,12 @@ interface AuthState {
   logout: () => void
   updateUser: (user: Partial<User>) => void
   checkAuth: () => Promise<void>
+  
+  // 角色相关辅助方法
+  isAdmin: () => boolean
+  isMentor: () => boolean
+  isStudent: () => boolean
+  hasRole: (role: UserRole) => boolean
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -30,8 +63,13 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.login(email, password)
+          // 确保用户有角色字段，默认为 student
+          const user = {
+            ...response.user,
+            role: response.user.role || UserRole.STUDENT,
+          }
           set({
-            user: response.user,
+            user,
             token: response.access_token,
             isAuthenticated: true,
             isLoading: false,
@@ -47,8 +85,13 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.register(email, username, password, fullName)
+          // 新注册用户默认为 student
+          const user = {
+            ...response.user,
+            role: response.user.role || UserRole.STUDENT,
+          }
           set({
-            user: response.user,
+            user,
             token: response.access_token,
             isAuthenticated: true,
             isLoading: false,
@@ -93,11 +136,37 @@ export const useAuthStore = create<AuthState>()(
         // 后台验证 token 有效性（不阻塞）
         try {
           const userData = await authApi.me()
-          set({ user: userData, isAuthenticated: true, isInitialized: true })
+          // 确保用户有角色字段
+          const userWithRole = {
+            ...userData,
+            role: userData.role || UserRole.STUDENT,
+          }
+          set({ user: userWithRole as User, isAuthenticated: true, isInitialized: true })
         } catch {
           // token 无效，清除状态
           set({ user: null, token: null, isAuthenticated: false, isInitialized: true })
         }
+      },
+      
+      // 角色辅助方法
+      isAdmin: () => {
+        const { user } = get()
+        return user?.role === UserRole.ADMIN
+      },
+      
+      isMentor: () => {
+        const { user } = get()
+        return user?.role === UserRole.MENTOR
+      },
+      
+      isStudent: () => {
+        const { user } = get()
+        return user?.role === UserRole.STUDENT
+      },
+      
+      hasRole: (role: UserRole) => {
+        const { user } = get()
+        return user?.role === role
       },
     }),
     {
