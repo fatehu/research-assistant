@@ -935,140 +935,48 @@ async def init_user_literature(
     """初始化用户的文献管理（创建默认收藏夹）"""
     # 预定义的收藏夹配置
     default_collection_configs = [
-        {
-            "name": "所有论文",
-            "description": "所有保存的论文",
-            "color": "#3b82f6",
-            "icon": "folder",
-            "collection_type": "default",
-            "is_default": True
-        },
-        {
-            "name": "待读",
-            "description": "待阅读的论文",
-            "color": "#f59e0b",
-            "icon": "clock",
-            "collection_type": "reading_list",
-            "is_default": False
-        },
-        {
-            "name": "已读",
-            "description": "已阅读的论文",
-            "color": "#10b981",
-            "icon": "check",
-            "collection_type": "reading_list",
-            "is_default": False
-        },
-        {
-            "name": "收藏",
-            "description": "重要论文",
-            "color": "#ef4444",
-            "icon": "star",
-            "collection_type": "custom",
-            "is_default": False
-        }
+        ("所有论文", "所有保存的论文", "#3b82f6", "folder", "default", True),
+        ("待读", "待阅读的论文", "#f59e0b", "clock", "reading_list", False),
+        ("已读", "已阅读的论文", "#10b981", "check", "reading_list", False),
+        ("收藏", "重要论文", "#ef4444", "star", "custom", False),
     ]
     
-    # 获取用户现有的所有收藏夹
-    stmt = select(PaperCollection).where(
-        PaperCollection.user_id == current_user.id
-    ).with_for_update(skip_locked=True)
-    result = await db.execute(stmt)
-    existing_collections = result.scalars().all()
+    # 一次性查询所有已存在的收藏夹名称
+    existing_result = await db.execute(
+        select(PaperCollection.name).where(
+            PaperCollection.user_id == current_user.id
+        )
+    )
+    existing_names = set(row[0] for row in existing_result.fetchall())
     
-    # 按名称分组现有收藏夹
-    collections_by_name = {}
-    for coll in existing_collections:
-        if coll.name not in collections_by_name:
-            collections_by_name[coll.name] = []
-        collections_by_name[coll.name].append(coll)
+    # 如果已有所有默认收藏夹，直接返回
+    default_names = set(config[0] for config in default_collection_configs)
+    if default_names.issubset(existing_names):
+        return {"message": "已初始化"}
     
+    # 只创建不存在的收藏夹
     created_count = 0
-    cleaned_count = 0
-    
-    # 处理每个预定义收藏夹
-    for config in default_collection_configs:
-        name = config["name"]
-        existing = collections_by_name.get(name, [])
-        
-        if len(existing) == 0:
-            # 不存在，创建新的
+    for name, description, color, icon, coll_type, is_default in default_collection_configs:
+        if name not in existing_names:
             new_coll = PaperCollection(
                 user_id=current_user.id,
-                name=config["name"],
-                description=config["description"],
-                color=config["color"],
-                icon=config["icon"],
-                collection_type=config["collection_type"],
-                is_default=config["is_default"]
+                name=name,
+                description=description,
+                color=color,
+                icon=icon,
+                collection_type=coll_type,
+                is_default=is_default
             )
             db.add(new_coll)
             created_count += 1
-        elif len(existing) > 1:
-            # 有重复，保留第一个，删除其他
-            keep_coll = existing[0]
-            for dup_coll in existing[1:]:
-                # 将重复收藏夹中的论文移到保留的收藏夹
-                paper_stmt = select(paper_collection_association.c.paper_id).where(
-                    paper_collection_association.c.collection_id == dup_coll.id
-                )
-                paper_result = await db.execute(paper_stmt)
-                paper_ids = [row[0] for row in paper_result.fetchall()]
-                
-                for paper_id in paper_ids:
-                    # 检查论文是否已在保留的收藏夹中
-                    exists_stmt = select(paper_collection_association).where(
-                        and_(
-                            paper_collection_association.c.paper_id == paper_id,
-                            paper_collection_association.c.collection_id == keep_coll.id
-                        )
-                    )
-                    exists_result = await db.execute(exists_stmt)
-                    if not exists_result.first():
-                        await db.execute(
-                            paper_collection_association.insert().values(
-                                paper_id=paper_id,
-                                collection_id=keep_coll.id
-                            )
-                        )
-                
-                # 删除重复收藏夹的关联和收藏夹本身
-                await db.execute(
-                    delete(paper_collection_association).where(
-                        paper_collection_association.c.collection_id == dup_coll.id
-                    )
-                )
-                await db.delete(dup_coll)
-                cleaned_count += 1
-            
-            # 更新保留收藏夹的论文计数
-            count_stmt = select(func.count()).select_from(paper_collection_association).where(
-                paper_collection_association.c.collection_id == keep_coll.id
-            )
-            count_result = await db.execute(count_stmt)
-            paper_count = count_result.scalar() or 0
-            keep_coll.paper_count = paper_count
     
-    try:
-        await db.commit()
-        if cleaned_count > 0:
-            logger.info(f"[Literature API] 用户 {current_user.id}: 清理了 {cleaned_count} 个重复收藏夹")
-            return {"message": f"已初始化，清理了 {cleaned_count} 个重复收藏夹", "created": created_count, "cleaned": cleaned_count}
-        elif created_count > 0:
-            return {"message": "初始化成功", "created": created_count}
-        else:
+    if created_count > 0:
+        try:
+            await db.commit()
+            return {"message": f"初始化成功，创建了 {created_count} 个收藏夹"}
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"[Literature API] 初始化时发生冲突: {e}")
             return {"message": "已初始化"}
-    except Exception as e:
-        await db.rollback()
-        logger.error(f"[Literature API] 初始化失败: {e}")
-        # 检查是否是并发创建导致的
-        check_stmt = select(PaperCollection).where(
-            and_(
-                PaperCollection.user_id == current_user.id,
-                PaperCollection.is_default == True
-            )
-        )
-        check_result = await db.execute(check_stmt)
-        if check_result.scalars().first():
-            return {"message": "已初始化"}
-        raise e
+    
+    return {"message": "已初始化"}

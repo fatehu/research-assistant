@@ -23,7 +23,8 @@ const { TextArea } = Input;
 const StudentsPage: React.FC = () => {
   const {
     students, studentsLoading, invitations, invitationsLoading,
-    fetchStudents, inviteStudent, removeStudent, fetchInvitations, cancelInvitation
+    fetchStudents, inviteStudent, removeStudent, fetchInvitations, cancelInvitation,
+    acceptInvitation, rejectInvitation
   } = useRoleStore();
 
   const [inviteModalVisible, setInviteModalVisible] = useState(false);
@@ -523,6 +524,111 @@ const StudentsPage: React.FC = () => {
                     ),
                   }}
                 />
+              ),
+            },
+            {
+              key: 'applications',
+              label: (
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <ClockCircleOutlined style={{ color: receivedApplications.length > 0 ? '#fa8c16' : undefined }} />
+                  <span style={{ color: receivedApplications.length > 0 ? '#fa8c16' : undefined }}>
+                    收到申请
+                  </span>
+                  {receivedApplications.length > 0 && (
+                    <Badge 
+                      count={receivedApplications.length} 
+                      size="small"
+                      style={{ backgroundColor: '#fa8c16' }}
+                    />
+                  )}
+                </span>
+              ),
+              children: (
+                <div style={{ padding: '16px 0' }}>
+                  {receivedApplications.length === 0 ? (
+                    <Empty 
+                      image={Empty.PRESENTED_IMAGE_SIMPLE}
+                      description={<span style={{ color: '#8899A6' }}>暂无待处理的申请</span>}
+                    />
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                      {receivedApplications.map(app => (
+                        <Card
+                          key={app.id}
+                          size="small"
+                          style={{
+                            backgroundColor: '#1C2128',
+                            borderColor: '#30363D',
+                            borderRadius: 12,
+                          }}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                              <Avatar 
+                                src={app.from_user?.avatar} 
+                                icon={<UserOutlined />}
+                                style={{ backgroundColor: '#4A90D9' }}
+                              />
+                              <div>
+                                <div style={{ fontWeight: 500, color: '#E8E8E8' }}>
+                                  {app.from_user?.full_name || app.from_user?.username || '未知用户'}
+                                </div>
+                                <Text style={{ color: '#8899A6', fontSize: 12 }}>
+                                  {app.from_user?.email}
+                                </Text>
+                                {app.message && (
+                                  <div style={{ color: '#6B8E9F', fontSize: 12, marginTop: 4 }}>
+                                    留言: {app.message}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                              <Text style={{ color: '#8899A6', fontSize: 12 }}>
+                                {new Date(app.created_at).toLocaleDateString('zh-CN')}
+                              </Text>
+                              <Space>
+                                <Button
+                                  type="primary"
+                                  size="small"
+                                  icon={<CheckCircleOutlined />}
+                                  onClick={async () => {
+                                    try {
+                                      await acceptInvitation(app.id);
+                                      message.success('已接受申请');
+                                      fetchInvitations();
+                                      fetchStudents();
+                                    } catch (error: any) {
+                                      message.error(error.response?.data?.detail || '操作失败');
+                                    }
+                                  }}
+                                  style={{ backgroundColor: '#52c41a', borderColor: '#52c41a' }}
+                                >
+                                  接受
+                                </Button>
+                                <Button
+                                  size="small"
+                                  danger
+                                  onClick={async () => {
+                                    try {
+                                      await rejectInvitation(app.id);
+                                      message.success('已拒绝申请');
+                                      fetchInvitations();
+                                    } catch (error: any) {
+                                      message.error(error.response?.data?.detail || '操作失败');
+                                    }
+                                  }}
+                                >
+                                  拒绝
+                                </Button>
+                              </Space>
+                            </div>
+                          </div>
+                        </Card>
+                      ))}
+                    </div>
+                  )}
+                </div>
               ),
             },
           ]}

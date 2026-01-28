@@ -614,6 +614,28 @@ const MainLayout = () => {
               '--ant-menu-item-selected-color': 'rgb(52, 211, 153)',
             } as React.CSSProperties}
           />
+          {/* 菜单样式覆盖 */}
+          <style>{`
+            .ant-menu-item-group-title {
+              color: rgb(100, 116, 139) !important;
+              font-size: 11px !important;
+              font-weight: 600 !important;
+              text-transform: uppercase !important;
+              letter-spacing: 0.05em !important;
+              padding: 12px 16px 4px !important;
+            }
+            .ant-menu-item-group-list .ant-menu-item {
+              color: rgb(203, 213, 225) !important;
+            }
+            .ant-menu-item-group-list .ant-menu-item:hover {
+              color: rgb(255, 255, 255) !important;
+              background-color: rgba(255, 255, 255, 0.05) !important;
+            }
+            .ant-menu-item-group-list .ant-menu-item-selected {
+              color: rgb(52, 211, 153) !important;
+              background-color: rgba(16, 185, 129, 0.15) !important;
+            }
+          `}</style>
           
           {/* 对话历史 - 仅在展开时显示 */}
           {!collapsed && (

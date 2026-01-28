@@ -131,6 +131,15 @@ class GroupDetailResponse(GroupResponse):
 
 # ========== 邀请相关 ==========
 
+class InvitationUserInfo(BaseModel):
+    """邀请中的用户信息"""
+    id: int
+    username: str
+    full_name: Optional[str] = None
+    email: str
+    avatar: Optional[str] = None
+
+
 class InviteStudentRequest(BaseModel):
     """邀请学生请求"""
     email: EmailStr
@@ -152,8 +161,10 @@ class InvitationResponse(BaseModel):
     type: str  # 'invite' or 'apply'
     from_user_id: int
     from_user_name: str
+    from_user: Optional[InvitationUserInfo] = None
     to_user_id: int
     to_user_name: str
+    to_user: Optional[InvitationUserInfo] = None
     group_id: Optional[int] = None
     group_name: Optional[str] = None
     message: Optional[str] = None

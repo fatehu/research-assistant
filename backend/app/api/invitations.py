@@ -264,22 +264,44 @@ async def _build_invitation_responses(
     db: AsyncSession
 ) -> list[InvitationResponse]:
     """构建邀请响应列表"""
+    from app.schemas.role import InvitationUserInfo
+    
     responses = []
     
     for inv in invitations:
-        # 获取发起者信息
+        # 获取发起者完整信息
         from_user_result = await db.execute(
-            select(User.username, User.full_name).where(User.id == inv.from_user_id)
+            select(User).where(User.id == inv.from_user_id)
         )
-        from_user_info = from_user_result.first()
-        from_user_name = from_user_info[1] or from_user_info[0] if from_user_info else ""
+        from_user = from_user_result.scalar_one_or_none()
+        from_user_info = None
+        from_user_name = ""
+        if from_user:
+            from_user_name = from_user.full_name or from_user.username
+            from_user_info = InvitationUserInfo(
+                id=from_user.id,
+                username=from_user.username,
+                full_name=from_user.full_name,
+                email=from_user.email,
+                avatar=from_user.avatar
+            )
         
-        # 获取接收者信息
+        # 获取接收者完整信息
         to_user_result = await db.execute(
-            select(User.username, User.full_name).where(User.id == inv.to_user_id)
+            select(User).where(User.id == inv.to_user_id)
         )
-        to_user_info = to_user_result.first()
-        to_user_name = to_user_info[1] or to_user_info[0] if to_user_info else ""
+        to_user = to_user_result.scalar_one_or_none()
+        to_user_info = None
+        to_user_name = ""
+        if to_user:
+            to_user_name = to_user.full_name or to_user.username
+            to_user_info = InvitationUserInfo(
+                id=to_user.id,
+                username=to_user.username,
+                full_name=to_user.full_name,
+                email=to_user.email,
+                avatar=to_user.avatar
+            )
         
         # 获取研究组信息
         group_name = None
@@ -295,8 +317,10 @@ async def _build_invitation_responses(
             type=inv.type,
             from_user_id=inv.from_user_id,
             from_user_name=from_user_name,
+            from_user=from_user_info,
             to_user_id=inv.to_user_id,
             to_user_name=to_user_name,
+            to_user=to_user_info,
             group_id=inv.group_id,
             group_name=group_name,
             message=inv.message,

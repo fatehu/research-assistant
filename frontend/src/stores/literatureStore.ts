@@ -102,14 +102,23 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   viewMode: 'card',
   detailPanelOpen: false,
 
-  // 初始化
+  // 初始化（带防重复标志）
   init: async () => {
+    // 使用闭包变量防止重复初始化
+    const state = get() as any;
+    if (state._initializing || state._initialized) {
+      return;
+    }
+    set({ _initializing: true } as any);
+    
     try {
       await literatureApi.init()
       await get().loadCollections()
       await get().loadPapers()
+      set({ _initialized: true, _initializing: false } as any);
     } catch (error) {
       console.error('Failed to init literature:', error)
+      set({ _initializing: false } as any);
     }
   },
 
