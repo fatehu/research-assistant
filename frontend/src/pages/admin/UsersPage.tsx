@@ -632,28 +632,157 @@ const UsersPage: React.FC = () => {
         </Form>
       </Modal>
 
-      {/* 样式覆盖 */}
+      {/* 2026 Design System Styles */}
       <style>{`
-        .ant-table { background: #161B22 !important; }
-        .ant-table-thead > tr > th { background: #0D1117 !important; color: #8899A6 !important; border-bottom: 1px solid #30363D !important; font-weight: 500; padding: 6px 8px !important; font-size: 12px !important; }
-        .ant-table-tbody > tr > td { background: #161B22 !important; color: #E8E8E8 !important; border-bottom: 1px solid #21262D !important; padding: 4px 8px !important; }
-        .ant-table-tbody > tr:hover > td { background: #1C2128 !important; }
-        .ant-table-cell-fix-right { background: #161B22 !important; }
-        .ant-pagination { padding: 8px 16px !important; }
-        .ant-pagination-item { background: #0D1117 !important; border-color: #30363D !important; }
-        .ant-pagination-item a { color: #8899A6 !important; }
-        .ant-pagination-item-active { border-color: #4A90D9 !important; }
-        .ant-pagination-item-active a { color: #4A90D9 !important; }
+        /* 表格基础 */
+        .ant-table { 
+          background: transparent !important; 
+          font-family: 'Inter', -apple-system, sans-serif !important;
+        }
+        .ant-table-thead > tr > th { 
+          background: hsl(220, 18%, 10%) !important; 
+          color: hsl(220, 10%, 48%) !important; 
+          border-bottom: 1px solid hsla(220, 20%, 35%, 0.4) !important; 
+          font-weight: 500 !important; 
+          font-size: 11px !important;
+          text-transform: uppercase !important;
+          letter-spacing: 0.06em !important;
+          padding: 12px 14px !important;
+        }
+        .ant-table-tbody > tr > td { 
+          background: transparent !important; 
+          color: hsl(220, 15%, 93%) !important; 
+          border-bottom: 1px solid hsla(220, 20%, 40%, 0.25) !important; 
+          padding: 12px 14px !important;
+          transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-table-tbody > tr:hover > td { 
+          background: hsl(215, 20%, 22%) !important; 
+        }
+        .ant-table-tbody > tr:hover {
+          transform: scale(1.002);
+        }
+        .ant-table-cell-fix-right { 
+          background: hsl(220, 16%, 14%) !important; 
+        }
+        .ant-table-tbody > tr:hover .ant-table-cell-fix-right {
+          background: hsl(215, 20%, 22%) !important;
+        }
+        
+        /* 操作按钮 - 高可见度 */
+        .ant-table-tbody .ant-btn-text,
+        .ant-table-tbody .ant-btn-icon-only {
+          color: hsl(220, 12%, 68%) !important;
+          width: 36px !important;
+          height: 36px !important;
+          border-radius: 10px !important;
+          background: hsl(220, 14%, 18%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-table-tbody .ant-btn-text:hover,
+        .ant-table-tbody .ant-btn-icon-only:hover {
+          color: hsl(215, 90%, 65%) !important;
+          background: hsl(215, 20%, 22%) !important;
+          border-color: hsl(215, 85%, 55%) !important;
+          box-shadow: 0 0 24px hsla(215, 90%, 60%, 0.4), 0 4px 12px rgba(0,0,0,0.2) !important;
+          transform: translateY(-2px) scale(1.08) !important;
+        }
+        .ant-table-tbody .ant-btn-text .anticon,
+        .ant-table-tbody .ant-btn-icon-only .anticon {
+          font-size: 16px !important;
+        }
+        
+        /* 分页 */
+        .ant-pagination { padding: 12px 16px !important; }
+        .ant-pagination-item { 
+          background: hsl(220, 14%, 18%) !important; 
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-pagination-item a { color: hsl(220, 12%, 68%) !important; }
+        .ant-pagination-item:hover {
+          border-color: hsl(215, 85%, 55%) !important;
+          transform: translateY(-2px) !important;
+          box-shadow: 0 4px 12px hsla(215, 90%, 60%, 0.3) !important;
+        }
+        .ant-pagination-item:hover a { color: hsl(215, 90%, 65%) !important; }
+        .ant-pagination-item-active { 
+          background: linear-gradient(135deg, hsl(215, 85%, 55%), hsl(215, 80%, 48%)) !important;
+          border-color: transparent !important;
+          box-shadow: 0 0 20px hsla(215, 90%, 60%, 0.4) !important;
+        }
+        .ant-pagination-item-active a { color: white !important; }
         .ant-pagination-prev .ant-pagination-item-link,
-        .ant-pagination-next .ant-pagination-item-link { background: #0D1117 !important; border-color: #30363D !important; color: #8899A6 !important; }
-        .ant-select-selector { background: #0D1117 !important; border-color: #30363D !important; }
-        .ant-select-selection-item, .ant-select-selection-placeholder { color: #E8E8E8 !important; }
-        .ant-input { color: #E8E8E8 !important; }
-        .ant-input::placeholder { color: #8899A6 !important; }
-        .ant-dropdown { background: #161B22 !important; }
-        .ant-dropdown-menu { background: #161B22 !important; border: 1px solid #30363D !important; box-shadow: 0 6px 16px rgba(0,0,0,0.5) !important; }
-        .ant-dropdown-menu-item { color: #E8E8E8 !important; }
-        .ant-dropdown-menu-item:hover { background: #1C2128 !important; }
+        .ant-pagination-next .ant-pagination-item-link { 
+          background: hsl(220, 14%, 18%) !important; 
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+          color: hsl(220, 10%, 48%) !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-pagination-prev:hover .ant-pagination-item-link,
+        .ant-pagination-next:hover .ant-pagination-item-link {
+          border-color: hsl(215, 85%, 55%) !important;
+          color: hsl(215, 90%, 65%) !important;
+        }
+        
+        /* 输入框 & 选择器 */
+        .ant-select-selector { 
+          background: hsl(220, 18%, 10%) !important; 
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+        }
+        .ant-select-selection-item, .ant-select-selection-placeholder { color: hsl(220, 15%, 93%) !important; }
+        .ant-input { 
+          color: hsl(220, 15%, 93%) !important;
+          background: hsl(220, 18%, 10%) !important; 
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+        }
+        .ant-input:focus, .ant-input:hover {
+          border-color: hsl(215, 85%, 55%) !important;
+          box-shadow: 0 0 0 3px hsla(215, 90%, 60%, 0.2) !important;
+        }
+        .ant-input::placeholder { color: hsl(220, 10%, 48%) !important; }
+        
+        /* 下拉菜单 */
+        .ant-dropdown-menu { 
+          background: hsl(220, 16%, 14%) !important; 
+          backdrop-filter: blur(20px) saturate(180%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 12px !important;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 0 1px hsla(220, 20%, 40%, 0.25) !important;
+          padding: 6px !important;
+        }
+        .ant-dropdown-menu-item { 
+          color: hsl(220, 12%, 68%) !important;
+          border-radius: 8px !important;
+          padding: 10px 14px !important;
+          font-size: 13px !important;
+          transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+          margin: 2px 0 !important;
+        }
+        .ant-dropdown-menu-item:hover { 
+          background: hsl(215, 20%, 22%) !important;
+          color: hsl(220, 15%, 93%) !important;
+          transform: translateX(4px) !important;
+        }
+        .ant-dropdown-menu-item .anticon {
+          color: hsl(220, 10%, 48%) !important;
+          margin-right: 10px !important;
+          transition: color 0.15s !important;
+        }
+        .ant-dropdown-menu-item:hover .anticon {
+          color: hsl(215, 90%, 65%) !important;
+        }
+        .ant-dropdown-menu-item-danger { color: hsl(0, 75%, 60%) !important; }
+        .ant-dropdown-menu-item-danger .anticon { color: hsl(0, 75%, 60%) !important; }
+        .ant-dropdown-menu-item-danger:hover { background: hsla(0, 70%, 55%, 0.12) !important; }
       `}</style>
     </div>
   );

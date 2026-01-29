@@ -752,92 +752,209 @@ const StudentsPage: React.FC = () => {
         )}
       </Modal>
 
-      {/* 全局样式 */}
+      {/* 2026 Design System Styles */}
       <style>{`
+        /* 表格基础 */
         .ant-table {
           background: transparent !important;
+          font-family: 'Inter', -apple-system, sans-serif !important;
         }
         .ant-table-thead > tr > th {
-          background: #0D1117 !important;
-          color: #8899A6 !important;
-          border-bottom: 1px solid #30363D !important;
-          padding: 6px 8px !important;
-          font-size: 12px !important;
+          background: hsl(220, 18%, 10%) !important;
+          color: hsl(220, 10%, 48%) !important;
+          border-bottom: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          font-weight: 500 !important;
+          font-size: 11px !important;
+          text-transform: uppercase !important;
+          letter-spacing: 0.06em !important;
+          padding: 12px 14px !important;
         }
         .ant-table-tbody > tr > td {
-          border-bottom: 1px solid #30363D !important;
+          border-bottom: 1px solid hsla(220, 20%, 40%, 0.25) !important;
           background: transparent !important;
-          color: #E8E8E8;
-          padding: 6px 8px !important;
+          color: hsl(220, 15%, 93%) !important;
+          padding: 12px 14px !important;
+          transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
         }
         .ant-table-tbody > tr:hover > td {
-          background: #1C2128 !important;
+          background: hsl(215, 20%, 22%) !important;
         }
+        .ant-table-tbody > tr {
+          transition: transform 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-table-tbody > tr:hover {
+          transform: scale(1.002) !important;
+        }
+        
+        /* 操作按钮 - 高可见度 */
+        .ant-table-tbody .ant-btn-text,
+        .ant-table-tbody .ant-btn-icon-only {
+          color: hsl(220, 12%, 68%) !important;
+          width: 36px !important;
+          height: 36px !important;
+          border-radius: 10px !important;
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+          background: hsl(220, 14%, 18%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+        }
+        .ant-table-tbody .ant-btn-text:hover,
+        .ant-table-tbody .ant-btn-icon-only:hover {
+          color: hsl(215, 90%, 65%) !important;
+          background: hsl(215, 20%, 22%) !important;
+          border-color: hsl(215, 85%, 55%) !important;
+          box-shadow: 0 0 24px hsla(215, 90%, 60%, 0.4), 0 4px 12px rgba(0,0,0,0.2) !important;
+          transform: translateY(-2px) scale(1.08) !important;
+        }
+        .ant-table-tbody .ant-btn-text .anticon,
+        .ant-table-tbody .ant-btn-icon-only .anticon {
+          font-size: 16px !important;
+        }
+        
+        /* Tabs */
         .ant-tabs-nav {
           margin-bottom: 0 !important;
         }
         .ant-tabs-tab {
-          color: #8899A6 !important;
-          padding: 8px 12px !important;
+          color: hsl(220, 10%, 48%) !important;
+          padding: 12px 16px !important;
+          font-weight: 500 !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-tabs-tab:hover {
+          color: hsl(220, 12%, 68%) !important;
         }
         .ant-tabs-tab-active .ant-tabs-tab-btn {
-          color: #4A90D9 !important;
+          color: hsl(215, 90%, 65%) !important;
+          text-shadow: 0 0 20px hsla(215, 90%, 60%, 0.4) !important;
         }
         .ant-tabs-ink-bar {
-          background: #4A90D9 !important;
+          background: linear-gradient(90deg, hsl(215, 85%, 55%), hsl(160, 75%, 45%)) !important;
+          height: 3px !important;
+          border-radius: 2px !important;
+          box-shadow: 0 0 12px hsla(215, 90%, 60%, 0.4) !important;
         }
+        
+        /* Modal */
         .ant-modal-content {
-          background: #161B22 !important;
+          background: hsl(220, 16%, 14%) !important;
+          backdrop-filter: blur(24px) saturate(180%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 20px !important;
+          box-shadow: 0 25px 50px rgba(0, 0, 0, 0.4), 0 0 0 1px hsla(220, 20%, 40%, 0.25) !important;
         }
         .ant-modal-header {
-          background: #161B22 !important;
-          border-bottom: 1px solid #30363D !important;
+          background: transparent !important;
+          border-bottom: 1px solid hsla(220, 20%, 40%, 0.25) !important;
         }
         .ant-form-item-label > label {
-          color: #B8C4CE !important;
+          color: hsl(220, 12%, 68%) !important;
         }
+        
+        /* Inputs */
         .ant-input, .ant-input-affix-wrapper {
-          background: #0D1117 !important;
-          border-color: #30363D !important;
-          color: #E8E8E8 !important;
+          background: hsl(220, 18%, 10%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 10px !important;
+          color: hsl(220, 15%, 93%) !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        .ant-input:focus, .ant-input-affix-wrapper:focus, .ant-input-affix-wrapper-focused {
+          border-color: hsl(215, 85%, 55%) !important;
+          box-shadow: 0 0 0 3px hsla(215, 90%, 60%, 0.2), 0 0 20px hsla(215, 90%, 60%, 0.15) !important;
         }
         .ant-input::placeholder {
-          color: #8899A6 !important;
+          color: hsl(220, 10%, 48%) !important;
         }
-        .ant-dropdown {
-          background: #161B22 !important;
-        }
+        
+        /* Dropdown */
         .ant-dropdown-menu {
-          background: #161B22 !important;
-          border: 1px solid #30363D !important;
+          background: hsl(220, 16%, 14%) !important;
+          backdrop-filter: blur(20px) saturate(180%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 12px !important;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 0 1px hsla(220, 20%, 40%, 0.25) !important;
+          padding: 6px !important;
         }
         .ant-dropdown-menu-item {
-          color: #E8E8E8 !important;
+          color: hsl(220, 12%, 68%) !important;
+          border-radius: 8px !important;
+          padding: 10px 14px !important;
+          font-size: 13px !important;
+          transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+          margin: 2px 0 !important;
         }
         .ant-dropdown-menu-item:hover {
-          background: #1C2128 !important;
+          background: hsl(215, 20%, 22%) !important;
+          color: hsl(220, 15%, 93%) !important;
+          transform: translateX(4px) !important;
         }
+        .ant-dropdown-menu-item .anticon {
+          color: hsl(220, 10%, 48%) !important;
+          margin-right: 10px !important;
+          transition: color 0.15s !important;
+        }
+        .ant-dropdown-menu-item:hover .anticon {
+          color: hsl(215, 90%, 65%) !important;
+        }
+        .ant-dropdown-menu-item-danger {
+          color: hsl(0, 75%, 60%) !important;
+        }
+        .ant-dropdown-menu-item-danger .anticon {
+          color: hsl(0, 75%, 60%) !important;
+        }
+        .ant-dropdown-menu-item-danger:hover {
+          background: hsla(0, 70%, 55%, 0.12) !important;
+        }
+        
+        /* Pagination */
         .ant-pagination-item {
-          background: #0D1117 !important;
-          border-color: #30363D !important;
+          background: hsl(220, 14%, 18%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
         }
         .ant-pagination-item a {
-          color: #8899A6 !important;
+          color: hsl(220, 12%, 68%) !important;
+        }
+        .ant-pagination-item:hover {
+          border-color: hsl(215, 85%, 55%) !important;
+          transform: translateY(-2px) !important;
+          box-shadow: 0 4px 12px hsla(215, 90%, 60%, 0.3) !important;
+        }
+        .ant-pagination-item:hover a {
+          color: hsl(215, 90%, 65%) !important;
         }
         .ant-pagination-item-active {
-          border-color: #4A90D9 !important;
+          background: linear-gradient(135deg, hsl(215, 85%, 55%), hsl(215, 80%, 48%)) !important;
+          border-color: transparent !important;
+          box-shadow: 0 0 20px hsla(215, 90%, 60%, 0.4) !important;
         }
         .ant-pagination-item-active a {
-          color: #4A90D9 !important;
+          color: white !important;
         }
         .ant-pagination-prev .ant-pagination-item-link,
         .ant-pagination-next .ant-pagination-item-link {
-          background: #0D1117 !important;
-          border-color: #30363D !important;
-          color: #8899A6 !important;
+          background: hsl(220, 14%, 18%) !important;
+          border: 1px solid hsla(220, 20%, 35%, 0.4) !important;
+          border-radius: 8px !important;
+          color: hsl(220, 10%, 48%) !important;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
         }
+        .ant-pagination-prev:hover .ant-pagination-item-link,
+        .ant-pagination-next:hover .ant-pagination-item-link {
+          border-color: hsl(215, 85%, 55%) !important;
+          color: hsl(215, 90%, 65%) !important;
+        }
+        
+        /* Fixed columns */
         .ant-table-cell-fix-right {
-          background: #161B22 !important;
+          background: hsl(220, 16%, 14%) !important;
+        }
+        .ant-table-tbody > tr:hover .ant-table-cell-fix-right {
+          background: hsl(215, 20%, 22%) !important;
         }
       `}</style>
     </div>
