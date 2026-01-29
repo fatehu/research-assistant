@@ -16,6 +16,9 @@ import { UsersPage as AdminUsersPage } from '@/pages/admin'
 import { StudentsPage as MentorStudentsPage, GroupsPage as MentorGroupsPage } from '@/pages/mentor'
 import { MentorPage as StudentMentorPage } from '@/pages/student'
 
+// 用户页面
+import { ProfilePage, SettingsPage } from '@/pages/user'
+
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated, isInitialized } = useAuthStore()
@@ -226,8 +229,8 @@ function App() {
           />
           
           {/* 个人设置页面 */}
-          <Route path="profile" element={<PlaceholderPage title="个人资料" />} />
-          <Route path="settings" element={<PlaceholderPage title="设置" />} />
+          <Route path="profile" element={<ProfilePage />} />
+          <Route path="settings" element={<SettingsPage />} />
         </Route>
         
         {/* 404 */}

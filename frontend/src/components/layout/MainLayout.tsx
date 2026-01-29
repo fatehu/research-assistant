@@ -318,8 +318,8 @@ const MainLayout = () => {
     },
     {
       key: '/feed',
-      icon: <GlobalOutlined />,
-      label: '资讯追踪',
+      icon: <GlobalOutlined style={{ color: '#94a3b8' }} />,
+      label: <span style={{ color: '#94a3b8' }}>资讯追踪 <span style={{ fontSize: 10, opacity: 0.7 }}>(即将推出)</span></span>,
       disabled: true,
     },
   ]
@@ -634,6 +634,17 @@ const MainLayout = () => {
             .ant-menu-item-group-list .ant-menu-item-selected {
               color: rgb(52, 211, 153) !important;
               background-color: rgba(16, 185, 129, 0.15) !important;
+            }
+            .ant-menu-item-disabled {
+              color: rgb(200, 210, 225) !important;
+              opacity: 1 !important;
+              cursor: not-allowed !important;
+            }
+            .ant-menu-item-disabled .anticon {
+              color: rgb(200, 210, 225) !important;
+            }
+            .ant-menu-item-disabled span {
+              color: rgb(200, 210, 225) !important;
             }
           `}</style>
           
