@@ -596,8 +596,15 @@ const MainLayout = () => {
           </Button>
         </div>
         
-        {/* 可滚动区域 */}
-        <div className="flex-1 overflow-y-auto flex flex-col min-h-0">
+        {/* 可滚动区域 - 菜单 */}
+        <div 
+          className="overflow-y-auto" 
+          style={{ 
+            maxHeight: collapsed ? 'calc(100vh - 180px)' : 'calc(100vh - 400px)',
+            scrollbarWidth: 'thin',
+            scrollbarColor: 'rgba(100, 116, 139, 0.3) transparent',
+          }}
+        >
           {/* 导航菜单 */}
           <Menu
             mode="inline"
@@ -647,20 +654,21 @@ const MainLayout = () => {
               color: rgb(200, 210, 225) !important;
             }
           `}</style>
+        </div>
           
-          {/* 对话历史 - 仅在展开时显示 */}
-          {!collapsed && (
-            <div className="flex-1 flex flex-col min-h-0 mt-2 border-t border-white/5 pt-2">
-              {/* 历史标题 */}
-              <div 
-                className="flex items-center gap-2 px-4 py-2 text-slate-400 text-sm cursor-pointer hover:text-slate-300 transition-colors flex-shrink-0"
-                onClick={() => setHistoryExpanded(!historyExpanded)}
+        {/* 对话历史 - 仅在展开时显示 */}
+        {!collapsed && (
+          <div className="flex-1 flex flex-col min-h-0 border-t border-white/5 overflow-hidden">
+            {/* 历史标题 */}
+            <div 
+              className="flex items-center gap-2 px-4 py-2 text-slate-400 text-sm cursor-pointer hover:text-slate-300 transition-colors flex-shrink-0"
+              onClick={() => setHistoryExpanded(!historyExpanded)}
+            >
+              <motion.div
+                animate={{ rotate: historyExpanded ? 0 : -90 }}
+                transition={{ duration: 0.2 }}
               >
-                <motion.div
-                  animate={{ rotate: historyExpanded ? 0 : -90 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  <DownOutlined className="text-xs" />
+                <DownOutlined className="text-xs" />
                 </motion.div>
                 <HistoryOutlined />
                 <span>历史对话</span>
@@ -721,7 +729,6 @@ const MainLayout = () => {
               )}
             </div>
           )}
-        </div>
         
         {/* 折叠按钮 - 固定在底部 */}
         <div className="p-3 border-t border-white/5 flex-shrink-0">

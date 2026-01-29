@@ -154,26 +154,27 @@ const UsersPage: React.FC = () => {
     }
   };
 
-  // 表格列定义
+  // 表格列定义 - 紧凑版
   const columns: ColumnsType<UserInfo> = [
     {
       title: '用户',
       key: 'user',
-      width: 240,
+      width: 200,
       render: (_, record) => (
-        <Space>
+        <Space size="small">
           <Avatar 
+            size="small"
             src={record.avatar} 
             icon={<UserOutlined />}
             style={{ backgroundColor: roleColors[record.role] }}
           />
           <div>
-            <div style={{ fontWeight: 500, color: '#E8E8E8' }}>
+            <span style={{ fontWeight: 500, color: '#E8E8E8', fontSize: 13 }}>
               {record.full_name || record.username}
-            </div>
-            <Text style={{ fontSize: 12, color: '#8899A6' }}>
+            </span>
+            <div style={{ fontSize: 11, color: '#8899A6' }}>
               @{record.username}
-            </Text>
+            </div>
           </div>
         </Space>
       ),
@@ -182,19 +183,19 @@ const UsersPage: React.FC = () => {
       title: '邮箱',
       dataIndex: 'email',
       key: 'email',
-      width: 180,
-      render: (email) => <Text style={{ color: '#8899A6', fontSize: 13 }}>{email}</Text>,
+      width: 160,
+      render: (email) => <span style={{ color: '#8899A6', fontSize: 12 }}>{email}</span>,
     },
     {
       title: '角色',
       dataIndex: 'role',
       key: 'role',
-      width: 100,
+      width: 90,
       render: (role: UserRole) => (
         <Tag 
           icon={roleIcons[role]}
           color={roleColors[role]}
-          style={{ borderRadius: 12, padding: '2px 10px' }}
+          style={{ borderRadius: 10, padding: '1px 8px', fontSize: 11 }}
         >
           {roleLabels[role]}
         </Tag>
@@ -203,17 +204,17 @@ const UsersPage: React.FC = () => {
     {
       title: '部门/方向',
       key: 'department',
-      width: 160,
+      width: 120,
       render: (_, record) => (
         <div>
           {record.department && (
-            <div style={{ color: '#8899A6', fontSize: 12 }}>{record.department}</div>
+            <div style={{ color: '#8899A6', fontSize: 11 }}>{record.department}</div>
           )}
           {record.research_direction && (
-            <div style={{ color: '#6B8E9F', fontSize: 11 }}>{record.research_direction}</div>
+            <div style={{ color: '#6B8E9F', fontSize: 10 }}>{record.research_direction}</div>
           )}
           {!record.department && !record.research_direction && (
-            <Text style={{ color: '#4A5568' }}>-</Text>
+            <span style={{ color: '#4A5568' }}>-</span>
           )}
         </div>
       ),
@@ -222,11 +223,11 @@ const UsersPage: React.FC = () => {
       title: '状态',
       dataIndex: 'is_active',
       key: 'is_active',
-      width: 80,
+      width: 70,
       render: (isActive) => (
         <Badge 
           status={isActive ? 'success' : 'error'} 
-          text={<span style={{ color: isActive ? '#52c41a' : '#ff4d4f', fontSize: 12 }}>
+          text={<span style={{ color: isActive ? '#52c41a' : '#ff4d4f', fontSize: 11 }}>
             {isActive ? '正常' : '禁用'}
           </span>}
         />
@@ -236,11 +237,11 @@ const UsersPage: React.FC = () => {
       title: '注册时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 100,
+      width: 90,
       render: (date) => (
-        <Text style={{ color: '#8899A6', fontSize: 12 }}>
+        <span style={{ color: '#8899A6', fontSize: 11 }}>
           {new Date(date).toLocaleDateString('zh-CN')}
-        </Text>
+        </span>
       ),
     },
     {
@@ -333,8 +334,9 @@ const UsersPage: React.FC = () => {
 
   return (
     <div style={{ 
-      padding: '20px 28px',
-      minHeight: '100vh',
+      padding: '20px 24px',
+      height: '100vh',
+      overflow: 'auto',
       background: 'linear-gradient(180deg, #0D1117 0%, #161B22 100%)',
     }}>
       {/* 页面标题和统计 */}
@@ -342,11 +344,11 @@ const UsersPage: React.FC = () => {
         display: 'flex', 
         justifyContent: 'space-between', 
         alignItems: 'center',
-        marginBottom: 20,
+        marginBottom: 16,
         flexWrap: 'wrap',
         gap: 12,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <Title level={4} style={{ 
             margin: 0, 
             color: '#E8E8E8',
@@ -464,8 +466,8 @@ const UsersPage: React.FC = () => {
           pagination={{
             ...pagination,
             size: 'small',
-            showSizeChanger: true,
-            showQuickJumper: true,
+            pageSize: 15,
+            showSizeChanger: false,
             showTotal: (total) => `共 ${total} 条`,
             onChange: (page, pageSize) => {
               setPagination({ current: page, pageSize });
@@ -633,18 +635,23 @@ const UsersPage: React.FC = () => {
       {/* 样式覆盖 */}
       <style>{`
         .ant-table { background: #161B22 !important; }
-        .ant-table-thead > tr > th { background: #0D1117 !important; color: #8899A6 !important; border-bottom: 1px solid #30363D !important; font-weight: 500; padding: 10px 12px !important; }
-        .ant-table-tbody > tr > td { background: #161B22 !important; color: #E8E8E8 !important; border-bottom: 1px solid #21262D !important; padding: 8px 12px !important; }
+        .ant-table-thead > tr > th { background: #0D1117 !important; color: #8899A6 !important; border-bottom: 1px solid #30363D !important; font-weight: 500; padding: 6px 8px !important; font-size: 12px !important; }
+        .ant-table-tbody > tr > td { background: #161B22 !important; color: #E8E8E8 !important; border-bottom: 1px solid #21262D !important; padding: 4px 8px !important; }
         .ant-table-tbody > tr:hover > td { background: #1C2128 !important; }
+        .ant-table-cell-fix-right { background: #161B22 !important; }
+        .ant-pagination { padding: 8px 16px !important; }
         .ant-pagination-item { background: #0D1117 !important; border-color: #30363D !important; }
         .ant-pagination-item a { color: #8899A6 !important; }
         .ant-pagination-item-active { border-color: #4A90D9 !important; }
         .ant-pagination-item-active a { color: #4A90D9 !important; }
+        .ant-pagination-prev .ant-pagination-item-link,
+        .ant-pagination-next .ant-pagination-item-link { background: #0D1117 !important; border-color: #30363D !important; color: #8899A6 !important; }
         .ant-select-selector { background: #0D1117 !important; border-color: #30363D !important; }
         .ant-select-selection-item, .ant-select-selection-placeholder { color: #E8E8E8 !important; }
         .ant-input { color: #E8E8E8 !important; }
         .ant-input::placeholder { color: #8899A6 !important; }
-        .ant-dropdown-menu { background: #161B22 !important; border: 1px solid #30363D !important; }
+        .ant-dropdown { background: #161B22 !important; }
+        .ant-dropdown-menu { background: #161B22 !important; border: 1px solid #30363D !important; box-shadow: 0 6px 16px rgba(0,0,0,0.5) !important; }
         .ant-dropdown-menu-item { color: #E8E8E8 !important; }
         .ant-dropdown-menu-item:hover { background: #1C2128 !important; }
       `}</style>

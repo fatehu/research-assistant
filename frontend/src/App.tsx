@@ -13,8 +13,8 @@ import { CodeLabPage } from '@/pages/codelab'
 
 // 角色相关页面 - 懒加载
 import { UsersPage as AdminUsersPage } from '@/pages/admin'
-import { StudentsPage as MentorStudentsPage, GroupsPage as MentorGroupsPage } from '@/pages/mentor'
-import { MentorPage as StudentMentorPage } from '@/pages/student'
+import { StudentsPage as MentorStudentsPage, GroupsPage as MentorGroupsPage, AnnouncementsPage as MentorAnnouncementsPage } from '@/pages/mentor'
+import { MentorPage as StudentMentorPage, AnnouncementsPage as StudentAnnouncementsPage } from '@/pages/student'
 
 // 用户页面
 import { ProfilePage, SettingsPage } from '@/pages/user'
@@ -189,7 +189,7 @@ function App() {
             path="mentor/announcements" 
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <PlaceholderPage title="公告管理" />
+                <MentorAnnouncementsPage />
               </RoleRoute>
             } 
           />
@@ -223,7 +223,7 @@ function App() {
             path="student/announcements" 
             element={
               <RoleRoute allowedRoles={['student']}>
-                <PlaceholderPage title="公告通知" />
+                <StudentAnnouncementsPage />
               </RoleRoute>
             } 
           />

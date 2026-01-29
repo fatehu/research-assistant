@@ -113,27 +113,23 @@ const StudentsPage: React.FC = () => {
     {
       title: '学生',
       key: 'student',
+      width: 180,
       render: (_, record) => (
-        <Space>
+        <Space size="small">
           <Avatar 
-            size={44} 
+            size="small"
             src={record.avatar}
             icon={<UserOutlined />}
-            style={{ 
-              backgroundColor: '#4A90D9',
-              border: '2px solid #4A90D920'
-            }}
+            style={{ backgroundColor: '#4A90D9' }}
           />
           <div>
-            <div style={{ fontWeight: 600, color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontWeight: 500, color: '#E8E8E8', fontSize: 13, display: 'flex', alignItems: 'center', gap: 4 }}>
               {record.username}
               {getActivityScore(record) >= 70 && (
-                <Tooltip title="活跃学生">
-                  <StarOutlined style={{ color: '#D4AF37', fontSize: 12 }} />
-                </Tooltip>
+                <StarOutlined style={{ color: '#D4AF37', fontSize: 10 }} />
               )}
             </div>
-            <Text type="secondary" style={{ fontSize: 12 }}>{record.email}</Text>
+            <div style={{ fontSize: 11, color: '#8899A6' }}>{record.email}</div>
           </div>
         </Space>
       ),
@@ -141,13 +137,12 @@ const StudentsPage: React.FC = () => {
     {
       title: '研究方向',
       key: 'research',
+      width: 120,
       render: (_, record) => (
         <div>
-          <div style={{ color: '#B8C4CE' }}>{record.department || '-'}</div>
+          <div style={{ color: '#B8C4CE', fontSize: 12 }}>{record.department || '-'}</div>
           {record.research_direction && (
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {record.research_direction}
-            </Text>
+            <div style={{ fontSize: 11, color: '#8899A6' }}>{record.research_direction}</div>
           )}
         </div>
       ),
@@ -155,70 +150,67 @@ const StudentsPage: React.FC = () => {
     {
       title: '活跃度',
       key: 'activity',
-      width: 160,
+      width: 100,
       render: (_, record) => {
         const score = getActivityScore(record);
         return (
-          <Tooltip title={`活跃度得分: ${score}`}>
-            <Progress 
-              percent={score} 
-              size="small"
-              strokeColor={getActivityColor(score)}
-              trailColor="#30363D"
-              format={() => (
-                <span style={{ color: getActivityColor(score), fontSize: 12 }}>{score}%</span>
-              )}
-            />
-          </Tooltip>
+          <Progress 
+            percent={score} 
+            size="small"
+            strokeColor={getActivityColor(score)}
+            trailColor="#30363D"
+            format={() => <span style={{ color: getActivityColor(score), fontSize: 11 }}>{score}%</span>}
+          />
         );
       },
     },
     {
       title: '研究数据',
       key: 'stats',
+      width: 140,
       render: (_, record) => (
-        <Space size={16}>
+        <Space size={4}>
           <Tooltip title="对话数">
-            <Badge count={record.conversation_count} showZero color="#4A90D9" overflowCount={999}>
+            <Badge count={record.conversation_count} showZero color="#4A90D9" size="small" overflowCount={999}>
               <div style={{ 
-                width: 32, height: 32, borderRadius: 8, 
+                width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#4A90D915', display: 'flex', 
                 alignItems: 'center', justifyContent: 'center' 
               }}>
-                <MessageOutlined style={{ color: '#4A90D9' }} />
+                <MessageOutlined style={{ color: '#4A90D9', fontSize: 12 }} />
               </div>
             </Badge>
           </Tooltip>
           <Tooltip title="知识库">
-            <Badge count={record.knowledge_base_count} showZero color="#13c2c2" overflowCount={99}>
+            <Badge count={record.knowledge_base_count} showZero color="#13c2c2" size="small" overflowCount={99}>
               <div style={{ 
-                width: 32, height: 32, borderRadius: 8, 
+                width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#13c2c215', display: 'flex', 
                 alignItems: 'center', justifyContent: 'center' 
               }}>
-                <BookOutlined style={{ color: '#13c2c2' }} />
+                <BookOutlined style={{ color: '#13c2c2', fontSize: 12 }} />
               </div>
             </Badge>
           </Tooltip>
           <Tooltip title="论文数">
-            <Badge count={record.paper_count} showZero color="#eb2f96" overflowCount={99}>
+            <Badge count={record.paper_count} showZero color="#eb2f96" size="small" overflowCount={99}>
               <div style={{ 
-                width: 32, height: 32, borderRadius: 8, 
+                width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#eb2f9615', display: 'flex', 
                 alignItems: 'center', justifyContent: 'center' 
               }}>
-                <FileTextOutlined style={{ color: '#eb2f96' }} />
+                <FileTextOutlined style={{ color: '#eb2f96', fontSize: 12 }} />
               </div>
             </Badge>
           </Tooltip>
           <Tooltip title="笔记本">
-            <Badge count={record.notebook_count} showZero color="#fa8c16" overflowCount={99}>
+            <Badge count={record.notebook_count} showZero color="#fa8c16" size="small" overflowCount={99}>
               <div style={{ 
-                width: 32, height: 32, borderRadius: 8, 
+                width: 24, height: 24, borderRadius: 6, 
                 backgroundColor: '#fa8c1615', display: 'flex', 
                 alignItems: 'center', justifyContent: 'center' 
               }}>
-                <ExperimentOutlined style={{ color: '#fa8c16' }} />
+                <ExperimentOutlined style={{ color: '#fa8c16', fontSize: 12 }} />
               </div>
             </Badge>
           </Tooltip>
@@ -229,19 +221,17 @@ const StudentsPage: React.FC = () => {
       title: '加入时间',
       dataIndex: 'joined_at',
       key: 'joined_at',
+      width: 100,
       render: (date: string) => (
-        <Space>
-          <ClockCircleOutlined style={{ color: '#8899A6' }} />
-          <span style={{ color: '#8899A6' }}>
-            {date ? new Date(date).toLocaleDateString('zh-CN') : '-'}
-          </span>
-        </Space>
+        <span style={{ color: '#8899A6', fontSize: 11 }}>
+          {date ? new Date(date).toLocaleDateString('zh-CN') : '-'}
+        </span>
       ),
     },
     {
       title: '操作',
       key: 'action',
-      width: 100,
+      width: 60,
       render: (_, record) => (
         <Dropdown
           menu={{
@@ -266,7 +256,7 @@ const StudentsPage: React.FC = () => {
             ],
           }}
         >
-          <Button type="text" icon={<MoreOutlined />} />
+          <Button type="text" size="small" icon={<MoreOutlined />} />
         </Dropdown>
       ),
     },
@@ -329,130 +319,84 @@ const StudentsPage: React.FC = () => {
     },
   ];
 
-  // 统计卡片
+  // 统计卡片 - 超紧凑版
   const StatCard: React.FC<{
     title: string;
     value: number;
     icon: React.ReactNode;
     color: string;
   }> = ({ title, value, icon, color }) => (
-    <Card
+    <div
       style={{
-        background: `linear-gradient(135deg, ${color}12 0%, ${color}05 100%)`,
-        borderColor: `${color}25`,
-        borderRadius: 16,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '8px 12px',
+        background: `${color}10`,
+        borderRadius: 8,
+        border: `1px solid ${color}25`,
       }}
-      bodyStyle={{ padding: '24px' }}
     >
-      <Space align="start">
-        <div 
-          style={{ 
-            width: 52, height: 52, borderRadius: 14, 
-            backgroundColor: `${color}18`,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 24, color: color,
-          }}
-        >
-          {icon}
-        </div>
-        <div>
-          <Text style={{ color: '#8899A6', fontSize: 13 }}>{title}</Text>
-          <div style={{ fontSize: 32, fontWeight: 700, color: color, lineHeight: 1.2, marginTop: 4 }}>
-            {value}
-          </div>
-        </div>
-      </Space>
-    </Card>
+      <span style={{ fontSize: 14, color }}>{icon}</span>
+      <span style={{ fontSize: 16, fontWeight: 600, color }}>{value}</span>
+      <span style={{ fontSize: 11, color: '#8899A6' }}>{title}</span>
+    </div>
   );
 
   return (
     <div style={{ 
-      padding: '32px 40px',
-      minHeight: '100vh',
+      padding: '20px 24px',
+      height: '100vh',
+      overflow: 'auto',
       background: 'linear-gradient(180deg, #0D1117 0%, #161B22 100%)',
     }}>
       {/* 页面标题 */}
-      <div style={{ marginBottom: 32, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div>
-          <Title level={2} style={{ 
-            margin: 0, 
-            color: '#E8E8E8',
-            fontWeight: 600,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-          }}>
-            <TeamOutlined style={{ color: '#4A90D9' }} />
-            学生管理
-          </Title>
-          <Text style={{ color: '#8899A6', marginTop: 8, display: 'block' }}>
-            管理您指导的学生，跟踪研究进度，发送邀请
-          </Text>
-        </div>
+      <div style={{ marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Title level={4} style={{ 
+          margin: 0, 
+          color: '#E8E8E8',
+          fontWeight: 600,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+        }}>
+          <TeamOutlined style={{ color: '#4A90D9' }} />
+          学生管理
+        </Title>
         <Button 
           type="primary" 
           icon={<UserAddOutlined />}
           onClick={() => setInviteModalVisible(true)}
-          size="large"
+          size="small"
           style={{ 
             backgroundColor: '#4A90D9',
-            borderRadius: 10,
-            height: 44,
-            paddingLeft: 24,
-            paddingRight: 24,
+            borderRadius: 6,
           }}
         >
           邀请学生
         </Button>
       </div>
 
-      {/* 统计卡片 */}
-      <Row gutter={[20, 20]} style={{ marginBottom: 32 }}>
-        <Col xs={24} sm={12} lg={6}>
-          <StatCard 
-            title="我的学生" 
-            value={students.length} 
-            icon={<TeamOutlined />}
-            color="#4A90D9"
-          />
-        </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <StatCard 
-            title="待处理邀请" 
-            value={pendingInvitations.length} 
-            icon={<SendOutlined />}
-            color="#faad14"
-          />
-        </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <StatCard 
-            title="待处理申请" 
-            value={receivedApplications.length} 
-            icon={<MailOutlined />}
-            color="#52c41a"
-          />
-        </Col>
-        <Col xs={24} sm={12} lg={6}>
-          <StatCard 
-            title="活跃学生" 
-            value={students.filter(s => getActivityScore(s) >= 70).length} 
-            icon={<StarOutlined />}
-            color="#D4AF37"
-          />
-        </Col>
-      </Row>
+      {/* 统计 - 内联紧凑 */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+        <StatCard title="学生" value={students.length} icon={<TeamOutlined />} color="#4A90D9" />
+        <StatCard title="邀请" value={pendingInvitations.length} icon={<SendOutlined />} color="#faad14" />
+        <StatCard title="申请" value={receivedApplications.length} icon={<MailOutlined />} color="#52c41a" />
+        <StatCard title="活跃" value={students.filter(s => getActivityScore(s) >= 70).length} icon={<StarOutlined />} color="#D4AF37" />
+      </div>
 
       {/* 主内容区 */}
       <Card
         style={{
           backgroundColor: '#161B22',
           borderColor: '#30363D',
-          borderRadius: 16,
+          borderRadius: 12,
         }}
         bodyStyle={{ padding: 0 }}
       >
         <Tabs
           defaultActiveKey="students"
+          size="small"
           items={[
             {
               key: 'students',
@@ -465,7 +409,7 @@ const StudentsPage: React.FC = () => {
               children: (
                 <>
                   <div style={{ 
-                    padding: '16px 24px', 
+                    padding: '8px 16px', 
                     borderBottom: '1px solid #30363D',
                     display: 'flex',
                     justifyContent: 'flex-end',
@@ -473,6 +417,7 @@ const StudentsPage: React.FC = () => {
                     <Button 
                       icon={<ReloadOutlined />} 
                       onClick={() => fetchStudents()}
+                      size="small"
                       style={{ borderColor: '#30363D' }}
                     >
                       刷新
@@ -483,7 +428,13 @@ const StudentsPage: React.FC = () => {
                     dataSource={students}
                     rowKey="id"
                     loading={studentsLoading}
-                    pagination={false}
+                    size="small"
+                    pagination={{
+                      pageSize: 8,
+                      size: 'small',
+                      showSizeChanger: false,
+                      showTotal: (total) => `共 ${total} 名学生`,
+                    }}
                     locale={{
                       emptyText: (
                         <Empty 
@@ -514,6 +465,7 @@ const StudentsPage: React.FC = () => {
                   dataSource={invitations.filter(i => i.type === 'invite')}
                   rowKey="id"
                   loading={invitationsLoading}
+                  size="small"
                   pagination={false}
                   locale={{
                     emptyText: (
@@ -809,11 +761,14 @@ const StudentsPage: React.FC = () => {
           background: #0D1117 !important;
           color: #8899A6 !important;
           border-bottom: 1px solid #30363D !important;
+          padding: 6px 8px !important;
+          font-size: 12px !important;
         }
         .ant-table-tbody > tr > td {
           border-bottom: 1px solid #30363D !important;
           background: transparent !important;
           color: #E8E8E8;
+          padding: 6px 8px !important;
         }
         .ant-table-tbody > tr:hover > td {
           background: #1C2128 !important;
@@ -823,6 +778,7 @@ const StudentsPage: React.FC = () => {
         }
         .ant-tabs-tab {
           color: #8899A6 !important;
+          padding: 8px 12px !important;
         }
         .ant-tabs-tab-active .ant-tabs-tab-btn {
           color: #4A90D9 !important;
@@ -847,6 +803,41 @@ const StudentsPage: React.FC = () => {
         }
         .ant-input::placeholder {
           color: #8899A6 !important;
+        }
+        .ant-dropdown {
+          background: #161B22 !important;
+        }
+        .ant-dropdown-menu {
+          background: #161B22 !important;
+          border: 1px solid #30363D !important;
+        }
+        .ant-dropdown-menu-item {
+          color: #E8E8E8 !important;
+        }
+        .ant-dropdown-menu-item:hover {
+          background: #1C2128 !important;
+        }
+        .ant-pagination-item {
+          background: #0D1117 !important;
+          border-color: #30363D !important;
+        }
+        .ant-pagination-item a {
+          color: #8899A6 !important;
+        }
+        .ant-pagination-item-active {
+          border-color: #4A90D9 !important;
+        }
+        .ant-pagination-item-active a {
+          color: #4A90D9 !important;
+        }
+        .ant-pagination-prev .ant-pagination-item-link,
+        .ant-pagination-next .ant-pagination-item-link {
+          background: #0D1117 !important;
+          border-color: #30363D !important;
+          color: #8899A6 !important;
+        }
+        .ant-table-cell-fix-right {
+          background: #161B22 !important;
         }
       `}</style>
     </div>
