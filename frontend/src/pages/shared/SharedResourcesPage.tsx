@@ -20,12 +20,13 @@ const { Search } = Input;
 interface SharedResource {
   id: number;
   resource_type: string;
-  resource_id: number;
+  resource_id: number | string;  // notebook uses string UUID
   resource_name: string;
   resource_detail?: {
     title?: string; authors?: string[]; year?: number; venue?: string;
     abstract?: string; pdf_url?: string; url?: string; citation_count?: number;
     description?: string; paper_count?: number; document_count?: number;
+    cell_count?: number;  // notebook specific
   };
   owner_id: number;
   owner_name: string;
@@ -40,9 +41,11 @@ interface SharedResource {
 }
 
 interface SelectableResource {
-  id: number; title?: string; name?: string; authors?: string[];
+  id: number | string;  // notebook uses string UUID
+  title?: string; name?: string; authors?: string[];
   year?: number; venue?: string; description?: string;
   paper_count?: number; document_count?: number; color?: string;
+  cell_count?: number; updated_at?: string;  // notebook specific
 }
 
 interface MyGroup { id: number; name: string; role: string; }
@@ -68,16 +71,28 @@ const SharedResourcesPage: React.FC = () => {
   const [sharedWithMe, setSharedWithMe] = useState<SharedResource[]>([]);
   const [myShares, setMyShares] = useState<SharedResource[]>([]);
   const [counts, setCounts] = useState({ paper: 0, paper_collection: 0, knowledge_base: 0, notebook: 0, total: 0 });
+  const [myShareCounts, setMyShareCounts] = useState({ paper: 0, paper_collection: 0, knowledge_base: 0, notebook: 0, total: 0 });
   const [filterType, setFilterType] = useState<string | undefined>();
   
   const [shareModalVisible, setShareModalVisible] = useState(false);
   const [shareLoading, setShareLoading] = useState(false);
-  const [shareResourceType, setShareResourceType] = useState<'paper' | 'paper_collection' | 'knowledge_base'>('paper');
+  const [shareResourceType, setShareResourceType] = useState<'paper' | 'paper_collection' | 'knowledge_base' | 'notebook'>('paper');
   const [resources, setResources] = useState<SelectableResource[]>([]);
   const [myGroups, setMyGroups] = useState<MyGroup[]>([]);
   const [resourceSearch, setResourceSearch] = useState('');
-  const [selectedResources, setSelectedResources] = useState<number[]>([]);
+  const [selectedResources, setSelectedResources] = useState<(number | string)[]>([]);
   const [shareTarget, setShareTarget] = useState<{ type: string; id?: number }>({ type: 'group' });
+
+  // 计算"我共享的"各类型数量
+  const calcMyShareCounts = (shares: SharedResource[]) => {
+    const result = { paper: 0, paper_collection: 0, knowledge_base: 0, notebook: 0, total: shares.length };
+    shares.forEach(s => {
+      if (s.resource_type in result) {
+        result[s.resource_type as keyof typeof result]++;
+      }
+    });
+    return result;
+  };
 
   const loadData = async () => {
     setLoading(true);
@@ -90,6 +105,7 @@ const SharedResourcesPage: React.FC = () => {
       setSharedWithMe(withMe);
       setMyShares(mySharesData);
       setCounts(countsData);
+      setMyShareCounts(calcMyShareCounts(mySharesData));
     } catch (error) {
       console.error('加载共享资源失败:', error);
       message.error('加载数据失败');
@@ -100,33 +116,37 @@ const SharedResourcesPage: React.FC = () => {
 
   useEffect(() => { loadData(); }, [filterType]);
 
-  const loadResources = async () => {
+  // 加载可共享的资源列表
+  const loadResources = async (resourceType: string, search: string) => {
     try {
       let data: SelectableResource[] = [];
-      if (shareResourceType === 'paper') {
-        data = await shareApi.getMyPapers(resourceSearch);
-      } else if (shareResourceType === 'paper_collection') {
-        data = await shareApi.getMyCollections(resourceSearch);
-      } else if (shareResourceType === 'knowledge_base') {
-        data = await shareApi.getMyKnowledgeBases(resourceSearch);
+      if (resourceType === 'paper') {
+        data = await shareApi.getMyPapers(search);
+      } else if (resourceType === 'paper_collection') {
+        data = await shareApi.getMyCollections(search);
+      } else if (resourceType === 'knowledge_base') {
+        data = await shareApi.getMyKnowledgeBases(search);
+      } else if (resourceType === 'notebook') {
+        data = await shareApi.getMyNotebooks(search);
       }
       setResources(data);
     } catch (error) {
       console.error('加载资源列表失败:', error);
+      setResources([]);
     }
   };
 
   useEffect(() => {
     if (shareModalVisible) {
       shareApi.getMyGroups().then(setMyGroups);
-      loadResources();
+      loadResources(shareResourceType, resourceSearch);
     }
   }, [shareModalVisible]);
 
   useEffect(() => {
     if (shareModalVisible) {
       setSelectedResources([]);
-      loadResources();
+      loadResources(shareResourceType, resourceSearch);
     }
   }, [shareResourceType, resourceSearch]);
 
@@ -173,7 +193,7 @@ const SharedResourcesPage: React.FC = () => {
     navigate(`/shared/view/${resource.id}`);
   };
 
-  const toggleResourceSelection = (id: number) => {
+  const toggleResourceSelection = (id: number | string) => {
     setSelectedResources(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
@@ -197,6 +217,7 @@ const SharedResourcesPage: React.FC = () => {
                 <Tag color={config.color} style={{ fontSize: 10, padding: '0 6px', borderRadius: 10 }}>{config.label}</Tag>
                 {record.resource_detail?.year && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>{record.resource_detail.year}</Text>}
                 {record.resource_detail?.paper_count !== undefined && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>{record.resource_detail.paper_count} 篇</Text>}
+                {record.resource_detail?.cell_count !== undefined && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>{record.resource_detail.cell_count} 个单元格</Text>}
               </Space>
             </div>
           </Space>
@@ -228,7 +249,10 @@ const SharedResourcesPage: React.FC = () => {
           <div style={{ width: 42, height: 42, borderRadius: 12, background: `${config.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: config.color, fontSize: 18 }}>{config.icon}</div>
           <div>
             <div style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: 260 }}><Tooltip title={record.resource_name}>{record.resource_name.length > 30 ? record.resource_name.slice(0, 30) + '...' : record.resource_name}</Tooltip></div>
-            <Tag color={config.color} style={{ fontSize: 10, padding: '0 6px', borderRadius: 10 }}>{config.label}</Tag>
+            <Space size={4}>
+              <Tag color={config.color} style={{ fontSize: 10, padding: '0 6px', borderRadius: 10 }}>{config.label}</Tag>
+              {record.resource_detail?.cell_count !== undefined && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>{record.resource_detail.cell_count} 个单元格</Text>}
+            </Space>
           </div>
         </Space>
       );
@@ -267,17 +291,20 @@ const SharedResourcesPage: React.FC = () => {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 20 }}>
-        {Object.entries(resourceTypeConfig).map(([type, config]) => (
-          <Card key={type} size="small" style={{ background: 'var(--bg-elevated)', border: `1px solid ${filterType === type ? config.color : 'var(--border)'}`, borderRadius: 14, cursor: 'pointer', transition: 'all 0.2s' }} styles={{ body: { padding: '18px 20px' } }} onClick={() => setFilterType(filterType === type ? undefined : type)}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-              <div style={{ width: 48, height: 48, borderRadius: 14, background: `linear-gradient(135deg, ${config.color}20, ${config.color}10)`, border: `1px solid ${config.color}30`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: config.color, fontSize: 22 }}>{config.icon}</div>
-              <div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.1 }}>{counts[type as keyof typeof counts] || 0}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>共享{config.label}</div>
+        {Object.entries(resourceTypeConfig).map(([type, config]) => {
+          const displayCounts = activeTab === 'sent' ? myShareCounts : counts;
+          return (
+            <Card key={type} size="small" style={{ background: 'var(--bg-elevated)', border: `1px solid ${filterType === type ? config.color : 'var(--border)'}`, borderRadius: 14, cursor: 'pointer', transition: 'all 0.2s' }} styles={{ body: { padding: '18px 20px' } }} onClick={() => setFilterType(filterType === type ? undefined : type)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                <div style={{ width: 48, height: 48, borderRadius: 14, background: `linear-gradient(135deg, ${config.color}20, ${config.color}10)`, border: `1px solid ${config.color}30`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: config.color, fontSize: 22 }}>{config.icon}</div>
+                <div>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.1 }}>{displayCounts[type as keyof typeof displayCounts] || 0}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{activeTab === 'sent' ? '已共享' : '共享'}{config.label}</div>
+                </div>
               </div>
-            </div>
-          </Card>
-        ))}
+            </Card>
+          );
+        })}
       </div>
 
       <Card style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 16 }} styles={{ body: { padding: 0 } }}>
@@ -306,6 +333,7 @@ const SharedResourcesPage: React.FC = () => {
               { value: 'paper', label: <Space><FileTextOutlined />论文</Space> },
               { value: 'paper_collection', label: <Space><FolderOutlined />文献集</Space> },
               { value: 'knowledge_base', label: <Space><DatabaseOutlined />知识库</Space> },
+              { value: 'notebook', label: <Space><EditOutlined />笔记本</Space> },
             ]} block />
           </div>
 
@@ -320,7 +348,7 @@ const SharedResourcesPage: React.FC = () => {
                 const isSelected = selectedResources.includes(item.id);
                 const displayTitle = item.title || item.name || '';
                 return (
-                  <div key={item.id} onClick={() => toggleResourceSelection(item.id)} style={{ padding: '14px 16px', cursor: 'pointer', background: isSelected ? 'rgba(74, 158, 232, 0.1)' : 'transparent', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div key={String(item.id)} onClick={() => toggleResourceSelection(item.id)} style={{ padding: '14px 16px', cursor: 'pointer', background: isSelected ? 'rgba(74, 158, 232, 0.1)' : 'transparent', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 12 }}>
                     <Checkbox checked={isSelected} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 500, color: 'var(--text-primary)', marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{displayTitle.length > 50 ? displayTitle.slice(0, 50) + '...' : displayTitle}</div>
@@ -329,6 +357,8 @@ const SharedResourcesPage: React.FC = () => {
                         {item.year && <Tag style={{ fontSize: 10, borderRadius: 10 }}>{item.year}</Tag>}
                         {item.paper_count !== undefined && <Tag style={{ fontSize: 10, borderRadius: 10 }}>{item.paper_count} 篇论文</Tag>}
                         {item.document_count !== undefined && <Tag style={{ fontSize: 10, borderRadius: 10 }}>{item.document_count} 个文档</Tag>}
+                        {item.cell_count !== undefined && <Tag style={{ fontSize: 10, borderRadius: 10 }}>{item.cell_count} 个单元格</Tag>}
+                        {item.updated_at && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>更新于 {new Date(item.updated_at).toLocaleDateString()}</Text>}
                       </Space>
                     </div>
                     {isSelected && <CheckOutlined style={{ color: 'var(--primary)' }} />}

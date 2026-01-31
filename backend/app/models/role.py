@@ -111,7 +111,7 @@ class SharedResource(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     resource_type = Column(String(30), nullable=False)  # knowledge_base, paper_collection, notebook
-    resource_id = Column(Integer, nullable=False)
+    resource_id = Column(String(50), nullable=False)  # 支持整数ID和UUID字符串
     owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     shared_with_type = Column(String(20), nullable=False)  # 'user', 'group', 'all_students'
     shared_with_id = Column(Integer, nullable=True)  # user_id 或 group_id

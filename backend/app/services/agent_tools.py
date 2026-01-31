@@ -535,7 +535,13 @@ class KnowledgeSearchTool(Tool):
                 )
             )
             
-            result = set(row[0] for row in shared_result.fetchall())
+            # resource_id 是字符串，需要转为整数（知识库ID是整数）
+            result = set()
+            for row in shared_result.fetchall():
+                try:
+                    result.add(int(row[0]))
+                except (ValueError, TypeError):
+                    logger.warning(f"无效的知识库ID: {row[0]}")
             logger.info(f"用户 {self.user_id} 可访问的共享知识库 (agent_tools): {result}")
             return result
         except Exception as e:

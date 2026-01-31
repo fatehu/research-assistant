@@ -1193,7 +1193,7 @@ export interface Invitation {
 export interface SharedResource {
   id: number
   resource_type: ShareType
-  resource_id: number
+  resource_id: number | string  // 支持整数和字符串（如notebook UUID）
   owner_id: number
   shared_with_type: 'user' | 'group' | 'all_students'
   shared_with_id?: number
@@ -1520,10 +1520,17 @@ export const shareApi = {
     return response.data
   },
 
+  // 获取我的笔记本列表（用于共享选择）
+  getMyNotebooks: async (search?: string): Promise<{ id: string; title: string; description: string; cell_count: number; updated_at: string }[]> => {
+    const params = search ? { search } : {}
+    const response = await api.get('/api/share/my-notebooks', { params })
+    return response.data
+  },
+
   // 共享资源
   shareResource: async (data: {
     resource_type: string
-    resource_id: number
+    resource_id: number | string  // 支持整数和字符串（如notebook UUID）
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -1536,7 +1543,7 @@ export const shareApi = {
   // 批量共享
   batchShare: async (data: {
     resource_type: string
-    resource_ids: number[]
+    resource_ids: (number | string)[]  // 支持整数和字符串
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string

@@ -8,6 +8,7 @@ import {
   ArrowLeftOutlined, FileTextOutlined, FolderOutlined, DatabaseOutlined,
   UserOutlined, CalendarOutlined, LinkOutlined, DownloadOutlined,
   CopyOutlined, CheckOutlined, FileOutlined, FilePdfOutlined,
+  CodeOutlined, PlayCircleOutlined,
 } from '@ant-design/icons';
 import { shareApi } from '@/services/api';
 
@@ -44,12 +45,21 @@ interface SharedDetail {
     id: number; filename: string; file_type: string; file_size: number;
     chunk_count: number; status: string; created_at?: string;
   }[];
+  notebook?: {
+    id: string; title: string; description?: string; execution_count: number;
+    created_at?: string; updated_at?: string; cell_count: number;
+  };
+  cells?: {
+    id: string; cell_type: string; source: string; outputs: any[];
+    execution_count?: number; position: number;
+  }[];
 }
 
 const resourceTypeConfig: Record<string, { label: string; icon: React.ReactNode; color: string }> = {
   paper: { label: '论文', icon: <FileTextOutlined />, color: '#4A9EE8' },
   paper_collection: { label: '文献集', icon: <FolderOutlined />, color: '#52c41a' },
   knowledge_base: { label: '知识库', icon: <DatabaseOutlined />, color: '#722ed1' },
+  notebook: { label: '笔记本', icon: <CodeOutlined />, color: '#fa8c16' },
 };
 
 const permissionConfig: Record<string, { label: string; color: string }> = {
@@ -152,7 +162,12 @@ const SharedResourceViewPage: React.FC = () => {
   const permConfig = permissionConfig[detail.permission] || { label: '只读', color: 'default' };
 
   return (
-    <div style={{ padding: 24, maxWidth: 1000, margin: '0 auto' }}>
+    <div style={{ 
+      padding: 24, 
+      maxWidth: 1000, 
+      margin: '0 auto', 
+      paddingBottom: 80,
+    }}>
       {/* 返回按钮 */}
       <Button 
         type="text" 
@@ -180,7 +195,7 @@ const SharedResourceViewPage: React.FC = () => {
               <Tag color={permConfig.color} style={{ borderRadius: 12 }}>{permConfig.label}</Tag>
             </div>
             <Title level={4} style={{ margin: 0, color: 'var(--text-primary)' }}>
-              {detail.paper?.title || detail.collection?.name || detail.knowledge_base?.name}
+              {detail.paper?.title || detail.collection?.name || detail.knowledge_base?.name || detail.notebook?.title}
             </Title>
             <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 16 }}>
               <Space size={8}>
@@ -429,6 +444,222 @@ const SharedResourceViewPage: React.FC = () => {
               )}
               locale={{ emptyText: <Empty description="暂无文档" /> }}
             />
+          </div>
+        </Card>
+      )}
+
+      {/* Notebook 详情 - 只读查看 */}
+      {detail.resource_type === 'notebook' && detail.notebook && (
+        <Card style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: 16, marginBottom: 24 }}>
+          {/* 只读提示 */}
+          <div style={{ 
+            marginBottom: 20, 
+            padding: 16, 
+            background: 'linear-gradient(135deg, rgba(250, 140, 22, 0.1), rgba(255, 169, 64, 0.1))',
+            borderRadius: 12,
+            border: '1px solid rgba(250, 140, 22, 0.2)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{
+                width: 40, height: 40, borderRadius: 10,
+                background: 'rgba(250, 140, 22, 0.2)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: '#fa8c16', fontSize: 20,
+              }}>
+                <CodeOutlined />
+              </div>
+              <div>
+                <Text strong style={{ color: 'var(--text-primary)', fontSize: 15 }}>只读模式</Text>
+                <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>您可以查看此笔记本的内容，但无法编辑或执行代码</div>
+              </div>
+            </div>
+          </div>
+
+          {detail.notebook.description && (
+            <Paragraph style={{ color: 'var(--text-secondary)', marginBottom: 20 }}>
+              {detail.notebook.description}
+            </Paragraph>
+          )}
+
+          <Descriptions column={3} size="small" style={{ marginBottom: 20 }}>
+            <Descriptions.Item label="单元格数">{detail.notebook.cell_count}</Descriptions.Item>
+            <Descriptions.Item label="执行次数">{detail.notebook.execution_count}</Descriptions.Item>
+            <Descriptions.Item label="更新时间">{detail.notebook.updated_at ? new Date(detail.notebook.updated_at).toLocaleString() : '-'}</Descriptions.Item>
+          </Descriptions>
+
+          <Divider style={{ margin: '16px 0' }} />
+
+          <Text strong style={{ color: 'var(--text-primary)', fontSize: 16, display: 'block', marginBottom: 16 }}>
+            单元格列表 ({detail.cells?.length || 0} 个)
+          </Text>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {(detail.cells || []).map((cell, index) => (
+              <div key={cell.id} style={{ 
+                background: 'var(--bg-surface)', 
+                borderRadius: 12, 
+                border: '1px solid var(--border)',
+                overflow: 'hidden',
+              }}>
+                {/* 单元格头部 */}
+                <div style={{ 
+                  padding: '8px 16px', 
+                  background: cell.cell_type === 'code' ? 'rgba(250, 140, 22, 0.05)' : 'rgba(82, 196, 26, 0.05)',
+                  borderBottom: '1px solid var(--border)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                }}>
+                  <Tag color={cell.cell_type === 'code' ? 'orange' : 'green'} style={{ margin: 0, borderRadius: 8 }}>
+                    {cell.cell_type === 'code' ? 'Code' : 'Markdown'}
+                  </Tag>
+                  {cell.cell_type === 'code' && cell.execution_count && (
+                    <Text style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      [执行 #{cell.execution_count}]
+                    </Text>
+                  )}
+                  <Text style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                    #{index + 1}
+                  </Text>
+                </div>
+                
+                {/* 单元格内容 */}
+                <div style={{ padding: 16 }}>
+                  {cell.cell_type === 'code' ? (
+                    <pre style={{ 
+                      margin: 0, 
+                      padding: 12, 
+                      background: '#1e1e2e', 
+                      borderRadius: 8,
+                      overflow: 'auto',
+                      maxHeight: 500,
+                      fontFamily: 'Monaco, Consolas, "Courier New", monospace',
+                      fontSize: 13,
+                      lineHeight: 1.5,
+                      color: '#cdd6f4',
+                    }}>
+                      <code>{cell.source || '# 空单元格'}</code>
+                    </pre>
+                  ) : (
+                    <div style={{ 
+                      color: 'var(--text-secondary)', 
+                      fontSize: 14,
+                      lineHeight: 1.6,
+                      whiteSpace: 'pre-wrap',
+                    }}>
+                      {cell.source || '*空内容*'}
+                    </div>
+                  )}
+                  
+                  {/* 代码输出 - 修复输出显示 */}
+                  {cell.cell_type === 'code' && cell.outputs && cell.outputs.length > 0 && (
+                    <div style={{ marginTop: 12 }}>
+                      <Text style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8, display: 'block' }}>
+                        输出 ({cell.outputs.length} 项):
+                      </Text>
+                      {cell.outputs.map((output: any, outIdx: number) => {
+                        // 获取输出内容 - 兼容多种格式
+                        const outputContent = output.content || output.text || output.data || '';
+                        const outputText = typeof outputContent === 'string' 
+                          ? outputContent 
+                          : (outputContent?.['text/plain'] || JSON.stringify(outputContent, null, 2));
+                        
+                        return (
+                          <div key={outIdx} style={{ 
+                            padding: 12, 
+                            background: output.output_type === 'error' ? 'rgba(255, 77, 79, 0.1)' : 'var(--bg-hover)',
+                            borderRadius: 8,
+                            marginTop: 4,
+                            overflow: 'auto',
+                            maxHeight: 400,
+                          }}>
+                            {/* 标准输出流 */}
+                            {output.output_type === 'stream' && (
+                              <pre style={{ 
+                                margin: 0, 
+                                fontFamily: 'Monaco, Consolas, monospace', 
+                                fontSize: 12,
+                                color: 'var(--text-secondary)',
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-all',
+                              }}>
+                                {outputText}
+                              </pre>
+                            )}
+                            {/* 执行结果 */}
+                            {output.output_type === 'execute_result' && (
+                              <pre style={{ 
+                                margin: 0, 
+                                fontFamily: 'Monaco, Consolas, monospace', 
+                                fontSize: 12,
+                                color: '#52c41a',
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-all',
+                              }}>
+                                {outputText}
+                              </pre>
+                            )}
+                            {/* 错误信息 */}
+                            {output.output_type === 'error' && (
+                              <pre style={{ 
+                                margin: 0, 
+                                fontFamily: 'Monaco, Consolas, monospace', 
+                                fontSize: 12,
+                                color: '#ff4d4f',
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-all',
+                              }}>
+                                {output.traceback ? output.traceback.join('\n') : outputText}
+                              </pre>
+                            )}
+                            {/* 图片显示 - content 是完整的 data URI */}
+                            {output.output_type === 'display_data' && (
+                              <>
+                                {/* 检查是否是图片：通过 mime_type 或 content 内容判断 */}
+                                {(output.mime_type === 'image/png' || 
+                                  (typeof output.content === 'string' && output.content.includes('image/png'))) && output.content && (
+                                  <img 
+                                    src={typeof output.content === 'string' && output.content.startsWith('data:') 
+                                      ? output.content 
+                                      : `data:image/png;base64,${output.content}`
+                                    } 
+                                    alt="output" 
+                                    style={{ maxWidth: '100%', borderRadius: 4 }}
+                                  />
+                                )}
+                                {/* 非图片的 display_data */}
+                                {!(output.mime_type === 'image/png' || 
+                                  (typeof output.content === 'string' && output.content.includes('image/png'))) && outputText && (
+                                  <pre style={{ margin: 0, fontFamily: 'Monaco, Consolas, monospace', fontSize: 12, whiteSpace: 'pre-wrap' }}>
+                                    {outputText}
+                                  </pre>
+                                )}
+                              </>
+                            )}
+                            {/* 未知类型 - 通用显示 */}
+                            {!['stream', 'execute_result', 'error', 'display_data'].includes(output.output_type) && (
+                              <pre style={{ 
+                                margin: 0, 
+                                fontFamily: 'Monaco, Consolas, monospace', 
+                                fontSize: 12,
+                                color: 'var(--text-secondary)',
+                                whiteSpace: 'pre-wrap',
+                              }}>
+                                {outputText || JSON.stringify(output, null, 2)}
+                              </pre>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            
+            {(!detail.cells || detail.cells.length === 0) && (
+              <Empty description="暂无单元格" />
+            )}
           </div>
         </Card>
       )}

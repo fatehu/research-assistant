@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Union
 from loguru import logger
 
 from app.core.database import get_db
@@ -26,7 +26,7 @@ router = APIRouter()
 
 class ShareResourceRequest(BaseModel):
     resource_type: str  # knowledge_base, paper_collection, paper, notebook
-    resource_id: int
+    resource_id: Union[int, str]  # 支持整数ID和UUID字符串（如notebook）
     shared_with_type: str  # user, group, all_students
     shared_with_id: Optional[int] = None
     permission: str = "read"  # read, write
@@ -36,7 +36,7 @@ class ShareResourceRequest(BaseModel):
 class SharedResourceResponse(BaseModel):
     id: int
     resource_type: str
-    resource_id: int
+    resource_id: Union[int, str]  # 支持整数ID和UUID字符串
     resource_name: str
     resource_detail: Optional[dict] = None
     owner_id: int
@@ -54,7 +54,7 @@ class SharedResourceResponse(BaseModel):
 class SharedWithMeResponse(BaseModel):
     id: int
     resource_type: str
-    resource_id: int
+    resource_id: Union[int, str]  # 支持整数ID和UUID字符串
     resource_name: str
     resource_detail: Optional[dict] = None
     owner_id: int
@@ -223,7 +223,7 @@ async def share_resource(
         select(SharedResource).where(
             and_(
                 SharedResource.resource_type == data.resource_type,
-                SharedResource.resource_id == data.resource_id,
+                SharedResource.resource_id == str(data.resource_id),  # 转为字符串比较
                 SharedResource.owner_id == current_user.id,
                 SharedResource.shared_with_type == data.shared_with_type,
                 SharedResource.shared_with_id == data.shared_with_id
@@ -233,10 +233,10 @@ async def share_resource(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="已存在相同的共享")
     
-    # 创建共享
+    # 创建共享（resource_id 转为字符串存储）
     shared = SharedResource(
         resource_type=data.resource_type,
-        resource_id=data.resource_id,
+        resource_id=str(data.resource_id),  # 确保是字符串
         owner_id=current_user.id,
         shared_with_type=data.shared_with_type,
         shared_with_id=data.shared_with_id,
@@ -393,51 +393,74 @@ async def get_shared_with_me(
         resource_detail = None
         
         if res.resource_type == "knowledge_base":
-            kb_result = await db.execute(
-                select(KnowledgeBase).where(KnowledgeBase.id == res.resource_id)
-            )
-            kb = kb_result.scalar_one_or_none()
-            if kb:
-                resource_name = kb.name
-                resource_detail = {"description": kb.description}
+            try:
+                kb_id = int(res.resource_id)
+                kb_result = await db.execute(
+                    select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
+                )
+                kb = kb_result.scalar_one_or_none()
+                if kb:
+                    resource_name = kb.name
+                    resource_detail = {"description": kb.description}
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "paper_collection":
-            pc_result = await db.execute(
-                select(PaperCollection).where(PaperCollection.id == res.resource_id)
-            )
-            pc = pc_result.scalar_one_or_none()
-            if pc:
-                resource_name = pc.name
-                resource_detail = {
-                    "description": pc.description,
-                    "paper_count": pc.paper_count
-                }
+            try:
+                pc_id = int(res.resource_id)
+                pc_result = await db.execute(
+                    select(PaperCollection).where(PaperCollection.id == pc_id)
+                )
+                pc = pc_result.scalar_one_or_none()
+                if pc:
+                    resource_name = pc.name
+                    resource_detail = {
+                        "description": pc.description,
+                        "paper_count": pc.paper_count
+                    }
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "paper":
-            paper_result = await db.execute(
-                select(Paper).where(Paper.id == res.resource_id)
-            )
-            paper = paper_result.scalar_one_or_none()
-            if paper:
-                resource_name = paper.title
-                resource_detail = {
-                    "title": paper.title,
-                    "authors": paper.author_names[:3] if paper.authors else [],
-                    "year": paper.year,
-                    "venue": paper.venue,
-                    "abstract": paper.abstract[:300] + "..." if paper.abstract and len(paper.abstract) > 300 else paper.abstract,
-                    "pdf_url": paper.pdf_url,
-                    "url": paper.url,
-                    "citation_count": paper.citation_count
-                }
+            try:
+                paper_id = int(res.resource_id)
+                paper_result = await db.execute(
+                    select(Paper).where(Paper.id == paper_id)
+                )
+                paper = paper_result.scalar_one_or_none()
+                if paper:
+                    resource_name = paper.title
+                    resource_detail = {
+                        "title": paper.title,
+                        "authors": paper.author_names[:3] if paper.authors else [],
+                        "year": paper.year,
+                        "venue": paper.venue,
+                        "abstract": paper.abstract[:300] + "..." if paper.abstract and len(paper.abstract) > 300 else paper.abstract,
+                        "pdf_url": paper.pdf_url,
+                        "url": paper.url,
+                        "citation_count": paper.citation_count
+                    }
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "notebook":
+            # Notebook.id 是字符串(UUID)，直接比较
             nb_result = await db.execute(
                 select(Notebook).where(Notebook.id == res.resource_id)
             )
             nb = nb_result.scalar_one_or_none()
             if nb:
                 resource_name = nb.title
+                # 计算单元格数量
+                from app.models.notebook import NotebookCell
+                cell_count_result = await db.execute(
+                    select(func.count(NotebookCell.id)).where(NotebookCell.notebook_id == nb.id)
+                )
+                cell_count = cell_count_result.scalar() or 0
+                resource_detail = {
+                    "description": nb.description,
+                    "cell_count": cell_count
+                }
         
         if not resource_name:
             continue  # 资源已删除
@@ -653,42 +676,65 @@ async def _build_resource_responses(
         resource_detail = None
         
         if res.resource_type == "knowledge_base":
-            kb_result = await db.execute(
-                select(KnowledgeBase).where(KnowledgeBase.id == res.resource_id)
-            )
-            kb = kb_result.scalar_one_or_none()
-            if kb:
-                resource_name = kb.name
+            try:
+                kb_id = int(res.resource_id)
+                kb_result = await db.execute(
+                    select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
+                )
+                kb = kb_result.scalar_one_or_none()
+                if kb:
+                    resource_name = kb.name
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "paper_collection":
-            pc_result = await db.execute(
-                select(PaperCollection).where(PaperCollection.id == res.resource_id)
-            )
-            pc = pc_result.scalar_one_or_none()
-            if pc:
-                resource_name = pc.name
+            try:
+                pc_id = int(res.resource_id)
+                pc_result = await db.execute(
+                    select(PaperCollection).where(PaperCollection.id == pc_id)
+                )
+                pc = pc_result.scalar_one_or_none()
+                if pc:
+                    resource_name = pc.name
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "paper":
-            paper_result = await db.execute(
-                select(Paper).where(Paper.id == res.resource_id)
-            )
-            paper = paper_result.scalar_one_or_none()
-            if paper:
-                resource_name = paper.title
-                resource_detail = {
-                    "title": paper.title,
-                    "authors": paper.author_names[:3] if paper.authors else [],
-                    "year": paper.year,
-                    "venue": paper.venue
-                }
+            try:
+                paper_id = int(res.resource_id)
+                paper_result = await db.execute(
+                    select(Paper).where(Paper.id == paper_id)
+                )
+                paper = paper_result.scalar_one_or_none()
+                if paper:
+                    resource_name = paper.title
+                    resource_detail = {
+                        "title": paper.title,
+                        "authors": paper.author_names[:3] if paper.authors else [],
+                        "year": paper.year,
+                        "venue": paper.venue
+                    }
+            except (ValueError, TypeError):
+                continue
                 
         elif res.resource_type == "notebook":
+            # Notebook.id 是字符串(UUID)，直接比较
             nb_result = await db.execute(
                 select(Notebook).where(Notebook.id == res.resource_id)
             )
             nb = nb_result.scalar_one_or_none()
             if nb:
                 resource_name = nb.title
+                # 计算单元格数量
+                from app.models.notebook import NotebookCell
+                cell_count_result = await db.execute(
+                    select(func.count(NotebookCell.id)).where(NotebookCell.notebook_id == nb.id)
+                )
+                cell_count = cell_count_result.scalar() or 0
+                resource_detail = {
+                    "description": nb.description,
+                    "cell_count": cell_count
+                }
         
         if not resource_name:
             continue
@@ -795,11 +841,57 @@ async def get_my_knowledge_bases_for_sharing(
     ]
 
 
+# ========== 获取我的笔记本列表（用于共享选择）==========
+
+@router.get("/my-notebooks")
+async def get_my_notebooks_for_sharing(
+    search: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取我的笔记本列表（用于选择共享）"""
+    from app.models.notebook import NotebookCell
+    
+    # 使用子查询计算 cell_count，避免 lazy loading 问题
+    cell_count_subq = (
+        select(func.count(NotebookCell.id))
+        .where(NotebookCell.notebook_id == Notebook.id)
+        .correlate(Notebook)
+        .scalar_subquery()
+    )
+    
+    query = select(
+        Notebook.id,
+        Notebook.title,
+        Notebook.description,
+        Notebook.updated_at,
+        cell_count_subq.label('cell_count')
+    ).where(Notebook.user_id == current_user.id)
+    
+    if search:
+        query = query.where(Notebook.title.ilike(f"%{search}%"))
+    
+    query = query.order_by(Notebook.updated_at.desc())
+    result = await db.execute(query)
+    rows = result.all()
+    
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "description": row.description,
+            "cell_count": row.cell_count or 0,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None
+        }
+        for row in rows
+    ]
+
+
 # ========== 批量共享 ==========
 
 class BatchShareRequest(BaseModel):
     resource_type: str
-    resource_ids: List[int]
+    resource_ids: List[Union[int, str]]  # 支持整数ID和UUID字符串
     shared_with_type: str
     shared_with_id: Optional[int] = None
     permission: str = "read"
@@ -851,6 +943,13 @@ async def batch_share_resources(
                     and_(KnowledgeBase.id == resource_id, KnowledgeBase.user_id == current_user.id)
                 )
             )
+        elif data.resource_type == "notebook":
+            # Notebook.id 是字符串UUID
+            res = await db.execute(
+                select(Notebook).where(
+                    and_(Notebook.id == str(resource_id), Notebook.user_id == current_user.id)
+                )
+            )
         else:
             continue
         
@@ -863,7 +962,7 @@ async def batch_share_resources(
             select(SharedResource).where(
                 and_(
                     SharedResource.resource_type == data.resource_type,
-                    SharedResource.resource_id == resource_id,
+                    SharedResource.resource_id == str(resource_id),  # 转为字符串
                     SharedResource.owner_id == current_user.id,
                     SharedResource.shared_with_type == data.shared_with_type,
                     SharedResource.shared_with_id == data.shared_with_id
@@ -877,7 +976,7 @@ async def batch_share_resources(
         # 创建共享
         shared = SharedResource(
             resource_type=data.resource_type,
-            resource_id=resource_id,
+            resource_id=str(resource_id),  # 转为字符串
             owner_id=current_user.id,
             shared_with_type=data.shared_with_type,
             shared_with_id=data.shared_with_id,
@@ -946,8 +1045,13 @@ async def copy_shared_paper_to_library(
         raise HTTPException(status_code=403, detail="无权访问此共享资源")
     
     # 获取原论文
+    try:
+        paper_id = int(share.resource_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="无效的论文ID")
+    
     paper_result = await db.execute(
-        select(Paper).where(Paper.id == share.resource_id)
+        select(Paper).where(Paper.id == paper_id)
     )
     original_paper = paper_result.scalar_one_or_none()
     
@@ -1109,105 +1213,156 @@ async def get_shared_resource_detail(
     
     if share.resource_type == "paper":
         # 获取论文详情
-        paper_result = await db.execute(
-            select(Paper).where(Paper.id == share.resource_id)
-        )
-        paper = paper_result.scalar_one_or_none()
-        if paper:
-            result["paper"] = {
-                "id": paper.id,
-                "title": paper.title,
-                "abstract": paper.abstract,
-                "authors": paper.authors or [],
-                "year": paper.year,
-                "venue": paper.venue,
-                "journal": paper.journal,
-                "url": paper.url,
-                "pdf_url": paper.pdf_url,
-                "arxiv_url": paper.arxiv_url,
-                "doi": paper.doi,
-                "citation_count": paper.citation_count,
-                "reference_count": paper.reference_count,
-                "fields_of_study": paper.fields_of_study or [],
-                "is_read": paper.is_read,
-                "notes": paper.notes,
-                "tags": paper.tags or [],
-            }
+        try:
+            paper_id = int(share.resource_id)
+            paper_result = await db.execute(
+                select(Paper).where(Paper.id == paper_id)
+            )
+            paper = paper_result.scalar_one_or_none()
+            if paper:
+                result["paper"] = {
+                    "id": paper.id,
+                    "title": paper.title,
+                    "abstract": paper.abstract,
+                    "authors": paper.authors or [],
+                    "year": paper.year,
+                    "venue": paper.venue,
+                    "journal": paper.journal,
+                    "url": paper.url,
+                    "pdf_url": paper.pdf_url,
+                    "arxiv_url": paper.arxiv_url,
+                    "doi": paper.doi,
+                    "citation_count": paper.citation_count,
+                    "reference_count": paper.reference_count,
+                    "fields_of_study": paper.fields_of_study or [],
+                    "is_read": paper.is_read,
+                    "notes": paper.notes,
+                    "tags": paper.tags or [],
+                }
+        except (ValueError, TypeError):
+            pass
     
     elif share.resource_type == "paper_collection":
         # 获取文献集详情及论文列表
-        collection_result = await db.execute(
-            select(PaperCollection).where(PaperCollection.id == share.resource_id)
-        )
-        collection = collection_result.scalar_one_or_none()
-        if collection:
-            result["collection"] = {
-                "id": collection.id,
-                "name": collection.name,
-                "description": collection.description,
-                "color": collection.color,
-                "paper_count": collection.paper_count,
-            }
-            
-            # 获取文献集中的论文
-            from app.models.literature import paper_collection_association
-            papers_result = await db.execute(
-                select(Paper).join(
-                    paper_collection_association,
-                    Paper.id == paper_collection_association.c.paper_id
-                ).where(
-                    paper_collection_association.c.collection_id == share.resource_id
-                ).order_by(Paper.created_at.desc()).limit(50)
+        try:
+            collection_id = int(share.resource_id)
+            collection_result = await db.execute(
+                select(PaperCollection).where(PaperCollection.id == collection_id)
             )
-            papers = papers_result.scalars().all()
-            result["papers"] = [
-                {
-                    "id": p.id,
-                    "title": p.title,
-                    "authors": [a.get("name", "") for a in (p.authors or [])][:3],
-                    "year": p.year,
-                    "venue": p.venue,
-                    "citation_count": p.citation_count,
-                    "url": p.url,
-                    "pdf_url": p.pdf_url,
+            collection = collection_result.scalar_one_or_none()
+            if collection:
+                result["collection"] = {
+                    "id": collection.id,
+                    "name": collection.name,
+                    "description": collection.description,
+                    "color": collection.color,
+                    "paper_count": collection.paper_count,
                 }
-                for p in papers
-            ]
+                
+                # 获取文献集中的论文
+                from app.models.literature import paper_collection_association
+                papers_result = await db.execute(
+                    select(Paper).join(
+                        paper_collection_association,
+                        Paper.id == paper_collection_association.c.paper_id
+                    ).where(
+                        paper_collection_association.c.collection_id == collection_id
+                    ).order_by(Paper.created_at.desc()).limit(50)
+                )
+                papers = papers_result.scalars().all()
+                result["papers"] = [
+                    {
+                        "id": p.id,
+                        "title": p.title,
+                        "authors": [a.get("name", "") for a in (p.authors or [])][:3],
+                        "year": p.year,
+                        "venue": p.venue,
+                        "citation_count": p.citation_count,
+                        "url": p.url,
+                        "pdf_url": p.pdf_url,
+                    }
+                    for p in papers
+                ]
+        except (ValueError, TypeError):
+            pass
     
     elif share.resource_type == "knowledge_base":
         # 获取知识库详情及文档列表
-        kb_result = await db.execute(
-            select(KnowledgeBase).where(KnowledgeBase.id == share.resource_id)
+        try:
+            kb_id = int(share.resource_id)
+            kb_result = await db.execute(
+                select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
+            )
+            kb = kb_result.scalar_one_or_none()
+            if kb:
+                result["knowledge_base"] = {
+                    "id": kb.id,
+                    "name": kb.name,
+                    "description": kb.description,
+                    "document_count": kb.document_count,
+                    "embedding_model": kb.embedding_model,
+                }
+                
+                # 获取知识库中的文档
+                from app.models.knowledge import Document
+                docs_result = await db.execute(
+                    select(Document).where(
+                        Document.knowledge_base_id == kb_id
+                    ).order_by(Document.created_at.desc()).limit(50)
+                )
+                docs = docs_result.scalars().all()
+                result["documents"] = [
+                    {
+                        "id": d.id,
+                        "filename": d.filename,
+                        "file_type": d.file_type,
+                        "file_size": d.file_size,
+                        "chunk_count": d.chunk_count,
+                        "status": d.status,
+                        "created_at": d.created_at.isoformat() if d.created_at else None,
+                    }
+                    for d in docs
+                ]
+        except (ValueError, TypeError):
+            pass
+    
+    elif share.resource_type == "notebook":
+        # 获取笔记本详情及单元格列表 (Notebook.id 是字符串UUID)
+        nb_result = await db.execute(
+            select(Notebook).where(Notebook.id == share.resource_id)
         )
-        kb = kb_result.scalar_one_or_none()
-        if kb:
-            result["knowledge_base"] = {
-                "id": kb.id,
-                "name": kb.name,
-                "description": kb.description,
-                "document_count": kb.document_count,
-                "embedding_model": kb.embedding_model,
+        nb = nb_result.scalar_one_or_none()
+        if nb:
+            from app.models.notebook import NotebookCell
+            
+            # 获取所有单元格
+            cells_result = await db.execute(
+                select(NotebookCell).where(
+                    NotebookCell.notebook_id == nb.id
+                ).order_by(NotebookCell.position)
+            )
+            cells = cells_result.scalars().all()
+            
+            result["notebook"] = {
+                "id": nb.id,
+                "title": nb.title,
+                "description": nb.description,
+                "execution_count": nb.execution_count,
+                "created_at": nb.created_at.isoformat() if nb.created_at else None,
+                "updated_at": nb.updated_at.isoformat() if nb.updated_at else None,
+                "cell_count": len(cells),
             }
             
-            # 获取知识库中的文档
-            from app.models.knowledge import Document
-            docs_result = await db.execute(
-                select(Document).where(
-                    Document.knowledge_base_id == share.resource_id
-                ).order_by(Document.created_at.desc()).limit(50)
-            )
-            docs = docs_result.scalars().all()
-            result["documents"] = [
+            result["cells"] = [
                 {
-                    "id": d.id,
-                    "filename": d.filename,
-                    "file_type": d.file_type,
-                    "file_size": d.file_size,
-                    "chunk_count": d.chunk_count,
-                    "status": d.status,
-                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                    "id": cell.id,
+                    "cell_type": cell.cell_type,
+                    "source": cell.source,
+                    "outputs": cell.outputs or [],
+                    "execution_count": cell.execution_count,
+                    "position": cell.position,
                 }
-                for d in docs
+                for cell in cells
             ]
     
     return result
@@ -1242,11 +1397,16 @@ async def copy_collection_papers_to_library(
     # 获取要复制的论文
     from app.models.literature import paper_collection_association
     
+    try:
+        collection_id = int(share.resource_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="无效的文献集ID")
+    
     query = select(Paper).join(
         paper_collection_association,
         Paper.id == paper_collection_association.c.paper_id
     ).where(
-        paper_collection_association.c.collection_id == share.resource_id
+        paper_collection_association.c.collection_id == collection_id
     )
     
     if paper_ids:

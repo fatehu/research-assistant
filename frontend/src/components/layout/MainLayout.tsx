@@ -859,7 +859,7 @@ const MainLayout = () => {
         </Header>
         
         {/* 内容 */}
-        <Content className="overflow-hidden">
+        <Content className="overflow-auto">
           <Outlet />
         </Content>
       </Layout>

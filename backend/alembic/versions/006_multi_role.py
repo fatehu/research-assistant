@@ -102,7 +102,7 @@ def upgrade() -> None:
         'shared_resources',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('resource_type', sa.String(30), nullable=False),
-        sa.Column('resource_id', sa.Integer(), nullable=False),
+        sa.Column('resource_id', sa.String(50), nullable=False),  # 支持UUID字符串
         sa.Column('owner_id', sa.Integer(), nullable=False),
         sa.Column('shared_with_type', sa.String(20), nullable=False),
         sa.Column('shared_with_id', sa.Integer(), nullable=True),
