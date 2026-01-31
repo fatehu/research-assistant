@@ -19,6 +19,9 @@ import { MentorPage as StudentMentorPage, AnnouncementsPage as StudentAnnounceme
 // 用户页面
 import { ProfilePage, SettingsPage } from '@/pages/user'
 
+// 共享资源页面
+import { SharedResourcesPage } from '@/pages/shared'
+
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated, isInitialized } = useAuthStore()
@@ -197,7 +200,7 @@ function App() {
             path="mentor/shares" 
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <PlaceholderPage title="资源共享" />
+                <SharedResourcesPage />
               </RoleRoute>
             } 
           />
@@ -215,7 +218,7 @@ function App() {
             path="student/shared" 
             element={
               <RoleRoute allowedRoles={['student']}>
-                <PlaceholderPage title="共享资源" />
+                <SharedResourcesPage />
               </RoleRoute>
             } 
           />

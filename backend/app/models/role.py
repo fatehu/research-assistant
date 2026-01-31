@@ -28,6 +28,7 @@ class ShareType(str, PyEnum):
     """共享类型枚举"""
     KNOWLEDGE_BASE = "knowledge_base"
     PAPER_COLLECTION = "paper_collection"
+    PAPER = "paper"
     NOTEBOOK = "notebook"
 
 

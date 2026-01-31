@@ -66,7 +66,7 @@ services:
       - SERPER_API_KEY=${SERPER_API_KEY}
       - REACT_MAX_ITERATIONS=${REACT_MAX_ITERATIONS:-5}
     ports:
-      - "8000:8000"
+      - "8888:8000"
     volumes:
       - ./backend:/app
       - backend_uploads:/app/uploads
@@ -87,8 +87,8 @@ services:
       dockerfile: Dockerfile
     container_name: research_frontend
     environment:
-      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
-      - VITE_WS_BASE_URL=${VITE_WS_BASE_URL:-ws://localhost:8000}
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8888}
+      - VITE_WS_BASE_URL=${VITE_WS_BASE_URL:-ws://localhost:8888}
     ports:
       - "3000:3000"
     volumes:

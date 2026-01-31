@@ -1462,33 +1462,48 @@ export const invitationApi = {
 
 export const shareApi = {
   // 获取共享给我的资源
-  getSharedWithMe: async (): Promise<SharedResource[]> => {
-    const response = await api.get('/api/share/received')
+  getSharedWithMe: async (resourceType?: string): Promise<SharedResource[]> => {
+    const params = resourceType ? { resource_type: resourceType } : {}
+    const response = await api.get('/api/share/shared-with-me', { params })
+    return response.data
+  },
+
+  // 获取共享给我的资源数量统计
+  getSharedCount: async (): Promise<{ paper: number; paper_collection: number; knowledge_base: number; notebook: number; total: number }> => {
+    const response = await api.get('/api/share/shared-with-me/count')
     return response.data
   },
 
   // 获取我共享出去的资源
-  getMyShares: async (): Promise<SharedResource[]> => {
-    const response = await api.get('/api/share/sent')
+  getMyShares: async (resourceType?: string): Promise<SharedResource[]> => {
+    const params = resourceType ? { resource_type: resourceType } : {}
+    const response = await api.get('/api/share/my-shares', { params })
+    return response.data
+  },
+
+  // 获取可共享的研究组
+  getMyGroups: async (): Promise<{ id: number; name: string; role: string }[]> => {
+    const response = await api.get('/api/share/my-groups')
+    return response.data
+  },
+
+  // 获取我的论文列表（用于共享选择）
+  getMyPapers: async (search?: string): Promise<{ id: number; title: string; authors: string[]; year: number; venue: string }[]> => {
+    const params = search ? { search } : {}
+    const response = await api.get('/api/share/my-papers', { params })
     return response.data
   },
 
   // 共享资源
   shareResource: async (data: {
-    resource_type: ShareType
+    resource_type: string
     resource_id: number
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
-    permission?: SharePermission
-    expires_at?: string
+    permission?: string
+    message?: string
   }): Promise<SharedResource> => {
-    const response = await api.post('/api/share', data)
-    return response.data
-  },
-
-  // 更新共享权限
-  updatePermission: async (shareId: number, permission: SharePermission): Promise<SharedResource> => {
-    const response = await api.put(`/api/share/${shareId}`, { permission })
+    const response = await api.post('/api/share/', data)
     return response.data
   },
 
