@@ -41,7 +41,7 @@ interface KnowledgeState {
   
   fetchChunks: (kbId: number, docId: number) => Promise<void>
   
-  search: (query: string, knowledgeBaseIds?: number[]) => Promise<SearchResponse>
+  search: (query: string, knowledgeBaseIds?: number[], includeShared?: boolean) => Promise<SearchResponse>
   clearSearch: () => void
   
   clearCurrentKnowledgeBase: () => void
@@ -207,10 +207,10 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
   
   // ========== 搜索操作 ==========
   
-  search: async (query: string, knowledgeBaseIds?: number[]) => {
+  search: async (query: string, knowledgeBaseIds?: number[], includeShared: boolean = true) => {
     set({ isSearching: true, searchQuery: query })
     try {
-      const response = await knowledgeApi.search(query, knowledgeBaseIds)
+      const response = await knowledgeApi.search(query, knowledgeBaseIds, 5, 0.5, includeShared)
       set({
         searchResults: response.results,
         searchTime: response.search_time_ms,

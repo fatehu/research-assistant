@@ -1,15 +1,15 @@
 """
-知识库 API 路由
+知识库 API 路由 - 支持共享知识库访问（可选）
 """
 import os
 import shutil
 import time
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, or_, and_
 from loguru import logger
 
 from app.core.database import get_db
@@ -35,11 +35,102 @@ from app.schemas.knowledge import (
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service
 
+# 共享功能导入（可选，如果模块不存在则禁用共享功能）
+try:
+    from app.models.role import SharedResource, GroupMember, ResearchGroup, UserRole
+    SHARING_ENABLED = True
+except ImportError:
+    SHARING_ENABLED = False
+    logger.warning("共享模块未安装，知识库共享功能已禁用")
+
 router = APIRouter()
 
 # 文件上传目录
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ========== 共享知识库辅助函数 ==========
+
+async def get_shared_kb_ids(current_user: User, db: AsyncSession) -> Set[int]:
+    """获取共享给当前用户的知识库ID集合"""
+    if not SHARING_ENABLED:
+        logger.debug("共享功能未启用")
+        return set()
+    
+    logger.debug(f"获取用户 {current_user.id} 的共享知识库")
+    
+    # 获取用户加入的研究组
+    group_ids_result = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
+    )
+    group_ids = [row[0] for row in group_ids_result.fetchall()]
+    logger.debug(f"用户加入的研究组: {group_ids}")
+    
+    # 如果是导师，获取管理的研究组
+    if current_user.role == UserRole.MENTOR.value:
+        mentor_groups_result = await db.execute(
+            select(ResearchGroup.id).where(ResearchGroup.mentor_id == current_user.id)
+        )
+        mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
+        group_ids = list(set(group_ids + mentor_group_ids))
+        logger.debug(f"导师管理的研究组: {mentor_group_ids}")
+    
+    # 构建共享条件
+    conditions = [
+        and_(
+            SharedResource.shared_with_type == 'user',
+            SharedResource.shared_with_id == current_user.id
+        ),
+    ]
+    
+    if group_ids:
+        conditions.append(
+            and_(
+                SharedResource.shared_with_type == 'group',
+                SharedResource.shared_with_id.in_(group_ids)
+            )
+        )
+    
+    if current_user.mentor_id:
+        logger.debug(f"用户的导师ID: {current_user.mentor_id}")
+        conditions.append(
+            and_(
+                SharedResource.shared_with_type == 'all_students',
+                SharedResource.owner_id == current_user.mentor_id
+            )
+        )
+    
+    if current_user.role == UserRole.STUDENT.value and group_ids:
+        mentor_ids_result = await db.execute(
+            select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
+        )
+        mentor_ids = [row[0] for row in mentor_ids_result.fetchall()]
+        logger.debug(f"研究组导师IDs: {mentor_ids}")
+        if mentor_ids:
+            conditions.append(
+                and_(
+                    SharedResource.shared_with_type == 'all_students',
+                    SharedResource.owner_id.in_(mentor_ids)
+                )
+            )
+    
+    shared_result = await db.execute(
+        select(SharedResource.resource_id).where(
+            and_(
+                SharedResource.resource_type == 'knowledge_base',
+                or_(*conditions),
+                or_(
+                    SharedResource.expires_at == None,
+                    SharedResource.expires_at > datetime.utcnow()
+                )
+            )
+        )
+    )
+    
+    result = set(row[0] for row in shared_result.fetchall())
+    logger.info(f"用户 {current_user.id} 可访问的共享知识库: {result}")
+    return result
 
 
 # ========== 知识库 CRUD ==========
@@ -73,6 +164,66 @@ async def list_knowledge_bases(
         items=[KnowledgeBaseResponse.model_validate(item) for item in items],
         total=total
     )
+
+
+@router.get("/available")
+async def get_available_knowledge_bases(
+    include_shared: bool = Query(True, description="是否包含共享的知识库"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    获取用户可用的所有知识库（自己的 + 共享的）
+    用于 AI 对话时选择知识库
+    
+    参数:
+    - include_shared: 是否包含共享的知识库，默认 True
+    """
+    result = {
+        "own": [],
+        "shared": [],
+        "sharing_enabled": SHARING_ENABLED,
+    }
+    
+    # 1. 获取自己的知识库
+    own_result = await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.user_id == current_user.id)
+        .order_by(KnowledgeBase.updated_at.desc())
+    )
+    own_kbs = own_result.scalars().all()
+    
+    for kb in own_kbs:
+        result["own"].append({
+            "id": kb.id,
+            "name": kb.name,
+            "description": kb.description,
+            "document_count": kb.document_count,
+            "total_chunks": kb.total_chunks,
+        })
+    
+    # 2. 获取共享的知识库（可选）
+    if include_shared and SHARING_ENABLED:
+        shared_kb_ids = await get_shared_kb_ids(current_user, db)
+        
+        if shared_kb_ids:
+            for kb_id in shared_kb_ids:
+                kb = await db.get(KnowledgeBase, kb_id)
+                if kb:
+                    owner = await db.get(User, kb.user_id)
+                    owner_name = owner.full_name or owner.username if owner else "未知"
+                    
+                    result["shared"].append({
+                        "id": kb.id,
+                        "name": kb.name,
+                        "description": kb.description,
+                        "document_count": kb.document_count,
+                        "total_chunks": kb.total_chunks,
+                        "owner_id": kb.user_id,
+                        "owner_name": owner_name,
+                    })
+    
+    return result
 
 
 @router.post("/knowledge-bases", response_model=KnowledgeBaseResponse)
@@ -536,6 +687,7 @@ async def list_chunks(
 @router.post("/search", response_model=SearchResponse)
 async def search_knowledge(
     request: SearchRequest,
+    include_shared: bool = Query(True, description="是否包含共享的知识库"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -544,6 +696,9 @@ async def search_knowledge(
     
     pgvector 使用余弦距离 (1 - 余弦相似度) 进行搜索
     <=> 操作符返回余弦距离，越小越相似
+    
+    参数:
+    - include_shared: 是否包含共享的知识库，默认 True（包含共享知识库）
     """
     start_time = time.time()
     
@@ -558,19 +713,33 @@ async def search_knowledge(
     if not query_embedding:
         raise HTTPException(status_code=400, detail="无法生成查询向量")
     
+    # 获取用户可访问的知识库ID
+    own_kb_result = await db.execute(
+        select(KnowledgeBase.id).where(KnowledgeBase.user_id == current_user.id)
+    )
+    own_kb_ids = set(row[0] for row in own_kb_result.fetchall())
+    
+    # 如果启用共享，获取共享的知识库ID
+    shared_kb_ids = set()
+    if include_shared and SHARING_ENABLED:
+        shared_kb_ids = await get_shared_kb_ids(current_user, db)
+    
+    accessible_kb_ids = own_kb_ids | shared_kb_ids
+    
     # 确定要搜索的知识库
     if request.knowledge_base_ids:
         # 验证知识库权限
         for kb_id in request.knowledge_base_ids:
+            if kb_id in accessible_kb_ids:
+                continue  # 有权限
+            # 检查是否为公开知识库
             kb = await db.get(KnowledgeBase, kb_id)
-            if not kb or (kb.user_id != current_user.id and not kb.is_public):
+            if not kb or not kb.is_public:
                 raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在或无权限")
         kb_ids = request.knowledge_base_ids
     else:
-        # 搜索用户所有知识库
-        kb_query = select(KnowledgeBase.id).where(KnowledgeBase.user_id == current_user.id)
-        kb_result = await db.execute(kb_query)
-        kb_ids = [row[0] for row in kb_result.fetchall()]
+        # 搜索用户所有可访问的知识库
+        kb_ids = list(accessible_kb_ids)
         
         if not kb_ids:
             return SearchResponse(

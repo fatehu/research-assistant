@@ -20,7 +20,7 @@ import { MentorPage as StudentMentorPage, AnnouncementsPage as StudentAnnounceme
 import { ProfilePage, SettingsPage } from '@/pages/user'
 
 // 共享资源页面
-import { SharedResourcesPage } from '@/pages/shared'
+import { SharedResourcesPage, SharedResourceViewPage } from '@/pages/shared'
 
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
@@ -234,6 +234,9 @@ function App() {
           {/* 个人设置页面 */}
           <Route path="profile" element={<ProfilePage />} />
           <Route path="settings" element={<SettingsPage />} />
+          
+          {/* 共享资源详情页 - 所有已登录用户可访问 */}
+          <Route path="shared/view/:shareId" element={<SharedResourceViewPage />} />
         </Route>
         
         {/* 404 */}

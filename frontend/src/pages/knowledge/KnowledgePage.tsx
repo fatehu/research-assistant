@@ -46,14 +46,28 @@ import {
   LoadingOutlined,
   ExclamationCircleOutlined,
   ArrowLeftOutlined,
+  ShareAltOutlined,
+  UserOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
 import type { KnowledgeBase, Document, SearchResult } from '@/services/api'
+import { knowledgeApi } from '@/services/api'
 import dayjs from 'dayjs'
 
 const { TextArea } = Input
 const { Text, Paragraph } = Typography
+
+// 共享知识库类型
+interface SharedKnowledgeBase {
+  id: number
+  name: string
+  description?: string
+  document_count: number
+  total_chunks: number
+  owner_id: number
+  owner_name: string
+}
 
 // 文件类型图标映射
 const getFileIcon = (fileType: string) => {
@@ -180,6 +194,61 @@ const KnowledgeBaseCard = ({
   )
 }
 
+// 共享知识库卡片组件（只读）
+const SharedKnowledgeBaseCard = ({
+  kb,
+  onClick,
+}: {
+  kb: SharedKnowledgeBase
+  onClick: () => void
+}) => {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      whileHover={{ scale: 1.02 }}
+      className="cursor-pointer"
+      onClick={onClick}
+    >
+      <Card
+        className="bg-slate-800/50 border-slate-700/50 hover:border-purple-500/50 transition-all"
+        bodyStyle={{ padding: '20px' }}
+      >
+        <div className="flex items-start justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500/20 to-pink-500/20 flex items-center justify-center">
+              <ShareAltOutlined className="text-2xl text-purple-400" />
+            </div>
+            <div>
+              <h3 className="text-white font-medium text-lg">{kb.name}</h3>
+              <div className="flex items-center gap-1 text-slate-500 text-sm">
+                <UserOutlined className="text-xs" />
+                <span>来自 {kb.owner_name}</span>
+              </div>
+            </div>
+          </div>
+          <Tag color="purple" className="text-xs">共享</Tag>
+        </div>
+        
+        {kb.description && (
+          <p className="text-slate-400 text-sm mb-4 line-clamp-2">{kb.description}</p>
+        )}
+        
+        <div className="grid grid-cols-2 gap-4">
+          <div className="text-center">
+            <div className="text-2xl font-bold text-white">{kb.document_count}</div>
+            <div className="text-xs text-slate-500">文档</div>
+          </div>
+          <div className="text-center">
+            <div className="text-2xl font-bold text-white">{kb.total_chunks}</div>
+            <div className="text-xs text-slate-500">分片</div>
+          </div>
+        </div>
+      </Card>
+    </motion.div>
+  )
+}
+
 // 搜索结果卡片
 const SearchResultCard = ({ result, index }: { result: SearchResult; index: number }) => {
   return (
@@ -254,9 +323,21 @@ const KnowledgePage = () => {
   const [searchInput, setSearchInput] = useState('')
   const [form] = Form.useForm()
   
+  // 共享知识库状态
+  const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
+  const [sharingEnabled, setSharingEnabled] = useState(false)
+  
   // 初始化
   useEffect(() => {
     fetchKnowledgeBases()
+    // 获取共享的知识库
+    knowledgeApi.getAvailableKnowledgeBases().then((data) => {
+      setSharedKnowledgeBases(data.shared || [])
+      setSharingEnabled(data.sharing_enabled || false)
+    }).catch(() => {
+      // 如果API不存在或失败，忽略错误
+      setSharedKnowledgeBases([])
+    })
   }, [])
   
   // 选中知识库
@@ -373,7 +454,7 @@ const KnowledgePage = () => {
         <div className="flex justify-center py-20">
           <Spin size="large" />
         </div>
-      ) : knowledgeBases.length === 0 ? (
+      ) : knowledgeBases.length === 0 && sharedKnowledgeBases.length === 0 ? (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={<span className="text-slate-500">暂无知识库</span>}
@@ -388,19 +469,50 @@ const KnowledgePage = () => {
           </Button>
         </Empty>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {knowledgeBases.map((kb) => (
-            <KnowledgeBaseCard
-              key={kb.id}
-              kb={kb}
-              onClick={() => navigate(`/knowledge/${kb.id}`)}
-              onDelete={() => {
-                setDeleteTarget({ type: 'kb', id: kb.id })
-                setDeleteModalVisible(true)
-              }}
-            />
-          ))}
-        </div>
+        <>
+          {/* 我的知识库 */}
+          {knowledgeBases.length > 0 && (
+            <>
+              <h3 className="text-lg font-medium text-white mb-4">我的知识库</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+                {knowledgeBases.map((kb) => (
+                  <KnowledgeBaseCard
+                    key={kb.id}
+                    kb={kb}
+                    onClick={() => navigate(`/knowledge/${kb.id}`)}
+                    onDelete={() => {
+                      setDeleteTarget({ type: 'kb', id: kb.id })
+                      setDeleteModalVisible(true)
+                    }}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+          
+          {/* 共享的知识库 */}
+          {sharedKnowledgeBases.length > 0 && (
+            <>
+              <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
+                <ShareAltOutlined className="text-purple-400" />
+                共享给我的知识库
+                <Tag color="purple" className="ml-2">{sharedKnowledgeBases.length}</Tag>
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {sharedKnowledgeBases.map((kb) => (
+                  <SharedKnowledgeBaseCard
+                    key={`shared-${kb.id}`}
+                    kb={kb}
+                    onClick={() => {
+                      // 点击共享知识库可以跳转到对话页面使用
+                      message.info('共享的知识库可以在 AI 对话中直接选择使用')
+                    }}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </>
       )}
     </div>
   )

@@ -395,6 +395,15 @@ export const knowledgeApi = {
     return response.data
   },
   
+  // 获取可用的知识库（自己的 + 共享的），用于AI对话选择
+  getAvailableKnowledgeBases: async (): Promise<{
+    own: { id: number; name: string; description?: string; document_count: number; total_chunks: number }[];
+    shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
+  }> => {
+    const response = await api.get('/api/knowledge/available')
+    return response.data
+  },
+  
   createKnowledgeBase: async (data: KnowledgeBaseCreate): Promise<KnowledgeBase> => {
     const response = await api.post('/api/knowledge/knowledge-bases', data)
     return response.data
@@ -465,13 +474,16 @@ export const knowledgeApi = {
     query: string,
     knowledgeBaseIds?: number[],
     topK = 5,
-    scoreThreshold = 0.5
+    scoreThreshold = 0.5,
+    includeShared = false
   ): Promise<SearchResponse> => {
     const response = await api.post('/api/knowledge/search', {
       query,
       knowledge_base_ids: knowledgeBaseIds,
       top_k: topK,
       score_threshold: scoreThreshold,
+    }, {
+      params: { include_shared: includeShared }
     })
     return response.data
   },
@@ -1494,6 +1506,20 @@ export const shareApi = {
     return response.data
   },
 
+  // 获取我的文献集列表（用于共享选择）
+  getMyCollections: async (search?: string): Promise<{ id: number; name: string; description: string; paper_count: number; color: string }[]> => {
+    const params = search ? { search } : {}
+    const response = await api.get('/api/share/my-collections', { params })
+    return response.data
+  },
+
+  // 获取我的知识库列表（用于共享选择）
+  getMyKnowledgeBases: async (search?: string): Promise<{ id: number; name: string; description: string; document_count: number }[]> => {
+    const params = search ? { search } : {}
+    const response = await api.get('/api/share/my-knowledge-bases', { params })
+    return response.data
+  },
+
   // 共享资源
   shareResource: async (data: {
     resource_type: string
@@ -1504,6 +1530,40 @@ export const shareApi = {
     message?: string
   }): Promise<SharedResource> => {
     const response = await api.post('/api/share/', data)
+    return response.data
+  },
+
+  // 批量共享
+  batchShare: async (data: {
+    resource_type: string
+    resource_ids: number[]
+    shared_with_type: 'user' | 'group' | 'all_students'
+    shared_with_id?: number
+    permission?: string
+  }): Promise<{ success_count: number; skip_count: number; message: string }> => {
+    const response = await api.post('/api/share/batch', data)
+    return response.data
+  },
+
+  // 将共享论文添加到我的库
+  copyToLibrary: async (shareId: number, collectionId?: number): Promise<{ message: string; paper_id: number }> => {
+    const params = collectionId ? { collection_id: collectionId } : {}
+    const response = await api.post(`/api/share/copy-to-library/${shareId}`, null, { params })
+    return response.data
+  },
+
+  // 获取共享资源详情（包含完整内容）
+  getSharedDetail: async (shareId: number): Promise<any> => {
+    const response = await api.get(`/api/share/detail/${shareId}`)
+    return response.data
+  },
+
+  // 批量复制文献集中的论文
+  copyCollectionPapers: async (shareId: number, paperIds?: number[], targetCollectionId?: number): Promise<{ success_count: number; skip_count: number; message: string }> => {
+    const response = await api.post(`/api/share/copy-collection-papers/${shareId}`, {
+      paper_ids: paperIds,
+      target_collection_id: targetCollectionId,
+    })
     return response.data
   },
 

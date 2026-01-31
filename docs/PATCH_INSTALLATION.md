@@ -18,7 +18,8 @@ patch/
 │   │   │   ├── student.py             # 学生API（新增）
 │   │   │   ├── invitations.py         # 邀请API（新增）
 │   │   │   ├── share.py               # 共享API（新增）
-│   │   │   └── announcements.py       # 公告API（新增）
+│   │   │   ├── announcements.py       # 公告API（新增）
+│   │   │   └── knowledge_share.py     # 知识库共享扩展API（新增）
 │   │   ├── core/
 │   │   │   └── permissions.py         # 权限装饰器（新增）
 │   │   ├── models/
@@ -44,9 +45,13 @@ patch/
 │       │   │   ├── index.ts           # 导出（新增）
 │       │   │   ├── StudentsPage.tsx   # 学生管理页（新增）
 │       │   │   └── GroupsPage.tsx     # 研究组管理页（新增）
-│       │   └── student/
+│       │   ├── student/
+│       │   │   ├── index.ts           # 导出（新增）
+│       │   │   └── MentorPage.tsx     # 我的导师页（新增）
+│       │   └── shared/
 │       │       ├── index.ts           # 导出（新增）
-│       │       └── MentorPage.tsx     # 我的导师页（新增）
+│       │       ├── SharedResourcesPage.tsx   # 共享资源列表页（新增）
+│       │       └── SharedResourceViewPage.tsx # 共享资源详情页（新增）
 │       ├── services/
 │       │   └── api.ts                 # API服务（覆盖更新，添加角色API）
 │       └── stores/
@@ -54,6 +59,7 @@ patch/
 │           └── roleStore.ts           # 角色状态管理（新增）
 └── docs/
     ├── MULTI_ROLE_SYSTEM_DESIGN.md    # 系统设计文档
+    ├── FEATURE_LIST.md                # 功能清单
     └── PATCH_INSTALLATION.md          # 安装指南（本文档）
 ```
 
@@ -329,3 +335,108 @@ UPDATE users SET role = 'admin' WHERE email = 'user@example.com';
 1. 查阅 `docs/MULTI_ROLE_SYSTEM_DESIGN.md` 了解系统设计
 2. 查阅 `docs/API_ENDPOINTS.md` 了解 API 详情
 3. 提交 Issue 并附上错误日志
+
+
+## 附录：共享知识库功能说明
+
+### 设计理念：引用/快捷方式模式
+
+共享的知识库采用**引用模式**而非复制模式：
+
+- **不复制数据**：共享时不复制文档和向量数据
+- **建立引用关系**：接收者通过引用访问原知识库
+- **实时同步**：原作者更新内容后，接收者立即可见
+- **节省存储**：无数据冗余，节省存储空间
+
+### 用户体验
+
+1. **知识库列表**：共享的知识库会显示在用户的知识库列表中，标记为"共享"
+2. **AI对话选择**：在AI对话的知识库选择器中，可以选择共享的知识库
+3. **权限控制**：共享的知识库为只读，用户无法修改原内容
+
+### 功能特点
+
+- **向后兼容**：默认不启用共享功能，不影响现有行为
+- **按需开启**：通过参数控制是否包含共享知识库
+- **自动降级**：如果角色模块未安装，共享功能自动禁用
+
+### 新增 API
+
+#### 1. 获取可用知识库
+
+```
+GET /api/knowledge/available?include_shared=true
+```
+
+返回：
+```json
+{
+  "own": [
+    { "id": 1, "name": "我的知识库", "document_count": 10 }
+  ],
+  "shared": [
+    { "id": 5, "name": "NLP论文集", "owner_name": "张教授", "document_count": 25 }
+  ],
+  "sharing_enabled": true
+}
+```
+
+参数：
+- `include_shared`: 是否包含共享的知识库，默认 `true`
+
+#### 2. 搜索（支持共享知识库）
+
+```
+POST /api/knowledge/search?include_shared=true
+```
+
+参数：
+- `include_shared`: 是否搜索共享的知识库，默认 `false`（保持原有行为）
+
+### 前端使用示例
+
+```typescript
+// 获取可用知识库（自己的 + 共享的）
+const available = await knowledgeApi.getAvailableKnowledgeBases()
+// available.own - 自己的知识库
+// available.shared - 共享的知识库（包含所有者信息）
+// available.sharing_enabled - 共享功能是否启用
+
+// 搜索时包含共享知识库
+const results = await knowledgeApi.search(
+  "机器学习", 
+  undefined,  // 不指定则搜索所有可访问的
+  5,          // topK
+  0.5,        // scoreThreshold
+  true        // includeShared = true
+)
+```
+
+### 知识库选择器示例
+
+```tsx
+<Select mode="multiple" placeholder="选择知识库">
+  <Select.OptGroup label="我的知识库">
+    {available.own.map(kb => (
+      <Select.Option key={kb.id} value={kb.id}>
+        {kb.name} ({kb.document_count} 个文档)
+      </Select.Option>
+    ))}
+  </Select.OptGroup>
+  {available.shared.length > 0 && (
+    <Select.OptGroup label="共享的知识库">
+      {available.shared.map(kb => (
+        <Select.Option key={kb.id} value={kb.id}>
+          📤 {kb.name} (来自 {kb.owner_name})
+        </Select.Option>
+      ))}
+    </Select.OptGroup>
+  )}
+</Select>
+```
+
+### 注意事项
+
+1. **默认行为不变**：如果不传 `include_shared` 参数，行为与原来完全一致
+2. **权限检查**：用户只能访问明确共享给自己的知识库
+3. **实时同步**：共享的知识库是引用而非复制，原库更新立即可见

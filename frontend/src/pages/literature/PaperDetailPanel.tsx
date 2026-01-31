@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { 
   Button, Tag, Space, Rate, Input, message, Tooltip, 
   Select
@@ -34,6 +34,16 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
   const [tags, setTags] = useState<string[]>(paper.tags || [])
   const [newTag, setNewTag] = useState('')
   const [abstractExpanded, setAbstractExpanded] = useState(false)
+
+  // 当论文切换时，重置所有内部状态
+  useEffect(() => {
+    setNotes(paper.notes || '')
+    setTags(paper.tags || [])
+    setEditingNotes(false)
+    setEditingTags(false)
+    setNewTag('')
+    setAbstractExpanded(false)
+  }, [paper.id, paper.notes, paper.tags])
 
   // 更新阅读状态
   const handleToggleRead = async () => {

@@ -1,5 +1,5 @@
 """
-Agent 工具定义和执行
+Agent 工具定义和执行 - 支持共享知识库搜索
 """
 import json
 import time
@@ -7,14 +7,22 @@ import math
 import re
 import httpx
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text
+from sqlalchemy import select, text, or_, and_
 
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.services.embedding_service import get_embedding_service
+
+# 尝试导入共享模块（可选）
+try:
+    from app.models.role import SharedResource, GroupMember, ResearchGroup, UserRole
+    from app.models.user import User
+    SHARING_ENABLED = True
+except ImportError:
+    SHARING_ENABLED = False
 
 
 @dataclass
@@ -336,7 +344,7 @@ class KnowledgeSearchTool(Tool):
         self.embedding_service = get_embedding_service()
     
     async def execute(self, query: str, top_k: int = 5) -> ToolResult:
-        """执行知识库搜索 - 使用 pgvector 原生向量搜索"""
+        """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
             start_time = time.time()
             
@@ -352,14 +360,20 @@ class KnowledgeSearchTool(Tool):
             # 获取用户的知识库ID列表
             kb_query = select(KnowledgeBase.id).where(KnowledgeBase.user_id == self.user_id)
             kb_result = await self.db.execute(kb_query)
-            kb_ids = [row[0] for row in kb_result.fetchall()]
+            kb_ids = set(row[0] for row in kb_result.fetchall())
+            
+            # 获取共享给用户的知识库ID
+            shared_kb_ids = await self._get_shared_kb_ids()
+            kb_ids = kb_ids | shared_kb_ids
             
             if not kb_ids:
                 return ToolResult(
                     success=True,
-                    output="用户没有创建任何知识库，无法搜索相关内容。建议用户先上传文档到知识库。",
+                    output="用户没有创建任何知识库，也没有收到共享的知识库，无法搜索相关内容。建议用户先上传文档到知识库，或请导师共享知识库。",
                     data={"results": [], "total": 0}
                 )
+            
+            kb_ids = list(kb_ids)
             
             # 使用 pgvector 进行向量相似度搜索
             vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
@@ -434,6 +448,101 @@ class KnowledgeSearchTool(Tool):
                 output=f"搜索过程中发生错误: {str(e)}",
                 error=str(e)
             )
+    
+    async def _get_shared_kb_ids(self) -> Set[int]:
+        """获取共享给当前用户的知识库ID"""
+        if not SHARING_ENABLED:
+            logger.debug("共享功能未启用 (agent_tools)")
+            return set()
+        
+        try:
+            logger.debug(f"获取用户 {self.user_id} 的共享知识库 (agent_tools)")
+            
+            # 获取当前用户信息
+            user_result = await self.db.execute(
+                select(User).where(User.id == self.user_id)
+            )
+            current_user = user_result.scalar_one_or_none()
+            if not current_user:
+                logger.warning(f"用户 {self.user_id} 不存在")
+                return set()
+            
+            logger.debug(f"当前用户: {current_user.username}, 角色: {current_user.role}, 导师ID: {current_user.mentor_id}")
+            
+            # 获取用户加入的研究组
+            group_ids_result = await self.db.execute(
+                select(GroupMember.group_id).where(GroupMember.user_id == self.user_id)
+            )
+            group_ids = [row[0] for row in group_ids_result.fetchall()]
+            logger.debug(f"用户加入的研究组: {group_ids}")
+            
+            # 如果是导师，获取管理的研究组
+            if current_user.role == UserRole.MENTOR.value:
+                mentor_groups_result = await self.db.execute(
+                    select(ResearchGroup.id).where(ResearchGroup.mentor_id == self.user_id)
+                )
+                mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
+                group_ids = list(set(group_ids + mentor_group_ids))
+            
+            # 构建共享条件
+            conditions = [
+                and_(
+                    SharedResource.shared_with_type == 'user',
+                    SharedResource.shared_with_id == self.user_id
+                ),
+            ]
+            
+            if group_ids:
+                conditions.append(
+                    and_(
+                        SharedResource.shared_with_type == 'group',
+                        SharedResource.shared_with_id.in_(group_ids)
+                    )
+                )
+            
+            if current_user.mentor_id:
+                conditions.append(
+                    and_(
+                        SharedResource.shared_with_type == 'all_students',
+                        SharedResource.owner_id == current_user.mentor_id
+                    )
+                )
+            
+            if current_user.role == UserRole.STUDENT.value and group_ids:
+                mentor_ids_result = await self.db.execute(
+                    select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
+                )
+                mentor_ids = [row[0] for row in mentor_ids_result.fetchall()]
+                if mentor_ids:
+                    conditions.append(
+                        and_(
+                            SharedResource.shared_with_type == 'all_students',
+                            SharedResource.owner_id.in_(mentor_ids)
+                        )
+                    )
+            
+            # 查询共享的知识库ID
+            shared_result = await self.db.execute(
+                select(SharedResource.resource_id).where(
+                    and_(
+                        SharedResource.resource_type == 'knowledge_base',
+                        or_(*conditions),
+                        or_(
+                            SharedResource.expires_at == None,
+                            SharedResource.expires_at > datetime.utcnow()
+                        )
+                    )
+                )
+            )
+            
+            result = set(row[0] for row in shared_result.fetchall())
+            logger.info(f"用户 {self.user_id} 可访问的共享知识库 (agent_tools): {result}")
+            return result
+        except Exception as e:
+            logger.warning(f"获取共享知识库失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return set()
 
 
 class CalculatorTool(Tool):

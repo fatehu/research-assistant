@@ -15,7 +15,7 @@ from app.models.user import User
 from app.models.role import (
     UserRole, ResearchGroup, GroupMember, SharedResource, SharePermission
 )
-from app.models.knowledge import KnowledgeBase
+from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.models.literature import PaperCollection, Paper
 from app.models.notebook import Notebook
 
@@ -314,6 +314,17 @@ async def get_shared_with_me(
     )
     group_ids = [row[0] for row in group_ids_result.fetchall()]
     
+    # 如果是导师，还要获取他管理的研究组
+    mentor_group_ids = []
+    if current_user.role == UserRole.MENTOR.value:
+        mentor_groups_result = await db.execute(
+            select(ResearchGroup.id).where(ResearchGroup.mentor_id == current_user.id)
+        )
+        mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
+    
+    # 合并所有关联的研究组
+    all_group_ids = list(set(group_ids + mentor_group_ids))
+    
     # 构建查询条件
     conditions = [
         # 直接共享给用户
@@ -323,16 +334,16 @@ async def get_shared_with_me(
         ),
     ]
     
-    # 共享给用户的研究组
-    if group_ids:
+    # 共享给用户关联的研究组（包括导师管理的组）
+    if all_group_ids:
         conditions.append(
             and_(
                 SharedResource.shared_with_type == 'group',
-                SharedResource.shared_with_id.in_(group_ids)
+                SharedResource.shared_with_id.in_(all_group_ids)
             )
         )
     
-    # 导师共享给所有学生
+    # 学生可以看到导师共享给所有学生的
     if current_user.mentor_id:
         conditions.append(
             and_(
@@ -475,6 +486,17 @@ async def get_shared_count(
     )
     group_ids = [row[0] for row in group_ids_result.fetchall()]
     
+    # 如果是导师，还要获取他管理的研究组
+    mentor_group_ids = []
+    if current_user.role == UserRole.MENTOR.value:
+        mentor_groups_result = await db.execute(
+            select(ResearchGroup.id).where(ResearchGroup.mentor_id == current_user.id)
+        )
+        mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
+    
+    # 合并所有关联的研究组
+    all_group_ids = list(set(group_ids + mentor_group_ids))
+    
     conditions = [
         and_(
             SharedResource.shared_with_type == 'user',
@@ -482,11 +504,11 @@ async def get_shared_count(
         ),
     ]
     
-    if group_ids:
+    if all_group_ids:
         conditions.append(
             and_(
                 SharedResource.shared_with_type == 'group',
-                SharedResource.shared_with_id.in_(group_ids)
+                SharedResource.shared_with_id.in_(all_group_ids)
             )
         )
     
@@ -712,3 +734,596 @@ async def _build_resource_responses(
         ))
     
     return responses
+
+
+# ========== 获取我的文献集列表（用于共享选择）==========
+
+@router.get("/my-collections")
+async def get_my_collections_for_sharing(
+    search: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取我的文献集列表（用于选择共享）"""
+    query = select(PaperCollection).where(PaperCollection.user_id == current_user.id)
+    
+    if search:
+        query = query.where(PaperCollection.name.ilike(f"%{search}%"))
+    
+    query = query.order_by(PaperCollection.created_at.desc())
+    result = await db.execute(query)
+    collections = result.scalars().all()
+    
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "paper_count": c.paper_count,
+            "color": c.color
+        }
+        for c in collections
+    ]
+
+
+# ========== 获取我的知识库列表（用于共享选择）==========
+
+@router.get("/my-knowledge-bases")
+async def get_my_knowledge_bases_for_sharing(
+    search: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取我的知识库列表（用于选择共享）"""
+    query = select(KnowledgeBase).where(KnowledgeBase.user_id == current_user.id)
+    
+    if search:
+        query = query.where(KnowledgeBase.name.ilike(f"%{search}%"))
+    
+    query = query.order_by(KnowledgeBase.created_at.desc())
+    result = await db.execute(query)
+    kbs = result.scalars().all()
+    
+    return [
+        {
+            "id": kb.id,
+            "name": kb.name,
+            "description": kb.description,
+            "document_count": kb.document_count
+        }
+        for kb in kbs
+    ]
+
+
+# ========== 批量共享 ==========
+
+class BatchShareRequest(BaseModel):
+    resource_type: str
+    resource_ids: List[int]
+    shared_with_type: str
+    shared_with_id: Optional[int] = None
+    permission: str = "read"
+
+
+@router.post("/batch")
+async def batch_share_resources(
+    data: BatchShareRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """批量共享资源"""
+    if not data.resource_ids:
+        raise HTTPException(status_code=400, detail="请选择要共享的资源")
+    
+    # 验证共享对象
+    if data.shared_with_type == 'group':
+        if not data.shared_with_id:
+            raise HTTPException(status_code=400, detail="请选择研究组")
+        group_result = await db.execute(
+            select(ResearchGroup).where(ResearchGroup.id == data.shared_with_id)
+        )
+        if not group_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="研究组不存在")
+    elif data.shared_with_type == 'all_students':
+        if current_user.role != UserRole.MENTOR.value:
+            raise HTTPException(status_code=403, detail="只有导师可以共享给所有学生")
+    
+    success_count = 0
+    skip_count = 0
+    
+    for resource_id in data.resource_ids:
+        # 验证资源所有权
+        if data.resource_type == "paper":
+            res = await db.execute(
+                select(Paper).where(
+                    and_(Paper.id == resource_id, Paper.user_id == current_user.id)
+                )
+            )
+        elif data.resource_type == "paper_collection":
+            res = await db.execute(
+                select(PaperCollection).where(
+                    and_(PaperCollection.id == resource_id, PaperCollection.user_id == current_user.id)
+                )
+            )
+        elif data.resource_type == "knowledge_base":
+            res = await db.execute(
+                select(KnowledgeBase).where(
+                    and_(KnowledgeBase.id == resource_id, KnowledgeBase.user_id == current_user.id)
+                )
+            )
+        else:
+            continue
+        
+        if not res.scalar_one_or_none():
+            skip_count += 1
+            continue
+        
+        # 检查是否已共享
+        existing = await db.execute(
+            select(SharedResource).where(
+                and_(
+                    SharedResource.resource_type == data.resource_type,
+                    SharedResource.resource_id == resource_id,
+                    SharedResource.owner_id == current_user.id,
+                    SharedResource.shared_with_type == data.shared_with_type,
+                    SharedResource.shared_with_id == data.shared_with_id
+                )
+            )
+        )
+        if existing.scalar_one_or_none():
+            skip_count += 1
+            continue
+        
+        # 创建共享
+        shared = SharedResource(
+            resource_type=data.resource_type,
+            resource_id=resource_id,
+            owner_id=current_user.id,
+            shared_with_type=data.shared_with_type,
+            shared_with_id=data.shared_with_id,
+            permission=data.permission,
+        )
+        db.add(shared)
+        success_count += 1
+    
+    await db.commit()
+    
+    logger.info(f"用户 {current_user.username} 批量共享了 {success_count} 个 {data.resource_type}")
+    
+    return {
+        "success_count": success_count,
+        "skip_count": skip_count,
+        "message": f"成功共享 {success_count} 个资源，跳过 {skip_count} 个"
+    }
+
+
+# ========== 将共享论文添加到我的库 ==========
+
+@router.post("/copy-to-library/{share_id}")
+async def copy_shared_paper_to_library(
+    share_id: int,
+    collection_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """将共享的论文复制到我的文献库"""
+    # 获取共享记录
+    share_result = await db.execute(
+        select(SharedResource).where(SharedResource.id == share_id)
+    )
+    share = share_result.scalar_one_or_none()
+    
+    if not share:
+        raise HTTPException(status_code=404, detail="共享记录不存在")
+    
+    if share.resource_type != "paper":
+        raise HTTPException(status_code=400, detail="只能复制论文到文献库")
+    
+    # 验证访问权限
+    group_ids_result = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
+    )
+    group_ids = [row[0] for row in group_ids_result.fetchall()]
+    
+    has_access = False
+    if share.shared_with_type == 'user' and share.shared_with_id == current_user.id:
+        has_access = True
+    elif share.shared_with_type == 'group' and share.shared_with_id in group_ids:
+        has_access = True
+    elif share.shared_with_type == 'all_students':
+        # 检查是否是该导师的学生
+        if current_user.mentor_id == share.owner_id:
+            has_access = True
+        # 或者是同组成员
+        mentor_ids_result = await db.execute(
+            select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
+        )
+        mentor_ids = [row[0] for row in mentor_ids_result.fetchall()]
+        if share.owner_id in mentor_ids:
+            has_access = True
+    
+    if not has_access:
+        raise HTTPException(status_code=403, detail="无权访问此共享资源")
+    
+    # 获取原论文
+    paper_result = await db.execute(
+        select(Paper).where(Paper.id == share.resource_id)
+    )
+    original_paper = paper_result.scalar_one_or_none()
+    
+    if not original_paper:
+        raise HTTPException(status_code=404, detail="原论文已被删除")
+    
+    # 检查是否已存在相同论文
+    existing_query = select(Paper).where(Paper.user_id == current_user.id)
+    if original_paper.semantic_scholar_id:
+        existing_query = existing_query.where(Paper.semantic_scholar_id == original_paper.semantic_scholar_id)
+    elif original_paper.doi:
+        existing_query = existing_query.where(Paper.doi == original_paper.doi)
+    elif original_paper.arxiv_id:
+        existing_query = existing_query.where(Paper.arxiv_id == original_paper.arxiv_id)
+    else:
+        existing_query = existing_query.where(Paper.title == original_paper.title)
+    
+    existing_result = await db.execute(existing_query)
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="您的文献库中已存在相同论文")
+    
+    # 复制论文
+    new_paper = Paper(
+        user_id=current_user.id,
+        semantic_scholar_id=original_paper.semantic_scholar_id,
+        arxiv_id=original_paper.arxiv_id,
+        doi=original_paper.doi,
+        pubmed_id=original_paper.pubmed_id,
+        title=original_paper.title,
+        abstract=original_paper.abstract,
+        authors=original_paper.authors,
+        year=original_paper.year,
+        venue=original_paper.venue,
+        journal=original_paper.journal,
+        volume=original_paper.volume,
+        pages=original_paper.pages,
+        publisher=original_paper.publisher,
+        url=original_paper.url,
+        pdf_url=original_paper.pdf_url,
+        arxiv_url=original_paper.arxiv_url,
+        citation_count=original_paper.citation_count,
+        reference_count=original_paper.reference_count,
+        fields_of_study=original_paper.fields_of_study,
+        source=original_paper.source,
+        raw_data=original_paper.raw_data,
+        published_date=original_paper.published_date,
+    )
+    db.add(new_paper)
+    await db.flush()
+    
+    # 如果指定了收藏夹，添加到收藏夹
+    if collection_id:
+        from app.models.literature import paper_collection_association
+        await db.execute(
+            paper_collection_association.insert().values(
+                paper_id=new_paper.id,
+                collection_id=collection_id
+            )
+        )
+        # 更新收藏夹计数
+        await db.execute(
+            select(PaperCollection).where(PaperCollection.id == collection_id)
+        )
+    
+    await db.commit()
+    
+    logger.info(f"用户 {current_user.username} 将共享论文 {original_paper.title[:50]} 添加到了自己的库")
+    
+    return {
+        "message": "论文已添加到您的文献库",
+        "paper_id": new_paper.id
+    }
+
+
+# ========== 获取共享资源详情（包含完整内容）==========
+
+async def _check_share_access(
+    share_id: int,
+    current_user: User,
+    db: AsyncSession
+) -> Optional[SharedResource]:
+    """检查用户是否有权访问共享资源"""
+    # 获取共享记录
+    share_result = await db.execute(
+        select(SharedResource).where(SharedResource.id == share_id)
+    )
+    share = share_result.scalar_one_or_none()
+    
+    if not share:
+        return None
+    
+    # 获取用户加入的研究组
+    group_ids_result = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
+    )
+    group_ids = [row[0] for row in group_ids_result.fetchall()]
+    
+    # 如果是导师，获取管理的研究组
+    if current_user.role == UserRole.MENTOR.value:
+        mentor_groups_result = await db.execute(
+            select(ResearchGroup.id).where(ResearchGroup.mentor_id == current_user.id)
+        )
+        mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
+        group_ids = list(set(group_ids + mentor_group_ids))
+    
+    # 检查访问权限
+    has_access = False
+    if share.shared_with_type == 'user' and share.shared_with_id == current_user.id:
+        has_access = True
+    elif share.shared_with_type == 'group' and share.shared_with_id in group_ids:
+        has_access = True
+    elif share.shared_with_type == 'all_students':
+        # 检查是否是该导师的学生或同组
+        if current_user.mentor_id == share.owner_id:
+            has_access = True
+        else:
+            mentor_ids_result = await db.execute(
+                select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
+            )
+            mentor_ids = [row[0] for row in mentor_ids_result.fetchall()]
+            if share.owner_id in mentor_ids:
+                has_access = True
+    
+    # 如果是自己共享的也可以看
+    if share.owner_id == current_user.id:
+        has_access = True
+    
+    return share if has_access else None
+
+
+@router.get("/detail/{share_id}")
+async def get_shared_resource_detail(
+    share_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取共享资源的详细内容"""
+    share = await _check_share_access(share_id, current_user, db)
+    
+    if not share:
+        raise HTTPException(status_code=404, detail="共享资源不存在或无权访问")
+    
+    # 获取所有者信息
+    owner_result = await db.execute(
+        select(User).where(User.id == share.owner_id)
+    )
+    owner = owner_result.scalar_one_or_none()
+    
+    result = {
+        "share_id": share.id,
+        "resource_type": share.resource_type,
+        "resource_id": share.resource_id,
+        "owner_id": share.owner_id,
+        "owner_name": owner.full_name or owner.username if owner else "未知",
+        "owner_avatar": owner.avatar if owner else None,
+        "shared_at": share.created_at.isoformat(),
+        "permission": share.permission,
+    }
+    
+    if share.resource_type == "paper":
+        # 获取论文详情
+        paper_result = await db.execute(
+            select(Paper).where(Paper.id == share.resource_id)
+        )
+        paper = paper_result.scalar_one_or_none()
+        if paper:
+            result["paper"] = {
+                "id": paper.id,
+                "title": paper.title,
+                "abstract": paper.abstract,
+                "authors": paper.authors or [],
+                "year": paper.year,
+                "venue": paper.venue,
+                "journal": paper.journal,
+                "url": paper.url,
+                "pdf_url": paper.pdf_url,
+                "arxiv_url": paper.arxiv_url,
+                "doi": paper.doi,
+                "citation_count": paper.citation_count,
+                "reference_count": paper.reference_count,
+                "fields_of_study": paper.fields_of_study or [],
+                "is_read": paper.is_read,
+                "notes": paper.notes,
+                "tags": paper.tags or [],
+            }
+    
+    elif share.resource_type == "paper_collection":
+        # 获取文献集详情及论文列表
+        collection_result = await db.execute(
+            select(PaperCollection).where(PaperCollection.id == share.resource_id)
+        )
+        collection = collection_result.scalar_one_or_none()
+        if collection:
+            result["collection"] = {
+                "id": collection.id,
+                "name": collection.name,
+                "description": collection.description,
+                "color": collection.color,
+                "paper_count": collection.paper_count,
+            }
+            
+            # 获取文献集中的论文
+            from app.models.literature import paper_collection_association
+            papers_result = await db.execute(
+                select(Paper).join(
+                    paper_collection_association,
+                    Paper.id == paper_collection_association.c.paper_id
+                ).where(
+                    paper_collection_association.c.collection_id == share.resource_id
+                ).order_by(Paper.created_at.desc()).limit(50)
+            )
+            papers = papers_result.scalars().all()
+            result["papers"] = [
+                {
+                    "id": p.id,
+                    "title": p.title,
+                    "authors": [a.get("name", "") for a in (p.authors or [])][:3],
+                    "year": p.year,
+                    "venue": p.venue,
+                    "citation_count": p.citation_count,
+                    "url": p.url,
+                    "pdf_url": p.pdf_url,
+                }
+                for p in papers
+            ]
+    
+    elif share.resource_type == "knowledge_base":
+        # 获取知识库详情及文档列表
+        kb_result = await db.execute(
+            select(KnowledgeBase).where(KnowledgeBase.id == share.resource_id)
+        )
+        kb = kb_result.scalar_one_or_none()
+        if kb:
+            result["knowledge_base"] = {
+                "id": kb.id,
+                "name": kb.name,
+                "description": kb.description,
+                "document_count": kb.document_count,
+                "embedding_model": kb.embedding_model,
+            }
+            
+            # 获取知识库中的文档
+            from app.models.knowledge import Document
+            docs_result = await db.execute(
+                select(Document).where(
+                    Document.knowledge_base_id == share.resource_id
+                ).order_by(Document.created_at.desc()).limit(50)
+            )
+            docs = docs_result.scalars().all()
+            result["documents"] = [
+                {
+                    "id": d.id,
+                    "filename": d.filename,
+                    "file_type": d.file_type,
+                    "file_size": d.file_size,
+                    "chunk_count": d.chunk_count,
+                    "status": d.status,
+                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                }
+                for d in docs
+            ]
+    
+    return result
+
+
+# ========== 批量添加共享文献集中的论文到我的库 ==========
+
+class CopyCollectionPapersRequest(BaseModel):
+    paper_ids: Optional[List[int]] = None
+    target_collection_id: Optional[int] = None
+
+
+@router.post("/copy-collection-papers/{share_id}")
+async def copy_collection_papers_to_library(
+    share_id: int,
+    data: Optional[CopyCollectionPapersRequest] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """将共享文献集中的论文批量添加到我的库"""
+    share = await _check_share_access(share_id, current_user, db)
+    
+    if not share:
+        raise HTTPException(status_code=404, detail="共享资源不存在或无权访问")
+    
+    if share.resource_type != "paper_collection":
+        raise HTTPException(status_code=400, detail="只能复制文献集中的论文")
+    
+    paper_ids = data.paper_ids if data else None
+    target_collection_id = data.target_collection_id if data else None
+    
+    # 获取要复制的论文
+    from app.models.literature import paper_collection_association
+    
+    query = select(Paper).join(
+        paper_collection_association,
+        Paper.id == paper_collection_association.c.paper_id
+    ).where(
+        paper_collection_association.c.collection_id == share.resource_id
+    )
+    
+    if paper_ids:
+        query = query.where(Paper.id.in_(paper_ids))
+    
+    papers_result = await db.execute(query)
+    papers = papers_result.scalars().all()
+    
+    success_count = 0
+    skip_count = 0
+    
+    for original_paper in papers:
+        # 检查是否已存在
+        existing_query = select(Paper).where(Paper.user_id == current_user.id)
+        if original_paper.semantic_scholar_id:
+            existing_query = existing_query.where(Paper.semantic_scholar_id == original_paper.semantic_scholar_id)
+        elif original_paper.doi:
+            existing_query = existing_query.where(Paper.doi == original_paper.doi)
+        elif original_paper.arxiv_id:
+            existing_query = existing_query.where(Paper.arxiv_id == original_paper.arxiv_id)
+        else:
+            existing_query = existing_query.where(Paper.title == original_paper.title)
+        
+        existing_result = await db.execute(existing_query)
+        if existing_result.scalar_one_or_none():
+            skip_count += 1
+            continue
+        
+        # 复制论文
+        new_paper = Paper(
+            user_id=current_user.id,
+            semantic_scholar_id=original_paper.semantic_scholar_id,
+            arxiv_id=original_paper.arxiv_id,
+            doi=original_paper.doi,
+            pubmed_id=original_paper.pubmed_id,
+            title=original_paper.title,
+            abstract=original_paper.abstract,
+            authors=original_paper.authors,
+            year=original_paper.year,
+            venue=original_paper.venue,
+            journal=original_paper.journal,
+            volume=original_paper.volume,
+            pages=original_paper.pages,
+            publisher=original_paper.publisher,
+            url=original_paper.url,
+            pdf_url=original_paper.pdf_url,
+            arxiv_url=original_paper.arxiv_url,
+            citation_count=original_paper.citation_count,
+            reference_count=original_paper.reference_count,
+            fields_of_study=original_paper.fields_of_study,
+            source=original_paper.source,
+            raw_data=original_paper.raw_data,
+            published_date=original_paper.published_date,
+        )
+        db.add(new_paper)
+        await db.flush()
+        
+        # 如果指定了目标收藏夹
+        if target_collection_id:
+            await db.execute(
+                paper_collection_association.insert().values(
+                    paper_id=new_paper.id,
+                    collection_id=target_collection_id
+                )
+            )
+        
+        success_count += 1
+    
+    await db.commit()
+    
+    return {
+        "success_count": success_count,
+        "skip_count": skip_count,
+        "message": f"成功添加 {success_count} 篇论文，跳过 {skip_count} 篇已存在的"
+    }
+
+
+# 注：共享知识库采用直接引用方案，不需要复制
+# 用户可以在AI对话中直接选择和使用共享的知识库
+# 相关实现见 /api/knowledge/available 端点
