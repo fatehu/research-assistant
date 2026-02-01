@@ -133,12 +133,75 @@ class NotebookService:
     
     async def delete_notebook(self, notebook_id: str, user_id: int) -> bool:
         """删除 Notebook"""
-        result = await self.db.execute(
-            delete(Notebook)
-            .where(Notebook.id == notebook_id, Notebook.user_id == user_id)
-        )
+        # 先查询notebook是否存在（asyncpg的rowcount可能不可靠）
+        notebook = await self.get_notebook_model(notebook_id, user_id)
+        if not notebook:
+            return False
+        
+        # 删除notebook（级联删除cells）
+        await self.db.delete(notebook)
         await self.db.commit()
-        return result.rowcount > 0
+        return True
+    
+    async def sync_cells(self, notebook_id: str, user_id: int, 
+                        cells_data: List[Dict]) -> Optional[Dict]:
+        """
+        完整同步 cells - 处理新增、更新、删除
+        这是保存 notebook 时的核心方法
+        """
+        notebook = await self.get_notebook_model(notebook_id, user_id)
+        if not notebook:
+            return None
+        
+        # 获取现有 cell 的 id 集合
+        existing_cell_ids = {cell.id for cell in notebook.cells}
+        existing_cells_map = {cell.id: cell for cell in notebook.cells}
+        
+        # 获取前端发送的 cell id 集合
+        new_cell_ids = {cell.get('id') for cell in cells_data if cell.get('id')}
+        
+        # 1. 删除不在新列表中的 cells
+        cells_to_delete = existing_cell_ids - new_cell_ids
+        for cell_id in cells_to_delete:
+            cell = existing_cells_map[cell_id]
+            await self.db.delete(cell)
+            logger.debug(f"删除 cell: {cell_id}")
+        
+        # 2. 更新或新增 cells
+        for position, cell_data in enumerate(cells_data):
+            cell_id = cell_data.get('id')
+            
+            if cell_id in existing_cells_map:
+                # 更新现有 cell
+                cell = existing_cells_map[cell_id]
+                cell.source = cell_data.get('source', '')
+                cell.cell_type = cell_data.get('cell_type', 'code')
+                cell.outputs = cell_data.get('outputs', [])
+                cell.execution_count = cell_data.get('execution_count')
+                cell.cell_metadata = cell_data.get('metadata', {})
+                cell.position = position
+                cell.updated_at = datetime.utcnow()
+                logger.debug(f"更新 cell: {cell_id}, position={position}")
+            else:
+                # 新增 cell
+                new_cell = NotebookCell(
+                    id=cell_id or str(uuid.uuid4()),
+                    notebook_id=notebook_id,
+                    cell_type=cell_data.get('cell_type', 'code'),
+                    source=cell_data.get('source', ''),
+                    outputs=cell_data.get('outputs', []),
+                    execution_count=cell_data.get('execution_count'),
+                    cell_metadata=cell_data.get('metadata', {}),
+                    position=position,
+                )
+                self.db.add(new_cell)
+                logger.debug(f"新增 cell: {new_cell.id}, position={position}")
+        
+        notebook.updated_at = datetime.utcnow()
+        await self.db.commit()
+        
+        # 重新查询以获取完整数据
+        return await self.get_notebook(notebook_id, user_id)
     
     async def add_cell(self, notebook_id: str, user_id: int, 
                       cell_type: str = 'code', source: str = '',

@@ -535,7 +535,13 @@ async def list_notebooks(
     db: AsyncSession = Depends(get_db)
 ):
     """获取用户的所有 Notebook"""
-    notebooks = await get_user_notebooks_cached(db, current_user.id)
+    # 总是从数据库获取最新数据，确保列表页数据一致性
+    service = NotebookService(db)
+    notebooks = await service.get_user_notebooks(current_user.id)
+    
+    # 同步更新缓存
+    for nb in notebooks:
+        _notebooks_cache[nb['id']] = nb
     
     # 定义排序键函数，处理 datetime 对象和 ISO 字符串的混合情况
     def sort_key(x):
@@ -584,9 +590,16 @@ async def get_notebook_detail(
     db: AsyncSession = Depends(get_db)
 ):
     """获取 Notebook 详情"""
-    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    # 总是从数据库获取最新数据，确保详情页数据一致性
+    service = NotebookService(db)
+    notebook = await service.get_notebook(notebook_id, current_user.id)
+    
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook 不存在")
+    
+    # 更新缓存
+    _notebooks_cache[notebook_id] = notebook
+    
     return notebook
 
 
@@ -600,33 +613,40 @@ async def update_notebook(
     """更新 Notebook"""
     service = NotebookService(db)
     
-    # 如果更新 cells，需要特殊处理
+    # 先获取当前 notebook
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+    
+    # 更新基本信息
+    if data.title is not None or data.description is not None:
+        await service.update_notebook(notebook_id, current_user.id, data.title, data.description)
+    
+    # 如果更新 cells，使用 sync_cells 完整同步
     if data.cells is not None:
-        # 先获取当前 notebook
-        notebook = await get_notebook_cached(db, notebook_id, current_user.id)
-        if not notebook:
-            raise HTTPException(status_code=404, detail="Notebook 不存在")
+        # 将 Cell 对象转换为字典
+        cells_data = []
+        for cell in data.cells:
+            if hasattr(cell, 'dict'):
+                cells_data.append(cell.dict())
+            elif hasattr(cell, 'model_dump'):
+                cells_data.append(cell.model_dump())
+            elif isinstance(cell, dict):
+                cells_data.append(cell)
+            else:
+                cells_data.append({
+                    'id': getattr(cell, 'id', None),
+                    'cell_type': getattr(cell, 'cell_type', 'code'),
+                    'source': getattr(cell, 'source', ''),
+                    'outputs': getattr(cell, 'outputs', []),
+                    'execution_count': getattr(cell, 'execution_count', None),
+                    'metadata': getattr(cell, 'metadata', {}),
+                })
         
-        # 更新基本信息
-        if data.title is not None or data.description is not None:
-            await service.update_notebook(notebook_id, current_user.id, data.title, data.description)
-        
-        # 更新 cells - 逐个更新
-        for cell_data in data.cells:
-            cell_dict = cell_data.dict() if hasattr(cell_data, 'dict') else cell_data
-            await service.update_cell(
-                notebook_id, current_user.id, cell_dict['id'],
-                source=cell_dict.get('source'),
-                cell_type=cell_dict.get('cell_type'),
-                outputs=cell_dict.get('outputs'),
-                execution_count=cell_dict.get('execution_count')
-            )
-        
-        # 重新获取更新后的 notebook
-        notebook = await service.get_notebook(notebook_id, current_user.id)
+        notebook = await service.sync_cells(notebook_id, current_user.id, cells_data)
     else:
-        # 只更新基本信息
-        notebook = await service.update_notebook(notebook_id, current_user.id, data.title, data.description)
+        # 只更新基本信息，重新获取
+        notebook = await service.get_notebook(notebook_id, current_user.id)
     
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook 不存在")

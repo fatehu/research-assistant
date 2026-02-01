@@ -602,80 +602,117 @@ const CodeLabPage = () => {
   }, [])
 
   // 添加单元格
-  const addCell = useCallback((index: number, cellType: 'code' | 'markdown' = 'code') => {
-    const newCell: Cell = {
-      id: crypto.randomUUID(),
-      cell_type: cellType,
-      source: '',
-      outputs: [],
-      execution_count: null,
-      metadata: {},
+  const addCell = useCallback(async (index: number, cellType: 'code' | 'markdown' = 'code') => {
+    if (!currentNotebook) return
+    
+    try {
+      // 调用后端API添加
+      const newCell = await codelabApi.addCell(currentNotebook.id, cellType, index + 1)
+      
+      // 更新本地状态
+      setCurrentNotebook(prev => {
+        if (!prev) return prev
+        const cells = [...prev.cells]
+        cells.splice(index + 1, 0, newCell)
+        return { ...prev, cells }
+      })
+      
+      setSelectedCellIndex(index + 1)
+    } catch (error) {
+      message.error('添加单元格失败')
     }
-    
-    setCurrentNotebook(prev => {
-      if (!prev) return prev
-      const cells = [...prev.cells]
-      cells.splice(index + 1, 0, newCell)
-      return { ...prev, cells }
-    })
-    
-    setSelectedCellIndex(index + 1)
-  }, [])
+  }, [currentNotebook])
 
   // 删除单元格
-  const deleteCell = useCallback((cellId: string) => {
+  const deleteCell = useCallback(async (cellId: string) => {
     if (!currentNotebook || currentNotebook.cells.length <= 1) {
       message.warning('至少保留一个单元格')
       return
     }
     
-    setCurrentNotebook(prev => {
-      if (!prev) return prev
-      return { ...prev, cells: prev.cells.filter(c => c.id !== cellId) }
-    })
-    
-    setSelectedCellIndex(prev => Math.max(0, prev - 1))
+    try {
+      // 调用后端API删除
+      await codelabApi.deleteCell(currentNotebook.id, cellId)
+      
+      // 更新本地状态
+      setCurrentNotebook(prev => {
+        if (!prev) return prev
+        return { ...prev, cells: prev.cells.filter(c => c.id !== cellId) }
+      })
+      
+      setSelectedCellIndex(prev => Math.max(0, prev - 1))
+    } catch (error) {
+      message.error('删除单元格失败')
+    }
   }, [currentNotebook])
 
   // 切换单元格类型
-  const toggleCellType = useCallback((cellId: string) => {
+  const toggleCellType = useCallback(async (cellId: string) => {
+    if (!currentNotebook) return
+    
+    // 计算新的cells
+    const newCells = currentNotebook.cells.map(cell =>
+      cell.id === cellId
+        ? { ...cell, cell_type: cell.cell_type === 'code' ? 'markdown' : 'code', outputs: [] } as Cell
+        : cell
+    )
+    
+    // 更新本地状态
     setCurrentNotebook(prev => {
       if (!prev) return prev
-      return {
-        ...prev,
-        cells: prev.cells.map(cell =>
-          cell.id === cellId
-            ? { ...cell, cell_type: cell.cell_type === 'code' ? 'markdown' : 'code', outputs: [] }
-            : cell
-        ),
-      }
+      return { ...prev, cells: newCells }
     })
-  }, [])
+    
+    // 立即保存到后端
+    try {
+      await codelabApi.updateNotebook(currentNotebook.id, {
+        title: currentNotebook.title,
+        cells: newCells,
+      })
+    } catch (error) {
+      message.error('保存失败')
+    }
+  }, [currentNotebook])
 
   // 移动单元格
-  const moveCell = useCallback((cellId: string, direction: 'up' | 'down') => {
+  const moveCell = useCallback(async (cellId: string, direction: 'up' | 'down') => {
+    if (!currentNotebook) return
+    
+    const cells = [...currentNotebook.cells]
+    const index = cells.findIndex(c => c.id === cellId)
+    if (index === -1) return
+    
+    const newIndex = direction === 'up' ? index - 1 : index + 1
+    if (newIndex < 0 || newIndex >= cells.length) return
+    
+    // 交换位置
+    [cells[index], cells[newIndex]] = [cells[newIndex], cells[index]]
+    
+    // 更新本地状态
     setCurrentNotebook(prev => {
       if (!prev) return prev
-      const cells = [...prev.cells]
-      const index = cells.findIndex(c => c.id === cellId)
-      if (index === -1) return prev
-      
-      const newIndex = direction === 'up' ? index - 1 : index + 1
-      if (newIndex < 0 || newIndex >= cells.length) return prev
-      
-      [cells[index], cells[newIndex]] = [cells[newIndex], cells[index]]
       return { ...prev, cells }
     })
     
     setSelectedCellIndex(prev => {
       const delta = direction === 'up' ? -1 : 1
-      return Math.max(0, Math.min((currentNotebook?.cells.length || 1) - 1, prev + delta))
+      return Math.max(0, Math.min(cells.length - 1, prev + delta))
     })
+    
+    // 立即保存到后端
+    try {
+      await codelabApi.updateNotebook(currentNotebook.id, {
+        title: currentNotebook.title,
+        cells: cells,
+      })
+    } catch (error) {
+      message.error('保存失败')
+    }
   }, [currentNotebook])
 
   // ========== Agent 回调函数 ==========
 
-  const handleAgentInsertCode = useCallback((code: string) => {
+  const handleAgentInsertCode = useCallback(async (code: string) => {
     if (!currentNotebook) return
     
     const newCell: Cell = {
@@ -687,15 +724,26 @@ const CodeLabPage = () => {
       metadata: { from_agent: true },
     }
     
+    const newCells = [...currentNotebook.cells]
+    newCells.splice(selectedCellIndex + 1, 0, newCell)
+    
     setCurrentNotebook(prev => {
       if (!prev) return prev
-      const cells = [...prev.cells]
-      cells.splice(selectedCellIndex + 1, 0, newCell)
-      return { ...prev, cells }
+      return { ...prev, cells: newCells }
     })
     
     setSelectedCellIndex(selectedCellIndex + 1)
     message.success('代码已插入')
+    
+    // 保存到后端
+    try {
+      await codelabApi.updateNotebook(currentNotebook.id, {
+        title: currentNotebook.title,
+        cells: newCells,
+      })
+    } catch (error) {
+      console.error('保存失败:', error)
+    }
   }, [currentNotebook, selectedCellIndex])
 
   const handleAgentRunCode = useCallback(async (code: string) => {
@@ -711,14 +759,26 @@ const CodeLabPage = () => {
       metadata: { from_agent: true },
     }
     
+    const newCells = [...currentNotebook.cells]
+    newCells.splice(selectedCellIndex + 1, 0, newCell)
+    
     setCurrentNotebook(prev => {
       if (!prev) return prev
-      const cells = [...prev.cells]
-      cells.splice(selectedCellIndex + 1, 0, newCell)
-      return { ...prev, cells }
+      return { ...prev, cells: newCells }
     })
     
     setSelectedCellIndex(selectedCellIndex + 1)
+    
+    // 保存到后端
+    try {
+      await codelabApi.updateNotebook(currentNotebook.id, {
+        title: currentNotebook.title,
+        cells: newCells,
+      })
+    } catch (error) {
+      console.error('保存失败:', error)
+    }
+    
     setTimeout(() => { runCell(newCellId, code) }, 100)
   }, [currentNotebook, selectedCellIndex, runCell])
 
@@ -727,56 +787,81 @@ const CodeLabPage = () => {
     setSelectedCellIndex(Math.max(0, Math.min(currentNotebook.cells.length - 1, cellIndex)))
   }, [currentNotebook])
 
-  const handleAgentClearOutputs = useCallback(() => {
+  const handleAgentClearOutputs = useCallback(async () => {
     if (!currentNotebook) return
+    
+    const newCells = currentNotebook.cells.map(cell => ({ ...cell, outputs: [], execution_count: null }))
+    
     startTransition(() => {
       setCurrentNotebook(prev => {
         if (!prev) return prev
-        return {
-          ...prev,
-          cells: prev.cells.map(cell => ({ ...cell, outputs: [], execution_count: null })),
-        }
+        return { ...prev, cells: newCells }
       })
     })
     message.success('所有输出已清除')
+    
+    // 保存到后端
+    try {
+      await codelabApi.updateNotebook(currentNotebook.id, {
+        title: currentNotebook.title,
+        cells: newCells,
+      })
+    } catch (error) {
+      console.error('保存失败:', error)
+    }
   }, [currentNotebook])
 
   // AI 添加新 Cell（实时更新）
   const handleAgentAddCell = useCallback((newCell: Cell) => {
-    if (!currentNotebook) return
-    startTransition(() => {
-      setCurrentNotebook(prev => {
-        if (!prev) return prev
-        // 检查是否已存在该 cell（避免重复添加）
-        const exists = prev.cells.some(c => c.id === newCell.id)
-        if (exists) return prev
-        return {
-          ...prev,
-          cells: [...prev.cells, newCell],
-        }
-      })
-      // 自动滚动到新 Cell
-      setTimeout(() => {
-        setSelectedCellIndex(currentNotebook.cells.length)
-      }, 100)
+    // 使用函数式更新，确保获取最新状态，避免闭包问题
+    setCurrentNotebook(prev => {
+      if (!prev) return prev
+      
+      // 检查是否已存在该 cell（避免重复添加）
+      const exists = prev.cells.some(c => c.id === newCell.id)
+      if (exists) return prev
+      
+      console.log('[handleAgentAddCell] 添加新 cell:', newCell.id)
+      return { ...prev, cells: [...prev.cells, newCell] }
     })
-  }, [currentNotebook])
+    
+    // 自动滚动到新 Cell（延迟执行确保状态已更新）
+    setTimeout(() => {
+      setSelectedCellIndex(prev => prev + 1)
+    }, 100)
+    
+    // 注意：不在这里保存到后端，因为后端Agent已经在observation处理时保存到数据库了
+  }, [])
 
   // AI 更新 Cell（实时更新）
   const handleAgentUpdateCell = useCallback((updatedCell: Cell) => {
-    if (!currentNotebook) return
-    startTransition(() => {
-      setCurrentNotebook(prev => {
-        if (!prev) return prev
+    // 使用函数式更新，确保获取最新状态
+    setCurrentNotebook(prev => {
+      if (!prev) return prev
+      
+      // 检查 cell 是否存在
+      const cellExists = prev.cells.some(c => c.id === updatedCell.id)
+      
+      if (cellExists) {
+        console.log('[handleAgentUpdateCell] 更新 cell:', updatedCell.id)
         return {
           ...prev,
           cells: prev.cells.map(c => 
             c.id === updatedCell.id ? { ...c, ...updatedCell } : c
           ),
         }
-      })
+      } else {
+        // cell 不存在，添加到末尾
+        console.log('[handleAgentUpdateCell] cell不存在，添加:', updatedCell.id)
+        return {
+          ...prev,
+          cells: [...prev.cells, updatedCell],
+        }
+      }
     })
-  }, [currentNotebook])
+    
+    // 注意：不在这里保存到后端，因为后端Agent已经在observation处理时保存到数据库了
+  }, [])
 
   // 初始化加载
   useEffect(() => { loadNotebooks() }, [loadNotebooks])
@@ -786,8 +871,10 @@ const CodeLabPage = () => {
       loadNotebook(notebookId)
     } else {
       setCurrentNotebook(null)
+      // 返回列表页时重新加载列表，确保数据最新
+      loadNotebooks()
     }
-  }, [notebookId, loadNotebook])
+  }, [notebookId, loadNotebook, loadNotebooks])
 
   // 键盘快捷键
   useEffect(() => {
