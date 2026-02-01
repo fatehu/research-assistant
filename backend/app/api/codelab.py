@@ -1297,6 +1297,16 @@ async def notebook_agent_chat(
                                         execution_count=updated_cell.get('execution_count')
                                     )
                                     logger.info(f"[Agent] Cell 更新已同步到数据库: {updated_cell.get('id')}")
+                                
+                                # 【新增】处理删除操作
+                                deleted_ids = tool_data.get('deleted_ids', []) if isinstance(tool_data, dict) else []
+                                if deleted_ids:
+                                    for del_id in deleted_ids:
+                                        try:
+                                            await service.delete_cell(notebook_id, user_id, del_id)
+                                            logger.info(f"[Agent] Cell 删除已同步到数据库: {del_id}")
+                                        except Exception as del_e:
+                                            logger.warning(f"删除 cell {del_id} 失败: {del_e}")
                                     
                         except Exception as e:
                             logger.warning(f"同步到数据库失败: {e}")

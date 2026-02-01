@@ -1,6 +1,8 @@
 """
 ReAct Agent 服务
 实现 Reasoning + Acting 的智能代理框架
+
+【增强版】改进了系统提示词，特别是 Notebook 单元格操作的说明
 """
 import json
 import re
@@ -62,7 +64,7 @@ class ReActAgent:
     5. Answer: 输出最终回答
     """
     
-    # ReAct 系统提示词
+    # ReAct 系统提示词 - 【增强版】
     SYSTEM_PROMPT = """你是一个智能AI助手，可以使用以下工具来帮助回答问题：
 
 {tools_description}
@@ -97,23 +99,91 @@ class ReActAgent:
 4. 每次只能调用一个工具
 5. 使用中文回复
 
-## 工具说明
+## 核心工具说明
 
+### Notebook 单元格操作 (notebook_cell)
+操作 Notebook 的单元格，支持以下操作:
+- `get`: 获取所有单元格列表，显示每个单元格的【索引】和【ID】
+- `add`: 添加新单元格
+- `delete`: 删除单元格
+- `update`: 更新单元格内容
+- `move`: 移动单元格位置
+- `get_one`: 获取单个单元格详情
+
+**【重要】定位单元格的两种方式：**
+1. `cell_index`: 使用从1开始的索引（推荐，如：第1个单元格索引为1）
+2. `cell_id`: 使用单元格的UUID（如：abc123-def456-...）
+
+**示例：**
+```json
+// 获取所有单元格
+{{"tool": "notebook_cell", "input": {{"action": "get"}}}}
+
+// 通过索引删除第2个单元格
+{{"tool": "notebook_cell", "input": {{"action": "delete", "cell_index": 2}}}}
+
+// 通过ID删除单元格
+{{"tool": "notebook_cell", "input": {{"action": "delete", "cell_id": "abc123-..."}}}}
+
+// 更新第3个单元格的内容
+{{"tool": "notebook_cell", "input": {{"action": "update", "cell_index": 3, "content": "新内容"}}}}
+
+// 在位置2插入新单元格
+{{"tool": "notebook_cell", "input": {{"action": "add", "content": "代码", "index": 2}}}}
+```
+
+### 智能清理工具 (notebook_cleanup)
+批量清理 Notebook 单元格，支持多种策略:
+- `preview`: 预览分析，显示可清理的单元格（不实际删除）
+- `duplicates`: 删除重复内容的单元格
+- `empty`: 删除空白单元格
+- `unexecuted`: 删除未执行的代码单元格
+- `ai_created`: 删除AI创建的单元格
+- `by_indices`: 批量删除指定索引的单元格
+
+**示例：**
+```json
+// 预览分析
+{{"tool": "notebook_cleanup", "input": {{"strategy": "preview"}}}}
+
+// 清理重复单元格
+{{"tool": "notebook_cleanup", "input": {{"strategy": "duplicates"}}}}
+
+// 批量删除索引为2,3,5的单元格
+{{"tool": "notebook_cleanup", "input": {{"strategy": "by_indices", "indices": [2, 3, 5]}}}}
+
+// 预览模式（不实际删除）
+{{"tool": "notebook_cleanup", "input": {{"strategy": "empty", "dry_run": true}}}}
+```
+
+### 其他工具
+- `notebook_execute`: 执行代码，参数 code（代码）, description（描述）
+- `notebook_variables`: 获取变量，参数 filter_type（类型过滤）
 - `web_search`: 搜索互联网，参数 query（搜索词）
 - `knowledge_search`: 搜索知识库，参数 query（搜索词）
 - `calculator`: 数学计算，参数 expression（表达式如 sqrt(16)）
 - `datetime`: 获取时间，参数 action（now/date/weekday）
-- `unit_converter`: 单位转换，参数 value, from_unit, to_unit
+- `pip_install`: 安装包，参数 packages（包列表）
+- `code_analysis`: 代码分析，参数 code（代码）
+- `error_diagnosis`: 错误诊断，参数 error_message（错误信息）
 
-## 示例
+## 典型工作流程示例
 
-用户问"今天天气怎么样"，你应该输出：
-<think>用户询问天气，需要搜索最新信息</think>
-<action>{{"tool": "web_search", "input": {{"query": "今天天气"}}}}</action>
+**用户说"帮我清理无用的cell"：**
+1. 先调用 `notebook_cleanup` 的 `preview` 策略分析
+2. 根据分析结果，选择合适的清理策略
+3. 执行清理（如 `duplicates` 或 `by_indices`）
 
-收到搜索结果后，你应该输出：
-<think>已获取天气信息，可以回答用户</think>
-<answer>根据搜索结果，今天的天气是...</answer>
+**用户说"删除第2个单元格"：**
+直接调用 `notebook_cell`：
+```json
+{{"tool": "notebook_cell", "input": {{"action": "delete", "cell_index": 2}}}}
+```
+
+**用户说"查看所有单元格"：**
+```json
+{{"tool": "notebook_cell", "input": {{"action": "get"}}}}
+```
 """
 
     def __init__(
@@ -348,55 +418,44 @@ class ReActAgent:
                         think_content = ""  # 重置
                         processed = True
                     else:
-                        # 流式输出思考内容
-                        if len(buffer) > 15:
-                            send_chunk = buffer[:-15]
-                            think_content += send_chunk
-                            yield {"type": "thinking", "data": send_chunk}
-                            buffer = buffer[-15:]
+                        # 缓冲直到看到结束标签
                         break
                         
                 elif current_mode == "action":
                     if "</action>" in buffer:
                         idx = buffer.find("</action>")
                         action_content += buffer[:idx]
-                        action_str = action_content.strip()
                         buffer = buffer[idx + 9:]
                         current_mode = None
                         
-                        logger.info(f"[ReAct] 收到 action: {action_str}")
+                        action_str = action_content.strip()
+                        logger.info(f"[ReAct] 行动: {action_str[:100]}...")
                         
-                        # 解析并执行工具
                         try:
                             action_data = json.loads(action_str)
                             tool_name = action_data.get("tool")
                             tool_input = action_data.get("input", {})
-                            
-                            logger.info(f"[ReAct] 执行工具: {tool_name}, 参数: {tool_input}")
-                            
-                            yield {
-                                "type": "action",
-                                "data": {
-                                    "tool": tool_name,
-                                    "input": tool_input
-                                }
-                            }
-                            
-                            # 执行工具
-                            result = await self.tools.execute(tool_name, **tool_input)
-                            
-                            logger.info(f"[ReAct] 工具结果: success={result.success}, output={result.output[:200]}...")
                             
                             # 记录行动步骤
                             step = AgentStep(
                                 step_type="action",
                                 content=action_str,
                                 tool_name=tool_name,
-                                tool_input=tool_input,
-                                tool_output=result.output,
-                                success=result.success
+                                tool_input=tool_input
                             )
                             context.steps.append(step)
+                            
+                            yield {
+                                "type": "action",
+                                "data": {"tool": tool_name, "input": tool_input}
+                            }
+                            
+                            # 执行工具
+                            logger.info(f"[ReAct] 执行工具: {tool_name}")
+                            result = await self.tools.execute(tool_name, **tool_input)
+                            
+                            step.tool_output = result.output
+                            step.success = result.success
                             
                             yield {
                                 "type": "observation",
@@ -404,54 +463,32 @@ class ReActAgent:
                                     "tool": tool_name,
                                     "success": result.success,
                                     "output": result.output[:2000],
-                                    "data": result.data  # 包含 notebook_updated, cell_id 等
+                                    "data": result.data
                                 }
                             }
                             
-                            # 将工具结果添加到对话历史
+                            # 更新对话历史
                             context.messages.append({
                                 "role": "assistant",
                                 "content": full_response
                             })
                             context.messages.append({
                                 "role": "user",
-                                "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息继续思考。如果信息足够，请给出最终回答；如果需要更多信息，可以继续使用工具。"
+                                "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
                             })
                             
-                            logger.info(f"[ReAct] 工具执行完成，返回以开始新迭代")
-                            # 返回以开始新迭代
-                            return
-                            
                         except json.JSONDecodeError as e:
-                            logger.error(f"[ReAct] 工具调用 JSON 解析失败: {e}, 内容: {action_str}")
-                            # 不返回错误，继续处理
+                            logger.error(f"[ReAct] 解析 action 失败: {e}")
                             yield {
-                                "type": "thought",
-                                "data": f"工具调用格式错误，尝试直接回答"
+                                "type": "error",
+                                "data": f"Action 解析失败: {e}"
                             }
-                            action_content = ""
-                            processed = True
-                            continue
-                        except Exception as e:
-                            logger.error(f"[ReAct] 工具执行失败: {e}")
-                            yield {
-                                "type": "observation",
-                                "data": {
-                                    "tool": tool_name if 'tool_name' in dir() else "unknown",
-                                    "success": False,
-                                    "output": f"工具执行失败: {str(e)}",
-                                    "data": {}
-                                }
-                            }
-                            action_content = ""
-                            processed = True
-                            continue
                         
+                        action_content = ""  # 重置
+                        processed = True
+                        return  # 结束当前迭代，进入下一轮
                     else:
-                        # 累积 action 内容
-                        if len(buffer) > 15:
-                            action_content += buffer[:-15]
-                            buffer = buffer[-15:]
+                        # 缓冲直到看到结束标签
                         break
                         
                 elif current_mode == "answer":
