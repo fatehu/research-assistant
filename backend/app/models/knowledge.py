@@ -74,7 +74,7 @@ class KnowledgeBase(Base):
     
     # 关系
     user = relationship("User", back_populates="knowledge_bases")
-    documents = relationship("Document", back_populates="knowledge_base", cascade="all, delete-orphan")
+    documents = relationship("Document", back_populates="knowledge_base", cascade="all, delete-orphan", passive_deletes=True)
     
     def __repr__(self):
         return f"<KnowledgeBase {self.id}: {self.name}>"
@@ -129,7 +129,7 @@ class Document(Base):
     
     # 关系
     knowledge_base = relationship("KnowledgeBase", back_populates="documents")
-    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan", passive_deletes=True)
     
     def __repr__(self):
         return f"<Document {self.id}: {self.original_filename}>"

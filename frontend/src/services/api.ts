@@ -173,6 +173,11 @@ export interface SearchResult {
   score: number
   chunk_index: number
   metadata: Record<string, unknown>
+  // [Fix 12] 层级检索新增字段
+  chunk_level?: string          // 分块层级: paragraph / section / document
+  section_type?: string         // 章节类型: abstract / methodology / results 等
+  section_title?: string        // 章节标题
+  parent_context?: string       // 父级 chunk 的内容摘要（前 300 字符）
 }
 
 export interface SearchResponse {
@@ -470,19 +475,26 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 搜索
+  // 搜索（支持层级过滤 + 父级上下文回溯）
   search: async (
     query: string,
     knowledgeBaseIds?: number[],
     topK = 5,
     scoreThreshold = 0.5,
-    includeShared = false
+    includeShared = false,
+    chunkLevel: string = 'paragraph',
+    sectionType?: string,
+    includeParentContext = false,
   ): Promise<SearchResponse> => {
     const response = await api.post('/api/knowledge/search', {
       query,
       knowledge_base_ids: knowledgeBaseIds,
       top_k: topK,
       score_threshold: scoreThreshold,
+      // [Fix 12] 层级检索参数
+      chunk_level: chunkLevel,
+      section_type: sectionType || undefined,
+      include_parent_context: includeParentContext,
     }, {
       params: { include_shared: includeShared }
     })
@@ -1829,6 +1841,9 @@ export interface DocumentAnalysis {
     avg_sentence_length: number
     section_count: number
   }
+  // [Fix 7] 新增字段
+  estimated_chunks?: number      // 预估分块数量
+  language?: string              // 检测到的语言 (zh / en)
 }
 
 export interface StrategyComparison {

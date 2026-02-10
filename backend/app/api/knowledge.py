@@ -292,13 +292,13 @@ async def update_knowledge_base(
     
     update_data = data.model_dump(exclude_unset=True)
     
-    # 特殊处理 chunking_config
+    # Handle chunking_config specially
     if "chunking_config" in update_data:
         config = update_data.pop("chunking_config")
-        # 确保 metadata_ 是字典
+        # Ensure metadata_ is a dict
         current_metadata = dict(kb.metadata_) if kb.metadata_ else {}
         current_metadata["chunking_config"] = config
-        # 赋值新字典以触发 SQLAlchemy 更新
+        # Assign new dict to trigger SQLAlchemy update
         kb.metadata_ = current_metadata
     
     for key, value in update_data.items():
@@ -615,10 +615,47 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 db.add(chunk)
                 smart_id_map[chunk_data["id"]] = chunk
             
-            await db.flush() # 生成 ID
+            # [Fix 12 Correction] 同时也保存 context_chunks (section/document)，但不生成 embedding
+            # 这样可以在 search 时通过 parent_id 回溯到父级 chunk
+            for chunk_data in context_chunks:
+                meta = chunk_data["metadata"]
+                # 为 context chunk 分配 index，接在 primary 后面
+                # 注意：这里 index 可能不连续，但对检索影响不大
+                
+                chunk = DocumentChunk(
+                    document_id=doc.id,
+                    knowledge_base_id=doc.knowledge_base_id,
+                    content=chunk_data["content"],
+                    chunk_index=-1, # context chunk index 设为 -1 或其他标记
+                    start_char=chunk_data["start_char"],
+                    end_char=chunk_data["end_char"],
+                    embedding=None, # 不生成 embedding
+                    embedding_model=embedding_svc._get_model(),
+                    char_count=len(chunk_data["content"]),
+                    token_count=processor.estimate_tokens(chunk_data["content"]),
+                    
+                    # 智能分块字段
+                    chunk_level=meta.get("level", "section"),
+                    section_type=meta.get("section_type"),
+                    section_title=meta.get("section_title"),
+                    has_citations=meta.get("has_citations", False),
+                    metadata_={
+                        "position_ratio": meta.get("position_ratio"),
+                        "keywords": meta.get("keywords"),
+                        "original_id": chunk_data["id"] 
+                    }
+                )
+                db.add(chunk)
+                smart_id_map[chunk_data["id"]] = chunk
+            
+            await db.flush() # Generate IDs
             
             # 更新父子关系
-            for chunk_data in chunks_to_save:
+            await db.flush() # Generate IDs
+            
+            # 更新父子关系 (现在 context chunks 也在 smart_id_map 中了，可以链接)
+            all_chunks = primary_chunks + context_chunks
+            for chunk_data in all_chunks:
                 smart_id = chunk_data["id"]
                 parent_smart_id = chunk_data["metadata"].get("parent_id")
                 

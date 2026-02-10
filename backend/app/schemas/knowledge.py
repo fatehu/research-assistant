@@ -129,7 +129,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     knowledge_base_ids: Optional[List[int]] = None  # 不指定则搜索所有知识库
     top_k: int = Field(default=5, ge=1, le=20)
-    score_threshold: float = Field(default=0.2, ge=0, le=1)
+    score_threshold: float = Field(default=0.05, ge=0, le=1)
     # [Fix 12] 新增字段：chunk_level 过滤
     chunk_level: Optional[str] = Field(
         default="paragraph",

@@ -443,31 +443,38 @@ export default function SmartChunkingPage() {
                   <Form layout="vertical" className="text-slate-300">
                     {/* 策略选择 */}
                     <Form.Item label={<Text className="text-slate-300">分块策略</Text>}>
-                      <Radio.Group
+                      <Select
                         value={customConfig.strategy}
-                        onChange={(e) =>
-                          setCustomConfig({ ...customConfig, strategy: e.target.value })
+                        onChange={(v) =>
+                          setCustomConfig({ ...customConfig, strategy: v })
                         }
                         className="w-full"
-                      >
-                        <Space direction="vertical" className="w-full">
-                          {Object.entries(STRATEGY_NAMES).map(([key, name]) => (
-                            <Radio key={key} value={key} className="text-slate-300">
-                              <span className="text-slate-200">{name}</span>
-                            </Radio>
-                          ))}
-                        </Space>
-                      </Radio.Group>
+                        options={Object.entries(STRATEGY_NAMES).map(([key, name]) => ({
+                          value: key,
+                          label: (
+                            <span>
+                              {name}
+                              <Text className="text-slate-500 ml-2 text-xs">
+                                {key === 'fixed' && '— 按固定字符数切分，速度最快'}
+                                {key === 'semantic' && '— 基于语义相似度自动切分'}
+                                {key === 'hierarchical' && '— 多层级结构（段落/章节/文档）'}
+                                {key === 'academic' && '— 识别论文 Abstract/Method/Results 等'}
+                                {key === 'hybrid' && '— 自动选择最佳策略（推荐）'}
+                              </Text>
+                            </span>
+                          ),
+                        }))}
+                      />
                     </Form.Item>
 
-                    <Divider className="border-slate-700" />
+                    <Divider className="border-slate-700">基础分块参数</Divider>
 
                     {/* 基础参数 */}
                     <Row gutter={16}>
                       <Col span={12}>
                         <Form.Item
                           label={
-                            <Tooltip title="每个分块的基础大小（字符数）">
+                            <Tooltip title="每个分块的目标大小（字符数）。较小的值产生更精细的分块，适合精确检索；较大的值保留更多上下文。">
                               <Text className="text-slate-300">
                                 基础块大小 <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
@@ -482,14 +489,15 @@ export default function SmartChunkingPage() {
                             onChange={(v) =>
                               setCustomConfig({ ...customConfig, base_chunk_size: v })
                             }
-                            marks={{ 100: '100', 500: '500', 1000: '1000', 2000: '2000' }}
+                            marks={{ 100: '100', 500: '500', 1000: '1K', 2000: '2K' }}
                           />
+                          <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_size} 字符</Text>
                         </Form.Item>
                       </Col>
                       <Col span={12}>
                         <Form.Item
                           label={
-                            <Tooltip title="相邻分块之间的重叠字符数">
+                            <Tooltip title="相邻分块之间的重叠字符数。重叠可以避免关键信息被截断，但会增加总分块数。">
                               <Text className="text-slate-300">
                                 块重叠大小 <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
@@ -506,20 +514,22 @@ export default function SmartChunkingPage() {
                             }
                             marks={{ 0: '0', 50: '50', 150: '150', 300: '300' }}
                           />
+                          <Text className="text-slate-500 text-xs">当前: {customConfig.chunk_overlap} 字符</Text>
                         </Form.Item>
                       </Col>
                     </Row>
 
                     {/* 语义分块参数 */}
                     {(customConfig.strategy === ChunkingStrategy.SEMANTIC ||
-                      customConfig.strategy === ChunkingStrategy.HYBRID) && (
+                      customConfig.strategy === ChunkingStrategy.HYBRID ||
+                      customConfig.strategy === ChunkingStrategy.ACADEMIC) && (
                       <>
                         <Divider className="border-slate-700">语义分块参数</Divider>
                         <Form.Item
                           label={
-                            <Tooltip title="低于此阈值的相似度被认为是语义边界">
+                            <Tooltip title="相邻文本窗口的余弦相似度低于此阈值时，判定为语义边界。值越低越敏感（产生更多分块），值越高越宽松。">
                               <Text className="text-slate-300">
-                                语义阈值 <QuestionCircleOutlined className="text-slate-500" />
+                                语义相似度阈值 <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
                             </Tooltip>
                           }
@@ -532,17 +542,73 @@ export default function SmartChunkingPage() {
                             onChange={(v) =>
                               setCustomConfig({ ...customConfig, semantic_threshold: v })
                             }
-                            marks={{ 0.5: '0.5', 0.75: '0.75', 0.95: '0.95' }}
+                            marks={{ 0.5: '敏感', 0.65: '0.65', 0.75: '默认', 0.85: '0.85', 0.95: '宽松' }}
                           />
                         </Form.Item>
+                        <Row gutter={16}>
+                          <Col span={12}>
+                            <Form.Item
+                              label={
+                                <Tooltip title="语义分块的最小字符数。小于此值的块会被合并到相邻块中，避免产生过碎的分块。">
+                                  <Text className="text-slate-300">
+                                    最小语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                  </Text>
+                                </Tooltip>
+                              }
+                            >
+                              <Slider
+                                min={50}
+                                max={500}
+                                step={25}
+                                value={customConfig.min_semantic_chunk}
+                                onChange={(v) =>
+                                  setCustomConfig({ ...customConfig, min_semantic_chunk: v })
+                                }
+                                marks={{ 50: '50', 100: '100', 250: '250', 500: '500' }}
+                              />
+                              <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_chunk} 字符</Text>
+                            </Form.Item>
+                          </Col>
+                          <Col span={12}>
+                            <Form.Item
+                              label={
+                                <Tooltip title="语义分块的最大字符数。超过此值的块会被强制二次切分，防止单块过大影响检索精度。">
+                                  <Text className="text-slate-300">
+                                    最大语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                  </Text>
+                                </Tooltip>
+                              }
+                            >
+                              <Slider
+                                min={500}
+                                max={3000}
+                                step={100}
+                                value={customConfig.max_semantic_chunk}
+                                onChange={(v) =>
+                                  setCustomConfig({ ...customConfig, max_semantic_chunk: v })
+                                }
+                                marks={{ 500: '500', 1000: '1K', 1500: '默认', 2000: '2K', 3000: '3K' }}
+                              />
+                              <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_chunk} 字符</Text>
+                            </Form.Item>
+                          </Col>
+                        </Row>
                       </>
                     )}
 
-                    {/* 层级分块参数 */}
-                    <Divider className="border-slate-700">层级与学术参数</Divider>
+                    {/* 层级与学术参数 */}
+                    <Divider className="border-slate-700">高级选项</Divider>
                     <Row gutter={16}>
-                      <Col span={12}>
-                        <Form.Item label={<Text className="text-slate-300">启用层级分块</Text>}>
+                      <Col span={8}>
+                        <Form.Item
+                          label={
+                            <Tooltip title="生成段落→章节→文档的多级分块结构，检索时可回溯上级获取更多上下文。">
+                              <Text className="text-slate-300">
+                                层级分块 <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
                           <Switch
                             checked={customConfig.enable_hierarchical}
                             onChange={(v) =>
@@ -551,8 +617,16 @@ export default function SmartChunkingPage() {
                           />
                         </Form.Item>
                       </Col>
-                      <Col span={12}>
-                        <Form.Item label={<Text className="text-slate-300">检测学术结构</Text>}>
+                      <Col span={8}>
+                        <Form.Item
+                          label={
+                            <Tooltip title="自动识别 Abstract、Introduction、Methods、Results、Conclusion 等学术论文章节。">
+                              <Text className="text-slate-300">
+                                学术结构 <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
                           <Switch
                             checked={customConfig.detect_academic_structure}
                             onChange={(v) =>
@@ -561,16 +635,50 @@ export default function SmartChunkingPage() {
                           />
                         </Form.Item>
                       </Col>
+                      <Col span={8}>
+                        <Form.Item
+                          label={
+                            <Tooltip title="当分块边界落在引用 [1] 附近时，自动扩展上下文以保留完整的引用语境。">
+                              <Text className="text-slate-300">
+                                引用保护 <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
+                          <Switch
+                            checked={customConfig.preserve_citations}
+                            onChange={(v) =>
+                              setCustomConfig({ ...customConfig, preserve_citations: v })
+                            }
+                          />
+                        </Form.Item>
+                      </Col>
                     </Row>
 
-                    <Form.Item label={<Text className="text-slate-300">保留引用上下文</Text>}>
-                      <Switch
-                        checked={customConfig.preserve_citations}
-                        onChange={(v) =>
-                          setCustomConfig({ ...customConfig, preserve_citations: v })
+                    {customConfig.enable_hierarchical && (
+                      <Form.Item
+                        label={
+                          <Tooltip title="选择需要生成的层级。段落级用于精确检索，章节级用于上下文回溯，文档级用于全局摘要。">
+                            <Text className="text-slate-300">
+                              层级选择 <QuestionCircleOutlined className="text-slate-500" />
+                            </Text>
+                          </Tooltip>
                         }
-                      />
-                    </Form.Item>
+                      >
+                        <Select
+                          mode="multiple"
+                          value={customConfig.hierarchy_levels}
+                          onChange={(v) =>
+                            setCustomConfig({ ...customConfig, hierarchy_levels: v })
+                          }
+                          options={Object.entries(LEVEL_NAMES).map(([key, name]) => ({
+                            value: key,
+                            label: name,
+                          }))}
+                          placeholder="选择需要生成的层级"
+                        />
+                      </Form.Item>
+                    )}
                   </Form>
                 </TabPane>
               </Tabs>
@@ -626,37 +734,50 @@ export default function SmartChunkingPage() {
                   title={<Text className="text-slate-300">文档分析</Text>}
                 >
                   <div className="space-y-2">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <Text className="text-slate-400">文档类型:</Text>
                       <Tag color={analysisResult.is_academic ? 'orange' : 'blue'}>
                         {analysisResult.is_academic ? '学术文档' : '通用文档'}
                       </Tag>
                       {analysisResult.has_citations && <Tag color="purple">含引用</Tag>}
+                      {analysisResult.language && (
+                        <Tag color="cyan">{analysisResult.language === 'zh' ? '中文' : '英文'}</Tag>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <Text className="text-slate-400">推荐策略:</Text>
                       <Tag color="green">{STRATEGY_NAMES[analysisResult.recommended_strategy]}</Tag>
+                      {analysisResult.estimated_chunks != null && (
+                        <Tag color="geekblue">预估 {analysisResult.estimated_chunks} 块</Tag>
+                      )}
                     </div>
                     <Text className="text-slate-500 text-sm">{analysisResult.recommended_reason}</Text>
                     
                     <Divider className="border-slate-700 my-2" />
                     
                     <Row gutter={8}>
-                      <Col span={8}>
+                      <Col span={6}>
                         <Statistic
                           title={<Text className="text-slate-500 text-xs">字符数</Text>}
                           value={analysisResult.document_stats.total_chars}
                           valueStyle={{ fontSize: 14, color: '#94a3b8' }}
                         />
                       </Col>
-                      <Col span={8}>
+                      <Col span={6}>
                         <Statistic
                           title={<Text className="text-slate-500 text-xs">句子数</Text>}
                           value={analysisResult.document_stats.total_sentences}
                           valueStyle={{ fontSize: 14, color: '#94a3b8' }}
                         />
                       </Col>
-                      <Col span={8}>
+                      <Col span={6}>
+                        <Statistic
+                          title={<Text className="text-slate-500 text-xs">段落数</Text>}
+                          value={analysisResult.document_stats.total_paragraphs}
+                          valueStyle={{ fontSize: 14, color: '#94a3b8' }}
+                        />
+                      </Col>
+                      <Col span={6}>
                         <Statistic
                           title={<Text className="text-slate-500 text-xs">章节数</Text>}
                           value={analysisResult.document_stats.section_count}
@@ -664,6 +785,45 @@ export default function SmartChunkingPage() {
                         />
                       </Col>
                     </Row>
+
+                    {/* 检测到的章节结构可视化 */}
+                    {analysisResult.detected_sections && analysisResult.detected_sections.length > 0 && (
+                      <>
+                        <Divider className="border-slate-700 my-2" />
+                        <Text className="text-slate-400 text-xs block mb-2">检测到的章节结构:</Text>
+                        <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+                          {analysisResult.detected_sections.map((section, idx) => (
+                            <div
+                              key={idx}
+                              className="flex items-center gap-2 px-2 py-1.5 rounded bg-slate-800/80 border border-slate-700/50"
+                            >
+                              <Badge
+                                color={
+                                  section.type === 'abstract' ? '#f59e0b' :
+                                  section.type === 'methodology' ? '#3b82f6' :
+                                  section.type === 'results' ? '#10b981' :
+                                  section.type === 'conclusion' ? '#8b5cf6' :
+                                  section.type === 'references' ? '#ef4444' :
+                                  '#64748b'
+                                }
+                              />
+                              <Text className="text-slate-300 text-xs flex-1 truncate" title={section.title}>
+                                {section.title}
+                              </Text>
+                              <Tag
+                                className="text-xs border-slate-600 bg-slate-700/50"
+                                style={{ margin: 0, fontSize: 10 }}
+                              >
+                                {section.type}
+                              </Tag>
+                              <Text className="text-slate-500 text-xs whitespace-nowrap">
+                                {section.length} 字符
+                              </Text>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 </Card>
               )}

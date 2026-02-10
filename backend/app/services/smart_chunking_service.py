@@ -616,6 +616,11 @@ class HierarchicalChunker:
         for i, line in enumerate(lines):
             stripped = line.strip()
 
+            # [Fix 12] 先过滤 OCR 噪声，再判断标题
+            if self._is_ocr_noise(stripped):
+                current_pos += len(line) + 1
+                continue
+
             # [Fix 6] 收紧编号标题正则，要求更典型的学术编号格式
             is_heading = (
                 stripped.startswith('#') or
@@ -660,38 +665,154 @@ class HierarchicalChunker:
 
         return boundaries
 
+    @staticmethod
+    def _is_ocr_noise(line: str) -> bool:
+        """
+        [Fix 12] 检测 OCR 噪声行，避免将图表/表格 OCR 文本误识别为章节标题。
+
+        过滤规则:
+        1. 太短 (<5 字符) 或太长 (>200 字符) 的行不适合做标题
+        2. 匹配 Figure/Table 标注模式
+        3. 非字母比例过高（含大量数字、符号 → 可能是 OCR 噪声）
+        4. 连续大写缩写过多（如 "SAM VITDET 80M local attentionConv..."）
+        5. 包含典型 OCR 噪声模式（如 "......" 省略号、连续拼接单词）
+        """
+        if not line:
+            return False
+
+        # 规则 1: 长度过滤（Markdown # 标题不受此限）
+        if not line.startswith('#'):
+            if len(line) < 5 or len(line) > 200:
+                return True
+
+        # 规则 2: Figure/Table 标注
+        if re.match(
+            r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*[\d.:]+',
+            line, re.IGNORECASE
+        ):
+            return True
+
+        # 规则 3: 非字母/汉字比例过高 → OCR 噪声
+        alpha_chars = sum(1 for c in line if c.isalpha() or '\u4e00' <= c <= '\u9fff')
+        if len(line) > 10 and alpha_chars / len(line) < 0.4:
+            return True
+
+        # 规则 4: 连续大写缩写词过多（>3 个连续全大写单词，如 "SAM VITDET VIT MOE"）
+        words = line.split()
+        consecutive_upper = 0
+        max_consecutive_upper = 0
+        for w in words:
+            if w.isupper() and len(w) >= 2:
+                consecutive_upper += 1
+                max_consecutive_upper = max(max_consecutive_upper, consecutive_upper)
+            else:
+                consecutive_upper = 0
+        if max_consecutive_upper > 3:
+            return True
+
+        # 规则 5: 包含典型 OCR 噪声特征
+        # - 连续省略号
+        if '......' in line or '…' in line:
+            return True
+        # - 单词拼接（如 "attentionConv", "patchesvision", "tokensn/16"）
+        camel_or_concat = re.findall(r'[a-z][A-Z][a-z]', line)
+        if len(camel_or_concat) >= 3:
+            return True
+        # - 过多斜杠/管道分隔（如 "n/16 DeepEncoderDeepSeek -3B (MOE -A570M)"）
+        if line.count('/') + line.count('|') >= 4:
+            return True
+
+        return False
+
     def _merge_to_sections(
         self,
         base_chunks: List[Tuple[str, int, int]],
-        chunks_per_section: int = 4
+        max_section_chars: int = 3000
     ) -> List[SmartChunk]:
-        """将基础块合并为章节"""
+        """
+        [Fix 12] 将基础块合并为章节 — 内容感知版本。
+        不再盲目每 N 块一组，而是:
+        1. 优先在自然段落/空行边界处切分
+        2. 尝试从首块中提取标题作为 section_title
+        3. 控制最大章节大小
+        """
+        if not base_chunks:
+            return []
+
         sections = []
+        current_group: List[Tuple[str, int, int]] = []
+        current_size = 0
 
-        for i in range(0, len(base_chunks), chunks_per_section):
-            group = base_chunks[i:i + chunks_per_section]
+        for chunk in base_chunks:
+            chunk_text, chunk_start, chunk_end = chunk
+            chunk_len = len(chunk_text)
 
-            content = '\n\n'.join(chunk[0] for chunk in group)
-            start = group[0][1]
-            end = group[-1][2]
+            # 检测是否应该开启新章节
+            should_break = False
 
-            chunk_id = self._generate_chunk_id(content, start)
+            if current_group:
+                # 条件 1: 累积大小超过上限
+                if current_size + chunk_len > max_section_chars:
+                    should_break = True
 
-            metadata = ChunkMetadata(
-                level=ChunkLevel.SECTION,
-                has_citations=AcademicStructureDetector.has_citations(content)
-            )
+                # 条件 2: 当前块以明显的段落标题开头（编号、Markdown标题等）
+                first_line = chunk_text.split('\n')[0].strip()
+                if (first_line.startswith('#') or
+                    re.match(r'^(\d+\.)+\s+[A-Z\u4e00-\u9fff]', first_line) or
+                    re.match(r'^第[一二三四五六七八九十百]+[章节部分]\s', first_line)):
+                    should_break = True
 
-            chunk = SmartChunk(
-                id=chunk_id,
-                content=content,
-                start_char=start,
-                end_char=end,
-                metadata=metadata
-            )
-            sections.append(chunk)
+                # 条件 3: 前一块末尾和当前块开头存在双换行（段落分隔）
+                prev_text = current_group[-1][0]
+                if prev_text.rstrip().endswith('\n') or chunk_text.lstrip().startswith('\n'):
+                    # 如果已经积累了足够的内容，在段落边界切分
+                    if current_size >= max_section_chars * 0.5:
+                        should_break = True
+
+            if should_break and current_group:
+                sections.append(self._build_section_chunk(current_group))
+                current_group = []
+                current_size = 0
+
+            current_group.append(chunk)
+            current_size += chunk_len
+
+        # 处理最后一组
+        if current_group:
+            sections.append(self._build_section_chunk(current_group))
 
         return sections
+
+    def _build_section_chunk(
+        self,
+        group: List[Tuple[str, int, int]]
+    ) -> SmartChunk:
+        """[Fix 12] 从一组基础块构建章节级 SmartChunk"""
+        content = '\n\n'.join(chunk[0] for chunk in group)
+        start = group[0][1]
+        end = group[-1][2]
+
+        # 尝试从第一个块提取标题
+        first_text = group[0][0]
+        section_title = AcademicStructureDetector.extract_section_title(first_text)
+        section_type = AcademicStructureDetector.detect_section_type(first_text)
+
+        chunk_id = self._generate_chunk_id(content, start)
+
+        metadata = ChunkMetadata(
+            level=ChunkLevel.SECTION,
+            section_type=section_type,
+            section_title=section_title,
+            has_citations=AcademicStructureDetector.has_citations(content)
+        )
+
+        return SmartChunk(
+            id=chunk_id,
+            content=content,
+            start_char=start,
+            end_char=end,
+            metadata=metadata
+        )
 
     def _create_document_chunk(self, text: str) -> SmartChunk:
         """创建文档级分块（摘要）"""
@@ -1165,10 +1286,8 @@ class SmartChunkingService:
         try:
             sentences = self._split_to_sentences(text)
             raw_chunks = await self.semantic_chunker.chunk_by_semantics(text, sentences)
-        except EmbeddingLimitExceeded:
-            raise
-        except Exception as e:
-            logger.warning(f"层级分块中语义分块失败，使用固定分块: {e}")
+        except (EmbeddingLimitExceeded, Exception) as e:
+            logger.warning(f"层级分块中语义分块受限或失败，使用固定分块: {e}")
             from app.services.document_service import TextSplitter
             splitter = TextSplitter(chunk_size=config.base_chunk_size, chunk_overlap=config.chunk_overlap)
             raw_chunks = splitter.split_text(text)
@@ -1230,10 +1349,8 @@ class SmartChunkingService:
                 sentences = self._split_to_sentences(part_content)
                 try:
                     section_chunks = await self.semantic_chunker.chunk_by_semantics(part_content, sentences)
-                except EmbeddingLimitExceeded:
-                    raise
-                except Exception as e:
-                    logger.warning(f"章节内语义分块失败，使用固定分块: {e}")
+                except (EmbeddingLimitExceeded, Exception) as e:
+                    logger.warning(f"章节内语义分块受限或失败，使用固定分块: {e}")
                     from app.services.document_service import TextSplitter
                     splitter = TextSplitter(chunk_size=config.base_chunk_size, chunk_overlap=config.chunk_overlap)
                     section_chunks = splitter.split_text(part_content)
@@ -1309,7 +1426,127 @@ class SmartChunkingService:
         text = re.sub(r'\n{3,}', '\n\n', text)
         # 移除多余空格
         text = re.sub(r' {2,}', ' ', text)
+
+        # [Fix 13] 清除 PDF 提取中的图表/表格内部 OCR 噪声块
+        text = self._strip_figure_noise_blocks(text)
+
         return text.strip()
+
+    @staticmethod
+    def _strip_figure_noise_blocks(text: str) -> str:
+        """
+        [Fix 13] 检测并移除 pypdf 提取的图表/表格内部噪声文本块。
+
+        pypdf 从 PDF 中提取文本时，会把 Figure/Table 内部的标注文字
+        （如架构图里的 "SAM", "VITDET", "80M", "Conv 16x" 等）
+        提取为一连串短碎片行，混入正文。这些噪声块的特征:
+        - 连续多行(≥3)很短的行（<60 字符）
+        - 不以句号等标点结尾（不是正常句子）
+        - 不匹配章节标题模式
+        - 通常紧跟在 "Figure N|..." 或 "Table N|..." 标注前面
+
+        本方法检测这类噪声块并移除，保留 Figure/Table 的 caption 正文。
+        """
+        lines = text.split('\n')
+        cleaned_lines = []
+        i = 0
+
+        while i < len(lines):
+            # 检测潜在噪声块的起始
+            if SmartChunkingService._is_fragment_line(lines[i]):
+                # 向前探测连续碎片行
+                block_start = i
+                while i < len(lines) and SmartChunkingService._is_fragment_line(lines[i]):
+                    i += 1
+
+                block_length = i - block_start
+
+                # 只有连续 3+ 行碎片才认为是噪声块
+                if block_length >= 3:
+                    # 检查这个块后面是否紧跟 Figure/Table caption（强信号）
+                    next_line = lines[i].strip() if i < len(lines) else ""
+                    is_before_caption = bool(re.match(
+                        r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*\d',
+                        next_line, re.IGNORECASE
+                    ))
+
+                    # 进一步验证：计算这个块的"噪声密度"
+                    block_lines = lines[block_start:i]
+                    avg_len = sum(len(l.strip()) for l in block_lines) / max(block_length, 1)
+                    has_sentence = any(
+                        l.strip().endswith(('.', '。', '!', '！', '?', '？'))
+                        and len(l.strip()) > 30
+                        for l in block_lines
+                    )
+
+                    # 判定为噪声块的条件:
+                    # (a) 紧跟在 figure/table caption 前，或
+                    # (b) 平均行长 < 40 且没有完整句子
+                    if is_before_caption or (avg_len < 40 and not has_sentence):
+                        logger.debug(
+                            f"[Fix 13] 移除图表噪声块: {block_length} 行, "
+                            f"avg_len={avg_len:.0f}, 内容='{block_lines[0].strip()[:50]}...'"
+                        )
+                        # 跳过这个噪声块，不加入 cleaned_lines
+                        continue
+                    else:
+                        # 不满足噪声条件，保留原始行
+                        cleaned_lines.extend(block_lines)
+                        continue
+                else:
+                    # 只有 1-2 行碎片，保留（可能是正常短行）
+                    cleaned_lines.extend(lines[block_start:i])
+                    continue
+
+            cleaned_lines.append(lines[i])
+            i += 1
+
+        return '\n'.join(cleaned_lines)
+
+    @staticmethod
+    def _is_fragment_line(line: str) -> bool:
+        """
+        [Fix 13] 判断一行是否为图表碎片行（pypdf 从图中提取的短文字标签）。
+
+        碎片行特征：短、非句子、非标题、含大量缩写/数字/特殊符号。
+        """
+        stripped = line.strip()
+        if not stripped:
+            return False
+
+        # 太长的行不是碎片
+        if len(stripped) > 60:
+            return False
+
+        # 是正常的章节标题，不是碎片
+        if stripped.startswith('#'):
+            return False
+        if re.match(r'^(\d+\.)+\s+[A-Z\u4e00-\u9fff]', stripped):
+            return False
+        if re.match(r'^第[一二三四五六七八九十百]+[章节部分]', stripped):
+            return False
+
+        # Figure/Table caption 行不是碎片
+        if re.match(r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*\d', stripped, re.IGNORECASE):
+            return False
+
+        # 以句号结尾且长度合理的行不是碎片
+        if len(stripped) > 30 and stripped[-1] in '.。!！?？':
+            return False
+
+        # 以下特征判定为碎片:
+        # 1. 非常短（< 20 字符）
+        if len(stripped) < 20:
+            return True
+
+        # 2. 不以任何标点结尾
+        if stripped[-1] not in '.。,，;；:：!！?？)）]】"\'':
+            # 且字母比例低于 60%
+            alpha_chars = sum(1 for c in stripped if c.isalpha() or '\u4e00' <= c <= '\u9fff')
+            if alpha_chars / max(len(stripped), 1) < 0.6:
+                return True
+
+        return False
 
     def _split_to_sentences(self, text: str) -> List[str]:
         """将文本分割为句子"""

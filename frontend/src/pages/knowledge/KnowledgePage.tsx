@@ -19,6 +19,10 @@ import {
   Statistic,
   Row,
   Col,
+  Select,
+  Switch,
+  Collapse,
+  Badge,
 } from 'antd'
 import {
   PlusOutlined,
@@ -43,6 +47,9 @@ import {
   ShareAltOutlined,
   UserOutlined,
   SettingOutlined,
+  FilterOutlined,
+  ExpandAltOutlined,
+  NodeIndexOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
@@ -244,8 +251,29 @@ const SharedKnowledgeBaseCard = ({
   )
 }
 
-// 搜索结果卡片
+// 层级标签颜色映射
+const CHUNK_LEVEL_CONFIG: Record<string, { color: string; label: string }> = {
+  paragraph: { color: 'blue', label: '段落' },
+  section: { color: 'orange', label: '章节' },
+  document: { color: 'purple', label: '文档' },
+}
+
+// 章节类型标签颜色映射
+const SECTION_TYPE_COLORS: Record<string, string> = {
+  abstract: 'gold',
+  introduction: 'cyan',
+  methodology: 'geekblue',
+  results: 'green',
+  discussion: 'lime',
+  conclusion: 'purple',
+  references: 'red',
+}
+
+// 搜索结果卡片（增强版：支持层级标签 + 章节标题 + 父级上下文）
 const SearchResultCard = ({ result, index }: { result: SearchResult; index: number }) => {
+  const [showParent, setShowParent] = useState(false)
+  const levelConfig = result.chunk_level ? CHUNK_LEVEL_CONFIG[result.chunk_level] : null
+
   return (
     <motion.div
       initial={{ opacity: 0, x: -20 }}
@@ -263,17 +291,65 @@ const SearchResultCard = ({ result, index }: { result: SearchResult; index: numb
             </div>
           </div>
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-2">
+            {/* 标签行：知识库 + 文档 + 层级 + 章节类型 */}
+            <div className="flex items-center gap-2 mb-2 flex-wrap">
               <Tag color="blue" className="text-xs">{result.knowledge_base_name}</Tag>
               <span className="text-slate-500 text-xs">{result.document_name}</span>
               <span className="text-slate-600 text-xs">#{result.chunk_index + 1}</span>
+              {/* 分块层级标签 */}
+              {levelConfig && (
+                <Tag color={levelConfig.color} className="text-xs" style={{ margin: 0 }}>
+                  {levelConfig.label}
+                </Tag>
+              )}
+              {/* 章节类型标签 */}
+              {result.section_type && (
+                <Tag
+                  color={SECTION_TYPE_COLORS[result.section_type] || 'default'}
+                  className="text-xs"
+                  style={{ margin: 0 }}
+                >
+                  {result.section_type}
+                </Tag>
+              )}
             </div>
+            {/* 章节标题 */}
+            {result.section_title && (
+              <div className="mb-1.5">
+                <Text className="text-slate-400 text-xs">
+                  <NodeIndexOutlined className="mr-1" />
+                  {result.section_title}
+                </Text>
+              </div>
+            )}
+            {/* 内容 */}
             <Paragraph
               className="text-slate-300 mb-0"
               ellipsis={{ rows: 3, expandable: true, symbol: '展开' }}
             >
               {result.content}
             </Paragraph>
+            {/* 父级上下文（可展开） */}
+            {result.parent_context && (
+              <div className="mt-2">
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<ExpandAltOutlined />}
+                  onClick={() => setShowParent(!showParent)}
+                  className="text-slate-500 hover:text-blue-400 px-0 text-xs"
+                >
+                  {showParent ? '收起上下文' : '查看父级上下文'}
+                </Button>
+                {showParent && (
+                  <div className="mt-1.5 p-2.5 rounded bg-slate-900/60 border border-slate-700/50">
+                    <Text className="text-slate-400 text-xs leading-relaxed">
+                      {result.parent_context}
+                    </Text>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </Card>
@@ -317,6 +393,11 @@ const KnowledgePage = () => {
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'kb' | 'doc'; id: number } | null>(null)
   const [searchInput, setSearchInput] = useState('')
   const [form] = Form.useForm()
+
+  // 高级搜索过滤器状态
+  const [searchChunkLevel, setSearchChunkLevel] = useState<string>('paragraph')
+  const [searchSectionType, setSearchSectionType] = useState<string | undefined>(undefined)
+  const [searchIncludeParent, setSearchIncludeParent] = useState(false)
 
   // 共享知识库状态
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
@@ -405,14 +486,21 @@ const KnowledgePage = () => {
     }
   }
 
-  // 执行搜索
+  // 执行搜索（支持高级过滤）
   const handleSearch = async () => {
     if (!searchInput.trim()) return
 
     try {
       // 如果当前在知识库详情页，限制搜索范围
       const kbIds = currentKnowledgeBase ? [currentKnowledgeBase.id] : undefined
-      await search(searchInput, kbIds)
+      await search(
+        searchInput,
+        kbIds,
+        undefined,               // includeShared 使用默认值
+        searchChunkLevel,         // chunk_level 过滤
+        searchSectionType,        // section_type 过滤
+        searchIncludeParent,      // 是否返回父级上下文
+      )
     } catch (error) {
       message.error('搜索失败')
     }
@@ -758,7 +846,7 @@ const KnowledgePage = () => {
         </Form>
       </Modal>
 
-      {/* 搜索弹窗 */}
+      {/* 搜索弹窗（增强版：含高级过滤器） */}
       <Modal
         title="向量搜索"
         open={searchModalVisible}
@@ -768,7 +856,7 @@ const KnowledgePage = () => {
           setSearchInput('')
         }}
         footer={null}
-        width={700}
+        width={720}
       >
         <div className="mb-4">
           <Input.Search
@@ -781,6 +869,74 @@ const KnowledgePage = () => {
             size="large"
           />
         </div>
+
+        {/* 高级过滤面板 */}
+        <Collapse
+          ghost
+          className="mb-4"
+          items={[{
+            key: 'advanced',
+            label: (
+              <span className="text-slate-400 text-sm">
+                <FilterOutlined className="mr-1" />
+                高级过滤
+                {(searchChunkLevel !== 'paragraph' || searchSectionType || searchIncludeParent) && (
+                  <Badge dot className="ml-2" />
+                )}
+              </span>
+            ),
+            children: (
+              <Row gutter={[16, 12]}>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">分块层级</div>
+                  <Select
+                    value={searchChunkLevel}
+                    onChange={setSearchChunkLevel}
+                    size="small"
+                    className="w-full"
+                    options={[
+                      { value: 'paragraph', label: '段落级' },
+                      { value: 'section', label: '章节级' },
+                      { value: 'document', label: '文档级' },
+                      { value: 'all', label: '全部层级' },
+                    ]}
+                  />
+                </Col>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">章节类型</div>
+                  <Select
+                    value={searchSectionType}
+                    onChange={setSearchSectionType}
+                    size="small"
+                    className="w-full"
+                    allowClear
+                    placeholder="不限"
+                    options={[
+                      { value: 'abstract', label: '摘要' },
+                      { value: 'introduction', label: '引言' },
+                      { value: 'methodology', label: '方法' },
+                      { value: 'results', label: '结果' },
+                      { value: 'discussion', label: '讨论' },
+                      { value: 'conclusion', label: '结论' },
+                      { value: 'references', label: '参考文献' },
+                    ]}
+                  />
+                </Col>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">父级上下文</div>
+                  <Switch
+                    checked={searchIncludeParent}
+                    onChange={setSearchIncludeParent}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">回溯上级</span>
+                </Col>
+              </Row>
+            ),
+          }]}
+        />
 
         {searchResults.length > 0 && (
           <div className="mb-2 text-slate-400 text-sm">
