@@ -14,6 +14,8 @@ from app.api import (
     admin, mentor, student, invitations, share, announcements
 )
 
+from app.api.chunking import router as chunking_router
+
 
 # 配置日志
 logger.remove()
@@ -89,6 +91,9 @@ app.include_router(student.router, prefix="/api/student", tags=["学生"])
 app.include_router(invitations.router, prefix="/api/invitations", tags=["邀请管理"])
 app.include_router(share.router, prefix="/api/share", tags=["资源共享"])
 app.include_router(announcements.router, prefix="/api/announcements", tags=["公告管理"])
+
+# 注册文本分块路由
+app.include_router(chunking_router, prefix="/api/chunking", tags=["chunking"])
 
 
 @app.get("/")

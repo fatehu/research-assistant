@@ -9,6 +9,7 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
+import time
 
 
 class EmbeddingService:
@@ -119,8 +120,8 @@ class EmbeddingService:
         model = self._get_model()
         
         try:
-            # 阿里云 text-embedding-v2 批量限制为 25 个
-            batch_size = 20 if self.provider == "aliyun" else 20
+            # 阿里云 text-embedding-v2 批量限制为 25 个，但为了避免 tokens 超限，降低到 5
+            batch_size = 5 if self.provider == "aliyun" else 20
             all_embeddings = []
             
             logger.info(f"批量 Embedding: total={len(valid_texts)}, batch_size={batch_size}")
@@ -129,17 +130,27 @@ class EmbeddingService:
                 batch = valid_texts[i:i + batch_size]
                 logger.debug(f"处理批次 {i//batch_size + 1}: {len(batch)} 条文本")
                 
-                response = await client.embeddings.create(
-                    input=batch,
-                    model=model,
-                )
-                batch_embeddings = [d.embedding for d in response.data]
-                all_embeddings.extend(batch_embeddings)
+                try:
+                    response = await client.embeddings.create(
+                        input=batch,
+                        model=model,
+                    )
+                    batch_embeddings = [d.embedding for d in response.data]
+                    all_embeddings.extend(batch_embeddings)
+                except Exception as e:
+                    logger.error(f"批次 {i//batch_size + 1} 失败: {e}")
+                    raise
+                
+                # 简单的速率限制
+                import asyncio
+                await asyncio.sleep(0.1)
             
             logger.info(f"批量 Embedding 完成: {len(all_embeddings)} 个向量")
             return all_embeddings
         except Exception as e:
             logger.error(f"批量 Embedding 失败: {e}")
+            if hasattr(e, 'response'):
+                 logger.error(f"Error Response: {e.response}")
             raise
     
     def cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:

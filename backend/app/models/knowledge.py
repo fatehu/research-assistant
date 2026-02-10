@@ -1,6 +1,7 @@
 """
 知识库模型 - 文档、分片和向量
 使用 pgvector 进行向量存储和相似度搜索
+支持层级分块和语义分块
 """
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON, Float, Boolean, BigInteger, Index
@@ -32,6 +33,13 @@ class DocumentType(str, enum.Enum):
     DOCX = "docx"
 
 
+class ChunkLevel(str, enum.Enum):
+    """分块层级"""
+    PARAGRAPH = "paragraph"    # 段落级（细粒度）
+    SECTION = "section"        # 章节级（中粒度）
+    DOCUMENT = "document"      # 文档级（粗粒度）
+
+
 class KnowledgeBase(Base):
     """知识库表"""
     __tablename__ = "knowledge_bases"
@@ -54,7 +62,7 @@ class KnowledgeBase(Base):
     total_chunks = Column(Integer, default=0)
     total_tokens = Column(BigInteger, default=0)
     
-    # 元数据
+    # 元数据（包含分块策略配置）
     metadata_ = Column("metadata", JSON, default=dict)
     
     # 状态
@@ -70,6 +78,17 @@ class KnowledgeBase(Base):
     
     def __repr__(self):
         return f"<KnowledgeBase {self.id}: {self.name}>"
+    
+    @property
+    def chunking_config(self) -> dict:
+        """获取分块配置"""
+        if self.metadata_ and "chunking_config" in self.metadata_:
+            return self.metadata_["chunking_config"]
+        return {
+            "strategy": "hybrid",
+            "semantic_threshold": 0.75,
+            "enable_hierarchical": True,
+        }
 
 
 class Document(Base):
@@ -118,7 +137,7 @@ class Document(Base):
 
 class DocumentChunk(Base):
     """
-    文档分片表 - 使用 pgvector 存储向量
+    文档分片表 - 使用 pgvector 存储向量，支持层级分块
     
     pgvector 支持的距离函数：
     - <-> : L2 距离 (欧几里得距离)
@@ -126,6 +145,11 @@ class DocumentChunk(Base):
     - <=> : 余弦距离 (1 - 余弦相似度)
     
     对于归一化向量，余弦距离和L2距离等价
+    
+    层级分块说明：
+    - paragraph: 细粒度分块，用于精确检索
+    - section: 章节级分块，用于上下文理解
+    - document: 文档级摘要，用于概览
     """
     __tablename__ = "document_chunks"
     
@@ -146,6 +170,21 @@ class DocumentChunk(Base):
     embedding = Column(Vector(EMBEDDING_DIMENSION), nullable=True)
     embedding_model = Column(String(100), nullable=True)
     
+    # ===== 层级分块相关字段 =====
+    # 分块层级
+    chunk_level = Column(String(20), default=ChunkLevel.PARAGRAPH.value, index=True)
+    
+    # 学术文档结构
+    section_type = Column(String(50), nullable=True, index=True)  # abstract/introduction/methodology等
+    section_title = Column(String(500), nullable=True)            # 章节标题
+    
+    # 层级关系
+    parent_chunk_id = Column(Integer, ForeignKey("document_chunks.id", ondelete="SET NULL"), nullable=True, index=True)
+    
+    # 语义分析
+    has_citations = Column(Boolean, default=False)    # 是否包含引用
+    semantic_score = Column(Float, nullable=True)     # 语义连贯性得分
+    
     # 统计
     token_count = Column(Integer, default=0)
     char_count = Column(Integer, default=0)
@@ -159,12 +198,14 @@ class DocumentChunk(Base):
     # 关系
     document = relationship("Document", back_populates="chunks")
     knowledge_base = relationship("KnowledgeBase")
+    parent_chunk = relationship("DocumentChunk", remote_side=[id], backref="child_chunks")
     
     # 索引
     __table_args__ = (
         Index('idx_chunk_kb_doc', 'knowledge_base_id', 'document_id'),
+        Index('idx_chunk_level_kb', 'chunk_level', 'knowledge_base_id'),
         # HNSW 索引将在迁移脚本中创建，因为需要特殊语法
     )
     
     def __repr__(self):
-        return f"<DocumentChunk {self.id}: doc={self.document_id}, idx={self.chunk_index}>"
+        return f"<DocumentChunk {self.id}: doc={self.document_id}, idx={self.chunk_index}, level={self.chunk_level}>"

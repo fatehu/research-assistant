@@ -22,6 +22,7 @@ class KnowledgeBaseUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
     is_public: Optional[bool] = None
+    chunking_config: Optional[Dict[str, Any]] = None
 
 
 class KnowledgeBaseResponse(BaseModel):
@@ -128,7 +129,20 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     knowledge_base_ids: Optional[List[int]] = None  # 不指定则搜索所有知识库
     top_k: int = Field(default=5, ge=1, le=20)
-    score_threshold: float = Field(default=0.5, ge=0, le=1)
+    score_threshold: float = Field(default=0.2, ge=0, le=1)
+    # [Fix 12] 新增字段：chunk_level 过滤
+    chunk_level: Optional[str] = Field(
+        default="paragraph",
+        description="搜索的分块层级: paragraph/section/document/all"
+    )
+    section_type: Optional[str] = Field(
+        default=None,
+        description="过滤章节类型: abstract/methodology/results 等"
+    )
+    include_parent_context: bool = Field(
+        default=False,
+        description="是否同时返回父级 chunk 作为上下文"
+    )
 
 
 class SearchResultItem(BaseModel):
@@ -142,6 +156,11 @@ class SearchResultItem(BaseModel):
     score: float
     chunk_index: int
     metadata: Dict[str, Any] = {}
+    # [Fix 12] 新增字段：层级信息
+    chunk_level: Optional[str] = None
+    section_type: Optional[str] = None
+    section_title: Optional[str] = None
+    parent_context: Optional[str] = None  # 父级 chunk 的内容摘要
 
 
 class SearchResponse(BaseModel):

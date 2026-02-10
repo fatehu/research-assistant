@@ -12,25 +12,19 @@ import {
   Upload,
   message,
   Tooltip,
-  Progress,
   Empty,
   Spin,
   Dropdown,
-  Drawer,
-  Descriptions,
-  List,
   Typography,
   Statistic,
   Row,
   Col,
-  Badge,
 } from 'antd'
 import {
   PlusOutlined,
   UploadOutlined,
   SearchOutlined,
   DeleteOutlined,
-  FolderOutlined,
   FileTextOutlined,
   FilePdfOutlined,
   FileMarkdownOutlined,
@@ -48,6 +42,7 @@ import {
   ArrowLeftOutlined,
   ShareAltOutlined,
   UserOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
@@ -168,11 +163,11 @@ const KnowledgeBaseCard = ({
             />
           </Dropdown>
         </div>
-        
+
         {kb.description && (
           <p className="text-slate-400 text-sm mb-4 line-clamp-2">{kb.description}</p>
         )}
-        
+
         <div className="grid grid-cols-3 gap-4">
           <div className="text-center">
             <div className="text-2xl font-bold text-white">{kb.document_count}</div>
@@ -229,11 +224,11 @@ const SharedKnowledgeBaseCard = ({
           </div>
           <Tag color="purple" className="text-xs">共享</Tag>
         </div>
-        
+
         {kb.description && (
           <p className="text-slate-400 text-sm mb-4 line-clamp-2">{kb.description}</p>
         )}
-        
+
         <div className="grid grid-cols-2 gap-4">
           <div className="text-center">
             <div className="text-2xl font-bold text-white">{kb.document_count}</div>
@@ -291,7 +286,7 @@ const KnowledgePage = () => {
   const navigate = useNavigate()
   const { kbId } = useParams()
   const fileInputRef = useRef<HTMLInputElement>(null)
-  
+
   const {
     knowledgeBases,
     currentKnowledgeBase,
@@ -315,18 +310,18 @@ const KnowledgePage = () => {
     clearSearch,
     clearCurrentKnowledgeBase,
   } = useKnowledgeStore()
-  
+
   const [createModalVisible, setCreateModalVisible] = useState(false)
   const [searchModalVisible, setSearchModalVisible] = useState(false)
   const [deleteModalVisible, setDeleteModalVisible] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<{ type: 'kb' | 'doc'; id: number } | null>(null)
   const [searchInput, setSearchInput] = useState('')
   const [form] = Form.useForm()
-  
+
   // 共享知识库状态
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
   const [sharingEnabled, setSharingEnabled] = useState(false)
-  
+
   // 初始化
   useEffect(() => {
     fetchKnowledgeBases()
@@ -339,7 +334,7 @@ const KnowledgePage = () => {
       setSharedKnowledgeBases([])
     })
   }, [])
-  
+
   // 选中知识库
   useEffect(() => {
     if (kbId) {
@@ -348,23 +343,23 @@ const KnowledgePage = () => {
       clearCurrentKnowledgeBase()
     }
   }, [kbId])
-  
+
   // 轮询处理中的文档状态
   useEffect(() => {
     if (!currentKnowledgeBase) return
-    
+
     const processingDocs = documents.filter((d) => d.status === 'processing' || d.status === 'pending')
     if (processingDocs.length === 0) return
-    
+
     const interval = setInterval(() => {
       processingDocs.forEach((doc) => {
         refreshDocumentStatus(currentKnowledgeBase.id, doc.id)
       })
     }, 3000)
-    
+
     return () => clearInterval(interval)
   }, [documents, currentKnowledgeBase])
-  
+
   // 创建知识库
   const handleCreate = async (values: { name: string; description?: string }) => {
     try {
@@ -377,11 +372,11 @@ const KnowledgePage = () => {
       message.error('创建失败')
     }
   }
-  
+
   // 上传文件
   const handleUpload = async (file: File) => {
     if (!currentKnowledgeBase) return
-    
+
     try {
       await uploadDocument(currentKnowledgeBase.id, file)
       message.success('上传成功，正在处理...')
@@ -389,11 +384,11 @@ const KnowledgePage = () => {
       message.error(error.response?.data?.detail || '上传失败')
     }
   }
-  
+
   // 删除确认
   const handleDelete = async () => {
     if (!deleteTarget) return
-    
+
     try {
       if (deleteTarget.type === 'kb') {
         await deleteKnowledgeBase(deleteTarget.id)
@@ -409,18 +404,20 @@ const KnowledgePage = () => {
       message.error('删除失败')
     }
   }
-  
+
   // 执行搜索
   const handleSearch = async () => {
     if (!searchInput.trim()) return
-    
+
     try {
-      await search(searchInput)
+      // 如果当前在知识库详情页，限制搜索范围
+      const kbIds = currentKnowledgeBase ? [currentKnowledgeBase.id] : undefined
+      await search(searchInput, kbIds)
     } catch (error) {
       message.error('搜索失败')
     }
   }
-  
+
   // 渲染知识库列表
   const renderKnowledgeBaseList = () => (
     <div>
@@ -448,7 +445,7 @@ const KnowledgePage = () => {
           </Button>
         </Space>
       </div>
-      
+
       {/* 知识库网格 */}
       {isLoading ? (
         <div className="flex justify-center py-20">
@@ -489,7 +486,7 @@ const KnowledgePage = () => {
               </div>
             </>
           )}
-          
+
           {/* 共享的知识库 */}
           {sharedKnowledgeBases.length > 0 && (
             <>
@@ -516,11 +513,11 @@ const KnowledgePage = () => {
       )}
     </div>
   )
-  
+
   // 渲染知识库详情
   const renderKnowledgeBaseDetail = () => {
     if (!currentKnowledgeBase) return null
-    
+
     return (
       <div>
         {/* 头部 */}
@@ -545,6 +542,13 @@ const KnowledgePage = () => {
             >
               搜索
             </Button>
+            <Button
+              icon={<SettingOutlined />}
+              onClick={() => navigate(`/knowledge/${currentKnowledgeBase.id}/chunking`)}
+              className="bg-slate-700/50 border-slate-600 text-slate-300 hover:text-white hover:border-slate-500"
+            >
+              分块配置
+            </Button>
             <Upload
               accept=".txt,.md,.pdf,.html"
               showUploadList={false}
@@ -564,7 +568,7 @@ const KnowledgePage = () => {
             </Upload>
           </Space>
         </div>
-        
+
         {/* 统计卡片 */}
         <Row gutter={16} className="mb-6">
           <Col span={8}>
@@ -603,7 +607,7 @@ const KnowledgePage = () => {
             </Card>
           </Col>
         </Row>
-        
+
         {/* 文档列表 */}
         <Card
           title={<span className="text-white">文档列表</span>}
@@ -718,13 +722,13 @@ const KnowledgePage = () => {
       </div>
     )
   }
-  
+
   return (
     <div className="h-full overflow-y-auto bg-gradient-to-b from-slate-900 to-slate-950 p-6">
       <div className="max-w-6xl mx-auto">
         {kbId ? renderKnowledgeBaseDetail() : renderKnowledgeBaseList()}
       </div>
-      
+
       {/* 创建知识库弹窗 */}
       <Modal
         title="新建知识库"
@@ -753,7 +757,7 @@ const KnowledgePage = () => {
           </Form.Item>
         </Form>
       </Modal>
-      
+
       {/* 搜索弹窗 */}
       <Modal
         title="向量搜索"
@@ -777,13 +781,13 @@ const KnowledgePage = () => {
             size="large"
           />
         </div>
-        
+
         {searchResults.length > 0 && (
           <div className="mb-2 text-slate-400 text-sm">
             找到 {searchResults.length} 条结果，耗时 {searchTime.toFixed(2)}ms
           </div>
         )}
-        
+
         <div className="max-h-96 overflow-y-auto">
           {searchResults.map((result, index) => (
             <SearchResultCard key={result.chunk_id} result={result} index={index} />
@@ -793,7 +797,7 @@ const KnowledgePage = () => {
           )}
         </div>
       </Modal>
-      
+
       {/* 删除确认弹窗 */}
       <Modal
         title="确认删除"

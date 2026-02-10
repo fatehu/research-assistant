@@ -8,6 +8,7 @@ import RegisterPage from '@/pages/auth/RegisterPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import ChatPage from '@/pages/chat/ChatPage'
 import KnowledgePage from '@/pages/knowledge/KnowledgePage'
+import SmartChunkingPage from '@/pages/knowledge/SmartChunkingPage'
 import { LiteraturePage } from '@/pages/literature'
 import { CodeLabPage } from '@/pages/codelab'
 
@@ -149,6 +150,8 @@ function App() {
           <Route path="chat/:conversationId" element={<ChatPage />} />
           <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="knowledge/:kbId" element={<KnowledgePage />} />
+          <Route path="knowledge/:kbId/chunking" element={<SmartChunkingPage />} />
+          <Route path="knowledge/chunking" element={<SmartChunkingPage />} />
           <Route path="literature" element={<LiteraturePage />} />
           <Route path="code" element={<CodeLabPage />} />
           <Route path="code/:notebookId" element={<CodeLabPage />} />

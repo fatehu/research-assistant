@@ -197,7 +197,7 @@ export const authApi = {
     const response = await api.post('/api/auth/login', { email, password })
     return response.data
   },
-  
+
   register: async (
     email: string,
     username: string,
@@ -212,12 +212,12 @@ export const authApi = {
     })
     return response.data
   },
-  
+
   me: async (): Promise<User> => {
     const response = await api.get('/api/auth/me')
     return response.data
   },
-  
+
   logout: async (): Promise<void> => {
     await api.post('/api/auth/logout')
   },
@@ -229,12 +229,12 @@ export const userApi = {
     const response = await api.get('/api/users/profile')
     return response.data
   },
-  
+
   updateProfile: async (data: Partial<User>): Promise<User> => {
     const response = await api.put('/api/users/profile', data)
     return response.data
   },
-  
+
   getLLMProviders: async (): Promise<{
     default: string
     providers: LLMProvider[]
@@ -256,21 +256,21 @@ export const chatApi = {
     })
     return response.data
   },
-  
+
   createConversation: async (title?: string): Promise<Conversation> => {
     const response = await api.post('/api/chat/conversations', { title })
     return response.data
   },
-  
+
   getConversation: async (conversationId: number): Promise<Conversation> => {
     const response = await api.get(`/api/chat/conversations/${conversationId}`)
     return response.data
   },
-  
+
   deleteConversation: async (conversationId: number): Promise<void> => {
     await api.delete(`/api/chat/conversations/${conversationId}`)
   },
-  
+
   getMessages: async (
     conversationId: number,
     skip = 0,
@@ -282,7 +282,7 @@ export const chatApi = {
     )
     return response.data
   },
-  
+
   // 流式发送消息
   sendMessageStream: async (
     message: string,
@@ -304,26 +304,26 @@ export const chatApi = {
         }),
         signal: abortController?.signal,
       })
-      
+
       if (!response.ok) {
         const error = await response.json()
         throw new Error(error.detail || '发送失败')
       }
-      
+
       const reader = response.body?.getReader()
       if (!reader) throw new Error('无法读取响应')
-      
+
       const decoder = new TextDecoder()
       let buffer = ''
-      
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        
+
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
-        
+
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             try {
@@ -344,7 +344,7 @@ export const chatApi = {
       throw error
     }
   },
-  
+
   // 搜索消息
   searchMessages: async (query: string, limit = 20): Promise<{
     query: string
@@ -363,7 +363,7 @@ export const chatApi = {
     })
     return response.data
   },
-  
+
   // 保存停止的消息
   saveStoppedMessage: async (data: {
     conversation_id: number
@@ -394,35 +394,36 @@ export const knowledgeApi = {
     })
     return response.data
   },
-  
+
   // 获取可用的知识库（自己的 + 共享的），用于AI对话选择
   getAvailableKnowledgeBases: async (): Promise<{
     own: { id: number; name: string; description?: string; document_count: number; total_chunks: number }[];
     shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
+    sharing_enabled: boolean;
   }> => {
     const response = await api.get('/api/knowledge/available')
     return response.data
   },
-  
+
   createKnowledgeBase: async (data: KnowledgeBaseCreate): Promise<KnowledgeBase> => {
     const response = await api.post('/api/knowledge/knowledge-bases', data)
     return response.data
   },
-  
+
   getKnowledgeBase: async (kbId: number): Promise<KnowledgeBase> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}`)
     return response.data
   },
-  
+
   updateKnowledgeBase: async (kbId: number, data: Partial<KnowledgeBaseCreate>): Promise<KnowledgeBase> => {
     const response = await api.put(`/api/knowledge/knowledge-bases/${kbId}`, data)
     return response.data
   },
-  
+
   deleteKnowledgeBase: async (kbId: number): Promise<void> => {
     await api.delete(`/api/knowledge/knowledge-bases/${kbId}`)
   },
-  
+
   // 文档管理
   getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents`, {
@@ -430,11 +431,11 @@ export const knowledgeApi = {
     })
     return response.data
   },
-  
+
   uploadDocument: async (kbId: number, file: File): Promise<Document> => {
     const formData = new FormData()
     formData.append('file', file)
-    
+
     const response = await api.post(
       `/api/knowledge/knowledge-bases/${kbId}/documents/upload`,
       formData,
@@ -446,21 +447,21 @@ export const knowledgeApi = {
     )
     return response.data
   },
-  
+
   getDocument: async (kbId: number, docId: number): Promise<Document> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
     return response.data
   },
-  
+
   deleteDocument: async (kbId: number, docId: number): Promise<void> => {
     await api.delete(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
   },
-  
+
   getDocumentStatus: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/status`)
     return response.data
   },
-  
+
   // 分片
   getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
@@ -468,7 +469,7 @@ export const knowledgeApi = {
     })
     return response.data
   },
-  
+
   // 搜索
   search: async (
     query: string,
@@ -1091,7 +1092,7 @@ function getToken(): string {
 
 export enum UserRole {
   ADMIN = 'admin',
-  MENTOR = 'mentor', 
+  MENTOR = 'mentor',
   STUDENT = 'student',
 }
 
@@ -1653,19 +1654,19 @@ export const mentorshipApi = {
       if (mentor) {
         return { status: MentorshipStatus.ACTIVE, mentor }
       }
-      
+
       // 检查是否有待处理的邀请或申请
       const invitations = await invitationApi.getAll()
       const pendingInvitations = invitations.filter(i => i.type === 'invite' && i.status === 'pending')
       const pendingApplications = invitations.filter(i => i.type === 'apply' && i.status === 'pending')
-      
+
       if (pendingInvitations.length > 0) {
         return { status: MentorshipStatus.INVITED, pendingInvitations }
       }
       if (pendingApplications.length > 0) {
         return { status: MentorshipStatus.PENDING, pendingApplications }
       }
-      
+
       return { status: MentorshipStatus.NONE }
     } catch (error) {
       return { status: MentorshipStatus.NONE }
@@ -1719,3 +1720,220 @@ export const mentorshipApi = {
 }
 
 export default api
+
+// ========== 智能分块类型定义 ==========
+
+export enum ChunkingStrategy {
+  FIXED = 'fixed',
+  SEMANTIC = 'semantic',
+  HIERARCHICAL = 'hierarchical',
+  ACADEMIC = 'academic',
+  HYBRID = 'hybrid',
+}
+
+export enum ChunkLevel {
+  PARAGRAPH = 'paragraph',
+  SECTION = 'section',
+  DOCUMENT = 'document',
+}
+
+export enum ChunkingPreset {
+  DEFAULT = 'default',
+  FAST = 'fast',
+  PRECISE = 'precise',
+  ACADEMIC = 'academic',
+  DEEP = 'deep',
+}
+
+export interface ChunkingConfig {
+  strategy: ChunkingStrategy
+  base_chunk_size: number
+  chunk_overlap: number
+  semantic_threshold: number
+  min_semantic_chunk: number
+  max_semantic_chunk: number
+  enable_hierarchical: boolean
+  hierarchy_levels: ChunkLevel[]
+  detect_academic_structure: boolean
+  preserve_citations: boolean
+}
+
+export interface ChunkingConfigResponse extends ChunkingConfig {
+  id?: number
+  user_id?: number
+  name?: string
+  is_default: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PresetDescription {
+  name: string
+  description: string
+  strategy: string
+  recommended_for: string[]
+}
+
+export interface ChunkMetadata {
+  level: ChunkLevel
+  section_type?: string
+  section_title?: string
+  parent_id?: string
+  child_ids: string[]
+  has_citations: boolean
+  position_ratio: number
+  keywords: string[]
+}
+
+export interface SmartChunk {
+  id: string
+  content: string
+  start_char: number
+  end_char: number
+  metadata: ChunkMetadata
+}
+
+export interface ChunkingStats {
+  total_chunks: number
+  total_chars: number
+  avg_chunk_size: number
+  min_chunk_size: number
+  max_chunk_size: number
+  chunks_with_citations: number
+}
+
+export interface ChunkingResult {
+  strategy: string
+  chunks: SmartChunk[]
+  hierarchy?: Record<string, Array<Record<string, unknown>>>
+  metadata: Record<string, unknown>
+  stats: ChunkingStats
+}
+
+export interface DocumentAnalysis {
+  is_academic: boolean
+  detected_sections: Array<{
+    title: string
+    type: string
+    start: number
+    end: number
+    length: number
+  }>
+  has_citations: boolean
+  recommended_strategy: string
+  recommended_reason: string
+  document_stats: {
+    total_chars: number
+    total_sentences: number
+    total_paragraphs: number
+    avg_sentence_length: number
+    section_count: number
+  }
+}
+
+export interface StrategyComparison {
+  document_length: number
+  comparisons: Record<string, {
+    strategy: string
+    stats?: ChunkingStats
+    sample_chunks?: Array<{
+      content: string
+      length: number
+      has_citations: boolean
+    }>
+    total_chunks?: number
+    error?: string
+  }>
+  recommendation: {
+    best_strategy: string
+    reason: string
+  }
+}
+
+// ========== 智能分块API ==========
+
+export const chunkingApi = {
+  // 获取所有预设
+  getPresets: async (): Promise<{ presets: PresetDescription[] }> => {
+    const response = await api.get('/api/chunking/presets')
+    return response.data
+  },
+
+  // 获取指定预设详情
+  getPreset: async (presetName: ChunkingPreset): Promise<ChunkingConfigResponse> => {
+    const response = await api.get(`/api/chunking/presets/${presetName}`)
+    return response.data
+  },
+
+  // 预览分块效果
+  previewChunking: async (
+    text: string,
+    config?: Partial<ChunkingConfig>,
+    preset?: ChunkingPreset,
+    fileType = 'txt'
+  ): Promise<ChunkingResult> => {
+    const response = await api.post('/api/chunking/preview', {
+      text,
+      config,
+      preset,
+      file_type: fileType,
+    })
+    return response.data
+  },
+
+  // 分析文档结构
+  analyzeDocument: async (
+    text: string,
+    fileType = 'txt'
+  ): Promise<DocumentAnalysis> => {
+    const response = await api.post('/api/chunking/analyze', {
+      text,
+      file_type: fileType,
+    })
+    return response.data
+  },
+
+  // 比较不同策略
+  compareStrategies: async (
+    text: string,
+    strategies: ChunkingPreset[] = [ChunkingPreset.FAST, ChunkingPreset.PRECISE, ChunkingPreset.DEEP],
+    fileType = 'txt'
+  ): Promise<StrategyComparison> => {
+    const params = new URLSearchParams()
+    strategies.forEach(s => params.append('strategies', s))
+
+    const response = await api.post(`/api/chunking/compare?${params.toString()}`, {
+      text,
+      file_type: fileType,
+    })
+    return response.data
+  },
+
+  // 获取知识库的分块配置
+  getKnowledgeBaseConfig: async (kbId: number): Promise<ChunkingConfigResponse | null> => {
+    try {
+      const response = await api.get(`/api/chunking/knowledge-base/${kbId}/config`)
+      return response.data
+    } catch {
+      return null
+    }
+  },
+
+  // 更新知识库的分块配置
+  updateKnowledgeBaseConfig: async (
+    kbId: number,
+    config: Partial<ChunkingConfig> | { preset: ChunkingPreset }
+  ): Promise<ChunkingConfigResponse> => {
+    const response = await api.put(`/api/chunking/knowledge-base/${kbId}/config`, config)
+    return response.data
+  },
+
+  // 将预设应用到知识库
+  applyPresetToKnowledgeBase: async (
+    kbId: number,
+    preset: ChunkingPreset
+  ): Promise<{ message: string; knowledge_base_id: number; preset: string }> => {
+    const response = await api.post(`/api/chunking/knowledge-base/${kbId}/apply-preset?preset=${preset}`)
+    return response.data
+  },
+}

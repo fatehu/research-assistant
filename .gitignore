@@ -47,3 +47,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# 测试脚本
+backend/debug_scripts/
+backend/scripts/
+scripts/

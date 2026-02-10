@@ -34,6 +34,13 @@ from app.schemas.knowledge import (
 )
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service
+from app.services.smart_chunking_service import (
+    SmartChunkingService,
+    ChunkConfig,
+    ChunkingStrategy,
+    ChunkLevel,
+    get_preset_config,
+)
 
 # 共享功能导入（可选，如果模块不存在则禁用共享功能）
 try:
@@ -284,6 +291,16 @@ async def update_knowledge_base(
         raise HTTPException(status_code=404, detail="知识库不存在")
     
     update_data = data.model_dump(exclude_unset=True)
+    
+    # 特殊处理 chunking_config
+    if "chunking_config" in update_data:
+        config = update_data.pop("chunking_config")
+        # 确保 metadata_ 是字典
+        current_metadata = dict(kb.metadata_) if kb.metadata_ else {}
+        current_metadata["chunking_config"] = config
+        # 赋值新字典以触发 SQLAlchemy 更新
+        kb.metadata_ = current_metadata
+    
     for key, value in update_data.items():
         setattr(kb, key, value)
     
@@ -471,51 +488,175 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             doc.char_count = len(text)
             doc.token_count = processor.estimate_tokens(text)
             
-            # 分片
-            logger.info(f"开始分片: {doc_id}")
-            chunks = processor.chunk_text(text)
-            
-            if not chunks:
+            # 获取知识库以读取分块配置
+            kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
+            if not kb:
+                logger.error(f"知识库不存在: {doc.knowledge_base_id}")
                 doc.status = DocumentStatus.FAILED.value
-                doc.error_message = "文档分片失败"
+                doc.error_message = "知识库不存在"
                 await db.commit()
                 return
+
+            # 分片
+            logger.info(f"开始智能分块: {doc_id}")
+            
+            # 准备配置
+            kb_config = kb.chunking_config
+            chunk_config = ChunkConfig(
+                strategy=ChunkingStrategy(kb_config.get("strategy", "hybrid")),
+                base_chunk_size=kb.chunk_size,
+                chunk_overlap=kb.chunk_overlap,
+                semantic_threshold=kb_config.get("semantic_threshold", 0.75),
+                min_semantic_chunk=kb_config.get("min_semantic_chunk", 100),
+                max_semantic_chunk=kb_config.get("max_semantic_chunk", 1500),
+                enable_hierarchical=kb_config.get("enable_hierarchical", True),
+                detect_academic_structure=kb_config.get("detect_academic_structure", True),
+                preserve_citations=kb_config.get("preserve_citations", True),
+            )
+            
+            if "hierarchy_levels" in kb_config:
+                 chunk_config.hierarchy_levels = [ChunkLevel(l) for l in kb_config["hierarchy_levels"]]
+
+            # 执行分块
+            smart_service = SmartChunkingService()
+            result = await smart_service.chunk_document(text, chunk_config, doc.file_type)
+            
+            # ===== [Fix 1] 收集分块 =====
+            # 核心原则：paragraph 级作为检索单元（生成 embedding）
+            #          section/document 级作为上下文参考（不生成 embedding，存入文档 metadata）
+            
+            primary_chunks = []   # paragraph 级，用于检索
+            context_chunks = []   # section/document 级，仅存元数据
+            
+            if result.get("hierarchy"):
+                hierarchy = result["hierarchy"]
+                for level, level_chunks in hierarchy.items():
+                    for chunk_data in level_chunks:
+                        # 确保 chunk_data 是 dict 格式
+                        if not isinstance(chunk_data, dict):
+                            chunk_data = smart_service._chunk_to_dict(chunk_data) if hasattr(chunk_data, 'metadata') else chunk_data
+                        
+                        chunk_level = chunk_data.get("metadata", {}).get("level", "paragraph")
+                        if chunk_level == "paragraph":
+                            primary_chunks.append(chunk_data)
+                        else:
+                            context_chunks.append(chunk_data)
+            else:
+                # result["chunks"] 是 SmartChunk 对象，转为 dict
+                for val in result.get("chunks", []):
+                    primary_chunks.append({
+                        "id": val.id,
+                        "content": val.content,
+                        "start_char": val.start_char,
+                        "end_char": val.end_char,
+                        "metadata": {
+                            "level": val.metadata.level.value if val.metadata.level else "paragraph",
+                            "section_type": val.metadata.section_type,
+                            "section_title": val.metadata.section_title,
+                            "parent_id": val.metadata.parent_id,
+                            "child_ids": val.metadata.child_ids,
+                            "has_citations": val.metadata.has_citations,
+                            "position_ratio": val.metadata.position_ratio,
+                            "keywords": val.metadata.keywords,
+                        }
+                    })
+            
+            chunks_to_save = primary_chunks
+            
+            if not chunks_to_save:
+                # 降级：如果 primary_chunks 为空但 context_chunks 有内容，使用 context
+                if context_chunks:
+                    chunks_to_save = context_chunks
+                    logger.warning(f"文档 {doc_id} 没有 paragraph 级分块，降级使用 section 级")
+            
+            if not chunks_to_save:
+                doc.status = DocumentStatus.FAILED.value
+                doc.error_message = "文档分片失败：无有效分块"
+                await db.commit()
+                return
+                
+            # 按位置排序
+            chunks_to_save.sort(key=lambda x: x["start_char"])
             
             # 生成嵌入向量
-            logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks)} 个分片")
-            chunk_texts = [c[0] for c in chunks]
+            logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
+            chunk_texts = [c["content"] for c in chunks_to_save]
             embeddings = await processor.embed_chunks(chunk_texts)
             
             # 创建分片记录
-            for i, (chunk_text, start_char, end_char) in enumerate(chunks):
+            smart_id_map = {} # str_id -> DocumentChunk
+            
+            for i, chunk_data in enumerate(chunks_to_save):
+                meta = chunk_data["metadata"]
+                
                 chunk = DocumentChunk(
                     document_id=doc.id,
                     knowledge_base_id=doc.knowledge_base_id,
-                    content=chunk_text,
+                    content=chunk_data["content"],
                     chunk_index=i,
-                    start_char=start_char,
-                    end_char=end_char,
+                    start_char=chunk_data["start_char"],
+                    end_char=chunk_data["end_char"],
                     embedding=embeddings[i] if i < len(embeddings) else None,
-                    embedding_model=embedding_svc._get_model(),  # 正确存储模型名称
-                    char_count=len(chunk_text),
-                    token_count=processor.estimate_tokens(chunk_text),
+                    embedding_model=embedding_svc._get_model(),
+                    char_count=len(chunk_data["content"]),
+                    token_count=processor.estimate_tokens(chunk_data["content"]),
+                    
+                    # 智能分块字段
+                    chunk_level=meta.get("level", "paragraph"),
+                    section_type=meta.get("section_type"),
+                    section_title=meta.get("section_title"),
+                    has_citations=meta.get("has_citations", False),
+                    metadata_={
+                        "position_ratio": meta.get("position_ratio"),
+                        "keywords": meta.get("keywords"),
+                        "original_id": chunk_data["id"] 
+                    }
                 )
                 db.add(chunk)
+                smart_id_map[chunk_data["id"]] = chunk
+            
+            await db.flush() # 生成 ID
+            
+            # 更新父子关系
+            for chunk_data in chunks_to_save:
+                smart_id = chunk_data["id"]
+                parent_smart_id = chunk_data["metadata"].get("parent_id")
+                
+                if parent_smart_id and parent_smart_id in smart_id_map and smart_id in smart_id_map:
+                    child_db_chunk = smart_id_map[smart_id]
+                    parent_db_chunk = smart_id_map[parent_smart_id]
+                    child_db_chunk.parent_chunk_id = parent_db_chunk.id
+            
+            # [Fix 1] 将 section 级上下文存入文档 metadata，供检索时回溯使用
+            if context_chunks:
+                section_context = {}
+                for ctx in context_chunks:
+                    ctx_id = ctx.get("id", "")
+                    section_context[ctx_id] = {
+                        "content": ctx["content"][:500],  # 存摘要，避免过大
+                        "section_type": ctx.get("metadata", {}).get("section_type"),
+                        "section_title": ctx.get("metadata", {}).get("section_title"),
+                        "start_char": ctx.get("start_char", 0),
+                        "end_char": ctx.get("end_char", 0),
+                    }
+                doc_meta = dict(doc.metadata_) if doc.metadata_ else {}
+                doc_meta["section_context"] = section_context
+                doc.metadata_ = doc_meta
             
             # 更新文档状态
             doc.status = DocumentStatus.COMPLETED.value
-            doc.chunk_count = len(chunks)
+            doc.chunk_count = len(chunks_to_save)
             doc.processed_at = datetime.utcnow()
             
             # 更新知识库统计
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
             if kb:
                 kb.document_count = (kb.document_count or 0) + 1
-                kb.total_chunks = (kb.total_chunks or 0) + len(chunks)
+                kb.total_chunks = (kb.total_chunks or 0) + len(chunks_to_save)
                 kb.total_tokens = (kb.total_tokens or 0) + doc.token_count
             
             await db.commit()
-            logger.info(f"文档处理完成: {doc_id}, {len(chunks)} 个分片")
+            logger.info(f"文档处理完成: {doc_id}, {len(chunks_to_save)} 个分片")
             
         except Exception as e:
             logger.error(f"处理文档失败 {doc_id}: {e}")
@@ -762,13 +903,36 @@ async def search_knowledge(
     distance_threshold = 1 - request.score_threshold
     
     # 构建 pgvector 原生查询
-    # 使用 ORDER BY embedding <=> query_embedding 进行排序
-    # HNSW 索引会加速这个查询
     from sqlalchemy import text
     
     vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
     
-    sql = text("""
+    # [Fix 12] 动态构建 WHERE 条件，支持 chunk_level/section_type 过滤
+    where_clauses = [
+        "dc.knowledge_base_id = ANY(:kb_ids)",
+        "dc.embedding IS NOT NULL",
+        "(dc.embedding <=> :query_vector) <= :distance_threshold",
+    ]
+    params = {
+        "query_vector": vector_str,
+        "kb_ids": kb_ids,
+        "distance_threshold": distance_threshold,
+        "top_k": request.top_k,
+    }
+    
+    # chunk_level 过滤（默认只搜索 paragraph 级）
+    if request.chunk_level and request.chunk_level != "all":
+        where_clauses.append("dc.chunk_level = :chunk_level")
+        params["chunk_level"] = request.chunk_level
+    
+    # section_type 过滤（如 "只搜方法部分"）
+    if request.section_type:
+        where_clauses.append("dc.section_type = :section_type")
+        params["section_type"] = request.section_type
+    
+    where_sql = " AND ".join(where_clauses)
+    
+    sql = text(f"""
         SELECT 
             dc.id,
             dc.document_id,
@@ -776,31 +940,30 @@ async def search_knowledge(
             dc.content,
             dc.chunk_index,
             dc.metadata,
+            dc.chunk_level,
+            dc.section_type,
+            dc.section_title,
+            dc.parent_chunk_id,
             1 - (dc.embedding <=> :query_vector) as similarity,
             d.original_filename as document_name,
             kb.name as knowledge_base_name
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
         JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
-        WHERE dc.knowledge_base_id = ANY(:kb_ids)
-            AND dc.embedding IS NOT NULL
-            AND (dc.embedding <=> :query_vector) <= :distance_threshold
+        WHERE {where_sql}
         ORDER BY dc.embedding <=> :query_vector
         LIMIT :top_k
     """)
     
-    result = await db.execute(sql, {
-        "query_vector": vector_str,
-        "kb_ids": kb_ids,
-        "distance_threshold": distance_threshold,
-        "top_k": request.top_k
-    })
+    result = await db.execute(sql, params)
     rows = result.fetchall()
     
     # 构建结果
     results = []
+    parent_ids_to_fetch = set()
+    
     for row in rows:
-        results.append(SearchResultItem(
+        item = SearchResultItem(
             chunk_id=row.id,
             document_id=row.document_id,
             knowledge_base_id=row.knowledge_base_id,
@@ -810,7 +973,32 @@ async def search_knowledge(
             score=round(float(row.similarity), 4),
             chunk_index=row.chunk_index,
             metadata=row.metadata or {},
-        ))
+            chunk_level=getattr(row, 'chunk_level', None),
+            section_type=getattr(row, 'section_type', None),
+            section_title=getattr(row, 'section_title', None),
+        )
+        results.append(item)
+        
+        # [Fix 12] 收集需要回溯的父级 chunk
+        parent_id = getattr(row, 'parent_chunk_id', None)
+        if request.include_parent_context and parent_id:
+            parent_ids_to_fetch.add((len(results) - 1, parent_id))
+    
+    # [Fix 12] 批量回溯父级上下文
+    if parent_ids_to_fetch:
+        parent_ids = [pid for _, pid in parent_ids_to_fetch]
+        parent_result = await db.execute(
+            select(DocumentChunk.id, DocumentChunk.content, DocumentChunk.section_title)
+            .where(DocumentChunk.id.in_(parent_ids))
+        )
+        parent_map = {row.id: row for row in parent_result.fetchall()}
+        
+        for idx, pid in parent_ids_to_fetch:
+            if pid in parent_map:
+                parent = parent_map[pid]
+                results[idx].parent_context = parent.content[:300]
+                if not results[idx].section_title:
+                    results[idx].section_title = parent.section_title
     
     search_time = (time.time() - start_time) * 1000
     
