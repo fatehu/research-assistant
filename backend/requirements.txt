@@ -40,6 +40,10 @@ aiofiles==23.2.1
 # 阶段2: 知识库相关
 pypdf==4.0.0
 pdfplumber==0.10.3
+# Layout-aware PDF parsers (recommended for OCR-noise-heavy PDFs)
+# markitdown 需要 [pdf] extra 才支持 PDF 转换
+markitdown[pdf]>=0.1.4
+# docling>=2.73.0
 beautifulsoup4==4.12.3
 numpy==1.26.4
 pgvector==0.3.5

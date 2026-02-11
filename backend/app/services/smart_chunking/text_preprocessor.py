@@ -16,7 +16,17 @@ from .types import ChunkConfig
 
 # ============== 文本预处理 ==============
 
-def preprocess_text(text: str) -> str:
+_CAPTION_PATTERN = re.compile(
+    r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*\d',
+    re.IGNORECASE,
+)
+
+
+def preprocess_text(
+    text: str,
+    file_type: str = "txt",
+    enable_ocr_noise_cleanup: bool = True,
+) -> str:
     """
     预处理文本：统一换行、去多余空白、移除 OCR 噪声。
 
@@ -28,8 +38,15 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     # 移除多余空格
     text = re.sub(r' {2,}', ' ', text)
-    # 清除 PDF 提取中的图表/表格内部 OCR 噪声块
-    text = _strip_figure_noise_blocks(text)
+    normalized_file_type = (file_type or "txt").lower().replace(".", "")
+
+    # OCR 噪声清理只在 PDF 场景下触发，且需检测到明显噪声信号
+    if (
+        enable_ocr_noise_cleanup
+        and normalized_file_type == "pdf"
+        and _should_apply_heuristic_ocr_cleanup(text)
+    ):
+        text = _strip_figure_noise_blocks(text)
 
     return text.strip()
 
@@ -94,6 +111,38 @@ def split_to_sentences(text: str, config: ChunkConfig) -> List[str]:
 
 # ============== OCR 噪声清理 ==============
 
+def _is_caption_line(line: str) -> bool:
+    """判断是否为 Figure/Table caption 行。"""
+    return bool(_CAPTION_PATTERN.match(line.strip()))
+
+
+def _should_apply_heuristic_ocr_cleanup(text: str) -> bool:
+    """
+    是否启用启发式 OCR 清洗。
+    仅当文本中存在明显“图表碎片 + caption”信号时触发，避免误删正文。
+    """
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if len(lines) < 12:
+        return False
+
+    fragment_count = sum(1 for line in lines if _is_fragment_line(line))
+    fragment_ratio = fragment_count / len(lines)
+    caption_count = sum(1 for line in lines if _is_caption_line(line))
+
+    # 规则1：出现 caption 且碎片比例达到阈值
+    if caption_count >= 1 and fragment_count >= 3 and fragment_ratio >= 0.08:
+        return True
+
+    # 规则2：大量短碎片行（无 caption 的兜底）
+    short_fragment_count = sum(
+        1 for line in lines
+        if len(line) <= 20 and _is_fragment_line(line)
+    )
+    if fragment_count >= 8 and short_fragment_count >= 6 and fragment_ratio >= 0.20:
+        return True
+
+    return False
+
 def _strip_figure_noise_blocks(text: str) -> str:
     """
     检测并移除 pypdf 提取的图表/表格内部噪声文本块。
@@ -119,10 +168,7 @@ def _strip_figure_noise_blocks(text: str) -> str:
 
             if block_length >= 3:
                 next_line = lines[i].strip() if i < len(lines) else ""
-                is_before_caption = bool(re.match(
-                    r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*\d',
-                    next_line, re.IGNORECASE
-                ))
+                is_before_caption = _is_caption_line(next_line)
 
                 block_lines = lines[block_start:i]
                 avg_len = sum(len(l.strip()) for l in block_lines) / max(block_length, 1)
@@ -173,7 +219,7 @@ def _is_fragment_line(line: str) -> bool:
         return False
 
     # Figure/Table caption 不是碎片
-    if re.match(r'^(Figure|Fig\.?|Table|Tab\.?|图|表)\s*\d', stripped, re.IGNORECASE):
+    if _is_caption_line(stripped):
         return False
 
     if len(stripped) > 30 and stripped[-1] in '.。!！?？':

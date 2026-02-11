@@ -156,7 +156,7 @@ class SmartChunkingService:
         self.hierarchical_chunker = HierarchicalChunker(config)
 
         # 预处理
-        text = preprocess_text(text)
+        text = preprocess_text(text, file_type=file_type)
 
         # 策略路由
         try:
@@ -478,8 +478,8 @@ class SmartChunkingService:
     def _split_to_sentences(self, text: str) -> List[str]:
         return split_to_sentences(text, self._config or ChunkConfig())
 
-    def _preprocess_text(self, text: str) -> str:
-        return preprocess_text(text)
+    def _preprocess_text(self, text: str, file_type: str = "txt") -> str:
+        return preprocess_text(text, file_type=file_type)
 
     def _chunk_to_dict(self, chunk: SmartChunk) -> Dict[str, Any]:
         return _chunk_to_dict(chunk)

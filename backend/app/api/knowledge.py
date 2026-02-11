@@ -623,6 +623,10 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             doc.content_hash = processor.compute_hash(text)
             doc.char_count = len(text)
             doc.token_count = processor.estimate_tokens(text)
+            if doc.file_type.lower() == "pdf" and processor.last_pdf_extractor:
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["pdf_extractor"] = processor.last_pdf_extractor
+                doc.metadata_ = current_metadata
             
             # 获取知识库以读取分块配置
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)

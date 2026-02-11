@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     notebook_context_cell_max_length: int = 200   # 单个 Cell 代码预览最大字符数
     notebook_context_variables: int = 15          # 包含的最大变量数量
     notebook_context_output_cells: int = 5        # recent_outputs 包含的 Cell 数量
+
+    # ========== PDF Layout 解析配置 ==========
+    # auto: 优先尝试 markitdown -> docling，失败后回退 pypdf/pdfplumber
+    # markitdown/docling: 仅尝试指定解析器，再回退基础解析
+    # none: 完全禁用 layout 解析
+    pdf_layout_parser: Literal["auto", "markitdown", "docling", "none"] = "auto"
+    pdf_layout_min_chars: int = 200
     
     def get_llm_config(self, provider: str = None):
         """获取 LLM 配置"""
