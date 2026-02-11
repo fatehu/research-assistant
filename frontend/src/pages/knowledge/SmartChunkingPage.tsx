@@ -214,7 +214,7 @@ export default function SmartChunkingPage() {
     // 字符计量（旧）
     base_chunk_size: 500,
     chunk_overlap: 50,
-    breakpoint_percentile: 90,
+    breakpoint_percentile: 95,
     semantic_threshold: 0.75, // 保留以兼容类型定义
     min_semantic_chunk: 100,
     max_semantic_chunk: 1500,
