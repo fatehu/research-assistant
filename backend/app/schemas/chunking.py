@@ -56,12 +56,19 @@ class ChunkingConfigCreate(BaseModel):
         description="块重叠大小"
     )
     
-    # 语义分块配置
+    # 语义分块配置（V2: 新增 breakpoint_percentile）
+    breakpoint_percentile: float = Field(
+        default=95.0,
+        ge=50.0,
+        le=99.9,
+        description="断点百分位阈值。距离高于此百分位的句子间隙视为语义边界。"
+                    "越高→切分越少、块越大；越低→切分越多、块越小。推荐 85-95"
+    )
     semantic_threshold: float = Field(
         default=0.75,
         ge=0.0,
         le=1.0,
-        description="语义相似度阈值（低于此值认为是边界）"
+        description="[已弃用] 保留以兼容旧 API，不再影响核心语义检测算法"
     )
     min_semantic_chunk: int = Field(
         default=100,

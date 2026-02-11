@@ -33,6 +33,7 @@ from app.services.smart_chunking_service import (
     ChunkingStrategy,
     ChunkLevel,
     get_preset_config,
+    create_chunking_service,
 )
 
 router = APIRouter()
@@ -66,6 +67,7 @@ async def get_chunking_preset(
         strategy=config.strategy.value,
         base_chunk_size=config.base_chunk_size,
         chunk_overlap=config.chunk_overlap,
+        breakpoint_percentile=config.breakpoint_percentile,
         semantic_threshold=config.semantic_threshold,
         min_semantic_chunk=config.min_semantic_chunk,
         max_semantic_chunk=config.max_semantic_chunk,
@@ -105,7 +107,7 @@ async def preview_chunking(
         config = ChunkConfig()  # 默认配置
     
     # 执行分块
-    service = SmartChunkingService()
+    service = create_chunking_service()
     
     try:
         result = await service.chunk_document(
@@ -138,7 +140,7 @@ async def analyze_document(
         - document_stats: 文档统计信息
     """
     # [Fix 7] 通过公开方法 analyze_document 获取结果，不再直接调用私有方法
-    service = SmartChunkingService()
+    service = create_chunking_service()
     return service.analyze_document(request.text)
 
 
@@ -157,7 +159,7 @@ async def compare_strategies(
     对同一文档使用不同策略分块，比较结果
     """
     results = {}
-    service = SmartChunkingService()
+    service = create_chunking_service()
     
     for strategy in strategies:
         config = get_preset_config(strategy.value)
@@ -217,6 +219,7 @@ async def get_kb_chunking_config(
         strategy=chunking_config.get("strategy", "hybrid"),
         base_chunk_size=kb.chunk_size,
         chunk_overlap=kb.chunk_overlap,
+        breakpoint_percentile=chunking_config.get("breakpoint_percentile", 95.0),
         semantic_threshold=chunking_config.get("semantic_threshold", 0.75),
         min_semantic_chunk=chunking_config.get("min_semantic_chunk", 100),
         max_semantic_chunk=chunking_config.get("max_semantic_chunk", 1500),
@@ -250,6 +253,7 @@ async def update_kb_chunking_config(
     # 更新高级配置到元数据
     chunking_config = {
         "strategy": config.strategy.value,
+        "breakpoint_percentile": config.breakpoint_percentile,
         "semantic_threshold": config.semantic_threshold,
         "min_semantic_chunk": config.min_semantic_chunk,
         "max_semantic_chunk": config.max_semantic_chunk,
@@ -273,6 +277,7 @@ async def update_kb_chunking_config(
         strategy=config.strategy,
         base_chunk_size=config.base_chunk_size,
         chunk_overlap=config.chunk_overlap,
+        breakpoint_percentile=config.breakpoint_percentile,
         semantic_threshold=config.semantic_threshold,
         min_semantic_chunk=config.min_semantic_chunk,
         max_semantic_chunk=config.max_semantic_chunk,
@@ -306,6 +311,7 @@ async def apply_preset_to_kb(
     
     chunking_config = {
         "strategy": preset_config.strategy.value,
+        "breakpoint_percentile": preset_config.breakpoint_percentile,
         "semantic_threshold": preset_config.semantic_threshold,
         "min_semantic_chunk": preset_config.min_semantic_chunk,
         "max_semantic_chunk": preset_config.max_semantic_chunk,
@@ -338,6 +344,7 @@ def _convert_to_chunk_config(schema_config: ChunkingConfigCreate) -> ChunkConfig
         strategy=ChunkingStrategy(schema_config.strategy.value),
         base_chunk_size=schema_config.base_chunk_size,
         chunk_overlap=schema_config.chunk_overlap,
+        breakpoint_percentile=schema_config.breakpoint_percentile,
         semantic_threshold=schema_config.semantic_threshold,
         min_semantic_chunk=schema_config.min_semantic_chunk,
         max_semantic_chunk=schema_config.max_semantic_chunk,
