@@ -33,7 +33,7 @@ from app.schemas.knowledge import (
     ProcessingStatus,
 )
 from app.services.document_service import get_document_processor
-from app.services.embedding_service import get_embedding_service, MODEL_DIMENSIONS
+from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -603,7 +603,12 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             # 创建处理器
             processor = get_document_processor(chunk_size, chunk_overlap)
-            embedding_svc = get_embedding_service()
+            
+            # 获取知识库配置的嵌入模型
+            kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
+            kb_embedding_model = kb.embedding_model if kb else None
+            embedding_svc = get_embedding_service_for_model(kb_embedding_model)
+            logger.info(f"文档 {doc_id} 使用嵌入模型: {embedding_svc._get_model()} (知识库配置: {kb_embedding_model})")
             
             # 提取文本
             logger.info(f"开始提取文档文本: {doc_id}")
@@ -713,7 +718,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 生成嵌入向量
             logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
             chunk_texts = [c["content"] for c in chunks_to_save]
-            embeddings = await processor.embed_chunks(chunk_texts)
+            embeddings = await processor.embed_chunks(chunk_texts, embedding_svc=embedding_svc)
             
             # 创建分片记录
             smart_id_map = {} # str_id -> DocumentChunk
@@ -1018,7 +1023,22 @@ async def search_knowledge(
     """
     start_time = time.time()
     
-    embedding_svc = get_embedding_service()
+    # 获取要搜索的知识库，确定嵌入模型
+    target_kb_ids = set()
+    if request.knowledge_base_ids:
+        target_kb_ids = set(request.knowledge_base_ids)
+    
+    # 获取 KB 的 embedding_model（使用第一个 KB 的模型来编码 query）
+    kb_embedding_model = None
+    if target_kb_ids:
+        kb_result = await db.execute(
+            select(KnowledgeBase.embedding_model).where(KnowledgeBase.id.in_(target_kb_ids)).limit(1)
+        )
+        row = kb_result.first()
+        if row:
+            kb_embedding_model = row[0]
+    
+    embedding_svc = get_embedding_service_for_model(kb_embedding_model)
     
     # 生成查询向量
     try:

@@ -196,9 +196,15 @@ class DocumentProcessor:
         """分割文本为多个块"""
         return self.splitter.split_text(text)
     
-    async def embed_chunks(self, chunks: List[str]) -> List[List[float]]:
-        """为文本块生成嵌入向量"""
-        return await embedding_service.embed_texts(chunks)
+    async def embed_chunks(self, chunks: List[str], embedding_svc=None) -> List[List[float]]:
+        """为文本块生成嵌入向量
+        
+        Args:
+            chunks: 文本块列表
+            embedding_svc: 可选的 EmbeddingService 实例。为 None 时使用全局默认实例。
+        """
+        svc = embedding_svc or embedding_service
+        return await svc.embed_texts(chunks)
     
     def compute_hash(self, content: str) -> str:
         """计算内容哈希"""

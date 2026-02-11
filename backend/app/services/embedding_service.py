@@ -13,6 +13,7 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
   - BAAI/bge-large-zh-v1.5: 中文优化, 1024维
 """
 import asyncio
+import threading
 import numpy as np
 from typing import List, Optional, Dict
 from loguru import logger
@@ -73,9 +74,10 @@ class LocalEmbeddingModel:
     - 异步安全: 通过线程池执行推理，不阻塞事件循环
     """
 
-    def __init__(self):
+    def __init__(self, model_name: Optional[str] = None, target_dimension: int = 0):
         self._model = None
-        self._model_name: str = settings.local_embedding_model
+        self._model_name: str = model_name or settings.local_embedding_model
+        self._target_dimension: int = target_dimension  # 0 = use model default
         self._dimension: Optional[int] = None
         self._device: Optional[str] = None
         self._loaded = False
@@ -112,8 +114,8 @@ class LocalEmbeddingModel:
             )
             self._device = device
 
-            # 确定输出维度
-            target_dim = settings.local_embedding_dimension
+            # 确定输出维度 (优先使用实例级 target_dimension，其次全局 settings)
+            target_dim = self._target_dimension or settings.local_embedding_dimension
             if target_dim > 0:
                 self._dimension = target_dim
             else:
@@ -143,7 +145,7 @@ class LocalEmbeddingModel:
         # 尝试从注册表获取
         dim = MODEL_DIMENSIONS.get(self._model_name)
         if dim:
-            target = settings.local_embedding_dimension
+            target = self._target_dimension or settings.local_embedding_dimension
             return target if target > 0 else dim
         # 必须加载模型才能确定
         self._load_model()
@@ -187,7 +189,7 @@ class LocalEmbeddingModel:
         )
 
         # Matryoshka 维度截断
-        target_dim = settings.local_embedding_dimension
+        target_dim = self._target_dimension or settings.local_embedding_dimension
         if target_dim > 0 and embeddings.shape[1] > target_dim:
             embeddings = embeddings[:, :target_dim]
             if settings.local_embedding_normalize:
@@ -196,6 +198,39 @@ class LocalEmbeddingModel:
                 embeddings = embeddings / norms
 
         return embeddings
+
+
+class EmbeddingModelPool:
+    """
+    本地嵌入模型实例池 - 按 model_name 缓存 LocalEmbeddingModel 实例
+    
+    线程安全，懒加载。避免为同一模型重复创建实例。
+    """
+    
+    def __init__(self):
+        self._models: Dict[str, LocalEmbeddingModel] = {}
+        self._lock = threading.Lock()
+    
+    def get(self, model_name: str, target_dimension: int = 0) -> LocalEmbeddingModel:
+        """获取或创建指定模型的 LocalEmbeddingModel 实例"""
+        key = f"{model_name}:{target_dimension}"
+        if key not in self._models:
+            with self._lock:
+                if key not in self._models:  # double-check
+                    logger.info(f"模型池: 创建新实例 {model_name} (dim={target_dimension})")
+                    self._models[key] = LocalEmbeddingModel(
+                        model_name=model_name,
+                        target_dimension=target_dimension,
+                    )
+        return self._models[key]
+    
+    def list_loaded(self) -> List[str]:
+        """列出已加载的模型"""
+        return list(self._models.keys())
+
+
+# 全局模型池
+_model_pool = EmbeddingModelPool()
 
 
 class EmbeddingService:
@@ -209,18 +244,47 @@ class EmbeddingService:
       ollama → Ollama 本地 API
     """
 
-    def __init__(self):
-        self.provider = settings.embedding_provider
+    def __init__(self, model_name: Optional[str] = None):
+        """
+        初始化嵌入服务
+        
+        Args:
+            model_name: 指定模型名称。为 None 时使用全局配置。
+                        本地模型格式: "BAAI/bge-m3" 等
+                        API 模型格式: "text-embedding-v2", "text-embedding-3-small", "nomic-embed-text"
+        """
+        self._model_name_override = model_name
+        self.provider = self._resolve_provider(model_name)
         self._client = None
         self._local_model: Optional[LocalEmbeddingModel] = None
 
         if self.provider == "local":
-            self._local_model = LocalEmbeddingModel()
+            actual_model = model_name or settings.local_embedding_model
+            self._local_model = _model_pool.get(actual_model)
 
         logger.info(
             f"Embedding 服务初始化: provider={self.provider}, "
             f"model={self._get_model()}"
         )
+    
+    @staticmethod
+    def _resolve_provider(model_name: Optional[str]) -> str:
+        """根据模型名称推断 provider"""
+        if model_name is None:
+            return settings.embedding_provider
+        
+        # API 模型 -> 对应 provider
+        API_MODEL_PROVIDERS = {
+            "text-embedding-v2": "aliyun",
+            "text-embedding-3-small": "openai",
+            "text-embedding-3-large": "openai",
+            "nomic-embed-text": "ollama",
+        }
+        if model_name in API_MODEL_PROVIDERS:
+            return API_MODEL_PROVIDERS[model_name]
+        
+        # 其他 (含 BAAI/*, allenai/*, intfloat/* 等) -> local
+        return "local"
 
     def _get_api_client(self):
         """获取 API 客户端 (aliyun/openai/ollama)"""
@@ -255,6 +319,8 @@ class EmbeddingService:
 
     def _get_model(self) -> str:
         """获取模型名称"""
+        if self._model_name_override:
+            return self._model_name_override
         if self.provider == "local":
             return settings.local_embedding_model
         elif self.provider == "aliyun":
@@ -451,10 +517,44 @@ class EmbeddingService:
         return similarities
 
 
-# 全局实例
+# 全局默认实例
 embedding_service = EmbeddingService()
 
 
 def get_embedding_service() -> EmbeddingService:
-    """获取嵌入服务实例"""
+    """获取默认嵌入服务实例（使用全局配置）"""
     return embedding_service
+
+
+# 按模型名缓存的 EmbeddingService 实例
+_service_cache: Dict[str, EmbeddingService] = {}
+_service_cache_lock = threading.Lock()
+
+
+def get_embedding_service_for_model(model_name: Optional[str] = None) -> EmbeddingService:
+    """
+    获取针对指定模型的嵌入服务实例
+    
+    Args:
+        model_name: 模型名称，如 "BAAI/bge-m3"。
+                    为 None 或与全局配置相同时返回默认实例。
+    
+    Returns:
+        配置了对应模型的 EmbeddingService 实例
+    """
+    # None 或与全局模型相同 -> 返回默认实例
+    if not model_name:
+        return embedding_service
+    
+    default_model = embedding_service._get_model()
+    if model_name == default_model:
+        return embedding_service
+    
+    # 按模型名缓存
+    if model_name not in _service_cache:
+        with _service_cache_lock:
+            if model_name not in _service_cache:
+                logger.info(f"创建模型专用 EmbeddingService: {model_name}")
+                _service_cache[model_name] = EmbeddingService(model_name=model_name)
+    
+    return _service_cache[model_name]
