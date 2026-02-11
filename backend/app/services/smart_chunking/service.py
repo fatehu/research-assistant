@@ -6,6 +6,13 @@
 - 管理 embedding 缓存
 - 标准化输出格式
 - 提供预设配置和便捷函数
+
+V3 变更:
+  - chunk_document() 先调用 config.resolve_char_limits(text) 获取语言自适应的字符限制
+  - 将 ResolvedCharLimits 注入 SemanticChunker
+  - _fixed_chunking / _split_large_chunk 也使用 ResolvedCharLimits
+  - stats 输出新增 token 相关指标
+  - 预设配置新增 Token 字段
 """
 import re
 import hashlib
@@ -15,12 +22,14 @@ from loguru import logger
 
 from .types import (
     ChunkConfig, ChunkingStrategy, ChunkLevel, ChunkMetadata,
-    SmartChunk, ChunkResult, EmbeddingLimitExceeded, generate_chunk_id,
+    SmartChunk, ChunkResult, EmbeddingLimitExceeded, ResolvedCharLimits,
+    generate_chunk_id,
 )
 from .academic_detector import AcademicStructureDetector
 from .semantic_chunker import SemanticChunker
 from .hierarchical_chunker import HierarchicalChunker, enforce_limit
 from .text_preprocessor import preprocess_text, split_to_sentences
+from .token_utils import estimate_tokens as _estimate_tokens
 
 from app.services.embedding_service import embedding_service
 
@@ -42,6 +51,7 @@ class SmartChunkingService:
         self.semantic_chunker: Optional[SemanticChunker] = None
         self.hierarchical_chunker: Optional[HierarchicalChunker] = None
         self._config: Optional[ChunkConfig] = None
+        self._resolved: Optional[ResolvedCharLimits] = None
         self._embedding_cache: Dict[str, List[float]] = {}
         self._embedding_call_count: int = 0
 
@@ -84,6 +94,7 @@ class SmartChunkingService:
             rec_strategy, rec_reason = "hybrid", "通用文档，推荐使用混合策略"
 
         sentences = split_to_sentences(text, ChunkConfig())
+        total_tokens = _estimate_tokens(text)
 
         return {
             "is_academic": is_academic,
@@ -93,12 +104,13 @@ class SmartChunkingService:
             "recommended_reason": rec_reason,
             "document_stats": {
                 "total_chars": len(text),
+                "total_tokens": total_tokens,
                 "total_sentences": len(sentences),
                 "total_paragraphs": text.count('\n\n') + 1,
                 "avg_sentence_length": len(text) // max(len(sentences), 1),
                 "section_count": len(detected_sections),
             },
-            "estimated_chunks": len(text) // 500 + 1,
+            "estimated_chunks": max(1, total_tokens // 128),
             "language": "zh" if any('\u4e00' <= c <= '\u9fff' for c in text[:1000]) else "en",
         }
 
@@ -126,8 +138,21 @@ class SmartChunkingService:
         self._embedding_cache = {}
         self._embedding_call_count = 0
 
-        # 初始化分块器
-        self.semantic_chunker = SemanticChunker(config, embed_fn=self._cached_embed_texts)
+        # V3: 解析 Token → 字符限制
+        self._resolved = config.resolve_char_limits(text)
+        if self._resolved.is_token_based:
+            logger.info(
+                f"Token 计量模式: CJK={self._resolved.cjk_ratio:.1%}, "
+                f"chars_per_token={self._resolved.chars_per_token:.1f}, "
+                f"base_chunk={self._resolved.base_chunk_size}chars"
+            )
+
+        # 初始化分块器 — 注入 ResolvedCharLimits
+        self.semantic_chunker = SemanticChunker(
+            config,
+            embed_fn=self._cached_embed_texts,
+            resolved_limits=self._resolved,
+        )
         self.hierarchical_chunker = HierarchicalChunker(config)
 
         # 预处理
@@ -152,6 +177,12 @@ class SmartChunkingService:
         # 标准化 + 构建结果
         result = self._normalize_result(result, text)
         chunks = result.get("chunks", [])
+
+        # V3: 为每个 chunk 填充 token_count
+        for chunk in chunks:
+            if chunk.metadata.token_count == 0:
+                chunk.metadata.token_count = _estimate_tokens(chunk.content)
+
         return ChunkResult(
             strategy=config.strategy.value,
             chunks=chunks,
@@ -246,9 +277,13 @@ class SmartChunkingService:
     # ---------- 策略实现 ----------
 
     async def _fixed_chunking(self, text: str, config: ChunkConfig) -> Dict[str, Any]:
-        """固定大小分块。"""
+        """固定大小分块 — 使用 Token 感知的尺寸。"""
         from app.services.document_service import TextSplitter
-        splitter = TextSplitter(chunk_size=config.base_chunk_size, chunk_overlap=config.chunk_overlap)
+        lim = self._resolved or config.resolve_char_limits(text)
+        splitter = TextSplitter(
+            chunk_size=lim.base_chunk_size,
+            chunk_overlap=lim.chunk_overlap,
+        )
         raw_chunks = splitter.split_text(text)
 
         chunks = [
@@ -273,7 +308,8 @@ class SmartChunkingService:
             logger.warning(f"语义分块失败，降级到固定分块: {e}")
             return await self._fixed_chunking(text, config)
 
-        if len(raw_chunks) <= 1 and len(text) > config.base_chunk_size * 2:
+        lim = self._resolved or config.resolve_char_limits(text)
+        if len(raw_chunks) <= 1 and len(text) > lim.base_chunk_size * 2:
             logger.info("语义分块结果不理想（仅1块），降级到固定分块")
             return await self._fixed_chunking(text, config)
 
@@ -299,7 +335,11 @@ class SmartChunkingService:
         except (EmbeddingLimitExceeded, Exception) as e:
             logger.warning(f"层级分块中语义分块受限或失败: {e}")
             from app.services.document_service import TextSplitter
-            splitter = TextSplitter(chunk_size=config.base_chunk_size, chunk_overlap=config.chunk_overlap)
+            lim = self._resolved or config.resolve_char_limits(text)
+            splitter = TextSplitter(
+                chunk_size=lim.base_chunk_size,
+                chunk_overlap=lim.chunk_overlap,
+            )
             raw_chunks = splitter.split_text(text)
 
         hierarchy = self.hierarchical_chunker.create_hierarchy(text, raw_chunks)
@@ -349,7 +389,11 @@ class SmartChunkingService:
                 except (EmbeddingLimitExceeded, Exception) as e:
                     logger.warning(f"章节内语义分块受限: {e}")
                     from app.services.document_service import TextSplitter
-                    splitter = TextSplitter(chunk_size=config.base_chunk_size, chunk_overlap=config.chunk_overlap)
+                    lim = self._resolved or config.resolve_char_limits(text)
+                    splitter = TextSplitter(
+                        chunk_size=lim.base_chunk_size,
+                        chunk_overlap=lim.chunk_overlap,
+                    )
                     section_chunks = splitter.split_text(part_content)
 
                 for content, sub_start, sub_end in section_chunks:
@@ -416,12 +460,17 @@ class SmartChunkingService:
         if not chunks:
             return {}
         sizes = [len(c.content) for c in chunks]
+        token_sizes = [c.metadata.token_count for c in chunks]
         return {
             "total_chunks": len(chunks),
             "total_chars": len(text),
+            "total_tokens": _estimate_tokens(text),
             "avg_chunk_size": sum(sizes) // len(sizes),
             "min_chunk_size": min(sizes),
             "max_chunk_size": max(sizes),
+            "avg_chunk_tokens": sum(token_sizes) // len(token_sizes) if token_sizes else 0,
+            "min_chunk_tokens": min(token_sizes) if token_sizes else 0,
+            "max_chunk_tokens": max(token_sizes) if token_sizes else 0,
             "chunks_with_citations": sum(1 for c in chunks if c.metadata.has_citations),
         }
 
@@ -453,6 +502,7 @@ def _chunk_to_dict(chunk: SmartChunk) -> Dict[str, Any]:
             "child_ids": chunk.metadata.child_ids,
             "has_citations": chunk.metadata.has_citations,
             "position_ratio": chunk.metadata.position_ratio,
+            "token_count": chunk.metadata.token_count,
         }
     }
 
@@ -483,29 +533,60 @@ async def chunk_document_smart(text: str, strategy: str = "hybrid", **kwargs) ->
 
 
 def get_preset_config(preset: str) -> ChunkConfig:
-    """获取预设配置。"""
+    """
+    获取预设配置。
+
+    V3: 所有预设默认 use_token_based=True，
+    同时保留字符字段以兼容旧代码路径。
+    """
     presets = {
-        "default": ChunkConfig(),
+        "default": ChunkConfig(
+            use_token_based=True,
+            base_chunk_tokens=128,
+            overlap_tokens=16,
+            min_semantic_tokens=32,
+            max_semantic_tokens=384,
+        ),
         "fast": ChunkConfig(
             strategy=ChunkingStrategy.FIXED,
-            enable_hierarchical=False
+            enable_hierarchical=False,
+            use_token_based=True,
+            base_chunk_tokens=128,
+            overlap_tokens=16,
+            min_semantic_tokens=32,
+            max_semantic_tokens=384,
         ),
         "precise": ChunkConfig(
             strategy=ChunkingStrategy.SEMANTIC,
             breakpoint_percentile=90.0,
             min_semantic_chunk=150,
-            enable_hierarchical=False
+            enable_hierarchical=False,
+            use_token_based=True,
+            base_chunk_tokens=128,
+            overlap_tokens=16,
+            min_semantic_tokens=48,
+            max_semantic_tokens=384,
         ),
         "academic": ChunkConfig(
             strategy=ChunkingStrategy.ACADEMIC,
             detect_academic_structure=True,
             preserve_citations=True,
-            enable_hierarchical=True
+            enable_hierarchical=True,
+            use_token_based=True,
+            base_chunk_tokens=128,
+            overlap_tokens=16,
+            min_semantic_tokens=32,
+            max_semantic_tokens=384,
         ),
         "deep": ChunkConfig(
             strategy=ChunkingStrategy.HIERARCHICAL,
             enable_hierarchical=True,
-            hierarchy_levels=[ChunkLevel.PARAGRAPH, ChunkLevel.SECTION, ChunkLevel.DOCUMENT]
+            hierarchy_levels=[ChunkLevel.PARAGRAPH, ChunkLevel.SECTION, ChunkLevel.DOCUMENT],
+            use_token_based=True,
+            base_chunk_tokens=128,
+            overlap_tokens=16,
+            min_semantic_tokens=32,
+            max_semantic_tokens=384,
         ),
     }
     return presets.get(preset, presets["default"])

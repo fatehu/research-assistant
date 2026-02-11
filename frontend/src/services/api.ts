@@ -1782,6 +1782,13 @@ export enum ChunkingPreset {
 
 export interface ChunkingConfig {
   strategy: ChunkingStrategy
+  // V3 Token 计量新增
+  use_token_based: boolean
+  base_chunk_tokens: number
+  overlap_tokens: number
+  min_semantic_tokens: number
+  max_semantic_tokens: number
+  // 字符计量（旧）
   base_chunk_size: number
   chunk_overlap: number
   semantic_threshold: number
@@ -1819,6 +1826,7 @@ export interface ChunkMetadata {
   has_citations: boolean
   position_ratio: number
   keywords: string[]
+  token_count?: number
 }
 
 export interface SmartChunk {
@@ -1836,6 +1844,10 @@ export interface ChunkingStats {
   min_chunk_size: number
   max_chunk_size: number
   chunks_with_citations: number
+  total_tokens?: number
+  avg_chunk_tokens?: number
+  min_chunk_tokens?: number
+  max_chunk_tokens?: number
 }
 
 export interface ChunkingResult {
@@ -1864,6 +1876,7 @@ export interface DocumentAnalysis {
     total_paragraphs: number
     avg_sentence_length: number
     section_count: number
+    total_tokens?: number
   }
   // [Fix 7] 新增字段
   estimated_chunks?: number      // 预估分块数量

@@ -3,23 +3,40 @@
 
 V2 算法：相邻句子 embedding 余弦距离 + 百分位断点检测。
 对齐业界标准（LlamaIndex SemanticSplitter / Greg Kamradt）。
+
+V3 变更:
+  - 内部使用 ResolvedCharLimits 而非直接读取 ChunkConfig 的字符字段
+  - 通过 Token 计量模式，中英文混合文档获得一致的信息密度分块
 """
 import numpy as np
 from typing import List, Tuple, Optional, Callable
 
 from loguru import logger
 
-from .types import ChunkConfig
+from .types import ChunkConfig, ResolvedCharLimits
 from .academic_detector import AcademicStructureDetector
 
 
 class SemanticChunker:
     """基于语义相似度的分块器"""
 
-    def __init__(self, config: ChunkConfig, embed_fn: Optional[Callable] = None):
+    def __init__(
+        self,
+        config: ChunkConfig,
+        embed_fn: Optional[Callable] = None,
+        resolved_limits: Optional[ResolvedCharLimits] = None,
+    ):
         self.config = config
+        self._resolved = resolved_limits  # 由 service 层注入
         from app.services.embedding_service import embedding_service
         self._embed_fn = embed_fn or embedding_service.embed_texts
+
+    @property
+    def limits(self) -> ResolvedCharLimits:
+        """获取解析后的字符限制（延迟回退）"""
+        if self._resolved is not None:
+            return self._resolved
+        return self.config.resolve_char_limits()
 
     async def detect_semantic_boundaries(
         self,
@@ -85,6 +102,7 @@ class SemanticChunker:
         按语义边界分块。
 
         直接从原文按位置截取，保留换行/段落等格式。
+        使用 ResolvedCharLimits 中的尺寸限制（已根据语言比例调整）。
 
         返回: [(chunk_text, start_char, end_char), ...]
         """
@@ -93,6 +111,8 @@ class SemanticChunker:
 
         boundaries = await self.detect_semantic_boundaries(sentences)
         sentence_positions = self._get_sentence_positions(text, sentences)
+
+        lim = self.limits  # 使用解析后的字符限制
 
         chunks = []
         start_idx = 0
@@ -118,17 +138,17 @@ class SemanticChunker:
 
             chunk_text = text[start_char:end_char]
 
-            # 太小则合并到上一块
-            if len(chunk_text) < self.config.min_semantic_chunk and chunks:
+            # 太小则合并到上一块 — 使用 Token 感知的限制
+            if len(chunk_text) < lim.min_semantic_chunk and chunks:
                 prev_text, prev_start, prev_end = chunks[-1]
                 merged_text = text[prev_start:end_char]
-                if len(merged_text) <= self.config.max_semantic_chunk:
+                if len(merged_text) <= lim.max_semantic_chunk:
                     chunks[-1] = (merged_text, prev_start, end_char)
                     start_idx = end_idx
                     continue
 
-            # 太大则进一步切分
-            if len(chunk_text) > self.config.max_semantic_chunk:
+            # 太大则进一步切分 — 使用 Token 感知的限制
+            if len(chunk_text) > lim.max_semantic_chunk:
                 sub_chunks = self._split_large_chunk(chunk_text, start_char)
                 chunks.extend(sub_chunks)
             else:
@@ -184,10 +204,11 @@ class SemanticChunker:
         text: str,
         offset: int
     ) -> List[Tuple[str, int, int]]:
-        """切分过大的块"""
+        """切分过大的块 — 使用 Token 感知的尺寸"""
+        lim = self.limits
         chunks = []
-        chunk_size = self.config.base_chunk_size
-        overlap = self.config.chunk_overlap
+        chunk_size = lim.base_chunk_size
+        overlap = lim.chunk_overlap
 
         start = 0
         while start < len(text):

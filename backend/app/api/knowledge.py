@@ -649,6 +649,13 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 enable_hierarchical=kb_config.get("enable_hierarchical", True),
                 detect_academic_structure=kb_config.get("detect_academic_structure", True),
                 preserve_citations=kb_config.get("preserve_citations", True),
+                
+                # ===== V3 Token 计量 =====
+                use_token_based=kb_config.get("use_token_based", True),
+                base_chunk_tokens=kb_config.get("base_chunk_tokens", 128),
+                overlap_tokens=kb_config.get("overlap_tokens", 16),
+                min_semantic_tokens=kb_config.get("min_semantic_tokens", 32),
+                max_semantic_tokens=kb_config.get("max_semantic_tokens", 384),
             )
             
             if "hierarchy_levels" in kb_config:

@@ -1,5 +1,8 @@
 """
 文档处理服务 - 解析、分片、embedding
+
+V3 变更:
+  - estimate_tokens 委托给 smart_chunking.token_utils（更精确的中英文估算）
 """
 import hashlib
 import os
@@ -211,15 +214,19 @@ class DocumentProcessor:
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
     
     def estimate_tokens(self, text: str) -> int:
-        """估算 token 数量"""
-        # 简单估算：中文约 1.5 字符/token，英文约 4 字符/token
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-        other_chars = len(text) - chinese_chars
-        
-        chinese_tokens = chinese_chars / 1.5
-        other_tokens = other_chars / 4
-        
-        return int(chinese_tokens + other_tokens)
+        """
+        估算 token 数量 — 委托给 token_utils（更精确的中英文加权估算）
+        """
+        try:
+            from app.services.smart_chunking.token_utils import estimate_tokens
+            return estimate_tokens(text)
+        except ImportError:
+            # 回退到旧的简单估算
+            chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+            other_chars = len(text) - chinese_chars
+            chinese_tokens = chinese_chars / 1.5
+            other_tokens = other_chars / 4
+            return int(chinese_tokens + other_tokens)
     
     @staticmethod
     def get_file_type(filename: str) -> str:

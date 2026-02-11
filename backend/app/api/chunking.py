@@ -2,6 +2,11 @@
 智能分块 API 路由
 
 提供分块配置、预览、测试等功能
+
+V3 变更:
+  - _convert_to_chunk_config 传递 Token 计量字段
+  - stats 响应新增 token 统计
+  - 配置响应新增 Token 字段
 """
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -43,28 +48,21 @@ router = APIRouter()
 
 @router.get("/presets", response_model=PresetListResponse)
 async def list_chunking_presets():
-    """
-    获取所有预设分块配置
-    
-    返回可用的预设配置列表及其说明
-    """
+    """获取所有预设分块配置"""
     return PresetListResponse(presets=PRESET_DESCRIPTIONS)
 
 
 @router.get("/presets/{preset_name}", response_model=ChunkingConfigResponse)
-async def get_chunking_preset(
-    preset_name: ChunkingPresetEnum
-):
-    """
-    获取指定预设的详细配置
-    
-    参数:
-        preset_name: 预设名称 (default/fast/precise/academic/deep)
-    """
+async def get_chunking_preset(preset_name: ChunkingPresetEnum):
+    """获取指定预设的详细配置"""
     config = get_preset_config(preset_name.value)
-    
     return ChunkingConfigResponse(
         strategy=config.strategy.value,
+        use_token_based=config.use_token_based,
+        base_chunk_tokens=config.base_chunk_tokens,
+        overlap_tokens=config.overlap_tokens,
+        min_semantic_tokens=config.min_semantic_tokens,
+        max_semantic_tokens=config.max_semantic_tokens,
         base_chunk_size=config.base_chunk_size,
         chunk_overlap=config.chunk_overlap,
         breakpoint_percentile=config.breakpoint_percentile,
@@ -87,39 +85,23 @@ async def preview_chunking(
     request: DocumentChunkRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    预览分块效果
-    
-    在实际应用到知识库之前，预览分块结果
-    
-    参数:
-        text: 要分块的文本
-        config: 分块配置（可选）
-        preset: 预设名称（可选，优先级低于 config）
-        file_type: 文件类型
-    """
-    # 确定使用的配置
+    """预览分块效果"""
     if request.config:
         config = _convert_to_chunk_config(request.config)
     elif request.preset:
         config = get_preset_config(request.preset.value)
     else:
-        config = ChunkConfig()  # 默认配置
-    
-    # 执行分块
+        config = ChunkConfig()
+
     service = create_chunking_service()
-    
     try:
         result = await service.chunk_document(
-            text=request.text,
-            config=config,
-            file_type=request.file_type
+            text=request.text, config=config, file_type=request.file_type
         )
     except Exception as e:
         logger.error(f"分块预览失败: {e}")
         raise HTTPException(status_code=500, detail=f"分块失败: {str(e)}")
-    
-    # 转换结果
+
     return _convert_to_response(result)
 
 
@@ -128,18 +110,7 @@ async def analyze_document(
     request: DocumentChunkRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    分析文档结构
-    
-    分析文档的结构特征，推荐最佳分块策略
-    
-    返回:
-        - is_academic: 是否为学术文档
-        - detected_sections: 检测到的章节类型
-        - recommended_strategy: 推荐的分块策略
-        - document_stats: 文档统计信息
-    """
-    # [Fix 7] 通过公开方法 analyze_document 获取结果，不再直接调用私有方法
+    """分析文档结构，推荐最佳分块策略"""
     service = create_chunking_service()
     return service.analyze_document(request.text)
 
@@ -153,24 +124,16 @@ async def compare_strategies(
     ),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    比较不同分块策略的效果
-    
-    对同一文档使用不同策略分块，比较结果
-    """
+    """比较不同分块策略的效果"""
     results = {}
     service = create_chunking_service()
-    
+
     for strategy in strategies:
         config = get_preset_config(strategy.value)
-        
         try:
             result = await service.chunk_document(
-                text=request.text,
-                config=config,
-                file_type=request.file_type
+                text=request.text, config=config, file_type=request.file_type
             )
-            
             results[strategy.value] = {
                 "strategy": strategy.value,
                 "stats": result["stats"],
@@ -178,18 +141,16 @@ async def compare_strategies(
                     {
                         "content": c.content[:200] + "..." if len(c.content) > 200 else c.content,
                         "length": len(c.content),
+                        "tokens": c.metadata.token_count,
                         "has_citations": c.metadata.has_citations,
                     }
-                    for c in result["chunks"][:3]  # 只返回前3个块作为样例
+                    for c in result["chunks"][:3]
                 ],
                 "total_chunks": len(result["chunks"]),
             }
         except Exception as e:
-            results[strategy.value] = {
-                "strategy": strategy.value,
-                "error": str(e)
-            }
-    
+            results[strategy.value] = {"strategy": strategy.value, "error": str(e)}
+
     return {
         "document_length": len(request.text),
         "comparisons": results,
@@ -205,18 +166,20 @@ async def get_kb_chunking_config(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    获取知识库的分块配置
-    """
+    """获取知识库的分块配置"""
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb or kb.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    
-    # 从知识库元数据中获取分块配置
+
     chunking_config = kb.metadata_.get("chunking_config", {}) if kb.metadata_ else {}
-    
+
     return ChunkingConfigResponse(
         strategy=chunking_config.get("strategy", "hybrid"),
+        use_token_based=chunking_config.get("use_token_based", True),
+        base_chunk_tokens=chunking_config.get("base_chunk_tokens", 128),
+        overlap_tokens=chunking_config.get("overlap_tokens", 16),
+        min_semantic_tokens=chunking_config.get("min_semantic_tokens", 32),
+        max_semantic_tokens=chunking_config.get("max_semantic_tokens", 384),
         base_chunk_size=kb.chunk_size,
         chunk_overlap=kb.chunk_overlap,
         breakpoint_percentile=chunking_config.get("breakpoint_percentile", 95.0),
@@ -237,22 +200,21 @@ async def update_kb_chunking_config(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    更新知识库的分块配置
-    
-    注意: 更改配置后，需要重新处理已上传的文档才能应用新配置
-    """
+    """更新知识库的分块配置"""
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb or kb.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    
-    # 更新基础配置
+
     kb.chunk_size = config.base_chunk_size
     kb.chunk_overlap = config.chunk_overlap
-    
-    # 更新高级配置到元数据
+
     chunking_config = {
         "strategy": config.strategy.value,
+        "use_token_based": config.use_token_based,
+        "base_chunk_tokens": config.base_chunk_tokens,
+        "overlap_tokens": config.overlap_tokens,
+        "min_semantic_tokens": config.min_semantic_tokens,
+        "max_semantic_tokens": config.max_semantic_tokens,
         "breakpoint_percentile": config.breakpoint_percentile,
         "semantic_threshold": config.semantic_threshold,
         "min_semantic_chunk": config.min_semantic_chunk,
@@ -262,19 +224,23 @@ async def update_kb_chunking_config(
         "detect_academic_structure": config.detect_academic_structure,
         "preserve_citations": config.preserve_citations,
     }
-    
-    # Update metadata with new dict to trigger SQLAlchemy change
+
     current_metadata = dict(kb.metadata_) if kb.metadata_ else {}
     current_metadata["chunking_config"] = chunking_config
     kb.metadata_ = current_metadata
-    
+
     await db.commit()
     await db.refresh(kb)
-    
+
     logger.info(f"用户 {current_user.id} 更新了知识库 {kb_id} 的分块配置")
-    
+
     return ChunkingConfigResponse(
         strategy=config.strategy,
+        use_token_based=config.use_token_based,
+        base_chunk_tokens=config.base_chunk_tokens,
+        overlap_tokens=config.overlap_tokens,
+        min_semantic_tokens=config.min_semantic_tokens,
+        max_semantic_tokens=config.max_semantic_tokens,
         base_chunk_size=config.base_chunk_size,
         chunk_overlap=config.chunk_overlap,
         breakpoint_percentile=config.breakpoint_percentile,
@@ -295,22 +261,23 @@ async def apply_preset_to_kb(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    将预设配置应用到知识库
-    """
+    """将预设配置应用到知识库"""
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb or kb.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    
-    # 获取预设配置
+
     preset_config = get_preset_config(preset.value)
-    
-    # 更新知识库
+
     kb.chunk_size = preset_config.base_chunk_size
     kb.chunk_overlap = preset_config.chunk_overlap
-    
+
     chunking_config = {
         "strategy": preset_config.strategy.value,
+        "use_token_based": preset_config.use_token_based,
+        "base_chunk_tokens": preset_config.base_chunk_tokens,
+        "overlap_tokens": preset_config.overlap_tokens,
+        "min_semantic_tokens": preset_config.min_semantic_tokens,
+        "max_semantic_tokens": preset_config.max_semantic_tokens,
         "breakpoint_percentile": preset_config.breakpoint_percentile,
         "semantic_threshold": preset_config.semantic_threshold,
         "min_semantic_chunk": preset_config.min_semantic_chunk,
@@ -321,14 +288,13 @@ async def apply_preset_to_kb(
         "preserve_citations": preset_config.preserve_citations,
         "applied_preset": preset.value,
     }
-    
-    # Update metadata with new dict to trigger SQLAlchemy change
+
     current_metadata = dict(kb.metadata_) if kb.metadata_ else {}
     current_metadata["chunking_config"] = chunking_config
     kb.metadata_ = current_metadata
-    
+
     await db.commit()
-    
+
     return {
         "message": f"已将预设 '{preset.value}' 应用到知识库",
         "knowledge_base_id": kb_id,
@@ -342,6 +308,11 @@ def _convert_to_chunk_config(schema_config: ChunkingConfigCreate) -> ChunkConfig
     """将 Schema 配置转换为服务配置"""
     return ChunkConfig(
         strategy=ChunkingStrategy(schema_config.strategy.value),
+        use_token_based=schema_config.use_token_based,
+        base_chunk_tokens=schema_config.base_chunk_tokens,
+        overlap_tokens=schema_config.overlap_tokens,
+        min_semantic_tokens=schema_config.min_semantic_tokens,
+        max_semantic_tokens=schema_config.max_semantic_tokens,
         base_chunk_size=schema_config.base_chunk_size,
         chunk_overlap=schema_config.chunk_overlap,
         breakpoint_percentile=schema_config.breakpoint_percentile,
@@ -368,8 +339,9 @@ def _convert_to_response(result: dict) -> ChunkingResultResponse:
             has_citations=chunk.metadata.has_citations,
             position_ratio=chunk.metadata.position_ratio,
             keywords=chunk.metadata.keywords,
+            token_count=chunk.metadata.token_count,
         )
-        
+
         chunks.append(SmartChunkResponse(
             id=chunk.id,
             content=chunk.content,
@@ -377,9 +349,9 @@ def _convert_to_response(result: dict) -> ChunkingResultResponse:
             end_char=chunk.end_char,
             metadata=metadata,
         ))
-    
+
     stats = result.get("stats", {})
-    
+
     return ChunkingResultResponse(
         strategy=result.get("strategy", "unknown"),
         chunks=chunks,
@@ -388,9 +360,13 @@ def _convert_to_response(result: dict) -> ChunkingResultResponse:
         stats=ChunkingStatsResponse(
             total_chunks=stats.get("total_chunks", 0),
             total_chars=stats.get("total_chars", 0),
+            total_tokens=stats.get("total_tokens", 0),
             avg_chunk_size=stats.get("avg_chunk_size", 0),
             min_chunk_size=stats.get("min_chunk_size", 0),
             max_chunk_size=stats.get("max_chunk_size", 0),
+            avg_chunk_tokens=stats.get("avg_chunk_tokens", 0),
+            min_chunk_tokens=stats.get("min_chunk_tokens", 0),
+            max_chunk_tokens=stats.get("max_chunk_tokens", 0),
             chunks_with_citations=stats.get("chunks_with_citations", 0),
         )
     )
@@ -400,31 +376,25 @@ def _get_recommendation(results: dict) -> dict:
     """根据比较结果给出推荐"""
     best_strategy = None
     best_score = 0
-    
+
     for strategy, result in results.items():
         if "error" in result:
             continue
-        
+
         stats = result.get("stats", {})
-        
-        # 简单评分：考虑块大小的标准差和块数量
         avg_size = stats.get("avg_chunk_size", 0)
         min_size = stats.get("min_chunk_size", 0)
         max_size = stats.get("max_chunk_size", 0)
-        
-        # 理想的块大小在 300-800 之间
+
         size_score = 100 - abs(avg_size - 500) / 10
-        
-        # 块大小方差不要太大
         variance = max_size - min_size if max_size > 0 else 0
         variance_score = max(0, 100 - variance / 10)
-        
         score = (size_score + variance_score) / 2
-        
+
         if score > best_score:
             best_score = score
             best_strategy = strategy
-    
+
     return {
         "recommended": best_strategy or "hybrid",
         "confidence": min(best_score / 100, 1.0),

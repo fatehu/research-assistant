@@ -177,7 +177,7 @@ const ChunkCard = ({
       {chunk.content}
     </Paragraph>
     <div className="mt-2 text-slate-500 text-xs">
-      {chunk.content.length} 字符
+      {chunk.content.length} 字符 | {chunk.metadata.token_count || '?'} Tokens
     </div>
   </Card>
 )
@@ -205,6 +205,13 @@ export default function SmartChunkingPage() {
   // 自定义配置
   const [customConfig, setCustomConfig] = useState<Partial<ChunkingConfig>>({
     strategy: ChunkingStrategy.HYBRID,
+    // V3 Token 计量新增
+    use_token_based: true,
+    base_chunk_tokens: 128,        // 约 512 英文字符 / 192 中文字符
+    overlap_tokens: 16,
+    min_semantic_tokens: 32,
+    max_semantic_tokens: 384,
+    // 字符计量（旧）
     base_chunk_size: 500,
     chunk_overlap: 50,
     breakpoint_percentile: 90,
@@ -469,55 +476,161 @@ export default function SmartChunkingPage() {
 
                     <Divider className="border-slate-700">基础分块参数</Divider>
 
-                    {/* 基础参数 */}
-                    <Row gutter={16}>
-                      <Col span={12}>
-                        <Form.Item
-                          label={
-                            <Tooltip title="每个分块的目标大小（字符数）。较小的值产生更精细的分块，适合精确检索；较大的值保留更多上下文。">
-                              <Text className="text-slate-300">
-                                基础块大小 <QuestionCircleOutlined className="text-slate-500" />
-                              </Text>
-                            </Tooltip>
-                          }
-                        >
-                          <Slider
-                            min={100}
-                            max={2000}
-                            step={50}
-                            value={customConfig.base_chunk_size}
-                            onChange={(v) =>
-                              setCustomConfig({ ...customConfig, base_chunk_size: v })
+                    {/* Token/字符计量模式切换 */}
+                    <Form.Item label={<Text className="text-slate-300">计量模式</Text>}>
+                      <Switch
+                        checked={customConfig.use_token_based}
+                        onChange={(v) => setCustomConfig({ ...customConfig, use_token_based: v })}
+                        checkedChildren="Token"
+                        unCheckedChildren="字符"
+                      />
+                      <Text className="text-slate-500 text-xs ml-2">
+                        {customConfig.use_token_based
+                          ? 'Token 模式: 自动适配中英文信息密度（推荐）'
+                          : '字符模式: 按字符数切分（旧行为）'}
+                      </Text>
+                    </Form.Item>
+
+                    {customConfig.use_token_based ? (
+                      // Token 模式的滑块组
+                      <Row gutter={16}>
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="每个分块的目标大小（Token数）。128 Tokens 约等于 500 英文字符或 200 中文字符。">
+                                <Text className="text-slate-300">
+                                  基础块大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
                             }
-                            marks={{ 100: '100', 500: '500', 1000: '1K', 2000: '2K' }}
-                          />
-                          <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_size} 字符</Text>
-                        </Form.Item>
-                      </Col>
-                      <Col span={12}>
-                        <Form.Item
-                          label={
-                            <Tooltip title="相邻分块之间的重叠字符数。重叠可以避免关键信息被截断，但会增加总分块数。">
-                              <Text className="text-slate-300">
-                                块重叠大小 <QuestionCircleOutlined className="text-slate-500" />
-                              </Text>
-                            </Tooltip>
-                          }
-                        >
-                          <Slider
-                            min={0}
-                            max={300}
-                            step={10}
-                            value={customConfig.chunk_overlap}
-                            onChange={(v) =>
-                              setCustomConfig({ ...customConfig, chunk_overlap: v })
+                          >
+                            <Slider
+                              min={32}
+                              max={512}
+                              step={16}
+                              value={customConfig.base_chunk_tokens}
+                              onChange={(v) => setCustomConfig({ ...customConfig, base_chunk_tokens: v })}
+                              marks={{ 32: '32', 128: '128', 256: '256', 512: '512' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_tokens} Tokens</Text>
+                          </Form.Item>
+                        </Col>
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="相邻分块之间的重叠大小（Token数）。">
+                                <Text className="text-slate-300">
+                                  块重叠大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
                             }
-                            marks={{ 0: '0', 50: '50', 150: '150', 300: '300' }}
-                          />
-                          <Text className="text-slate-500 text-xs">当前: {customConfig.chunk_overlap} 字符</Text>
-                        </Form.Item>
-                      </Col>
-                    </Row>
+                          >
+                            <Slider
+                              min={0}
+                              max={64}
+                              step={4}
+                              value={customConfig.overlap_tokens}
+                              onChange={(v) => setCustomConfig({ ...customConfig, overlap_tokens: v })}
+                              marks={{ 0: '0', 16: '16', 32: '32', 64: '64' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.overlap_tokens} Tokens</Text>
+                          </Form.Item>
+                        </Col>
+
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="语义分块的最小大小（Token数）。">
+                                <Text className="text-slate-300">
+                                  最小语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
+                            }
+                          >
+                            <Slider
+                              min={16}
+                              max={128}
+                              step={8}
+                              value={customConfig.min_semantic_tokens}
+                              onChange={(v) => setCustomConfig({ ...customConfig, min_semantic_tokens: v })}
+                              marks={{ 16: '16', 32: '32', 64: '64', 128: '128' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_tokens} Tokens</Text>
+                          </Form.Item>
+                        </Col>
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="语义分块的最大大小（Token数）。">
+                                <Text className="text-slate-300">
+                                  最大语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
+                            }
+                          >
+                            <Slider
+                              min={128}
+                              max={1024}
+                              step={32}
+                              value={customConfig.max_semantic_tokens}
+                              onChange={(v) => setCustomConfig({ ...customConfig, max_semantic_tokens: v })}
+                              marks={{ 128: '128', 384: '384', 512: '512', 1024: '1K' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_tokens} Tokens</Text>
+                          </Form.Item>
+                        </Col>
+                      </Row>
+                    ) : (
+                      // 字符模式的滑块组 (原有代码)
+                      <Row gutter={16}>
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="每个分块的目标大小（字符数）。较小的值产生更精细的分块，适合精确检索；较大的值保留更多上下文。">
+                                <Text className="text-slate-300">
+                                  基础块大小 <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
+                            }
+                          >
+                            <Slider
+                              min={100}
+                              max={2000}
+                              step={50}
+                              value={customConfig.base_chunk_size}
+                              onChange={(v) =>
+                                setCustomConfig({ ...customConfig, base_chunk_size: v })
+                              }
+                              marks={{ 100: '100', 500: '500', 1000: '1K', 2000: '2K' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_size} 字符</Text>
+                          </Form.Item>
+                        </Col>
+                        <Col span={12}>
+                          <Form.Item
+                            label={
+                              <Tooltip title="相邻分块之间的重叠字符数。重叠可以避免关键信息被截断，但会增加总分块数。">
+                                <Text className="text-slate-300">
+                                  块重叠大小 <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
+                            }
+                          >
+                            <Slider
+                              min={0}
+                              max={300}
+                              step={10}
+                              value={customConfig.chunk_overlap}
+                              onChange={(v) =>
+                                setCustomConfig({ ...customConfig, chunk_overlap: v })
+                              }
+                              marks={{ 0: '0', 50: '50', 150: '150', 300: '300' }}
+                            />
+                            <Text className="text-slate-500 text-xs">当前: {customConfig.chunk_overlap} 字符</Text>
+                          </Form.Item>
+                        </Col>
+                      </Row>
+                    )}
 
                     {/* 语义分块参数 */}
                     {(customConfig.strategy === ChunkingStrategy.SEMANTIC ||
@@ -551,7 +664,7 @@ export default function SmartChunkingPage() {
                                 label={
                                   <Tooltip title="语义分块的最小字符数。小于此值的块会被合并到相邻块中，避免产生过碎的分块。">
                                     <Text className="text-slate-300">
-                                      最小语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                      最小语义块 (字符) <QuestionCircleOutlined className="text-slate-500" />
                                     </Text>
                                   </Tooltip>
                                 }
@@ -574,7 +687,7 @@ export default function SmartChunkingPage() {
                                 label={
                                   <Tooltip title="语义分块的最大字符数。超过此值的块会被强制二次切分，防止单块过大影响检索精度。">
                                     <Text className="text-slate-300">
-                                      最大语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                      最大语义块 (字符) <QuestionCircleOutlined className="text-slate-500" />
                                     </Text>
                                   </Tooltip>
                                 }
@@ -749,6 +862,9 @@ export default function SmartChunkingPage() {
                       <Tag color="green">{STRATEGY_NAMES[analysisResult.recommended_strategy]}</Tag>
                       {analysisResult.estimated_chunks != null && (
                         <Tag color="geekblue">预估 {analysisResult.estimated_chunks} 块</Tag>
+                      )}
+                      {analysisResult.document_stats.total_tokens && (
+                        <Tag color="blue">{analysisResult.document_stats.total_tokens} Tokens</Tag>
                       )}
                     </div>
                     <Text className="text-slate-500 text-sm">{analysisResult.recommended_reason}</Text>

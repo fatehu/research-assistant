@@ -2,6 +2,12 @@
 智能分块 - 类型定义
 
 包含所有枚举、数据类、异常。纯数据模块，无外部依赖。
+
+V3 变更:
+  - ChunkConfig 新增 Token 计量字段 (base_chunk_tokens, min_semantic_tokens, etc.)
+  - 当 Token 字段 > 0 时，系统以 Token 为准，运行时按文本语言比例自动转换为字符限制
+  - 旧的字符字段 (base_chunk_size, min_semantic_chunk, etc.) 保留以向后兼容
+  - 新增 use_token_based 标志，显式控制计量模式
 """
 import hashlib
 from enum import Enum
@@ -31,11 +37,29 @@ class ChunkLevel(str, Enum):
 
 @dataclass
 class ChunkConfig:
-    """分块配置 - 用户可自定义"""
-    # 基础配置
+    """
+    分块配置 - 用户可自定义
+
+    计量模式:
+      - use_token_based=True  → 以 Token 字段为准 (推荐，自动适配中英文)
+      - use_token_based=False → 以字符字段为准 (旧行为，向后兼容)
+
+    当 use_token_based=True 时，运行时会根据实际文本的中英文比例，
+    将 Token 限制自动换算为字符限制。这意味着:
+      - 英文 500 字 → ~125 Tokens → 分块约 500 字符
+      - 中文 500 字 → ~333 Tokens → 分块约 500 字符 (而非之前的 500 字符 ≈ 500 Tokens)
+    """
+    # 基础配置 - 字符计量 (旧字段，向后兼容)
     strategy: ChunkingStrategy = ChunkingStrategy.HYBRID
     base_chunk_size: int = 500          # 基础块大小（字符）
-    chunk_overlap: int = 50             # 块重叠大小
+    chunk_overlap: int = 50             # 块重叠大小（字符）
+
+    # ===== Token 计量 (V3 新增) =====
+    use_token_based: bool = True        # 是否启用 Token 计量模式
+    base_chunk_tokens: int = 128        # 基础块大小（Token） — 约等于 512 英文字符 / 192 中文字符
+    overlap_tokens: int = 16            # 块重叠大小（Token）
+    min_semantic_tokens: int = 32       # 最小语义块（Token）
+    max_semantic_tokens: int = 384      # 最大语义块（Token）
 
     # 语义分块配置（V2: 相邻句子余弦距离算法）
     breakpoint_percentile: float = 95.0  # 断点百分位阈值（距离高于此百分位视为边界）
@@ -62,6 +86,61 @@ class ChunkConfig:
     sentence_split_threshold: int = 200      # 句子级切分阈值
     use_sliding_window: bool = True          # [已弃用] 保留兼容
 
+    def resolve_char_limits(self, text: str = "") -> "ResolvedCharLimits":
+        """
+        根据计量模式和文本内容，解析出运行时使用的字符限制。
+
+        当 use_token_based=True 且有 text:
+          → 按文本语言比例将 Token 转字符
+        当 use_token_based=False 或无 text:
+          → 直接使用字符字段
+        """
+        if self.use_token_based and text:
+            from .token_utils import compute_adaptive_char_limits
+            limits = compute_adaptive_char_limits(
+                base_tokens=self.base_chunk_tokens,
+                text=text,
+                min_tokens=self.min_semantic_tokens,
+                max_tokens=self.max_semantic_tokens,
+                overlap_tokens=self.overlap_tokens,
+            )
+            return ResolvedCharLimits(
+                base_chunk_size=limits["base_chunk_chars"],
+                chunk_overlap=limits["overlap_chars"],
+                min_semantic_chunk=limits["min_semantic_chars"],
+                max_semantic_chunk=limits["max_semantic_chars"],
+                chars_per_token=limits["chars_per_token"],
+                cjk_ratio=limits["language_ratio"]["cjk"],
+                is_token_based=True,
+            )
+        else:
+            return ResolvedCharLimits(
+                base_chunk_size=self.base_chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                min_semantic_chunk=self.min_semantic_chunk,
+                max_semantic_chunk=self.max_semantic_chunk,
+                chars_per_token=4.0,
+                cjk_ratio=0.0,
+                is_token_based=False,
+            )
+
+
+@dataclass
+class ResolvedCharLimits:
+    """
+    运行时解析后的字符限制 — 由 ChunkConfig.resolve_char_limits() 生成。
+
+    分块器内部使用这个结构而非直接读取 ChunkConfig 的字符字段，
+    以确保 Token 计量模式下字符限制已根据语言比例调整。
+    """
+    base_chunk_size: int
+    chunk_overlap: int
+    min_semantic_chunk: int
+    max_semantic_chunk: int
+    chars_per_token: float
+    cjk_ratio: float
+    is_token_based: bool
+
 
 @dataclass
 class ChunkMetadata:
@@ -75,6 +154,7 @@ class ChunkMetadata:
     position_ratio: float = 0.0         # 在文档中的位置比例
     has_citations: bool = False         # 是否包含引用
     keywords: List[str] = field(default_factory=list)   # 关键词
+    token_count: int = 0               # Token 数（V3 新增）
 
 
 @dataclass

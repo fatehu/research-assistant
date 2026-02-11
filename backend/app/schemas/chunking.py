@@ -1,5 +1,10 @@
 """
 智能分块相关的 Pydantic schemas
+
+V3 变更:
+  - ChunkingConfigCreate 新增 Token 计量字段
+  - ChunkingStatsResponse 新增 token 统计
+  - 前端可选择 Token 或字符模式
 """
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -43,20 +48,65 @@ class ChunkingConfigCreate(BaseModel):
         default=ChunkingStrategyEnum.HYBRID,
         description="分块策略"
     )
+
+    # ===== Token 计量 (V3 新增，推荐) =====
+    use_token_based: bool = Field(
+        default=True,
+        description="是否启用 Token 计量模式。开启后系统根据文本的实际中/英比例"
+                    "自动换算分块尺寸，确保中英文文档获得一致的信息密度。"
+    )
+    base_chunk_tokens: int = Field(
+        default=128,
+        ge=16,
+        le=1024,
+        description="基础块大小（Token）。128 Token ≈ 512 英文字符 / 192 中文字符"
+    )
+    overlap_tokens: int = Field(
+        default=16,
+        ge=0,
+        le=128,
+        description="块重叠大小（Token）"
+    )
+    min_semantic_tokens: int = Field(
+        default=32,
+        ge=8,
+        le=256,
+        description="最小语义块（Token）"
+    )
+    max_semantic_tokens: int = Field(
+        default=384,
+        ge=64,
+        le=2048,
+        description="最大语义块（Token）"
+    )
+
+    # ===== 字符计量 (旧字段，向后兼容) =====
     base_chunk_size: int = Field(
         default=500,
         ge=100,
         le=3000,
-        description="基础块大小（字符）"
+        description="基础块大小（字符）— 仅在 use_token_based=False 时生效"
     )
     chunk_overlap: int = Field(
         default=50,
         ge=0,
         le=500,
-        description="块重叠大小"
+        description="块重叠大小（字符）— 仅在 use_token_based=False 时生效"
     )
-    
-    # 语义分块配置（V2: 新增 breakpoint_percentile）
+    min_semantic_chunk: int = Field(
+        default=100,
+        ge=50,
+        le=500,
+        description="最小语义块大小（字符）— 仅在 use_token_based=False 时生效"
+    )
+    max_semantic_chunk: int = Field(
+        default=1500,
+        ge=500,
+        le=5000,
+        description="最大语义块大小（字符）— 仅在 use_token_based=False 时生效"
+    )
+
+    # 语义分块配置（V2: breakpoint_percentile）
     breakpoint_percentile: float = Field(
         default=95.0,
         ge=50.0,
@@ -70,19 +120,7 @@ class ChunkingConfigCreate(BaseModel):
         le=1.0,
         description="[已弃用] 保留以兼容旧 API，不再影响核心语义检测算法"
     )
-    min_semantic_chunk: int = Field(
-        default=100,
-        ge=50,
-        le=500,
-        description="最小语义块大小"
-    )
-    max_semantic_chunk: int = Field(
-        default=1500,
-        ge=500,
-        le=5000,
-        description="最大语义块大小"
-    )
-    
+
     # 层级分块配置
     enable_hierarchical: bool = Field(
         default=True,
@@ -92,7 +130,7 @@ class ChunkingConfigCreate(BaseModel):
         default=[ChunkLevelEnum.PARAGRAPH, ChunkLevelEnum.SECTION],
         description="层级列表"
     )
-    
+
     # 学术文档配置
     detect_academic_structure: bool = Field(
         default=True,
@@ -137,6 +175,7 @@ class ChunkMetadataResponse(BaseModel):
     has_citations: bool = False
     position_ratio: float = 0.0
     keywords: List[str] = []
+    token_count: int = 0
 
 
 class SmartChunkResponse(BaseModel):
@@ -146,7 +185,7 @@ class SmartChunkResponse(BaseModel):
     start_char: int
     end_char: int
     metadata: ChunkMetadataResponse
-    
+
     class Config:
         from_attributes = True
 
@@ -155,9 +194,13 @@ class ChunkingStatsResponse(BaseModel):
     """分块统计"""
     total_chunks: int
     total_chars: int
+    total_tokens: int = 0
     avg_chunk_size: int
     min_chunk_size: int
     max_chunk_size: int
+    avg_chunk_tokens: int = 0
+    min_chunk_tokens: int = 0
+    max_chunk_tokens: int = 0
     chunks_with_citations: int = 0
 
 
@@ -213,9 +256,9 @@ class PresetDescription(BaseModel):
 PRESET_DESCRIPTIONS = [
     PresetDescription(
         name="default",
-        description="默认混合策略，平衡速度和质量",
+        description="默认混合策略，平衡速度和质量，自动适配中英文",
         strategy="hybrid",
-        recommended_for=["通用文档", "混合内容"]
+        recommended_for=["通用文档", "混合内容", "中英文混合"]
     ),
     PresetDescription(
         name="fast",
