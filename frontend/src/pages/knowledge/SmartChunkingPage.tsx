@@ -113,11 +113,10 @@ const PresetCard = ({
     whileTap={{ scale: 0.98 }}
   >
     <Card
-      className={`cursor-pointer transition-all border-2 ${
-        selected
-          ? 'border-emerald-500 bg-emerald-500/10'
-          : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'
-      }`}
+      className={`cursor-pointer transition-all border-2 ${selected
+        ? 'border-emerald-500 bg-emerald-500/10'
+        : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'
+        }`}
       onClick={onClick}
       bodyStyle={{ padding: 16 }}
     >
@@ -208,7 +207,8 @@ export default function SmartChunkingPage() {
     strategy: ChunkingStrategy.HYBRID,
     base_chunk_size: 500,
     chunk_overlap: 50,
-    semantic_threshold: 0.75,
+    breakpoint_percentile: 90,
+    semantic_threshold: 0.75, // 保留以兼容类型定义
     min_semantic_chunk: 100,
     max_semantic_chunk: 1500,
     enable_hierarchical: true,
@@ -364,7 +364,7 @@ export default function SmartChunkingPage() {
           >
             返回{knowledgeBase ? `「${knowledgeBase.name}」` : '知识库'}
           </Button>
-          
+
           <div className="flex items-center justify-between">
             <div>
               <Title level={2} className="text-white mb-2">
@@ -523,78 +523,78 @@ export default function SmartChunkingPage() {
                     {(customConfig.strategy === ChunkingStrategy.SEMANTIC ||
                       customConfig.strategy === ChunkingStrategy.HYBRID ||
                       customConfig.strategy === ChunkingStrategy.ACADEMIC) && (
-                      <>
-                        <Divider className="border-slate-700">语义分块参数</Divider>
-                        <Form.Item
-                          label={
-                            <Tooltip title="相邻文本窗口的余弦相似度低于此阈值时，判定为语义边界。值越低越敏感（产生更多分块），值越高越宽松。">
-                              <Text className="text-slate-300">
-                                语义相似度阈值 <QuestionCircleOutlined className="text-slate-500" />
-                              </Text>
-                            </Tooltip>
-                          }
-                        >
-                          <Slider
-                            min={0.5}
-                            max={0.95}
-                            step={0.05}
-                            value={customConfig.semantic_threshold}
-                            onChange={(v) =>
-                              setCustomConfig({ ...customConfig, semantic_threshold: v })
+                        <>
+                          <Divider className="border-slate-700">语义分块参数</Divider>
+                          <Form.Item
+                            label={
+                              <Tooltip title="语义断点检测的敏感度（百分位）。值越小（如 50），检测到的断点越多，分块越细；值越大（如 95），检测到的断点越少，分块越粗（语义更聚合）。">
+                                <Text className="text-slate-300">
+                                  语义敏感度 (百分位) <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
                             }
-                            marks={{ 0.5: '敏感', 0.65: '0.65', 0.75: '默认', 0.85: '0.85', 0.95: '宽松' }}
-                          />
-                        </Form.Item>
-                        <Row gutter={16}>
-                          <Col span={12}>
-                            <Form.Item
-                              label={
-                                <Tooltip title="语义分块的最小字符数。小于此值的块会被合并到相邻块中，避免产生过碎的分块。">
-                                  <Text className="text-slate-300">
-                                    最小语义块 <QuestionCircleOutlined className="text-slate-500" />
-                                  </Text>
-                                </Tooltip>
+                          >
+                            <Slider
+                              min={20}
+                              max={99}
+                              step={5}
+                              value={customConfig.breakpoint_percentile}
+                              onChange={(v) =>
+                                setCustomConfig({ ...customConfig, breakpoint_percentile: v })
                               }
-                            >
-                              <Slider
-                                min={50}
-                                max={500}
-                                step={25}
-                                value={customConfig.min_semantic_chunk}
-                                onChange={(v) =>
-                                  setCustomConfig({ ...customConfig, min_semantic_chunk: v })
+                              marks={{ 20: '细碎', 50: '50', 75: '75', 90: '默认', 99: '聚合' }}
+                            />
+                          </Form.Item>
+                          <Row gutter={16}>
+                            <Col span={12}>
+                              <Form.Item
+                                label={
+                                  <Tooltip title="语义分块的最小字符数。小于此值的块会被合并到相邻块中，避免产生过碎的分块。">
+                                    <Text className="text-slate-300">
+                                      最小语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                    </Text>
+                                  </Tooltip>
                                 }
-                                marks={{ 50: '50', 100: '100', 250: '250', 500: '500' }}
-                              />
-                              <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_chunk} 字符</Text>
-                            </Form.Item>
-                          </Col>
-                          <Col span={12}>
-                            <Form.Item
-                              label={
-                                <Tooltip title="语义分块的最大字符数。超过此值的块会被强制二次切分，防止单块过大影响检索精度。">
-                                  <Text className="text-slate-300">
-                                    最大语义块 <QuestionCircleOutlined className="text-slate-500" />
-                                  </Text>
-                                </Tooltip>
-                              }
-                            >
-                              <Slider
-                                min={500}
-                                max={3000}
-                                step={100}
-                                value={customConfig.max_semantic_chunk}
-                                onChange={(v) =>
-                                  setCustomConfig({ ...customConfig, max_semantic_chunk: v })
+                              >
+                                <Slider
+                                  min={50}
+                                  max={500}
+                                  step={25}
+                                  value={customConfig.min_semantic_chunk}
+                                  onChange={(v) =>
+                                    setCustomConfig({ ...customConfig, min_semantic_chunk: v })
+                                  }
+                                  marks={{ 50: '50', 100: '100', 250: '250', 500: '500' }}
+                                />
+                                <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_chunk} 字符</Text>
+                              </Form.Item>
+                            </Col>
+                            <Col span={12}>
+                              <Form.Item
+                                label={
+                                  <Tooltip title="语义分块的最大字符数。超过此值的块会被强制二次切分，防止单块过大影响检索精度。">
+                                    <Text className="text-slate-300">
+                                      最大语义块 <QuestionCircleOutlined className="text-slate-500" />
+                                    </Text>
+                                  </Tooltip>
                                 }
-                                marks={{ 500: '500', 1000: '1K', 1500: '默认', 2000: '2K', 3000: '3K' }}
-                              />
-                              <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_chunk} 字符</Text>
-                            </Form.Item>
-                          </Col>
-                        </Row>
-                      </>
-                    )}
+                              >
+                                <Slider
+                                  min={500}
+                                  max={3000}
+                                  step={100}
+                                  value={customConfig.max_semantic_chunk}
+                                  onChange={(v) =>
+                                    setCustomConfig({ ...customConfig, max_semantic_chunk: v })
+                                  }
+                                  marks={{ 500: '500', 1000: '1K', 1500: '默认', 2000: '2K', 3000: '3K' }}
+                                />
+                                <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_chunk} 字符</Text>
+                              </Form.Item>
+                            </Col>
+                          </Row>
+                        </>
+                      )}
 
                     {/* 层级与学术参数 */}
                     <Divider className="border-slate-700">高级选项</Divider>
@@ -752,9 +752,9 @@ export default function SmartChunkingPage() {
                       )}
                     </div>
                     <Text className="text-slate-500 text-sm">{analysisResult.recommended_reason}</Text>
-                    
+
                     <Divider className="border-slate-700 my-2" />
-                    
+
                     <Row gutter={8}>
                       <Col span={6}>
                         <Statistic
@@ -800,11 +800,11 @@ export default function SmartChunkingPage() {
                               <Badge
                                 color={
                                   section.type === 'abstract' ? '#f59e0b' :
-                                  section.type === 'methodology' ? '#3b82f6' :
-                                  section.type === 'results' ? '#10b981' :
-                                  section.type === 'conclusion' ? '#8b5cf6' :
-                                  section.type === 'references' ? '#ef4444' :
-                                  '#64748b'
+                                    section.type === 'methodology' ? '#3b82f6' :
+                                      section.type === 'results' ? '#10b981' :
+                                        section.type === 'conclusion' ? '#8b5cf6' :
+                                          section.type === 'references' ? '#ef4444' :
+                                            '#64748b'
                                 }
                               />
                               <Text className="text-slate-300 text-xs flex-1 truncate" title={section.title}>
@@ -883,7 +883,7 @@ export default function SmartChunkingPage() {
                       <Tag color="blue">平均 {testResult.stats.avg_chunk_size} 字符</Tag>
                     </Space>
                   </div>
-                  
+
                   <div className="max-h-96 overflow-y-auto pr-2">
                     {testResult.chunks.slice(0, 10).map((chunk, idx) => (
                       <ChunkCard key={chunk.id} chunk={chunk} index={idx} />

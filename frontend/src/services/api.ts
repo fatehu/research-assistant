@@ -1791,6 +1791,7 @@ export interface ChunkingConfig {
   hierarchy_levels: ChunkLevel[]
   detect_academic_structure: boolean
   preserve_citations: boolean
+  breakpoint_percentile: number
 }
 
 export interface ChunkingConfigResponse extends ChunkingConfig {
