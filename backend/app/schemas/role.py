@@ -24,6 +24,11 @@ class UserAdminUpdate(BaseModel):
     role: Optional[UserRole] = None
 
 
+class UserPasswordUpdate(BaseModel):
+    """管理员修改用户密码"""
+    password: str = Field(..., min_length=6, max_length=100)
+
+
 class AdminCreateUserRequest(BaseModel):
     """管理员创建用户请求"""
     email: EmailStr

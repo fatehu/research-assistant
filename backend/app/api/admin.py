@@ -17,7 +17,7 @@ from app.models.literature import Paper
 from app.models.notebook import Notebook
 from app.schemas.role import (
     UserListResponse, UserAdminUpdate, UserRoleUpdate, SystemStatistics,
-    AdminCreateUserRequest
+    AdminCreateUserRequest, UserPasswordUpdate
 )
 
 router = APIRouter()
@@ -258,6 +258,30 @@ async def update_user_info(
     logger.info(f"管理员 {current_user.username} 更新了用户 {user.username} 的信息")
     
     return UserListResponse.model_validate(user)
+
+
+@router.put("/users/{user_id}/password")
+async def update_user_password(
+    user_id: int,
+    data: UserPasswordUpdate,
+    current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """修改用户密码（管理员）"""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    # 更新密码
+    user.hashed_password = get_password_hash(data.password)
+    
+    await db.commit()
+    
+    logger.info(f"管理员 {current_user.username} 修改了用户 {user.username} 的密码")
+    
+    return {"message": "密码修改成功"}
 
 
 @router.put("/users/{user_id}/toggle-active")

@@ -3,8 +3,8 @@
  * 设计风格: 学术深空 - 深色背景配合优雅的金色与蓝色点缀
  */
 import React, { useEffect, useState } from 'react';
-import { 
-  Table, Tag, Space, Button, Input, Select, Modal, message, 
+import {
+  Table, Tag, Space, Button, Input, Select, Modal, message,
   Card, Row, Col, Avatar, Tooltip, Dropdown, Badge, Form,
   Typography, Spin, Empty
 } from 'antd';
@@ -42,7 +42,7 @@ const roleIcons: Record<UserRole, React.ReactNode> = {
 };
 
 const UsersPage: React.FC = () => {
-  const { 
+  const {
     users, usersLoading, statistics, statisticsLoading,
     fetchUsers, fetchStatistics, updateUserRole, toggleUserActive, deleteUser
   } = useRoleStore();
@@ -58,8 +58,14 @@ const UsersPage: React.FC = () => {
   const [createLoading, setCreateLoading] = useState(false);
   const [editModalVisible, setEditModalVisible] = useState(false);
   const [editLoading, setEditLoading] = useState(false);
+
+  // 修改密码相关状态
+  const [passwordModalVisible, setPasswordModalVisible] = useState(false);
+  const [passwordLoading, setPasswordLoading] = useState(false);
+
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
+  const [passwordForm] = Form.useForm();
 
   useEffect(() => {
     fetchStatistics();
@@ -154,6 +160,21 @@ const UsersPage: React.FC = () => {
     }
   };
 
+  const handleUpdatePassword = async (values: any) => {
+    if (!selectedUser) return;
+    setPasswordLoading(true);
+    try {
+      await api.put(`/api/admin/users/${selectedUser.id}/password`, values);
+      message.success('用户密码已修改');
+      setPasswordModalVisible(false);
+      passwordForm.resetFields();
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '修改失败');
+    } finally {
+      setPasswordLoading(false);
+    }
+  };
+
   // 表格列定义 - 紧凑版
   const columns: ColumnsType<UserInfo> = [
     {
@@ -162,9 +183,9 @@ const UsersPage: React.FC = () => {
       width: 200,
       render: (_, record) => (
         <Space size="small">
-          <Avatar 
+          <Avatar
             size="small"
-            src={record.avatar} 
+            src={record.avatar}
             icon={<UserOutlined />}
             style={{ backgroundColor: roleColors[record.role] }}
           />
@@ -192,7 +213,7 @@ const UsersPage: React.FC = () => {
       key: 'role',
       width: 90,
       render: (role: UserRole) => (
-        <Tag 
+        <Tag
           icon={roleIcons[role]}
           color={roleColors[role]}
           style={{ borderRadius: 10, padding: '1px 8px', fontSize: 11 }}
@@ -225,8 +246,8 @@ const UsersPage: React.FC = () => {
       key: 'is_active',
       width: 70,
       render: (isActive) => (
-        <Badge 
-          status={isActive ? 'success' : 'error'} 
+        <Badge
+          status={isActive ? 'success' : 'error'}
           text={<span style={{ color: isActive ? '#52c41a' : '#ff4d4f', fontSize: 11 }}>
             {isActive ? '正常' : '禁用'}
           </span>}
@@ -279,6 +300,15 @@ const UsersPage: React.FC = () => {
                 },
               },
               {
+                key: 'password',
+                icon: <LockOutlined />,
+                label: '修改密码',
+                onClick: () => {
+                  setSelectedUser(record);
+                  setPasswordModalVisible(true);
+                },
+              },
+              {
                 key: 'toggle',
                 icon: record.is_active ? <StopOutlined /> : <CheckCircleOutlined />,
                 label: record.is_active ? '禁用账户' : '启用账户',
@@ -317,9 +347,9 @@ const UsersPage: React.FC = () => {
     color: string;
     icon: React.ReactNode;
   }> = ({ label, value, color, icon }) => (
-    <div style={{ 
-      display: 'flex', 
-      alignItems: 'center', 
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
       gap: 6,
       padding: '6px 12px',
       background: `${color}10`,
@@ -333,24 +363,24 @@ const UsersPage: React.FC = () => {
   );
 
   return (
-    <div style={{ 
+    <div style={{
       padding: '20px 24px',
       height: '100vh',
       overflow: 'auto',
       background: 'linear-gradient(180deg, #0D1117 0%, #161B22 100%)',
     }}>
       {/* 页面标题和统计 */}
-      <div style={{ 
-        display: 'flex', 
-        justifyContent: 'space-between', 
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
         alignItems: 'center',
         marginBottom: 16,
         flexWrap: 'wrap',
         gap: 12,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <Title level={4} style={{ 
-            margin: 0, 
+          <Title level={4} style={{
+            margin: 0,
             color: '#E8E8E8',
             fontWeight: 600,
             display: 'flex',
@@ -360,7 +390,7 @@ const UsersPage: React.FC = () => {
             <CrownOutlined style={{ color: '#D4AF37' }} />
             用户管理
           </Title>
-          
+
           {/* 紧凑统计 */}
           <Spin spinning={statisticsLoading} size="small">
             <div style={{ display: 'flex', gap: 8 }}>
@@ -371,8 +401,8 @@ const UsersPage: React.FC = () => {
             </div>
           </Spin>
         </div>
-        
-        <Button 
+
+        <Button
           type="primary"
           icon={<UserAddOutlined />}
           onClick={() => setCreateModalVisible(true)}
@@ -392,8 +422,8 @@ const UsersPage: React.FC = () => {
         styles={{ body: { padding: 0 } }}
       >
         {/* 工具栏 */}
-        <div style={{ 
-          padding: '12px 16px', 
+        <div style={{
+          padding: '12px 16px',
           borderBottom: '1px solid #30363D',
           display: 'flex',
           justifyContent: 'space-between',
@@ -407,7 +437,7 @@ const UsersPage: React.FC = () => {
               value={searchText}
               onChange={(e) => setSearchText(e.target.value)}
               onPressEnter={handleSearch}
-              style={{ 
+              style={{
                 width: 180,
                 backgroundColor: '#0D1117',
                 borderColor: '#30363D',
@@ -435,8 +465,8 @@ const UsersPage: React.FC = () => {
               <Option value={true}>正常</Option>
               <Option value={false}>禁用</Option>
             </Select>
-            <Button 
-              type="primary" 
+            <Button
+              type="primary"
               icon={<SearchOutlined />}
               onClick={handleSearch}
               size="small"
@@ -446,8 +476,8 @@ const UsersPage: React.FC = () => {
             </Button>
           </Space>
           <Tooltip title="刷新">
-            <Button 
-              icon={<ReloadOutlined />} 
+            <Button
+              icon={<ReloadOutlined />}
               onClick={() => { loadUsers(); fetchStatistics(); }}
               size="small"
               style={{ borderColor: '#30363D' }}
@@ -476,7 +506,7 @@ const UsersPage: React.FC = () => {
           }}
           locale={{
             emptyText: (
-              <Empty 
+              <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
                 description={<span style={{ color: '#8899A6' }}>暂无用户</span>}
               />
@@ -628,6 +658,47 @@ const UsersPage: React.FC = () => {
               <Option value={UserRole.MENTOR}>导师</Option>
               <Option value={UserRole.ADMIN}>管理员</Option>
             </Select>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 修改密码弹窗 */}
+      <Modal
+        title={<span style={{ color: '#E8E8E8' }}><LockOutlined style={{ marginRight: 8, color: '#D4AF37' }} />修改用户密码</span>}
+        open={passwordModalVisible}
+        onOk={() => passwordForm.submit()}
+        onCancel={() => { setPasswordModalVisible(false); passwordForm.resetFields(); }}
+        okText="修改"
+        cancelText="取消"
+        confirmLoading={passwordLoading}
+        width={400}
+        styles={{
+          content: { backgroundColor: '#161B22', border: '1px solid #30363D' },
+          header: { backgroundColor: '#161B22', borderBottom: '1px solid #30363D' },
+          body: { backgroundColor: '#161B22' },
+          footer: { backgroundColor: '#161B22', borderTop: '1px solid #30363D' },
+        }}
+      >
+        {selectedUser && (
+          <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Avatar src={selectedUser.avatar} icon={<UserOutlined />} style={{ backgroundColor: roleColors[selectedUser.role] }} />
+            <div>
+              <div style={{ fontWeight: 600, color: '#E8E8E8' }}>@{selectedUser.username}</div>
+              <Text style={{ color: '#8899A6', fontSize: 12 }}>{selectedUser.email}</Text>
+            </div>
+          </div>
+        )}
+        <Form form={passwordForm} layout="vertical" onFinish={handleUpdatePassword}>
+          <Form.Item
+            name="password"
+            label={<span style={{ color: '#8899A6' }}>新密码</span>}
+            rules={[{ required: true, message: '请输入新密码' }, { min: 6, message: '至少6位' }]}
+          >
+            <Input.Password
+              prefix={<LockOutlined style={{ color: '#8899A6' }} />}
+              placeholder="请输入新密码"
+              style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }}
+            />
           </Form.Item>
         </Form>
       </Modal>
@@ -784,7 +855,7 @@ const UsersPage: React.FC = () => {
         .ant-dropdown-menu-item-danger .anticon { color: hsl(0, 75%, 60%) !important; }
         .ant-dropdown-menu-item-danger:hover { background: hsla(0, 70%, 55%, 0.12) !important; }
       `}</style>
-    </div>
+    </div >
   );
 };
 
