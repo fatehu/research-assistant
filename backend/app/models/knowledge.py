@@ -107,6 +107,7 @@ class KnowledgeBase(Base):
             return self.metadata_["chunking_config"]
         return {
             "strategy": "hybrid",
+            "breakpoint_percentile": 95.0,
             "semantic_threshold": 0.75,
             "enable_hierarchical": True,
         }

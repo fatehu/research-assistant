@@ -642,6 +642,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 strategy=ChunkingStrategy(kb_config.get("strategy", "hybrid")),
                 base_chunk_size=kb.chunk_size,
                 chunk_overlap=kb.chunk_overlap,
+                breakpoint_percentile=kb_config.get("breakpoint_percentile", 95.0),
                 semantic_threshold=kb_config.get("semantic_threshold", 0.75),
                 min_semantic_chunk=kb_config.get("min_semantic_chunk", 100),
                 max_semantic_chunk=kb_config.get("max_semantic_chunk", 1500),
