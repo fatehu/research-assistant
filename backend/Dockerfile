@@ -11,14 +11,17 @@ RUN apt-get update && apt-get install -y \
 # 复制依赖文件
 COPY requirements.txt .
 
+# 安装 PyTorch CPU 版 (减小镜像体积, 如需 GPU 请注释掉此行并安装 CUDA 版)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码
 COPY . .
 
-# 创建上传目录
-RUN mkdir -p /app/uploads
+# 创建必要目录
+RUN mkdir -p /app/uploads /app/model_cache
 
 # 暴露端口
 EXPOSE 8000

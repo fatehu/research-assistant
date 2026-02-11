@@ -6,41 +6,41 @@ interface KnowledgeState {
   knowledgeBases: KnowledgeBase[]
   currentKnowledgeBase: KnowledgeBase | null
   totalKnowledgeBases: number
-  
+
   // 文档列表
   documents: Document[]
   currentDocument: Document | null
   totalDocuments: number
-  
+
   // 分片列表
   chunks: DocumentChunk[]
   totalChunks: number
-  
+
   // 搜索结果
   searchResults: SearchResult[]
   searchQuery: string
   searchTime: number
-  
+
   // 加载状态
   isLoading: boolean
   isUploading: boolean
   isSearching: boolean
-  
+
   // Actions
   fetchKnowledgeBases: () => Promise<void>
-  createKnowledgeBase: (name: string, description?: string) => Promise<KnowledgeBase>
+  createKnowledgeBase: (name: string, description?: string, embedding_model?: string) => Promise<KnowledgeBase>
   selectKnowledgeBase: (kbId: number) => Promise<void>
   updateKnowledgeBase: (kbId: number, data: Partial<KnowledgeBase>) => Promise<void>
   deleteKnowledgeBase: (kbId: number) => Promise<void>
-  
+
   fetchDocuments: (kbId: number) => Promise<void>
   uploadDocument: (kbId: number, file: File) => Promise<Document>
   selectDocument: (kbId: number, docId: number) => Promise<void>
   deleteDocument: (kbId: number, docId: number) => Promise<void>
   refreshDocumentStatus: (kbId: number, docId: number) => Promise<void>
-  
+
   fetchChunks: (kbId: number, docId: number) => Promise<void>
-  
+
   search: (
     query: string,
     knowledgeBaseIds?: number[],
@@ -50,7 +50,7 @@ interface KnowledgeState {
     includeParentContext?: boolean,
   ) => Promise<SearchResponse>
   clearSearch: () => void
-  
+
   clearCurrentKnowledgeBase: () => void
   clearCurrentDocument: () => void
 }
@@ -59,24 +59,24 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
   knowledgeBases: [],
   currentKnowledgeBase: null,
   totalKnowledgeBases: 0,
-  
+
   documents: [],
   currentDocument: null,
   totalDocuments: 0,
-  
+
   chunks: [],
   totalChunks: 0,
-  
+
   searchResults: [],
   searchQuery: '',
   searchTime: 0,
-  
+
   isLoading: false,
   isUploading: false,
   isSearching: false,
-  
+
   // ========== 知识库操作 ==========
-  
+
   fetchKnowledgeBases: async () => {
     set({ isLoading: true })
     try {
@@ -87,16 +87,16 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       set({ isLoading: false })
     }
   },
-  
-  createKnowledgeBase: async (name: string, description?: string) => {
-    const kb = await knowledgeApi.createKnowledgeBase({ name, description })
+
+  createKnowledgeBase: async (name: string, description?: string, embedding_model?: string) => {
+    const kb = await knowledgeApi.createKnowledgeBase({ name, description, embedding_model })
     set((state) => ({
       knowledgeBases: [kb, ...state.knowledgeBases],
       totalKnowledgeBases: state.totalKnowledgeBases + 1,
     }))
     return kb
   },
-  
+
   selectKnowledgeBase: async (kbId: number) => {
     set({ isLoading: true })
     try {
@@ -110,7 +110,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       throw error
     }
   },
-  
+
   updateKnowledgeBase: async (kbId: number, data: Partial<KnowledgeBase>) => {
     const kb = await knowledgeApi.updateKnowledgeBase(kbId, data)
     set((state) => ({
@@ -118,7 +118,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       currentKnowledgeBase: state.currentKnowledgeBase?.id === kbId ? kb : state.currentKnowledgeBase,
     }))
   },
-  
+
   deleteKnowledgeBase: async (kbId: number) => {
     await knowledgeApi.deleteKnowledgeBase(kbId)
     const { currentKnowledgeBase } = get()
@@ -129,9 +129,9 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       documents: currentKnowledgeBase?.id === kbId ? [] : state.documents,
     }))
   },
-  
+
   // ========== 文档操作 ==========
-  
+
   fetchDocuments: async (kbId: number) => {
     set({ isLoading: true })
     try {
@@ -142,7 +142,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       set({ isLoading: false })
     }
   },
-  
+
   uploadDocument: async (kbId: number, file: File) => {
     set({ isUploading: true })
     try {
@@ -158,7 +158,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       throw error
     }
   },
-  
+
   selectDocument: async (kbId: number, docId: number) => {
     set({ isLoading: true })
     try {
@@ -170,7 +170,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       throw error
     }
   },
-  
+
   deleteDocument: async (kbId: number, docId: number) => {
     await knowledgeApi.deleteDocument(kbId, docId)
     const { currentDocument } = get()
@@ -182,7 +182,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     // 刷新知识库信息
     await get().selectKnowledgeBase(kbId)
   },
-  
+
   refreshDocumentStatus: async (kbId: number, docId: number) => {
     try {
       const status = await knowledgeApi.getDocumentStatus(kbId, docId)
@@ -198,9 +198,9 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       console.error('获取文档状态失败:', error)
     }
   },
-  
+
   // ========== 分片操作 ==========
-  
+
   fetchChunks: async (kbId: number, docId: number) => {
     set({ isLoading: true })
     try {
@@ -211,9 +211,9 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       set({ isLoading: false })
     }
   },
-  
+
   // ========== 搜索操作 ==========
-  
+
   search: async (
     query: string,
     knowledgeBaseIds?: number[],
@@ -240,17 +240,17 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       throw error
     }
   },
-  
+
   clearSearch: () => {
     set({ searchResults: [], searchQuery: '', searchTime: 0 })
   },
-  
+
   // ========== 清理操作 ==========
-  
+
   clearCurrentKnowledgeBase: () => {
     set({ currentKnowledgeBase: null, documents: [], totalDocuments: 0 })
   },
-  
+
   clearCurrentDocument: () => {
     set({ currentDocument: null, chunks: [], totalChunks: 0 })
   },

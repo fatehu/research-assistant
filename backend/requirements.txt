@@ -59,6 +59,14 @@ plotly==5.19.0
 # torch==2.2.0
 # transformers==4.37.0
 
+# ========== 本地嵌入模型依赖 ==========
+# sentence-transformers (自动安装 torch + transformers + huggingface_hub)
+sentence-transformers>=3.0.0
+# 如需指定 CPU 版 torch 以减小体积:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 如需 CUDA 加速:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
 # Jupyter 相关工具 (用于格式处理)
 nbformat==5.9.2
 nbconvert==7.14.2

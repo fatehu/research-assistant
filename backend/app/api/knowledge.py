@@ -33,7 +33,7 @@ from app.schemas.knowledge import (
     ProcessingStatus,
 )
 from app.services.document_service import get_document_processor
-from app.services.embedding_service import get_embedding_service
+from app.services.embedding_service import get_embedding_service, MODEL_DIMENSIONS
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -55,6 +55,87 @@ router = APIRouter()
 # 文件上传目录
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ========== 可用嵌入模型注册表 ==========
+
+# 面向用户的模型描述信息
+EMBEDDING_MODEL_CATALOG = [
+    # 本地模型 (sentence-transformers)
+    {
+        "id": "BAAI/bge-m3",
+        "name": "BGE-M3 (推荐)",
+        "dimension": 1024,
+        "provider": "local",
+        "description": "多语言SOTA, 支持中英文, 科研论文表现优秀",
+        "max_tokens": 8192,
+    },
+    {
+        "id": "BAAI/bge-large-zh-v1.5",
+        "name": "BGE-Large-ZH",
+        "dimension": 1024,
+        "provider": "local",
+        "description": "中文优化, 适合纯中文文档",
+        "max_tokens": 512,
+    },
+    {
+        "id": "BAAI/bge-large-en-v1.5",
+        "name": "BGE-Large-EN",
+        "dimension": 1024,
+        "provider": "local",
+        "description": "英文优化, 适合纯英文文档",
+        "max_tokens": 512,
+    },
+    {
+        "id": "allenai/specter2",
+        "name": "SPECTER2 (科研专用)",
+        "dimension": 768,
+        "provider": "local",
+        "description": "Allen AI 专为科研论文设计, 仅英文",
+        "max_tokens": 512,
+    },
+    {
+        "id": "BAAI/bge-base-zh-v1.5",
+        "name": "BGE-Base-ZH",
+        "dimension": 768,
+        "provider": "local",
+        "description": "中文轻量级, 速度更快",
+        "max_tokens": 512,
+    },
+    {
+        "id": "sentence-transformers/all-MiniLM-L6-v2",
+        "name": "MiniLM-L6 (轻量)",
+        "dimension": 384,
+        "provider": "local",
+        "description": "超轻量英文模型, 适合快速原型",
+        "max_tokens": 256,
+    },
+    # API 模型
+    {
+        "id": "text-embedding-v2",
+        "name": "阿里云 text-embedding-v2",
+        "dimension": 1536,
+        "provider": "aliyun",
+        "description": "阿里云 DashScope, 支持中英文",
+        "max_tokens": 2048,
+    },
+    {
+        "id": "text-embedding-3-small",
+        "name": "OpenAI text-embedding-3-small",
+        "dimension": 1536,
+        "provider": "openai",
+        "description": "OpenAI 嵌入模型, 英文表现优秀",
+        "max_tokens": 8191,
+    },
+    {
+        "id": "nomic-embed-text",
+        "name": "Nomic Embed (Ollama)",
+        "dimension": 768,
+        "provider": "ollama",
+        "description": "Ollama 本地 API, 开源可控",
+        "max_tokens": 8192,
+    },
+]
 
 
 # ========== 共享知识库辅助函数 ==========
@@ -144,6 +225,47 @@ async def get_shared_kb_ids(current_user: User, db: AsyncSession) -> Set[int]:
             logger.warning(f"无效的知识库ID: {row[0]}")
     logger.info(f"用户 {current_user.id} 可访问的共享知识库: {result}")
     return result
+
+
+# ========== 嵌入模型列表 ==========
+
+@router.get("/embedding-models")
+async def list_embedding_models(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    获取可用的嵌入模型列表
+    
+    返回所有支持的嵌入模型及其配置信息，前端用于创建知识库时选择模型。
+    会标注当前系统正在使用的模型。
+    """
+    from app.config import settings
+    from app.models.knowledge import EMBEDDING_DIMENSION
+    
+    current_model = (
+        settings.local_embedding_model
+        if settings.embedding_provider == "local"
+        else settings.aliyun_embedding_model
+        if settings.embedding_provider == "aliyun"
+        else "text-embedding-3-small"
+        if settings.embedding_provider == "openai"
+        else "nomic-embed-text"
+    )
+    
+    models = []
+    for model in EMBEDDING_MODEL_CATALOG:
+        models.append({
+            **model,
+            "is_current": model["id"] == current_model,
+            "compatible": model["dimension"] == EMBEDDING_DIMENSION,
+        })
+    
+    return {
+        "models": models,
+        "current_model": current_model,
+        "current_provider": settings.embedding_provider,
+        "current_dimension": EMBEDDING_DIMENSION,
+    }
 
 
 # ========== 知识库 CRUD ==========
@@ -246,11 +368,21 @@ async def create_knowledge_base(
     current_user: User = Depends(get_current_user),
 ):
     """创建知识库"""
+    # 根据选择的模型确定向量维度
+    embedding_model = data.embedding_model
+    embedding_dimension = MODEL_DIMENSIONS.get(embedding_model)
+    if not embedding_dimension:
+        # 未知模型，使用系统默认维度
+        from app.models.knowledge import EMBEDDING_DIMENSION
+        embedding_dimension = EMBEDDING_DIMENSION
+        logger.warning(f"未知嵌入模型 {embedding_model}，使用系统默认维度 {embedding_dimension}")
+    
     kb = KnowledgeBase(
         user_id=current_user.id,
         name=data.name,
         description=data.description,
-        embedding_model=data.embedding_model,
+        embedding_model=embedding_model,
+        embedding_dimension=embedding_dimension,
         chunk_size=data.chunk_size,
         chunk_overlap=data.chunk_overlap,
     )
@@ -258,7 +390,7 @@ async def create_knowledge_base(
     await db.commit()
     await db.refresh(kb)
     
-    logger.info(f"用户 {current_user.id} 创建知识库: {kb.name}")
+    logger.info(f"用户 {current_user.id} 创建知识库: {kb.name}, 模型: {embedding_model}, 维度: {embedding_dimension}")
     return KnowledgeBaseResponse.model_validate(kb)
 
 

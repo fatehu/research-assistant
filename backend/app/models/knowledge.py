@@ -12,8 +12,29 @@ import enum
 from app.core.database import Base
 
 
-# 阿里云 text-embedding-v2 向量维度
-EMBEDDING_DIMENSION = 1536
+# 向量维度 - 根据嵌入模型动态确定
+# 从 embedding_service 获取实际维度，避免硬编码
+def _get_embedding_dimension() -> int:
+    """获取当前配置的嵌入模型维度"""
+    from app.services.embedding_service import MODEL_DIMENSIONS
+    from app.config import settings
+    
+    if settings.embedding_provider == "local":
+        model = settings.local_embedding_model
+        target_dim = settings.local_embedding_dimension
+        if target_dim > 0:
+            return target_dim
+        return MODEL_DIMENSIONS.get(model, 1024)
+    elif settings.embedding_provider == "aliyun":
+        return 1536
+    elif settings.embedding_provider == "openai":
+        return 1536
+    elif settings.embedding_provider == "ollama":
+        return 768
+    return 1024
+
+
+EMBEDDING_DIMENSION = _get_embedding_dimension()
 
 
 class DocumentStatus(str, enum.Enum):
@@ -52,7 +73,7 @@ class KnowledgeBase(Base):
     description = Column(Text, nullable=True)
     
     # 配置
-    embedding_model = Column(String(100), default="text-embedding-v2")
+    embedding_model = Column(String(100), default="BAAI/bge-m3")
     embedding_dimension = Column(Integer, default=EMBEDDING_DIMENSION)
     chunk_size = Column(Integer, default=500)
     chunk_overlap = Column(Integer, default=50)
@@ -166,7 +187,7 @@ class DocumentChunk(Base):
     end_char = Column(Integer, default=0)
     
     # 向量 - 使用 pgvector 的 Vector 类型
-    # 阿里云 text-embedding-v2 输出 1536 维向量
+    # 维度由 EMBEDDING_DIMENSION 动态确定 (取决于所选嵌入模型)
     embedding = Column(Vector(EMBEDDING_DIMENSION), nullable=True)
     embedding_model = Column(String(100), nullable=True)
     

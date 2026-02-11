@@ -55,9 +55,23 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
     
     # ========== Embedding 配置 ==========
-    embedding_provider: str = "aliyun"
+    embedding_provider: str = "local"  # local / aliyun / openai / ollama
     aliyun_embedding_api_key: str = ""
     aliyun_embedding_model: str = "text-embedding-v2"
+    
+    # 本地嵌入模型配置 (sentence-transformers)
+    # 推荐科研模型:
+    #   BAAI/bge-m3          - 多语言科研通用, 1024维, 支持中英文 (默认推荐)
+    #   allenai/specter2     - Allen AI 科研论文专用, 768维, 仅英文
+    #   BAAI/bge-large-zh-v1.5 - 中文优化, 1024维
+    #   nomic-ai/nomic-embed-text-v1.5 - 轻量级, 768维
+    local_embedding_model: str = "BAAI/bge-m3"
+    local_embedding_device: str = "auto"         # auto / cpu / cuda / mps
+    local_embedding_batch_size: int = 32         # 本地推理批量大小
+    local_embedding_max_length: int = 8192       # 最大输入token数 (bge-m3 支持 8192)
+    local_embedding_cache_dir: str = ""          # 模型缓存目录, 为空则使用默认
+    local_embedding_normalize: bool = True       # 是否L2归一化向量
+    local_embedding_dimension: int = 0           # 0=使用模型默认维度, >0 则截断 (Matryoshka)
     
     # ========== LLM 推理参数 ==========
     llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)

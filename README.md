@@ -1,379 +1,246 @@
-# 研究助手多角色系统 (Multi-Role Research Assistant)
+# 研究助手系统 (Research Assistant)
 
-[![Version](https://img.shields.io/badge/version-1.0.18-blue.svg)]()
-[![Sessions](https://img.shields.io/badge/sessions-1--18-green.svg)]()
+一个为科研团队设计的智能研究助手平台，集成 AI 对话、知识库管理、文献管理、代码实验室等功能，支持多角色协作与资源共享。
 
-一个为科研团队设计的智能研究助手系统，支持多角色协作、资源共享、AI 对话等功能。
+## ✨ 核心功能
 
-## 🎯 系统概述
+| 模块 | 说明 |
+|------|------|
+| 🤖 **AI 智能对话** | 多 LLM 支持（DeepSeek、OpenAI、Ollama）、流式响应、ReAct Agent 工具调用 |
+| 📚 **知识库** | 文档向量化、语义搜索、RAG 检索、**智能分块**（层级化 / 多策略）|
+| 🔬 **文献管理** | Semantic Scholar / arXiv 论文搜索、PDF 下载、收藏分类、阅读标注 |
+| 💻 **代码实验室** | Jupyter 风格笔记本、Python 沙箱执行、AI Notebook Agent |
+| 👥 **多角色协作** | 管理员 / 导师 / 学生三级角色、研究组、邀请系统、资源共享 |
 
-### 核心功能
+## 🏗️ 技术栈
 
-| 功能模块 | 说明 |
-|---------|------|
-| **多角色系统** | 管理员、导师、学生三级角色体系 |
-| **团队协作** | 研究组管理、邀请系统、导师-学生关系 |
-| **资源共享** | 论文、知识库、文献集、笔记本共享 |
-| **AI 智能助手** | 基于知识库的对话、代码执行、文献分析 |
-| **文献管理** | 论文搜索、收藏、分类、标注 |
-| **知识库** | 文档向量化、语义搜索、RAG 检索 |
-| **代码实验室** | Jupyter 风格笔记本、Python 执行环境 |
+| 层级 | 技术 |
+|------|------|
+| **前端** | React 18 + TypeScript + Vite + Ant Design + Zustand + Framer Motion |
+| **后端** | FastAPI + SQLAlchemy (async) + PostgreSQL + pgvector + Redis |
+| **AI/ML** | sentence-transformers（本地嵌入）、多 LLM Provider 抽象层 |
+| **部署** | Docker Compose 一键部署 |
 
-### 角色权限
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                        管理员 (Admin)                       │
-│  • 用户管理（创建、审核、禁用）                              │
-│  • 角色分配（设置导师、学生）                                │
-│  • 系统配置                                                │
-└────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌────────────────────────────────────────────────────────────┐
-│                        导师 (Mentor)                        │
-│  • 学生管理（邀请、移除、查看活动）                          │
-│  • 研究组管理（创建、配置、成员管理）                        │
-│  • 资源共享（知识库、论文、笔记本）                          │
-│  • 发布公告                                                │
-└────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌────────────────────────────────────────────────────────────┐
-│                        学生 (Student)                       │
-│  • 访问共享资源（只读）                                      │
-│  • 个人文献库管理                                           │
-│  • 个人知识库管理                                           │
-│  • AI 对话（可使用共享知识库）                               │
-│  • 查看公告、申请加入研究组                                  │
-└────────────────────────────────────────────────────────────┘
-```
-
-## 📦 安装指南
+## 📦 快速开始
 
 ### 前置要求
 
 - Docker & Docker Compose
-- 已部署的研究助手基础系统
+- 至少 4GB 内存（本地嵌入模型需要）
 
-### 快速安装
-
-```bash
-# 1. 解压补丁包
-unzip multi-role-patch.zip
-
-# 2. 备份现有文件
-cp -r backend/app backend/app.bak
-cp -r frontend/src frontend/src.bak
-
-# 3. 应用补丁
-cp -rf patch/backend/* backend/
-cp -rf patch/frontend/* frontend/
-
-# 4. 运行数据库迁移
-docker exec -it research_backend alembic upgrade head
-
-# 5. 重启服务
-docker-compose restart backend frontend
-
-# 6. 创建管理员账户
-docker exec -it research_backend python scripts/create_admin.py
-```
-
-### 升级已有系统
-
-如果您之前已安装过旧版本，需要先修改数据库：
+### 部署步骤
 
 ```bash
-# 修改 shared_resources 表的 resource_id 列类型
-docker exec -i research_postgres psql -U research_user -d research_assistant \
-  < patch/backend/scripts/migrate_resource_id_type.sql
+# 1. 克隆仓库
+git clone <repo-url>
+cd research-assistant
+
+# 2. 配置环境变量
+cp .env.example .env
+# 编辑 .env，配置 LLM API Key 等
+
+# 3. 启动服务
+docker compose up -d
+
+# 4. 访问
+# 前端: http://localhost:3000
+# 后端 API: http://localhost:8888
 ```
+
+### 服务端口
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| Frontend | 3000 | React 前端 |
+| Backend | 8888 | FastAPI 后端 API |
+| PostgreSQL | 5432 | 数据库（含 pgvector 扩展）|
+| Redis | 6379 | 缓存 & 会话管理 |
 
 ## 🔧 配置说明
 
-### 环境变量
+### 嵌入模型
 
-在 `.env` 文件中配置：
+系统支持 **本地嵌入** 和 **API 嵌入** 两种方式，在 `.env` 中配置：
 
 ```env
-# 共享功能开关（默认开启）
-SHARING_ENABLED=true
+# 嵌入提供者: local / aliyun / openai / ollama
+EMBEDDING_PROVIDER=local
 
-# 数据库配置
-DATABASE_URL=postgresql+asyncpg://user:pass@localhost/dbname
-
-# AI 模型配置
-OPENAI_API_KEY=your_api_key
+# 本地模型配置
+LOCAL_EMBEDDING_MODEL=BAAI/bge-m3       # 推荐: 多语言SOTA
+LOCAL_EMBEDDING_DEVICE=auto             # auto / cpu / cuda / mps
+LOCAL_EMBEDDING_DIMENSION=0             # 0=使用模型默认维度
 ```
 
-## 📖 功能详解
+**创建知识库时可选择嵌入模型**，支持的模型包括：
 
-### 1. 多角色系统
+| 模型 | 维度 | 类型 | 说明 |
+|------|------|------|------|
+| `BAAI/bge-m3` | 1024 | 本地 | 多语言 SOTA，推荐 |
+| `BAAI/bge-large-zh-v1.5` | 1024 | 本地 | 中文优化 |
+| `BAAI/bge-large-en-v1.5` | 1024 | 本地 | 英文优化 |
+| `allenai/specter2` | 768 | 本地 | 科研论文专用 |
+| `text-embedding-v2` | 1536 | 阿里云 API | DashScope |
+| `text-embedding-3-small` | 1536 | OpenAI API | OpenAI |
+| `nomic-embed-text` | 768 | Ollama | 本地 API |
 
-#### 创建管理员
-```bash
-docker exec -it research_backend python scripts/create_admin.py
-# 按提示输入用户名、密码、邮箱
+### LLM 模型
+
+```env
+# LLM 提供者: deepseek / openai / ollama
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_key
+DEEPSEEK_MODEL=deepseek-chat
+
+# 或使用本地 Ollama
+# LLM_PROVIDER=ollama
+# OLLAMA_BASE_URL=http://host.docker.internal:11434
 ```
 
-#### 角色转换（管理员操作）
-- 访问 `/admin/users`
-- 选择用户 → 更改角色 → 选择导师/学生
+## 📚 知识库系统
 
-### 2. 团队协作
+### 智能分块 (Smart Chunking)
 
-#### 导师邀请学生
-1. 导师访问 `/mentor/students`
-2. 点击「邀请学生」
-3. 输入学生邮箱
-4. 学生收到邀请后接受
+系统提供 **层级化智能分块**，支持多种预设策略：
 
-#### 创建研究组
-1. 导师访问 `/mentor/groups`
-2. 点击「创建研究组」
-3. 设置名称、描述、最大人数
+| 预设 | 适用场景 | 特点 |
+|------|----------|------|
+| FAST | 快速处理 | 大块、少分片 |
+| PRECISE | 精确检索 | 小块、多分片 |
+| ACADEMIC | 学术论文 | 识别章节结构 |
+| DEEP | 深度分析 | 最细粒度分块 |
+| DEFAULT | 通用 | 平衡效果 |
 
-### 3. 资源共享
+分块层级：
+- **段落级** (paragraph) — 适合精确检索
+- **章节级** (section) — 适合获取完整上下文
+- **文档级** (document) — 全文检索
 
-#### 共享知识库（引用模式）
-
-```
-导师                              学生
-┌──────────────┐                ┌──────────────┐
-│ 📚 我的知识库 │   ──共享──>   │ 📤 共享知识库 │
-│  - doc1.pdf  │    (引用)      │  (只读引用)  │
-│  - doc2.md   │                │              │
-└──────────────┘                └──────────────┘
-                                       │
-                                       ▼
-                              AI 对话可直接使用
-```
-
-**特点**：
-- 不复制数据，只建立引用
-- 导师更新后学生即时可见
-- 学生可在 AI 对话中选择使用
-
-#### 共享笔记本（只读模式）
-
-导师共享笔记本后，学生可以：
-- 查看所有代码单元格
-- 查看 Markdown 内容
-- 查看执行输出和图表
-- **不能**编辑或执行代码
-
-### 4. AI 对话集成
-
-学生在 AI 对话中可以：
-- 选择自己的知识库
-- 选择导师共享的知识库
-- 同时搜索多个知识库
-
-```typescript
-// 前端选择器自动包含共享知识库
-const { own, shared } = await knowledgeApi.getAvailableKnowledgeBases()
-```
-
-## 🗂️ 文件结构
+### 向量搜索
 
 ```
-patch/
+POST /api/knowledge/search
+{
+  "query": "深度学习在NLP中的应用",
+  "knowledge_base_ids": [1, 2],
+  "top_k": 5,
+  "chunk_level": "paragraph",
+  "include_parent_context": true
+}
+```
+
+## 🗂️ 项目结构
+
+```
+research-assistant/
 ├── backend/
-│   ├── alembic/versions/
-│   │   └── 006_multi_role.py        # 数据库迁移
 │   ├── app/
-│   │   ├── api/
-│   │   │   ├── admin.py             # 管理员 API
-│   │   │   ├── mentor.py            # 导师 API
-│   │   │   ├── student.py           # 学生 API
-│   │   │   ├── share.py             # 资源共享 API
-│   │   │   ├── invitations.py       # 邀请系统 API
-│   │   │   ├── announcements.py     # 公告 API
-│   │   │   ├── knowledge.py         # 知识库 API (修改)
-│   │   │   └── literature.py        # 文献 API (修改)
-│   │   ├── models/
-│   │   │   ├── user.py              # 用户模型 (修改)
-│   │   │   └── role.py              # 角色相关模型
-│   │   ├── schemas/
-│   │   │   ├── user.py              # 用户 Schema
-│   │   │   └── role.py              # 角色 Schema
-│   │   ├── services/
-│   │   │   └── agent_tools.py       # AI 工具 (修改)
-│   │   └── core/
-│   │       └── permissions.py       # 权限控制
-│   └── scripts/
-│       ├── create_admin.py          # 创建管理员
-│       └── migrate_resource_id_type.sql  # 列类型迁移
-│
+│   │   ├── api/              # FastAPI 路由
+│   │   │   ├── knowledge.py  # 知识库 + 嵌入模型 API
+│   │   │   ├── chat.py       # AI 对话
+│   │   │   ├── literature.py # 文献管理
+│   │   │   ├── codelab.py    # 代码实验室
+│   │   │   ├── chunking.py   # 智能分块配置
+│   │   │   ├── agent.py      # ReAct Agent
+│   │   │   ├── admin.py      # 管理员
+│   │   │   ├── mentor.py     # 导师
+│   │   │   ├── student.py    # 学生
+│   │   │   └── share.py      # 资源共享
+│   │   ├── models/           # SQLAlchemy 数据模型
+│   │   ├── schemas/          # Pydantic 验证模型
+│   │   ├── services/         # 业务逻辑
+│   │   │   ├── embedding_service.py      # 嵌入服务（本地/API）
+│   │   │   ├── smart_chunking_service.py # 智能分块引擎
+│   │   │   └── document_service.py       # 文档处理
+│   │   ├── core/             # 核心组件（数据库、认证、权限）
+│   │   └── config.py         # 配置管理
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── pages/
-│   │   │   ├── admin/               # 管理员页面
-│   │   │   ├── mentor/              # 导师页面
-│   │   │   ├── student/             # 学生页面
-│   │   │   ├── shared/              # 共享资源页面
-│   │   │   ├── dashboard/           # 仪表盘
-│   │   │   ├── knowledge/           # 知识库 (修改)
-│   │   │   ├── literature/          # 文献 (修改)
-│   │   │   └── user/                # 用户设置
-│   │   ├── components/
-│   │   │   ├── layout/              # 布局组件
-│   │   │   └── team/                # 团队组件
-│   │   ├── stores/
-│   │   │   ├── authStore.ts         # 认证 (修改)
-│   │   │   ├── roleStore.ts         # 角色状态
-│   │   │   ├── knowledgeStore.ts    # 知识库 (修改)
-│   │   │   └── literatureStore.ts   # 文献 (修改)
-│   │   ├── services/
-│   │   │   └── api.ts               # API 服务 (修改)
-│   │   └── App.tsx                  # 路由 (修改)
-│
-└── docs/
-    ├── FEATURE_LIST.md              # 功能清单
-    ├── MULTI_ROLE_SYSTEM_DESIGN.md  # 系统设计
-    └── PATCH_INSTALLATION.md        # 安装说明
+│   │   ├── pages/            # 页面组件
+│   │   │   ├── knowledge/    # 知识库（含模型选择）
+│   │   │   ├── chat/         # AI 对话
+│   │   │   ├── literature/   # 文献管理
+│   │   │   ├── codelab/      # 代码实验室
+│   │   │   └── ...           # 管理/导师/学生/共享
+│   │   ├── stores/           # Zustand 状态管理
+│   │   ├── services/api.ts   # API 客户端
+│   │   └── App.tsx           # 路由配置
+│   └── Dockerfile
+├── docker-compose.yml
+├── .env.example
+└── README.md
 ```
 
-## 🔌 API 端点
+## 🔌 主要 API
 
-### 管理员 API
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/admin/users` | 获取用户列表 |
-| PUT | `/api/admin/users/{id}/role` | 修改用户角色 |
-| PUT | `/api/admin/users/{id}/status` | 启用/禁用用户 |
-
-### 导师 API
+### 知识库
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| GET | `/api/mentor/students` | 获取我的学生 |
-| GET | `/api/mentor/groups` | 获取研究组 |
-| POST | `/api/mentor/groups` | 创建研究组 |
-| DELETE | `/api/mentor/students/{id}` | 移除学生 |
-
-### 学生 API
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/student/mentor` | 获取我的导师 |
-| GET | `/api/student/groups` | 获取我的研究组 |
-| POST | `/api/student/apply/{mentor_id}` | 申请导师 |
-
-### 资源共享 API
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/share/shared-with-me` | 共享给我的资源 |
-| GET | `/api/share/my-shares` | 我共享的资源 |
-| POST | `/api/share/` | 共享资源 |
-| DELETE | `/api/share/{id}` | 取消共享 |
-| GET | `/api/share/detail/{id}` | 共享资源详情 |
-| GET | `/api/share/my-notebooks` | 我的笔记本列表 |
-
-### 知识库 API（扩展）
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
+| GET | `/api/knowledge/embedding-models` | 获取可用嵌入模型列表 |
+| POST | `/api/knowledge/knowledge-bases` | 创建知识库（可选嵌入模型）|
+| POST | `/api/knowledge/knowledge-bases/{id}/documents/upload` | 上传文档 |
+| POST | `/api/knowledge/search` | 向量搜索（支持层级过滤）|
 | GET | `/api/knowledge/available` | 获取可用知识库（含共享）|
-| POST | `/api/knowledge/search?include_shared=true` | 搜索（含共享知识库）|
+
+### AI 对话
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| POST | `/api/chat/send` | 流式 AI 对话 |
+| GET | `/api/chat/conversations` | 获取对话列表 |
+
+### 文献管理
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| GET | `/api/literature/search` | 搜索论文 |
+| POST | `/api/literature/papers` | 保存论文 |
+| POST | `/api/literature/papers/{id}/download-pdf` | 下载 PDF |
+
+### 智能分块配置
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| GET | `/api/chunking/presets` | 获取分块预设列表 |
+| GET | `/api/chunking/knowledge-bases/{id}/config` | 获取知识库分块配置 |
+| PUT | `/api/chunking/knowledge-bases/{id}/config` | 更新分块配置 |
 
 ## 🐛 故障排除
 
-### 问题：共享资源页面 500 错误
+### 本地嵌入模型加载慢
 
-**原因**：数据库 `resource_id` 列类型不匹配
-
-**解决**：
-```bash
-docker exec -i research_postgres psql -U research_user -d research_assistant \
-  -c "ALTER TABLE shared_resources ALTER COLUMN resource_id TYPE VARCHAR(50) USING resource_id::VARCHAR;"
-```
-
-### 问题：看不到共享的知识库
-
-**检查步骤**：
-1. 确认 `SHARING_ENABLED=true`
-2. 检查导师是否已共享
-3. 检查学生是否已关联导师
+首次启动需下载模型权重（~2GB），后续通过 Docker Volume `model_cache` 缓存：
 
 ```bash
-# 查看后端日志
+# 查看模型缓存
+docker volume inspect research-assistant_model_cache
+
+# 查看后端日志确认加载状态
 docker logs -f research_backend
-
-# 检查共享记录
-docker exec -it research_postgres psql -U research_user -d research_assistant \
-  -c "SELECT * FROM shared_resources;"
 ```
 
-### 问题：迁移失败
+### 维度不匹配
 
-**解决**：
+不同嵌入模型的向量维度不同，**已有知识库不支持切换模型**。如需切换，需要：
+1. 删除原知识库
+2. 使用新模型重新创建
+3. 重新上传文档
+
+### 容器状态检查
+
 ```bash
-# 清理失败的迁移
-docker exec -it research_backend python scripts/cleanup_failed_migration.py
-
-# 重新运行迁移
-docker exec -it research_backend alembic upgrade head
+docker compose ps
+docker compose logs backend --tail 50
+docker compose logs frontend --tail 50
 ```
-
-## 📊 数据模型
-
-### 新增数据表
-
-```sql
--- 研究组
-research_groups (id, name, description, mentor_id, ...)
-
--- 组成员
-group_members (id, group_id, user_id, role, joined_at)
-
--- 邀请记录
-invitations (id, type, from_user_id, to_user_id, group_id, status, ...)
-
--- 共享资源
-shared_resources (id, resource_type, resource_id, owner_id, 
-                  shared_with_type, shared_with_id, permission, ...)
-
--- 公告
-announcements (id, mentor_id, group_id, title, content, ...)
-
--- 公告已读
-announcement_reads (id, announcement_id, user_id, read_at)
-```
-
-### 用户表扩展
-
-```sql
--- users 表新增字段
-ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'student';
-ALTER TABLE users ADD COLUMN mentor_id INTEGER REFERENCES users(id);
-ALTER TABLE users ADD COLUMN department VARCHAR(200);
-ALTER TABLE users ADD COLUMN research_direction VARCHAR(500);
-```
-
-## 🔄 版本历史
-
-| 版本 | Session | 主要更新 |
-|------|---------|----------|
-| 1.0.1-7 | 1-7 | 多角色基础系统 |
-| 1.0.8-11 | 8-11 | 邀请系统、公告功能 |
-| 1.0.12-13 | 12-13 | 资源共享（论文、文献集）|
-| 1.0.14-16 | 14-16 | 知识库共享（引用模式）|
-| 1.0.17 | 17 | 全局搜索支持共享 |
-| 1.0.18 | 18 | 笔记本共享（只读）|
 
 ## 📝 License
 
 MIT License
 
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
 ---
 
-**开发者**：Claude AI Assistant  
-**最后更新**：2026-01-31
+**最后更新**：2026-02-11

@@ -133,6 +133,24 @@ export interface KnowledgeBaseCreate {
   chunk_overlap?: number
 }
 
+export interface EmbeddingModel {
+  id: string
+  name: string
+  dimension: number
+  provider: string
+  description: string
+  max_tokens: number
+  is_current: boolean
+  compatible: boolean
+}
+
+export interface EmbeddingModelsResponse {
+  models: EmbeddingModel[]
+  current_model: string
+  current_provider: string
+  current_dimension: number
+}
+
 export interface Document {
   id: number
   knowledge_base_id: number
@@ -412,6 +430,11 @@ export const knowledgeApi = {
 
   createKnowledgeBase: async (data: KnowledgeBaseCreate): Promise<KnowledgeBase> => {
     const response = await api.post('/api/knowledge/knowledge-bases', data)
+    return response.data
+  },
+
+  getEmbeddingModels: async (): Promise<EmbeddingModelsResponse> => {
+    const response = await api.get('/api/knowledge/embedding-models')
     return response.data
   },
 

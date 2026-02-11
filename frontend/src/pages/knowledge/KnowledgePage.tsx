@@ -53,7 +53,7 @@ import {
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
-import type { KnowledgeBase, Document, SearchResult } from '@/services/api'
+import type { KnowledgeBase, Document, SearchResult, EmbeddingModel } from '@/services/api'
 import { knowledgeApi } from '@/services/api'
 import dayjs from 'dayjs'
 
@@ -190,6 +190,14 @@ const KnowledgeBaseCard = ({
             </div>
             <div className="text-xs text-slate-500">Tokens</div>
           </div>
+        </div>
+
+        {/* 嵌入模型标签 */}
+        <div className="mt-3 pt-3 border-t border-slate-700/50 flex items-center gap-2">
+          <Tag color="geekblue" className="text-xs" style={{ margin: 0 }}>
+            {kb.embedding_model?.split('/').pop() || 'bge-m3'}
+          </Tag>
+          <span className="text-slate-600 text-xs">{kb.embedding_dimension || 1024}维</span>
         </div>
       </Card>
     </motion.div>
@@ -403,6 +411,10 @@ const KnowledgePage = () => {
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
   const [sharingEnabled, setSharingEnabled] = useState(false)
 
+  // 嵌入模型列表
+  const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModel[]>([])
+  const [embeddingModelsLoading, setEmbeddingModelsLoading] = useState(false)
+
   // 初始化
   useEffect(() => {
     fetchKnowledgeBases()
@@ -442,15 +454,29 @@ const KnowledgePage = () => {
   }, [documents, currentKnowledgeBase])
 
   // 创建知识库
-  const handleCreate = async (values: { name: string; description?: string }) => {
+  const handleCreate = async (values: { name: string; description?: string; embedding_model?: string }) => {
     try {
-      const kb = await createKnowledgeBase(values.name, values.description)
+      const kb = await createKnowledgeBase(values.name, values.description, values.embedding_model)
       message.success('创建成功')
       setCreateModalVisible(false)
       form.resetFields()
       navigate(`/knowledge/${kb.id}`)
     } catch (error) {
       message.error('创建失败')
+    }
+  }
+
+  // 加载嵌入模型列表
+  const loadEmbeddingModels = async () => {
+    if (embeddingModels.length > 0) return // 已加载过
+    setEmbeddingModelsLoading(true)
+    try {
+      const data = await knowledgeApi.getEmbeddingModels()
+      setEmbeddingModels(data.models)
+    } catch (error) {
+      console.error('加载嵌入模型列表失败:', error)
+    } finally {
+      setEmbeddingModelsLoading(false)
     }
   }
 
@@ -659,7 +685,7 @@ const KnowledgePage = () => {
 
         {/* 统计卡片 */}
         <Row gutter={16} className="mb-6">
-          <Col span={8}>
+          <Col span={6}>
             <Card className="bg-slate-800/50 border-slate-700/50">
               <Statistic
                 title={<span className="text-slate-400">文档数</span>}
@@ -669,7 +695,7 @@ const KnowledgePage = () => {
               />
             </Card>
           </Col>
-          <Col span={8}>
+          <Col span={6}>
             <Card className="bg-slate-800/50 border-slate-700/50">
               <Statistic
                 title={<span className="text-slate-400">分片数</span>}
@@ -679,7 +705,7 @@ const KnowledgePage = () => {
               />
             </Card>
           </Col>
-          <Col span={8}>
+          <Col span={6}>
             <Card className="bg-slate-800/50 border-slate-700/50">
               <Statistic
                 title={<span className="text-slate-400">Token 数</span>}
@@ -692,6 +718,19 @@ const KnowledgePage = () => {
                     : String(value)
                 }
               />
+            </Card>
+          </Col>
+          <Col span={6}>
+            <Card className="bg-slate-800/50 border-slate-700/50">
+              <div>
+                <div className="text-slate-400 text-sm mb-2">嵌入模型</div>
+                <div className="text-white font-medium text-base">
+                  {currentKnowledgeBase.embedding_model?.split('/').pop() || 'bge-m3'}
+                </div>
+                <div className="text-slate-500 text-xs mt-1">
+                  {currentKnowledgeBase.embedding_dimension || 1024} 维向量
+                </div>
+              </div>
             </Card>
           </Col>
         </Row>
@@ -823,8 +862,13 @@ const KnowledgePage = () => {
         open={createModalVisible}
         onCancel={() => setCreateModalVisible(false)}
         footer={null}
+        afterOpenChange={(open) => {
+          if (open) loadEmbeddingModels()
+        }}
       >
-        <Form form={form} layout="vertical" onFinish={handleCreate}>
+        <Form form={form} layout="vertical" onFinish={handleCreate}
+          initialValues={{ embedding_model: 'BAAI/bge-m3' }}
+        >
           <Form.Item
             name="name"
             label="名称"
@@ -834,6 +878,44 @@ const KnowledgePage = () => {
           </Form.Item>
           <Form.Item name="description" label="描述">
             <TextArea placeholder="输入描述（可选）" rows={3} />
+          </Form.Item>
+          <Form.Item
+            name="embedding_model"
+            label="嵌入模型"
+            tooltip="选择用于生成向量的嵌入模型，创建后不可更改"
+          >
+            <Select
+              loading={embeddingModelsLoading}
+              placeholder="选择嵌入模型"
+              optionLabelProp="label"
+            >
+              {embeddingModels.map((model) => (
+                <Select.Option
+                  key={model.id}
+                  value={model.id}
+                  label={model.name}
+                  disabled={!model.compatible}
+                >
+                  <div className="flex items-center justify-between py-1">
+                    <div>
+                      <div className="font-medium">
+                        {model.name}
+                        {model.is_current && (
+                          <Tag color="green" className="ml-2 text-xs" style={{ margin: '0 0 0 8px' }}>当前</Tag>
+                        )}
+                        {!model.compatible && (
+                          <Tag color="red" className="ml-2 text-xs" style={{ margin: '0 0 0 8px' }}>维度不兼容</Tag>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-400">{model.description}</div>
+                    </div>
+                    <div className="text-xs text-gray-400 ml-4 flex-shrink-0">
+                      {model.dimension}维 · {model.provider}
+                    </div>
+                  </div>
+                </Select.Option>
+              ))}
+            </Select>
           </Form.Item>
           <Form.Item className="mb-0 text-right">
             <Space>

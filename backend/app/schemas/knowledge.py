@@ -12,7 +12,7 @@ class KnowledgeBaseCreate(BaseModel):
     """创建知识库"""
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
-    embedding_model: str = "text-embedding-v2"
+    embedding_model: str = "BAAI/bge-m3"
     chunk_size: int = Field(default=500, ge=100, le=2000)
     chunk_overlap: int = Field(default=50, ge=0, le=500)
 
