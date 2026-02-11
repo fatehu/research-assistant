@@ -2,6 +2,7 @@
 知识库 API 路由 - 支持共享知识库访问（可选）
 """
 import os
+import re
 import shutil
 import time
 import uuid
@@ -1169,7 +1170,28 @@ async def search_knowledge(
         for idx, pid in parent_ids_to_fetch:
             if pid in parent_map:
                 parent = parent_map[pid]
-                results[idx].parent_context = parent.content[:300]
+                # [Fix 13] 优先展示父级 section_title，而非截取正文开头
+                # 旧逻辑: parent.content[:300] — 对大章节块常常返回无关文字
+                if parent.section_title:
+                    # 有标题时：展示标题 + 正文开头的简短摘要
+                    title_prefix = f"📌 {parent.section_title}"
+                    # 跳过标题行本身，取正文前 200 字符作为补充
+                    content_lines = parent.content.split('\n')
+                    # 找到非标题的第一行
+                    body_start = 0
+                    for li, line in enumerate(content_lines):
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith('#') and not re.match(r'^(\d+[\.\d]*)\s', stripped):
+                            body_start = li
+                            break
+                    body_preview = '\n'.join(content_lines[body_start:]).strip()[:200]
+                    if body_preview:
+                        results[idx].parent_context = f"{title_prefix}\n{body_preview}..."
+                    else:
+                        results[idx].parent_context = title_prefix
+                else:
+                    # 无标题时：回退到旧逻辑，但截取更短
+                    results[idx].parent_context = parent.content[:200] + "..."
                 if not results[idx].section_title:
                     results[idx].section_title = parent.section_title
     

@@ -206,8 +206,8 @@ class AcademicStructureDetector:
             # 检测 Markdown 标题
             if line.startswith('#'):
                 return re.sub(r'^#+\s*', '', line)
-            # 检测数字编号标题（使用收紧后的正则 [Fix 6]）
-            if re.match(r'^(\d+\.)+\s+\S', line):
+            # 检测数字编号标题（[Fix 6] + [Fix 13] 允许末位无点号）
+            if re.match(r'^(\d+\.)+\d*\.?\s+\S', line):
                 return line
         return None
 
@@ -291,16 +291,34 @@ class SemanticChunker:
         if not similarities:
             return []
 
-        # 检测相似度骤降点作为边界
-        mean_sim = np.mean(similarities)
-        std_sim = np.std(similarities)
-        threshold = max(
-            self.config.semantic_threshold,
-            mean_sim - 1.5 * std_sim  # 动态阈值
-        )
+        # [Fix 13] 使用百分位数 + 局部极小值检测，替代 mean - 1.5*std
+        # 旧逻辑对 OCR 噪声敏感，全局 std 被噪声拉大导致阈值过低
+        sim_array = np.array(similarities)
 
+        # 策略: 百分位数阈值 — 取相似度分布的 P25 作为"显著下降"
+        # 对于噪声分布均匀的文档，比 mean-1.5*std 更稳健
+        percentile_threshold = float(np.percentile(sim_array, 25))
+        # 同时保留用户配置的最低阈值
+        threshold = max(self.config.semantic_threshold, percentile_threshold)
+
+        # 额外：局部极小值检测 — 即使绝对值不低于阈值，
+        # 如果某点相比左右邻居有显著下降，也视为边界
         for i, sim in enumerate(similarities):
+            is_boundary = False
+
+            # 条件 1: 低于全局百分位阈值
             if sim < threshold:
+                is_boundary = True
+
+            # 条件 2: 局部极小值 — 比左右邻居都低 0.05 以上
+            if not is_boundary and 1 <= i < len(similarities) - 1:
+                left_sim = similarities[i - 1]
+                right_sim = similarities[i + 1]
+                drop = min(left_sim - sim, right_sim - sim)
+                if drop > 0.05:
+                    is_boundary = True
+
+            if is_boundary:
                 boundary_pos = i + window_size
                 # 确保边界间距合理
                 if not boundaries or (boundary_pos - boundaries[-1]) >= 2:
@@ -622,20 +640,27 @@ class HierarchicalChunker:
                 continue
 
             # [Fix 6] 收紧编号标题正则，要求更典型的学术编号格式
+            # [Fix 13] 修正: 允许最后一级编号无尾随点号（如 "3.5.1 Training"）
             is_heading = (
                 stripped.startswith('#') or
-                # 严格匹配学术编号: "1.", "1.1", "3.5." 等
-                re.match(r'^(\d+\.)+\s+[A-Z\u4e00-\u9fff]', stripped) is not None or
+                # 严格匹配学术编号: "1.", "1.1", "3.5.1", "3.5.1." 等
+                re.match(r'^(\d+\.)+\d*\.?\s+[A-Z\u4e00-\u9fff]', stripped) is not None or
                 # 中文章节编号: "第一章", "第二节" 等
                 re.match(r'^第[一二三四五六七八九十百]+[章节部分]\s', stripped) is not None
             )
 
             # [Fix 6] 额外上下文验证：编号标题前通常有空行
+            # [Fix 13] 放宽条件: 多级编号(如 3.5.1)几乎不会出现在正文中，不需要空行验证
             if is_heading and not stripped.startswith('#'):
                 prev_line = lines[i - 1].strip() if i > 0 else ""
                 if prev_line and not prev_line.startswith('#'):
-                    # 编号行前面不是空行也不是标题，可能是正文中的编号
-                    is_heading = False
+                    # 检查是否为多级编号(2+ 个点号) — 这类几乎确定是标题
+                    dot_count = len(re.findall(r'\.', stripped.split()[0])) if stripped.split() else 0
+                    if dot_count < 2:
+                        # 单级编号(如 "3. xxx")且前面有非空行，可能是正文
+                        # 但如果前行以句末标点结尾，仍允许（段落刚结束）
+                        if not (prev_line and prev_line[-1] in '.。!！?？:：;；'):
+                            is_heading = False
 
             if is_heading:
                 section_type = AcademicStructureDetector.detect_section_type(line)
@@ -758,7 +783,7 @@ class HierarchicalChunker:
                 # 条件 2: 当前块以明显的段落标题开头（编号、Markdown标题等）
                 first_line = chunk_text.split('\n')[0].strip()
                 if (first_line.startswith('#') or
-                    re.match(r'^(\d+\.)+\s+[A-Z\u4e00-\u9fff]', first_line) or
+                    re.match(r'^(\d+\.)+\d*\.?\s+[A-Z\u4e00-\u9fff]', first_line) or
                     re.match(r'^第[一二三四五六七八九十百]+[章节部分]\s', first_line)):
                     should_break = True
 
@@ -1521,7 +1546,7 @@ class SmartChunkingService:
         # 是正常的章节标题，不是碎片
         if stripped.startswith('#'):
             return False
-        if re.match(r'^(\d+\.)+\s+[A-Z\u4e00-\u9fff]', stripped):
+        if re.match(r'^(\d+\.)+\d*\.?\s+[A-Z\u4e00-\u9fff]', stripped):
             return False
         if re.match(r'^第[一二三四五六七八九十百]+[章节部分]', stripped):
             return False

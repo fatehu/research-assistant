@@ -337,7 +337,7 @@ const SearchResultCard = ({ result, index }: { result: SearchResult; index: numb
             >
               {result.content}
             </Paragraph>
-            {/* 父级上下文（可展开） */}
+            {/* 父级上下文（可展开）[Fix 13] 优化显示: 标题 + 摘要 */}
             {result.parent_context && (
               <div className="mt-2">
                 <Button
@@ -351,9 +351,22 @@ const SearchResultCard = ({ result, index }: { result: SearchResult; index: numb
                 </Button>
                 {showParent && (
                   <div className="mt-1.5 p-2.5 rounded bg-slate-900/60 border border-slate-700/50">
-                    <Text className="text-slate-400 text-xs leading-relaxed">
-                      {result.parent_context}
-                    </Text>
+                    {result.parent_context.startsWith('📌') ? (
+                      <>
+                        <Text className="text-blue-400 text-xs font-medium block mb-1">
+                          {result.parent_context.split('\n')[0]}
+                        </Text>
+                        {result.parent_context.includes('\n') && (
+                          <Text className="text-slate-500 text-xs leading-relaxed">
+                            {result.parent_context.split('\n').slice(1).join('\n')}
+                          </Text>
+                        )}
+                      </>
+                    ) : (
+                      <Text className="text-slate-400 text-xs leading-relaxed">
+                        {result.parent_context}
+                      </Text>
+                    )}
                   </div>
                 )}
               </div>
