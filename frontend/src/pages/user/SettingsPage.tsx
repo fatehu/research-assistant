@@ -3,14 +3,18 @@
  */
 import React, { useState, useEffect } from 'react';
 import {
-  Card, Form, Input, Button, Select, Switch, message, Typography, Space, Divider, Row, Col, Modal, Alert
+  Card, Form, Input, Button, Select, Switch, message, Typography, Space, Divider, Modal, Alert, Tag
 } from 'antd';
 import {
   SettingOutlined, LockOutlined, BellOutlined, BgColorsOutlined,
-  RobotOutlined, SaveOutlined, KeyOutlined
+  RobotOutlined, SaveOutlined, KeyOutlined, CloudServerOutlined, ReloadOutlined, CheckCircleOutlined
 } from '@ant-design/icons';
 import { useAuthStore } from '../../stores/authStore';
-import api from '../../services/api';
+import api, {
+  mcpApi,
+  MCPServerStatusItem,
+  MCPServerTemplate,
+} from '../../services/api';
 
 const { Title, Text } = Typography;
 const { Option } = Select;
@@ -22,6 +26,13 @@ const SettingsPage: React.FC = () => {
   const [savingLLM, setSavingLLM] = useState(false);
   const [changingPassword, setChangingPassword] = useState(false);
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
+  const [mcpConfigText, setMcpConfigText] = useState('');
+  const [mcpTemplates, setMcpTemplates] = useState<MCPServerTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const [mcpStatus, setMcpStatus] = useState<MCPServerStatusItem[]>([]);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpSaving, setMcpSaving] = useState(false);
+  const [mcpValidating, setMcpValidating] = useState(false);
 
   useEffect(() => {
     if (user) {
@@ -30,6 +41,91 @@ const SettingsPage: React.FC = () => {
       });
     }
   }, [user, llmForm]);
+
+  const loadMcpConfig = async () => {
+    setMcpLoading(true);
+    try {
+      const data = await mcpApi.getConfig();
+      setMcpConfigText(JSON.stringify(data.claude_desktop_config || { mcpServers: {} }, null, 2));
+      message.success('已加载当前 MCP 配置');
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '加载 MCP 配置失败');
+    } finally {
+      setMcpLoading(false);
+    }
+  };
+
+  const loadMcpTemplates = async () => {
+    try {
+      const data = await mcpApi.getTemplates();
+      setMcpTemplates(data.templates || []);
+      if ((data.templates || []).length > 0) {
+        setSelectedTemplateId(data.templates[0].id);
+      }
+    } catch (error) {
+      console.error('加载 MCP 模板失败:', error);
+    }
+  };
+
+  const applyTemplate = () => {
+    const template = mcpTemplates.find(item => item.id === selectedTemplateId);
+    if (!template) {
+      message.warning('请先选择模板');
+      return;
+    }
+    setMcpConfigText(JSON.stringify(template.claude_desktop_config, null, 2));
+    message.success(`已套用模板: ${template.title}`);
+  };
+
+  const handleValidateMcp = async () => {
+    if (!mcpConfigText.trim()) {
+      message.warning('请先填写 MCP 配置 JSON');
+      return;
+    }
+    setMcpValidating(true);
+    try {
+      const result = await mcpApi.validateConfig({ raw_json: mcpConfigText });
+      message.success(`配置校验通过，解析到 ${result.server_count} 个 Server`);
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || 'MCP 配置校验失败');
+    } finally {
+      setMcpValidating(false);
+    }
+  };
+
+  const handleSaveMcp = async () => {
+    if (!mcpConfigText.trim()) {
+      message.warning('请先填写 MCP 配置 JSON');
+      return;
+    }
+    setMcpSaving(true);
+    try {
+      const result = await mcpApi.saveConfig({ raw_json: mcpConfigText });
+      message.success(`${result.message}（${result.server_count} 个 Server）`);
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '保存 MCP 配置失败');
+    } finally {
+      setMcpSaving(false);
+    }
+  };
+
+  const handleRefreshMcpStatus = async () => {
+    setMcpLoading(true);
+    try {
+      const data = await mcpApi.refreshStatus(true);
+      setMcpStatus(data.servers || []);
+      message.success(`探测完成：${data.server_count} 个 Server，发现 ${data.tool_count} 个工具`);
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || 'MCP 状态探测失败');
+    } finally {
+      setMcpLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadMcpTemplates();
+    loadMcpConfig();
+  }, []);
 
   const handleSaveLLMSettings = async (values: any) => {
     setSavingLLM(true);
@@ -148,6 +244,92 @@ const SettingsPage: React.FC = () => {
       </Card>
 
       {/* 安全设置 */}
+      <Card
+        title={
+          <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <CloudServerOutlined style={{ color: '#13c2c2' }} />
+            MCP Server 配置
+          </span>
+        }
+        style={{
+          backgroundColor: '#161B22',
+          borderColor: '#30363D',
+          borderRadius: 16,
+          marginBottom: 24,
+        }}
+        styles={{
+          header: { borderBottom: '1px solid #30363D' },
+          body: { padding: 24 },
+        }}
+      >
+        <Alert
+          message="说明"
+          description="支持 Claude Desktop 风格的 mcpServers JSON。可先套模板，再校验并保存到后端配置文件。"
+          type="info"
+          showIcon
+          style={{
+            backgroundColor: 'rgba(19, 194, 194, 0.08)',
+            border: '1px solid rgba(19, 194, 194, 0.35)',
+            marginBottom: 16,
+          }}
+        />
+
+        <Space wrap style={{ marginBottom: 12 }}>
+          <Select
+            value={selectedTemplateId}
+            onChange={setSelectedTemplateId}
+            style={{ width: 280 }}
+            placeholder="选择 MCP 模板"
+            options={mcpTemplates.map(item => ({ value: item.id, label: item.title }))}
+          />
+          <Button onClick={applyTemplate}>套用模板</Button>
+          <Button icon={<ReloadOutlined />} loading={mcpLoading} onClick={loadMcpConfig}>
+            加载当前
+          </Button>
+          <Button icon={<CheckCircleOutlined />} loading={mcpValidating} onClick={handleValidateMcp}>
+            校验配置
+          </Button>
+          <Button type="primary" icon={<SaveOutlined />} loading={mcpSaving} onClick={handleSaveMcp}>
+            保存配置
+          </Button>
+          <Button loading={mcpLoading} onClick={handleRefreshMcpStatus}>
+            连通性检查
+          </Button>
+        </Space>
+
+        <Input.TextArea
+          value={mcpConfigText}
+          onChange={(e) => setMcpConfigText(e.target.value)}
+          autoSize={{ minRows: 10, maxRows: 18 }}
+          placeholder='{"mcpServers": {"exa": {"type": "http", "url": "https://mcp.exa.ai/mcp"}}}'
+          style={{
+            backgroundColor: '#0D1117',
+            borderColor: '#30363D',
+            color: '#E8E8E8',
+            marginBottom: 12,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            fontSize: 12,
+          }}
+        />
+
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {mcpStatus.length === 0 ? (
+            <Text style={{ color: '#6B8E9F', fontSize: 12 }}>
+              暂无探测结果，点击“连通性检查”获取状态。
+            </Text>
+          ) : (
+            mcpStatus.map((item) => (
+              <Tag
+                key={item.name}
+                color={item.reachable ? 'success' : item.reachable === false ? 'error' : 'default'}
+              >
+                {item.name}: {item.reachable ? '可达' : item.reachable === false ? '不可达' : '未探测'} / tools {item.discovered_tools}
+              </Tag>
+            ))
+          )}
+        </div>
+      </Card>
+
       <Card
         title={
           <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>

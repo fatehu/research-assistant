@@ -1489,6 +1489,7 @@ class ToolRegistry:
         configs = load_mcp_server_configs(
             settings.mcp_servers,
             settings.mcp_call_timeout_seconds,
+            config_path=getattr(settings, "mcp_config_path", ""),
         )
         if not configs:
             logger.warning("[MCP] MCP_ENABLED=true but MCP_SERVERS is empty")

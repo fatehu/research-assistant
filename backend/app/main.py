@@ -11,7 +11,7 @@ from app.config import settings
 from app.core.database import create_tables
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent,
-    admin, mentor, student, invitations, share, announcements
+    admin, mentor, student, invitations, share, announcements, mcp
 )
 
 from app.api.chunking import router as chunking_router
@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  REACT_OUTPUT_MAX_LENGTH: {settings.react_output_max_length}")
     logger.info(f"  MCP_ENABLED: {settings.mcp_enabled}")
     logger.info(f"  MCP_TOOL_PREFIX: {settings.mcp_tool_prefix}")
+    logger.info(f"  MCP_CONFIG_PATH: {settings.mcp_config_path}")
     logger.info(f"  MCP_TOOL_ROUTES: {settings.mcp_tool_routes}")
     logger.info(f"  MCP_ROUTE_TIMEOUT_SECONDS: {settings.mcp_route_timeout_seconds}")
     logger.info(f"  MCP_ROUTE_RETRY_ATTEMPTS: {settings.mcp_route_retry_attempts}")
@@ -88,6 +89,7 @@ app.include_router(literature.router, prefix="/api", tags=["文献管理"])
 app.include_router(codelab.router, prefix="/api/codelab", tags=["代码实验室"])
 app.include_router(agent.router, prefix="/api/codelab", tags=["Notebook Agent"])
 app.include_router(notebook_agent.router, prefix="/api/codelab", tags=["Notebook ReAct Agent"])
+app.include_router(mcp.router, prefix="/api/mcp", tags=["MCP 管理"])
 
 # === 注册多角色系统路由 ===
 app.include_router(admin.router, prefix="/api/admin", tags=["管理员"])

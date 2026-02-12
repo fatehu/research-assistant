@@ -1803,6 +1803,101 @@ export const mentorshipApi = {
   },
 }
 
+// ========== MCP 管理类型与 API ==========
+
+export interface MCPServerConfigItem {
+  name: string
+  transport: 'stdio' | 'sse' | 'streamable_http'
+  enabled: boolean
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  cwd?: string
+  url?: string
+  headers?: Record<string, string>
+  timeout_seconds?: number
+  sse_read_timeout_seconds?: number
+}
+
+export interface MCPServerTemplate {
+  id: string
+  title: string
+  description: string
+  claude_desktop_config: Record<string, unknown>
+  recommended_routes?: Record<string, string[]>
+}
+
+export interface MCPServerStatusItem {
+  name: string
+  transport: string
+  enabled: boolean
+  reachable: boolean | null
+  discovered_tools: number
+  last_checked_at?: string | null
+  last_error?: string | null
+  tools: string[]
+}
+
+export interface MCPConfigResponse {
+  enabled: boolean
+  tool_prefix: string
+  call_timeout_seconds: number
+  config_path: string
+  tool_routes: Record<string, string[]>
+  servers: MCPServerConfigItem[]
+  claude_desktop_config: Record<string, unknown>
+}
+
+export const mcpApi = {
+  getTemplates: async (): Promise<{ templates: MCPServerTemplate[] }> => {
+    const response = await api.get('/api/mcp/templates')
+    return response.data
+  },
+
+  getConfig: async (): Promise<MCPConfigResponse> => {
+    const response = await api.get('/api/mcp/config')
+    return response.data
+  },
+
+  validateConfig: async (payload: {
+    raw_json?: string
+    claude_desktop_config?: Record<string, unknown>
+    servers?: Record<string, unknown>[]
+  }): Promise<{
+    valid: boolean
+    server_count: number
+    servers: MCPServerConfigItem[]
+    claude_desktop_config: Record<string, unknown>
+  }> => {
+    const response = await api.post('/api/mcp/config/validate', payload)
+    return response.data
+  },
+
+  saveConfig: async (payload: {
+    raw_json?: string
+    claude_desktop_config?: Record<string, unknown>
+    servers?: Record<string, unknown>[]
+  }): Promise<{
+    message: string
+    path: string
+    server_count: number
+    servers: MCPServerConfigItem[]
+    claude_desktop_config: Record<string, unknown>
+  }> => {
+    const response = await api.put('/api/mcp/config', payload)
+    return response.data
+  },
+
+  refreshStatus: async (forceRefresh = true): Promise<{
+    server_count: number
+    tool_count: number
+    servers: MCPServerStatusItem[]
+  }> => {
+    const response = await api.post('/api/mcp/status/refresh', { force_refresh: forceRefresh })
+    return response.data
+  },
+}
+
 export default api
 
 // ========== 智能分块类型定义 ==========

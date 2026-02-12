@@ -104,6 +104,7 @@ class Settings(BaseSettings):
     mcp_tool_prefix: str = "mcp"
     mcp_call_timeout_seconds: int = 20
     mcp_servers: str = "[]"
+    mcp_config_path: str = "mcp_servers.json"
     mcp_tool_routes: str = "{}"
     mcp_route_timeout_seconds: int = 15
     mcp_route_retry_attempts: int = 2
