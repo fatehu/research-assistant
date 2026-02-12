@@ -130,6 +130,7 @@ class SearchRequest(BaseModel):
     knowledge_base_ids: Optional[List[int]] = None  # 不指定则搜索所有知识库
     top_k: int = Field(default=5, ge=1, le=20)
     score_threshold: float = Field(default=0.05, ge=0, le=1)
+    use_reranker: bool = Field(default=True, description="是否启用Reranker精排")
     # [Fix 12] 新增字段：chunk_level 过滤
     chunk_level: Optional[str] = Field(
         default="paragraph",

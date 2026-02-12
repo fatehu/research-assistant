@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     local_embedding_cache_dir: str = ""          # 模型缓存目录, 为空则使用默认
     local_embedding_normalize: bool = True       # 是否L2归一化向量
     local_embedding_dimension: int = 0           # 0=使用模型默认维度, >0 则截断 (Matryoshka)
+
+    # ========== Reranker 配置 ==========
+    enable_reranker: bool = True
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_device: str = "auto"                # auto / cpu / cuda / mps
+    reranker_top_k: int = 20                     # pgvector 粗排候选数
     
     # ========== LLM 推理参数 ==========
     llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)

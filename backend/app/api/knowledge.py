@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_
 from loguru import logger
 
+from app.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
@@ -35,6 +36,7 @@ from app.schemas.knowledge import (
 )
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
+from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -1087,6 +1089,13 @@ async def search_knowledge(
     # 距离越小，相似度越高
     # 我们需要将距离阈值转换为：score_threshold 对应 distance_threshold = 1 - score_threshold
     distance_threshold = 1 - request.score_threshold
+    use_reranker = settings.enable_reranker and request.use_reranker
+    final_top_k = request.top_k
+    coarse_top_k = (
+        max(final_top_k, settings.reranker_top_k)
+        if use_reranker
+        else final_top_k
+    )
     
     # 构建 pgvector 原生查询
     from sqlalchemy import text
@@ -1103,7 +1112,7 @@ async def search_knowledge(
         "query_vector": vector_str,
         "kb_ids": kb_ids,
         "distance_threshold": distance_threshold,
-        "top_k": request.top_k,
+        "top_k": coarse_top_k,
     }
     
     # chunk_level 过滤（默认只搜索 paragraph 级）
@@ -1143,12 +1152,41 @@ async def search_knowledge(
     
     result = await db.execute(sql, params)
     rows = result.fetchall()
+
+    selected_rows = []
+    if use_reranker and rows:
+        try:
+            reranker = get_reranker_service()
+            reranked = await reranker.rerank(
+                query=request.query,
+                documents=[row.content for row in rows],
+                top_k=final_top_k,
+            )
+            selected_rows = [
+                (rows[idx], score)
+                for idx, score in reranked
+                if 0 <= idx < len(rows)
+            ]
+        except Exception as e:
+            logger.warning(f"Reranker failed, fallback to ANN ranking: {e}")
+
+    if not selected_rows:
+        selected_rows = [(row, None) for row in rows[:final_top_k]]
     
     # 构建结果
     results = []
     parent_ids_to_fetch = set()
     
-    for row in rows:
+    for row, reranker_score in selected_rows:
+        vector_score = round(float(row.similarity), 4)
+        metadata = dict(row.metadata or {})
+        if reranker_score is not None:
+            metadata["vector_score"] = vector_score
+            metadata["reranker_score"] = round(float(reranker_score), 4)
+            score = round(RerankerService.normalize_score(float(reranker_score)), 4)
+        else:
+            score = vector_score
+
         item = SearchResultItem(
             chunk_id=row.id,
             document_id=row.document_id,
@@ -1156,9 +1194,9 @@ async def search_knowledge(
             document_name=row.document_name or "未知文档",
             knowledge_base_name=row.knowledge_base_name or "未知知识库",
             content=row.content,
-            score=round(float(row.similarity), 4),
+            score=score,
             chunk_index=row.chunk_index,
-            metadata=row.metadata or {},
+            metadata=metadata,
             chunk_level=getattr(row, 'chunk_level', None),
             section_type=getattr(row, 'section_type', None),
             section_title=getattr(row, 'section_title', None),
@@ -1209,7 +1247,10 @@ async def search_knowledge(
     
     search_time = (time.time() - start_time) * 1000
     
-    logger.info(f"向量搜索完成: query='{request.query[:50]}...', results={len(results)}, time={search_time:.2f}ms")
+    logger.info(
+        f"向量搜索完成: query='{request.query[:50]}...', results={len(results)}, "
+        f"reranker={use_reranker}, time={search_time:.2f}ms"
+    )
     
     return SearchResponse(
         query=request.query,

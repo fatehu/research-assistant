@@ -13,8 +13,10 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, or_, and_
 
+from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.services.embedding_service import get_embedding_service
+from app.services.reranker_service import get_reranker_service, RerankerService
 
 # 尝试导入共享模块（可选）
 try:
@@ -374,6 +376,13 @@ class KnowledgeSearchTool(Tool):
                 )
             
             kb_ids = list(kb_ids)
+            use_reranker = settings.enable_reranker
+            final_top_k = top_k
+            coarse_top_k = (
+                max(final_top_k, settings.reranker_top_k)
+                if use_reranker
+                else final_top_k
+            )
             
             # 使用 pgvector 进行向量相似度搜索
             vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
@@ -401,7 +410,7 @@ class KnowledgeSearchTool(Tool):
             result = await self.db.execute(sql, {
                 "query_vector": vector_str,
                 "kb_ids": kb_ids,
-                "top_k": top_k
+                "top_k": coarse_top_k
             })
             rows = result.fetchall()
             
@@ -411,16 +420,45 @@ class KnowledgeSearchTool(Tool):
                     output="未找到与查询相关的内容。可能知识库中没有相关信息，或者需要调整搜索关键词。",
                     data={"results": [], "total": 0}
                 )
+
+            selected_rows = []
+            if use_reranker:
+                try:
+                    reranker = get_reranker_service()
+                    reranked = await reranker.rerank(
+                        query=query,
+                        documents=[row.content for row in rows],
+                        top_k=final_top_k,
+                    )
+                    selected_rows = [
+                        (rows[idx], score)
+                        for idx, score in reranked
+                        if 0 <= idx < len(rows)
+                    ]
+                except Exception as e:
+                    logger.warning(f"[KnowledgeSearch] Reranker failed, fallback to ANN ranking: {e}")
+
+            if not selected_rows:
+                selected_rows = [(row, None) for row in rows[:final_top_k]]
             
             # 构建结果
             results = []
-            for row in rows:
+            for row, reranker_score in selected_rows:
+                vector_score = round(float(row.similarity), 4)
+                score = (
+                    round(RerankerService.normalize_score(float(reranker_score)), 4)
+                    if reranker_score is not None
+                    else vector_score
+                )
+
                 results.append({
                     "content": row.content,
-                    "score": round(float(row.similarity), 4),
+                    "score": score,
                     "document": row.document_name or "未知",
                     "knowledge_base": row.knowledge_base_name or "未知",
                     "chunk_index": row.chunk_index,
+                    "vector_score": vector_score,
+                    "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
                 })
             
             # 格式化输出
