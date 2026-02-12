@@ -19,6 +19,7 @@ from app.services.embedding_service import get_embedding_service
 from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
+from app.services.vector_search_tuning import apply_hnsw_ef_search
 
 # 尝试导入共享模块（可选）
 try:
@@ -449,6 +450,12 @@ class KnowledgeSearchTool(Tool):
                         )
                         emb = []
                     vector_embeddings.append(emb)
+
+            await apply_hnsw_ef_search(
+                self.db,
+                settings.pgvector_hnsw_ef_search,
+                source="knowledge_search_tool",
+            )
 
             for idx, variant in enumerate(vector_variants):
                 query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []

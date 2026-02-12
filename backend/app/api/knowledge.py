@@ -43,6 +43,7 @@ from app.services.contextual_compression_service import (
 )
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
+from app.services.vector_search_tuning import apply_hnsw_ef_search
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -1187,6 +1188,12 @@ async def search_knowledge(
                 )
                 emb = []
             vector_embeddings.append(emb)
+
+    await apply_hnsw_ef_search(
+        db,
+        settings.pgvector_hnsw_ef_search,
+        source="knowledge.search",
+    )
 
     for idx, variant in enumerate(vector_variants):
         query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []

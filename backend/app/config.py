@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     hybrid_vector_top_k: int = 20
     hybrid_text_top_k: int = 20
     hybrid_rrf_k: int = 60
+    pgvector_hnsw_ef_search: int = 40
 
     # ========== Query Rewrite 配置 ==========
     enable_query_rewrite: bool = True
