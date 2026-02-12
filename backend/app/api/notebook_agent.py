@@ -14,7 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.llm_service import get_llm_service
@@ -131,7 +133,8 @@ class NotebookToolRegistry(ToolRegistry):
 async def notebook_agent_chat(
     notebook_id: str,
     request: NotebookAgentChatRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Notebook AI Agent 聊天接口
@@ -147,7 +150,7 @@ async def notebook_agent_chat(
     
     # 创建工具注册表（带 notebook 上下文）
     tool_registry = NotebookToolRegistry(
-        db=None,  # Notebook 工具不需要数据库
+        db=db,
         user_id=current_user.id,
         notebook_id=notebook_id,
         kernel_manager=kernel_manager,
@@ -369,7 +372,8 @@ async def clear_notebook_agent_history(
 @router.get("/notebooks/{notebook_id}/agent/tools")
 async def get_available_tools(
     notebook_id: str,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """获取可用工具列表"""
     notebook = get_notebook(notebook_id, current_user.id)
@@ -378,7 +382,7 @@ async def get_available_tools(
     
     # 创建工具注册表
     tool_registry = NotebookToolRegistry(
-        db=None,
+        db=db,
         user_id=current_user.id,
         notebook_id=notebook_id,
         kernel_manager=kernel_manager,

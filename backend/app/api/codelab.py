@@ -1118,7 +1118,7 @@ async def notebook_agent_chat(
             
             # 创建带 Notebook 上下文的工具注册表
             tool_registry = ToolRegistry(
-                db=None,
+                db=db,
                 user_id=current_user.id,
                 notebook_id=notebook_id,
                 kernel_manager=kernel_manager,

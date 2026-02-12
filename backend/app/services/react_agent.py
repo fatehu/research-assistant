@@ -190,6 +190,14 @@ class ReActAgent:
 ```
 """
 
+    CITATION_POLICY_PROMPT = """
+## 知识检索引用规范（必须遵守）
+1. 当你基于 `knowledge_search` 返回内容作答时，关键结论后必须带 `[来源X]` 引用。
+2. 引用编号必须来自 observation 中已出现的 `[来源X]`，禁止编造不存在的来源编号。
+3. 若现有来源不足以支持结论，请明确说明“根据现有来源无法确认”。
+4. 不要把 `<observation>` 原文整段照搬到 `<answer>`，只保留结论与必要引用。
+""".strip()
+
     def __init__(
         self,
         llm_service: LLMService,
@@ -204,7 +212,22 @@ class ReActAgent:
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
         tools_desc = self.tools.get_tools_description()
-        return self.SYSTEM_PROMPT.format(tools_description=tools_desc)
+        base_prompt = self.SYSTEM_PROMPT.format(tools_description=tools_desc)
+        return f"{base_prompt}\n\n{self.CITATION_POLICY_PROMPT}"
+
+    @staticmethod
+    def _build_observation_message(tool_name: str, observation_output: str) -> str:
+        """Build follow-up prompt after one tool observation."""
+        if tool_name == "knowledge_search":
+            followup = (
+                "请根据工具返回的信息继续。若要给出最终回答，"
+                "必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中出现过的来源编号。"
+                "如证据不足，请明确说明。请用<answer>标签给出最终回答。"
+            )
+        else:
+            followup = "请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
+
+        return f"<observation>\n{observation_output}\n</observation>\n\n{followup}"
     
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """
@@ -542,7 +565,7 @@ class ReActAgent:
                             })
                             context.messages.append({
                                 "role": "user",
-                                "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
+                                "content": self._build_observation_message(tool_name, observation_output)
                             })
                             
                         except json.JSONDecodeError as e:
@@ -657,7 +680,7 @@ class ReActAgent:
                     })
                     context.messages.append({
                         "role": "user", 
-                        "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
+                        "content": self._build_observation_message(tool_name, observation_output)
                     })
                     return
                 except Exception as e:
@@ -712,7 +735,7 @@ class ReActAgent:
                     })
                     context.messages.append({
                         "role": "user",
-                        "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
+                        "content": self._build_observation_message(tool_name, observation_output)
                     })
                     return
                 except Exception as e:
@@ -796,7 +819,7 @@ class ReActAgent:
             })
             context.messages.append({
                 "role": "user",
-                "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息继续。"
+                "content": self._build_observation_message(tool_name, observation_output)
             })
         
         # 处理回答
