@@ -59,3 +59,10 @@ vite.config.js
 vite.config.d.ts
 tsc_output.txt
 verify_pages.js
+
+# Playwright temporary artifacts
+.playwright-cli/
+output/
+
+# Runtime-generated MCP config
+backend/mcp_servers.json
