@@ -33,6 +33,11 @@ from app.core.database import get_db, async_session_factory
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.notebook_service import NotebookService
+from app.services.notebook_agent_history_service import (
+    append_history_message,
+    clear_history as clear_history_in_db,
+    load_history,
+)
 from app.config import settings
 
 router = APIRouter()
@@ -943,6 +948,7 @@ async def interrupt_kernel(
 
 # Agent 对话历史存储 (内存中)
 _agent_histories: Dict[str, Dict[str, Any]] = {}
+AGENT_HISTORY_CHANNEL = "codelab"
 
 
 class AgentChatRequest(BaseModel):
@@ -971,24 +977,39 @@ class AgentMessage(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
-def get_agent_history(notebook_id: str, user_id: int) -> Dict[str, Any]:
+async def get_agent_history(notebook_id: str, user_id: int) -> Dict[str, Any]:
     """获取 Agent 对话历史"""
     key = f"{user_id}:{notebook_id}"
     if key not in _agent_histories:
-        _agent_histories[key] = {
-            "notebook_id": notebook_id,
-            "messages": [],
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
-        }
+        _agent_histories[key] = await load_history(
+            notebook_id=notebook_id,
+            user_id=user_id,
+            channel=AGENT_HISTORY_CHANNEL,
+        )
     return _agent_histories[key]
 
 
-def save_agent_message(notebook_id: str, user_id: int, message: AgentMessage):
+async def save_agent_message(notebook_id: str, user_id: int, message: AgentMessage):
     """保存 Agent 消息"""
-    history = get_agent_history(notebook_id, user_id)
-    history["messages"].append(message.model_dump())
-    history["updated_at"] = datetime.now().isoformat()
+    key = f"{user_id}:{notebook_id}"
+    history = await get_agent_history(notebook_id, user_id)
+    _agent_histories[key] = await append_history_message(
+        notebook_id=notebook_id,
+        user_id=user_id,
+        channel=AGENT_HISTORY_CHANNEL,
+        history=history,
+        message=message.model_dump(),
+    )
+
+
+async def clear_agent_history_state(notebook_id: str, user_id: int) -> None:
+    """娓呯┖ Agent 瀵硅瘽鍘嗗彶"""
+    key = f"{user_id}:{notebook_id}"
+    _agent_histories[key] = await clear_history_in_db(
+        notebook_id=notebook_id,
+        user_id=user_id,
+        channel=AGENT_HISTORY_CHANNEL,
+    )
 
 
 @router.get("/notebooks/{notebook_id}/agent/context")
@@ -1052,7 +1073,7 @@ async def get_agent_history_endpoint(
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
-    return get_agent_history(notebook_id, current_user.id)
+    return await get_agent_history(notebook_id, current_user.id)
 
 
 @router.delete("/notebooks/{notebook_id}/agent/history")
@@ -1066,9 +1087,7 @@ async def clear_agent_history(
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
-    key = f"{current_user.id}:{notebook_id}"
-    if key in _agent_histories:
-        del _agent_histories[key]
+    await clear_agent_history_state(notebook_id, current_user.id)
     
     return {"message": "对话历史已清空"}
 
@@ -1107,7 +1126,7 @@ async def notebook_agent_chat(
         timestamp=datetime.now().isoformat(),
         metadata={}
     )
-    save_agent_message(notebook_id, current_user.id, user_message)
+    await save_agent_message(notebook_id, current_user.id, user_message)
     
     async def generate_response():
         """生成流式响应"""
@@ -1204,7 +1223,7 @@ async def notebook_agent_chat(
             ]
             
             # 获取对话历史
-            history = get_agent_history(notebook_id, current_user.id)
+            history = await get_agent_history(notebook_id, current_user.id)
             # 添加最近的对话历史 (最多 10 条)
             for msg in history.get("messages", [])[-10:-1]:  # 不包括刚添加的用户消息
                 messages.append({
@@ -1235,8 +1254,8 @@ async def notebook_agent_chat(
                 elif event_type == "observation":
                     # data 是字典 {"tool": "...", "success": ..., "output": ..., "data": ...}
                     success = event_data.get("success", False) if isinstance(event_data, dict) else False
-                    max_output_len = settings.react_output_max_length
-                    output = event_data.get("output", "")[:max_output_len] if isinstance(event_data, dict) else str(event_data)[:max_output_len]
+                    output_raw = event_data.get("output", "") if isinstance(event_data, dict) else event_data
+                    output = output_raw if isinstance(output_raw, str) else str(output_raw)
                     tool_data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
                     
                     # 检查是否有 notebook 更新
@@ -1358,9 +1377,9 @@ async def notebook_agent_chat(
                 content=full_content,
                 code_blocks=[AgentCodeBlock(**cb) for cb in code_blocks],
                 timestamp=datetime.now().isoformat(),
-                metadata={}
+                metadata={"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {}
             )
-            save_agent_message(notebook_id, current_user.id, assistant_message)
+            await save_agent_message(notebook_id, current_user.id, assistant_message)
             
             # 发送完成事件
             done_payload = {"type": "done", "code_blocks": code_blocks}

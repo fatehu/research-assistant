@@ -165,7 +165,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                   <div>
                     修复成功/尝试: {ragMetrics.citation_repair_successes}/{ragMetrics.citation_repair_attempts}
                   </div>
-                  <div className="col-span-2 truncate">
+                  <div className="col-span-2 break-all">
                     来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
                   </div>
                 </div>

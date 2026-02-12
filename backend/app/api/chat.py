@@ -455,7 +455,7 @@ async def send_message(
                                 "iteration": current_iteration,
                                 "tool": event_data.get("tool"),
                                 "success": event_data.get("success"),
-                                "output": event_data.get("output", "")[:500]  # 限制长度
+                                "output": event_data.get("output", "")
                             })
                             yield f"data: {json.dumps({'event': 'observation', 'data': event_data})}\n\n"
                         elif event_type == "content":
@@ -487,6 +487,7 @@ async def send_message(
                                     message_type=MessageType.TEXT,
                                     thought=thought if thought else None,
                                     react_steps=react_steps if react_steps else None,
+                                    metadata_={"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {},
                                 )
                                 save_db.add(assistant_message)
                                 await save_db.commit()

@@ -192,9 +192,7 @@ const ReActPanel = ({
                                   </span>
                                 </div>
                                 <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">
-                                  {step.content.length > 300
-                                    ? step.content.slice(0, 300) + '...'
-                                    : step.content}
+                                  {step.content}
                                 </p>
                               </div>
                             </div>

@@ -166,7 +166,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
           } else if (event.type === 'observation') {
             // 显示工具结果
             const status = event.success ? '✅' : '❌'
-            fullContent += `\n${status} 结果: ${event.output?.substring(0, 200)}${event.output && event.output.length > 200 ? '...' : ''}\n`
+            fullContent += `\n${status} 结果: ${event.output || ''}\n`
             setStreamingContent(fullContent)
             
             // 如果有新 Cell，直接添加到 Notebook（实时更新）
@@ -269,7 +269,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
                       <div>引用有效: {ragMetrics.citation_valid ? '是' : '否'}</div>
                       <div>压缩调用: {ragMetrics.compression_calls}</div>
                       <div>压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}</div>
-                      <div className="col-span-2 truncate">
+                      <div className="col-span-2 break-all">
                         来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
                       </div>
                     </div>

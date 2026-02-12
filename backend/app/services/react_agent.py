@@ -691,7 +691,7 @@ class ReActAgent:
                                 "data": {
                                     "tool": tool_name,
                                     "success": result.success,
-                                    "output": observation_output[:2000],
+                                    "output": observation_output,
                                     "data": result.data
                                 }
                             }
@@ -809,7 +809,7 @@ class ReActAgent:
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": observation_output[:2000],
+                            "output": observation_output,
                             "data": result.data
                         }
                     }
@@ -865,7 +865,7 @@ class ReActAgent:
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": observation_output[:2000],
+                            "output": observation_output,
                             "data": result.data
                         }
                     }
@@ -946,7 +946,7 @@ class ReActAgent:
                 "data": {
                     "tool": tool_name,
                     "success": result.success,
-                    "output": observation_output[:2000],
+                    "output": observation_output,
                     "data": result.data
                 }
             })

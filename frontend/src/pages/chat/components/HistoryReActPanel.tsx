@@ -141,9 +141,7 @@ const HistoryReActPanel = ({ steps }: HistoryReActPanelProps) => {
                             </span>
                           </div>
                           <p className="text-xs text-slate-400 leading-relaxed whitespace-pre-wrap">
-                            {(step.output || '').length > 300
-                              ? (step.output || '').slice(0, 300) + '...'
-                              : step.output}
+                            {step.output}
                           </p>
                         </div>
                       </div>
