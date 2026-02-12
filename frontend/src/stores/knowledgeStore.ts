@@ -1,5 +1,13 @@
 import { create } from 'zustand'
-import { knowledgeApi, KnowledgeBase, Document, DocumentChunk, SearchResult, SearchResponse } from '@/services/api'
+import {
+  knowledgeApi,
+  KnowledgeBase,
+  Document,
+  DocumentChunk,
+  SearchResult,
+  SearchResponse,
+  KnowledgeSearchOptions,
+} from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
 interface KnowledgeState {
@@ -49,6 +57,7 @@ interface KnowledgeState {
     chunkLevel?: string,
     sectionType?: string,
     includeParentContext?: boolean,
+    options?: KnowledgeSearchOptions,
   ) => Promise<SearchResponse>
   clearSearch: () => void
 
@@ -222,12 +231,13 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     chunkLevel: string = 'paragraph',
     sectionType?: string,
     includeParentContext: boolean = false,
+    options: KnowledgeSearchOptions = {},
   ) => {
     set({ isSearching: true, searchQuery: query })
     try {
       const response = await knowledgeApi.search(
         query, knowledgeBaseIds, 5, 0.5, includeShared,
-        chunkLevel, sectionType, includeParentContext,
+        chunkLevel, sectionType, includeParentContext, options,
       )
       set({
         searchResults: response.results,

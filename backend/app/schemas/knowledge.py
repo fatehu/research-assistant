@@ -150,6 +150,10 @@ class SearchRequest(BaseModel):
         default=False,
         description="是否同时返回父级 chunk 作为上下文"
     )
+    use_contextual_compression: bool = Field(
+        default=False,
+        description="是否启用检索结果的上下文压缩（会增加延迟）"
+    )
 
 
 class SearchResultItem(BaseModel):

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_name: str = "AI科研助手"
     app_version: str = "1.0.0"
     debug: bool = True
+    sqlalchemy_echo: bool = False
     
     # ========== 数据库配置 ==========
     database_url: str = "postgresql://research_user:research_password_123@localhost:5432/research_assistant"

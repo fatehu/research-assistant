@@ -98,6 +98,11 @@ const KnowledgePage = () => {
   const [searchChunkLevel, setSearchChunkLevel] = useState<string>('paragraph')
   const [searchSectionType, setSearchSectionType] = useState<string | undefined>(undefined)
   const [searchIncludeParent, setSearchIncludeParent] = useState(false)
+  const [searchUseQueryRewrite, setSearchUseQueryRewrite] = useState(true)
+  const [searchUseHybrid, setSearchUseHybrid] = useState(true)
+  const [searchUseReranker, setSearchUseReranker] = useState(true)
+  const [searchUseContextualCompression, setSearchUseContextualCompression] = useState(false)
+  const [searchTimeoutMs, setSearchTimeoutMs] = useState<number>(90000)
 
   // 共享知识库状态
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
@@ -185,7 +190,21 @@ const KnowledgePage = () => {
     if (!searchInput.trim()) return
     try {
       const kbIds = currentKnowledgeBase ? [currentKnowledgeBase.id] : undefined
-      await search(searchInput, kbIds, undefined, searchChunkLevel, searchSectionType, searchIncludeParent)
+      await search(
+        searchInput,
+        kbIds,
+        undefined,
+        searchChunkLevel,
+        searchSectionType,
+        searchIncludeParent,
+        {
+          useQueryRewrite: searchUseQueryRewrite,
+          useHybrid: searchUseHybrid,
+          useReranker: searchUseReranker,
+          useContextualCompression: searchUseContextualCompression,
+          timeoutMs: searchTimeoutMs,
+        },
+      )
     } catch {
       // Error handled by store
     }
@@ -452,7 +471,16 @@ const KnowledgePage = () => {
               <span className="text-slate-400 text-sm">
                 <FilterOutlined className="mr-1" />
                 高级过滤
-                {(searchChunkLevel !== 'paragraph' || searchSectionType || searchIncludeParent) && <Badge dot className="ml-2" />}
+                {(
+                  searchChunkLevel !== 'paragraph'
+                  || searchSectionType
+                  || searchIncludeParent
+                  || !searchUseQueryRewrite
+                  || !searchUseHybrid
+                  || !searchUseReranker
+                  || searchUseContextualCompression
+                  || searchTimeoutMs !== 90000
+                ) && <Badge dot className="ml-2" />}
               </span>
             ),
             children: (
@@ -479,6 +507,64 @@ const KnowledgePage = () => {
                   <div className="text-slate-400 text-xs mb-1">父级上下文</div>
                   <Switch checked={searchIncludeParent} onChange={setSearchIncludeParent} checkedChildren="开启" unCheckedChildren="关闭" size="small" />
                   <span className="text-slate-500 text-xs ml-2">回溯上级</span>
+                </Col>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">请求超时</div>
+                  <Select
+                    value={searchTimeoutMs}
+                    onChange={setSearchTimeoutMs}
+                    size="small"
+                    className="w-full"
+                    options={[
+                      { value: 45000, label: '45 秒' },
+                      { value: 90000, label: '90 秒（推荐）' },
+                      { value: 120000, label: '120 秒' },
+                    ]}
+                  />
+                </Col>
+                <Col span={12}>
+                  <div className="text-slate-400 text-xs mb-1">Query Rewrite 改写</div>
+                  <Switch
+                    checked={searchUseQueryRewrite}
+                    onChange={setSearchUseQueryRewrite}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">扩展查询语义，召回更全</span>
+                </Col>
+                <Col span={12}>
+                  <div className="text-slate-400 text-xs mb-1">Hybrid 混合检索</div>
+                  <Switch
+                    checked={searchUseHybrid}
+                    onChange={setSearchUseHybrid}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">向量 + 全文融合，兼顾精确与召回</span>
+                </Col>
+                <Col span={12}>
+                  <div className="text-slate-400 text-xs mb-1">Reranker 精排</div>
+                  <Switch
+                    checked={searchUseReranker}
+                    onChange={setSearchUseReranker}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">提高排序质量，增加耗时</span>
+                </Col>
+                <Col span={12}>
+                  <div className="text-slate-400 text-xs mb-1">Contextual Compression</div>
+                  <Switch
+                    checked={searchUseContextualCompression}
+                    onChange={setSearchUseContextualCompression}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">压缩上下文降低噪声，增加 LLM 开销</span>
                 </Col>
               </Row>
             ),

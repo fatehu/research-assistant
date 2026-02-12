@@ -1334,6 +1334,7 @@ async def search_knowledge(
     compression_results = await contextual_compression.compress_chunks(
         request.query,
         compression_inputs,
+        use_contextual_compression=request.use_contextual_compression,
     )
     compression_by_source_id = {
         item.source_id: item

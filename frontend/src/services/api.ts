@@ -205,6 +205,15 @@ export interface SearchResponse {
   search_time_ms: number
 }
 
+export interface KnowledgeSearchOptions {
+  useReranker?: boolean
+  useHybrid?: boolean
+  useQueryRewrite?: boolean
+  useContextualCompression?: boolean
+  queryRewriteStrategies?: string[]
+  timeoutMs?: number
+}
+
 export interface ProcessingStatus {
   document_id: number
   status: string
@@ -508,18 +517,34 @@ export const knowledgeApi = {
     chunkLevel: string = 'paragraph',
     sectionType?: string,
     includeParentContext = false,
+    options: KnowledgeSearchOptions = {},
   ): Promise<SearchResponse> => {
+    const {
+      useReranker = false,
+      useHybrid = false,
+      useQueryRewrite = false,
+      useContextualCompression = false,
+      queryRewriteStrategies,
+      timeoutMs = 60000,
+    } = options
+
     const response = await api.post('/api/knowledge/search', {
       query,
       knowledge_base_ids: knowledgeBaseIds,
       top_k: topK,
       score_threshold: scoreThreshold,
+      use_reranker: useReranker,
+      use_hybrid: useHybrid,
+      use_query_rewrite: useQueryRewrite,
+      use_contextual_compression: useContextualCompression,
+      query_rewrite_strategies: queryRewriteStrategies,
       // [Fix 12] 层级检索参数
       chunk_level: chunkLevel,
       section_type: sectionType || undefined,
       include_parent_context: includeParentContext,
     }, {
-      params: { include_shared: includeShared }
+      params: { include_shared: includeShared },
+      timeout: timeoutMs,
     })
     return response.data
   },

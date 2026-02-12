@@ -48,6 +48,7 @@ services:
       - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-this-in-production-min-32-chars}
       - ALGORITHM=${ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      - SQLALCHEMY_ECHO=${SQLALCHEMY_ECHO:-false}
       - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-deepseek}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
