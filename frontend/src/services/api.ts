@@ -1,7 +1,9 @@
 import axios, { AxiosError } from 'axios'
 
 // API 基础配置
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
+const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8000'
+export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 
 // 创建 axios 实例
 const api = axios.create({
@@ -81,6 +83,24 @@ export interface ReactStep {
   success?: boolean
 }
 
+export interface RagMetrics {
+  knowledge_search_calls: number
+  source_labels_count: number
+  source_labels: string[]
+  answer_citation_count: number
+  citation_required: boolean
+  citation_valid: boolean
+  citation_repair_attempts: number
+  citation_repair_successes: number
+  compression_calls: number
+  compression_success_chunks: number
+  compression_fallback_chunks: number
+}
+
+export interface MessageMetadata extends Record<string, unknown> {
+  rag_metrics?: RagMetrics
+}
+
 export interface Message {
   id: number
   conversation_id: number
@@ -92,7 +112,7 @@ export interface Message {
   action?: string
   action_input?: Record<string, unknown>
   observation?: string
-  metadata?: Record<string, unknown>
+  metadata?: MessageMetadata
   prompt_tokens?: number
   completion_tokens?: number
   total_tokens?: number
@@ -319,7 +339,7 @@ export const chatApi = {
   sendMessageStream: async (
     message: string,
     conversationId?: number,
-    onEvent?: (event: string, data: unknown) => void,
+    onEvent?: (event: string, data: any) => void,
     abortController?: AbortController
   ): Promise<void> => {
     try {
@@ -945,7 +965,10 @@ export interface AgentMessage {
   content: string
   code_blocks: AgentCodeBlock[]
   timestamp: string
-  metadata: Record<string, any>
+  metadata: {
+    rag_metrics?: RagMetrics
+    [key: string]: any
+  }
 }
 
 export interface AgentContextResponse {
@@ -976,6 +999,7 @@ export interface AgentChatEvent {
   code_blocks?: AgentCodeBlock[]
   suggested_action?: string
   suggested_code?: string
+  rag_metrics?: RagMetrics
   error?: string
   tool?: string
   input?: Record<string, any>

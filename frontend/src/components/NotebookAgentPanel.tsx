@@ -21,7 +21,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { agentApi, AgentMessage, AgentCodeBlock, Cell } from '@/services/api'
+import { SHOW_RAG_METRICS, agentApi, AgentMessage, AgentCodeBlock, Cell, RagMetrics } from '@/services/api'
 
 const { TextArea } = Input
 
@@ -51,6 +51,31 @@ const quickActions = [
   { key: 'optimize', icon: <BulbOutlined />, label: '优化代码', prompt: '请优化最近的代码，提高性能' },
 ]
 
+const parseRagMetrics = (value: unknown): RagMetrics | null => {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const metrics = value as Partial<RagMetrics>
+  if (typeof metrics.knowledge_search_calls !== 'number') {
+    return null
+  }
+
+  return {
+    knowledge_search_calls: metrics.knowledge_search_calls,
+    source_labels_count: Number(metrics.source_labels_count || 0),
+    source_labels: Array.isArray(metrics.source_labels) ? metrics.source_labels : [],
+    answer_citation_count: Number(metrics.answer_citation_count || 0),
+    citation_required: Boolean(metrics.citation_required),
+    citation_valid: Boolean(metrics.citation_valid),
+    citation_repair_attempts: Number(metrics.citation_repair_attempts || 0),
+    citation_repair_successes: Number(metrics.citation_repair_successes || 0),
+    compression_calls: Number(metrics.compression_calls || 0),
+    compression_success_chunks: Number(metrics.compression_success_chunks || 0),
+    compression_fallback_chunks: Number(metrics.compression_fallback_chunks || 0),
+  }
+}
+
 const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   notebookId, onInsertCode, onRunCode, onFocusCell, onClearOutputs, onRefreshNotebook, onAddCell, onUpdateCell,
   isVisible, onClose, onToggleExpand, isExpanded = false,
@@ -62,7 +87,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
   const [isAuthorized, setIsAuthorized] = useState(false)  // 授权状态
-  const [pendingAuthAction, setPendingAuthAction] = useState<string | null>(null)
+  const [, setPendingAuthAction] = useState<string | null>(null)
   
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<any>(null)
@@ -169,7 +194,11 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
               content: fullContent,
               code_blocks: codeBlocks,
               timestamp: new Date().toISOString(),
-              metadata: { suggested_action: event.suggested_action, suggested_code: event.suggested_code },
+              metadata: {
+                suggested_action: event.suggested_action,
+                suggested_code: event.suggested_code,
+                rag_metrics: event.rag_metrics,
+              },
             }
             setMessages(prev => [...prev, assistantMessage])
             setStreamingContent('')
@@ -215,6 +244,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
   const renderMessageContent = (msg: AgentMessage) => {
     const isUser = msg.role === 'user'
+    const ragMetrics = !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
     
     return (
       <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
@@ -226,32 +256,53 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             {isUser ? (
               <p className="whitespace-pre-wrap">{msg.content}</p>
             ) : (
-              <div className="prose prose-invert prose-sm max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                  code({ node, className, children, ...props }: any) {
-                    const match = /language-(\w+)/.exec(className || '')
-                    const inline = !match
-                    const codeString = String(children).replace(/\n$/, '')
-                    
-                    if (inline) return <code className="bg-slate-700/50 px-1.5 py-0.5 rounded text-emerald-400 text-sm" {...props}>{children}</code>
-                    
-                    return (
-                      <div className="relative group my-2">
-                        <div className="absolute right-2 top-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-                          <Tooltip title="复制"><Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyCode(codeString)} className="text-slate-400 hover:text-white" /></Tooltip>
-                          {onInsertCode && <Tooltip title="插入到 Notebook"><Button type="text" size="small" icon={<CodeOutlined />} onClick={() => insertCode(codeString)} className="text-slate-400 hover:text-emerald-400" /></Tooltip>}
-                          {onRunCode && <Tooltip title="运行代码"><Button type="text" size="small" icon={<PlayCircleOutlined />} onClick={() => runCode(codeString)} className="text-slate-400 hover:text-amber-400" /></Tooltip>}
-                        </div>
-                        <SyntaxHighlighter style={oneDark} language={match ? match[1] : 'python'} PreTag="div" customStyle={{ margin: 0, borderRadius: '0.5rem', fontSize: '0.85rem' }}>
-                          {codeString}
-                        </SyntaxHighlighter>
+              <div className="space-y-2">
+                {SHOW_RAG_METRICS && ragMetrics && (
+                  <details className="rounded-lg border border-cyan-500/20 bg-slate-900/60 px-3 py-2">
+                    <summary className="cursor-pointer text-xs text-cyan-300 select-none">
+                      RAG质量
+                    </summary>
+                    <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-slate-300">
+                      <div>检索调用: {ragMetrics.knowledge_search_calls}</div>
+                      <div>来源数: {ragMetrics.source_labels_count}</div>
+                      <div>答案引用: {ragMetrics.answer_citation_count}</div>
+                      <div>引用有效: {ragMetrics.citation_valid ? '是' : '否'}</div>
+                      <div>压缩调用: {ragMetrics.compression_calls}</div>
+                      <div>压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}</div>
+                      <div className="col-span-2 truncate">
+                        来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
                       </div>
-                    )
-                  },
-                  p({ children }) { return <p className="mb-2 last:mb-0">{children}</p> },
-                  ul({ children }) { return <ul className="list-disc list-inside mb-2">{children}</ul> },
-                  ol({ children }) { return <ol className="list-decimal list-inside mb-2">{children}</ol> },
-                }}>{msg.content}</ReactMarkdown>
+                    </div>
+                  </details>
+                )}
+
+                <div className="prose prose-invert prose-sm max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                    code({ node, className, children, ...props }: any) {
+                      const match = /language-(\w+)/.exec(className || '')
+                      const inline = !match
+                      const codeString = String(children).replace(/\n$/, '')
+                      
+                      if (inline) return <code className="bg-slate-700/50 px-1.5 py-0.5 rounded text-emerald-400 text-sm" {...props}>{children}</code>
+                      
+                      return (
+                        <div className="relative group my-2">
+                          <div className="absolute right-2 top-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                            <Tooltip title="复制"><Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyCode(codeString)} className="text-slate-400 hover:text-white" /></Tooltip>
+                            {onInsertCode && <Tooltip title="插入到 Notebook"><Button type="text" size="small" icon={<CodeOutlined />} onClick={() => insertCode(codeString)} className="text-slate-400 hover:text-emerald-400" /></Tooltip>}
+                            {onRunCode && <Tooltip title="运行代码"><Button type="text" size="small" icon={<PlayCircleOutlined />} onClick={() => runCode(codeString)} className="text-slate-400 hover:text-amber-400" /></Tooltip>}
+                          </div>
+                          <SyntaxHighlighter style={oneDark} language={match ? match[1] : 'python'} PreTag="div" customStyle={{ margin: 0, borderRadius: '0.5rem', fontSize: '0.85rem' }}>
+                            {codeString}
+                          </SyntaxHighlighter>
+                        </div>
+                      )
+                    },
+                    p({ children }) { return <p className="mb-2 last:mb-0">{children}</p> },
+                    ul({ children }) { return <ul className="list-disc list-inside mb-2">{children}</ul> },
+                    ol({ children }) { return <ol className="list-decimal list-inside mb-2">{children}</ol> },
+                  }}>{msg.content}</ReactMarkdown>
+                </div>
               </div>
             )}
           </div>

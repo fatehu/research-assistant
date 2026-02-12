@@ -327,14 +327,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
             case 'done':
               // 完成，添加助手消息
+              const doneData = (data && typeof data === 'object') ? data as Record<string, any> : {}
+              const ragMetrics = doneData.rag_metrics
               const assistantMessage: Message = {
                 id: Date.now() + 1,
                 conversation_id: newConversationId || currentConversation?.id || 0,
                 role: 'assistant',
-                content: fullContent || data.answer || '',
+                content: fullContent || doneData.answer || '',
                 message_type: 'text',
-                thought: currentThought || data.thought || undefined,
-                react_steps: data.react_steps || undefined,  // 保存ReAct步骤
+                thought: currentThought || doneData.thought || undefined,
+                react_steps: doneData.react_steps || undefined,  // 保存ReAct步骤
+                metadata: ragMetrics ? { rag_metrics: ragMetrics } : undefined,
                 created_at: new Date().toISOString(),
               }
 

@@ -8,7 +8,7 @@ import {
 import { motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { Message } from '@/services/api'
+import { SHOW_RAG_METRICS, type Message, type RagMetrics } from '@/services/api'
 import CodeBlock from './CodeBlock'
 import ThinkingPanel from './ThinkingPanel'
 import HistoryReActPanel from './HistoryReActPanel'
@@ -22,6 +22,31 @@ interface MessageBubbleProps {
   isHighlighted?: boolean
 }
 
+const parseRagMetrics = (value: unknown): RagMetrics | null => {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const metrics = value as Partial<RagMetrics>
+  if (typeof metrics.knowledge_search_calls !== 'number') {
+    return null
+  }
+
+  return {
+    knowledge_search_calls: metrics.knowledge_search_calls,
+    source_labels_count: Number(metrics.source_labels_count || 0),
+    source_labels: Array.isArray(metrics.source_labels) ? metrics.source_labels : [],
+    answer_citation_count: Number(metrics.answer_citation_count || 0),
+    citation_required: Boolean(metrics.citation_required),
+    citation_valid: Boolean(metrics.citation_valid),
+    citation_repair_attempts: Number(metrics.citation_repair_attempts || 0),
+    citation_repair_successes: Number(metrics.citation_repair_successes || 0),
+    compression_calls: Number(metrics.compression_calls || 0),
+    compression_success_chunks: Number(metrics.compression_success_chunks || 0),
+    compression_fallback_chunks: Number(metrics.compression_fallback_chunks || 0),
+  }
+}
+
 /** 消息气泡 - 美化版 */
 const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
   (
@@ -29,7 +54,6 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       msg,
       isStreaming = false,
       streamingContent = '',
-      streamingThought = '',
       isThinking = false,
       isHighlighted = false,
     },
@@ -40,6 +64,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const thought = isStreaming ? '' : msg.thought
     const reactSteps = isStreaming ? undefined : msg.react_steps
     const [thoughtExpanded, setThoughtExpanded] = useState(false)
+    const [ragExpanded, setRagExpanded] = useState(false)
+    const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
 
     const handleCopy = () => {
       navigator.clipboard.writeText(content)
@@ -111,6 +137,40 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
               isExpanded={thoughtExpanded}
               onToggle={() => setThoughtExpanded(!thoughtExpanded)}
             />
+          )}
+
+          {SHOW_RAG_METRICS && !isUser && !isStreaming && ragMetrics && (
+            <div className="mb-3 rounded-xl border border-cyan-500/20 bg-slate-900/60">
+              <button
+                type="button"
+                onClick={() => setRagExpanded(!ragExpanded)}
+                className="w-full flex items-center justify-between px-3 py-2 text-left"
+              >
+                <span className="text-xs font-medium text-cyan-300">RAG质量</span>
+                <span className={`text-xs ${ragMetrics.citation_valid ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {ragMetrics.citation_valid ? '引用有效' : '引用待修正'}
+                </span>
+              </button>
+
+              {ragExpanded && (
+                <div className="px-3 pb-3 pt-1 text-xs text-slate-300 grid grid-cols-2 gap-x-3 gap-y-1">
+                  <div>检索调用: {ragMetrics.knowledge_search_calls}</div>
+                  <div>来源数: {ragMetrics.source_labels_count}</div>
+                  <div>答案引用: {ragMetrics.answer_citation_count}</div>
+                  <div>需引用: {ragMetrics.citation_required ? '是' : '否'}</div>
+                  <div>压缩调用: {ragMetrics.compression_calls}</div>
+                  <div>
+                    压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}
+                  </div>
+                  <div>
+                    修复成功/尝试: {ragMetrics.citation_repair_successes}/{ragMetrics.citation_repair_attempts}
+                  </div>
+                  <div className="col-span-2 truncate">
+                    来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           {/* 消息内容 */}
