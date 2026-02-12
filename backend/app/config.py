@@ -78,6 +78,12 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_device: str = "auto"                # auto / cpu / cuda / mps
     reranker_top_k: int = 20                     # pgvector 粗排候选数
+
+    # ========== 混合检索配置 ==========
+    enable_hybrid_retrieval: bool = True
+    hybrid_vector_top_k: int = 20
+    hybrid_text_top_k: int = 20
+    hybrid_rrf_k: int = 60
     
     # ========== LLM 推理参数 ==========
     llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)

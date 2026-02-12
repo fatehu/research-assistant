@@ -36,6 +36,7 @@ from app.schemas.knowledge import (
 )
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
+from app.services.hybrid_retrieval_service import fuse_rrf
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.smart_chunking_service import (
     SmartChunkingService,
@@ -1090,44 +1091,50 @@ async def search_knowledge(
     # 我们需要将距离阈值转换为：score_threshold 对应 distance_threshold = 1 - score_threshold
     distance_threshold = 1 - request.score_threshold
     use_reranker = settings.enable_reranker and request.use_reranker
+    use_hybrid = settings.enable_hybrid_retrieval and request.use_hybrid
     final_top_k = request.top_k
-    coarse_top_k = (
+
+    reranker_candidate_k = (
         max(final_top_k, settings.reranker_top_k)
         if use_reranker
         else final_top_k
     )
+    vector_top_k = max(
+        reranker_candidate_k,
+        settings.hybrid_vector_top_k if use_hybrid else 0,
+    )
+    text_top_k = (
+        max(reranker_candidate_k, settings.hybrid_text_top_k)
+        if use_hybrid
+        else 0
+    )
+    fusion_limit = reranker_candidate_k
     
     # 构建 pgvector 原生查询
     from sqlalchemy import text
     
     vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-    
-    # [Fix 12] 动态构建 WHERE 条件，支持 chunk_level/section_type 过滤
-    where_clauses = [
-        "dc.knowledge_base_id = ANY(:kb_ids)",
-        "dc.embedding IS NOT NULL",
-        "(dc.embedding <=> :query_vector) <= :distance_threshold",
-    ]
-    params = {
-        "query_vector": vector_str,
-        "kb_ids": kb_ids,
-        "distance_threshold": distance_threshold,
-        "top_k": coarse_top_k,
-    }
-    
-    # chunk_level 过滤（默认只搜索 paragraph 级）
+
+    base_where_clauses = ["dc.knowledge_base_id = ANY(:kb_ids)"]
+    base_params = {"kb_ids": kb_ids}
+
     if request.chunk_level and request.chunk_level != "all":
-        where_clauses.append("dc.chunk_level = :chunk_level")
-        params["chunk_level"] = request.chunk_level
-    
-    # section_type 过滤（如 "只搜方法部分"）
+        base_where_clauses.append("dc.chunk_level = :chunk_level")
+        base_params["chunk_level"] = request.chunk_level
+
     if request.section_type:
-        where_clauses.append("dc.section_type = :section_type")
-        params["section_type"] = request.section_type
-    
-    where_sql = " AND ".join(where_clauses)
-    
-    sql = text(f"""
+        base_where_clauses.append("dc.section_type = :section_type")
+        base_params["section_type"] = request.section_type
+
+    vector_where_sql = " AND ".join(
+        base_where_clauses
+        + [
+            "dc.embedding IS NOT NULL",
+            "(dc.embedding <=> :query_vector) <= :distance_threshold",
+        ]
+    )
+
+    vector_sql = text(f"""
         SELECT 
             dc.id,
             dc.document_id,
@@ -1140,52 +1147,141 @@ async def search_knowledge(
             dc.section_title,
             dc.parent_chunk_id,
             1 - (dc.embedding <=> :query_vector) as similarity,
+            NULL::float as text_score,
             d.original_filename as document_name,
             kb.name as knowledge_base_name
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
         JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
-        WHERE {where_sql}
+        WHERE {vector_where_sql}
         ORDER BY dc.embedding <=> :query_vector
-        LIMIT :top_k
+        LIMIT :vector_top_k
     """)
-    
-    result = await db.execute(sql, params)
-    rows = result.fetchall()
 
-    selected_rows = []
-    if use_reranker and rows:
+    vector_params = {
+        **base_params,
+        "query_vector": vector_str,
+        "distance_threshold": distance_threshold,
+        "vector_top_k": vector_top_k,
+    }
+    vector_rows = (await db.execute(vector_sql, vector_params)).fetchall()
+
+    text_rows = []
+    if use_hybrid and request.query.strip():
+        text_where_sql = " AND ".join(
+            base_where_clauses
+            + [
+                "dc.content IS NOT NULL",
+                "dc.content <> ''",
+                "to_tsvector('simple', dc.content) @@ websearch_to_tsquery('simple', :fts_query)",
+            ]
+        )
+        text_sql = text(f"""
+            SELECT 
+                dc.id,
+                dc.document_id,
+                dc.knowledge_base_id,
+                dc.content,
+                dc.chunk_index,
+                dc.metadata,
+                dc.chunk_level,
+                dc.section_type,
+                dc.section_title,
+                dc.parent_chunk_id,
+                NULL::float as similarity,
+                ts_rank_cd(
+                    to_tsvector('simple', dc.content),
+                    websearch_to_tsquery('simple', :fts_query)
+                ) as text_score,
+                d.original_filename as document_name,
+                kb.name as knowledge_base_name
+            FROM document_chunks dc
+            JOIN documents d ON dc.document_id = d.id
+            JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
+            WHERE {text_where_sql}
+            ORDER BY text_score DESC
+            LIMIT :text_top_k
+        """)
+        text_params = {
+            **base_params,
+            "fts_query": request.query,
+            "text_top_k": text_top_k,
+        }
+        try:
+            text_rows = (await db.execute(text_sql, text_params)).fetchall()
+        except Exception as e:
+            logger.warning(f"Full-text search failed, fallback to vector ranking: {e}")
+            text_rows = []
+
+    fused_candidates = fuse_rrf(
+        vector_rows=vector_rows,
+        text_rows=text_rows if use_hybrid else [],
+        rrf_k=settings.hybrid_rrf_k,
+        limit=fusion_limit,
+    )
+
+    selected_candidates = []
+    if use_reranker and fused_candidates:
         try:
             reranker = get_reranker_service()
             reranked = await reranker.rerank(
                 query=request.query,
-                documents=[row.content for row in rows],
+                documents=[candidate.row.content for candidate in fused_candidates],
                 top_k=final_top_k,
             )
-            selected_rows = [
-                (rows[idx], score)
+            selected_candidates = [
+                (fused_candidates[idx], score)
                 for idx, score in reranked
-                if 0 <= idx < len(rows)
+                if 0 <= idx < len(fused_candidates)
             ]
         except Exception as e:
-            logger.warning(f"Reranker failed, fallback to ANN ranking: {e}")
+            logger.warning(f"Reranker failed, fallback to retrieval ranking: {e}")
 
-    if not selected_rows:
-        selected_rows = [(row, None) for row in rows[:final_top_k]]
+    if not selected_candidates:
+        selected_candidates = [
+            (candidate, None)
+            for candidate in fused_candidates[:final_top_k]
+        ]
     
     # 构建结果
     results = []
     parent_ids_to_fetch = set()
     
-    for row, reranker_score in selected_rows:
-        vector_score = round(float(row.similarity), 4)
+    max_rrf_score = max((c.rrf_score for c in fused_candidates), default=0.0)
+    for candidate, reranker_score in selected_candidates:
+        row = candidate.row
+        vector_score = (
+            round(float(candidate.vector_score), 4)
+            if candidate.vector_score is not None
+            else None
+        )
+        text_score = (
+            round(float(candidate.text_score), 4)
+            if candidate.text_score is not None
+            else None
+        )
+
         metadata = dict(row.metadata or {})
-        if reranker_score is not None:
+        metadata["retrieval_mode"] = "hybrid" if use_hybrid else "vector"
+        metadata["rrf_score"] = round(float(candidate.rrf_score), 6)
+        if candidate.vector_rank is not None:
+            metadata["vector_rank"] = candidate.vector_rank
+        if candidate.text_rank is not None:
+            metadata["text_rank"] = candidate.text_rank
+        if vector_score is not None:
             metadata["vector_score"] = vector_score
+        if text_score is not None:
+            metadata["text_score"] = text_score
+
+        if reranker_score is not None:
             metadata["reranker_score"] = round(float(reranker_score), 4)
             score = round(RerankerService.normalize_score(float(reranker_score)), 4)
-        else:
+        elif use_hybrid and max_rrf_score > 0:
+            score = round(candidate.rrf_score / max_rrf_score, 4)
+        elif vector_score is not None:
             score = vector_score
+        else:
+            score = 0.0
 
         item = SearchResultItem(
             chunk_id=row.id,
@@ -1249,7 +1345,8 @@ async def search_knowledge(
     
     logger.info(
         f"向量搜索完成: query='{request.query[:50]}...', results={len(results)}, "
-        f"reranker={use_reranker}, time={search_time:.2f}ms"
+        f"hybrid={use_hybrid}, reranker={use_reranker}, "
+        f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, time={search_time:.2f}ms"
     )
     
     return SearchResponse(

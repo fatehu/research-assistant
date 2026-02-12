@@ -16,6 +16,7 @@ from sqlalchemy import select, text, or_, and_
 from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.services.embedding_service import get_embedding_service
+from app.services.hybrid_retrieval_service import fuse_rrf
 from app.services.reranker_service import get_reranker_service, RerankerService
 
 # 尝试导入共享模块（可选）
@@ -377,17 +378,29 @@ class KnowledgeSearchTool(Tool):
             
             kb_ids = list(kb_ids)
             use_reranker = settings.enable_reranker
+            use_hybrid = settings.enable_hybrid_retrieval
             final_top_k = top_k
-            coarse_top_k = (
+
+            reranker_candidate_k = (
                 max(final_top_k, settings.reranker_top_k)
                 if use_reranker
                 else final_top_k
             )
+            vector_top_k = max(
+                reranker_candidate_k,
+                settings.hybrid_vector_top_k if use_hybrid else 0,
+            )
+            text_top_k = (
+                max(reranker_candidate_k, settings.hybrid_text_top_k)
+                if use_hybrid
+                else 0
+            )
+            fusion_limit = reranker_candidate_k
             
             # 使用 pgvector 进行向量相似度搜索
             vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
             
-            sql = text("""
+            vector_sql = text("""
                 SELECT 
                     dc.id,
                     dc.document_id,
@@ -395,6 +408,7 @@ class KnowledgeSearchTool(Tool):
                     dc.content,
                     dc.chunk_index,
                     1 - (dc.embedding <=> :query_vector) as similarity,
+                    NULL::float as text_score,
                     d.original_filename as document_name,
                     kb.name as knowledge_base_name
                 FROM document_chunks dc
@@ -404,52 +418,114 @@ class KnowledgeSearchTool(Tool):
                     AND dc.embedding IS NOT NULL
                     AND (dc.embedding <=> :query_vector) <= 0.5
                 ORDER BY dc.embedding <=> :query_vector
-                LIMIT :top_k
+                LIMIT :vector_top_k
             """)
             
-            result = await self.db.execute(sql, {
+            result = await self.db.execute(vector_sql, {
                 "query_vector": vector_str,
                 "kb_ids": kb_ids,
-                "top_k": coarse_top_k
+                "vector_top_k": vector_top_k,
             })
-            rows = result.fetchall()
-            
-            if not rows:
+            vector_rows = result.fetchall()
+
+            text_rows = []
+            if use_hybrid and query.strip():
+                text_sql = text("""
+                    SELECT 
+                        dc.id,
+                        dc.document_id,
+                        dc.knowledge_base_id,
+                        dc.content,
+                        dc.chunk_index,
+                        NULL::float as similarity,
+                        ts_rank_cd(
+                            to_tsvector('simple', dc.content),
+                            websearch_to_tsquery('simple', :fts_query)
+                        ) as text_score,
+                        d.original_filename as document_name,
+                        kb.name as knowledge_base_name
+                    FROM document_chunks dc
+                    JOIN documents d ON dc.document_id = d.id
+                    JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
+                    WHERE dc.knowledge_base_id = ANY(:kb_ids)
+                        AND dc.content IS NOT NULL
+                        AND dc.content <> ''
+                        AND to_tsvector('simple', dc.content) @@ websearch_to_tsquery('simple', :fts_query)
+                    ORDER BY text_score DESC
+                    LIMIT :text_top_k
+                """)
+                try:
+                    text_result = await self.db.execute(text_sql, {
+                        "fts_query": query,
+                        "kb_ids": kb_ids,
+                        "text_top_k": text_top_k,
+                    })
+                    text_rows = text_result.fetchall()
+                except Exception as e:
+                    logger.warning(f"[KnowledgeSearch] Full-text search failed, fallback to vector ranking: {e}")
+                    text_rows = []
+
+            fused_candidates = fuse_rrf(
+                vector_rows=vector_rows,
+                text_rows=text_rows if use_hybrid else [],
+                rrf_k=settings.hybrid_rrf_k,
+                limit=fusion_limit,
+            )
+
+            if not fused_candidates:
                 return ToolResult(
                     success=True,
                     output="未找到与查询相关的内容。可能知识库中没有相关信息，或者需要调整搜索关键词。",
                     data={"results": [], "total": 0}
                 )
 
-            selected_rows = []
+            selected_candidates = []
             if use_reranker:
                 try:
                     reranker = get_reranker_service()
                     reranked = await reranker.rerank(
                         query=query,
-                        documents=[row.content for row in rows],
+                        documents=[candidate.row.content for candidate in fused_candidates],
                         top_k=final_top_k,
                     )
-                    selected_rows = [
-                        (rows[idx], score)
+                    selected_candidates = [
+                        (fused_candidates[idx], score)
                         for idx, score in reranked
-                        if 0 <= idx < len(rows)
+                        if 0 <= idx < len(fused_candidates)
                     ]
                 except Exception as e:
-                    logger.warning(f"[KnowledgeSearch] Reranker failed, fallback to ANN ranking: {e}")
+                    logger.warning(f"[KnowledgeSearch] Reranker failed, fallback to retrieval ranking: {e}")
 
-            if not selected_rows:
-                selected_rows = [(row, None) for row in rows[:final_top_k]]
+            if not selected_candidates:
+                selected_candidates = [
+                    (candidate, None)
+                    for candidate in fused_candidates[:final_top_k]
+                ]
             
             # 构建结果
             results = []
-            for row, reranker_score in selected_rows:
-                vector_score = round(float(row.similarity), 4)
-                score = (
-                    round(RerankerService.normalize_score(float(reranker_score)), 4)
-                    if reranker_score is not None
-                    else vector_score
+            max_rrf_score = max((c.rrf_score for c in fused_candidates), default=0.0)
+            for candidate, reranker_score in selected_candidates:
+                row = candidate.row
+                vector_score = (
+                    round(float(candidate.vector_score), 4)
+                    if candidate.vector_score is not None
+                    else None
                 )
+                text_score = (
+                    round(float(candidate.text_score), 4)
+                    if candidate.text_score is not None
+                    else None
+                )
+
+                if reranker_score is not None:
+                    score = round(RerankerService.normalize_score(float(reranker_score)), 4)
+                elif use_hybrid and max_rrf_score > 0:
+                    score = round(candidate.rrf_score / max_rrf_score, 4)
+                elif vector_score is not None:
+                    score = vector_score
+                else:
+                    score = 0.0
 
                 results.append({
                     "content": row.content,
@@ -457,7 +533,12 @@ class KnowledgeSearchTool(Tool):
                     "document": row.document_name or "未知",
                     "knowledge_base": row.knowledge_base_name or "未知",
                     "chunk_index": row.chunk_index,
+                    "retrieval_mode": "hybrid" if use_hybrid else "vector",
+                    "vector_rank": candidate.vector_rank,
+                    "text_rank": candidate.text_rank,
+                    "rrf_score": round(float(candidate.rrf_score), 6),
                     "vector_score": vector_score,
+                    "text_score": text_score,
                     "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
                 })
             
