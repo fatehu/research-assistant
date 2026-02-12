@@ -33,7 +33,8 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
   const [physics, setPhysics] = useState(true)
 
   useEffect(() => {
-    if (!data || !containerRef.current) return
+    const container = containerRef.current
+    if (!data || !container) return
 
     // 动态加载 vis-network
     const loadVisNetwork = async () => {
@@ -42,7 +43,7 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
         const vis = await import('vis-network/standalone')
         
         // 准备节点数据
-        const nodes = new vis.DataSet(
+        const nodes = new vis.DataSet<any>(
           data.nodes.map((node: GraphNode) => ({
             id: node.id,
             label: truncateTitle(node.title, 30),
@@ -60,7 +61,7 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
         )
 
         // 准备边数据
-        const edges = new vis.DataSet(
+        const edges = new vis.DataSet<any>(
           data.edges.map((edge: GraphEdge, index: number) => ({
             id: `edge-${index}`,
             from: edge.from,
@@ -76,7 +77,7 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
         )
 
         // 配置选项
-        const options = {
+        const options: any = {
           nodes: {
             shape: 'dot',
             font: {
@@ -90,7 +91,9 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
           },
           edges: {
             smooth: {
+              enabled: true,
               type: 'continuous',
+              roundness: 0.2,
             },
             arrows: {
               to: { enabled: true, scaleFactor: 0.5 },
@@ -125,11 +128,7 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
           networkRef.current.destroy()
         }
         
-        networkRef.current = new vis.Network(
-          containerRef.current,
-          { nodes, edges },
-          options
-        )
+        networkRef.current = new vis.Network(container, { nodes, edges }, options)
 
         // 事件监听
         networkRef.current.on('click', (params: any) => {

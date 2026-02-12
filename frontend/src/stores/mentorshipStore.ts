@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { mentorshipApi, Mentorship, MentorshipStatus, UserBrief } from '@/services/api'
+import { mentorshipApi, Mentorship, MentorshipStatus, UserBrief, UserRole } from '@/services/api'
 
 // 学生活动类型（用于导师仪表板）
 export interface StudentActivity {
@@ -57,7 +57,7 @@ const mockStudentActivities: StudentActivity[] = [
     title: '深度学习模型优化讨论',
     description: '与 AI 助手讨论了 Transformer 模型的优化策略',
     timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    student: { id: 1, username: 'student1', full_name: '张三', role: 'student' as const },
+    student: { id: 1, username: 'student1', full_name: '张三', role: UserRole.STUDENT },
   },
   {
     id: '2',
@@ -65,7 +65,7 @@ const mockStudentActivities: StudentActivity[] = [
     title: '实验数据分析',
     description: '完成了实验数据的可视化分析',
     timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
-    student: { id: 2, username: 'student2', full_name: '李四', role: 'student' as const },
+    student: { id: 2, username: 'student2', full_name: '李四', role: UserRole.STUDENT },
   },
   {
     id: '3',
@@ -73,7 +73,7 @@ const mockStudentActivities: StudentActivity[] = [
     title: '论文收藏: Attention Is All You Need',
     description: '收藏并标注了 Transformer 原始论文',
     timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-    student: { id: 1, username: 'student1', full_name: '张三', role: 'student' as const },
+    student: { id: 1, username: 'student1', full_name: '张三', role: UserRole.STUDENT },
   },
   {
     id: '4',
@@ -81,7 +81,7 @@ const mockStudentActivities: StudentActivity[] = [
     title: 'PyTorch 模型训练',
     description: '运行了 CNN 图像分类训练代码',
     timestamp: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
-    student: { id: 2, username: 'student2', full_name: '李四', role: 'student' as const },
+    student: { id: 2, username: 'student2', full_name: '李四', role: UserRole.STUDENT },
   },
 ]
 

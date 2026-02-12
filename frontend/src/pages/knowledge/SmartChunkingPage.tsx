@@ -151,7 +151,7 @@ const ChunkCard = ({
   chunk,
   index,
 }: {
-  chunk: { content: string; metadata: { level: string; section_type?: string; has_citations: boolean } }
+  chunk: { content: string; metadata: { level: string; section_type?: string; has_citations: boolean; token_count?: number } }
   index: number
 }) => (
   <Card

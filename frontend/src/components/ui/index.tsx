@@ -31,8 +31,16 @@ const statusConfig: Record<MentorshipStatus, {
   dot: string
   icon: React.ReactNode
 }> = {
+  [MentorshipStatus.NONE]: {
+    label: 'Unassigned',
+    bg: 'bg-slate-500/20',
+    text: 'text-slate-400',
+    border: 'border-slate-500/30',
+    dot: 'bg-slate-400',
+    icon: <MinusCircleOutlined />,
+  },
   [MentorshipStatus.PENDING]: {
-    label: '待审批',
+    label: 'Pending',
     bg: 'bg-amber-500/20',
     text: 'text-amber-400',
     border: 'border-amber-500/30',
@@ -40,15 +48,23 @@ const statusConfig: Record<MentorshipStatus, {
     icon: <ClockCircleOutlined />,
   },
   [MentorshipStatus.ACTIVE]: {
-    label: '已关联',
+    label: 'Active',
     bg: 'bg-emerald-500/20',
     text: 'text-emerald-400',
     border: 'border-emerald-500/30',
     dot: 'bg-emerald-400',
     icon: <CheckCircleOutlined />,
   },
+  [MentorshipStatus.INVITED]: {
+    label: 'Invited',
+    bg: 'bg-blue-500/20',
+    text: 'text-blue-400',
+    border: 'border-blue-500/30',
+    dot: 'bg-blue-400',
+    icon: <ClockCircleOutlined />,
+  },
   [MentorshipStatus.ARCHIVED]: {
-    label: '已归档',
+    label: 'Archived',
     bg: 'bg-slate-500/20',
     text: 'text-slate-400',
     border: 'border-slate-500/30',

@@ -6,6 +6,7 @@ import {
   PaperCollection,
   SearchHistory
 } from '@/services/api'
+import { handleApiError } from '@/utils/apiErrorHandler'
 
 interface LiteratureState {
   // 论文列表

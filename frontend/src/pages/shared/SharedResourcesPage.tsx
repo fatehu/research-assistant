@@ -21,7 +21,7 @@ interface SharedResource {
   id: number;
   resource_type: string;
   resource_id: number | string;  // notebook uses string UUID
-  resource_name: string;
+  resource_name?: string;
   resource_detail?: {
     title?: string; authors?: string[]; year?: number; venue?: string;
     abstract?: string; pdf_url?: string; url?: string; citation_count?: number;
@@ -29,7 +29,7 @@ interface SharedResource {
     cell_count?: number;  // notebook specific
   };
   owner_id: number;
-  owner_name: string;
+  owner_name?: string;
   owner_avatar?: string;
   shared_with_type: string;
   shared_with_id?: number;
@@ -211,7 +211,7 @@ const SharedResourcesPage: React.FC = () => {
             <div style={{ width: 42, height: 42, borderRadius: 12, background: `${config.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: config.color, fontSize: 18 }}>{config.icon}</div>
             <div>
               <div style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: 280 }}>
-                <Tooltip title={record.resource_name}>{record.resource_name.length > 35 ? record.resource_name.slice(0, 35) + '...' : record.resource_name}</Tooltip>
+                <Tooltip title={record.resource_name || ''}>{(record.resource_name || '').length > 35 ? (record.resource_name || '').slice(0, 35) + '...' : (record.resource_name || '')}</Tooltip>
               </div>
               <Space size={4}>
                 <Tag color={config.color} style={{ fontSize: 10, padding: '0 6px', borderRadius: 10 }}>{config.label}</Tag>
@@ -248,7 +248,7 @@ const SharedResourcesPage: React.FC = () => {
         <Space>
           <div style={{ width: 42, height: 42, borderRadius: 12, background: `${config.color}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: config.color, fontSize: 18 }}>{config.icon}</div>
           <div>
-            <div style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: 260 }}><Tooltip title={record.resource_name}>{record.resource_name.length > 30 ? record.resource_name.slice(0, 30) + '...' : record.resource_name}</Tooltip></div>
+            <div style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: 260 }}><Tooltip title={record.resource_name || ''}>{(record.resource_name || '').length > 30 ? (record.resource_name || '').slice(0, 30) + '...' : (record.resource_name || '')}</Tooltip></div>
             <Space size={4}>
               <Tag color={config.color} style={{ fontSize: 10, padding: '0 6px', borderRadius: 10 }}>{config.label}</Tag>
               {record.resource_detail?.cell_count !== undefined && <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>{record.resource_detail.cell_count} 个单元格</Text>}

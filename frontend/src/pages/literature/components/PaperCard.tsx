@@ -34,7 +34,7 @@ const PaperCard = ({ paper, index, sourceInfo, onSelect, onDelete, onDownloadPdf
             {paper.is_read && (
               <Tag className="!bg-emerald-500/20 !border-emerald-500/30 !text-emerald-400 !m-0" icon={<CheckOutlined />}>已读</Tag>
             )}
-            {paper.rating > 0 && <Rate disabled value={paper.rating} className="text-sm !text-yellow-400" />}
+            {(paper.rating ?? 0) > 0 && <Rate disabled value={paper.rating ?? 0} className="text-sm !text-yellow-400" />}
           </div>
         </div>
 

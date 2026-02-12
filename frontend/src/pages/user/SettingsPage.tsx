@@ -1,134 +1,161 @@
-/**
- * 设置页面
- */
-import React, { useState, useEffect } from 'react';
+﻿import React, { useEffect, useMemo, useState } from 'react'
 import {
-  Card, Form, Input, Button, Select, Switch, message, Typography, Space, Divider, Modal, Alert, Tag
-} from 'antd';
+  Alert,
+  Button,
+  Card,
+  Col,
+  Divider,
+  Form,
+  Input,
+  List,
+  message,
+  Modal,
+  Row,
+  Select,
+  Space,
+  Statistic,
+  Switch,
+  Tag,
+  Typography,
+} from 'antd'
 import {
-  SettingOutlined, LockOutlined, BellOutlined, BgColorsOutlined,
-  RobotOutlined, SaveOutlined, KeyOutlined, CloudServerOutlined, ReloadOutlined, CheckCircleOutlined
-} from '@ant-design/icons';
-import { useAuthStore } from '../../stores/authStore';
+  BellOutlined,
+  CheckCircleOutlined,
+  CloudServerOutlined,
+  KeyOutlined,
+  LockOutlined,
+  ReloadOutlined,
+  RobotOutlined,
+  SaveOutlined,
+  SettingOutlined,
+} from '@ant-design/icons'
+import { useAuthStore } from '../../stores/authStore'
 import api, {
   mcpApi,
   MCPServerStatusItem,
   MCPServerTemplate,
-} from '../../services/api';
+} from '../../services/api'
 
-const { Title, Text } = Typography;
-const { Option } = Select;
+const { Title, Text } = Typography
+const { Option } = Select
 
 const SettingsPage: React.FC = () => {
-  const { user, updateUser } = useAuthStore();
-  const [llmForm] = Form.useForm();
-  const [passwordForm] = Form.useForm();
-  const [savingLLM, setSavingLLM] = useState(false);
-  const [changingPassword, setChangingPassword] = useState(false);
-  const [passwordModalVisible, setPasswordModalVisible] = useState(false);
-  const [mcpConfigText, setMcpConfigText] = useState('');
-  const [mcpTemplates, setMcpTemplates] = useState<MCPServerTemplate[]>([]);
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
-  const [mcpStatus, setMcpStatus] = useState<MCPServerStatusItem[]>([]);
-  const [mcpLoading, setMcpLoading] = useState(false);
-  const [mcpSaving, setMcpSaving] = useState(false);
-  const [mcpValidating, setMcpValidating] = useState(false);
+  const { user, updateUser } = useAuthStore()
+  const [llmForm] = Form.useForm()
+  const [passwordForm] = Form.useForm()
+
+  const [savingLLM, setSavingLLM] = useState(false)
+  const [changingPassword, setChangingPassword] = useState(false)
+  const [passwordModalVisible, setPasswordModalVisible] = useState(false)
+
+  const [mcpConfigText, setMcpConfigText] = useState('')
+  const [mcpTemplates, setMcpTemplates] = useState<MCPServerTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('')
+  const [mcpStatus, setMcpStatus] = useState<MCPServerStatusItem[]>([])
+
+  const [mcpLoading, setMcpLoading] = useState(false)
+  const [mcpSaving, setMcpSaving] = useState(false)
+  const [mcpValidating, setMcpValidating] = useState(false)
 
   useEffect(() => {
     if (user) {
       llmForm.setFieldsValue({
         preferred_llm_provider: user.preferred_llm_provider || 'openai',
-      });
+      })
     }
-  }, [user, llmForm]);
+  }, [user, llmForm])
 
   const loadMcpConfig = async () => {
-    setMcpLoading(true);
+    setMcpLoading(true)
     try {
-      const data = await mcpApi.getConfig();
-      setMcpConfigText(JSON.stringify(data.claude_desktop_config || { mcpServers: {} }, null, 2));
-      message.success('已加载当前 MCP 配置');
+      const data = await mcpApi.getConfig()
+      setMcpConfigText(JSON.stringify(data.claude_desktop_config || { mcpServers: {} }, null, 2))
+      message.success('Loaded current MCP config')
     } catch (error: any) {
-      message.error(error.response?.data?.detail || '加载 MCP 配置失败');
+      message.error(error.response?.data?.detail || 'Failed to load MCP config')
     } finally {
-      setMcpLoading(false);
+      setMcpLoading(false)
     }
-  };
+  }
 
   const loadMcpTemplates = async () => {
     try {
-      const data = await mcpApi.getTemplates();
-      setMcpTemplates(data.templates || []);
-      if ((data.templates || []).length > 0) {
-        setSelectedTemplateId(data.templates[0].id);
+      const data = await mcpApi.getTemplates()
+      const templates = data.templates || []
+      setMcpTemplates(templates)
+      if (templates.length > 0) {
+        setSelectedTemplateId(templates[0].id)
       }
     } catch (error) {
-      console.error('加载 MCP 模板失败:', error);
+      console.error('Failed to load MCP templates:', error)
     }
-  };
+  }
 
   const applyTemplate = () => {
-    const template = mcpTemplates.find(item => item.id === selectedTemplateId);
+    const template = mcpTemplates.find((item) => item.id === selectedTemplateId)
     if (!template) {
-      message.warning('请先选择模板');
-      return;
+      message.warning('Please select a template first')
+      return
     }
-    setMcpConfigText(JSON.stringify(template.claude_desktop_config, null, 2));
-    message.success(`已套用模板: ${template.title}`);
-  };
+    setMcpConfigText(JSON.stringify(template.claude_desktop_config, null, 2))
+    message.success(`Applied template: ${template.title}`)
+  }
 
   const handleValidateMcp = async () => {
     if (!mcpConfigText.trim()) {
-      message.warning('请先填写 MCP 配置 JSON');
-      return;
+      message.warning('Please input MCP JSON first')
+      return
     }
-    setMcpValidating(true);
+    setMcpValidating(true)
     try {
-      const result = await mcpApi.validateConfig({ raw_json: mcpConfigText });
-      message.success(`配置校验通过，解析到 ${result.server_count} 个 Server`);
+      const result = await mcpApi.validateConfig({ raw_json: mcpConfigText })
+      message.success(`Validation passed, parsed ${result.server_count} server(s)`)
     } catch (error: any) {
-      message.error(error.response?.data?.detail || 'MCP 配置校验失败');
+      message.error(error.response?.data?.detail || 'MCP validation failed')
     } finally {
-      setMcpValidating(false);
+      setMcpValidating(false)
     }
-  };
+  }
 
   const handleSaveMcp = async () => {
     if (!mcpConfigText.trim()) {
-      message.warning('请先填写 MCP 配置 JSON');
-      return;
+      message.warning('Please input MCP JSON first')
+      return
     }
-    setMcpSaving(true);
+    setMcpSaving(true)
     try {
-      const result = await mcpApi.saveConfig({ raw_json: mcpConfigText });
-      message.success(`${result.message}（${result.server_count} 个 Server）`);
+      const result = await mcpApi.saveConfig({ raw_json: mcpConfigText })
+      message.success(`${result.message} (${result.server_count} server(s))`)
     } catch (error: any) {
-      message.error(error.response?.data?.detail || '保存 MCP 配置失败');
+      message.error(error.response?.data?.detail || 'Failed to save MCP config')
     } finally {
-      setMcpSaving(false);
+      setMcpSaving(false)
     }
-  };
+  }
 
   const handleRefreshMcpStatus = async () => {
-    setMcpLoading(true);
+    setMcpLoading(true)
     try {
-      const data = await mcpApi.refreshStatus(true);
-      setMcpStatus(data.servers || []);
-      message.success(`探测完成：${data.server_count} 个 Server，发现 ${data.tool_count} 个工具`);
+      const data = await mcpApi.refreshStatus(true)
+      setMcpStatus(data.servers || [])
+      message.success(`Probe done: ${data.server_count} server(s), ${data.tool_count} tool(s)`)
     } catch (error: any) {
-      message.error(error.response?.data?.detail || 'MCP 状态探测失败');
+      message.error(error.response?.data?.detail || 'Failed to probe MCP servers')
     } finally {
-      setMcpLoading(false);
+      setMcpLoading(false)
     }
-  };
+  }
 
   useEffect(() => {
-    loadMcpTemplates();
-    loadMcpConfig();
-  }, []);
+    loadMcpTemplates()
+    loadMcpConfig()
+  }, [])
+
+  const mcpReachableCount = useMemo(() => mcpStatus.filter((item) => item.reachable === true).length, [mcpStatus])
+  const mcpToolCount = useMemo(() => mcpStatus.reduce((sum, item) => sum + (item.discovered_tools || 0), 0), [mcpStatus])
 
   const handleSaveLLMSettings = async (values: any) => {
-    setSavingLLM(true);
+    setSavingLLM(true)
     try {
       const response = await api.put('/api/users/profile', {
         preferred_llm_provider: values.preferred_llm_provider,
@@ -136,165 +163,138 @@ const SettingsPage: React.FC = () => {
           ...user?.preferences,
           ...values.preferences,
         },
-      });
-      updateUser(response.data);
-      message.success('设置已保存');
+      })
+      updateUser(response.data)
+      message.success('Settings saved')
     } catch (error: any) {
-      message.error(error.response?.data?.detail || '保存失败');
+      message.error(error.response?.data?.detail || 'Failed to save settings')
     } finally {
-      setSavingLLM(false);
+      setSavingLLM(false)
     }
-  };
+  }
 
   const handleChangePassword = async (values: any) => {
     if (values.new_password !== values.confirm_password) {
-      message.error('两次输入的密码不一致');
-      return;
+      message.error('Passwords do not match')
+      return
     }
-    
-    setChangingPassword(true);
+
+    setChangingPassword(true)
     try {
       await api.post('/api/auth/change-password', {
         current_password: values.current_password,
         new_password: values.new_password,
-      });
-      message.success('密码已修改');
-      setPasswordModalVisible(false);
-      passwordForm.resetFields();
+      })
+      message.success('Password updated')
+      setPasswordModalVisible(false)
+      passwordForm.resetFields()
     } catch (error: any) {
-      message.error(error.response?.data?.detail || '密码修改失败');
+      message.error(error.response?.data?.detail || 'Failed to update password')
     } finally {
-      setChangingPassword(false);
+      setChangingPassword(false)
     }
-  };
+  }
 
   return (
-    <div style={{ 
-      padding: 24, 
-      maxWidth: 800, 
-      margin: '0 auto',
-      minHeight: '100%',
-    }}>
+    <div
+      style={{
+        padding: 24,
+        maxWidth: 920,
+        margin: '0 auto',
+        minHeight: '100%',
+      }}
+    >
       <Title level={3} style={{ color: '#E8E8E8', marginBottom: 24, display: 'flex', alignItems: 'center', gap: 12 }}>
         <SettingOutlined style={{ color: '#4A90D9' }} />
-        设置
+        Settings
       </Title>
 
-      {/* AI 模型设置 */}
       <Card
         title={
           <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
             <RobotOutlined style={{ color: '#52c41a' }} />
-            AI 模型设置
+            LLM Settings
           </span>
         }
-        style={{
-          backgroundColor: '#161B22',
-          borderColor: '#30363D',
-          borderRadius: 16,
-          marginBottom: 24,
-        }}
-        styles={{
-          header: { borderBottom: '1px solid #30363D' },
-          body: { padding: 24 },
-        }}
+        style={{ backgroundColor: '#161B22', borderColor: '#30363D', borderRadius: 16, marginBottom: 24 }}
+        styles={{ header: { borderBottom: '1px solid #30363D' }, body: { padding: 24 } }}
       >
-        <Form
-          form={llmForm}
-          layout="vertical"
-          onFinish={handleSaveLLMSettings}
-        >
+        <Form form={llmForm} layout="vertical" onFinish={handleSaveLLMSettings}>
           <Form.Item
             name="preferred_llm_provider"
-            label={<span style={{ color: '#8899A6' }}>首选 AI 服务商</span>}
+            label={<span style={{ color: '#8899A6' }}>Preferred Provider</span>}
           >
-            <Select
-              style={{ width: '100%' }}
-              dropdownStyle={{ backgroundColor: '#161B22', borderColor: '#30363D' }}
-            >
+            <Select style={{ width: '100%' }} dropdownStyle={{ backgroundColor: '#161B22', borderColor: '#30363D' }}>
               <Option value="deepseek">DeepSeek (deepseek-chat)</Option>
               <Option value="openai">OpenAI (GPT-4o)</Option>
-              <Option value="aliyun">阿里云通义千问 (qwen-plus)</Option>
-              <Option value="ollama">本地模型 (Ollama)</Option>
+              <Option value="aliyun">Aliyun (qwen-plus)</Option>
+              <Option value="ollama">Local (Ollama)</Option>
             </Select>
           </Form.Item>
 
           <Alert
-            message="提示"
-            description="选择您偏好的 AI 服务商。不同服务商可能有不同的响应速度和能力特点。"
+            message="Tip"
+            description="Choose a default model provider for all assistant actions."
             type="info"
             showIcon
-            style={{ 
-              backgroundColor: 'rgba(74, 144, 217, 0.1)', 
-              border: '1px solid rgba(74, 144, 217, 0.3)',
-              marginBottom: 16,
-            }}
+            style={{ backgroundColor: 'rgba(74, 144, 217, 0.1)', border: '1px solid rgba(74, 144, 217, 0.3)', marginBottom: 16 }}
           />
 
-          <Button
-            type="primary"
-            icon={<SaveOutlined />}
-            htmlType="submit"
-            loading={savingLLM}
-            style={{ backgroundColor: '#4A90D9' }}
-          >
-            保存设置
+          <Button type="primary" icon={<SaveOutlined />} htmlType="submit" loading={savingLLM} style={{ backgroundColor: '#4A90D9' }}>
+            Save Settings
           </Button>
         </Form>
       </Card>
 
-      {/* 安全设置 */}
       <Card
         title={
           <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
             <CloudServerOutlined style={{ color: '#13c2c2' }} />
-            MCP Server 配置
+            MCP Server Config
           </span>
         }
-        style={{
-          backgroundColor: '#161B22',
-          borderColor: '#30363D',
-          borderRadius: 16,
-          marginBottom: 24,
-        }}
-        styles={{
-          header: { borderBottom: '1px solid #30363D' },
-          body: { padding: 24 },
-        }}
+        style={{ backgroundColor: '#161B22', borderColor: '#30363D', borderRadius: 16, marginBottom: 24 }}
+        styles={{ header: { borderBottom: '1px solid #30363D' }, body: { padding: 24 } }}
       >
         <Alert
-          message="说明"
-          description="支持 Claude Desktop 风格的 mcpServers JSON。可先套模板，再校验并保存到后端配置文件。"
+          message="MCP Config Guide"
+          description="Workflow: apply template -> validate JSON -> save config -> refresh connectivity status."
           type="info"
           showIcon
-          style={{
-            backgroundColor: 'rgba(19, 194, 194, 0.08)',
-            border: '1px solid rgba(19, 194, 194, 0.35)',
-            marginBottom: 16,
-          }}
+          style={{ backgroundColor: 'rgba(19, 194, 194, 0.08)', border: '1px solid rgba(19, 194, 194, 0.35)', marginBottom: 16 }}
         />
+
+        <Row gutter={12} style={{ marginBottom: 12 }}>
+          <Col xs={24} md={8}>
+            <Card size="small" style={{ background: '#0D1117', borderColor: '#30363D' }}>
+              <Statistic title={<span style={{ color: '#8b949e' }}>Servers</span>} value={mcpStatus.length} valueStyle={{ color: '#e6edf3', fontSize: 20 }} />
+            </Card>
+          </Col>
+          <Col xs={24} md={8}>
+            <Card size="small" style={{ background: '#0D1117', borderColor: '#30363D' }}>
+              <Statistic title={<span style={{ color: '#8b949e' }}>Reachable</span>} value={mcpReachableCount} valueStyle={{ color: '#52c41a', fontSize: 20 }} />
+            </Card>
+          </Col>
+          <Col xs={24} md={8}>
+            <Card size="small" style={{ background: '#0D1117', borderColor: '#30363D' }}>
+              <Statistic title={<span style={{ color: '#8b949e' }}>Tools</span>} value={mcpToolCount} valueStyle={{ color: '#13c2c2', fontSize: 20 }} />
+            </Card>
+          </Col>
+        </Row>
 
         <Space wrap style={{ marginBottom: 12 }}>
           <Select
             value={selectedTemplateId}
             onChange={setSelectedTemplateId}
-            style={{ width: 280 }}
-            placeholder="选择 MCP 模板"
-            options={mcpTemplates.map(item => ({ value: item.id, label: item.title }))}
+            style={{ width: 320 }}
+            placeholder="Select MCP template"
+            options={mcpTemplates.map((item) => ({ value: item.id, label: item.title }))}
           />
-          <Button onClick={applyTemplate}>套用模板</Button>
-          <Button icon={<ReloadOutlined />} loading={mcpLoading} onClick={loadMcpConfig}>
-            加载当前
-          </Button>
-          <Button icon={<CheckCircleOutlined />} loading={mcpValidating} onClick={handleValidateMcp}>
-            校验配置
-          </Button>
-          <Button type="primary" icon={<SaveOutlined />} loading={mcpSaving} onClick={handleSaveMcp}>
-            保存配置
-          </Button>
-          <Button loading={mcpLoading} onClick={handleRefreshMcpStatus}>
-            连通性检查
-          </Button>
+          <Button onClick={applyTemplate}>Apply Template</Button>
+          <Button icon={<ReloadOutlined />} loading={mcpLoading} onClick={loadMcpConfig}>Load Current</Button>
+          <Button icon={<CheckCircleOutlined />} loading={mcpValidating} onClick={handleValidateMcp}>Validate</Button>
+          <Button type="primary" icon={<SaveOutlined />} loading={mcpSaving} onClick={handleSaveMcp}>Save</Button>
+          <Button loading={mcpLoading} onClick={handleRefreshMcpStatus}>Refresh Status</Button>
         </Space>
 
         <Input.TextArea
@@ -312,57 +312,57 @@ const SettingsPage: React.FC = () => {
           }}
         />
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        <Card size="small" style={{ background: '#0D1117', borderColor: '#30363D' }}>
           {mcpStatus.length === 0 ? (
             <Text style={{ color: '#6B8E9F', fontSize: 12 }}>
-              暂无探测结果，点击“连通性检查”获取状态。
+              No status yet. Click "Refresh Status" to probe MCP servers.
             </Text>
           ) : (
-            mcpStatus.map((item) => (
-              <Tag
-                key={item.name}
-                color={item.reachable ? 'success' : item.reachable === false ? 'error' : 'default'}
-              >
-                {item.name}: {item.reachable ? '可达' : item.reachable === false ? '不可达' : '未探测'} / tools {item.discovered_tools}
-              </Tag>
-            ))
+            <List
+              dataSource={mcpStatus}
+              renderItem={(item) => (
+                <List.Item>
+                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Space>
+                      <Tag color={item.reachable ? 'success' : item.reachable === false ? 'error' : 'default'}>
+                        {item.reachable ? 'Reachable' : item.reachable === false ? 'Unreachable' : 'Unknown'}
+                      </Tag>
+                      <Text style={{ color: '#E8E8E8' }}>{item.name}</Text>
+                      <Text style={{ color: '#8b949e', fontSize: 12 }}>transport: {item.transport}</Text>
+                      <Text style={{ color: '#8b949e', fontSize: 12 }}>tools: {item.discovered_tools}</Text>
+                    </Space>
+                    {item.last_error && (
+                      <Text style={{ color: '#ff7875', fontSize: 12 }}>error: {item.last_error}</Text>
+                    )}
+                  </Space>
+                </List.Item>
+              )}
+            />
           )}
-        </div>
+        </Card>
       </Card>
 
       <Card
         title={
           <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
             <LockOutlined style={{ color: '#fa8c16' }} />
-            安全设置
+            Security
           </span>
         }
-        style={{
-          backgroundColor: '#161B22',
-          borderColor: '#30363D',
-          borderRadius: 16,
-          marginBottom: 24,
-        }}
-        styles={{
-          header: { borderBottom: '1px solid #30363D' },
-          body: { padding: 24 },
-        }}
+        style={{ backgroundColor: '#161B22', borderColor: '#30363D', borderRadius: 16, marginBottom: 24 }}
+        styles={{ header: { borderBottom: '1px solid #30363D' }, body: { padding: 24 } }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>修改密码</Text>
+            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>Change Password</Text>
             <div>
               <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                定期修改密码可以提高账户安全性
+                Update password regularly to improve account security.
               </Text>
             </div>
           </div>
-          <Button
-            icon={<KeyOutlined />}
-            onClick={() => setPasswordModalVisible(true)}
-            style={{ borderColor: '#30363D' }}
-          >
-            修改密码
+          <Button icon={<KeyOutlined />} onClick={() => setPasswordModalVisible(true)} style={{ borderColor: '#30363D' }}>
+            Change Password
           </Button>
         </div>
 
@@ -370,10 +370,10 @@ const SettingsPage: React.FC = () => {
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>登录通知</Text>
+            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>Login Alert</Text>
             <div>
               <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                当账户在新设备上登录时发送邮件通知
+                Notify by email when a new device logs in.
               </Text>
             </div>
           </div>
@@ -381,31 +381,22 @@ const SettingsPage: React.FC = () => {
         </div>
       </Card>
 
-      {/* 通知设置 */}
       <Card
         title={
           <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
             <BellOutlined style={{ color: '#eb2f96' }} />
-            通知设置
+            Notification Settings
           </span>
         }
-        style={{
-          backgroundColor: '#161B22',
-          borderColor: '#30363D',
-          borderRadius: 16,
-          marginBottom: 24,
-        }}
-        styles={{
-          header: { borderBottom: '1px solid #30363D' },
-          body: { padding: 24 },
-        }}
+        style={{ backgroundColor: '#161B22', borderColor: '#30363D', borderRadius: 16, marginBottom: 24 }}
+        styles={{ header: { borderBottom: '1px solid #30363D' }, body: { padding: 24 } }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>邀请通知</Text>
+            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>Invitation Alerts</Text>
             <div>
               <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                收到导师邀请或学生申请时通知
+                Notify when receiving mentor/student invitations.
               </Text>
             </div>
           </div>
@@ -414,10 +405,10 @@ const SettingsPage: React.FC = () => {
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>公告通知</Text>
+            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>Announcement Alerts</Text>
             <div>
               <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                收到新公告时通知
+                Notify when new announcements are published.
               </Text>
             </div>
           </div>
@@ -426,53 +417,10 @@ const SettingsPage: React.FC = () => {
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>资源共享通知</Text>
+            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>System Alerts</Text>
             <div>
               <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                收到新的共享资源时通知
-              </Text>
-            </div>
-          </div>
-          <Switch defaultChecked />
-        </div>
-      </Card>
-
-      {/* 界面设置 */}
-      <Card
-        title={
-          <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <BgColorsOutlined style={{ color: '#722ed1' }} />
-            界面设置
-          </span>
-        }
-        style={{
-          backgroundColor: '#161B22',
-          borderColor: '#30363D',
-          borderRadius: 16,
-        }}
-        styles={{
-          header: { borderBottom: '1px solid #30363D' },
-          body: { padding: 24 },
-        }}
-      >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>深色模式</Text>
-            <div>
-              <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                使用深色主题（当前已启用）
-              </Text>
-            </div>
-          </div>
-          <Switch checked disabled />
-        </div>
-
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <Text style={{ color: '#E8E8E8', fontSize: 15 }}>紧凑模式</Text>
-            <div>
-              <Text style={{ color: '#6B8E9F', fontSize: 13 }}>
-                减少界面间距以显示更多内容
+                Notify on major system updates and maintenance windows.
               </Text>
             </div>
           </div>
@@ -480,104 +428,58 @@ const SettingsPage: React.FC = () => {
         </div>
       </Card>
 
-      {/* 修改密码弹窗 */}
       <Modal
-        title={
-          <span style={{ color: '#E8E8E8', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <KeyOutlined style={{ color: '#fa8c16' }} />
-            修改密码
-          </span>
-        }
+        title={<span style={{ color: '#E8E8E8' }}>Change Password</span>}
         open={passwordModalVisible}
         onCancel={() => {
-          setPasswordModalVisible(false);
-          passwordForm.resetFields();
+          setPasswordModalVisible(false)
+          passwordForm.resetFields()
         }}
         footer={null}
-        width={400}
         styles={{
-          content: { backgroundColor: '#161B22', border: '1px solid #30363D' },
+          content: { backgroundColor: '#161B22', borderColor: '#30363D' },
           header: { backgroundColor: '#161B22', borderBottom: '1px solid #30363D' },
-          body: { backgroundColor: '#161B22' },
         }}
       >
-        <Form
-          form={passwordForm}
-          layout="vertical"
-          onFinish={handleChangePassword}
-          style={{ marginTop: 16 }}
-        >
+        <Form form={passwordForm} layout="vertical" onFinish={handleChangePassword}>
           <Form.Item
             name="current_password"
-            label={<span style={{ color: '#8899A6' }}>当前密码</span>}
-            rules={[{ required: true, message: '请输入当前密码' }]}
+            label={<span style={{ color: '#8899A6' }}>Current Password</span>}
+            rules={[{ required: true, message: 'Please input current password' }]}
           >
-            <Input.Password
-              prefix={<LockOutlined style={{ color: '#8899A6' }} />}
-              placeholder="输入当前密码"
-              style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }}
-            />
+            <Input.Password />
           </Form.Item>
 
           <Form.Item
             name="new_password"
-            label={<span style={{ color: '#8899A6' }}>新密码</span>}
+            label={<span style={{ color: '#8899A6' }}>New Password</span>}
             rules={[
-              { required: true, message: '请输入新密码' },
-              { min: 6, message: '密码至少6位' },
+              { required: true, message: 'Please input new password' },
+              { min: 6, message: 'Password must be at least 6 chars' },
             ]}
           >
-            <Input.Password
-              prefix={<LockOutlined style={{ color: '#8899A6' }} />}
-              placeholder="输入新密码（至少6位）"
-              style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }}
-            />
+            <Input.Password />
           </Form.Item>
 
           <Form.Item
             name="confirm_password"
-            label={<span style={{ color: '#8899A6' }}>确认新密码</span>}
-            rules={[
-              { required: true, message: '请再次输入新密码' },
-              ({ getFieldValue }) => ({
-                validator(_, value) {
-                  if (!value || getFieldValue('new_password') === value) {
-                    return Promise.resolve();
-                  }
-                  return Promise.reject(new Error('两次输入的密码不一致'));
-                },
-              }),
-            ]}
+            label={<span style={{ color: '#8899A6' }}>Confirm New Password</span>}
+            rules={[{ required: true, message: 'Please confirm new password' }]}
           >
-            <Input.Password
-              prefix={<LockOutlined style={{ color: '#8899A6' }} />}
-              placeholder="再次输入新密码"
-              style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }}
-            />
+            <Input.Password />
           </Form.Item>
 
           <Form.Item style={{ marginBottom: 0 }}>
             <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
-              <Button onClick={() => {
-                setPasswordModalVisible(false);
-                passwordForm.resetFields();
-              }}>
-                取消
-              </Button>
-              <Button
-                type="primary"
-                htmlType="submit"
-                loading={changingPassword}
-                style={{ backgroundColor: '#fa8c16', borderColor: '#fa8c16' }}
-              >
-                确认修改
+              <Button onClick={() => setPasswordModalVisible(false)}>Cancel</Button>
+              <Button type="primary" htmlType="submit" loading={changingPassword} style={{ backgroundColor: '#fa8c16', borderColor: '#fa8c16' }}>
+                Save Password
               </Button>
             </Space>
           </Form.Item>
         </Form>
       </Modal>
 
-      {/* 样式覆盖 */}
       <style>{`
         .ant-select-selector {
           background-color: #0D1117 !important;
@@ -607,7 +509,7 @@ const SettingsPage: React.FC = () => {
         }
       `}</style>
     </div>
-  );
-};
+  )
+}
 
-export default SettingsPage;
+export default SettingsPage

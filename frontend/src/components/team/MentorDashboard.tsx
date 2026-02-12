@@ -19,7 +19,7 @@ import {
   HistoryOutlined,
   LoadingOutlined,
 } from '@ant-design/icons'
-import { Mentorship, UserBrief } from '@/services/api'
+import { Mentorship, UserBrief, MentorshipStatus, UserRole } from '@/services/api'
 import { useMentorshipStore, StudentActivity } from '@/stores/mentorshipStore'
 import { UserAvatar, StatusBadge, ListSkeleton } from '@/components/ui'
 import dayjs from 'dayjs'
@@ -91,8 +91,8 @@ export const PendingRequests = ({ requests, isLoading, onRefresh }: PendingReque
       <div className="space-y-4">
         <AnimatePresence>
           {requests.map((request, index) => {
-            const student = request.student
-            const profile = student?.profile_data || {}
+            const student: UserBrief = request.student ?? { id: 0, username: '未知学生', role: UserRole.STUDENT }
+            const profile = student.profile_data || {}
             
             return (
               <motion.div
@@ -182,10 +182,10 @@ export const PendingRequests = ({ requests, isLoading, onRefresh }: PendingReque
         {selectedRequest && (
           <div className="space-y-4">
             <div className="flex items-center gap-3 p-3 bg-slate-100 dark:bg-slate-800 rounded-lg">
-              <UserAvatar user={selectedRequest.student} size="md" />
+              <UserAvatar user={selectedRequest.student ?? { id: 0, username: '未知学生', role: UserRole.STUDENT }} size="md" />
               <div>
                 <p className="font-medium">
-                  {selectedRequest.student?.full_name || selectedRequest.student?.username}
+                  {selectedRequest.student?.full_name || selectedRequest.student?.username || '未知学生'}
                 </p>
                 {selectedRequest.request_message && (
                   <p className="text-sm text-slate-500 mt-1">
@@ -272,7 +272,7 @@ export const StudentList = ({ students, isLoading, onViewStudent }: StudentListP
             )}
             
             <div className="flex items-center justify-between pt-3 border-t border-slate-700/50">
-              <StatusBadge status="active" />
+              <StatusBadge status={MentorshipStatus.ACTIVE} />
               <Tooltip title="查看详情">
                 <button className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition-all">
                   <EyeOutlined />

@@ -7,6 +7,7 @@ import {
   SearchResult,
   SearchResponse,
   KnowledgeSearchOptions,
+  ProcessingStatus,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
@@ -46,7 +47,7 @@ interface KnowledgeState {
   uploadDocument: (kbId: number, file: File) => Promise<Document>
   selectDocument: (kbId: number, docId: number) => Promise<void>
   deleteDocument: (kbId: number, docId: number) => Promise<void>
-  refreshDocumentStatus: (kbId: number, docId: number) => Promise<void>
+  refreshDocumentStatus: (kbId: number, docId: number) => Promise<ProcessingStatus | undefined>
 
   fetchChunks: (kbId: number, docId: number) => Promise<void>
 

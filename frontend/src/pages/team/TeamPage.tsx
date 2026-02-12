@@ -149,9 +149,8 @@ export const TeamPage = () => {
         ) : (
           <MentorGrid
             mentors={filteredMentors}
-            onApply={handleApply}
-            isSubmitting={isSubmitting}
-            emptyMessage={searchQuery ? '没有找到匹配的导师' : '暂无可用导师'}
+            onApplySuccess={handleRefresh}
+            disabled={isSubmitting}
           />
         )}
       </div>

@@ -1,20 +1,20 @@
-import axios, { AxiosError } from 'axios'
+﻿import axios, { AxiosError } from 'axios'
 
-// API 基础配置
+// API 鍩虹閰嶇疆
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8000'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 
-// 创建 axios 实例
+// 鍒涘缓 axios 瀹炰緥
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,  // 30 秒超时
+  timeout: 30000,  // 30 绉掕秴鏃?
   headers: {
     'Content-Type': 'application/json',
   },
 })
 
-// 请求拦截器 - 添加 token
+// 璇锋眰鎷︽埅鍣?- 娣诲姞 token
 api.interceptors.request.use((config) => {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -26,7 +26,7 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 响应拦截器 - 处理错误
+// 鍝嶅簲鎷︽埅鍣?- 澶勭悊閿欒
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError<{ detail: string }>) => {
@@ -38,7 +38,16 @@ api.interceptors.response.use(
   }
 )
 
-// 类型定义
+// 绫诲瀷瀹氫箟
+export interface UserProfileData {
+  title?: string
+  department?: string
+  research_area?: string
+  bio?: string
+  contact?: string
+  [key: string]: unknown
+}
+
 export interface User {
   id: number
   email: string
@@ -46,6 +55,11 @@ export interface User {
   full_name?: string
   avatar?: string
   bio?: string
+  role?: UserRole
+  mentor_id?: number
+  department?: string
+  research_direction?: string
+  profile_data?: UserProfileData
   is_active: boolean
   preferred_llm_provider: string
   preferences: Record<string, unknown>
@@ -126,7 +140,7 @@ export interface LLMProvider {
   available: boolean
 }
 
-// ========== 知识库类型 ==========
+// ========== 鐭ヨ瘑搴撶被鍨?==========
 
 export interface KnowledgeBase {
   id: number
@@ -211,11 +225,11 @@ export interface SearchResult {
   score: number
   chunk_index: number
   metadata: Record<string, unknown>
-  // [Fix 12] 层级检索新增字段
-  chunk_level?: string          // 分块层级: paragraph / section / document
-  section_type?: string         // 章节类型: abstract / methodology / results 等
-  section_title?: string        // 章节标题
-  parent_context?: string       // 父级 chunk 的内容摘要（前 300 字符）
+  // [Fix 12] 灞傜骇妫€绱㈡柊澧炲瓧娈?
+  chunk_level?: string          // 鍒嗗潡灞傜骇: paragraph / section / document
+  section_type?: string         // 绔犺妭绫诲瀷: abstract / methodology / results 绛?
+  section_title?: string        // 绔犺妭鏍囬
+  parent_context?: string       // 鐖剁骇 chunk 鐨勫唴瀹规憳瑕侊紙鍓?300 瀛楃锛?
 }
 
 export interface SearchResponse {
@@ -243,7 +257,7 @@ export interface ProcessingStatus {
   error?: string
 }
 
-// 认证 API
+// 璁よ瘉 API
 export const authApi = {
   login: async (email: string, password: string): Promise<AuthResponse> => {
     const response = await api.post('/api/auth/login', { email, password })
@@ -275,7 +289,7 @@ export const authApi = {
   },
 }
 
-// 用户 API
+// 鐢ㄦ埛 API
 export const userApi = {
   getProfile: async (): Promise<User> => {
     const response = await api.get('/api/users/profile')
@@ -296,7 +310,7 @@ export const userApi = {
   },
 }
 
-// 聊天 API
+// 鑱婂ぉ API
 export const chatApi = {
   getConversations: async (
     skip = 0,
@@ -335,7 +349,7 @@ export const chatApi = {
     return response.data
   },
 
-  // 流式发送消息
+  // 娴佸紡鍙戦€佹秷鎭?
   sendMessageStream: async (
     message: string,
     conversationId?: number,
@@ -359,11 +373,11 @@ export const chatApi = {
 
       if (!response.ok) {
         const error = await response.json()
-        throw new Error(error.detail || '发送失败')
+        throw new Error(error.detail || '请求失败')
       }
 
       const reader = response.body?.getReader()
-      if (!reader) throw new Error('无法读取响应')
+      if (!reader) throw new Error('鏃犳硶璇诲彇鍝嶅簲')
 
       const decoder = new TextDecoder()
       let buffer = ''
@@ -382,13 +396,13 @@ export const chatApi = {
               const data = JSON.parse(line.slice(6))
               onEvent?.(data.event, data.data)
             } catch {
-              // 忽略解析错误
+              // 蹇界暐瑙ｆ瀽閿欒
             }
           }
         }
       }
     } catch (error) {
-      // 如果是中止错误，触发 stopped 事件
+      // 濡傛灉鏄腑姝㈤敊璇紝瑙﹀彂 stopped 浜嬩欢
       if (error instanceof Error && error.name === 'AbortError') {
         onEvent?.('stopped', { aborted: true })
         return
@@ -397,7 +411,7 @@ export const chatApi = {
     }
   },
 
-  // 搜索消息
+  // 鎼滅储娑堟伅
   searchMessages: async (query: string, limit = 20): Promise<{
     query: string
     total: number
@@ -416,7 +430,7 @@ export const chatApi = {
     return response.data
   },
 
-  // 保存停止的消息
+  // 淇濆瓨鍋滄鐨勬秷鎭?
   saveStoppedMessage: async (data: {
     conversation_id: number
     content: string
@@ -436,10 +450,10 @@ export const chatApi = {
   },
 }
 
-// ========== 知识库 API ==========
+// ========== 鐭ヨ瘑搴?API ==========
 
 export const knowledgeApi = {
-  // 知识库 CRUD
+  // 鐭ヨ瘑搴?CRUD
   getKnowledgeBases: async (skip = 0, limit = 20): Promise<{ items: KnowledgeBase[]; total: number }> => {
     const response = await api.get('/api/knowledge/knowledge-bases', {
       params: { skip, limit },
@@ -447,7 +461,7 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 获取可用的知识库（自己的 + 共享的），用于AI对话选择
+  // 鑾峰彇鍙敤鐨勭煡璇嗗簱锛堣嚜宸辩殑 + 鍏变韩鐨勶級锛岀敤浜嶢I瀵硅瘽閫夋嫨
   getAvailableKnowledgeBases: async (): Promise<{
     own: { id: number; name: string; description?: string; document_count: number; total_chunks: number }[];
     shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
@@ -481,7 +495,7 @@ export const knowledgeApi = {
     await api.delete(`/api/knowledge/knowledge-bases/${kbId}`)
   },
 
-  // 文档管理
+  // 鏂囨。绠＄悊
   getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents`, {
       params: { skip, limit },
@@ -519,7 +533,7 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 分片
+  // 鍒嗙墖
   getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
       params: { skip, limit },
@@ -527,7 +541,7 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 搜索（支持层级过滤 + 父级上下文回溯）
+  // 鎼滅储锛堟敮鎸佸眰绾ц繃婊?+ 鐖剁骇涓婁笅鏂囧洖婧級
   search: async (
     query: string,
     knowledgeBaseIds?: number[],
@@ -558,8 +572,7 @@ export const knowledgeApi = {
       use_query_rewrite: useQueryRewrite,
       use_contextual_compression: useContextualCompression,
       query_rewrite_strategies: queryRewriteStrategies,
-      // [Fix 12] 层级检索参数
-      chunk_level: chunkLevel,
+      // [Fix 12] 灞傜骇妫€绱㈠弬鏁?      chunk_level: chunkLevel,
       section_type: sectionType || undefined,
       include_parent_context: includeParentContext,
     }, {
@@ -570,7 +583,7 @@ export const knowledgeApi = {
   },
 }
 
-// ========== 文献管理类型 ==========
+// ========== 鏂囩尞绠＄悊绫诲瀷 ==========
 
 export interface PaperAuthor {
   name: string
@@ -662,16 +675,37 @@ export interface SearchHistory {
   created_at: string
 }
 
-// ========== 文献管理 API ==========
+export interface GraphNode {
+  id: string
+  title: string
+  type: 'center' | 'citing' | 'referenced'
+  level: number
+  citations: number
+  year?: number
+  authors?: string[]
+}
+
+export interface GraphEdge {
+  from: string
+  to: string
+}
+
+export interface CitationGraph {
+  center_id: string
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+}
+
+// ========== 鏂囩尞绠＄悊 API ==========
 
 export const literatureApi = {
-  // 初始化
+  // 鍒濆鍖?
   init: async (): Promise<{ message: string }> => {
     const response = await api.post('/api/literature/init')
     return response.data
   },
 
-  // 搜索论文
+  // 鎼滅储璁烘枃
   searchPapers: async (params: {
     query: string
     source?: string
@@ -686,7 +720,7 @@ export const literatureApi = {
     return response.data
   },
 
-  // 获取搜索历史
+  // 鑾峰彇鎼滅储鍘嗗彶
   getSearchHistory: async (limit = 20): Promise<SearchHistory[]> => {
     const response = await api.get('/api/literature/search/history', {
       params: { limit },
@@ -694,7 +728,7 @@ export const literatureApi = {
     return response.data
   },
 
-  // 获取论文列表
+  // 鑾峰彇璁烘枃鍒楄〃
   getPapers: async (params?: {
     collection_id?: number
     is_read?: boolean
@@ -709,13 +743,13 @@ export const literatureApi = {
     return response.data
   },
 
-  // 获取论文详情
+  // 鑾峰彇璁烘枃璇︽儏
   getPaper: async (paperId: number): Promise<Paper> => {
     const response = await api.get(`/api/literature/papers/${paperId}`)
     return response.data
   },
 
-  // 保存论文
+  // 淇濆瓨璁烘枃
   savePaper: async (data: {
     source: string
     external_id: string
@@ -738,7 +772,7 @@ export const literatureApi = {
     return response.data
   },
 
-  // 更新论文
+  // 鏇存柊璁烘枃
   updatePaper: async (
     paperId: number,
     data: {
@@ -754,12 +788,12 @@ export const literatureApi = {
     return response.data
   },
 
-  // 删除论文
+  // 鍒犻櫎璁烘枃
   deletePaper: async (paperId: number): Promise<void> => {
     await api.delete(`/api/literature/papers/${paperId}`)
   },
 
-  // 下载 PDF
+  // 涓嬭浇 PDF
   downloadPdf: async (
     paperId: number,
     knowledgeBaseId?: number
@@ -770,7 +804,7 @@ export const literatureApi = {
     return response.data
   },
 
-  // 收藏夹管理
+  // 鏀惰棌澶圭鐞?
   getCollections: async (): Promise<PaperCollection[]> => {
     const response = await api.get('/api/literature/collections')
     return response.data
@@ -819,7 +853,7 @@ export const literatureApi = {
   },
 }
 
-// ========== 代码实验室类型 ==========
+// ========== 浠ｇ爜瀹為獙瀹ょ被鍨?==========
 
 export interface CellOutput {
   output_type: 'stream' | 'execute_result' | 'display_data' | 'error'
@@ -860,28 +894,28 @@ export interface ExecuteResponse {
   execution_time_ms: number
 }
 
-// ========== 代码实验室 API ==========
+// ========== 浠ｇ爜瀹為獙瀹?API ==========
 
 export const codelabApi = {
-  // 获取 Notebook 列表
+  // 鑾峰彇 Notebook 鍒楄〃
   listNotebooks: async (): Promise<Notebook[]> => {
     const response = await api.get('/api/codelab/notebooks')
     return response.data
   },
 
-  // 创建 Notebook
+  // 鍒涘缓 Notebook
   createNotebook: async (data: { title?: string; description?: string }): Promise<Notebook> => {
     const response = await api.post('/api/codelab/notebooks', data)
     return response.data
   },
 
-  // 获取 Notebook 详情
+  // 鑾峰彇 Notebook 璇︽儏
   getNotebook: async (notebookId: string): Promise<Notebook> => {
     const response = await api.get(`/api/codelab/notebooks/${notebookId}`)
     return response.data
   },
 
-  // 更新 Notebook
+  // 鏇存柊 Notebook
   updateNotebook: async (
     notebookId: string,
     data: { title?: string; description?: string; cells?: Cell[] }
@@ -890,24 +924,24 @@ export const codelabApi = {
     return response.data
   },
 
-  // 删除 Notebook
+  // 鍒犻櫎 Notebook
   deleteNotebook: async (notebookId: string): Promise<void> => {
     await api.delete(`/api/codelab/notebooks/${notebookId}`)
   },
 
-  // 执行代码单元格
+  // 鎵ц浠ｇ爜鍗曞厓鏍?
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/execute`, data)
     return response.data
   },
 
-  // 直接执行代码（不保存）
+  // 鐩存帴鎵ц浠ｇ爜锛堜笉淇濆瓨锛?
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
     const response = await api.post('/api/codelab/execute', data)
     return response.data
   },
 
-  // 添加单元格
+  // 娣诲姞鍗曞厓鏍?
   addCell: async (notebookId: string, cellType: 'code' | 'markdown', index?: number): Promise<Cell> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/cells`, null, {
       params: { cell_type: cellType, index },
@@ -915,24 +949,24 @@ export const codelabApi = {
     return response.data
   },
 
-  // 删除单元格
+  // 鍒犻櫎鍗曞厓鏍?
   deleteCell: async (notebookId: string, cellId: string): Promise<void> => {
     await api.delete(`/api/codelab/notebooks/${notebookId}/cells/${cellId}`)
   },
 
-  // 运行所有单元格
+  // 杩愯鎵€鏈夊崟鍏冩牸
   runAll: async (notebookId: string): Promise<{ message: string; results: any[] }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/run-all`)
     return response.data
   },
 
-  // 重启内核（清除所有变量状态）
+  // 閲嶅惎鍐呮牳锛堟竻闄ゆ墍鏈夊彉閲忕姸鎬侊級
   restartKernel: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/restart-kernel`)
     return response.data
   },
 
-  // 获取内核状态
+  // 鑾峰彇鍐呮牳鐘舵€?
   getKernelStatus: async (notebookId: string): Promise<{
     status: 'running' | 'stopped'
     execution_count: number
@@ -944,14 +978,14 @@ export const codelabApi = {
     return response.data
   },
 
-  // 中断内核执行
+  // 涓柇鍐呮牳鎵ц
   interruptKernel: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/interrupt`)
     return response.data
   },
 }
 
-// ========== Notebook Agent 类型 ==========
+// ========== Notebook Agent 绫诲瀷 ==========
 
 export interface AgentCodeBlock {
   id: string
@@ -989,7 +1023,7 @@ export interface AgentChatRequest {
   message: string
   include_context?: boolean
   include_variables?: boolean
-  user_authorized?: boolean  // 是否授权 AI 操作 Notebook
+  user_authorized?: boolean  // 鏄惁鎺堟潈 AI 鎿嶄綔 Notebook
   stream?: boolean
 }
 
@@ -1005,25 +1039,25 @@ export interface AgentChatEvent {
   input?: Record<string, any>
   success?: boolean
   output?: string
-  action?: string  // 需要授权的操作
+  action?: string  // 闇€瑕佹巿鏉冪殑鎿嶄綔
   provider?: string
   model?: string
-  notebook_updated?: boolean  // Notebook 是否有更新（新增 Cell）
-  cell_id?: string  // 新创建的 Cell ID
-  new_cell?: Cell   // 新创建的完整 Cell 数据
-  updated_cell?: Cell  // 更新的 Cell 数据
+  notebook_updated?: boolean  // Notebook 鏄惁鏈夋洿鏂帮紙鏂板 Cell锛?
+  cell_id?: string  // 鏂板垱寤虹殑 Cell ID
+  new_cell?: Cell   // 鏂板垱寤虹殑瀹屾暣 Cell 鏁版嵁
+  updated_cell?: Cell  // 鏇存柊鐨?Cell 鏁版嵁
 }
 
 // ========== Notebook Agent API ==========
 
 export const agentApi = {
-  // 获取 Notebook 上下文
+  // 鑾峰彇 Notebook 涓婁笅鏂?
   getContext: async (notebookId: string): Promise<AgentContextResponse> => {
     const response = await api.get(`/api/codelab/notebooks/${notebookId}/agent/context`)
     return response.data
   },
 
-  // 获取对话历史
+  // 鑾峰彇瀵硅瘽鍘嗗彶
   getHistory: async (notebookId: string): Promise<{
     notebook_id: string
     messages: AgentMessage[]
@@ -1034,13 +1068,13 @@ export const agentApi = {
     return response.data
   },
 
-  // 清空对话历史
+  // 娓呯┖瀵硅瘽鍘嗗彶
   clearHistory: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.delete(`/api/codelab/notebooks/${notebookId}/agent/history`)
     return response.data
   },
 
-  // 流式对话
+  // 娴佸紡瀵硅瘽
   chat: async (
     notebookId: string,
     request: AgentChatRequest,
@@ -1062,11 +1096,11 @@ export const agentApi = {
 
     if (!response.ok) {
       const error = await response.json()
-      throw new Error(error.detail || '请求失败')
+      throw new Error(error.detail || '璇锋眰澶辫触')
     }
 
     const reader = response.body?.getReader()
-    if (!reader) throw new Error('无法读取响应')
+    if (!reader) throw new Error('鏃犳硶璇诲彇鍝嶅簲')
 
     const decoder = new TextDecoder()
     let buffer = ''
@@ -1085,14 +1119,14 @@ export const agentApi = {
             const data = JSON.parse(line.slice(6))
             onEvent(data as AgentChatEvent)
           } catch (e) {
-            console.error('解析事件失败:', e)
+            console.error('瑙ｆ瀽浜嬩欢澶辫触:', e)
           }
         }
       }
     }
   },
 
-  // 非流式对话
+  // 闈炴祦寮忓璇?
   chatSync: async (
     notebookId: string,
     request: Omit<AgentChatRequest, 'stream'>
@@ -1108,7 +1142,7 @@ export const agentApi = {
     return response.data
   },
 
-  // 生成代码建议
+  // 鐢熸垚浠ｇ爜寤鸿
   suggestCode: async (
     notebookId: string,
     description: string
@@ -1125,7 +1159,7 @@ export const agentApi = {
     return response.data
   },
 
-  // 解释错误
+  // 瑙ｉ噴閿欒
   explainError: async (
     notebookId: string,
     errorMessage: string,
@@ -1142,7 +1176,7 @@ export const agentApi = {
     return response.data
   },
 
-  // 分析数据
+  // 鍒嗘瀽鏁版嵁
   analyzeData: async (
     notebookId: string,
     variableName: string,
@@ -1162,7 +1196,7 @@ export const agentApi = {
   },
 }
 
-// 辅助函数
+// 杈呭姪鍑芥暟
 function getToken(): string {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -1172,7 +1206,7 @@ function getToken(): string {
   return ''
 }
 
-// ========== 角色系统类型定义 ==========
+// ========== 瑙掕壊绯荤粺绫诲瀷瀹氫箟 ==========
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -1199,15 +1233,16 @@ export enum SharePermission {
   ADMIN = 'admin',
 }
 
-// 师生关系状态
+// 甯堢敓鍏崇郴鐘舵€?
 export enum MentorshipStatus {
-  NONE = 'none',           // 无导师
-  PENDING = 'pending',     // 申请中
-  ACTIVE = 'active',       // 已建立关系
-  INVITED = 'invited',     // 被邀请
+  NONE = 'none',
+  PENDING = 'pending',
+  ACTIVE = 'active',
+  INVITED = 'invited',
+  ARCHIVED = 'archived',
 }
 
-// 用户信息（扩展了角色字段）
+// 鐢ㄦ埛淇℃伅锛堟墿灞曚簡瑙掕壊瀛楁锛?
 export interface UserWithRole {
   id: number
   email: string
@@ -1225,7 +1260,37 @@ export interface UserWithRole {
   last_login?: string
 }
 
-// 学生详情（含统计）
+export interface UserBrief {
+  id: number
+  username: string
+  full_name?: string
+  avatar?: string
+  role: UserRole
+  profile_data?: UserProfileData
+}
+
+export interface Mentorship {
+  id: number
+  mentor_id: number
+  student_id: number
+  status: MentorshipStatus
+  request_message?: string
+  response_message?: string
+  metadata?: Record<string, unknown>
+  created_at: string
+  updated_at: string
+  approved_at?: string
+  archived_at?: string
+  mentor?: UserBrief
+  student?: UserBrief
+}
+
+export interface MentorshipListResponse {
+  items: Mentorship[]
+  total: number
+}
+
+// 瀛︾敓璇︽儏锛堝惈缁熻锛?
 export interface StudentDetail extends UserWithRole {
   conversation_count: number
   knowledge_base_count: number
@@ -1233,7 +1298,7 @@ export interface StudentDetail extends UserWithRole {
   notebook_count: number
 }
 
-// 研究组
+// 鐮旂┒缁?
 export interface ResearchGroup {
   id: number
   name: string
@@ -1247,7 +1312,7 @@ export interface ResearchGroup {
   created_at: string
 }
 
-// 组成员
+// 缁勬垚鍛?
 export interface GroupMember {
   id: number
   group_id: number
@@ -1257,7 +1322,7 @@ export interface GroupMember {
   user?: UserWithRole
 }
 
-// 邀请
+// 閭€璇?
 export interface Invitation {
   id: number
   type: 'invite' | 'apply'
@@ -1274,22 +1339,28 @@ export interface Invitation {
   group?: ResearchGroup
 }
 
-// 共享资源
+// 鍏变韩璧勬簮
 export interface SharedResource {
   id: number
   resource_type: ShareType
-  resource_id: number | string  // 支持整数和字符串（如notebook UUID）
+  resource_id: number | string
   owner_id: number
+  owner_name?: string
+  owner_avatar?: string
   shared_with_type: 'user' | 'group' | 'all_students'
   shared_with_id?: number
+  shared_with_name?: string
+  group_name?: string
   permission: SharePermission
   created_at: string
+  shared_at?: string
   expires_at?: string
   owner?: UserWithRole
   resource_name?: string
+  resource_detail?: Record<string, unknown>
 }
 
-// 公告
+// 鍏憡
 export interface Announcement {
   id: number
   mentor_id: number
@@ -1306,7 +1377,7 @@ export interface Announcement {
   read_count?: number
 }
 
-// 系统统计
+// 绯荤粺缁熻
 export interface SystemStatistics {
   total_users: number
   admin_count: number
@@ -1319,10 +1390,10 @@ export interface SystemStatistics {
   total_notebooks: number
 }
 
-// ========== 管理员 API ==========
+// ========== 绠＄悊鍛?API ==========
 
 export const adminApi = {
-  // 获取所有用户
+  // 鑾峰彇鎵€鏈夌敤鎴?
   getUsers: async (params?: {
     skip?: number
     limit?: number
@@ -1334,92 +1405,92 @@ export const adminApi = {
     return response.data
   },
 
-  // 获取用户详情
+  // 鑾峰彇鐢ㄦ埛璇︽儏
   getUser: async (userId: number): Promise<UserWithRole> => {
     const response = await api.get(`/api/admin/users/${userId}`)
     return response.data
   },
 
-  // 更新用户角色
+  // 鏇存柊鐢ㄦ埛瑙掕壊
   updateUserRole: async (userId: number, role: UserRole): Promise<UserWithRole> => {
     const response = await api.put(`/api/admin/users/${userId}/role`, { role })
     return response.data
   },
 
-  // 切换用户激活状态
+  // 鍒囨崲鐢ㄦ埛婵€娲荤姸鎬?
   toggleUserActive: async (userId: number): Promise<{ is_active: boolean }> => {
     const response = await api.put(`/api/admin/users/${userId}/toggle-active`)
     return response.data
   },
 
-  // 删除用户
+  // 鍒犻櫎鐢ㄦ埛
   deleteUser: async (userId: number): Promise<void> => {
     await api.delete(`/api/admin/users/${userId}`)
   },
 
-  // 获取系统统计
+  // 鑾峰彇绯荤粺缁熻
   getStatistics: async (): Promise<SystemStatistics> => {
     const response = await api.get('/api/admin/statistics')
     return response.data
   },
 
-  // 设置用户导师
+  // 璁剧疆鐢ㄦ埛瀵煎笀
   setUserMentor: async (userId: number, mentorId: number | null): Promise<UserWithRole> => {
     const response = await api.put(`/api/admin/users/${userId}/mentor`, { mentor_id: mentorId })
     return response.data
   },
 }
 
-// ========== 导师 API ==========
+// ========== 瀵煎笀 API ==========
 
 export const mentorApi = {
-  // 获取我的学生列表
+  // 鑾峰彇鎴戠殑瀛︾敓鍒楄〃
   getStudents: async (): Promise<StudentDetail[]> => {
     const response = await api.get('/api/mentor/students')
     return response.data
   },
 
-  // 获取学生详情
+  // 鑾峰彇瀛︾敓璇︽儏
   getStudentDetail: async (studentId: number): Promise<StudentDetail> => {
     const response = await api.get(`/api/mentor/students/${studentId}`)
     return response.data
   },
 
-  // 邀请学生
+  // 閭€璇峰鐢?
   inviteStudent: async (email: string, message?: string): Promise<Invitation> => {
     const response = await api.post('/api/mentor/students/invite', { email, message })
     return response.data
   },
 
-  // 移除学生
+  // 绉婚櫎瀛︾敓
   removeStudent: async (studentId: number): Promise<void> => {
     await api.delete(`/api/mentor/students/${studentId}`)
   },
 
-  // 获取发出的邀请
+  // 鑾峰彇鍙戝嚭鐨勯個璇?
   getSentInvitations: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/mentor/invitations/sent')
     return response.data
   },
 
-  // 取消邀请
+  // 鍙栨秷閭€璇?
   cancelInvitation: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/mentor/invitations/${invitationId}`)
   },
 
-  // 处理学生申请
+  // 澶勭悊瀛︾敓鐢宠
   handleApplication: async (invitationId: number, accept: boolean): Promise<void> => {
     const response = await api.post(`/api/mentor/applications/${invitationId}/${accept ? 'accept' : 'reject'}`)
     return response.data
   },
 
-  // 获取研究组列表
+  // 鑾峰彇鐮旂┒缁勫垪琛?
   getGroups: async (): Promise<ResearchGroup[]> => {
     const response = await api.get('/api/mentor/groups')
     return response.data
   },
 
-  // 创建研究组
+  // 鍒涘缓鐮旂┒缁?
   createGroup: async (data: {
     name: string
     description?: string
@@ -1429,7 +1500,7 @@ export const mentorApi = {
     return response.data
   },
 
-  // 更新研究组
+  // 鏇存柊鐮旂┒缁?
   updateGroup: async (groupId: number, data: {
     name?: string
     description?: string
@@ -1440,33 +1511,33 @@ export const mentorApi = {
     return response.data
   },
 
-  // 删除研究组
+  // 鍒犻櫎鐮旂┒缁?
   deleteGroup: async (groupId: number): Promise<void> => {
     await api.delete(`/api/mentor/groups/${groupId}`)
   },
 
-  // 获取组成员
+  // 鑾峰彇缁勬垚鍛?
   getGroupMembers: async (groupId: number): Promise<GroupMember[]> => {
     const response = await api.get(`/api/mentor/groups/${groupId}/members`)
     return response.data
   },
 
-  // 添加组成员
+  // 娣诲姞缁勬垚鍛?
   addGroupMember: async (groupId: number, userId: number): Promise<GroupMember> => {
     const response = await api.post(`/api/mentor/groups/${groupId}/members`, { user_id: userId })
     return response.data
   },
 
-  // 移除组成员
+  // 绉婚櫎缁勬垚鍛?
   removeGroupMember: async (groupId: number, userId: number): Promise<void> => {
     await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`)
   },
 }
 
-// ========== 学生 API ==========
+// ========== 瀛︾敓 API ==========
 
 export const studentApi = {
-  // 获取我的导师
+  // 鑾峰彇鎴戠殑瀵煎笀
   getMentor: async (): Promise<UserWithRole | null> => {
     try {
       const response = await api.get('/api/student/mentor')
@@ -1479,143 +1550,143 @@ export const studentApi = {
     }
   },
 
-  // 搜索导师
+  // 鎼滅储瀵煎笀
   searchMentors: async (query: string): Promise<UserWithRole[]> => {
     const response = await api.get('/api/student/mentors/search', { params: { query } })
     return response.data
   },
 
-  // 申请导师
+  // 鐢宠瀵煎笀
   applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
     const response = await api.post('/api/student/mentor/apply', { mentor_id: mentorId, message })
     return response.data
   },
 
-  // 离开导师
+  // 绂诲紑瀵煎笀
   leaveMentor: async (): Promise<void> => {
     await api.delete('/api/student/mentor/leave')
   },
 
-  // 获取我的申请
+  // 鑾峰彇鎴戠殑鐢宠
   getMyApplications: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/student/applications')
     return response.data
   },
 
-  // 取消申请
+  // 鍙栨秷鐢宠
   cancelApplication: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/student/applications/${invitationId}`)
   },
 
-  // 获取收到的邀请
+  // 鑾峰彇鏀跺埌鐨勯個璇?
   getReceivedInvitations: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/student/invitations')
     return response.data
   },
 
-  // 接受邀请
+  // 鎺ュ彈閭€璇?
   acceptInvitation: async (invitationId: number): Promise<void> => {
     await api.post(`/api/student/invitations/${invitationId}/accept`)
   },
 
-  // 拒绝邀请
+  // 鎷掔粷閭€璇?
   rejectInvitation: async (invitationId: number): Promise<void> => {
     await api.post(`/api/student/invitations/${invitationId}/reject`)
   },
 
-  // 获取我加入的研究组
+  // 鑾峰彇鎴戝姞鍏ョ殑鐮旂┒缁?
   getMyGroups: async (): Promise<ResearchGroup[]> => {
     const response = await api.get('/api/student/groups')
     return response.data
   },
 }
 
-// ========== 邀请 API ==========
+// ========== 閭€璇?API ==========
 
 export const invitationApi = {
-  // 获取我的所有邀请（收到和发出的）
+  // 鑾峰彇鎴戠殑鎵€鏈夐個璇凤紙鏀跺埌鍜屽彂鍑虹殑锛?
   getAll: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/invitations')
     return response.data
   },
 
-  // 接受邀请
+  // 鎺ュ彈閭€璇?
   accept: async (invitationId: number): Promise<void> => {
     await api.post(`/api/invitations/${invitationId}/accept`)
   },
 
-  // 拒绝邀请
+  // 鎷掔粷閭€璇?
   reject: async (invitationId: number): Promise<void> => {
     await api.post(`/api/invitations/${invitationId}/reject`)
   },
 
-  // 取消邀请
+  // 鍙栨秷閭€璇?
   cancel: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/invitations/${invitationId}`)
   },
 }
 
-// ========== 共享资源 API ==========
+// ========== 鍏变韩璧勬簮 API ==========
 
 export const shareApi = {
-  // 获取共享给我的资源
+  // 鑾峰彇鍏变韩缁欐垜鐨勮祫婧?
   getSharedWithMe: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
     const response = await api.get('/api/share/shared-with-me', { params })
     return response.data
   },
 
-  // 获取共享给我的资源数量统计
+  // 鑾峰彇鍏变韩缁欐垜鐨勮祫婧愭暟閲忕粺璁?
   getSharedCount: async (): Promise<{ paper: number; paper_collection: number; knowledge_base: number; notebook: number; total: number }> => {
     const response = await api.get('/api/share/shared-with-me/count')
     return response.data
   },
 
-  // 获取我共享出去的资源
+  // 鑾峰彇鎴戝叡浜嚭鍘荤殑璧勬簮
   getMyShares: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
     const response = await api.get('/api/share/my-shares', { params })
     return response.data
   },
 
-  // 获取可共享的研究组
+  // 鑾峰彇鍙叡浜殑鐮旂┒缁?
   getMyGroups: async (): Promise<{ id: number; name: string; role: string }[]> => {
     const response = await api.get('/api/share/my-groups')
     return response.data
   },
 
-  // 获取我的论文列表（用于共享选择）
+  // 鑾峰彇鎴戠殑璁烘枃鍒楄〃锛堢敤浜庡叡浜€夋嫨锛?
   getMyPapers: async (search?: string): Promise<{ id: number; title: string; authors: string[]; year: number; venue: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-papers', { params })
     return response.data
   },
 
-  // 获取我的文献集列表（用于共享选择）
+  // 鑾峰彇鎴戠殑鏂囩尞闆嗗垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyCollections: async (search?: string): Promise<{ id: number; name: string; description: string; paper_count: number; color: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-collections', { params })
     return response.data
   },
 
-  // 获取我的知识库列表（用于共享选择）
+  // 鑾峰彇鎴戠殑鐭ヨ瘑搴撳垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyKnowledgeBases: async (search?: string): Promise<{ id: number; name: string; description: string; document_count: number }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-knowledge-bases', { params })
     return response.data
   },
 
-  // 获取我的笔记本列表（用于共享选择）
+  // 鑾峰彇鎴戠殑绗旇鏈垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyNotebooks: async (search?: string): Promise<{ id: string; title: string; description: string; cell_count: number; updated_at: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-notebooks', { params })
     return response.data
   },
 
-  // 共享资源
+  // 鍏变韩璧勬簮
   shareResource: async (data: {
     resource_type: string
-    resource_id: number | string  // 支持整数和字符串（如notebook UUID）
+    resource_id: number | string  // 鏀寔鏁存暟鍜屽瓧绗︿覆锛堝notebook UUID锛?
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -1625,10 +1696,10 @@ export const shareApi = {
     return response.data
   },
 
-  // 批量共享
+  // 鎵归噺鍏变韩
   batchShare: async (data: {
     resource_type: string
-    resource_ids: (number | string)[]  // 支持整数和字符串
+    resource_ids: (number | string)[]  // 鏀寔鏁存暟鍜屽瓧绗︿覆
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -1637,20 +1708,20 @@ export const shareApi = {
     return response.data
   },
 
-  // 将共享论文添加到我的库
+  // 灏嗗叡浜鏂囨坊鍔犲埌鎴戠殑搴?
   copyToLibrary: async (shareId: number, collectionId?: number): Promise<{ message: string; paper_id: number }> => {
     const params = collectionId ? { collection_id: collectionId } : {}
     const response = await api.post(`/api/share/copy-to-library/${shareId}`, null, { params })
     return response.data
   },
 
-  // 获取共享资源详情（包含完整内容）
+  // 鑾峰彇鍏变韩璧勬簮璇︽儏锛堝寘鍚畬鏁村唴瀹癸級
   getSharedDetail: async (shareId: number): Promise<any> => {
     const response = await api.get(`/api/share/detail/${shareId}`)
     return response.data
   },
 
-  // 批量复制文献集中的论文
+  // 鎵归噺澶嶅埗鏂囩尞闆嗕腑鐨勮鏂?
   copyCollectionPapers: async (shareId: number, paperIds?: number[], targetCollectionId?: number): Promise<{ success_count: number; skip_count: number; message: string }> => {
     const response = await api.post(`/api/share/copy-collection-papers/${shareId}`, {
       paper_ids: paperIds,
@@ -1659,28 +1730,28 @@ export const shareApi = {
     return response.data
   },
 
-  // 取消共享
+  // 鍙栨秷鍏变韩
   removeShare: async (shareId: number): Promise<void> => {
     await api.delete(`/api/share/${shareId}`)
   },
 }
 
-// ========== 公告 API ==========
+// ========== 鍏憡 API ==========
 
 export const announcementApi = {
-  // 获取公告列表（学生看到的）
+  // 鑾峰彇鍏憡鍒楄〃锛堝鐢熺湅鍒扮殑锛?
   getAnnouncements: async (): Promise<Announcement[]> => {
     const response = await api.get('/api/announcements')
     return response.data
   },
 
-  // 获取我发布的公告（导师）
+  // 鑾峰彇鎴戝彂甯冪殑鍏憡锛堝甯堬級
   getMyAnnouncements: async (): Promise<Announcement[]> => {
     const response = await api.get('/api/announcements/my')
     return response.data
   },
 
-  // 创建公告
+  // 鍒涘缓鍏憡
   createAnnouncement: async (data: {
     title: string
     content: string
@@ -1691,7 +1762,7 @@ export const announcementApi = {
     return response.data
   },
 
-  // 更新公告
+  // 鏇存柊鍏憡
   updateAnnouncement: async (announcementId: number, data: {
     title?: string
     content?: string
@@ -1702,17 +1773,17 @@ export const announcementApi = {
     return response.data
   },
 
-  // 删除公告
+  // 鍒犻櫎鍏憡
   deleteAnnouncement: async (announcementId: number): Promise<void> => {
     await api.delete(`/api/announcements/${announcementId}`)
   },
 
-  // 标记已读
+  // 鏍囪宸茶
   markAsRead: async (announcementId: number): Promise<void> => {
     await api.post(`/api/announcements/${announcementId}/read`)
   },
 
-  // 获取公告阅读统计
+  // 鑾峰彇鍏憡闃呰缁熻
   getReadStats: async (announcementId: number): Promise<{
     total_count: number
     read_count: number
@@ -1723,10 +1794,76 @@ export const announcementApi = {
   },
 }
 
-// ========== 师生关系 API ==========
+// ========== 甯堢敓鍏崇郴 API ==========
+
+const toUserBrief = (
+  user: UserWithRole | null | undefined,
+  fallbackRole: UserRole = UserRole.STUDENT,
+): UserBrief | undefined => {
+  if (!user) {
+    return undefined
+  }
+  return {
+    id: user.id,
+    username: user.username,
+    full_name: user.full_name,
+    avatar: user.avatar,
+    role: (user.role || fallbackRole) as UserRole,
+    profile_data: {
+      department: user.department,
+      research_area: user.research_direction,
+      bio: user.bio,
+    },
+  }
+}
+
+const invitationToMentorship = (inv: Invitation): Mentorship => {
+  const isApply = inv.type === 'apply'
+  const mentorId = isApply ? inv.to_user_id : inv.from_user_id
+  const studentId = isApply ? inv.from_user_id : inv.to_user_id
+
+  let status: MentorshipStatus
+  if (inv.status === InvitationStatus.ACCEPTED) {
+    status = MentorshipStatus.ACTIVE
+  } else if (inv.status === InvitationStatus.PENDING) {
+    status = isApply ? MentorshipStatus.PENDING : MentorshipStatus.INVITED
+  } else {
+    status = MentorshipStatus.ARCHIVED
+  }
+
+  return {
+    id: inv.id,
+    mentor_id: mentorId,
+    student_id: studentId,
+    status,
+    request_message: inv.message,
+    created_at: inv.created_at,
+    updated_at: inv.responded_at || inv.created_at,
+    approved_at: inv.status === InvitationStatus.ACCEPTED ? inv.responded_at : undefined,
+    archived_at: inv.status !== InvitationStatus.PENDING && inv.status !== InvitationStatus.ACCEPTED ? inv.responded_at : undefined,
+    mentor: isApply
+      ? toUserBrief(inv.to_user, UserRole.MENTOR)
+      : toUserBrief(inv.from_user, UserRole.MENTOR),
+    student: isApply
+      ? toUserBrief(inv.from_user, UserRole.STUDENT)
+      : toUserBrief(inv.to_user, UserRole.STUDENT),
+  }
+}
+
+const activeMentorToMentorship = (mentor: UserWithRole): Mentorship => {
+  const now = new Date().toISOString()
+  return {
+    id: -(mentor.id + 100000),
+    mentor_id: mentor.id,
+    student_id: 0,
+    status: MentorshipStatus.ACTIVE,
+    created_at: now,
+    updated_at: now,
+    mentor: toUserBrief(mentor, UserRole.MENTOR),
+  }
+}
 
 export const mentorshipApi = {
-  // 获取当前师生关系状态
   getStatus: async (): Promise<{
     status: MentorshipStatus
     mentor?: UserWithRole
@@ -1739,10 +1876,13 @@ export const mentorshipApi = {
         return { status: MentorshipStatus.ACTIVE, mentor }
       }
 
-      // 检查是否有待处理的邀请或申请
       const invitations = await invitationApi.getAll()
-      const pendingInvitations = invitations.filter(i => i.type === 'invite' && i.status === 'pending')
-      const pendingApplications = invitations.filter(i => i.type === 'apply' && i.status === 'pending')
+      const pendingInvitations = invitations.filter(
+        (i) => i.type === 'invite' && i.status === InvitationStatus.PENDING,
+      )
+      const pendingApplications = invitations.filter(
+        (i) => i.type === 'apply' && i.status === InvitationStatus.PENDING,
+      )
 
       if (pendingInvitations.length > 0) {
         return { status: MentorshipStatus.INVITED, pendingInvitations }
@@ -1752,58 +1892,162 @@ export const mentorshipApi = {
       }
 
       return { status: MentorshipStatus.NONE }
-    } catch (error) {
+    } catch {
       return { status: MentorshipStatus.NONE }
     }
   },
 
-  // 获取导师信息
   getMentor: async (): Promise<UserWithRole | null> => {
     return studentApi.getMentor()
   },
 
-  // 搜索可用导师
   searchMentors: async (query: string): Promise<UserWithRole[]> => {
     return studentApi.searchMentors(query)
   },
 
-  // 申请成为某导师的学生
   applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
     return studentApi.applyToMentor(mentorId, message)
   },
 
-  // 离开当前导师
   leaveMentor: async (): Promise<void> => {
     return studentApi.leaveMentor()
   },
 
-  // 接受导师邀请
   acceptInvitation: async (invitationId: number): Promise<void> => {
     return studentApi.acceptInvitation(invitationId)
   },
 
-  // 拒绝导师邀请
   rejectInvitation: async (invitationId: number): Promise<void> => {
     return studentApi.rejectInvitation(invitationId)
   },
 
-  // 取消申请
   cancelApplication: async (invitationId: number): Promise<void> => {
     return studentApi.cancelApplication(invitationId)
   },
 
-  // 获取我的申请列表
   getMyApplications: async (): Promise<Invitation[]> => {
     return studentApi.getMyApplications()
   },
 
-  // 获取收到的邀请
   getReceivedInvitations: async (): Promise<Invitation[]> => {
     return studentApi.getReceivedInvitations()
   },
+
+  // Compatibility methods used by Team/Mentorship stores
+  getMentors: async (query: string = ''): Promise<UserBrief[]> => {
+    const mentors = await studentApi.searchMentors(query)
+    return mentors
+      .map((mentor) => toUserBrief(mentor, UserRole.MENTOR))
+      .filter((mentor): mentor is UserBrief => Boolean(mentor))
+  },
+
+  getMentorships: async (
+    status?: MentorshipStatus,
+    scope: 'as_student' | 'as_mentor' | 'all' = 'all',
+  ): Promise<MentorshipListResponse> => {
+    const items: Mentorship[] = []
+
+    if (scope !== 'as_mentor') {
+      const mentor = await studentApi.getMentor().catch(() => null)
+      if (mentor) {
+        items.push(activeMentorToMentorship(mentor))
+      }
+    }
+
+    const invitations = await invitationApi.getAll().catch(() => [])
+    for (const inv of invitations) {
+      if (scope === 'as_mentor' && inv.type !== 'apply') {
+        continue
+      }
+      if (scope === 'as_student' && inv.type !== 'apply' && inv.type !== 'invite') {
+        continue
+      }
+      items.push(invitationToMentorship(inv))
+    }
+
+    const filtered = status ? items.filter((item) => item.status === status) : items
+    return { items: filtered, total: filtered.length }
+  },
+
+  applyMentorship: async (mentorId: number, message?: string): Promise<Mentorship> => {
+    const created = await studentApi.applyToMentor(mentorId, message)
+    const createdId = (created as unknown as { invitation_id?: number; id?: number }).invitation_id
+      ?? (created as unknown as { id?: number }).id
+
+    if (createdId) {
+      const invitations = await invitationApi.getAll().catch(() => [])
+      const found = invitations.find((inv) => inv.id === createdId)
+      if (found) {
+        return invitationToMentorship(found)
+      }
+    }
+
+    const now = new Date().toISOString()
+    return {
+      id: createdId || Date.now(),
+      mentor_id: mentorId,
+      student_id: 0,
+      status: MentorshipStatus.PENDING,
+      request_message: message,
+      created_at: now,
+      updated_at: now,
+    }
+  },
+
+  updateMentorshipStatus: async (
+    mentorshipId: number,
+    status: MentorshipStatus,
+    _message?: string,
+  ): Promise<void> => {
+    if (status === MentorshipStatus.ACTIVE) {
+      await invitationApi.accept(mentorshipId)
+      return
+    }
+
+    if (status === MentorshipStatus.ARCHIVED) {
+      try {
+        await invitationApi.cancel(mentorshipId)
+      } catch {
+        await invitationApi.reject(mentorshipId)
+      }
+      return
+    }
+
+    if (status === MentorshipStatus.INVITED) {
+      await invitationApi.accept(mentorshipId)
+      return
+    }
+  },
+
+  getMyStudents: async (status: MentorshipStatus = MentorshipStatus.ACTIVE): Promise<UserBrief[]> => {
+    if (status !== MentorshipStatus.ACTIVE) {
+      return []
+    }
+    const students = await mentorApi.getStudents().catch(() => [])
+    return students.map((student) => ({
+      id: student.id,
+      username: student.username,
+      full_name: student.full_name,
+      avatar: student.avatar,
+      role: UserRole.STUDENT,
+      profile_data: {
+        department: student.department,
+        research_area: student.research_direction,
+      },
+    }))
+  },
+
+  deleteMentorship: async (mentorshipId: number): Promise<void> => {
+    await mentorshipApi.updateMentorshipStatus(mentorshipId, MentorshipStatus.ARCHIVED)
+  },
+
+  getPendingCount: async (): Promise<number> => {
+    const invitations = await invitationApi.getAll().catch(() => [])
+    return invitations.filter((inv) => inv.status === InvitationStatus.PENDING).length
+  },
 }
 
-// ========== MCP 管理类型与 API ==========
+// ========== MCP 绠＄悊绫诲瀷涓?API ==========
 
 export interface MCPServerConfigItem {
   name: string
@@ -1900,7 +2144,7 @@ export const mcpApi = {
 
 export default api
 
-// ========== 智能分块类型定义 ==========
+// ========== 鏅鸿兘鍒嗗潡绫诲瀷瀹氫箟 ==========
 
 export enum ChunkingStrategy {
   FIXED = 'fixed',
@@ -1926,13 +2170,13 @@ export enum ChunkingPreset {
 
 export interface ChunkingConfig {
   strategy: ChunkingStrategy
-  // V3 Token 计量新增
+  // V3 Token 璁￠噺鏂板
   use_token_based: boolean
   base_chunk_tokens: number
   overlap_tokens: number
   min_semantic_tokens: number
   max_semantic_tokens: number
-  // 字符计量（旧）
+  // 瀛楃璁￠噺锛堟棫锛?
   base_chunk_size: number
   chunk_overlap: number
   semantic_threshold: number
@@ -2022,9 +2266,9 @@ export interface DocumentAnalysis {
     section_count: number
     total_tokens?: number
   }
-  // [Fix 7] 新增字段
-  estimated_chunks?: number      // 预估分块数量
-  language?: string              // 检测到的语言 (zh / en)
+  // [Fix 7] 鏂板瀛楁
+  estimated_chunks?: number      // 棰勪及鍒嗗潡鏁伴噺
+  language?: string              // 妫€娴嬪埌鐨勮瑷€ (zh / en)
 }
 
 export interface StrategyComparison {
@@ -2046,22 +2290,22 @@ export interface StrategyComparison {
   }
 }
 
-// ========== 智能分块API ==========
+// ========== 鏅鸿兘鍒嗗潡API ==========
 
 export const chunkingApi = {
-  // 获取所有预设
+  // 鑾峰彇鎵€鏈夐璁?
   getPresets: async (): Promise<{ presets: PresetDescription[] }> => {
     const response = await api.get('/api/chunking/presets')
     return response.data
   },
 
-  // 获取指定预设详情
+  // 鑾峰彇鎸囧畾棰勮璇︽儏
   getPreset: async (presetName: ChunkingPreset): Promise<ChunkingConfigResponse> => {
     const response = await api.get(`/api/chunking/presets/${presetName}`)
     return response.data
   },
 
-  // 预览分块效果
+  // 棰勮鍒嗗潡鏁堟灉
   previewChunking: async (
     text: string,
     config?: Partial<ChunkingConfig>,
@@ -2077,7 +2321,7 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 分析文档结构
+  // 鍒嗘瀽鏂囨。缁撴瀯
   analyzeDocument: async (
     text: string,
     fileType = 'txt'
@@ -2089,7 +2333,7 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 比较不同策略
+  // 姣旇緝涓嶅悓绛栫暐
   compareStrategies: async (
     text: string,
     strategies: ChunkingPreset[] = [ChunkingPreset.FAST, ChunkingPreset.PRECISE, ChunkingPreset.DEEP],
@@ -2105,7 +2349,7 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 获取知识库的分块配置
+  // 鑾峰彇鐭ヨ瘑搴撶殑鍒嗗潡閰嶇疆
   getKnowledgeBaseConfig: async (kbId: number): Promise<ChunkingConfigResponse | null> => {
     try {
       const response = await api.get(`/api/chunking/knowledge-base/${kbId}/config`)
@@ -2115,7 +2359,7 @@ export const chunkingApi = {
     }
   },
 
-  // 更新知识库的分块配置
+  // 鏇存柊鐭ヨ瘑搴撶殑鍒嗗潡閰嶇疆
   updateKnowledgeBaseConfig: async (
     kbId: number,
     config: Partial<ChunkingConfig> | { preset: ChunkingPreset }
@@ -2124,7 +2368,7 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 将预设应用到知识库
+  // 灏嗛璁惧簲鐢ㄥ埌鐭ヨ瘑搴?
   applyPresetToKnowledgeBase: async (
     kbId: number,
     preset: ChunkingPreset
@@ -2133,3 +2377,7 @@ export const chunkingApi = {
     return response.data
   },
 }
+
+
+
+

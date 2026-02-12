@@ -1,15 +1,10 @@
-import { create } from 'zustand'
+﻿import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { authApi } from '@/services/api'
+import { authApi, UserRole as ApiUserRole } from '@/services/api'
 
-// 用户角色枚举
-export enum UserRole {
-  ADMIN = 'admin',
-  MENTOR = 'mentor',
-  STUDENT = 'student',
-}
+export type UserRole = ApiUserRole
 
-// 用户接口（扩展了角色字段）
+// 鐢ㄦ埛鎺ュ彛锛堟墿灞曚簡瑙掕壊瀛楁锛?
 export interface User {
   id: number
   email: string
@@ -17,11 +12,11 @@ export interface User {
   full_name?: string
   avatar?: string
   bio?: string
-  role: UserRole  // 新增：用户角色
-  mentor_id?: number  // 新增：导师ID（学生才有）
-  department?: string  // 新增：所属院系
-  research_direction?: string  // 新增：研究方向
-  joined_at?: string  // 新增：加入导师组时间
+  role: UserRole  // 鏂板锛氱敤鎴疯鑹?
+  mentor_id?: number  // 鏂板锛氬甯圛D锛堝鐢熸墠鏈夛級
+  department?: string  // 鏂板锛氭墍灞為櫌绯?
+  research_direction?: string  // 鏂板锛氱爺绌舵柟鍚?
+  joined_at?: string  // 鏂板锛氬姞鍏ュ甯堢粍鏃堕棿
   is_active: boolean
   preferred_llm_provider: string
   preferences: Record<string, unknown>
@@ -43,11 +38,11 @@ interface AuthState {
   updateUser: (user: Partial<User>) => void
   checkAuth: () => Promise<void>
   
-  // 角色相关辅助方法
+  // 瑙掕壊鐩稿叧杈呭姪鏂规硶
   isAdmin: () => boolean
   isMentor: () => boolean
   isStudent: () => boolean
-  hasRole: (role: UserRole) => boolean
+  hasRole: (roles: string | string[]) => boolean
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -63,10 +58,10 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.login(email, password)
-          // 确保用户有角色字段，默认为 student
+          // 纭繚鐢ㄦ埛鏈夎鑹插瓧娈碉紝榛樿涓?student
           const user = {
             ...response.user,
-            role: response.user.role || UserRole.STUDENT,
+            role: response.user.role || ApiUserRole.STUDENT,
           }
           set({
             user,
@@ -85,10 +80,10 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.register(email, username, password, fullName)
-          // 新注册用户默认为 student
+          // 鏂版敞鍐岀敤鎴烽粯璁や负 student
           const user = {
             ...response.user,
-            role: response.user.role || UserRole.STUDENT,
+            role: response.user.role || ApiUserRole.STUDENT,
           }
           set({
             user,
@@ -122,71 +117,75 @@ export const useAuthStore = create<AuthState>()(
       checkAuth: async () => {
         const { token, user } = get()
         
-        // 如果没有 token，直接设为未认证
+        // 濡傛灉娌℃湁 token锛岀洿鎺ヨ涓烘湭璁よ瘉
         if (!token) {
           set({ isAuthenticated: false, isInitialized: true })
           return
         }
         
-        // 如果已有用户信息，先设为已认证（乐观更新）
+        // 濡傛灉宸叉湁鐢ㄦ埛淇℃伅锛屽厛璁句负宸茶璇侊紙涔愯鏇存柊锛?
         if (user) {
           set({ isAuthenticated: true, isInitialized: true })
         }
         
-        // 后台验证 token 有效性（不阻塞）
+        // 鍚庡彴楠岃瘉 token 鏈夋晥鎬э紙涓嶉樆濉烇級
         try {
           const userData = await authApi.me()
-          // 确保用户有角色字段
+          // 纭繚鐢ㄦ埛鏈夎鑹插瓧娈?
           const userWithRole = {
             ...userData,
-            role: userData.role || UserRole.STUDENT,
+            role: userData.role || ApiUserRole.STUDENT,
           }
           set({ user: userWithRole as User, isAuthenticated: true, isInitialized: true })
         } catch {
-          // token 无效，清除状态
+          // token 鏃犳晥锛屾竻闄ょ姸鎬?
           set({ user: null, token: null, isAuthenticated: false, isInitialized: true })
         }
       },
       
-      // 角色辅助方法
+      // 瑙掕壊杈呭姪鏂规硶
       isAdmin: () => {
         const { user } = get()
-        return user?.role === UserRole.ADMIN
+        return user?.role === ApiUserRole.ADMIN
       },
       
       isMentor: () => {
         const { user } = get()
-        return user?.role === UserRole.MENTOR
+        return user?.role === ApiUserRole.MENTOR
       },
       
       isStudent: () => {
         const { user } = get()
-        return user?.role === UserRole.STUDENT
+        return user?.role === ApiUserRole.STUDENT
       },
       
-      hasRole: (role: UserRole) => {
+      hasRole: (roles: string | string[]) => {
         const { user } = get()
-        return user?.role === role
+        if (!user?.role) {
+          return false
+        }
+        return Array.isArray(roles) ? roles.includes(user.role) : user.role === roles
       },
     }),
     {
       name: 'auth-storage',
-      // 持久化 token 和 user
+      // 鎸佷箙鍖?token 鍜?user
       partialize: (state) => ({ 
         token: state.token,
         user: state.user,
       }),
-      // hydration 完成后的回调
+      // hydration 瀹屾垚鍚庣殑鍥炶皟
       onRehydrateStorage: () => (state) => {
-        // hydration 完成后，如果有 token 和 user，立即设置为已认证
+        // hydration 瀹屾垚鍚庯紝濡傛灉鏈?token 鍜?user锛岀珛鍗宠缃负宸茶璇?
         if (state?.token && state?.user) {
           state.isAuthenticated = true
           state.isInitialized = true
         } else if (state) {
-          // 如果没有有效数据，也设置为已初始化
+          // 濡傛灉娌℃湁鏈夋晥鏁版嵁锛屼篃璁剧疆涓哄凡鍒濆鍖?
           state.isInitialized = true
         }
       },
     }
   )
 )
+

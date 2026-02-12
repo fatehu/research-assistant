@@ -33,7 +33,7 @@ const PaperListItem = ({ paper, index, sourceInfo, onSelect, onDelete }: PaperLi
         <span className="font-medium text-slate-200 truncate group-hover:text-emerald-400 transition-colors">
           {paper.title}
         </span>
-        {paper.rating > 0 && <Rate disabled value={paper.rating} className="text-xs !text-yellow-400" />}
+        {(paper.rating ?? 0) > 0 && <Rate disabled value={paper.rating ?? 0} className="text-xs !text-yellow-400" />}
       </div>
       <div className="flex items-center gap-3 text-sm text-slate-500">
         <span>{paper.authors?.slice(0, 2).map(a => a.name).join(', ')}</span>

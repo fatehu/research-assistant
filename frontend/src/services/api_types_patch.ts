@@ -1,20 +1,22 @@
-// ========== V3: 智能分块 Token 计量类型 (替换原有 ChunkingConfig 及相关接口) ==========
+﻿import type { ChunkingStrategy, ChunkLevel } from './api'
+
+// ========== V3: 鏅鸿兘鍒嗗潡 Token 璁￠噺绫诲瀷 (鏇挎崲鍘熸湁 ChunkingConfig 鍙婄浉鍏虫帴鍙? ==========
 
 export interface ChunkingConfig {
   strategy: ChunkingStrategy
-  // Token 计量 (V3 新增)
+  // Token 璁￠噺 (V3 鏂板)
   use_token_based: boolean
   base_chunk_tokens: number
   overlap_tokens: number
   min_semantic_tokens: number
   max_semantic_tokens: number
-  // 字符计量 (旧字段，向后兼容)
+  // 瀛楃璁￠噺 (鏃у瓧娈碉紝鍚戝悗鍏煎)
   base_chunk_size: number
   chunk_overlap: number
   semantic_threshold: number
   min_semantic_chunk: number
   max_semantic_chunk: number
-  // 其他
+  // 鍏朵粬
   enable_hierarchical: boolean
   hierarchy_levels: ChunkLevel[]
   detect_academic_structure: boolean
@@ -102,3 +104,4 @@ export interface DocumentAnalysis {
   estimated_chunks?: number
   language?: string
 }
+
