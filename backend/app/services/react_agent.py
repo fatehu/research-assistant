@@ -54,6 +54,7 @@ class AgentContext:
     max_iterations: int = field(default_factory=lambda: settings.react_max_iterations)
     final_answer: str = ""
     error: Optional[str] = None
+    allowed_source_labels: set[str] = field(default_factory=set)
 
 
 class ReActAgent:
@@ -228,6 +229,77 @@ class ReActAgent:
             followup = "请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
 
         return f"<observation>\n{observation_output}\n</observation>\n\n{followup}"
+
+    @staticmethod
+    def _extract_source_labels(text: str) -> set[str]:
+        """Extract source numbers from [来源X] tokens."""
+        if not text:
+            return set()
+        return set(re.findall(r"\[来源(\d+)\]", text))
+
+    @staticmethod
+    def _extract_answer_citations(answer: str) -> set[str]:
+        """Extract citation numbers from final answer."""
+        if not answer:
+            return set()
+        return set(re.findall(r"\[来源(\d+)\]", answer))
+
+    @classmethod
+    def _citations_are_valid(cls, answer: str, allowed_source_labels: set[str]) -> bool:
+        """Check whether answer has citations and all are within allowed sources."""
+        if not allowed_source_labels:
+            return True
+        cited = cls._extract_answer_citations(answer)
+        return bool(cited) and cited.issubset(allowed_source_labels)
+
+    async def _ensure_citation_compliance(
+        self,
+        answer: str,
+        context: AgentContext,
+    ) -> str:
+        """
+        Ensure final answer cites allowed [来源X] when knowledge_search was used.
+        """
+        clean_answer = (answer or "").strip()
+        allowed = context.allowed_source_labels
+        if not clean_answer or not allowed:
+            return clean_answer
+        if self._citations_are_valid(clean_answer, allowed):
+            return clean_answer
+
+        allowed_tokens = ", ".join(f"[来源{idx}]" for idx in sorted(allowed, key=int))
+        repair_prompt = f"""
+请修正下面这段回答的来源标注。
+
+要求：
+1. 关键结论必须带来源标注。
+2. 只能使用这些来源标签：{allowed_tokens}
+3. 不要新增事实，不要输出解释，只输出修正后的回答正文。
+
+原回答：
+{clean_answer}
+""".strip()
+
+        try:
+            repaired_resp = await self.llm.chat(
+                messages=[{"role": "user", "content": repair_prompt}],
+                system_prompt=(
+                    "你是一个引用修正助手。只修正来源标注，不改变事实与结构。"
+                ),
+                temperature=0.0,
+                max_tokens=min(settings.llm_max_tokens, 1000),
+            )
+            repaired = str(repaired_resp.get("content") or "").strip()
+            repaired = re.sub(r"</?answer>", "", repaired).strip()
+            if repaired and self._citations_are_valid(repaired, allowed):
+                return repaired
+        except Exception as exc:
+            logger.warning(f"[ReAct] citation repair failed, fallback to annotated answer: {exc}")
+
+        return (
+            f"{clean_answer}\n\n"
+            f"注：当前可用来源仅为 {allowed_tokens}，请按来源补充标注。"
+        )
     
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """
@@ -306,20 +378,36 @@ class ReActAgent:
             compression_inputs,
         )
 
+        compression_map = {item.source_id: item for item in compression_results}
         compressed_parts: list[str] = []
-        for compressed in compression_results:
-            if not compressed.relevant_content:
+        for source_id, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
                 continue
-            row_index = compressed.source_id - 1
-            row = rows[row_index] if 0 <= row_index < len(rows) and isinstance(rows[row_index], dict) else {}
+
+            compressed = compression_map.get(source_id)
             retrieval_score = self._safe_float(row.get("score"), 0.0) * 100
             kb_name = row.get("knowledge_base") or row.get("knowledge_base_name") or "unknown_kb"
-            doc_name = row.get("document") or row.get("document_name") or compressed.doc_name
+            doc_name = row.get("document") or row.get("document_name") or "unknown_doc"
+            chunk_idx = int(self._safe_float(row.get("chunk_index"), 0))
+            source_label = f"来源{source_id}"
+
+            if compressed and compressed.relevant_content:
+                content = compressed.relevant_content
+                compression_score = compressed.relevance_score
+            else:
+                raw_content = str(row.get("content") or "").strip()
+                if not raw_content:
+                    continue
+                content = f"[{source_label}] {raw_content[:320]}"
+                if len(raw_content) > 320:
+                    content += "..."
+                compression_score = 0.0
+
             compressed_parts.append(
-                f"\n[{compressed.source_label}] (retrieval score {retrieval_score:.1f}%)\n"
-                f"Source: {kb_name} / {doc_name} / chunk {compressed.chunk_idx}\n"
-                f"Compression score: {compressed.relevance_score:.1f}/10\n"
-                f"Content: {compressed.relevant_content}"
+                f"\n[{source_label}] (retrieval score {retrieval_score:.1f}%)\n"
+                f"Source: {kb_name} / {doc_name} / chunk {chunk_idx}\n"
+                f"Compression score: {compression_score:.1f}/10\n"
+                f"Content: {content}"
             )
 
         if not compressed_parts:
@@ -406,11 +494,13 @@ class ReActAgent:
             
             parsed = self._parse_response(full_response)
             if parsed["answer"]:
-                context.final_answer = parsed["answer"]
-                yield {"type": "answer", "data": parsed["answer"]}
+                final_answer = await self._ensure_citation_compliance(parsed["answer"], context)
+                context.final_answer = final_answer
+                yield {"type": "answer", "data": final_answer}
             else:
                 # 清理响应作为答案
                 clean_answer = re.sub(r'</?(?:think|action|answer|observation)>', '', full_response).strip()
+                clean_answer = await self._ensure_citation_compliance(clean_answer, context)
                 context.final_answer = clean_answer
                 yield {"type": "answer", "data": clean_answer}
         
@@ -545,6 +635,9 @@ class ReActAgent:
                                     str(tool_input.get("query", "")),
                                     result,
                                 )
+                                context.allowed_source_labels.update(
+                                    self._extract_source_labels(observation_output)
+                                )
                             step.tool_output = observation_output
                             step.success = result.success
                             
@@ -590,6 +683,7 @@ class ReActAgent:
                         current_mode = None
                         
                         final_answer = answer_content.strip()
+                        final_answer = await self._ensure_citation_compliance(final_answer, context)
                         logger.info(f"[ReAct] 回答完成: {final_answer[:100]}...")
                         
                         # 记录回答步骤
@@ -627,6 +721,7 @@ class ReActAgent:
             answer_content += buffer
             final_answer = re.sub(r'</answer>.*', '', answer_content).strip()
             if final_answer:
+                final_answer = await self._ensure_citation_compliance(final_answer, context)
                 yield {"type": "answer", "data": final_answer}
         elif current_mode == "action" and buffer.strip():
             # action 模式但没有结束标签
@@ -661,6 +756,9 @@ class ReActAgent:
                     
                             result,
                     
+                        )
+                        context.allowed_source_labels.update(
+                            self._extract_source_labels(observation_output)
                         )
                     
                     yield {
@@ -717,6 +815,9 @@ class ReActAgent:
                             result,
                     
                         )
+                        context.allowed_source_labels.update(
+                            self._extract_source_labels(observation_output)
+                        )
                     
                     yield {
                         "type": "observation",
@@ -746,6 +847,7 @@ class ReActAgent:
             # 移除 JSON 对象
             clean_response = re.sub(r'\{[^{}]*"tool"[^{}]*\}', '', clean_response).strip()
             if clean_response:
+                clean_response = await self._ensure_citation_compliance(clean_response, context)
                 logger.warning(f"[ReAct] 未找到标准格式，使用清理后的响应作为答案")
                 yield {"type": "answer", "data": clean_response}
     
@@ -792,6 +894,9 @@ class ReActAgent:
                     str(tool_input.get("query", "")),
                     result,
                 )
+                context.allowed_source_labels.update(
+                    self._extract_source_labels(observation_output)
+                )
             
             events.append({
                 "type": "observation",
@@ -824,12 +929,13 @@ class ReActAgent:
         
         # 处理回答
         if parsed["answer"]:
-            events.append({"type": "answer", "data": parsed["answer"]})
-            context.final_answer = parsed["answer"]
+            final_answer = await self._ensure_citation_compliance(parsed["answer"], context)
+            events.append({"type": "answer", "data": final_answer})
+            context.final_answer = final_answer
             context.state = AgentState.DONE
             context.steps.append(AgentStep(
                 step_type="answer",
-                content=parsed["answer"]
+                content=final_answer
             ))
         
         return events
