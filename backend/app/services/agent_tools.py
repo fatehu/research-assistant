@@ -7,7 +7,7 @@ import math
 import re
 import httpx
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Callable
 from dataclasses import dataclass
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -343,13 +343,47 @@ class KnowledgeSearchTool(Tool):
         "required": ["query"]
     }
     
-    def __init__(self, db: AsyncSession, user_id: int):
+    def __init__(
+        self,
+        db: Optional[AsyncSession],
+        user_id: int,
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+    ):
         self.db = db
         self.user_id = user_id
+        self.db_session_factory = db_session_factory
         self.embedding_service = get_embedding_service()
         self.query_rewrite_service = get_query_rewrite_service()
     
     async def execute(self, query: str, top_k: int = 5) -> ToolResult:
+        """执行知识库搜索（自动选择会话策略）"""
+        if self.db is not None:
+            return await self._execute_with_db(self.db, query, top_k)
+
+        if self.db_session_factory is None:
+            return ToolResult(
+                success=False,
+                output="知识库搜索不可用：数据库会话未初始化",
+                error="db_session_unavailable",
+            )
+
+        try:
+            async with self.db_session_factory() as db:
+                return await self._execute_with_db(db, query, top_k)
+        except Exception as e:
+            logger.error(f"知识库搜索失败（短会话模式）: {e}")
+            return ToolResult(
+                success=False,
+                output=f"搜索过程中发生错误: {str(e)}",
+                error=str(e)
+            )
+
+    async def _execute_with_db(
+        self,
+        db: AsyncSession,
+        query: str,
+        top_k: int = 5,
+    ) -> ToolResult:
         """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
             start_time = time.time()
@@ -360,11 +394,11 @@ class KnowledgeSearchTool(Tool):
             
             # 获取用户的知识库ID列表
             kb_query = select(KnowledgeBase.id).where(KnowledgeBase.user_id == self.user_id)
-            kb_result = await self.db.execute(kb_query)
+            kb_result = await db.execute(kb_query)
             kb_ids = set(row[0] for row in kb_result.fetchall())
             
             # 获取共享给用户的知识库ID
-            shared_kb_ids = await self._get_shared_kb_ids()
+            shared_kb_ids = await self._get_shared_kb_ids(db)
             kb_ids = kb_ids | shared_kb_ids
             
             if not kb_ids:
@@ -457,7 +491,7 @@ class KnowledgeSearchTool(Tool):
                     vector_embeddings.append(emb)
 
             await apply_hnsw_ef_search(
-                self.db,
+                db,
                 settings.pgvector_hnsw_ef_search,
                 source="knowledge_search_tool",
             )
@@ -468,7 +502,7 @@ class KnowledgeSearchTool(Tool):
                     continue
 
                 vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-                result = await self.db.execute(
+                result = await db.execute(
                     vector_sql,
                     {
                         "query_vector": vector_str,
@@ -523,7 +557,7 @@ class KnowledgeSearchTool(Tool):
                     if not variant.text.strip():
                         continue
                     try:
-                        text_result = await self.db.execute(
+                        text_result = await db.execute(
                             text_sql,
                             {
                                 "fts_query": variant.text,
@@ -666,7 +700,7 @@ class KnowledgeSearchTool(Tool):
                 error=str(e)
             )
     
-    async def _get_shared_kb_ids(self) -> Set[int]:
+    async def _get_shared_kb_ids(self, db: AsyncSession) -> Set[int]:
         """获取共享给当前用户的知识库ID"""
         if not SHARING_ENABLED:
             logger.debug("共享功能未启用 (agent_tools)")
@@ -676,7 +710,7 @@ class KnowledgeSearchTool(Tool):
             logger.debug(f"获取用户 {self.user_id} 的共享知识库 (agent_tools)")
             
             # 获取当前用户信息
-            user_result = await self.db.execute(
+            user_result = await db.execute(
                 select(User).where(User.id == self.user_id)
             )
             current_user = user_result.scalar_one_or_none()
@@ -687,7 +721,7 @@ class KnowledgeSearchTool(Tool):
             logger.debug(f"当前用户: {current_user.username}, 角色: {current_user.role}, 导师ID: {current_user.mentor_id}")
             
             # 获取用户加入的研究组
-            group_ids_result = await self.db.execute(
+            group_ids_result = await db.execute(
                 select(GroupMember.group_id).where(GroupMember.user_id == self.user_id)
             )
             group_ids = [row[0] for row in group_ids_result.fetchall()]
@@ -695,7 +729,7 @@ class KnowledgeSearchTool(Tool):
             
             # 如果是导师，获取管理的研究组
             if current_user.role == UserRole.MENTOR.value:
-                mentor_groups_result = await self.db.execute(
+                mentor_groups_result = await db.execute(
                     select(ResearchGroup.id).where(ResearchGroup.mentor_id == self.user_id)
                 )
                 mentor_group_ids = [row[0] for row in mentor_groups_result.fetchall()]
@@ -726,7 +760,7 @@ class KnowledgeSearchTool(Tool):
                 )
             
             if current_user.role == UserRole.STUDENT.value and group_ids:
-                mentor_ids_result = await self.db.execute(
+                mentor_ids_result = await db.execute(
                     select(ResearchGroup.mentor_id).where(ResearchGroup.id.in_(group_ids))
                 )
                 mentor_ids = [row[0] for row in mentor_ids_result.fetchall()]
@@ -739,7 +773,7 @@ class KnowledgeSearchTool(Tool):
                     )
             
             # 查询共享的知识库ID
-            shared_result = await self.db.execute(
+            shared_result = await db.execute(
                 select(SharedResource.resource_id).where(
                     and_(
                         SharedResource.resource_type == 'knowledge_base',
@@ -1314,6 +1348,7 @@ class ToolRegistry:
     def __init__(
         self, 
         db: AsyncSession = None, 
+        db_session_factory: Optional[Callable[[], AsyncSession]] = None,
         user_id: int = None,
         # Notebook 上下文参数
         notebook_id: str = None,
@@ -1322,6 +1357,7 @@ class ToolRegistry:
         user_authorized: bool = False  # 用户是否授权 Agent 操作 Notebook
     ):
         self.db = db
+        self.db_session_factory = db_session_factory
         self.user_id = user_id
         self.notebook_id = notebook_id
         self.kernel_manager = kernel_manager
@@ -1337,8 +1373,14 @@ class ToolRegistry:
     def _register_default_tools(self):
         """注册默认工具"""
         # 知识库搜索（需要数据库和用户ID）
-        if self.db and self.user_id:
-            self.register(KnowledgeSearchTool(self.db, self.user_id))
+        if (self.db or self.db_session_factory) and self.user_id:
+            self.register(
+                KnowledgeSearchTool(
+                    self.db,
+                    self.user_id,
+                    db_session_factory=self.db_session_factory,
+                )
+            )
         
         # 通用工具（无需特殊依赖）
         self.register(WebSearchTool())
@@ -1467,6 +1509,10 @@ class ToolRegistry:
             )
 
 
-def get_tool_registry(db: AsyncSession, user_id: int) -> ToolRegistry:
+def get_tool_registry(
+    db: Optional[AsyncSession],
+    user_id: int,
+    db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+) -> ToolRegistry:
     """获取工具注册表"""
-    return ToolRegistry(db, user_id)
+    return ToolRegistry(db=db, user_id=user_id, db_session_factory=db_session_factory)

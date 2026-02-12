@@ -29,7 +29,7 @@ from sqlalchemy import select, delete
 from loguru import logger
 from contextlib import redirect_stdout, redirect_stderr
 
-from app.core.database import get_db
+from app.core.database import get_db, async_session_factory
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.notebook_service import NotebookService
@@ -1118,7 +1118,8 @@ async def notebook_agent_chat(
             
             # 创建带 Notebook 上下文的工具注册表
             tool_registry = ToolRegistry(
-                db=db,
+                db=None,
+                db_session_factory=async_session_factory,
                 user_id=current_user.id,
                 notebook_id=notebook_id,
                 kernel_manager=kernel_manager,

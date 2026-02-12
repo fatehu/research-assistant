@@ -18,7 +18,11 @@ def _fake_tool(name: str):
 
 
 def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeypatch):
-    monkeypatch.setattr(agent_tools, "KnowledgeSearchTool", lambda db, user_id: _fake_tool("knowledge_search"))
+    monkeypatch.setattr(
+        agent_tools,
+        "KnowledgeSearchTool",
+        lambda db, user_id, db_session_factory=None: _fake_tool("knowledge_search"),
+    )
     monkeypatch.setattr(agent_tools, "WebSearchTool", lambda: _fake_tool("web_search"))
     monkeypatch.setattr(agent_tools, "CalculatorTool", lambda: _fake_tool("calculator"))
     monkeypatch.setattr(agent_tools, "DateTimeTool", lambda: _fake_tool("datetime"))
@@ -28,13 +32,15 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
 
     with_db = agent_tools.ToolRegistry(db=object(), user_id=1)
     without_db = agent_tools.ToolRegistry(db=None, user_id=1)
+    with_factory = agent_tools.ToolRegistry(db=None, db_session_factory=lambda: object(), user_id=1)
 
     assert "knowledge_search" in with_db._tools
     assert "knowledge_search" not in without_db._tools
+    assert "knowledge_search" in with_factory._tools
 
 
 def test_knowledge_search_uses_configurable_distance_threshold():
-    source = inspect.getsource(agent_tools.KnowledgeSearchTool.execute)
+    source = inspect.getsource(agent_tools.KnowledgeSearchTool._execute_with_db)
     assert "settings.agent_knowledge_score_threshold" in source
     assert "<= :distance_threshold" in source
     assert "\"distance_threshold\": distance_threshold" in source

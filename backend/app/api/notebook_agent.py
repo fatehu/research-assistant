@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, async_session_factory
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.llm_service import get_llm_service
@@ -94,13 +94,14 @@ class NotebookToolRegistry(ToolRegistry):
         self,
         db,
         user_id: int,
+        db_session_factory=None,
         notebook_id: str = None,
         kernel_manager=None,
         notebooks_store: dict = None,
         user_authorized: bool = False
     ):
         # 初始化基础工具
-        super().__init__(db, user_id)
+        super().__init__(db=db, user_id=user_id, db_session_factory=db_session_factory)
         
         self.notebook_id = notebook_id
         self.kernel_manager = kernel_manager
@@ -150,7 +151,8 @@ async def notebook_agent_chat(
     
     # 创建工具注册表（带 notebook 上下文）
     tool_registry = NotebookToolRegistry(
-        db=db,
+        db=None,
+        db_session_factory=async_session_factory,
         user_id=current_user.id,
         notebook_id=notebook_id,
         kernel_manager=kernel_manager,
@@ -382,7 +384,8 @@ async def get_available_tools(
     
     # 创建工具注册表
     tool_registry = NotebookToolRegistry(
-        db=db,
+        db=None,
+        db_session_factory=async_session_factory,
         user_id=current_user.id,
         notebook_id=notebook_id,
         kernel_manager=kernel_manager,

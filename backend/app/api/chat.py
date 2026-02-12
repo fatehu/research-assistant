@@ -413,80 +413,83 @@ async def send_message(
                     # 收集ReAct步骤
                     react_steps = []
                     current_iteration = 0
+
+                    tool_registry = get_tool_registry(
+                        db=None,
+                        user_id=current_user.id,
+                        db_session_factory=async_session_factory,
+                    )
+                    agent = create_react_agent(llm_service, tool_registry, max_iterations=5)
                     
-                    async with async_session_factory() as tool_db:
-                        tool_registry = get_tool_registry(tool_db, current_user.id)
-                        agent = create_react_agent(llm_service, tool_registry, max_iterations=5)
+                    async for event in agent.run(messages, stream=True):
+                        event_type = event["type"]
+                        event_data = event["data"]
                         
-                        async for event in agent.run(messages, stream=True):
-                            event_type = event["type"]
-                            event_data = event["data"]
+                        if event_type == "start":
+                            yield f"data: {json.dumps({'event': 'model_info', 'data': event_data})}\n\n"
+                        elif event_type == "thinking_start":
+                            current_iteration += 1
+                            yield f"data: {json.dumps({'event': 'thinking_start', 'data': {'iteration': current_iteration}})}\n\n"
+                        elif event_type == "thinking":
+                            yield f"data: {json.dumps({'event': 'thinking', 'data': event_data})}\n\n"
+                        elif event_type == "thought":
+                            thought = event_data
+                            react_steps.append({
+                                "type": "thought",
+                                "iteration": current_iteration,
+                                "content": event_data
+                            })
+                            yield f"data: {json.dumps({'event': 'thought', 'data': event_data})}\n\n"
+                        elif event_type == "action":
+                            react_steps.append({
+                                "type": "action",
+                                "iteration": current_iteration,
+                                "tool": event_data.get("tool"),
+                                "input": event_data.get("input")
+                            })
+                            yield f"data: {json.dumps({'event': 'action', 'data': event_data})}\n\n"
+                        elif event_type == "observation":
+                            react_steps.append({
+                                "type": "observation",
+                                "iteration": current_iteration,
+                                "tool": event_data.get("tool"),
+                                "success": event_data.get("success"),
+                                "output": event_data.get("output", "")[:500]  # 限制长度
+                            })
+                            yield f"data: {json.dumps({'event': 'observation', 'data': event_data})}\n\n"
+                        elif event_type == "content":
+                            full_content += event_data
+                            yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
+                        elif event_type == "answer":
+                            full_content = event_data
+                            yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
+                        elif event_type == "error":
+                            logger.error(f"[Chat] ReAct Agent 错误: {event_data}")
+                            yield f"data: {json.dumps({'event': 'error', 'data': event_data})}\n\n"
+                        elif event_type == "done":
+                            if isinstance(event_data, dict):
+                                if event_data.get("thought"):
+                                    thought = event_data["thought"]
+                                if event_data.get("answer") and not full_content:
+                                    full_content = event_data["answer"]
                             
-                            if event_type == "start":
-                                yield f"data: {json.dumps({'event': 'model_info', 'data': event_data})}\n\n"
-                            elif event_type == "thinking_start":
-                                current_iteration += 1
-                                yield f"data: {json.dumps({'event': 'thinking_start', 'data': {'iteration': current_iteration}})}\n\n"
-                            elif event_type == "thinking":
-                                yield f"data: {json.dumps({'event': 'thinking', 'data': event_data})}\n\n"
-                            elif event_type == "thought":
-                                thought = event_data
-                                react_steps.append({
-                                    "type": "thought",
-                                    "iteration": current_iteration,
-                                    "content": event_data
-                                })
-                                yield f"data: {json.dumps({'event': 'thought', 'data': event_data})}\n\n"
-                            elif event_type == "action":
-                                react_steps.append({
-                                    "type": "action",
-                                    "iteration": current_iteration,
-                                    "tool": event_data.get("tool"),
-                                    "input": event_data.get("input")
-                                })
-                                yield f"data: {json.dumps({'event': 'action', 'data': event_data})}\n\n"
-                            elif event_type == "observation":
-                                react_steps.append({
-                                    "type": "observation",
-                                    "iteration": current_iteration,
-                                    "tool": event_data.get("tool"),
-                                    "success": event_data.get("success"),
-                                    "output": event_data.get("output", "")[:500]  # 限制长度
-                                })
-                                yield f"data: {json.dumps({'event': 'observation', 'data': event_data})}\n\n"
-                            elif event_type == "content":
-                                full_content += event_data
-                                yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
-                            elif event_type == "answer":
-                                full_content = event_data
-                                yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
-                            elif event_type == "error":
-                                logger.error(f"[Chat] ReAct Agent 错误: {event_data}")
-                                yield f"data: {json.dumps({'event': 'error', 'data': event_data})}\n\n"
-                            elif event_type == "done":
-                                if isinstance(event_data, dict):
-                                    if event_data.get("thought"):
-                                        thought = event_data["thought"]
-                                    if event_data.get("answer") and not full_content:
-                                        full_content = event_data["answer"]
+                            logger.info(f"[Chat] 对话完成: iterations={current_iteration}, steps={len(react_steps)}, content_len={len(full_content)}")
+                            
+                            # 保存助手消息（包含完整的ReAct步骤）
+                            async with async_session_factory() as save_db:
+                                assistant_message = Message(
+                                    conversation_id=conversation_id,
+                                    role=MessageRole.ASSISTANT,
+                                    content=full_content,
+                                    message_type=MessageType.TEXT,
+                                    thought=thought if thought else None,
+                                    react_steps=react_steps if react_steps else None,
+                                )
+                                save_db.add(assistant_message)
+                                await save_db.commit()
+                                await save_db.refresh(assistant_message)
                                 
-                                logger.info(f"[Chat] 对话完成: iterations={current_iteration}, steps={len(react_steps)}, content_len={len(full_content)}")
-                                
-                                # 保存助手消息（包含完整的ReAct步骤）
-                                async with async_session_factory() as save_db:
-                                    assistant_message = Message(
-                                        conversation_id=conversation_id,
-                                        role=MessageRole.ASSISTANT,
-                                        content=full_content,
-                                        message_type=MessageType.TEXT,
-                                        thought=thought if thought else None,
-                                        react_steps=react_steps if react_steps else None,
-                                    )
-                                    save_db.add(assistant_message)
-                                    await save_db.commit()
-                                    await save_db.refresh(assistant_message)
-                                    
-                                    yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id, 'thought': thought, 'answer': full_content, 'react_steps': react_steps}})}\n\n"
+                                yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id, 'thought': thought, 'answer': full_content, 'react_steps': react_steps}})}\n\n"
                 else:
                     # 使用普通 ReAct 聊天（无工具）
                     async for chunk in llm_service.react_chat_stream(messages):
