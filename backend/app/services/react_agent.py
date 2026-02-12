@@ -5,6 +5,7 @@ ReAct Agent 服务
 【增强版】改进了系统提示词，特别是 Notebook 单元格操作的说明
 """
 import json
+import inspect
 import re
 from typing import AsyncGenerator, List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
@@ -473,7 +474,16 @@ class ReActAgent:
             messages=messages.copy(),
             max_iterations=self.max_iterations,
         )
-        
+
+        refresh_mcp_tools = getattr(self.tools, "refresh_mcp_tools", None)
+        if callable(refresh_mcp_tools):
+            try:
+                maybe_awaitable = refresh_mcp_tools()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+            except Exception as exc:
+                logger.warning(f"[ReAct] MCP tool refresh failed, continue with local tools: {exc}")
+
         system_prompt = self._build_system_prompt()
         
         # 发送开始事件

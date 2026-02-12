@@ -39,6 +39,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"  LLM_MAX_TOKENS: {settings.llm_max_tokens}")
     logger.info(f"  REACT_MAX_ITERATIONS: {settings.react_max_iterations}")
     logger.info(f"  REACT_OUTPUT_MAX_LENGTH: {settings.react_output_max_length}")
+    logger.info(f"  MCP_ENABLED: {settings.mcp_enabled}")
+    logger.info(f"  MCP_TOOL_PREFIX: {settings.mcp_tool_prefix}")
     logger.info(f"  CODE_EXECUTION_TIMEOUT: {settings.code_execution_timeout}s")
     logger.info(f"  KERNEL_IDLE_TIMEOUT: {settings.kernel_idle_timeout}s")
     logger.info(f"  NOTEBOOK_CONTEXT_CELLS: {settings.notebook_context_cells}")

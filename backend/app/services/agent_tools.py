@@ -49,6 +49,30 @@ class Tool:
         raise NotImplementedError
 
 
+class MCPRemoteTool(Tool):
+    """Adapter: expose MCP remote tools through local Tool protocol."""
+
+    def __init__(self, schema: Any, mcp_client_manager: Any):
+        self.schema = schema
+        self.mcp_client_manager = mcp_client_manager
+        self.name = str(schema.qualified_name)
+        self.description = str(schema.description or f"MCP 远程工具（{schema.server_name}.{schema.tool_name}）")
+        self.parameters = schema.input_schema or {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+    async def execute(self, **kwargs) -> ToolResult:
+        result = await self.mcp_client_manager.call_tool(self.name, kwargs)
+        return ToolResult(
+            success=bool(result.success),
+            output=str(result.output),
+            data=result.data if isinstance(result.data, dict) else {"raw": result.data},
+            error=result.error,
+        )
+
+
 class WebSearchTool(Tool):
     """Web 搜索工具 - 使用 Serper API 进行 Google 搜索"""
     name = "web_search"
@@ -1364,11 +1388,15 @@ class ToolRegistry:
         self.notebooks_store = notebooks_store
         self.user_authorized = user_authorized
         self._tools: Dict[str, Tool] = {}
+        self._mcp_tools: Dict[str, MCPRemoteTool] = {}
+        self._mcp_client_manager: Any = None
         self._register_default_tools()
         
         # 如果提供了 Notebook 上下文，注册 Notebook 工具
         if notebook_id and kernel_manager:
             self._register_notebook_tools()
+
+        self._init_mcp_client_manager()
     
     def _register_default_tools(self):
         """注册默认工具"""
@@ -1440,6 +1468,44 @@ class ToolRegistry:
             logger.info(f"已注册 Notebook 工具集，授权状态: {self.user_authorized}")
         except ImportError as e:
             logger.warning(f"无法导入 Notebook 工具: {e}")
+
+    def _init_mcp_client_manager(self) -> None:
+        """Initialize MCP client manager when MCP is enabled."""
+        if not settings.mcp_enabled:
+            return
+        try:
+            self._mcp_client_manager = self._create_mcp_client_manager()
+            logger.info("[MCP] MCP client manager initialized")
+        except Exception as exc:
+            logger.warning(f"[MCP] init failed, fallback to local tools only: {exc}")
+            self._mcp_client_manager = None
+
+    def _create_mcp_client_manager(self):
+        from app.services.mcp import MCPClientManager, MCPServerManager, load_mcp_server_configs
+
+        configs = load_mcp_server_configs(
+            settings.mcp_servers,
+            settings.mcp_call_timeout_seconds,
+        )
+        if not configs:
+            logger.warning("[MCP] MCP_ENABLED=true but MCP_SERVERS is empty")
+
+        server_manager = MCPServerManager(configs)
+        return MCPClientManager(server_manager, tool_prefix=settings.mcp_tool_prefix)
+
+    async def refresh_mcp_tools(self, force_refresh: bool = False) -> None:
+        """Refresh remote MCP tool cache."""
+        if not self._mcp_client_manager:
+            return
+
+        schemas = await self._mcp_client_manager.discover_tools(force_refresh=force_refresh)
+        self._mcp_tools = {
+            schema.qualified_name: MCPRemoteTool(schema=schema, mcp_client_manager=self._mcp_client_manager)
+            for schema in schemas
+        }
+
+    def _iter_all_tools(self) -> List[Tool]:
+        return list(self._tools.values()) + list(self._mcp_tools.values())
     
     def register(self, tool: Tool):
         """注册工具"""
@@ -1447,7 +1513,7 @@ class ToolRegistry:
     
     def get(self, name: str) -> Optional[Tool]:
         """获取工具"""
-        return self._tools.get(name)
+        return self._tools.get(name) or self._mcp_tools.get(name)
     
     def list_tools(self) -> List[Dict[str, Any]]:
         """获取工具列表（用于发送给 LLM）"""
@@ -1460,13 +1526,13 @@ class ToolRegistry:
                     "parameters": tool.parameters,
                 }
             }
-            for tool in self._tools.values()
+            for tool in self._iter_all_tools()
         ]
     
     def get_tools_description(self) -> str:
         """获取工具描述（用于 ReAct prompt）"""
         descriptions = []
-        for tool in self._tools.values():
+        for tool in self._iter_all_tools():
             params = tool.parameters.get('properties', {})
             required = tool.parameters.get('required', [])
             
@@ -1488,25 +1554,35 @@ class ToolRegistry:
     async def execute(self, tool_name: str, **kwargs) -> ToolResult:
         """执行工具"""
         tool = self.get(tool_name)
-        if not tool:
-            return ToolResult(
-                success=False,
-                output=f"未找到工具: {tool_name}。可用工具: {', '.join(self._tools.keys())}",
-                error="tool_not_found"
-            )
-        
-        try:
-            logger.info(f"执行工具: {tool_name}, 参数: {kwargs}")
-            result = await tool.execute(**kwargs)
-            logger.info(f"工具执行完成: {tool_name}, 成功: {result.success}")
-            return result
-        except Exception as e:
-            logger.error(f"工具执行失败 {tool_name}: {e}")
-            return ToolResult(
-                success=False,
-                output=f"工具执行失败: {str(e)}",
-                error=str(e)
-            )
+        if tool:
+            try:
+                logger.info(f"执行工具: {tool_name}, 参数: {kwargs}")
+                result = await tool.execute(**kwargs)
+                logger.info(f"工具执行完成: {tool_name}, 成功: {result.success}")
+                return result
+            except Exception as e:
+                logger.error(f"工具执行失败 {tool_name}: {e}")
+                return ToolResult(
+                    success=False,
+                    output=f"工具执行失败: {str(e)}",
+                    error=str(e)
+                )
+
+        if self._mcp_client_manager:
+            mcp_result = await self._mcp_client_manager.call_tool(tool_name, kwargs)
+            if mcp_result.error != "tool_not_found":
+                return ToolResult(
+                    success=mcp_result.success,
+                    output=mcp_result.output,
+                    data=mcp_result.data,
+                    error=mcp_result.error,
+                )
+
+        return ToolResult(
+            success=False,
+            output=f"未找到工具: {tool_name}。可用工具: {', '.join([t.name for t in self._iter_all_tools()])}",
+            error="tool_not_found"
+        )
 
 
 def get_tool_registry(

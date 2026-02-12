@@ -398,6 +398,7 @@ async def get_available_tools(
         notebooks_store=_notebooks,
         user_authorized=False,
     )
+    await tool_registry.refresh_mcp_tools()
 
     tools = []
     for tool_info in tool_registry.list_tools():
