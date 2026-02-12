@@ -378,6 +378,11 @@ class KnowledgeSearchTool(Tool):
             use_reranker = settings.enable_reranker
             use_hybrid = settings.enable_hybrid_retrieval
             final_top_k = top_k
+            score_threshold = max(
+                0.0,
+                min(float(settings.agent_knowledge_score_threshold), 1.0),
+            )
+            distance_threshold = 1 - score_threshold
 
             reranker_candidate_k = (
                 max(final_top_k, settings.reranker_top_k)
@@ -412,7 +417,7 @@ class KnowledgeSearchTool(Tool):
                 JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
                 WHERE dc.knowledge_base_id = ANY(:kb_ids)
                     AND dc.embedding IS NOT NULL
-                    AND (dc.embedding <=> :query_vector) <= 0.5
+                    AND (dc.embedding <=> :query_vector) <= :distance_threshold
                 ORDER BY dc.embedding <=> :query_vector
                 LIMIT :vector_top_k
             """)
@@ -467,6 +472,7 @@ class KnowledgeSearchTool(Tool):
                     vector_sql,
                     {
                         "query_vector": vector_str,
+                        "distance_threshold": distance_threshold,
                         "kb_ids": kb_ids,
                         "vector_top_k": vector_top_k,
                     },

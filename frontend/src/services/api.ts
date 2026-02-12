@@ -520,9 +520,9 @@ export const knowledgeApi = {
     options: KnowledgeSearchOptions = {},
   ): Promise<SearchResponse> => {
     const {
-      useReranker = false,
-      useHybrid = false,
-      useQueryRewrite = false,
+      useReranker = true,
+      useHybrid = true,
+      useQueryRewrite = true,
       useContextualCompression = false,
       queryRewriteStrategies,
       timeoutMs = 60000,

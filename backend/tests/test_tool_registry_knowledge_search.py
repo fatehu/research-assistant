@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 
 from types import SimpleNamespace
 
@@ -31,3 +32,9 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     assert "knowledge_search" in with_db._tools
     assert "knowledge_search" not in without_db._tools
 
+
+def test_knowledge_search_uses_configurable_distance_threshold():
+    source = inspect.getsource(agent_tools.KnowledgeSearchTool.execute)
+    assert "settings.agent_knowledge_score_threshold" in source
+    assert "<= :distance_threshold" in source
+    assert "\"distance_threshold\": distance_threshold" in source
