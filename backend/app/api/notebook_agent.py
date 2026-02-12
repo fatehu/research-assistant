@@ -244,6 +244,7 @@ async def notebook_agent_chat(
     async def event_generator():
         full_content = ""
         code_blocks = []
+        rag_metrics = None
         
         try:
             async for event in agent.run(messages, stream=True):
@@ -286,6 +287,12 @@ async def notebook_agent_chat(
                 elif event_type == "start":
                     # 开始
                     yield f"data: {json.dumps({'type': 'start', 'provider': event_data.get('provider'), 'model': event_data.get('model')})}\n\n"
+
+                elif event_type == "done":
+                    if isinstance(event_data, dict) and event_data.get("answer"):
+                        full_content = event_data.get("answer", full_content)
+                    if isinstance(event_data, dict) and isinstance(event_data.get("rag_metrics"), dict):
+                        rag_metrics = event_data["rag_metrics"]
             
             # 提取代码块
             import re
@@ -308,7 +315,10 @@ async def notebook_agent_chat(
             })
             
             # 发送完成事件
-            yield f"data: {json.dumps({'type': 'done', 'code_blocks': code_blocks})}\n\n"
+            done_payload = {"type": "done", "code_blocks": code_blocks}
+            if isinstance(rag_metrics, dict):
+                done_payload["rag_metrics"] = rag_metrics
+            yield f"data: {json.dumps(done_payload)}\n\n"
             
         except Exception as e:
             logger.error(f"[NotebookAgent] Error: {e}")

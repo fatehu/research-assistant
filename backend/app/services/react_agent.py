@@ -55,6 +55,12 @@ class AgentContext:
     final_answer: str = ""
     error: Optional[str] = None
     allowed_source_labels: set[str] = field(default_factory=set)
+    knowledge_search_calls: int = 0
+    compression_calls: int = 0
+    compression_success_chunks: int = 0
+    compression_fallback_chunks: int = 0
+    citation_repair_attempts: int = 0
+    citation_repair_successes: int = 0
 
 
 class ReActAgent:
@@ -252,6 +258,29 @@ class ReActAgent:
         cited = cls._extract_answer_citations(answer)
         return bool(cited) and cited.issubset(allowed_source_labels)
 
+    @classmethod
+    def _build_rag_metrics(cls, context: AgentContext) -> Dict[str, Any]:
+        """Build RAG quality metrics for observability and regression baselines."""
+        final_answer = (context.final_answer or "").strip()
+        cited = cls._extract_answer_citations(final_answer)
+        allowed = context.allowed_source_labels
+        citation_required = bool(allowed)
+        citation_valid = cls._citations_are_valid(final_answer, allowed) if citation_required else True
+
+        return {
+            "knowledge_search_calls": context.knowledge_search_calls,
+            "source_labels_count": len(allowed),
+            "source_labels": [f"来源{idx}" for idx in sorted(allowed, key=int)],
+            "answer_citation_count": len(cited),
+            "citation_required": citation_required,
+            "citation_valid": citation_valid,
+            "citation_repair_attempts": context.citation_repair_attempts,
+            "citation_repair_successes": context.citation_repair_successes,
+            "compression_calls": context.compression_calls,
+            "compression_success_chunks": context.compression_success_chunks,
+            "compression_fallback_chunks": context.compression_fallback_chunks,
+        }
+
     async def _ensure_citation_compliance(
         self,
         answer: str,
@@ -266,6 +295,8 @@ class ReActAgent:
             return clean_answer
         if self._citations_are_valid(clean_answer, allowed):
             return clean_answer
+
+        context.citation_repair_attempts += 1
 
         allowed_tokens = ", ".join(f"[来源{idx}]" for idx in sorted(allowed, key=int))
         repair_prompt = f"""
@@ -292,6 +323,7 @@ class ReActAgent:
             repaired = str(repaired_resp.get("content") or "").strip()
             repaired = re.sub(r"</?answer>", "", repaired).strip()
             if repaired and self._citations_are_valid(repaired, allowed):
+                context.citation_repair_successes += 1
                 return repaired
         except Exception as exc:
             logger.warning(f"[ReAct] citation repair failed, fallback to annotated answer: {exc}")
@@ -351,6 +383,7 @@ class ReActAgent:
         self,
         query: str,
         result: ToolResult,
+        context: Optional[AgentContext] = None,
     ) -> str:
         data = result.data if isinstance(result.data, dict) else {}
         rows = data.get("results")
@@ -373,6 +406,9 @@ class ReActAgent:
         if not compression_inputs:
             return result.output
 
+        if context is not None:
+            context.compression_calls += 1
+
         compression_results = await self.contextual_compression_service.compress_chunks(
             query,
             compression_inputs,
@@ -394,6 +430,8 @@ class ReActAgent:
             if compressed and compressed.relevant_content:
                 content = compressed.relevant_content
                 compression_score = compressed.relevance_score
+                if context is not None:
+                    context.compression_success_chunks += 1
             else:
                 raw_content = str(row.get("content") or "").strip()
                 if not raw_content:
@@ -402,6 +440,8 @@ class ReActAgent:
                 if len(raw_content) > 320:
                     content += "..."
                 compression_score = 0.0
+                if context is not None:
+                    context.compression_fallback_chunks += 1
 
             compressed_parts.append(
                 f"\n[{source_label}] (retrieval score {retrieval_score:.1f}%)\n"
@@ -513,6 +553,8 @@ class ReActAgent:
                 break
         
         logger.info(f"[ReAct] 完成: iterations={context.iteration}, steps={len(context.steps)}, answer_len={len(context.final_answer)}")
+
+        rag_metrics = self._build_rag_metrics(context)
         
         yield {
             "type": "done",
@@ -521,6 +563,7 @@ class ReActAgent:
                 "steps": len(context.steps),
                 "thought": last_thought,
                 "answer": context.final_answer,
+                "rag_metrics": rag_metrics,
             }
         }
     
@@ -631,9 +674,11 @@ class ReActAgent:
                             result = await self.tools.execute(tool_name, **tool_input)
                             observation_output = result.output
                             if tool_name == "knowledge_search":
+                                context.knowledge_search_calls += 1
                                 observation_output = await self._compress_knowledge_observation(
                                     str(tool_input.get("query", "")),
                                     result,
+                                    context=context,
                                 )
                                 context.allowed_source_labels.update(
                                     self._extract_source_labels(observation_output)
@@ -749,13 +794,11 @@ class ReActAgent:
                     observation_output = result.output
                     
                     if tool_name == "knowledge_search":
-                    
+                        context.knowledge_search_calls += 1
                         observation_output = await self._compress_knowledge_observation(
-                    
                             str(tool_input.get("query", "")),
-                    
                             result,
-                    
+                            context=context,
                         )
                         context.allowed_source_labels.update(
                             self._extract_source_labels(observation_output)
@@ -807,13 +850,11 @@ class ReActAgent:
                     observation_output = result.output
                     
                     if tool_name == "knowledge_search":
-                    
+                        context.knowledge_search_calls += 1
                         observation_output = await self._compress_knowledge_observation(
-                    
                             str(tool_input.get("query", "")),
-                    
                             result,
-                    
+                            context=context,
                         )
                         context.allowed_source_labels.update(
                             self._extract_source_labels(observation_output)
@@ -890,9 +931,11 @@ class ReActAgent:
             result = await self.tools.execute(tool_name, **tool_input)
             observation_output = result.output
             if tool_name == "knowledge_search":
+                context.knowledge_search_calls += 1
                 observation_output = await self._compress_knowledge_observation(
                     str(tool_input.get("query", "")),
                     result,
+                    context=context,
                 )
                 context.allowed_source_labels.update(
                     self._extract_source_labels(observation_output)

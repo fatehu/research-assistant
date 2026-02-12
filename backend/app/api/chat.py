@@ -400,6 +400,7 @@ async def send_message(
         async def generate():
             full_content = ""
             thought = ""
+            rag_metrics = None
             
             try:
                 # 发送开始事件
@@ -472,6 +473,8 @@ async def send_message(
                                     thought = event_data["thought"]
                                 if event_data.get("answer") and not full_content:
                                     full_content = event_data["answer"]
+                                if isinstance(event_data.get("rag_metrics"), dict):
+                                    rag_metrics = event_data["rag_metrics"]
                             
                             logger.info(f"[Chat] 对话完成: iterations={current_iteration}, steps={len(react_steps)}, content_len={len(full_content)}")
                             
@@ -488,8 +491,17 @@ async def send_message(
                                 save_db.add(assistant_message)
                                 await save_db.commit()
                                 await save_db.refresh(assistant_message)
-                                
-                                yield f"data: {json.dumps({'event': 'done', 'data': {'message_id': assistant_message.id, 'thought': thought, 'answer': full_content, 'react_steps': react_steps}})}\n\n"
+
+                                done_payload = {
+                                    "message_id": assistant_message.id,
+                                    "thought": thought,
+                                    "answer": full_content,
+                                    "react_steps": react_steps,
+                                }
+                                if isinstance(rag_metrics, dict):
+                                    done_payload["rag_metrics"] = rag_metrics
+
+                                yield f"data: {json.dumps({'event': 'done', 'data': done_payload})}\n\n"
                 else:
                     # 使用普通 ReAct 聊天（无工具）
                     async for chunk in llm_service.react_chat_stream(messages):

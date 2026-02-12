@@ -1196,6 +1196,7 @@ async def notebook_agent_chat(
             # 收集完整响应
             full_content = ""
             code_blocks = []
+            rag_metrics = None
             
             # 调用 Agent - 注意: messages 构建已包含 system context
             messages = [
@@ -1332,6 +1333,8 @@ async def notebook_agent_chat(
                     # 完成事件，data 包含迭代信息
                     if isinstance(event_data, dict) and event_data.get("answer"):
                         full_content = event_data.get("answer", full_content)
+                    if isinstance(event_data, dict) and isinstance(event_data.get("rag_metrics"), dict):
+                        rag_metrics = event_data["rag_metrics"]
                 
                 elif event_type == "error":
                     error_msg = event_data if isinstance(event_data, str) else str(event_data)
@@ -1360,7 +1363,10 @@ async def notebook_agent_chat(
             save_agent_message(notebook_id, current_user.id, assistant_message)
             
             # 发送完成事件
-            yield f"data: {json.dumps({'type': 'done', 'code_blocks': code_blocks})}\n\n"
+            done_payload = {"type": "done", "code_blocks": code_blocks}
+            if isinstance(rag_metrics, dict):
+                done_payload["rag_metrics"] = rag_metrics
+            yield f"data: {json.dumps(done_payload)}\n\n"
             
         except Exception as e:
             logger.error(f"Agent 对话错误: {e}")

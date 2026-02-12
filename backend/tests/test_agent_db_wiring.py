@@ -38,3 +38,18 @@ def test_chat_stream_uses_db_session_factory_for_tool_registry():
     source = inspect.getsource(chat.send_message)
     assert "db_session_factory=async_session_factory" in source
     assert "db=None" in source
+
+
+def test_chat_stream_done_payload_includes_rag_metrics():
+    source = inspect.getsource(chat.send_message)
+    assert 'done_payload["rag_metrics"] = rag_metrics' in source
+
+
+def test_codelab_done_payload_includes_rag_metrics():
+    source = inspect.getsource(codelab.notebook_agent_chat)
+    assert 'done_payload["rag_metrics"] = rag_metrics' in source
+
+
+def test_notebook_agent_done_payload_includes_rag_metrics():
+    source = inspect.getsource(notebook_agent.notebook_agent_chat)
+    assert 'done_payload["rag_metrics"] = rag_metrics' in source
