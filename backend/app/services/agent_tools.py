@@ -16,7 +16,8 @@ from sqlalchemy import select, text, or_, and_
 from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.services.embedding_service import get_embedding_service
-from app.services.hybrid_retrieval_service import fuse_rrf
+from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
+from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
 
 # 尝试导入共享模块（可选）
@@ -345,20 +346,16 @@ class KnowledgeSearchTool(Tool):
         self.db = db
         self.user_id = user_id
         self.embedding_service = get_embedding_service()
+        self.query_rewrite_service = get_query_rewrite_service()
     
     async def execute(self, query: str, top_k: int = 5) -> ToolResult:
         """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
             start_time = time.time()
-            
-            # 生成查询向量
-            query_embedding = await self.embedding_service.embed_text(query)
-            if not query_embedding:
-                return ToolResult(
-                    success=False,
-                    output="无法生成查询向量",
-                    error="embedding_failed"
-                )
+            rewrite_result = await self.query_rewrite_service.rewrite_query(
+                query,
+                use_query_rewrite=True,
+            )
             
             # 获取用户的知识库ID列表
             kb_query = select(KnowledgeBase.id).where(KnowledgeBase.user_id == self.user_id)
@@ -398,8 +395,6 @@ class KnowledgeSearchTool(Tool):
             fusion_limit = reranker_candidate_k
             
             # 使用 pgvector 进行向量相似度搜索
-            vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-            
             vector_sql = text("""
                 SELECT 
                     dc.id,
@@ -420,16 +415,72 @@ class KnowledgeSearchTool(Tool):
                 ORDER BY dc.embedding <=> :query_vector
                 LIMIT :vector_top_k
             """)
-            
-            result = await self.db.execute(vector_sql, {
-                "query_vector": vector_str,
-                "kb_ids": kb_ids,
-                "vector_top_k": vector_top_k,
-            })
-            vector_rows = result.fetchall()
+
+            vector_rows = []
+            vector_group_rows = []
+            vector_variants = rewrite_result.vector_variants or [
+                QueryVariant(text=query, strategy="original")
+            ]
+
+            vector_embeddings = []
+            vector_texts = [variant.text for variant in vector_variants]
+            try:
+                vector_embeddings = await self.embedding_service.embed_texts(
+                    vector_texts,
+                    is_query=True,
+                )
+                if len(vector_embeddings) != len(vector_texts):
+                    raise ValueError(
+                        f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
+                    )
+            except Exception as e:
+                logger.warning(f"[KnowledgeSearch] Batch embedding failed, fallback to single: {e}")
+                vector_embeddings = []
+                for variant in vector_variants:
+                    try:
+                        emb = await self.embedding_service.embed_text(
+                            variant.text,
+                            is_query=True,
+                        )
+                    except Exception as single_exc:
+                        logger.warning(
+                            f"[KnowledgeSearch] Single embedding failed for "
+                            f"strategy={variant.strategy}: {single_exc}"
+                        )
+                        emb = []
+                    vector_embeddings.append(emb)
+
+            for idx, variant in enumerate(vector_variants):
+                query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
+                if not query_embedding:
+                    continue
+
+                vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
+                result = await self.db.execute(
+                    vector_sql,
+                    {
+                        "query_vector": vector_str,
+                        "kb_ids": kb_ids,
+                        "vector_top_k": vector_top_k,
+                    },
+                )
+                rows = result.fetchall()
+                if rows:
+                    vector_group_rows.append((variant.strategy, variant.text, rows))
+
+            vector_rows = merge_rows_by_score(
+                vector_group_rows,
+                score_attr="similarity",
+                query_attr="matched_vector_query",
+                strategy_attr="matched_vector_strategy",
+                limit=vector_top_k,
+            )
 
             text_rows = []
-            if use_hybrid and query.strip():
+            if use_hybrid:
+                text_variants = rewrite_result.text_variants or [
+                    QueryVariant(text=query, strategy="original")
+                ]
                 text_sql = text("""
                     SELECT 
                         dc.id,
@@ -454,16 +505,35 @@ class KnowledgeSearchTool(Tool):
                     ORDER BY text_score DESC
                     LIMIT :text_top_k
                 """)
-                try:
-                    text_result = await self.db.execute(text_sql, {
-                        "fts_query": query,
-                        "kb_ids": kb_ids,
-                        "text_top_k": text_top_k,
-                    })
-                    text_rows = text_result.fetchall()
-                except Exception as e:
-                    logger.warning(f"[KnowledgeSearch] Full-text search failed, fallback to vector ranking: {e}")
-                    text_rows = []
+                text_group_rows = []
+                for variant in text_variants:
+                    if not variant.text.strip():
+                        continue
+                    try:
+                        text_result = await self.db.execute(
+                            text_sql,
+                            {
+                                "fts_query": variant.text,
+                                "kb_ids": kb_ids,
+                                "text_top_k": text_top_k,
+                            },
+                        )
+                        rows = text_result.fetchall()
+                        if rows:
+                            text_group_rows.append((variant.strategy, variant.text, rows))
+                    except Exception as e:
+                        logger.warning(
+                            f"[KnowledgeSearch] Full-text query failed for "
+                            f"strategy={variant.strategy}: {e}"
+                        )
+
+                text_rows = merge_rows_by_score(
+                    text_group_rows,
+                    score_attr="text_score",
+                    query_attr="matched_text_query",
+                    strategy_attr="matched_text_strategy",
+                    limit=text_top_k,
+                )
 
             fused_candidates = fuse_rrf(
                 vector_rows=vector_rows,
@@ -534,6 +604,13 @@ class KnowledgeSearchTool(Tool):
                     "knowledge_base": row.knowledge_base_name or "未知",
                     "chunk_index": row.chunk_index,
                     "retrieval_mode": "hybrid" if use_hybrid else "vector",
+                    "query_rewrite_enabled": rewrite_result.enabled,
+                    "query_rewrite_strategies": rewrite_result.strategies,
+                    "query_rewrite_fallback": rewrite_result.fallback_reason,
+                    "matched_vector_query": getattr(row, "matched_vector_query", None),
+                    "matched_vector_strategy": getattr(row, "matched_vector_strategy", None),
+                    "matched_text_query": getattr(row, "matched_text_query", None),
+                    "matched_text_strategy": getattr(row, "matched_text_strategy", None),
                     "vector_rank": candidate.vector_rank,
                     "text_rank": candidate.text_rank,
                     "rrf_score": round(float(candidate.rrf_score), 6),
@@ -552,6 +629,14 @@ class KnowledgeSearchTool(Tool):
                 )
             
             search_time = (time.time() - start_time) * 1000
+            logger.info(
+                f"[KnowledgeSearch] query='{query[:50]}...', results={len(results)}, "
+                f"hybrid={use_hybrid}, reranker={use_reranker}, "
+                f"query_rewrite={rewrite_result.enabled}, "
+                f"rewrite_variants={len(rewrite_result.vector_variants)}, "
+                f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
+                f"time={search_time:.2f}ms"
+            )
             output_parts.append(f"\n\n(搜索耗时: {search_time:.2f}ms)")
             
             return ToolResult(

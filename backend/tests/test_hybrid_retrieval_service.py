@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.services.hybrid_retrieval_service import fuse_rrf
+from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 
 
 def _row(row_id: int, similarity: float | None = None, text_score: float | None = None):
@@ -61,3 +61,30 @@ def test_fuse_rrf_limit():
 
     fused = fuse_rrf(vector_rows=vector_rows, text_rows=text_rows, rrf_k=60, limit=2)
     assert len(fused) == 2
+
+
+def test_merge_rows_by_score_keeps_best_hit_with_query_trace():
+    group_1 = [
+        _row(1, similarity=0.70),
+        _row(2, similarity=0.80),
+    ]
+    group_2 = [
+        _row(1, similarity=0.92),
+        _row(3, similarity=0.75),
+    ]
+
+    merged = merge_rows_by_score(
+        [
+            ("original", "attention mechanism", group_1),
+            ("synonym", "self-attention mechanism", group_2),
+        ],
+        score_attr="similarity",
+        query_attr="matched_vector_query",
+        strategy_attr="matched_vector_strategy",
+        limit=3,
+    )
+
+    merged_ids = [row.id for row in merged]
+    assert merged_ids == [1, 2, 3]
+    assert merged[0].matched_vector_query == "self-attention mechanism"
+    assert merged[0].matched_vector_strategy == "synonym"

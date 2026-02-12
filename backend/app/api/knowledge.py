@@ -36,7 +36,8 @@ from app.schemas.knowledge import (
 )
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
-from app.services.hybrid_retrieval_service import fuse_rrf
+from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
+from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.smart_chunking_service import (
     SmartChunkingService,
@@ -1040,15 +1041,6 @@ async def search_knowledge(
     # [Revert] 统一使用默认嵌入模型，忽略知识库配置
     embedding_svc = get_embedding_service()
     
-    # 生成查询向量
-    try:
-        query_embedding = await embedding_svc.embed_text(request.query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成查询向量失败: {str(e)}")
-    
-    if not query_embedding:
-        raise HTTPException(status_code=400, detail="无法生成查询向量")
-    
     # 获取用户可访问的知识库ID
     own_kb_result = await db.execute(
         select(KnowledgeBase.id).where(KnowledgeBase.user_id == current_user.id)
@@ -1084,6 +1076,13 @@ async def search_knowledge(
                 total=0,
                 search_time_ms=(time.time() - start_time) * 1000
             )
+
+    rewrite_service = get_query_rewrite_service()
+    rewrite_result = await rewrite_service.rewrite_query(
+        request.query,
+        use_query_rewrite=request.use_query_rewrite,
+        requested_strategies=request.query_rewrite_strategies,
+    )
     
     # 使用 pgvector 进行向量相似度搜索
     # <=> 是余弦距离运算符 (cosine distance = 1 - cosine similarity)
@@ -1113,8 +1112,6 @@ async def search_knowledge(
     # 构建 pgvector 原生查询
     from sqlalchemy import text
     
-    vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-
     base_where_clauses = ["dc.knowledge_base_id = ANY(:kb_ids)"]
     base_params = {"kb_ids": kb_ids}
 
@@ -1158,16 +1155,66 @@ async def search_knowledge(
         LIMIT :vector_top_k
     """)
 
-    vector_params = {
-        **base_params,
-        "query_vector": vector_str,
-        "distance_threshold": distance_threshold,
-        "vector_top_k": vector_top_k,
-    }
-    vector_rows = (await db.execute(vector_sql, vector_params)).fetchall()
+    vector_rows = []
+    vector_group_rows = []
+    vector_variants = rewrite_result.vector_variants
+    if not vector_variants:
+        vector_variants = rewrite_result.vector_variants = [
+            QueryVariant(text=request.query, strategy="original")
+        ]
+
+    vector_embeddings = []
+    vector_texts = [variant.text for variant in vector_variants]
+    try:
+        vector_embeddings = await embedding_svc.embed_texts(vector_texts, is_query=True)
+        if len(vector_embeddings) != len(vector_texts):
+            raise ValueError(
+                f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
+            )
+    except Exception as e:
+        logger.warning(f"Batch query embedding failed, fallback to single embedding: {e}")
+        vector_embeddings = []
+        for variant in vector_variants:
+            try:
+                emb = await embedding_svc.embed_text(variant.text, is_query=True)
+            except Exception as single_exc:
+                logger.warning(
+                    f"Single query embedding failed for strategy={variant.strategy}: {single_exc}"
+                )
+                emb = []
+            vector_embeddings.append(emb)
+
+    for idx, variant in enumerate(vector_variants):
+        query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
+        if not query_embedding:
+            continue
+
+        vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
+        vector_params = {
+            **base_params,
+            "query_vector": vector_str,
+            "distance_threshold": distance_threshold,
+            "vector_top_k": vector_top_k,
+        }
+        rows = (await db.execute(vector_sql, vector_params)).fetchall()
+        if rows:
+            vector_group_rows.append((variant.strategy, variant.text, rows))
+
+    vector_rows = merge_rows_by_score(
+        vector_group_rows,
+        score_attr="similarity",
+        query_attr="matched_vector_query",
+        strategy_attr="matched_vector_strategy",
+        limit=vector_top_k,
+    )
+    if not vector_rows and not use_hybrid:
+        raise HTTPException(status_code=400, detail="无法生成有效查询向量")
 
     text_rows = []
-    if use_hybrid and request.query.strip():
+    if use_hybrid:
+        text_variants = rewrite_result.text_variants or [
+            QueryVariant(text=request.query, strategy="original")
+        ]
         text_where_sql = " AND ".join(
             base_where_clauses
             + [
@@ -1202,16 +1249,33 @@ async def search_knowledge(
             ORDER BY text_score DESC
             LIMIT :text_top_k
         """)
-        text_params = {
-            **base_params,
-            "fts_query": request.query,
-            "text_top_k": text_top_k,
-        }
-        try:
-            text_rows = (await db.execute(text_sql, text_params)).fetchall()
-        except Exception as e:
-            logger.warning(f"Full-text search failed, fallback to vector ranking: {e}")
-            text_rows = []
+        text_group_rows = []
+        for variant in text_variants:
+            if not variant.text.strip():
+                continue
+            text_params = {
+                **base_params,
+                "fts_query": variant.text,
+                "text_top_k": text_top_k,
+            }
+            try:
+                rows = (await db.execute(text_sql, text_params)).fetchall()
+                if rows:
+                    text_group_rows.append((variant.strategy, variant.text, rows))
+            except Exception as e:
+                logger.warning(
+                    f"Full-text query failed for strategy={variant.strategy}, "
+                    f"fallback to other candidates: {e}"
+                )
+                continue
+
+        text_rows = merge_rows_by_score(
+            text_group_rows,
+            score_attr="text_score",
+            query_attr="matched_text_query",
+            strategy_attr="matched_text_strategy",
+            limit=text_top_k,
+        )
 
     fused_candidates = fuse_rrf(
         vector_rows=vector_rows,
@@ -1264,6 +1328,22 @@ async def search_knowledge(
         metadata = dict(row.metadata or {})
         metadata["retrieval_mode"] = "hybrid" if use_hybrid else "vector"
         metadata["rrf_score"] = round(float(candidate.rrf_score), 6)
+        metadata["query_rewrite_enabled"] = rewrite_result.enabled
+        metadata["query_rewrite_strategies"] = rewrite_result.strategies
+        if rewrite_result.fallback_reason:
+            metadata["query_rewrite_fallback"] = rewrite_result.fallback_reason
+        matched_vector_query = getattr(row, "matched_vector_query", None)
+        matched_vector_strategy = getattr(row, "matched_vector_strategy", None)
+        matched_text_query = getattr(row, "matched_text_query", None)
+        matched_text_strategy = getattr(row, "matched_text_strategy", None)
+        if matched_vector_query:
+            metadata["matched_vector_query"] = matched_vector_query
+        if matched_vector_strategy:
+            metadata["matched_vector_strategy"] = matched_vector_strategy
+        if matched_text_query:
+            metadata["matched_text_query"] = matched_text_query
+        if matched_text_strategy:
+            metadata["matched_text_strategy"] = matched_text_strategy
         if candidate.vector_rank is not None:
             metadata["vector_rank"] = candidate.vector_rank
         if candidate.text_rank is not None:
@@ -1346,6 +1426,8 @@ async def search_knowledge(
     logger.info(
         f"向量搜索完成: query='{request.query[:50]}...', results={len(results)}, "
         f"hybrid={use_hybrid}, reranker={use_reranker}, "
+        f"query_rewrite={rewrite_result.enabled}, "
+        f"rewrite_variants={len(rewrite_result.vector_variants)}, "
         f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, time={search_time:.2f}ms"
     )
     

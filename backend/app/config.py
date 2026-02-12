@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     hybrid_vector_top_k: int = 20
     hybrid_text_top_k: int = 20
     hybrid_rrf_k: int = 60
+
+    # ========== Query Rewrite 配置 ==========
+    enable_query_rewrite: bool = True
+    query_rewrite_strategies: str = "synonym,hyde,decompose"
+    query_rewrite_max_synonyms: int = 3
+    query_rewrite_max_subqueries: int = 3
+    query_rewrite_max_variants: int = 8
+    query_rewrite_hyde_max_chars: int = 240
+    query_rewrite_timeout_seconds: int = 12
+    query_rewrite_temperature: float = 0.2
     
     # ========== LLM 推理参数 ==========
     llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)
