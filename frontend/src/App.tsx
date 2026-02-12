@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Spin } from 'antd'
 import { useAuthStore } from '@/stores/authStore'
+import ErrorBoundary from '@/components/common/ErrorBoundary'
 import MainLayout from '@/components/layout/MainLayout'
 import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
@@ -26,7 +27,7 @@ import { SharedResourcesPage, SharedResourceViewPage } from '@/pages/shared'
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated, isInitialized } = useAuthStore()
-  
+
   // 等待初始化完成
   if (!isInitialized) {
     return (
@@ -35,18 +36,18 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
       </div>
     )
   }
-  
+
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
   }
-  
+
   return <>{children}</>
 }
 
 // 公共路由组件（已登录用户重定向到首页）
 const PublicRoute = ({ children }: { children: React.ReactNode }) => {
   const { isAuthenticated, isInitialized } = useAuthStore()
-  
+
   // 等待初始化完成
   if (!isInitialized) {
     return (
@@ -55,24 +56,24 @@ const PublicRoute = ({ children }: { children: React.ReactNode }) => {
       </div>
     )
   }
-  
+
   if (isAuthenticated) {
     return <Navigate to="/dashboard" replace />
   }
-  
+
   return <>{children}</>
 }
 
 // 角色守卫组件
-const RoleRoute = ({ 
-  children, 
-  allowedRoles 
-}: { 
+const RoleRoute = ({
+  children,
+  allowedRoles
+}: {
   children: React.ReactNode
   allowedRoles: string[]
 }) => {
   const { user, isAuthenticated, isInitialized } = useAuthStore()
-  
+
   // 等待初始化完成
   if (!isInitialized) {
     return (
@@ -81,16 +82,16 @@ const RoleRoute = ({
       </div>
     )
   }
-  
+
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
   }
-  
+
   // 检查角色权限
   if (user && !allowedRoles.includes(user.role || 'student')) {
     return <Navigate to="/dashboard" replace />
   }
-  
+
   return <>{children}</>
 }
 
@@ -106,41 +107,47 @@ const PlaceholderPage = ({ title }: { title: string }) => (
 
 function App() {
   const { checkAuth, isInitialized } = useAuthStore()
-  
+
   // 应用启动时验证认证状态
   useEffect(() => {
     if (!isInitialized) {
       checkAuth()
     }
   }, [checkAuth, isInitialized])
-  
+
   return (
     <BrowserRouter>
       <Routes>
         {/* 公共路由 */}
-        <Route 
-          path="/login" 
+        <Route
+          path="/login"
           element={
             <PublicRoute>
               <LoginPage />
             </PublicRoute>
-          } 
+          }
         />
-        <Route 
-          path="/register" 
+        <Route
+          path="/register"
           element={
             <PublicRoute>
               <RegisterPage />
             </PublicRoute>
-          } 
+          }
         />
-        
+
+        import ErrorBoundary from '@/components/common/ErrorBoundary'
+
+        // ... (existing imports)
+
         {/* 私有路由 */}
-        <Route 
-          path="/" 
+        <Route
+          path="/"
           element={
             <PrivateRoute>
-              <MainLayout />
+              <ErrorBoundary>
+                <MainLayout />
+              </ErrorBoundary>
             </PrivateRoute>
           }
         >
@@ -155,93 +162,93 @@ function App() {
           <Route path="literature" element={<LiteraturePage />} />
           <Route path="code" element={<CodeLabPage />} />
           <Route path="code/:notebookId" element={<CodeLabPage />} />
-          
+
           {/* ========== 管理员路由 ========== */}
-          <Route 
-            path="admin/users" 
+          <Route
+            path="admin/users"
             element={
               <RoleRoute allowedRoles={['admin']}>
                 <AdminUsersPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="admin/statistics" 
+          <Route
+            path="admin/statistics"
             element={
               <RoleRoute allowedRoles={['admin']}>
                 <PlaceholderPage title="系统统计" />
               </RoleRoute>
-            } 
+            }
           />
-          
+
           {/* ========== 导师路由 ========== */}
-          <Route 
-            path="mentor/students" 
+          <Route
+            path="mentor/students"
             element={
               <RoleRoute allowedRoles={['mentor']}>
                 <MentorStudentsPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="mentor/groups" 
+          <Route
+            path="mentor/groups"
             element={
               <RoleRoute allowedRoles={['mentor']}>
                 <MentorGroupsPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="mentor/announcements" 
+          <Route
+            path="mentor/announcements"
             element={
               <RoleRoute allowedRoles={['mentor']}>
                 <MentorAnnouncementsPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="mentor/shares" 
+          <Route
+            path="mentor/shares"
             element={
               <RoleRoute allowedRoles={['mentor']}>
                 <SharedResourcesPage />
               </RoleRoute>
-            } 
+            }
           />
-          
+
           {/* ========== 学生路由 ========== */}
-          <Route 
-            path="student/mentor" 
+          <Route
+            path="student/mentor"
             element={
               <RoleRoute allowedRoles={['student']}>
                 <StudentMentorPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="student/shared" 
+          <Route
+            path="student/shared"
             element={
               <RoleRoute allowedRoles={['student']}>
                 <SharedResourcesPage />
               </RoleRoute>
-            } 
+            }
           />
-          <Route 
-            path="student/announcements" 
+          <Route
+            path="student/announcements"
             element={
               <RoleRoute allowedRoles={['student']}>
                 <StudentAnnouncementsPage />
               </RoleRoute>
-            } 
+            }
           />
-          
+
           {/* 个人设置页面 */}
           <Route path="profile" element={<ProfilePage />} />
           <Route path="settings" element={<SettingsPage />} />
-          
+
           {/* 共享资源详情页 - 所有已登录用户可访问 */}
           <Route path="shared/view/:shareId" element={<SharedResourceViewPage />} />
         </Route>
-        
+
         {/* 404 */}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

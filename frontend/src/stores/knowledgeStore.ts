@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { knowledgeApi, KnowledgeBase, Document, DocumentChunk, SearchResult, SearchResponse } from '@/services/api'
+import { handleApiError } from '@/utils/apiErrorHandler'
 
 interface KnowledgeState {
   // 知识库列表
@@ -83,7 +84,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       const { items, total } = await knowledgeApi.getKnowledgeBases()
       set({ knowledgeBases: items, totalKnowledgeBases: total, isLoading: false })
     } catch (error) {
-      console.error('获取知识库列表失败:', error)
+      handleApiError(error, '获取知识库列表')
       set({ isLoading: false })
     }
   },
@@ -105,7 +106,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       // 同时获取文档列表
       await get().fetchDocuments(kbId)
     } catch (error) {
-      console.error('获取知识库详情失败:', error)
+      handleApiError(error, '获取知识库详情')
       set({ isLoading: false })
       throw error
     }
@@ -138,7 +139,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       const { items, total } = await knowledgeApi.getDocuments(kbId)
       set({ documents: items, totalDocuments: total, isLoading: false })
     } catch (error) {
-      console.error('获取文档列表失败:', error)
+      handleApiError(error, '获取文档列表')
       set({ isLoading: false })
     }
   },
@@ -165,7 +166,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       const doc = await knowledgeApi.getDocument(kbId, docId)
       set({ currentDocument: doc, isLoading: false })
     } catch (error) {
-      console.error('获取文档详情失败:', error)
+      handleApiError(error, '获取文档详情')
       set({ isLoading: false })
       throw error
     }
@@ -195,7 +196,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       }))
       return status
     } catch (error) {
-      console.error('获取文档状态失败:', error)
+      handleApiError(error, '获取文档状态')
     }
   },
 
@@ -207,7 +208,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       const { items, total } = await knowledgeApi.getChunks(kbId, docId)
       set({ chunks: items, totalChunks: total, isLoading: false })
     } catch (error) {
-      console.error('获取分片列表失败:', error)
+      handleApiError(error, '获取分片列表')
       set({ isLoading: false })
     }
   },
@@ -235,7 +236,7 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       })
       return response
     } catch (error) {
-      console.error('搜索失败:', error)
+      handleApiError(error, '搜索')
       set({ isSearching: false })
       throw error
     }

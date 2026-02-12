@@ -1,17 +1,17 @@
 import { create } from 'zustand'
-import { 
-  literatureApi, 
-  Paper, 
-  PaperSearchResult, 
-  PaperCollection, 
-  SearchHistory 
+import {
+  literatureApi,
+  Paper,
+  PaperSearchResult,
+  PaperCollection,
+  SearchHistory
 } from '@/services/api'
 
 interface LiteratureState {
   // 论文列表
   papers: Paper[]
   papersLoading: boolean
-  
+
   // 搜索结果
   searchResults: PaperSearchResult[]
   searchQuery: string
@@ -21,26 +21,26 @@ interface LiteratureState {
   searchLoading: boolean
   searchLoadingMore: boolean
   searchHasMore: boolean
-  
+
   // 收藏夹
   collections: PaperCollection[]
   selectedCollectionId: number | null
   collectionsLoading: boolean
-  
+
   // 当前选中的论文
   selectedPaper: Paper | null
   selectedPaperLoading: boolean
-  
+
   // 搜索历史
   searchHistory: SearchHistory[]
-  
+
   // 视图状态
   viewMode: 'list' | 'card'
   detailPanelOpen: boolean
-  
+
   // Actions
   init: () => Promise<void>
-  
+
   // 搜索
   searchPapers: (query: string, source?: string, options?: {
     limit?: number
@@ -51,7 +51,7 @@ interface LiteratureState {
   loadMoreSearchResults: () => Promise<void>
   clearSearch: () => void
   loadSearchHistory: () => Promise<void>
-  
+
   // 论文管理
   loadPapers: (options?: {
     collection_id?: number
@@ -63,7 +63,7 @@ interface LiteratureState {
   deletePaper: (paperId: number) => Promise<void>
   selectPaper: (paper: Paper | null) => void
   loadPaperDetail: (paperId: number) => Promise<void>
-  
+
   // 收藏夹
   loadCollections: () => Promise<void>
   createCollection: (data: { name: string; description?: string; color?: string }) => Promise<PaperCollection>
@@ -72,10 +72,10 @@ interface LiteratureState {
   selectCollection: (collectionId: number | null) => void
   addToCollection: (paperId: number, collectionIds: number[]) => Promise<void>
   removeFromCollection: (paperId: number, collectionId: number) => Promise<void>
-  
+
   // PDF
   downloadPdf: (paperId: number, knowledgeBaseId?: number) => Promise<void>
-  
+
   // 视图
   setViewMode: (mode: 'list' | 'card') => void
   toggleDetailPanel: (open?: boolean) => void
@@ -110,7 +110,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       return;
     }
     set({ _initializing: true } as any);
-    
+
     try {
       await literatureApi.init()
       await get().loadCollections()
@@ -156,7 +156,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   loadMoreSearchResults: async () => {
     const { searchQuery, searchSource, searchOffset, searchTotal, searchLoadingMore, searchHasMore } = get()
     if (searchLoadingMore || !searchHasMore) return
-    
+
     const limit = 20
     set({ searchLoadingMore: true })
     try {
@@ -231,7 +231,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         fields_of_study: paper.fields_of_study,
         collection_ids: collectionIds,
       })
-      
+
       // 更新搜索结果中的状态
       set(state => ({
         searchResults: state.searchResults.map(p =>
@@ -241,13 +241,13 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         ),
         papers: [...state.papers, saved],
       }))
-      
+
       // 更新收藏夹计数
       await get().loadCollections()
-      
+
       return saved
     } catch (error) {
-      console.error('Failed to save paper:', error)
+      handleApiError(error, '保存论文')
       throw error
     }
   },
@@ -259,7 +259,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         papers: state.papers.map(p => p.id === paperId ? updated : p),
         selectedPaper: state.selectedPaper?.id === paperId ? updated : state.selectedPaper,
       }))
-      
+
       // 如果更新了阅读状态或评分，刷新收藏夹计数和论文列表
       if ('is_read' in data || 'rating' in data) {
         await get().loadCollections()
@@ -300,7 +300,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       const paper = await literatureApi.getPaper(paperId)
       set({ selectedPaper: paper, selectedPaperLoading: false, detailPanelOpen: true })
     } catch (error) {
-      console.error('Failed to load paper detail:', error)
+      handleApiError(error, '加载论文详情')
       set({ selectedPaperLoading: false })
     }
   },
@@ -323,7 +323,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       set(state => ({ collections: [...state.collections, collection] }))
       return collection
     } catch (error) {
-      console.error('Failed to create collection:', error)
+      handleApiError(error, '创建集合')
       throw error
     }
   },
@@ -335,7 +335,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         collections: state.collections.map(c => c.id === collectionId ? updated : c),
       }))
     } catch (error) {
-      console.error('Failed to update collection:', error)
+      handleApiError(error, '更新集合')
       throw error
     }
   },
@@ -348,7 +348,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         selectedCollectionId: state.selectedCollectionId === collectionId ? null : state.selectedCollectionId,
       }))
     } catch (error) {
-      console.error('Failed to delete collection:', error)
+      handleApiError(error, '删除集合')
       throw error
     }
   },
@@ -366,7 +366,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         await get().loadPaperDetail(paperId)
       }
     } catch (error) {
-      console.error('Failed to add to collection:', error)
+      handleApiError(error, '添加到集合')
       throw error
     }
   },
@@ -383,7 +383,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         await get().loadPaperDetail(paperId)
       }
     } catch (error) {
-      console.error('Failed to remove from collection:', error)
+      handleApiError(error, '从集合移除')
       throw error
     }
   },
@@ -398,7 +398,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       }
       await get().loadPapers()
     } catch (error) {
-      console.error('Failed to download PDF:', error)
+      handleApiError(error, '下载PDF')
       throw error
     }
   },
