@@ -103,6 +103,12 @@ services:
       - MCP_TOOL_PREFIX=${MCP_TOOL_PREFIX:-mcp}
       - MCP_CALL_TIMEOUT_SECONDS=${MCP_CALL_TIMEOUT_SECONDS:-20}
       - MCP_SERVERS=${MCP_SERVERS:-[]}
+      - MCP_TOOL_ROUTES=${MCP_TOOL_ROUTES:-{}}
+      - MCP_ROUTE_TIMEOUT_SECONDS=${MCP_ROUTE_TIMEOUT_SECONDS:-15}
+      - MCP_ROUTE_RETRY_ATTEMPTS=${MCP_ROUTE_RETRY_ATTEMPTS:-2}
+      - MCP_ROUTE_RETRY_BACKOFF_SECONDS=${MCP_ROUTE_RETRY_BACKOFF_SECONDS:-0.5}
+      - MCP_ROUTE_CIRCUIT_BREAKER_FAILURES=${MCP_ROUTE_CIRCUIT_BREAKER_FAILURES:-3}
+      - MCP_ROUTE_CIRCUIT_BREAKER_OPEN_SECONDS=${MCP_ROUTE_CIRCUIT_BREAKER_OPEN_SECONDS:-120}
     ports:
       - "8888:8000"
     volumes:
@@ -120,6 +126,43 @@ services:
       - research_network
 
   # React 前端
+  # MCP web server (Phase 2, profile: mcp)
+  mcp_web:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: research_mcp_web
+    environment:
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - MCP_WEB_HOST=${MCP_WEB_HOST:-0.0.0.0}
+      - MCP_WEB_PORT=${MCP_WEB_PORT:-8091}
+      - MCP_WEB_TRANSPORT=${MCP_WEB_TRANSPORT:-streamable-http}
+    command: python -m app.mcp_servers.web_server
+    ports:
+      - "${MCP_WEB_PORT:-8091}:8091"
+    profiles:
+      - mcp
+    networks:
+      - research_network
+
+  # MCP literature server (Phase 2, profile: mcp)
+  mcp_literature:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: research_mcp_literature
+    environment:
+      - MCP_LITERATURE_HOST=${MCP_LITERATURE_HOST:-0.0.0.0}
+      - MCP_LITERATURE_PORT=${MCP_LITERATURE_PORT:-8092}
+      - MCP_LITERATURE_TRANSPORT=${MCP_LITERATURE_TRANSPORT:-streamable-http}
+    command: python -m app.mcp_servers.literature_server
+    ports:
+      - "${MCP_LITERATURE_PORT:-8092}:8092"
+    profiles:
+      - mcp
+    networks:
+      - research_network
+
   frontend:
     build:
       context: ./frontend

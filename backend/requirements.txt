@@ -3,7 +3,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.9
 pydantic==2.9.0
-pydantic-settings==2.5.0
+pydantic-settings==2.5.2
 email-validator==2.2.0
 
 # 数据库

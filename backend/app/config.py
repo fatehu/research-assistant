@@ -104,6 +104,12 @@ class Settings(BaseSettings):
     mcp_tool_prefix: str = "mcp"
     mcp_call_timeout_seconds: int = 20
     mcp_servers: str = "[]"
+    mcp_tool_routes: str = "{}"
+    mcp_route_timeout_seconds: int = 15
+    mcp_route_retry_attempts: int = 2
+    mcp_route_retry_backoff_seconds: float = 0.5
+    mcp_route_circuit_breaker_failures: int = 3
+    mcp_route_circuit_breaker_open_seconds: int = 120
 
     # Code execution
     code_execution_timeout: int = 30

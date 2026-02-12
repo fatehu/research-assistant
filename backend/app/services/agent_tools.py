@@ -5,6 +5,7 @@ import json
 import time
 import math
 import re
+import asyncio
 import httpx
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set, Callable
@@ -1368,6 +1369,7 @@ class LiteratureSearchTool(Tool):
 
 class ToolRegistry:
     """工具注册表 - 支持 Notebook 工具扩展"""
+    _mcp_route_circuit_state: Dict[str, Dict[str, Any]] = {}
     
     def __init__(
         self, 
@@ -1390,6 +1392,7 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
         self._mcp_tools: Dict[str, MCPRemoteTool] = {}
         self._mcp_client_manager: Any = None
+        self._mcp_tool_routes: Dict[str, List[str]] = self._load_mcp_tool_routes()
         self._register_default_tools()
         
         # 如果提供了 Notebook 上下文，注册 Notebook 工具
@@ -1493,6 +1496,173 @@ class ToolRegistry:
         server_manager = MCPServerManager(configs)
         return MCPClientManager(server_manager, tool_prefix=settings.mcp_tool_prefix)
 
+    def _load_mcp_tool_routes(self) -> Dict[str, List[str]]:
+        """Load local-tool to remote-tool route mappings from MCP_TOOL_ROUTES."""
+        raw = (getattr(settings, "mcp_tool_routes", "") or "").strip()
+        if not raw:
+            return {}
+
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            logger.warning(f"[MCP] invalid MCP_TOOL_ROUTES JSON: {exc}")
+            return {}
+
+        if not isinstance(payload, dict):
+            logger.warning("[MCP] MCP_TOOL_ROUTES must be a JSON object")
+            return {}
+
+        routes: Dict[str, List[str]] = {}
+        for local_tool, remote_tools in payload.items():
+            local_name = str(local_tool or "").strip()
+            if not local_name:
+                continue
+
+            if isinstance(remote_tools, str):
+                candidates = [remote_tools.strip()] if remote_tools.strip() else []
+            elif isinstance(remote_tools, list):
+                candidates = [str(item).strip() for item in remote_tools if str(item).strip()]
+            else:
+                logger.warning(f"[MCP] skip invalid route for tool={local_name}, expected string/list")
+                continue
+
+            if candidates:
+                routes[local_name] = candidates
+        return routes
+
+    @classmethod
+    def _is_circuit_open(cls, route_key: str) -> bool:
+        state = cls._mcp_route_circuit_state.get(route_key)
+        if not state:
+            return False
+
+        opened_until = float(state.get("opened_until", 0.0) or 0.0)
+        if opened_until <= 0:
+            return False
+
+        now = time.time()
+        if now < opened_until:
+            return True
+
+        state["opened_until"] = 0.0
+        state["failures"] = 0
+        return False
+
+    @classmethod
+    def _record_circuit_success(cls, route_key: str) -> None:
+        state = cls._mcp_route_circuit_state.setdefault(
+            route_key,
+            {"failures": 0, "opened_until": 0.0},
+        )
+        state["failures"] = 0
+        state["opened_until"] = 0.0
+
+    @classmethod
+    def _record_circuit_failure(cls, route_key: str, error: str) -> None:
+        state = cls._mcp_route_circuit_state.setdefault(
+            route_key,
+            {"failures": 0, "opened_until": 0.0},
+        )
+        state["failures"] = int(state.get("failures", 0)) + 1
+
+        threshold = max(int(getattr(settings, "mcp_route_circuit_breaker_failures", 3)), 1)
+        if state["failures"] < threshold:
+            return
+
+        open_seconds = max(int(getattr(settings, "mcp_route_circuit_breaker_open_seconds", 120)), 1)
+        state["opened_until"] = time.time() + open_seconds
+        state["failures"] = 0
+        logger.warning(
+            f"[MCP] circuit opened route={route_key}, open_seconds={open_seconds}, last_error={error}"
+        )
+
+    async def _call_mcp_tool_with_retry(self, route_key: str, arguments: Dict[str, Any]):
+        if not self._mcp_client_manager:
+            return None
+
+        if self._is_circuit_open(route_key):
+            logger.warning(f"[MCP] circuit open, skip route={route_key}")
+            return type(
+                "MCPRouteResult",
+                (),
+                {
+                    "success": False,
+                    "output": f"MCP route circuit open: {route_key}",
+                    "data": None,
+                    "error": "circuit_open",
+                },
+            )()
+
+        timeout_seconds = max(int(getattr(settings, "mcp_route_timeout_seconds", 15)), 1)
+        retry_attempts = max(int(getattr(settings, "mcp_route_retry_attempts", 2)), 1)
+        backoff_seconds = float(getattr(settings, "mcp_route_retry_backoff_seconds", 0.5))
+        last_result = None
+
+        for attempt in range(1, retry_attempts + 1):
+            try:
+                maybe_awaitable = self._mcp_client_manager.call_tool(route_key, arguments)
+                result = await asyncio.wait_for(maybe_awaitable, timeout=timeout_seconds)
+                last_result = result
+                if result.success:
+                    self._record_circuit_success(route_key)
+                    return result
+            except asyncio.TimeoutError:
+                last_result = type(
+                    "MCPRouteResult",
+                    (),
+                    {
+                        "success": False,
+                        "output": f"MCP route timeout after {timeout_seconds}s: {route_key}",
+                        "data": None,
+                        "error": "timeout",
+                    },
+                )()
+            except Exception as exc:
+                last_result = type(
+                    "MCPRouteResult",
+                    (),
+                    {
+                        "success": False,
+                        "output": f"MCP route call failed: {exc}",
+                        "data": None,
+                        "error": "mcp_route_exception",
+                    },
+                )()
+
+            if attempt < retry_attempts and backoff_seconds > 0:
+                await asyncio.sleep(backoff_seconds * attempt)
+
+        if last_result and not last_result.success:
+            self._record_circuit_failure(route_key, str(last_result.error or "unknown_error"))
+        return last_result
+
+    async def _execute_routed_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[ToolResult]:
+        """Try remote MCP routes first and fallback to local tool when all fail."""
+        if not self._mcp_client_manager:
+            return None
+
+        candidates = self._mcp_tool_routes.get(tool_name) or []
+        if not candidates:
+            return None
+
+        for route_key in candidates:
+            result = await self._call_mcp_tool_with_retry(route_key, arguments)
+            if not result:
+                continue
+            if result.success:
+                logger.info(f"[MCP] routed success local={tool_name} remote={route_key}")
+                return ToolResult(
+                    success=True,
+                    output=str(result.output),
+                    data=result.data if isinstance(result.data, dict) else {"raw": result.data},
+                    error=result.error,
+                )
+            logger.warning(
+                f"[MCP] routed call failed local={tool_name} remote={route_key} error={result.error}"
+            )
+
+        return None
+
     async def refresh_mcp_tools(self, force_refresh: bool = False) -> None:
         """Refresh remote MCP tool cache."""
         if not self._mcp_client_manager:
@@ -1553,6 +1723,12 @@ class ToolRegistry:
     
     async def execute(self, tool_name: str, **kwargs) -> ToolResult:
         """执行工具"""
+        local_tool = self._tools.get(tool_name)
+        if local_tool:
+            routed_result = await self._execute_routed_mcp_tool(tool_name, kwargs)
+            if routed_result:
+                return routed_result
+
         tool = self.get(tool_name)
         if tool:
             try:
