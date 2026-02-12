@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     query_rewrite_hyde_max_chars: int = 240
     query_rewrite_timeout_seconds: int = 12
     query_rewrite_temperature: float = 0.2
+
+    # ========== Contextual Compression 閰嶇疆 ==========
+    enable_contextual_compression: bool = True
+    contextual_compression_timeout_seconds: int = 12
+    contextual_compression_temperature: float = 0.0
+    contextual_compression_min_relevance: float = 4.0
+    contextual_compression_max_chars_per_chunk: int = 2200
+    contextual_compression_max_output_tokens: int = 400
+    contextual_compression_max_concurrency: int = 3
     
     # ========== LLM 推理参数 ==========
     llm_temperature: float = 0.7           # LLM 默认温度 (0-1, 越高越随机)

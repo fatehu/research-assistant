@@ -37,6 +37,10 @@ from app.schemas.knowledge import (
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
 from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
+from app.services.contextual_compression_service import (
+    CompressionInput,
+    get_contextual_compression_service,
+)
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.smart_chunking_service import (
@@ -1308,11 +1312,32 @@ async def search_knowledge(
         ]
     
     # 构建结果
+    contextual_compression = get_contextual_compression_service()
+    compression_inputs = []
+    for source_id, (candidate, _) in enumerate(selected_candidates, start=1):
+        row = candidate.row
+        compression_inputs.append(
+            CompressionInput(
+                source_id=source_id,
+                doc_name=(row.document_name or "未知文档"),
+                chunk_idx=int(getattr(row, "chunk_index", 0) or 0),
+                chunk_content=row.content or "",
+            )
+        )
+    compression_results = await contextual_compression.compress_chunks(
+        request.query,
+        compression_inputs,
+    )
+    compression_by_source_id = {
+        item.source_id: item
+        for item in compression_results
+    }
+
     results = []
     parent_ids_to_fetch = set()
     
     max_rrf_score = max((c.rrf_score for c in fused_candidates), default=0.0)
-    for candidate, reranker_score in selected_candidates:
+    for source_id, (candidate, reranker_score) in enumerate(selected_candidates, start=1):
         row = candidate.row
         vector_score = (
             round(float(candidate.vector_score), 4)
@@ -1324,10 +1349,35 @@ async def search_knowledge(
             if candidate.text_score is not None
             else None
         )
+        compression_result = compression_by_source_id.get(source_id)
+        compressed_content = (
+            compression_result.relevant_content
+            if compression_result
+            else ""
+        )
+        compression_score = (
+            round(float(compression_result.relevance_score), 2)
+            if compression_result
+            else 0.0
+        )
+        compression_fallback = (
+            compression_result.fallback_reason
+            if compression_result
+            else "not_attempted"
+        )
+        source_label = f"来源{source_id}"
 
         metadata = dict(row.metadata or {})
         metadata["retrieval_mode"] = "hybrid" if use_hybrid else "vector"
         metadata["rrf_score"] = round(float(candidate.rrf_score), 6)
+        metadata["contextual_compression_enabled"] = bool(
+            compression_result and compression_result.used_compression
+        )
+        metadata["contextual_compression_source"] = source_label
+        metadata["contextual_compression_score"] = compression_score
+        metadata["contextual_compression_fallback"] = compression_fallback
+        if compressed_content:
+            metadata["contextual_compression_excerpt"] = compressed_content
         metadata["query_rewrite_enabled"] = rewrite_result.enabled
         metadata["query_rewrite_strategies"] = rewrite_result.strategies
         if rewrite_result.fallback_reason:
@@ -1369,7 +1419,7 @@ async def search_knowledge(
             knowledge_base_id=row.knowledge_base_id,
             document_name=row.document_name or "未知文档",
             knowledge_base_name=row.knowledge_base_name or "未知知识库",
-            content=row.content,
+            content=compressed_content or row.content,
             score=score,
             chunk_index=row.chunk_index,
             metadata=metadata,

@@ -15,6 +15,10 @@ from loguru import logger
 from app.config import settings
 from app.services.llm_service import LLMService
 from app.services.agent_tools import ToolRegistry, ToolResult
+from app.services.contextual_compression_service import (
+    CompressionInput,
+    get_contextual_compression_service,
+)
 
 
 class AgentState(Enum):
@@ -195,6 +199,7 @@ class ReActAgent:
         self.llm = llm_service
         self.tools = tool_registry
         self.max_iterations = max_iterations if max_iterations is not None else settings.react_max_iterations
+        self.contextual_compression_service = get_contextual_compression_service()
     
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
@@ -239,7 +244,65 @@ class ReActAgent:
             result["answer"] = answer_match.group(1).strip()
         
         return result
-    
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _compress_knowledge_observation(
+        self,
+        query: str,
+        result: ToolResult,
+    ) -> str:
+        data = result.data if isinstance(result.data, dict) else {}
+        rows = data.get("results")
+        if not isinstance(rows, list) or not rows:
+            return result.output
+
+        compression_inputs: list[CompressionInput] = []
+        for source_id, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            compression_inputs.append(
+                CompressionInput(
+                    source_id=source_id,
+                    doc_name=str(row.get("document") or row.get("document_name") or "unknown_doc"),
+                    chunk_idx=int(self._safe_float(row.get("chunk_index"), 0)),
+                    chunk_content=str(row.get("content") or ""),
+                )
+            )
+
+        if not compression_inputs:
+            return result.output
+
+        compression_results = await self.contextual_compression_service.compress_chunks(
+            query,
+            compression_inputs,
+        )
+
+        compressed_parts: list[str] = []
+        for compressed in compression_results:
+            if not compressed.relevant_content:
+                continue
+            row_index = compressed.source_id - 1
+            row = rows[row_index] if 0 <= row_index < len(rows) and isinstance(rows[row_index], dict) else {}
+            retrieval_score = self._safe_float(row.get("score"), 0.0) * 100
+            kb_name = row.get("knowledge_base") or row.get("knowledge_base_name") or "unknown_kb"
+            doc_name = row.get("document") or row.get("document_name") or compressed.doc_name
+            compressed_parts.append(
+                f"\n[{compressed.source_label}] (retrieval score {retrieval_score:.1f}%)\n"
+                f"Source: {kb_name} / {doc_name} / chunk {compressed.chunk_idx}\n"
+                f"Compression score: {compressed.relevance_score:.1f}/10\n"
+                f"Content: {compressed.relevant_content}"
+            )
+
+        if not compressed_parts:
+            return result.output
+        return f"Compressed contexts: {len(compressed_parts)}\n" + "".join(compressed_parts)
+
     async def run(
         self,
         messages: List[Dict[str, str]],
@@ -453,8 +516,13 @@ class ReActAgent:
                             # 执行工具
                             logger.info(f"[ReAct] 执行工具: {tool_name}")
                             result = await self.tools.execute(tool_name, **tool_input)
-                            
-                            step.tool_output = result.output
+                            observation_output = result.output
+                            if tool_name == "knowledge_search":
+                                observation_output = await self._compress_knowledge_observation(
+                                    str(tool_input.get("query", "")),
+                                    result,
+                                )
+                            step.tool_output = observation_output
                             step.success = result.success
                             
                             yield {
@@ -462,7 +530,7 @@ class ReActAgent:
                                 "data": {
                                     "tool": tool_name,
                                     "success": result.success,
-                                    "output": result.output[:2000],
+                                    "output": observation_output[:2000],
                                     "data": result.data
                                 }
                             }
@@ -474,7 +542,7 @@ class ReActAgent:
                             })
                             context.messages.append({
                                 "role": "user",
-                                "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
+                                "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
                             })
                             
                         except json.JSONDecodeError as e:
@@ -560,12 +628,24 @@ class ReActAgent:
                     
                     result = await self.tools.execute(tool_name, **tool_input)
                     
+                    observation_output = result.output
+                    
+                    if tool_name == "knowledge_search":
+                    
+                        observation_output = await self._compress_knowledge_observation(
+                    
+                            str(tool_input.get("query", "")),
+                    
+                            result,
+                    
+                        )
+                    
                     yield {
                         "type": "observation",
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": result.output[:2000],
+                            "output": observation_output[:2000],
                             "data": result.data
                         }
                     }
@@ -577,7 +657,7 @@ class ReActAgent:
                     })
                     context.messages.append({
                         "role": "user", 
-                        "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
+                        "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
                     })
                     return
                 except Exception as e:
@@ -603,12 +683,24 @@ class ReActAgent:
                     
                     result = await self.tools.execute(tool_name, **tool_input)
                     
+                    observation_output = result.output
+                    
+                    if tool_name == "knowledge_search":
+                    
+                        observation_output = await self._compress_knowledge_observation(
+                    
+                            str(tool_input.get("query", "")),
+                    
+                            result,
+                    
+                        )
+                    
                     yield {
                         "type": "observation",
                         "data": {
                             "tool": tool_name,
                             "success": result.success,
-                            "output": result.output[:2000],
+                            "output": observation_output[:2000],
                             "data": result.data
                         }
                     }
@@ -620,7 +712,7 @@ class ReActAgent:
                     })
                     context.messages.append({
                         "role": "user",
-                        "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
+                        "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息，使用<answer>标签给出最终回答。"
                     })
                     return
                 except Exception as e:
@@ -671,13 +763,19 @@ class ReActAgent:
             
             # 执行工具
             result = await self.tools.execute(tool_name, **tool_input)
+            observation_output = result.output
+            if tool_name == "knowledge_search":
+                observation_output = await self._compress_knowledge_observation(
+                    str(tool_input.get("query", "")),
+                    result,
+                )
             
             events.append({
                 "type": "observation",
                 "data": {
                     "tool": tool_name,
                     "success": result.success,
-                    "output": result.output[:2000],
+                    "output": observation_output[:2000],
                     "data": result.data
                 }
             })
@@ -687,7 +785,7 @@ class ReActAgent:
                 content=json.dumps(parsed["action"]),
                 tool_name=tool_name,
                 tool_input=tool_input,
-                tool_output=result.output,
+                tool_output=observation_output,
                 success=result.success
             ))
             
@@ -698,7 +796,7 @@ class ReActAgent:
             })
             context.messages.append({
                 "role": "user",
-                "content": f"<observation>\n{result.output}\n</observation>\n\n请根据工具返回的信息继续。"
+                "content": f"<observation>\n{observation_output}\n</observation>\n\n请根据工具返回的信息继续。"
             })
         
         # 处理回答
