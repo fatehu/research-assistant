@@ -52,3 +52,10 @@ __pycache__/
 backend/debug_scripts/
 backend/scripts/
 scripts/
+
+# Build artifacts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+tsc_output.txt
+verify_pages.js
