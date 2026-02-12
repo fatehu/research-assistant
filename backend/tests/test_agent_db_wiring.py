@@ -20,3 +20,7 @@ def test_notebook_agent_routes_have_db_dependency():
     assert "db" in chat_sig.parameters
     assert "db" in tools_sig.parameters
 
+
+def test_notebook_agent_chat_awaits_get_llm_service():
+    source = inspect.getsource(notebook_agent.notebook_agent_chat)
+    assert "await get_llm_service()" in source

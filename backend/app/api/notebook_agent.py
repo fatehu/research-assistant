@@ -159,7 +159,7 @@ async def notebook_agent_chat(
     )
     
     # 获取 LLM 服务
-    llm_service = get_llm_service()
+    llm_service = await get_llm_service()
     
     # 创建 ReAct Agent
     agent = create_react_agent(llm_service, tool_registry)
