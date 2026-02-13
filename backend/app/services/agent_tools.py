@@ -415,6 +415,7 @@ class KnowledgeSearchTool(Tool):
             start_time = time.time()
             rewrite_result = await self.query_rewrite_service.rewrite_query(
                 query,
+                rewrite_mode="auto",
                 use_query_rewrite=True,
             )
             
@@ -683,6 +684,9 @@ class KnowledgeSearchTool(Tool):
                     "query_rewrite_enabled": rewrite_result.enabled,
                     "query_rewrite_strategies": rewrite_result.strategies,
                     "query_rewrite_fallback": rewrite_result.fallback_reason,
+                    "query_rewrite_cache_hit": rewrite_result.cache_hit,
+                    "query_rewrite_skip_reason": rewrite_result.skip_reason,
+                    "query_rewrite_llm_called": rewrite_result.llm_called,
                     "matched_vector_query": getattr(row, "matched_vector_query", None),
                     "matched_vector_strategy": getattr(row, "matched_vector_strategy", None),
                     "matched_text_query": getattr(row, "matched_text_query", None),

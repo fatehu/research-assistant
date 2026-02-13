@@ -2,7 +2,7 @@
 知识库相关的 Pydantic schemas
 """
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -133,6 +133,10 @@ class SearchRequest(BaseModel):
     use_reranker: bool = Field(default=True, description="是否启用Reranker精排")
     use_hybrid: bool = Field(default=True, description="是否启用混合检索（向量+全文）")
     use_query_rewrite: bool = Field(default=True, description="是否启用Query Rewrite改写")
+    rewrite_mode: Literal["auto", "force", "off"] = Field(
+        default="auto",
+        description="改写模式，优先级高于 use_query_rewrite：auto/force/off",
+    )
     query_rewrite_strategies: Optional[List[str]] = Field(
         default=None,
         description="可选改写策略: synonym/hyde/decompose"

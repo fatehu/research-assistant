@@ -1088,6 +1088,7 @@ async def search_knowledge(
     rewrite_service = get_query_rewrite_service()
     rewrite_result = await rewrite_service.rewrite_query(
         request.query,
+        rewrite_mode=request.rewrite_mode,
         use_query_rewrite=request.use_query_rewrite,
         requested_strategies=request.query_rewrite_strategies,
     )
@@ -1395,6 +1396,9 @@ async def search_knowledge(
             metadata["contextual_compression_excerpt"] = compressed_content
         metadata["query_rewrite_enabled"] = rewrite_result.enabled
         metadata["query_rewrite_strategies"] = rewrite_result.strategies
+        metadata["query_rewrite_cache_hit"] = rewrite_result.cache_hit
+        metadata["query_rewrite_skip_reason"] = rewrite_result.skip_reason
+        metadata["query_rewrite_llm_called"] = rewrite_result.llm_called
         if rewrite_result.fallback_reason:
             metadata["query_rewrite_fallback"] = rewrite_result.fallback_reason
         matched_vector_query = getattr(row, "matched_vector_query", None)

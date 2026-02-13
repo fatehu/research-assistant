@@ -6,9 +6,13 @@ Strategies:
 - HyDE hypothetical answer
 - sub-question decomposition
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import re
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -42,6 +46,9 @@ class QueryRewriteResult:
     vector_variants: list[QueryVariant]
     text_variants: list[QueryVariant]
     fallback_reason: Optional[str] = None
+    cache_hit: bool = False
+    skip_reason: Optional[str] = None
+    llm_called: bool = False
 
 
 class QueryRewriteService:
@@ -49,6 +56,7 @@ class QueryRewriteService:
 
     def __init__(self):
         self._llm_service: Optional[LLMService] = None
+        self._cache: OrderedDict[str, tuple[float, QueryRewriteResult]] = OrderedDict()
 
     def _base_result(
         self,
@@ -57,6 +65,9 @@ class QueryRewriteService:
         enabled: bool,
         strategies: Optional[list[str]] = None,
         fallback_reason: Optional[str] = None,
+        cache_hit: bool = False,
+        skip_reason: Optional[str] = None,
+        llm_called: bool = False,
     ) -> QueryRewriteResult:
         clean_query = self._normalize_query(query)
         base_variant = QueryVariant(text=clean_query, strategy="original")
@@ -70,6 +81,9 @@ class QueryRewriteService:
             vector_variants=[base_variant] if clean_query else [],
             text_variants=[base_variant] if clean_query else [],
             fallback_reason=fallback_reason,
+            cache_hit=cache_hit,
+            skip_reason=skip_reason,
+            llm_called=llm_called,
         )
 
     @staticmethod
@@ -212,6 +226,94 @@ class QueryRewriteService:
                 break
         return result
 
+    @staticmethod
+    def should_skip_rewrite(query: str) -> Optional[str]:
+        clean = QueryRewriteService._normalize_query(query)
+        if not clean:
+            return "empty_query"
+
+        if len(clean) <= max(1, settings.query_rewrite_skip_short_chars):
+            return "short_query"
+
+        keyword_like_patterns = [
+            r"[\"“”][^\"“”]+[\"“”]",  # quoted phrase
+            r"\b(?:and|or|not)\b",  # boolean keywords
+            r"(?:\+|-|site:|filetype:|intitle:)",  # search operators
+        ]
+        for pattern in keyword_like_patterns:
+            if re.search(pattern, clean, re.IGNORECASE):
+                return "keyword_query"
+        return None
+
+    @staticmethod
+    def _clone_result(result: QueryRewriteResult) -> QueryRewriteResult:
+        return QueryRewriteResult(
+            original_query=result.original_query,
+            enabled=result.enabled,
+            strategies=list(result.strategies),
+            synonym_queries=list(result.synonym_queries),
+            sub_queries=list(result.sub_queries),
+            hyde_document=result.hyde_document,
+            vector_variants=[QueryVariant(text=item.text, strategy=item.strategy) for item in result.vector_variants],
+            text_variants=[QueryVariant(text=item.text, strategy=item.strategy) for item in result.text_variants],
+            fallback_reason=result.fallback_reason,
+            cache_hit=result.cache_hit,
+            skip_reason=result.skip_reason,
+            llm_called=result.llm_called,
+        )
+
+    def _cache_key(self, query: str, strategies: list[str]) -> str:
+        llm = self._ensure_llm_service()
+        payload = {
+            "query": query,
+            "strategies": strategies,
+            "provider": llm.provider,
+            "model": llm.config.get("model"),
+            "max_synonyms": settings.query_rewrite_max_synonyms,
+            "max_subqueries": settings.query_rewrite_max_subqueries,
+            "max_variants": settings.query_rewrite_max_variants,
+            "hyde_max_chars": settings.query_rewrite_hyde_max_chars,
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _cache_get(self, key: str) -> Optional[QueryRewriteResult]:
+        ttl = max(1, int(settings.query_rewrite_cache_ttl_seconds))
+        item = self._cache.get(key)
+        if item is None:
+            return None
+        ts, value = item
+        if (time.time() - ts) > ttl:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        hit = self._clone_result(value)
+        hit.cache_hit = True
+        return hit
+
+    def _cache_set(self, key: str, value: QueryRewriteResult) -> None:
+        max_size = max(1, int(settings.query_rewrite_cache_size))
+        clone = self._clone_result(value)
+        clone.cache_hit = False
+        self._cache[key] = (time.time(), clone)
+        self._cache.move_to_end(key)
+        while len(self._cache) > max_size:
+            self._cache.popitem(last=False)
+
+    @staticmethod
+    def _resolve_rewrite_mode(
+        rewrite_mode: Optional[str],
+        use_query_rewrite: bool,
+    ) -> tuple[str, bool]:
+        mode = (rewrite_mode or "auto").strip().lower()
+        if mode not in {"auto", "force", "off"}:
+            mode = "auto"
+
+        if mode == "off":
+            return mode, False
+        if mode == "force":
+            return mode, True
+        return mode, bool(use_query_rewrite)
+
     def _build_prompt(self, query: str, strategies: list[str]) -> str:
         synonym_hint = (
             f"- synonym_queries: 生成 2 到 {settings.query_rewrite_max_synonyms} 条语义等价查询。"
@@ -229,10 +331,9 @@ class QueryRewriteService:
             else "- sub_queries: []"
         )
         return f"""
-用户原始 query：
-{query}
+用户原始 query：{query}
 
-请只返回一个 JSON 对象，字段必须完整且可被 json.loads 解析，不要输出解释。
+请只返回一个 JSON 对象（可被 json.loads 解析），不要输出解释。
 {synonym_hint}
 {hyde_hint}
 {sub_hint}
@@ -249,7 +350,7 @@ class QueryRewriteService:
         llm = self._ensure_llm_service()
         system_prompt = (
             "你是检索系统的 Query Rewrite 专家。"
-            "你的目标是提升召回率，同时保持语义准确。"
+            "目标是提升召回率并保持语义准确。"
             "必须只输出 JSON。"
         )
         prompt = self._build_prompt(query, strategies)
@@ -270,12 +371,14 @@ class QueryRewriteService:
         *,
         use_query_rewrite: bool = True,
         requested_strategies: Optional[list[str]] = None,
+        rewrite_mode: Optional[str] = None,
     ) -> QueryRewriteResult:
         clean_query = self._normalize_query(query)
         if not clean_query:
             return self._base_result(clean_query, enabled=False, fallback_reason="empty_query")
 
-        if not settings.enable_query_rewrite or not use_query_rewrite:
+        mode, should_rewrite = self._resolve_rewrite_mode(rewrite_mode, use_query_rewrite)
+        if not settings.enable_query_rewrite or not should_rewrite:
             return self._base_result(clean_query, enabled=False, fallback_reason="disabled")
 
         strategies = self._resolve_strategies(requested_strategies)
@@ -285,6 +388,22 @@ class QueryRewriteService:
                 enabled=False,
                 fallback_reason="no_valid_strategy",
             )
+
+        if mode == "auto":
+            skip_reason = self.should_skip_rewrite(clean_query)
+            if skip_reason:
+                return self._base_result(
+                    clean_query,
+                    enabled=False,
+                    strategies=strategies,
+                    fallback_reason="skip_rewrite",
+                    skip_reason=skip_reason,
+                )
+
+        cache_key = self._cache_key(clean_query, strategies)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         if not self._llm_available():
             return self._base_result(
@@ -303,6 +422,7 @@ class QueryRewriteService:
                 enabled=False,
                 strategies=strategies,
                 fallback_reason="rewrite_error",
+                llm_called=True,
             )
 
         synonym_queries = (
@@ -348,7 +468,7 @@ class QueryRewriteService:
             max_items=max(1, settings.query_rewrite_max_variants),
         )
 
-        return QueryRewriteResult(
+        result = QueryRewriteResult(
             original_query=clean_query,
             enabled=True,
             strategies=strategies,
@@ -358,7 +478,12 @@ class QueryRewriteService:
             vector_variants=vector_variants,
             text_variants=text_variants,
             fallback_reason=None,
+            cache_hit=False,
+            skip_reason=None,
+            llm_called=True,
         )
+        self._cache_set(cache_key, result)
+        return result
 
 
 _query_rewrite_service = QueryRewriteService()
@@ -367,3 +492,4 @@ _query_rewrite_service = QueryRewriteService()
 def get_query_rewrite_service() -> QueryRewriteService:
     """Get global query rewrite service instance."""
     return _query_rewrite_service
+

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import pytest
 
@@ -40,6 +41,7 @@ async def test_rewrite_disabled_returns_original(monkeypatch):
     assert result.fallback_reason == "disabled"
     assert [item.text for item in result.vector_variants] == ["什么是 Attention"]
     assert [item.strategy for item in result.vector_variants] == ["original"]
+    assert result.llm_called is False
 
 
 @pytest.mark.asyncio
@@ -50,13 +52,16 @@ async def test_rewrite_generates_multi_strategy_variants(monkeypatch):
     monkeypatch.setattr(settings, "query_rewrite_max_subqueries", 3)
     monkeypatch.setattr(settings, "query_rewrite_max_variants", 8)
     monkeypatch.setattr(settings, "query_rewrite_hyde_max_chars", 240)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
     monkeypatch.setattr(service, "_llm_available", lambda: True)
 
     async def fake_rewrite_with_llm(query: str, strategies: list[str]):
         return {
             "synonym_queries": ["神经网络 自然语言处理", "DL in NLP"],
-            "hyde_document": "Attention 机制通过 query、key、value 的相关性计算动态权重，"
-            "能够捕捉长距离依赖并提升序列建模能力，在机器翻译和文本理解中表现优秀。",
+            "hyde_document": (
+                "Attention 机制通过 query、key、value 的相关性计算动态权重，"
+                "能够捕获长距离依赖并提升序列建模能力。"
+            ),
             "sub_queries": ["CNN 架构特点", "Transformer 架构特点"],
         }
 
@@ -65,6 +70,7 @@ async def test_rewrite_generates_multi_strategy_variants(monkeypatch):
     result = await service.rewrite_query(
         "对比 CNN 和 Transformer",
         requested_strategies=["synonym", "hyde", "decompose"],
+        rewrite_mode="force",
     )
 
     vector_strategies = [item.strategy for item in result.vector_variants]
@@ -77,12 +83,15 @@ async def test_rewrite_generates_multi_strategy_variants(monkeypatch):
     assert result.hyde_document is not None
     assert "hyde" in vector_strategies
     assert "hyde" not in text_strategies
+    assert result.llm_called is True
+    assert result.cache_hit is False
 
 
 @pytest.mark.asyncio
 async def test_rewrite_llm_error_fallback(monkeypatch):
     service = QueryRewriteService()
     monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
     monkeypatch.setattr(service, "_llm_available", lambda: True)
 
     async def raise_error(query: str, strategies: list[str]):
@@ -90,8 +99,102 @@ async def test_rewrite_llm_error_fallback(monkeypatch):
 
     monkeypatch.setattr(service, "_rewrite_with_llm", raise_error)
 
-    result = await service.rewrite_query("什么是 Attention", requested_strategies=["hyde"])
+    result = await service.rewrite_query("什么是 Attention", requested_strategies=["hyde"], rewrite_mode="force")
 
     assert result.enabled is False
     assert result.fallback_reason == "rewrite_error"
     assert [item.text for item in result.vector_variants] == ["什么是 Attention"]
+    assert result.llm_called is True
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_skips_short_query(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 10)
+
+    result = await service.rewrite_query("RAG", rewrite_mode="auto", use_query_rewrite=True)
+    assert result.enabled is False
+    assert result.fallback_reason == "skip_rewrite"
+    assert result.skip_reason == "short_query"
+    assert result.llm_called is False
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_for_same_query(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
+    monkeypatch.setattr(settings, "query_rewrite_cache_size", 2000)
+    monkeypatch.setattr(settings, "query_rewrite_cache_ttl_seconds", 1800)
+    monkeypatch.setattr(service, "_llm_available", lambda: True)
+
+    calls = {"n": 0}
+
+    async def fake_rewrite_with_llm(query: str, strategies: list[str]):
+        calls["n"] += 1
+        return {
+            "synonym_queries": ["机器学习"],
+            "hyde_document": "这是一段足够长的 HyDE 文档内容，用于缓存测试。",
+            "sub_queries": ["机器学习定义"],
+        }
+
+    monkeypatch.setattr(service, "_rewrite_with_llm", fake_rewrite_with_llm)
+
+    first = await service.rewrite_query("什么是机器学习", rewrite_mode="force")
+    second = await service.rewrite_query("什么是机器学习", rewrite_mode="force")
+
+    assert calls["n"] == 1
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert second.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_cache_ttl_expired_triggers_recompute(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
+    monkeypatch.setattr(settings, "query_rewrite_cache_ttl_seconds", 1)
+    monkeypatch.setattr(service, "_llm_available", lambda: True)
+
+    calls = {"n": 0}
+
+    async def fake_rewrite_with_llm(query: str, strategies: list[str]):
+        calls["n"] += 1
+        return {
+            "synonym_queries": ["深度学习"],
+            "hyde_document": "这是一段用于 TTL 过期测试的 HyDE 文档内容。",
+            "sub_queries": ["深度学习定义"],
+        }
+
+    monkeypatch.setattr(service, "_rewrite_with_llm", fake_rewrite_with_llm)
+
+    _ = await service.rewrite_query("深度学习是什么", rewrite_mode="force")
+    assert calls["n"] == 1
+
+    # Manually expire cache item.
+    for key, (_, result) in list(service._cache.items()):
+        service._cache[key] = (time.time() - 10, result)
+
+    second = await service.rewrite_query("深度学习是什么", rewrite_mode="force")
+    assert calls["n"] == 2
+    assert second.cache_hit is False
+
+
+@pytest.mark.asyncio
+async def test_rewrite_mode_compat_with_legacy_param(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
+
+    # Legacy off should still disable under auto mode.
+    legacy_off = await service.rewrite_query("attention mechanism", use_query_rewrite=False, rewrite_mode="auto")
+    assert legacy_off.fallback_reason == "disabled"
+
+    # Force mode has higher priority than legacy off.
+    monkeypatch.setattr(service, "_llm_available", lambda: False)
+    forced = await service.rewrite_query("attention mechanism", use_query_rewrite=False, rewrite_mode="force")
+    assert forced.fallback_reason == "llm_unavailable"
+    assert forced.fallback_reason != "disabled"
+
