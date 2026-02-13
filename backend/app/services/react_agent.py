@@ -401,6 +401,11 @@ class ReActAgent:
                     doc_name=str(row.get("document") or row.get("document_name") or "unknown_doc"),
                     chunk_idx=int(self._safe_float(row.get("chunk_index"), 0)),
                     chunk_content=str(row.get("content") or ""),
+                    reranker_score=(
+                        float(row.get("reranker_score"))
+                        if row.get("reranker_score") is not None
+                        else None
+                    ),
                 )
             )
 

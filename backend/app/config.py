@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     hybrid_text_top_k: int = 20
     hybrid_rrf_k: int = 60
     pgvector_hnsw_ef_search: int = 40
+    pgvector_hnsw_ef_search_mode: Literal["fixed", "adaptive"] = "adaptive"
+    pgvector_hnsw_ef_search_min: int = 32
+    pgvector_hnsw_ef_search_max: int = 96
     agent_knowledge_score_threshold: float = 0.5
 
     # Query rewrite
@@ -80,15 +83,22 @@ class Settings(BaseSettings):
     query_rewrite_hyde_max_chars: int = 240
     query_rewrite_timeout_seconds: int = 12
     query_rewrite_temperature: float = 0.2
+    query_rewrite_cache_size: int = 2000
+    query_rewrite_cache_ttl_seconds: int = 1800
+    query_rewrite_skip_short_chars: int = 10
 
     # Contextual compression
     enable_contextual_compression: bool = True
+    contextual_compression_mode: Literal["batch", "single"] = "batch"
     contextual_compression_timeout_seconds: int = 12
     contextual_compression_temperature: float = 0.0
     contextual_compression_min_relevance: float = 4.0
     contextual_compression_max_chars_per_chunk: int = 2200
     contextual_compression_max_output_tokens: int = 400
     contextual_compression_max_concurrency: int = 3
+    contextual_compression_batch_max_chunks: int = 8
+    contextual_compression_skip_rerank_threshold: float = 0.82
+    contextual_compression_batch_retry_attempts: int = 2
 
     # LLM runtime
     llm_temperature: float = 0.7

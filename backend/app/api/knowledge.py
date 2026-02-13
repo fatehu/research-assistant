@@ -1321,7 +1321,7 @@ async def search_knowledge(
     # 构建结果
     contextual_compression = get_contextual_compression_service()
     compression_inputs = []
-    for source_id, (candidate, _) in enumerate(selected_candidates, start=1):
+    for source_id, (candidate, reranker_score) in enumerate(selected_candidates, start=1):
         row = candidate.row
         compression_inputs.append(
             CompressionInput(
@@ -1329,6 +1329,7 @@ async def search_knowledge(
                 doc_name=(row.document_name or "未知文档"),
                 chunk_idx=int(getattr(row, "chunk_index", 0) or 0),
                 chunk_content=row.content or "",
+                reranker_score=float(reranker_score) if reranker_score is not None else None,
             )
         )
     compression_results = await contextual_compression.compress_chunks(
