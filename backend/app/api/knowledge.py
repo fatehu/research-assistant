@@ -772,6 +772,10 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             for i, chunk_data in enumerate(chunks_to_save):
                 meta = chunk_data["metadata"]
+                chunk_embedding = embeddings[i] if i < len(embeddings) else None
+                chunk_embedding_dimension = (
+                    len(chunk_embedding) if chunk_embedding is not None else embedding_svc.get_dimension()
+                )
                 
                 chunk = DocumentChunk(
                     document_id=doc.id,
@@ -782,8 +786,9 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     chunk_index=i,
                     start_char=chunk_data["start_char"],
                     end_char=chunk_data["end_char"],
-                    embedding=embeddings[i] if i < len(embeddings) else None,
+                    embedding=chunk_embedding,
                     embedding_model=embedding_svc._get_model(),
+                    embedding_dimension=chunk_embedding_dimension,
                     char_count=len(chunk_data["content"]),
                     token_count=processor.estimate_tokens(chunk_data["content"]),
                     
@@ -825,6 +830,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     end_char=chunk_data["end_char"],
                     embedding=None, # 不生成 embedding
                     embedding_model=embedding_svc._get_model(),
+                    embedding_dimension=embedding_svc.get_dimension(),
                     char_count=len(chunk_data["content"]),
                     token_count=processor.estimate_tokens(chunk_data["content"]),
                     
@@ -1170,6 +1176,7 @@ async def search_knowledge(
         base_where_clauses
         + [
             "dc.embedding IS NOT NULL",
+            "dc.embedding_dimension = :vector_dimension",
             "(dc.embedding <=> :query_vector) <= :distance_threshold",
         ]
     )
@@ -1227,21 +1234,25 @@ async def search_knowledge(
                 emb = []
             vector_embeddings.append(emb)
 
+    vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
+    if vector_dimension <= 0:
+        vector_dimension = settings.local_embedding_dimension or 1024
+
+    vector_base_params = {**base_params, "vector_dimension": vector_dimension}
+
     total_chunks = 0
     try:
-        vector_count_where_sql = " AND ".join(base_where_clauses + ["dc.embedding IS NOT NULL"])
+        vector_count_where_sql = " AND ".join(
+            base_where_clauses + ["dc.embedding IS NOT NULL", "dc.embedding_dimension = :vector_dimension"]
+        )
         vector_count_sql = text(f"""
             SELECT COUNT(*)
             FROM document_chunks dc
             WHERE {vector_count_where_sql}
         """)
-        total_chunks = int((await db.execute(vector_count_sql, base_params)).scalar() or 0)
+        total_chunks = int((await db.execute(vector_count_sql, vector_base_params)).scalar() or 0)
     except Exception as e:
         logger.warning(f"Failed to resolve retrieval corpus size, fallback ef_search config: {e}")
-
-    vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
-    if vector_dimension <= 0:
-        vector_dimension = settings.local_embedding_dimension or 1024
 
     resolved_ef_search = resolve_ef_search(total_chunks=total_chunks, dimension=vector_dimension)
     await apply_hnsw_ef_search(
@@ -1257,7 +1268,7 @@ async def search_knowledge(
 
         vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
         vector_params = {
-            **base_params,
+            **vector_base_params,
             "query_vector": vector_str,
             "distance_threshold": distance_threshold,
             "vector_top_k": vector_top_k,
@@ -1437,6 +1448,7 @@ async def search_knowledge(
 
         metadata = dict(row.metadata or {})
         metadata["retrieval_mode"] = "hybrid" if use_hybrid else "vector"
+        metadata["retrieval_dimension"] = vector_dimension
         metadata["rrf_score"] = round(float(candidate.rrf_score), 6)
         metadata["contextual_compression_enabled"] = bool(
             compression_result and compression_result.used_compression
@@ -1590,7 +1602,7 @@ async def search_knowledge(
         f"query_rewrite={rewrite_result.enabled}, "
         f"rewrite_variants={len(rewrite_result.vector_variants)}, "
         f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
-        f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, "
+        f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dim={vector_dimension}, "
         f"time={search_time:.2f}ms"
     )
     

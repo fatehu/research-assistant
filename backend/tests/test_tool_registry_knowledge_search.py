@@ -1,6 +1,7 @@
 import os
 import sys
 import inspect
+from pathlib import Path
 
 from types import SimpleNamespace
 
@@ -44,3 +45,17 @@ def test_knowledge_search_uses_configurable_distance_threshold():
     assert "settings.agent_knowledge_score_threshold" in source
     assert "<= :distance_threshold" in source
     assert "\"distance_threshold\": distance_threshold" in source
+
+
+def test_knowledge_search_filters_embedding_dimension():
+    source = inspect.getsource(agent_tools.KnowledgeSearchTool._execute_with_db)
+    assert "embedding_dimension = :vector_dimension" in source
+    assert "\"vector_dimension\": vector_dimension" in source
+
+
+def test_api_search_filters_embedding_dimension():
+    knowledge_api = (
+        Path(__file__).resolve().parents[1] / "app" / "api" / "knowledge.py"
+    ).read_text(encoding="utf-8")
+    assert "dc.embedding_dimension = :vector_dimension" in knowledge_api
+    assert "\"vector_dimension\": vector_dimension" in knowledge_api

@@ -66,3 +66,8 @@ output/
 
 # Runtime-generated MCP config
 backend/mcp_servers.json
+
+# Retrieval eval temporary artifacts
+backend/phase4_eval_report.md
+backend/tests/data/_phase4_*.tsv
+backend/docs/

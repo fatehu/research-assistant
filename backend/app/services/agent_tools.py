@@ -513,6 +513,7 @@ class KnowledgeSearchTool(Tool):
                 JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
                 WHERE dc.knowledge_base_id = ANY(:kb_ids)
                     AND dc.embedding IS NOT NULL
+                    AND dc.embedding_dimension = :vector_dimension
                     AND (dc.embedding <=> :query_vector) <= :distance_threshold
                 ORDER BY dc.embedding <=> :query_vector
                 LIMIT :vector_top_k
@@ -552,6 +553,10 @@ class KnowledgeSearchTool(Tool):
                         emb = []
                     vector_embeddings.append(emb)
 
+            vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
+            if vector_dimension <= 0:
+                vector_dimension = settings.local_embedding_dimension or 1024
+
             total_chunks = 0
             try:
                 count_sql = text("""
@@ -559,16 +564,24 @@ class KnowledgeSearchTool(Tool):
                     FROM document_chunks
                     WHERE knowledge_base_id = ANY(:kb_ids)
                         AND embedding IS NOT NULL
+                        AND embedding_dimension = :vector_dimension
                 """)
-                total_chunks = int((await db.execute(count_sql, {"kb_ids": kb_ids})).scalar() or 0)
+                total_chunks = int(
+                    (
+                        await db.execute(
+                            count_sql,
+                            {
+                                "kb_ids": kb_ids,
+                                "vector_dimension": vector_dimension,
+                            },
+                        )
+                    ).scalar()
+                    or 0
+                )
             except Exception as e:
                 logger.warning(
                     f"[KnowledgeSearch] Failed to resolve corpus size, fallback ef_search config: {e}"
                 )
-
-            vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
-            if vector_dimension <= 0:
-                vector_dimension = settings.local_embedding_dimension or 1024
 
             resolved_ef_search = resolve_ef_search(
                 total_chunks=total_chunks,
@@ -592,6 +605,7 @@ class KnowledgeSearchTool(Tool):
                         "query_vector": vector_str,
                         "distance_threshold": distance_threshold,
                         "kb_ids": kb_ids,
+                        "vector_dimension": vector_dimension,
                         "vector_top_k": vector_top_k,
                     },
                 )
@@ -757,6 +771,7 @@ class KnowledgeSearchTool(Tool):
                     "vector_score": vector_score,
                     "text_score": text_score,
                     "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
+                    "retrieval_dimension": vector_dimension,
                 }
                 results.append(result_item)
 
@@ -811,7 +826,7 @@ class KnowledgeSearchTool(Tool):
                 f"query_rewrite={rewrite_result.enabled}, "
                 f"rewrite_variants={len(rewrite_result.vector_variants)}, "
                 f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
-                f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, "
+                f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dim={vector_dimension}, "
                 f"time={search_time:.2f}ms"
             )
             output_parts.append(f"\n\n(搜索耗时: {search_time:.2f}ms)")
