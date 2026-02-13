@@ -1,0 +1,46 @@
+﻿{
+  "mcpServers": {
+    "exa": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "https://mcp.exa.ai/mcp?exaApiKey=YOUR_EXA_API_KEY"
+    },
+    "firecrawl": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "https://mcp.firecrawl.dev/v2/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_FIRECRAWL_API_KEY"
+      }
+    },
+    "github": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer YOUR_GITHUB_TOKEN"
+      }
+    },
+    "web_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_web:8091/mcp"
+    },
+    "literature_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_literature:8092/mcp"
+    },
+    "brave_http": {
+      "enabled": false,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_brave:8080/mcp"
+    }
+  }
+}

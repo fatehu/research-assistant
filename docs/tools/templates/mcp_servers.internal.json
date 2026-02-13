@@ -1,0 +1,16 @@
+﻿{
+  "mcpServers": {
+    "web_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_web:8091/mcp"
+    },
+    "literature_internal": {
+      "enabled": true,
+      "type": "http",
+      "transport": "streamable_http",
+      "url": "http://mcp_literature:8092/mcp"
+    }
+  }
+}
