@@ -20,7 +20,7 @@ from app.services.embedding_service import get_embedding_service
 from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
-from app.services.vector_search_tuning import apply_hnsw_ef_search
+from app.services.vector_search_tuning import apply_hnsw_ef_search, resolve_ef_search
 from app.services.chinese_segmentation_service import segment_text_for_fts
 
 # 尝试导入共享模块（可选）
@@ -517,9 +517,31 @@ class KnowledgeSearchTool(Tool):
                         emb = []
                     vector_embeddings.append(emb)
 
+            total_chunks = 0
+            try:
+                count_sql = text("""
+                    SELECT COUNT(*)
+                    FROM document_chunks
+                    WHERE knowledge_base_id = ANY(:kb_ids)
+                        AND embedding IS NOT NULL
+                """)
+                total_chunks = int((await db.execute(count_sql, {"kb_ids": kb_ids})).scalar() or 0)
+            except Exception as e:
+                logger.warning(
+                    f"[KnowledgeSearch] Failed to resolve corpus size, fallback ef_search config: {e}"
+                )
+
+            vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
+            if vector_dimension <= 0:
+                vector_dimension = settings.local_embedding_dimension or 1024
+
+            resolved_ef_search = resolve_ef_search(
+                total_chunks=total_chunks,
+                dimension=vector_dimension,
+            )
             await apply_hnsw_ef_search(
                 db,
-                settings.pgvector_hnsw_ef_search,
+                resolved_ef_search,
                 source="knowledge_search_tool",
             )
 
@@ -715,6 +737,7 @@ class KnowledgeSearchTool(Tool):
                 f"query_rewrite={rewrite_result.enabled}, "
                 f"rewrite_variants={len(rewrite_result.vector_variants)}, "
                 f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
+                f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, "
                 f"time={search_time:.2f}ms"
             )
             output_parts.append(f"\n\n(搜索耗时: {search_time:.2f}ms)")

@@ -1,0 +1,155 @@
+﻿{
+  "kb_ids": [],
+  "queries": [
+    {
+      "id": "q01_llm_quadratic_scaling_en",
+      "query": "What computational challenge do LLMs face due to quadratic scaling with sequence length?",
+      "expected_chunk_ids": [5071]
+    },
+    {
+      "id": "q02_llm_long_context_cn",
+      "query": "请说明 LLM 在长文本场景下因为 quadratic scaling 带来的计算挑战。",
+      "expected_chunk_ids": [5071]
+    },
+    {
+      "id": "q03_llm_centric_vlm_en",
+      "query": "LLM-centric perspective for vision-language models and encoder efficiency",
+      "expected_chunk_ids": [5072]
+    },
+    {
+      "id": "q04_convolutional_compressor_en",
+      "query": "16x convolutional compressor between window attention and global attention",
+      "expected_chunk_ids": [5074]
+    },
+    {
+      "id": "q05_token_reduction_cn",
+      "query": "vision-text compression 的 token reduction 7-20x 是怎么描述的？",
+      "expected_chunk_ids": [5076]
+    },
+    {
+      "id": "q06_vision_token_pain_points_en",
+      "query": "too many vision tokens large activations small global view",
+      "expected_chunk_ids": [5077]
+    },
+    {
+      "id": "q07_typical_vision_encoders_en",
+      "query": "Typical Vision Encoders in VLMs three main types",
+      "expected_chunk_ids": [5079]
+    },
+    {
+      "id": "q08_tile_based_internvl_en",
+      "query": "tile-based method exemplified by InternVL2 parallel computation",
+      "expected_chunk_ids": [5080]
+    },
+    {
+      "id": "q09_end_to_end_ocr_cn",
+      "query": "端到端 OCR 模型在 document parsing task 的描述",
+      "expected_chunk_ids": [5081]
+    },
+    {
+      "id": "q10_1000_words_tokens_en",
+      "query": "for a document containing 1000 words how many vision tokens are needed",
+      "expected_chunk_ids": [5082]
+    },
+    {
+      "id": "q11_unified_architecture_en",
+      "query": "DeepSeek-OCR unified end-to-end VLM architecture encoder and decoder",
+      "expected_chunk_ids": [5084]
+    },
+    {
+      "id": "q12_deepencoder_380m_en",
+      "query": "DeepEncoder approximately 380M parameters with SAM-base and CLIP-large",
+      "expected_chunk_ids": [5085]
+    },
+    {
+      "id": "q13_deepencoder_requirements_cn",
+      "query": "DeepEncoder 需要具备高分辨率处理能力和低激活内存，这段在哪？",
+      "expected_chunk_ids": [5086]
+    },
+    {
+      "id": "q14_novel_encoder_named_en",
+      "query": "design a novel vision encoder named DeepEncoder",
+      "expected_chunk_ids": [5087]
+    },
+    {
+      "id": "q15_two_components_en",
+      "query": "Architecture of DeepEncoder two components visual perception and visual knowledge",
+      "expected_chunk_ids": [5088]
+    },
+    {
+      "id": "q16_remove_patch_embedding_en",
+      "query": "remove the first patch embedding layer since input is no longer images",
+      "expected_chunk_ids": [5089]
+    },
+    {
+      "id": "q17_kernel_stride_padding_en",
+      "query": "kernel size 3 stride 2 padding 1 channels increase from 256 to 1024",
+      "expected_chunk_ids": [5090]
+    },
+    {
+      "id": "q18_multi_resolution_cn",
+      "query": "如果图像有 1000 optical characters，多分辨率支持如何描述？",
+      "expected_chunk_ids": [5091]
+    },
+    {
+      "id": "q19_dynamic_interpolation_en",
+      "query": "dynamic interpolation of positional encodings for multiple resolutions",
+      "expected_chunk_ids": [5092]
+    },
+    {
+      "id": "q20_gundam_mode_en",
+      "query": "Gundam mode n x 640x640 tiles and a 1024x1024 global view",
+      "expected_chunk_ids": [5093]
+    },
+    {
+      "id": "q21_moe_experts_en",
+      "query": "MoE decoder activates 6 out of 64 routed experts and 2 shared experts",
+      "expected_chunk_ids": [5095]
+    },
+    {
+      "id": "q22_decoder_reconstruct_en",
+      "query": "decoder reconstructs original text representation from compressed latent vision tokens",
+      "expected_chunk_ids": [5096]
+    },
+    {
+      "id": "q23_30m_pages_cn",
+      "query": "训练数据里 30M pages 与约 100 languages（中英文 25M）的描述",
+      "expected_chunk_ids": [5098]
+    },
+    {
+      "id": "q24_ocr2_data_en",
+      "query": "OCR 2.0 data includes chart chemical formula and plane geometry parsing",
+      "expected_chunk_ids": [5102]
+    },
+    {
+      "id": "q25_smiles_rdkit_en",
+      "query": "SMILES format from PubChem rendered into images using RDKit",
+      "expected_chunk_ids": [5104]
+    },
+    {
+      "id": "q26_data_ratio_en",
+      "query": "OCR data 70 percent general vision 20 percent text-only 10 percent",
+      "expected_chunk_ids": [5109]
+    },
+    {
+      "id": "q27_training_two_stages_en",
+      "query": "training pipeline two stages training DeepEncoder then training DeepSeek-OCR",
+      "expected_chunk_ids": [5110]
+    },
+    {
+      "id": "q28_laion_100m_en",
+      "query": "100M general data sampled from LAION with 2 epochs and batch size 1280",
+      "expected_chunk_ids": [5112]
+    },
+    {
+      "id": "q29_multilingual_sinhala_cn",
+      "query": "多语言识别示例里提到 Sinhala languages 的段落",
+      "expected_chunk_ids": [5149]
+    },
+    {
+      "id": "q30_convert_markdown_prompt_en",
+      "query": "Convert the document to markdown prompt in deep parsing",
+      "expected_chunk_ids": [5140]
+    }
+  ]
+}
