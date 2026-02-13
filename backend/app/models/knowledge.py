@@ -181,6 +181,7 @@ class DocumentChunk(Base):
     
     # 分片内容
     content = Column(Text, nullable=False)
+    content_segmented = Column(Text, nullable=True)
     chunk_index = Column(Integer, nullable=False)  # 在文档中的顺序
     
     # 位置信息

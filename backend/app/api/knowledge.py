@@ -44,6 +44,7 @@ from app.services.contextual_compression_service import (
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.vector_search_tuning import apply_hnsw_ef_search
+from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -750,6 +751,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     document_id=doc.id,
                     knowledge_base_id=doc.knowledge_base_id,
                     content=chunk_data["content"],
+                    content_segmented=segment_text_for_fts(chunk_data["content"]),
                     chunk_index=i,
                     start_char=chunk_data["start_char"],
                     end_char=chunk_data["end_char"],
@@ -783,6 +785,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     document_id=doc.id,
                     knowledge_base_id=doc.knowledge_base_id,
                     content=chunk_data["content"],
+                    content_segmented=segment_text_for_fts(chunk_data["content"]),
                     chunk_index=-1, # context chunk index 设为 -1 或其他标记
                     start_char=chunk_data["start_char"],
                     end_char=chunk_data["end_char"],
@@ -1229,9 +1232,9 @@ async def search_knowledge(
         text_where_sql = " AND ".join(
             base_where_clauses
             + [
-                "dc.content IS NOT NULL",
-                "dc.content <> ''",
-                "to_tsvector('simple', dc.content) @@ websearch_to_tsquery('simple', :fts_query)",
+                "COALESCE(NULLIF(dc.content_segmented, ''), dc.content) IS NOT NULL",
+                "COALESCE(NULLIF(dc.content_segmented, ''), dc.content) <> ''",
+                "to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)) @@ websearch_to_tsquery('simple', :fts_query)",
             ]
         )
         text_sql = text(f"""
@@ -1248,7 +1251,7 @@ async def search_knowledge(
                 dc.parent_chunk_id,
                 NULL::float as similarity,
                 ts_rank_cd(
-                    to_tsvector('simple', dc.content),
+                    to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)),
                     websearch_to_tsquery('simple', :fts_query)
                 ) as text_score,
                 d.original_filename as document_name,
@@ -1264,9 +1267,12 @@ async def search_knowledge(
         for variant in text_variants:
             if not variant.text.strip():
                 continue
+            fts_query = segment_text_for_fts(variant.text)
+            if not fts_query.strip():
+                continue
             text_params = {
                 **base_params,
-                "fts_query": variant.text,
+                "fts_query": fts_query,
                 "text_top_k": text_top_k,
             }
             try:

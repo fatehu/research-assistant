@@ -21,6 +21,7 @@ from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.vector_search_tuning import apply_hnsw_ef_search
+from app.services.chinese_segmentation_service import segment_text_for_fts
 
 # 尝试导入共享模块（可选）
 try:
@@ -562,7 +563,7 @@ class KnowledgeSearchTool(Tool):
                         dc.chunk_index,
                         NULL::float as similarity,
                         ts_rank_cd(
-                            to_tsvector('simple', dc.content),
+                            to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)),
                             websearch_to_tsquery('simple', :fts_query)
                         ) as text_score,
                         d.original_filename as document_name,
@@ -571,9 +572,9 @@ class KnowledgeSearchTool(Tool):
                     JOIN documents d ON dc.document_id = d.id
                     JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
                     WHERE dc.knowledge_base_id = ANY(:kb_ids)
-                        AND dc.content IS NOT NULL
-                        AND dc.content <> ''
-                        AND to_tsvector('simple', dc.content) @@ websearch_to_tsquery('simple', :fts_query)
+                        AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) IS NOT NULL
+                        AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) <> ''
+                        AND to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)) @@ websearch_to_tsquery('simple', :fts_query)
                     ORDER BY text_score DESC
                     LIMIT :text_top_k
                 """)
@@ -581,11 +582,14 @@ class KnowledgeSearchTool(Tool):
                 for variant in text_variants:
                     if not variant.text.strip():
                         continue
+                    fts_query = segment_text_for_fts(variant.text)
+                    if not fts_query.strip():
+                        continue
                     try:
                         text_result = await db.execute(
                             text_sql,
                             {
-                                "fts_query": variant.text,
+                                "fts_query": fts_query,
                                 "kb_ids": kb_ids,
                                 "text_top_k": text_top_k,
                             },
