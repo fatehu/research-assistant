@@ -50,7 +50,8 @@ def test_knowledge_search_uses_configurable_distance_threshold():
 def test_knowledge_search_filters_embedding_dimension():
     source = inspect.getsource(agent_tools.KnowledgeSearchTool._execute_with_db)
     assert "embedding_dimension = :vector_dimension" in source
-    assert "\"vector_dimension\": vector_dimension" in source
+    assert "\"vector_dimension\": group_dimension" in source
+    assert "embedding::vector(" in source
 
 
 def test_api_search_filters_embedding_dimension():
@@ -58,4 +59,5 @@ def test_api_search_filters_embedding_dimension():
         Path(__file__).resolve().parents[1] / "app" / "api" / "knowledge.py"
     ).read_text(encoding="utf-8")
     assert "dc.embedding_dimension = :vector_dimension" in knowledge_api
-    assert "\"vector_dimension\": vector_dimension" in knowledge_api
+    assert "\"vector_dimension\": group_dimension" in knowledge_api
+    assert "embedding::vector(" in knowledge_api

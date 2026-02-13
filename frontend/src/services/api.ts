@@ -249,6 +249,21 @@ export interface KnowledgeSearchOptions {
   adjacentWindow?: number
   queryRewriteStrategies?: string[]
   timeoutMs?: number
+  signal?: AbortSignal
+}
+
+export const isApiCanceledError = (error: unknown): boolean => {
+  return axios.isAxiosError(error) && error.code === 'ERR_CANCELED'
+}
+
+export const isApiTimeoutError = (error: unknown): boolean => {
+  if (!axios.isAxiosError(error)) {
+    return false
+  }
+  const code = String(error.code || '')
+  const status = error.response?.status
+  const msg = String(error.message || '').toLowerCase()
+  return code === 'ECONNABORTED' || status === 504 || msg.includes('timeout')
 }
 
 export interface ProcessingStatus {
@@ -565,7 +580,8 @@ export const knowledgeApi = {
       includeAdjacentChunks = false,
       adjacentWindow = 1,
       queryRewriteStrategies,
-      timeoutMs = 60000,
+      timeoutMs = 300000,
+      signal,
     } = options
     const normalizedAdjacentWindow = Math.max(1, Math.min(3, adjacentWindow))
 
@@ -588,6 +604,7 @@ export const knowledgeApi = {
     }, {
       params: { include_shared: includeShared },
       timeout: timeoutMs,
+      signal,
     })
     return response.data
   },

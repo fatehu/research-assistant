@@ -16,7 +16,7 @@ from sqlalchemy import select, text, or_, and_, tuple_
 
 from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
-from app.services.embedding_service import get_embedding_service
+from app.services.embedding_service import get_embedding_service_for_model_and_dimension
 from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_service
 from app.services.reranker_service import get_reranker_service, RerankerService
@@ -393,7 +393,6 @@ class KnowledgeSearchTool(Tool):
         self.db = db
         self.user_id = user_id
         self.db_session_factory = db_session_factory
-        self.embedding_service = get_embedding_service()
         self.query_rewrite_service = get_query_rewrite_service()
     
     async def execute(
@@ -496,122 +495,157 @@ class KnowledgeSearchTool(Tool):
             )
             fusion_limit = reranker_candidate_k
             
-            # 使用 pgvector 进行向量相似度搜索
-            vector_sql = text("""
-                SELECT 
-                    dc.id,
-                    dc.document_id,
-                    dc.knowledge_base_id,
-                    dc.content,
-                    dc.chunk_index,
-                    1 - (dc.embedding <=> :query_vector) as similarity,
-                    NULL::float as text_score,
-                    d.original_filename as document_name,
-                    kb.name as knowledge_base_name
-                FROM document_chunks dc
-                JOIN documents d ON dc.document_id = d.id
-                JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
-                WHERE dc.knowledge_base_id = ANY(:kb_ids)
-                    AND dc.embedding IS NOT NULL
-                    AND dc.embedding_dimension = :vector_dimension
-                    AND (dc.embedding <=> :query_vector) <= :distance_threshold
-                ORDER BY dc.embedding <=> :query_vector
-                LIMIT :vector_top_k
-            """)
+            # 按 embedding_model + embedding_dimension 分组检索
+            vector_groups_sql = text(
+                """
+                SELECT
+                    COALESCE(NULLIF(embedding_model, ''), :default_embedding_model) AS embedding_model,
+                    embedding_dimension,
+                    COUNT(*) AS chunk_count
+                FROM document_chunks
+                WHERE knowledge_base_id = ANY(:kb_ids)
+                    AND embedding IS NOT NULL
+                    AND embedding_dimension IS NOT NULL
+                GROUP BY COALESCE(NULLIF(embedding_model, ''), :default_embedding_model), embedding_dimension
+                ORDER BY chunk_count DESC
+                """
+            )
+            vector_groups = (
+                await db.execute(
+                    vector_groups_sql,
+                    {
+                        "kb_ids": kb_ids,
+                        "default_embedding_model": settings.local_embedding_model,
+                    },
+                )
+            ).fetchall()
 
             vector_rows = []
             vector_group_rows = []
             vector_variants = rewrite_result.vector_variants or [
                 QueryVariant(text=query, strategy="original")
             ]
-
-            vector_embeddings = []
-            vector_texts = [variant.text for variant in vector_variants]
-            try:
-                vector_embeddings = await self.embedding_service.embed_texts(
-                    vector_texts,
-                    is_query=True,
-                )
-                if len(vector_embeddings) != len(vector_texts):
-                    raise ValueError(
-                        f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
-                    )
-            except Exception as e:
-                logger.warning(f"[KnowledgeSearch] Batch embedding failed, fallback to single: {e}")
-                vector_embeddings = []
-                for variant in vector_variants:
-                    try:
-                        emb = await self.embedding_service.embed_text(
-                            variant.text,
-                            is_query=True,
-                        )
-                    except Exception as single_exc:
-                        logger.warning(
-                            f"[KnowledgeSearch] Single embedding failed for "
-                            f"strategy={variant.strategy}: {single_exc}"
-                        )
-                        emb = []
-                    vector_embeddings.append(emb)
-
-            vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
-            if vector_dimension <= 0:
-                vector_dimension = settings.local_embedding_dimension or 1024
-
             total_chunks = 0
-            try:
-                count_sql = text("""
-                    SELECT COUNT(*)
-                    FROM document_chunks
-                    WHERE knowledge_base_id = ANY(:kb_ids)
-                        AND embedding IS NOT NULL
-                        AND embedding_dimension = :vector_dimension
-                """)
-                total_chunks = int(
-                    (
-                        await db.execute(
-                            count_sql,
-                            {
-                                "kb_ids": kb_ids,
-                                "vector_dimension": vector_dimension,
-                            },
-                        )
-                    ).scalar()
-                    or 0
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[KnowledgeSearch] Failed to resolve corpus size, fallback ef_search config: {e}"
-                )
+            resolved_ef_search = int(settings.pgvector_hnsw_ef_search)
+            retrieval_dimensions: set[int] = set()
+            ef_search_debug: list[dict[str, int]] = []
 
-            resolved_ef_search = resolve_ef_search(
-                total_chunks=total_chunks,
-                dimension=vector_dimension,
-            )
-            await apply_hnsw_ef_search(
-                db,
-                resolved_ef_search,
-                source="knowledge_search_tool",
-            )
-
-            for idx, variant in enumerate(vector_variants):
-                query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
-                if not query_embedding:
+            for group in vector_groups:
+                group_model = str(
+                    getattr(group, "embedding_model", "") or settings.local_embedding_model
+                ).strip()
+                group_dimension = int(getattr(group, "embedding_dimension", 0) or 0)
+                group_chunks = int(getattr(group, "chunk_count", 0) or 0)
+                if group_dimension <= 0:
                     continue
 
-                vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-                result = await db.execute(
-                    vector_sql,
-                    {
-                        "query_vector": vector_str,
-                        "distance_threshold": distance_threshold,
-                        "kb_ids": kb_ids,
-                        "vector_dimension": vector_dimension,
-                        "vector_top_k": vector_top_k,
-                    },
+                retrieval_dimensions.add(group_dimension)
+                total_chunks += group_chunks
+
+                group_embedding_service = get_embedding_service_for_model_and_dimension(
+                    group_model,
+                    group_dimension,
                 )
-                rows = result.fetchall()
-                if rows:
-                    vector_group_rows.append((variant.strategy, variant.text, rows))
+                vector_texts = [variant.text for variant in vector_variants]
+                vector_embeddings: list[list[float]] = []
+                try:
+                    vector_embeddings = await group_embedding_service.embed_texts(
+                        vector_texts,
+                        is_query=True,
+                    )
+                    if len(vector_embeddings) != len(vector_texts):
+                        raise ValueError(
+                            f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[KnowledgeSearch] Batch embedding failed for model={group_model}, "
+                        f"dim={group_dimension}: {e}"
+                    )
+                    vector_embeddings = []
+                    for variant in vector_variants:
+                        try:
+                            emb = await group_embedding_service.embed_text(
+                                variant.text,
+                                is_query=True,
+                            )
+                        except Exception as single_exc:
+                            logger.warning(
+                                f"[KnowledgeSearch] Single embedding failed for strategy={variant.strategy}, "
+                                f"model={group_model}, dim={group_dimension}: {single_exc}"
+                            )
+                            emb = []
+                        vector_embeddings.append(emb)
+
+                distance_expr = (
+                    f"(dc.embedding::vector({group_dimension}) <=> "
+                    f"(:query_vector)::vector({group_dimension}))"
+                )
+                vector_sql = text(
+                    f"""
+                    SELECT
+                        dc.id,
+                        dc.document_id,
+                        dc.knowledge_base_id,
+                        dc.content,
+                        dc.chunk_index,
+                        dc.embedding_model,
+                        dc.embedding_dimension,
+                        1 - {distance_expr} AS similarity,
+                        NULL::float AS text_score,
+                        d.original_filename AS document_name,
+                        kb.name AS knowledge_base_name
+                    FROM document_chunks dc
+                    JOIN documents d ON dc.document_id = d.id
+                    JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
+                    WHERE dc.knowledge_base_id = ANY(:kb_ids)
+                        AND dc.embedding IS NOT NULL
+                        AND dc.embedding_dimension = :vector_dimension
+                        AND {distance_expr} <= :distance_threshold
+                    ORDER BY {distance_expr}
+                    LIMIT :vector_top_k
+                    """
+                )
+
+                resolved_group_ef = resolve_ef_search(
+                    total_chunks=group_chunks,
+                    dimension=group_dimension,
+                )
+                await apply_hnsw_ef_search(
+                    db,
+                    resolved_group_ef,
+                    source=f"knowledge_search_tool.dim{group_dimension}",
+                )
+                resolved_ef_search = max(resolved_ef_search, resolved_group_ef)
+                ef_search_debug.append(
+                    {
+                        "dimension": group_dimension,
+                        "chunks": group_chunks,
+                        "ef_search": resolved_group_ef,
+                    }
+                )
+
+                for idx, variant in enumerate(vector_variants):
+                    query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
+                    if not query_embedding:
+                        continue
+                    if len(query_embedding) != group_dimension:
+                        continue
+
+                    vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
+                    result = await db.execute(
+                        vector_sql,
+                        {
+                            "query_vector": vector_str,
+                            "distance_threshold": distance_threshold,
+                            "kb_ids": kb_ids,
+                            "vector_dimension": group_dimension,
+                            "vector_top_k": vector_top_k,
+                        },
+                    )
+                    rows = result.fetchall()
+                    if rows:
+                        vector_group_rows.append((variant.strategy, variant.text, rows))
 
             vector_rows = merge_rows_by_score(
                 vector_group_rows,
@@ -746,6 +780,10 @@ class KnowledgeSearchTool(Tool):
                 else:
                     score = 0.0
 
+                retrieval_dimension = int(getattr(row, "embedding_dimension", 0) or 0)
+                if retrieval_dimension <= 0 and retrieval_dimensions:
+                    retrieval_dimension = int(sorted(retrieval_dimensions)[0])
+
                 result_item = {
                     "content": row.content,
                     "score": score,
@@ -771,7 +809,8 @@ class KnowledgeSearchTool(Tool):
                     "vector_score": vector_score,
                     "text_score": text_score,
                     "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
-                    "retrieval_dimension": vector_dimension,
+                    "retrieval_dimension": retrieval_dimension,
+                    "retrieval_embedding_model": getattr(row, "embedding_model", None),
                 }
                 results.append(result_item)
 
@@ -826,7 +865,8 @@ class KnowledgeSearchTool(Tool):
                 f"query_rewrite={rewrite_result.enabled}, "
                 f"rewrite_variants={len(rewrite_result.vector_variants)}, "
                 f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
-                f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dim={vector_dimension}, "
+                f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dims={sorted(retrieval_dimensions)}, "
+                f"ef_detail={ef_search_debug}, "
                 f"time={search_time:.2f}ms"
             )
             output_parts.append(f"\n\n(搜索耗时: {search_time:.2f}ms)")

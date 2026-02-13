@@ -35,7 +35,10 @@ from app.schemas.knowledge import (
     ProcessingStatus,
 )
 from app.services.document_service import get_document_processor
-from app.services.embedding_service import get_embedding_service, get_embedding_service_for_model, MODEL_DIMENSIONS
+from app.services.embedding_service import (
+    MODEL_DIMENSIONS,
+    get_embedding_service_for_model_and_dimension,
+)
 from app.services.hybrid_retrieval_service import fuse_rrf, merge_rows_by_score
 from app.services.contextual_compression_service import (
     CompressionInput,
@@ -56,6 +59,8 @@ from app.services.document_status_guard_service import (
     build_timeout_error_message,
     is_stale_processing_status,
 )
+from app.services.embedding_dimension_policy_service import get_embedding_dimension_policy_service
+from app.services.dimension_rebuild_service import get_dimension_rebuild_service
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -626,9 +631,9 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 创建处理器
             processor = get_document_processor(chunk_size, chunk_overlap)
             
-            # [Revert] 统一使用默认嵌入模型
-            embedding_svc = get_embedding_service()
-            logger.info(f"文档 {doc_id} 使用嵌入模型: {embedding_svc._get_model()}")
+            # 嵌入模型与维度在分块完成后按策略动态决策
+            embedding_svc = None
+            logger.info(f"文档 {doc_id} 开始处理，Embedding 维度将按规模自适应")
             
             # 提取文本
             logger.info(f"开始提取文档文本: {doc_id}")
@@ -749,6 +754,25 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
 
             # 生成嵌入向量
             logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
+            embedding_model = (kb.embedding_model or "").strip() or settings.local_embedding_model
+            policy_service = get_embedding_dimension_policy_service()
+            existing_chunks = await policy_service.estimate_kb_paragraph_chunks(db, kb.id)
+            projected_chunks = int(existing_chunks) + len(chunks_to_save)
+            decision = policy_service.decide_dimension(
+                corpus_chunks=projected_chunks,
+                embedding_model=embedding_model,
+                previous_dimension=kb.embedding_dimension,
+            )
+            embedding_svc = get_embedding_service_for_model_and_dimension(
+                embedding_model,
+                decision.target_dimension,
+            )
+            logger.info(
+                f"[dimension_policy] kb={kb.id}, doc={doc_id}, model={embedding_model}, "
+                f"existing_chunks={existing_chunks}, projected_chunks={projected_chunks}, "
+                f"prev_dim={kb.embedding_dimension}, target_dim={decision.target_dimension}, reason={decision.reason}"
+            )
+
             chunk_context_summaries: list[str] = []
             embedding_inputs: list[str] = []
             for chunk_data in chunks_to_save:
@@ -892,12 +916,46 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             # 更新知识库统计
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
+            should_schedule_rebuild = False
             if kb:
                 kb.document_count = (kb.document_count or 0) + 1
                 kb.total_chunks = (kb.total_chunks or 0) + len(chunks_to_save)
                 kb.total_tokens = (kb.total_tokens or 0) + doc.token_count
-            
+                kb.embedding_model = embedding_model
+                kb.embedding_dimension = int(decision.target_dimension)
+                kb_meta = dict(kb.metadata_ or {})
+                policy_meta = dict(kb_meta.get("embedding_dimension_policy") or {})
+                policy_meta.update(
+                    {
+                        "policy": settings.embedding_dimension_policy,
+                        "reason": decision.reason,
+                        "corpus_chunks": decision.corpus_chunks,
+                        "target_dimension": int(decision.target_dimension),
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                )
+                kb_meta["embedding_dimension_policy"] = policy_meta
+                kb.metadata_ = kb_meta
+
+                should_schedule_rebuild = bool(
+                    settings.embedding_dim_rebuild_async
+                    and decision.should_rebuild
+                    and int(existing_chunks) > 0
+                )
+
             await db.commit()
+            if should_schedule_rebuild:
+                rebuild_service = get_dimension_rebuild_service()
+                rebuild_start = await rebuild_service.schedule_kb_rebuild(
+                    kb_id=kb.id,
+                    target_dimension=int(decision.target_dimension),
+                    trigger_reason=f"adaptive_policy_doc_{doc_id}",
+                )
+                logger.info(
+                    f"[dimension_rebuild] kb={kb.id}, target={decision.target_dimension}, "
+                    f"scheduled={rebuild_start.scheduled}, reason={rebuild_start.reason}"
+                )
+
             logger.info(f"文档处理完成: {doc_id}, {len(chunks_to_save)} 个分片")
             
         except Exception as e:
@@ -1113,9 +1171,6 @@ async def search_knowledge(
     """
     start_time = time.time()
     
-    # [Revert] 统一使用默认嵌入模型，忽略知识库配置
-    embedding_svc = get_embedding_service()
-    
     # 获取用户可访问的知识库ID
     own_kb_result = await db.execute(
         select(KnowledgeBase.id).where(KnowledgeBase.user_id == current_user.id)
@@ -1185,9 +1240,9 @@ async def search_knowledge(
     )
     fusion_limit = reranker_candidate_k
     
-    # 构建 pgvector 原生查询
+    # 构建 pgvector 原生查询，按 (embedding_model, embedding_dimension) 分组检索
     from sqlalchemy import text
-    
+
     base_where_clauses = ["dc.knowledge_base_id = ANY(:kb_ids)"]
     base_params = {"kb_ids": kb_ids}
 
@@ -1199,38 +1254,34 @@ async def search_knowledge(
         base_where_clauses.append("dc.section_type = :section_type")
         base_params["section_type"] = request.section_type
 
-    vector_where_sql = " AND ".join(
+    vector_groups_where_sql = " AND ".join(
         base_where_clauses
         + [
             "dc.embedding IS NOT NULL",
-            "dc.embedding_dimension = :vector_dimension",
-            "(dc.embedding <=> :query_vector) <= :distance_threshold",
+            "dc.embedding_dimension IS NOT NULL",
         ]
     )
-
-    vector_sql = text(f"""
-        SELECT 
-            dc.id,
-            dc.document_id,
-            dc.knowledge_base_id,
-            dc.content,
-            dc.chunk_index,
-            dc.metadata,
-            dc.chunk_level,
-            dc.section_type,
-            dc.section_title,
-            dc.parent_chunk_id,
-            1 - (dc.embedding <=> :query_vector) as similarity,
-            NULL::float as text_score,
-            d.original_filename as document_name,
-            kb.name as knowledge_base_name
+    vector_groups_sql = text(
+        f"""
+        SELECT
+            COALESCE(NULLIF(dc.embedding_model, ''), :default_embedding_model) AS embedding_model,
+            dc.embedding_dimension AS embedding_dimension,
+            COUNT(*) AS chunk_count
         FROM document_chunks dc
-        JOIN documents d ON dc.document_id = d.id
-        JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
-        WHERE {vector_where_sql}
-        ORDER BY dc.embedding <=> :query_vector
-        LIMIT :vector_top_k
-    """)
+        WHERE {vector_groups_where_sql}
+        GROUP BY COALESCE(NULLIF(dc.embedding_model, ''), :default_embedding_model), dc.embedding_dimension
+        ORDER BY chunk_count DESC
+        """
+    )
+    vector_groups = (
+        await db.execute(
+            vector_groups_sql,
+            {
+                **base_params,
+                "default_embedding_model": settings.local_embedding_model,
+            },
+        )
+    ).fetchall()
 
     vector_rows = []
     vector_group_rows = []
@@ -1240,69 +1291,130 @@ async def search_knowledge(
             QueryVariant(text=request.query, strategy="original")
         ]
 
-    vector_embeddings = []
-    vector_texts = [variant.text for variant in vector_variants]
-    try:
-        vector_embeddings = await embedding_svc.embed_texts(vector_texts, is_query=True)
-        if len(vector_embeddings) != len(vector_texts):
-            raise ValueError(
-                f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
-            )
-    except Exception as e:
-        logger.warning(f"Batch query embedding failed, fallback to single embedding: {e}")
-        vector_embeddings = []
-        for variant in vector_variants:
-            try:
-                emb = await embedding_svc.embed_text(variant.text, is_query=True)
-            except Exception as single_exc:
-                logger.warning(
-                    f"Single query embedding failed for strategy={variant.strategy}: {single_exc}"
-                )
-                emb = []
-            vector_embeddings.append(emb)
-
-    vector_dimension = next((len(emb) for emb in vector_embeddings if emb), 0)
-    if vector_dimension <= 0:
-        vector_dimension = settings.local_embedding_dimension or 1024
-
-    vector_base_params = {**base_params, "vector_dimension": vector_dimension}
-
     total_chunks = 0
-    try:
-        vector_count_where_sql = " AND ".join(
-            base_where_clauses + ["dc.embedding IS NOT NULL", "dc.embedding_dimension = :vector_dimension"]
-        )
-        vector_count_sql = text(f"""
-            SELECT COUNT(*)
-            FROM document_chunks dc
-            WHERE {vector_count_where_sql}
-        """)
-        total_chunks = int((await db.execute(vector_count_sql, vector_base_params)).scalar() or 0)
-    except Exception as e:
-        logger.warning(f"Failed to resolve retrieval corpus size, fallback ef_search config: {e}")
+    resolved_ef_search = int(settings.pgvector_hnsw_ef_search)
+    ef_search_debug: list[dict[str, int]] = []
+    retrieval_dimensions: set[int] = set()
 
-    resolved_ef_search = resolve_ef_search(total_chunks=total_chunks, dimension=vector_dimension)
-    await apply_hnsw_ef_search(
-        db,
-        resolved_ef_search,
-        source="knowledge.search",
-    )
-
-    for idx, variant in enumerate(vector_variants):
-        query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
-        if not query_embedding:
+    for group in vector_groups:
+        group_model = str(getattr(group, "embedding_model", "") or settings.local_embedding_model).strip()
+        group_dimension = int(getattr(group, "embedding_dimension", 0) or 0)
+        group_chunks = int(getattr(group, "chunk_count", 0) or 0)
+        if group_dimension <= 0:
             continue
 
-        vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
-        vector_params = {
-            **vector_base_params,
-            "query_vector": vector_str,
-            "distance_threshold": distance_threshold,
-            "vector_top_k": vector_top_k,
+        retrieval_dimensions.add(group_dimension)
+        total_chunks += group_chunks
+
+        group_embedding_svc = get_embedding_service_for_model_and_dimension(
+            group_model,
+            group_dimension,
+        )
+        vector_texts = [variant.text for variant in vector_variants]
+        vector_embeddings: list[list[float]] = []
+        try:
+            vector_embeddings = await group_embedding_svc.embed_texts(vector_texts, is_query=True)
+            if len(vector_embeddings) != len(vector_texts):
+                raise ValueError(
+                    f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Batch query embedding failed for model={group_model}, dim={group_dimension}, "
+                f"fallback to single embedding: {e}"
+            )
+            vector_embeddings = []
+            for variant in vector_variants:
+                try:
+                    emb = await group_embedding_svc.embed_text(variant.text, is_query=True)
+                except Exception as single_exc:
+                    logger.warning(
+                        f"Single query embedding failed for strategy={variant.strategy}, "
+                        f"model={group_model}, dim={group_dimension}: {single_exc}"
+                    )
+                    emb = []
+                vector_embeddings.append(emb)
+
+        distance_expr = (
+            f"(dc.embedding::vector({group_dimension}) <=> "
+            f"(:query_vector)::vector({group_dimension}))"
+        )
+        vector_where_sql = " AND ".join(
+            base_where_clauses
+            + [
+                "dc.embedding IS NOT NULL",
+                "dc.embedding_dimension = :vector_dimension",
+                f"{distance_expr} <= :distance_threshold",
+            ]
+        )
+        vector_sql = text(
+            f"""
+            SELECT
+                dc.id,
+                dc.document_id,
+                dc.knowledge_base_id,
+                dc.content,
+                dc.chunk_index,
+                dc.metadata,
+                dc.chunk_level,
+                dc.section_type,
+                dc.section_title,
+                dc.parent_chunk_id,
+                dc.embedding_model,
+                dc.embedding_dimension,
+                1 - {distance_expr} AS similarity,
+                NULL::float AS text_score,
+                d.original_filename AS document_name,
+                kb.name AS knowledge_base_name
+            FROM document_chunks dc
+            JOIN documents d ON dc.document_id = d.id
+            JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
+            WHERE {vector_where_sql}
+            ORDER BY {distance_expr}
+            LIMIT :vector_top_k
+            """
+        )
+
+        resolved_group_ef = resolve_ef_search(total_chunks=group_chunks, dimension=group_dimension)
+        await apply_hnsw_ef_search(
+            db,
+            resolved_group_ef,
+            source=f"knowledge.search.dim{group_dimension}",
+        )
+        resolved_ef_search = max(resolved_ef_search, resolved_group_ef)
+        ef_search_debug.append(
+            {
+                "dimension": group_dimension,
+                "chunks": group_chunks,
+                "ef_search": resolved_group_ef,
+            }
+        )
+
+        group_base_params = {
+            **base_params,
+            "vector_dimension": group_dimension,
         }
-        rows = (await db.execute(vector_sql, vector_params)).fetchall()
-        if rows:
-            vector_group_rows.append((variant.strategy, variant.text, rows))
+        for idx, variant in enumerate(vector_variants):
+            query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
+            if not query_embedding:
+                continue
+            if len(query_embedding) != group_dimension:
+                logger.warning(
+                    f"Skip variant due dimension mismatch: model={group_model}, "
+                    f"group_dim={group_dimension}, emb_dim={len(query_embedding)}"
+                )
+                continue
+
+            vector_str = f"[{','.join(str(x) for x in query_embedding)}]"
+            vector_params = {
+                **group_base_params,
+                "query_vector": vector_str,
+                "distance_threshold": distance_threshold,
+                "vector_top_k": vector_top_k,
+            }
+            rows = (await db.execute(vector_sql, vector_params)).fetchall()
+            if rows:
+                vector_group_rows.append((variant.strategy, variant.text, rows))
 
     vector_rows = merge_rows_by_score(
         vector_group_rows,
@@ -1475,7 +1587,14 @@ async def search_knowledge(
 
         metadata = dict(row.metadata or {})
         metadata["retrieval_mode"] = "hybrid" if use_hybrid else "vector"
-        metadata["retrieval_dimension"] = vector_dimension
+        row_dimension = getattr(row, "embedding_dimension", None)
+        if row_dimension is not None:
+            metadata["retrieval_dimension"] = int(row_dimension)
+        elif retrieval_dimensions:
+            metadata["retrieval_dimension"] = int(sorted(retrieval_dimensions)[0])
+        row_embedding_model = getattr(row, "embedding_model", None)
+        if row_embedding_model:
+            metadata["retrieval_embedding_model"] = row_embedding_model
         metadata["rrf_score"] = round(float(candidate.rrf_score), 6)
         metadata["contextual_compression_enabled"] = bool(
             compression_result and compression_result.used_compression
@@ -1629,7 +1748,8 @@ async def search_knowledge(
         f"query_rewrite={rewrite_result.enabled}, "
         f"rewrite_variants={len(rewrite_result.vector_variants)}, "
         f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
-        f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dim={vector_dimension}, "
+        f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dims={sorted(retrieval_dimensions)}, "
+        f"ef_detail={ef_search_debug}, "
         f"time={search_time:.2f}ms"
     )
     

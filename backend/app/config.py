@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     local_embedding_cache_dir: str = ""
     local_embedding_normalize: bool = True
     local_embedding_dimension: int = 0
+    embedding_dimension_policy: Literal["fixed", "adaptive"] = "adaptive"
+    embedding_dim_small: int = 256
+    embedding_dim_medium: int = 512
+    embedding_dim_small_max_chunks: int = 2000
+    embedding_dim_medium_max_chunks: int = 10000
+    embedding_dim_hysteresis_enabled: bool = True
+    embedding_dim_hysteresis_small_up: int = 2500
+    embedding_dim_hysteresis_small_down: int = 1500
+    embedding_dim_hysteresis_medium_up: int = 12000
+    embedding_dim_hysteresis_medium_down: int = 8000
+    embedding_dim_rebuild_async: bool = True
 
     # Reranker / retrieval
     enable_reranker: bool = True
@@ -73,6 +84,9 @@ class Settings(BaseSettings):
     pgvector_hnsw_ef_search_min: int = 32
     pgvector_hnsw_ef_search_max: int = 96
     agent_knowledge_score_threshold: float = 0.5
+    search_timeout_primary_ms: int = 300000
+    search_timeout_fallback_ms: int = 90000
+    search_timeout_auto_fallback: bool = True
 
     # Query rewrite
     enable_query_rewrite: bool = True

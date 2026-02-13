@@ -1,4 +1,4 @@
-"""
+﻿"""
 Embedding 服务 - 支持本地科研嵌入模型和云端 API
 
 支持的 Provider:
@@ -15,7 +15,7 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
 import asyncio
 import threading
 import numpy as np
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -244,7 +244,7 @@ class EmbeddingService:
       ollama → Ollama 本地 API
     """
 
-    def __init__(self, model_name: Optional[str] = None):
+    def __init__(self, model_name: Optional[str] = None, target_dimension: int = 0):
         """
         初始化嵌入服务
         
@@ -254,17 +254,18 @@ class EmbeddingService:
                         API 模型格式: "text-embedding-v2", "text-embedding-3-small", "nomic-embed-text"
         """
         self._model_name_override = model_name
+        self._target_dimension_override = max(0, int(target_dimension or 0))
         self.provider = self._resolve_provider(model_name)
         self._client = None
         self._local_model: Optional[LocalEmbeddingModel] = None
 
         if self.provider == "local":
             actual_model = model_name or settings.local_embedding_model
-            self._local_model = _model_pool.get(actual_model)
+            self._local_model = _model_pool.get(actual_model, self._target_dimension_override)
 
         logger.info(
             f"Embedding 服务初始化: provider={self.provider}, "
-            f"model={self._get_model()}"
+            f"model={self._get_model()}, target_dim={self._target_dimension_override or 'default'}"
         )
     
     @staticmethod
@@ -333,6 +334,8 @@ class EmbeddingService:
 
     def get_dimension(self) -> int:
         """获取当前 provider 的向量维度"""
+        if self._target_dimension_override > 0:
+            return self._target_dimension_override
         if self.provider == "local":
             return self._local_model.dimension
         elif self.provider == "aliyun":
@@ -342,6 +345,9 @@ class EmbeddingService:
         elif self.provider == "ollama":
             return 768
         return 1536
+
+    def get_target_dimension(self) -> int:
+        return self.get_dimension()
 
     # ===================================================================
     #  核心嵌入方法
@@ -421,6 +427,20 @@ class EmbeddingService:
     #  API 模型调用
     # ===================================================================
 
+    def _apply_target_dimension(self, embedding: List[float]) -> List[float]:
+        target_dim = self._target_dimension_override
+        if target_dim <= 0:
+            return embedding
+        if len(embedding) <= target_dim:
+            return embedding
+
+        clipped = np.array(embedding[:target_dim], dtype=np.float32)
+        if settings.local_embedding_normalize:
+            norm = np.linalg.norm(clipped)
+            if norm > 0:
+                clipped = clipped / norm
+        return clipped.tolist()
+
     async def _api_embed_text(self, text: str) -> List[float]:
         """API 单文本嵌入"""
         client = self._get_api_client()
@@ -429,7 +449,7 @@ class EmbeddingService:
         try:
             logger.debug(f"API Embedding: model={model}, len={len(text)}")
             response = await client.embeddings.create(input=text, model=model)
-            embedding = response.data[0].embedding
+            embedding = self._apply_target_dimension(response.data[0].embedding)
             logger.debug(f"API Embedding OK: dim={len(embedding)}")
             return embedding
         except Exception as e:
@@ -452,7 +472,10 @@ class EmbeddingService:
 
             try:
                 response = await client.embeddings.create(input=batch, model=model)
-                batch_embeddings = [d.embedding for d in response.data]
+                batch_embeddings = [
+                    self._apply_target_dimension(d.embedding)
+                    for d in response.data
+                ]
                 all_embeddings.extend(batch_embeddings)
             except Exception as e:
                 logger.error(f"批次 {i // batch_size + 1} 失败: {e}")
@@ -527,34 +550,38 @@ def get_embedding_service() -> EmbeddingService:
 
 
 # 按模型名缓存的 EmbeddingService 实例
-_service_cache: Dict[str, EmbeddingService] = {}
+_service_cache: Dict[Tuple[str, int], EmbeddingService] = {}
 _service_cache_lock = threading.Lock()
 
 
 def get_embedding_service_for_model(model_name: Optional[str] = None) -> EmbeddingService:
-    """
-    获取针对指定模型的嵌入服务实例
-    
-    Args:
-        model_name: 模型名称，如 "BAAI/bge-m3"。
-                    为 None 或与全局配置相同时返回默认实例。
-    
-    Returns:
-        配置了对应模型的 EmbeddingService 实例
-    """
-    # None 或与全局模型相同 -> 返回默认实例
-    if not model_name:
-        return embedding_service
-    
+    return get_embedding_service_for_model_and_dimension(model_name, target_dimension=0)
+
+
+def get_embedding_service_for_model_and_dimension(
+    model_name: Optional[str] = None,
+    target_dimension: int = 0,
+) -> EmbeddingService:
+    model_key = (model_name or "").strip()
+    dim_key = max(0, int(target_dimension or 0))
+
     default_model = embedding_service._get_model()
-    if model_name == default_model:
+    if not model_key:
+        model_key = default_model
+
+    if model_key == default_model and dim_key == embedding_service.get_target_dimension():
         return embedding_service
-    
-    # 按模型名缓存
-    if model_name not in _service_cache:
+
+    cache_key = (model_key, dim_key)
+    if cache_key not in _service_cache:
         with _service_cache_lock:
-            if model_name not in _service_cache:
-                logger.info(f"创建模型专用 EmbeddingService: {model_name}")
-                _service_cache[model_name] = EmbeddingService(model_name=model_name)
-    
-    return _service_cache[model_name]
+            if cache_key not in _service_cache:
+                logger.info(
+                    f"创建模型专用 EmbeddingService: {model_key} (dim={dim_key or 'default'})"
+                )
+                _service_cache[cache_key] = EmbeddingService(
+                    model_name=model_key,
+                    target_dimension=dim_key,
+                )
+
+    return _service_cache[cache_key]

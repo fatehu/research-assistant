@@ -38,7 +38,7 @@ import {
 } from '@ant-design/icons'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
 import type { SearchResult } from '@/services/api'
-import { knowledgeApi } from '@/services/api'
+import { isApiCanceledError, isApiTimeoutError, knowledgeApi } from '@/services/api'
 import dayjs from 'dayjs'
 import { KnowledgeBaseCard, SharedKnowledgeBaseCard, SearchResultCard } from './components'
 import {
@@ -49,6 +49,13 @@ import {
 } from './utils'
 
 const { TextArea } = Input
+
+const getSearchStageText = (elapsedMs: number): string => {
+  if (elapsedMs < 10000) return '编码中'
+  if (elapsedMs < 60000) return '检索候选中'
+  if (elapsedMs < 180000) return '重排压缩中'
+  return '深度处理中'
+}
 
 /**
  * KnowledgePage - 知识库管理页面（重构版）
@@ -104,7 +111,12 @@ const KnowledgePage = () => {
   const [searchUseContextualCompression, setSearchUseContextualCompression] = useState(true)
   const [searchIncludeAdjacent, setSearchIncludeAdjacent] = useState(false)
   const [searchAdjacentWindow, setSearchAdjacentWindow] = useState<number>(1)
-  const [searchTimeoutMs, setSearchTimeoutMs] = useState<number>(90000)
+  const [searchTimeoutMs, setSearchTimeoutMs] = useState<number>(300000)
+  const [searchAbortController, setSearchAbortController] = useState<AbortController | null>(null)
+  const [searchStageText, setSearchStageText] = useState('')
+  const [searchElapsedSeconds, setSearchElapsedSeconds] = useState(0)
+  const [searchFallbackUsed, setSearchFallbackUsed] = useState(false)
+  const [searchFallbackReason, setSearchFallbackReason] = useState('')
 
   // 共享知识库状态
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
@@ -146,6 +158,25 @@ const KnowledgePage = () => {
 
     return () => clearInterval(interval)
   }, [documents, currentKnowledgeBase])
+
+  useEffect(() => {
+    if (!isSearching) {
+      setSearchStageText('')
+      setSearchElapsedSeconds(0)
+      return
+    }
+
+    const startedAt = Date.now()
+    setSearchStageText(getSearchStageText(0))
+    setSearchElapsedSeconds(0)
+    const timer = setInterval(() => {
+      const elapsedMs = Date.now() - startedAt
+      setSearchStageText(getSearchStageText(elapsedMs))
+      setSearchElapsedSeconds(Math.floor(elapsedMs / 1000))
+    }, 1000)
+
+    return () => clearInterval(timer)
+  }, [isSearching])
 
   // ─── 操作回调 ──────────────────────────────────
   const handleCreate = async (values: { name: string; description?: string }) => {
@@ -190,8 +221,13 @@ const KnowledgePage = () => {
 
   const handleSearch = async () => {
     if (!searchInput.trim()) return
+    const kbIds = currentKnowledgeBase ? [currentKnowledgeBase.id] : undefined
+    const primaryController = new AbortController()
+    setSearchAbortController(primaryController)
+    setSearchFallbackUsed(false)
+    setSearchFallbackReason('')
+
     try {
-      const kbIds = currentKnowledgeBase ? [currentKnowledgeBase.id] : undefined
       await search(
         searchInput,
         kbIds,
@@ -207,11 +243,78 @@ const KnowledgePage = () => {
           includeAdjacentChunks: searchIncludeAdjacent,
           adjacentWindow: searchAdjacentWindow,
           timeoutMs: searchTimeoutMs,
+          signal: primaryController.signal,
         },
       )
-    } catch {
-      // Error handled by store
+      setSearchAbortController(null)
+      return
+    } catch (error) {
+      if (isApiCanceledError(error)) {
+        setSearchAbortController(null)
+        return
+      }
+      if (!isApiTimeoutError(error)) {
+        setSearchAbortController(null)
+        message.error('搜索失败，请稍后重试')
+        return
+      }
     }
+
+    message.warning('主请求超时，正在自动降级重试')
+    const fallbackController = new AbortController()
+    setSearchAbortController(fallbackController)
+    try {
+      await search(
+        searchInput,
+        kbIds,
+        undefined,
+        searchChunkLevel,
+        searchSectionType,
+        searchIncludeParent,
+        {
+          useQueryRewrite: false,
+          useHybrid: searchUseHybrid,
+          useReranker: false,
+          useContextualCompression: false,
+          includeAdjacentChunks: searchIncludeAdjacent,
+          adjacentWindow: searchAdjacentWindow,
+          timeoutMs: 90000,
+          signal: fallbackController.signal,
+        },
+      )
+      setSearchFallbackUsed(true)
+      setSearchFallbackReason('主请求超时后自动降级重试')
+      useKnowledgeStore.setState((state) => ({
+        searchResults: state.searchResults.map((item) => ({
+          ...item,
+          metadata: {
+            ...(item.metadata || {}),
+            fallback_retry_used: true,
+            fallback_retry_reason: 'primary_timeout',
+          },
+        })),
+      }))
+    } catch (fallbackError) {
+      if (isApiCanceledError(fallbackError)) {
+        return
+      }
+      if (isApiTimeoutError(fallbackError)) {
+        message.error('检索超时：主请求与降级重试均超时，请缩短查询或关闭增强选项后重试')
+        return
+      }
+      message.error('降级重试失败，请稍后重试')
+    } finally {
+      setSearchAbortController(null)
+    }
+  }
+
+  const handleCancelSearch = () => {
+    if (!searchAbortController) return
+    searchAbortController.abort()
+    setSearchAbortController(null)
+    setSearchStageText('')
+    setSearchElapsedSeconds(0)
+    message.info('已取消搜索')
   }
 
   // ─── 渲染：知识库列表 ─────────────────────────
@@ -451,7 +554,19 @@ const KnowledgePage = () => {
       <Modal
         title="向量搜索"
         open={searchModalVisible}
-        onCancel={() => { setSearchModalVisible(false); clearSearch(); setSearchInput('') }}
+        onCancel={() => {
+          if (searchAbortController) {
+            searchAbortController.abort()
+            setSearchAbortController(null)
+          }
+          setSearchModalVisible(false)
+          clearSearch()
+          setSearchInput('')
+          setSearchFallbackUsed(false)
+          setSearchFallbackReason('')
+          setSearchStageText('')
+          setSearchElapsedSeconds(0)
+        }}
         footer={null}
         width={720}
       >
@@ -466,6 +581,21 @@ const KnowledgePage = () => {
             size="large"
           />
         </div>
+        {isSearching && (
+          <div className="mb-3 flex items-center justify-between rounded border border-slate-700/60 bg-slate-900/50 px-3 py-2">
+            <span className="text-slate-300 text-xs">
+              {searchStageText || '处理中'}（已等待 {searchElapsedSeconds}s）
+            </span>
+            <Button size="small" danger onClick={handleCancelSearch}>
+              取消
+            </Button>
+          </div>
+        )}
+        {searchFallbackUsed && (
+          <div className="mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-amber-200 text-xs">
+            降级结果：{searchFallbackReason || '已关闭改写/重排/压缩后重试返回'}
+          </div>
+        )}
         <Collapse
           ghost
           className="mb-4"
@@ -485,7 +615,7 @@ const KnowledgePage = () => {
                   || !searchUseContextualCompression
                   || searchIncludeAdjacent
                   || searchAdjacentWindow !== 1
-                  || searchTimeoutMs !== 90000
+                  || searchTimeoutMs !== 300000
                 ) && <Badge dot className="ml-2" />}
               </span>
             ),
@@ -548,9 +678,9 @@ const KnowledgePage = () => {
                     size="small"
                     className="w-full"
                     options={[
-                      { value: 45000, label: '45 秒' },
-                      { value: 90000, label: '90 秒（推荐）' },
+                      { value: 90000, label: '90 秒' },
                       { value: 120000, label: '120 秒' },
+                      { value: 300000, label: '300 秒（推荐）' },
                     ]}
                   />
                 </Col>

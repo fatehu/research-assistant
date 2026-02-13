@@ -78,6 +78,8 @@ const SearchResultCard = ({ result, index }: SearchResultCardProps) => {
   const queryRewriteLlmCalled = asBool(metadata.query_rewrite_llm_called)
   const compressionEnabled = asBool(metadata.contextual_compression_enabled)
   const compressionFallback = asString(metadata.contextual_compression_fallback)
+  const fallbackRetryUsed = asBool(metadata.fallback_retry_used)
+  const fallbackRetryReason = asString(metadata.fallback_retry_reason)
 
   const adjacentContext: AdjacentContextItem[] = Array.isArray(metadata.adjacent_context)
     ? metadata.adjacent_context
@@ -199,6 +201,8 @@ const SearchResultCard = ({ result, index }: SearchResultCardProps) => {
                     <Text className="text-slate-400 text-xs">改写调用LLM: {boolText(queryRewriteLlmCalled)}</Text>
                     <Text className="text-slate-400 text-xs">启用压缩: {boolText(compressionEnabled)}</Text>
                     <Text className="text-slate-400 text-xs">压缩回退原因: {compressionFallback || '-'}</Text>
+                    <Text className="text-slate-400 text-xs">降级重试: {boolText(fallbackRetryUsed)}</Text>
+                    <Text className="text-slate-400 text-xs">降级原因: {fallbackRetryReason || '-'}</Text>
                   </div>
                 </div>
               </div>

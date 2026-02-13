@@ -191,7 +191,7 @@ class DocumentChunk(Base):
     
     # 向量 - 使用 pgvector 的 Vector 类型
     # 维度由 EMBEDDING_DIMENSION 动态确定 (取决于所选嵌入模型)
-    embedding = Column(Vector(EMBEDDING_DIMENSION), nullable=True)
+    embedding = Column(Vector(), nullable=True)
     embedding_model = Column(String(100), nullable=True)
     embedding_dimension = Column(Integer, default=EMBEDDING_DIMENSION, nullable=False)
     

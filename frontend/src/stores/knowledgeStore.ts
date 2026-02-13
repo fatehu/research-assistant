@@ -8,6 +8,8 @@ import {
   SearchResponse,
   KnowledgeSearchOptions,
   ProcessingStatus,
+  isApiCanceledError,
+  isApiTimeoutError,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
@@ -249,7 +251,9 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       })
       return response
     } catch (error) {
-      handleApiError(error, '搜索')
+      if (!isApiCanceledError(error) && !isApiTimeoutError(error)) {
+        handleApiError(error, '搜索')
+      }
       set({ isSearching: false })
       throw error
     }
