@@ -37,6 +37,12 @@ class UserUpdate(BaseModel):
     research_direction: Optional[str] = None
 
 
+class UserPasswordChange(BaseModel):
+    """用户修改密码请求"""
+    old_password: str = Field(..., min_length=6, max_length=100)
+    new_password: str = Field(..., min_length=6, max_length=100)
+
+
 class UserResponse(BaseModel):
     """用户响应模式"""
     model_config = ConfigDict(from_attributes=True)

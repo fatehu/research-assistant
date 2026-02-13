@@ -39,6 +39,20 @@ import api, {
 const { Title, Text } = Typography
 const { Option } = Select
 
+type NotificationPreferences = {
+  login_alert: boolean
+  invite_notification: boolean
+  announcement_notification: boolean
+  system_notification: boolean
+}
+
+const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
+  login_alert: true,
+  invite_notification: true,
+  announcement_notification: true,
+  system_notification: false,
+}
+
 const SettingsPage: React.FC = () => {
   const { user, updateUser } = useAuthStore()
   const [llmForm] = Form.useForm()
@@ -46,7 +60,11 @@ const SettingsPage: React.FC = () => {
 
   const [savingLLM, setSavingLLM] = useState(false)
   const [changingPassword, setChangingPassword] = useState(false)
+  const [savingNotifications, setSavingNotifications] = useState(false)
   const [passwordModalVisible, setPasswordModalVisible] = useState(false)
+  const [notificationPreferences, setNotificationPreferences] = useState<NotificationPreferences>(
+    DEFAULT_NOTIFICATION_PREFERENCES
+  )
 
   const [mcpConfigText, setMcpConfigText] = useState('')
   const [mcpTemplates, setMcpTemplates] = useState<MCPServerTemplate[]>([])
@@ -61,6 +79,12 @@ const SettingsPage: React.FC = () => {
     if (user) {
       llmForm.setFieldsValue({
         preferred_llm_provider: user.preferred_llm_provider || 'openai',
+      })
+      const rawPreferences = (user.preferences || {}) as Record<string, unknown>
+      const rawNotificationPrefs = (rawPreferences.notifications || {}) as Partial<NotificationPreferences>
+      setNotificationPreferences({
+        ...DEFAULT_NOTIFICATION_PREFERENCES,
+        ...rawNotificationPrefs,
       })
     }
   }, [user, llmForm])
@@ -173,6 +197,25 @@ const SettingsPage: React.FC = () => {
     }
   }
 
+  const handleSaveNotificationPreferences = async () => {
+    setSavingNotifications(true)
+    try {
+      const rawPreferences = (user?.preferences || {}) as Record<string, unknown>
+      const response = await api.put('/api/users/profile', {
+        preferences: {
+          ...rawPreferences,
+          notifications: notificationPreferences,
+        },
+      })
+      updateUser(response.data)
+      message.success('通知偏好已保存')
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '保存通知偏好失败')
+    } finally {
+      setSavingNotifications(false)
+    }
+  }
+
   const handleChangePassword = async (values: any) => {
     if (values.new_password !== values.confirm_password) {
       message.error('两次密码输入不一致')
@@ -181,8 +224,8 @@ const SettingsPage: React.FC = () => {
 
     setChangingPassword(true)
     try {
-      await api.post('/api/auth/change-password', {
-        current_password: values.current_password,
+      await api.put('/api/users/password', {
+        old_password: values.current_password,
         new_password: values.new_password,
       })
       message.success('密码已更新')
@@ -377,7 +420,24 @@ const SettingsPage: React.FC = () => {
               </Text>
             </div>
           </div>
-          <Switch defaultChecked disabled />
+          <Switch
+            checked={notificationPreferences.login_alert}
+            onChange={(checked) =>
+              setNotificationPreferences((prev) => ({ ...prev, login_alert: checked }))
+            }
+          />
+        </div>
+
+        <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
+          <Button
+            type="primary"
+            icon={<SaveOutlined />}
+            loading={savingNotifications}
+            onClick={handleSaveNotificationPreferences}
+            style={{ backgroundColor: '#4A90D9', borderColor: '#4A90D9' }}
+          >
+            保存通知偏好
+          </Button>
         </div>
       </Card>
 
@@ -400,7 +460,12 @@ const SettingsPage: React.FC = () => {
               </Text>
             </div>
           </div>
-          <Switch defaultChecked />
+          <Switch
+            checked={notificationPreferences.invite_notification}
+            onChange={(checked) =>
+              setNotificationPreferences((prev) => ({ ...prev, invite_notification: checked }))
+            }
+          />
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -412,7 +477,12 @@ const SettingsPage: React.FC = () => {
               </Text>
             </div>
           </div>
-          <Switch defaultChecked />
+          <Switch
+            checked={notificationPreferences.announcement_notification}
+            onChange={(checked) =>
+              setNotificationPreferences((prev) => ({ ...prev, announcement_notification: checked }))
+            }
+          />
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -424,7 +494,24 @@ const SettingsPage: React.FC = () => {
               </Text>
             </div>
           </div>
-          <Switch />
+          <Switch
+            checked={notificationPreferences.system_notification}
+            onChange={(checked) =>
+              setNotificationPreferences((prev) => ({ ...prev, system_notification: checked }))
+            }
+          />
+        </div>
+
+        <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
+          <Button
+            type="primary"
+            icon={<SaveOutlined />}
+            loading={savingNotifications}
+            onClick={handleSaveNotificationPreferences}
+            style={{ backgroundColor: '#eb2f96', borderColor: '#eb2f96' }}
+          >
+            保存通知偏好
+          </Button>
         </div>
       </Card>
 

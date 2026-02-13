@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import get_current_user, get_password_hash
 from app.models.user import User
-from app.schemas.user import UserResponse, UserUpdate
+from app.schemas.user import UserPasswordChange, UserResponse, UserUpdate
 
 router = APIRouter()
 
@@ -39,21 +39,26 @@ async def update_profile(
 
 @router.put("/password")
 async def change_password(
-    old_password: str,
-    new_password: str,
+    payload: UserPasswordChange,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """修改密码"""
     from app.core.security import verify_password
     
-    if not verify_password(old_password, current_user.hashed_password):
+    if not verify_password(payload.old_password, current_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="原密码错误"
         )
     
-    current_user.hashed_password = get_password_hash(new_password)
+    if payload.old_password == payload.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="新密码不能与旧密码相同",
+        )
+
+    current_user.hashed_password = get_password_hash(payload.new_password)
     await db.commit()
     
     return {"message": "密码修改成功"}
