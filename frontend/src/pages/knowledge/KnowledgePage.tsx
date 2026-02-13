@@ -101,7 +101,9 @@ const KnowledgePage = () => {
   const [searchUseQueryRewrite, setSearchUseQueryRewrite] = useState(true)
   const [searchUseHybrid, setSearchUseHybrid] = useState(true)
   const [searchUseReranker, setSearchUseReranker] = useState(true)
-  const [searchUseContextualCompression, setSearchUseContextualCompression] = useState(false)
+  const [searchUseContextualCompression, setSearchUseContextualCompression] = useState(true)
+  const [searchIncludeAdjacent, setSearchIncludeAdjacent] = useState(false)
+  const [searchAdjacentWindow, setSearchAdjacentWindow] = useState<number>(1)
   const [searchTimeoutMs, setSearchTimeoutMs] = useState<number>(90000)
 
   // 共享知识库状态
@@ -202,6 +204,8 @@ const KnowledgePage = () => {
           useHybrid: searchUseHybrid,
           useReranker: searchUseReranker,
           useContextualCompression: searchUseContextualCompression,
+          includeAdjacentChunks: searchIncludeAdjacent,
+          adjacentWindow: searchAdjacentWindow,
           timeoutMs: searchTimeoutMs,
         },
       )
@@ -478,7 +482,9 @@ const KnowledgePage = () => {
                   || !searchUseQueryRewrite
                   || !searchUseHybrid
                   || !searchUseReranker
-                  || searchUseContextualCompression
+                  || !searchUseContextualCompression
+                  || searchIncludeAdjacent
+                  || searchAdjacentWindow !== 1
                   || searchTimeoutMs !== 90000
                 ) && <Badge dot className="ml-2" />}
               </span>
@@ -507,6 +513,32 @@ const KnowledgePage = () => {
                   <div className="text-slate-400 text-xs mb-1">父级上下文</div>
                   <Switch checked={searchIncludeParent} onChange={setSearchIncludeParent} checkedChildren="开启" unCheckedChildren="关闭" size="small" />
                   <span className="text-slate-500 text-xs ml-2">回溯上级</span>
+                </Col>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">相邻上下文</div>
+                  <Switch
+                    checked={searchIncludeAdjacent}
+                    onChange={setSearchIncludeAdjacent}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                    size="small"
+                  />
+                  <span className="text-slate-500 text-xs ml-2">返回前后窗口</span>
+                </Col>
+                <Col span={8}>
+                  <div className="text-slate-400 text-xs mb-1">相邻窗口大小</div>
+                  <Select
+                    value={searchAdjacentWindow}
+                    onChange={setSearchAdjacentWindow}
+                    size="small"
+                    className="w-full"
+                    disabled={!searchIncludeAdjacent}
+                    options={[
+                      { value: 1, label: '1（前后各1段）' },
+                      { value: 2, label: '2（前后各2段）' },
+                      { value: 3, label: '3（前后各3段）' },
+                    ]}
+                  />
                 </Col>
                 <Col span={8}>
                   <div className="text-slate-400 text-xs mb-1">请求超时</div>

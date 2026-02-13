@@ -243,7 +243,10 @@ export interface KnowledgeSearchOptions {
   useReranker?: boolean
   useHybrid?: boolean
   useQueryRewrite?: boolean
+  rewriteMode?: 'auto' | 'force' | 'off'
   useContextualCompression?: boolean
+  includeAdjacentChunks?: boolean
+  adjacentWindow?: number
   queryRewriteStrategies?: string[]
   timeoutMs?: number
 }
@@ -557,10 +560,14 @@ export const knowledgeApi = {
       useReranker = true,
       useHybrid = true,
       useQueryRewrite = true,
-      useContextualCompression = false,
+      rewriteMode = 'auto',
+      useContextualCompression = true,
+      includeAdjacentChunks = false,
+      adjacentWindow = 1,
       queryRewriteStrategies,
       timeoutMs = 60000,
     } = options
+    const normalizedAdjacentWindow = Math.max(1, Math.min(3, adjacentWindow))
 
     const response = await api.post('/api/knowledge/search', {
       query,
@@ -570,9 +577,12 @@ export const knowledgeApi = {
       use_reranker: useReranker,
       use_hybrid: useHybrid,
       use_query_rewrite: useQueryRewrite,
+      rewrite_mode: rewriteMode,
       use_contextual_compression: useContextualCompression,
+      include_adjacent_chunks: includeAdjacentChunks,
+      adjacent_window: normalizedAdjacentWindow,
       query_rewrite_strategies: queryRewriteStrategies,
-      // [Fix 12] 灞傜骇妫€绱㈠弬鏁?      chunk_level: chunkLevel,
+      chunk_level: chunkLevel,
       section_type: sectionType || undefined,
       include_parent_context: includeParentContext,
     }, {

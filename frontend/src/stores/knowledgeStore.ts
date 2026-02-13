@@ -236,9 +236,11 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
   ) => {
     set({ isSearching: true, searchQuery: query })
     try {
+      // Keep all search option fields intact when forwarding to API.
+      const searchOptions: KnowledgeSearchOptions = { ...options }
       const response = await knowledgeApi.search(
         query, knowledgeBaseIds, 5, 0.5, includeShared,
-        chunkLevel, sectionType, includeParentContext, options,
+        chunkLevel, sectionType, includeParentContext, searchOptions,
       )
       set({
         searchResults: response.results,
