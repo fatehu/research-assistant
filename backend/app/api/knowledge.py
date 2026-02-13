@@ -886,6 +886,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             # 更新文档状态
             doc.status = DocumentStatus.COMPLETED.value
+            doc.error_message = None
             doc.chunk_count = len(chunks_to_save)
             doc.processed_at = datetime.utcnow()
             
