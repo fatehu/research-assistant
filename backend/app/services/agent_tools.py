@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional, Set, Callable
 from dataclasses import dataclass
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, or_, and_
+from sqlalchemy import select, text, or_, and_, tuple_
 
 from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
@@ -22,6 +22,11 @@ from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_s
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.vector_search_tuning import apply_hnsw_ef_search, resolve_ef_search
 from app.services.chinese_segmentation_service import segment_text_for_fts
+from app.services.contextual_retrieval_service import (
+    build_adjacent_lookup_keys,
+    merge_adjacent_context,
+    normalize_adjacent_window,
+)
 
 # 尝试导入共享模块（可选）
 try:
@@ -364,6 +369,16 @@ class KnowledgeSearchTool(Tool):
                 "type": "integer",
                 "description": "返回结果数量，默认5",
                 "default": 5
+            },
+            "include_adjacent_chunks": {
+                "type": "boolean",
+                "description": "是否返回命中 chunk 的相邻上下文",
+                "default": False
+            },
+            "adjacent_window": {
+                "type": "integer",
+                "description": "相邻窗口大小（1-3）",
+                "default": 1
             }
         },
         "required": ["query"]
@@ -381,10 +396,22 @@ class KnowledgeSearchTool(Tool):
         self.embedding_service = get_embedding_service()
         self.query_rewrite_service = get_query_rewrite_service()
     
-    async def execute(self, query: str, top_k: int = 5) -> ToolResult:
+    async def execute(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_adjacent_chunks: bool = False,
+        adjacent_window: int = 1,
+    ) -> ToolResult:
         """执行知识库搜索（自动选择会话策略）"""
         if self.db is not None:
-            return await self._execute_with_db(self.db, query, top_k)
+            return await self._execute_with_db(
+                self.db,
+                query,
+                top_k,
+                include_adjacent_chunks=include_adjacent_chunks,
+                adjacent_window=adjacent_window,
+            )
 
         if self.db_session_factory is None:
             return ToolResult(
@@ -395,7 +422,13 @@ class KnowledgeSearchTool(Tool):
 
         try:
             async with self.db_session_factory() as db:
-                return await self._execute_with_db(db, query, top_k)
+                return await self._execute_with_db(
+                    db,
+                    query,
+                    top_k,
+                    include_adjacent_chunks=include_adjacent_chunks,
+                    adjacent_window=adjacent_window,
+                )
         except Exception as e:
             logger.error(f"知识库搜索失败（短会话模式）: {e}")
             return ToolResult(
@@ -409,6 +442,8 @@ class KnowledgeSearchTool(Tool):
         db: AsyncSession,
         query: str,
         top_k: int = 5,
+        include_adjacent_chunks: bool = False,
+        adjacent_window: int = 1,
     ) -> ToolResult:
         """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
@@ -673,6 +708,7 @@ class KnowledgeSearchTool(Tool):
             
             # 构建结果
             results = []
+            adjacent_targets: list[tuple[int, int, int]] = []
             max_rrf_score = max((c.rrf_score for c in fused_candidates), default=0.0)
             for candidate, reranker_score in selected_candidates:
                 row = candidate.row
@@ -696,11 +732,13 @@ class KnowledgeSearchTool(Tool):
                 else:
                     score = 0.0
 
-                results.append({
+                result_item = {
                     "content": row.content,
                     "score": score,
                     "document": row.document_name or "未知",
                     "knowledge_base": row.knowledge_base_name or "未知",
+                    "document_id": row.document_id,
+                    "chunk_id": row.id,
                     "chunk_index": row.chunk_index,
                     "retrieval_mode": "hybrid" if use_hybrid else "vector",
                     "query_rewrite_enabled": rewrite_result.enabled,
@@ -719,7 +757,43 @@ class KnowledgeSearchTool(Tool):
                     "vector_score": vector_score,
                     "text_score": text_score,
                     "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
-                })
+                }
+                results.append(result_item)
+
+                chunk_index = int(getattr(row, "chunk_index", -1) or -1)
+                if include_adjacent_chunks and chunk_index >= 0:
+                    adjacent_targets.append((len(results) - 1, int(row.document_id), chunk_index))
+
+            if include_adjacent_chunks and adjacent_targets:
+                window = normalize_adjacent_window(adjacent_window)
+                neighbor_keys: set[tuple[int, int]] = set()
+                for _, doc_id, chunk_index in adjacent_targets:
+                    neighbor_keys.update(build_adjacent_lookup_keys(doc_id, chunk_index, window))
+
+                adjacent_map: dict[tuple[int, int], Any] = {}
+                if neighbor_keys:
+                    adjacent_result = await db.execute(
+                        select(
+                            DocumentChunk.id,
+                            DocumentChunk.document_id,
+                            DocumentChunk.chunk_index,
+                            DocumentChunk.chunk_level,
+                            DocumentChunk.section_title,
+                            DocumentChunk.content,
+                        ).where(tuple_(DocumentChunk.document_id, DocumentChunk.chunk_index).in_(list(neighbor_keys)))
+                    )
+                    adjacent_map = {
+                        (int(row.document_id), int(row.chunk_index)): row
+                        for row in adjacent_result.fetchall()
+                    }
+
+                for idx, doc_id, chunk_index in adjacent_targets:
+                    results[idx]["adjacent_context"] = merge_adjacent_context(
+                        document_id=doc_id,
+                        chunk_index=chunk_index,
+                        window=window,
+                        row_map=adjacent_map,
+                    )
             
             # 格式化输出
             output_parts = [f"找到 {len(results)} 条相关结果：\n"]

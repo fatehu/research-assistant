@@ -1,15 +1,14 @@
-"""
-知识库相关的 Pydantic schemas
-"""
+"""Pydantic schemas for knowledge base APIs."""
+
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Literal
+from typing import Any, Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
-# ========== 知识库 Schemas ==========
-
 class KnowledgeBaseCreate(BaseModel):
-    """创建知识库"""
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
     embedding_model: str = "BAAI/bge-m3"
@@ -18,7 +17,6 @@ class KnowledgeBaseCreate(BaseModel):
 
 
 class KnowledgeBaseUpdate(BaseModel):
-    """更新知识库"""
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     description: Optional[str] = None
     is_public: Optional[bool] = None
@@ -26,7 +24,6 @@ class KnowledgeBaseUpdate(BaseModel):
 
 
 class KnowledgeBaseResponse(BaseModel):
-    """知识库响应"""
     id: int
     user_id: int
     name: str
@@ -47,15 +44,11 @@ class KnowledgeBaseResponse(BaseModel):
 
 
 class KnowledgeBaseListResponse(BaseModel):
-    """知识库列表响应"""
     items: List[KnowledgeBaseResponse]
     total: int
 
 
-# ========== 文档 Schemas ==========
-
 class DocumentUploadResponse(BaseModel):
-    """文档上传响应"""
     id: int
     filename: str
     original_filename: str
@@ -66,7 +59,6 @@ class DocumentUploadResponse(BaseModel):
 
 
 class DocumentResponse(BaseModel):
-    """文档响应"""
     id: int
     knowledge_base_id: int
     filename: str
@@ -87,21 +79,16 @@ class DocumentResponse(BaseModel):
 
 
 class DocumentListResponse(BaseModel):
-    """文档列表响应"""
     items: List[DocumentResponse]
     total: int
 
 
 class DocumentDetailResponse(DocumentResponse):
-    """文档详情响应"""
     content: Optional[str] = None
     metadata: Dict[str, Any] = {}
 
 
-# ========== 分片 Schemas ==========
-
 class ChunkResponse(BaseModel):
-    """分片响应"""
     id: int
     document_id: int
     chunk_index: int
@@ -117,51 +104,55 @@ class ChunkResponse(BaseModel):
 
 
 class ChunkListResponse(BaseModel):
-    """分片列表响应"""
     items: List[ChunkResponse]
     total: int
 
 
-# ========== 搜索 Schemas ==========
-
 class SearchRequest(BaseModel):
-    """向量搜索请求"""
     query: str = Field(..., min_length=1, max_length=2000)
-    knowledge_base_ids: Optional[List[int]] = None  # 不指定则搜索所有知识库
+    knowledge_base_ids: Optional[List[int]] = None
     top_k: int = Field(default=5, ge=1, le=20)
     score_threshold: float = Field(default=0.05, ge=0, le=1)
-    use_reranker: bool = Field(default=True, description="是否启用Reranker精排")
+    use_reranker: bool = Field(default=True, description="是否启用重排")
     use_hybrid: bool = Field(default=True, description="是否启用混合检索（向量+全文）")
-    use_query_rewrite: bool = Field(default=True, description="是否启用Query Rewrite改写")
+    use_query_rewrite: bool = Field(default=True, description="是否启用 Query Rewrite")
     rewrite_mode: Literal["auto", "force", "off"] = Field(
         default="auto",
-        description="改写模式，优先级高于 use_query_rewrite：auto/force/off",
+        description="改写模式，优先级高于 use_query_rewrite",
     )
     query_rewrite_strategies: Optional[List[str]] = Field(
         default=None,
-        description="可选改写策略: synonym/hyde/decompose"
+        description="可选改写策略：synonym/hyde/decompose",
     )
-    # [Fix 12] 新增字段：chunk_level 过滤
     chunk_level: Optional[str] = Field(
         default="paragraph",
-        description="搜索的分块层级: paragraph/section/document/all"
+        description="检索分块层级：paragraph/section/document/all",
     )
     section_type: Optional[str] = Field(
         default=None,
-        description="过滤章节类型: abstract/methodology/results 等"
+        description="可选章节类型过滤",
     )
     include_parent_context: bool = Field(
         default=False,
-        description="是否同时返回父级 chunk 作为上下文"
+        description="是否返回父级 chunk 上下文",
+    )
+    include_adjacent_chunks: bool = Field(
+        default=False,
+        description="是否返回命中 chunk 的相邻上下文",
+    )
+    adjacent_window: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="相邻窗口大小（1-3）",
     )
     use_contextual_compression: bool = Field(
         default=False,
-        description="是否启用检索结果的上下文压缩（会增加延迟）"
+        description="是否启用上下文压缩",
     )
 
 
 class SearchResultItem(BaseModel):
-    """搜索结果项"""
     chunk_id: int
     document_id: int
     knowledge_base_id: int
@@ -171,28 +162,23 @@ class SearchResultItem(BaseModel):
     score: float
     chunk_index: int
     metadata: Dict[str, Any] = {}
-    # [Fix 12] 新增字段：层级信息
     chunk_level: Optional[str] = None
     section_type: Optional[str] = None
     section_title: Optional[str] = None
-    parent_context: Optional[str] = None  # 父级 chunk 的内容摘要
+    parent_context: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
-    """搜索响应"""
     query: str
     results: List[SearchResultItem]
     total: int
     search_time_ms: float
 
 
-# ========== 处理状态 Schemas ==========
-
 class ProcessingStatus(BaseModel):
-    """处理状态"""
     document_id: int
     status: str
-    progress: float  # 0-100
+    progress: float
     message: str
     chunk_count: int = 0
     error: Optional[str] = None

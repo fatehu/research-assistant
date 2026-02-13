@@ -7,10 +7,10 @@ import shutil
 import time
 import uuid
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete, or_, and_
+from sqlalchemy import select, func, delete, or_, and_, tuple_
 from loguru import logger
 
 from app.config import settings
@@ -45,6 +45,13 @@ from app.services.query_rewrite_service import QueryVariant, get_query_rewrite_s
 from app.services.reranker_service import get_reranker_service, RerankerService
 from app.services.vector_search_tuning import apply_hnsw_ef_search, resolve_ef_search
 from app.services.chinese_segmentation_service import segment_text_for_fts
+from app.services.contextual_retrieval_service import (
+    build_adjacent_lookup_keys,
+    build_context_summary,
+    compose_embedding_input,
+    merge_adjacent_context,
+    normalize_adjacent_window,
+)
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -735,11 +742,30 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 
             # 按位置排序
             chunks_to_save.sort(key=lambda x: x["start_char"])
-            
+
             # 生成嵌入向量
             logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
-            chunk_texts = [c["content"] for c in chunks_to_save]
-            embeddings = await processor.embed_chunks(chunk_texts, embedding_svc=embedding_svc)
+            chunk_context_summaries: list[str] = []
+            embedding_inputs: list[str] = []
+            for chunk_data in chunks_to_save:
+                meta = chunk_data.get("metadata", {}) or {}
+                context_summary = build_context_summary(
+                    document_name=doc.original_filename,
+                    chunk_level=meta.get("level", "paragraph"),
+                    section_title=meta.get("section_title"),
+                    section_type=meta.get("section_type"),
+                    metadata=meta,
+                )
+                chunk_context_summaries.append(context_summary)
+                embedding_inputs.append(
+                    compose_embedding_input(
+                        content=chunk_data["content"],
+                        context_summary=context_summary,
+                        chunk_level=meta.get("level", "paragraph"),
+                    )
+                )
+
+            embeddings = await processor.embed_chunks(embedding_inputs, embedding_svc=embedding_svc)
             
             # 创建分片记录
             smart_id_map = {} # str_id -> DocumentChunk
@@ -752,6 +778,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     knowledge_base_id=doc.knowledge_base_id,
                     content=chunk_data["content"],
                     content_segmented=segment_text_for_fts(chunk_data["content"]),
+                    context_summary=chunk_context_summaries[i] if i < len(chunk_context_summaries) else None,
                     chunk_index=i,
                     start_char=chunk_data["start_char"],
                     end_char=chunk_data["end_char"],
@@ -786,6 +813,13 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     knowledge_base_id=doc.knowledge_base_id,
                     content=chunk_data["content"],
                     content_segmented=segment_text_for_fts(chunk_data["content"]),
+                    context_summary=build_context_summary(
+                        document_name=doc.original_filename,
+                        chunk_level=meta.get("level", "section"),
+                        section_title=meta.get("section_title"),
+                        section_type=meta.get("section_type"),
+                        metadata=meta,
+                    ),
                     chunk_index=-1, # context chunk index 设为 -1 或其他标记
                     start_char=chunk_data["start_char"],
                     end_char=chunk_data["end_char"],
@@ -1368,6 +1402,7 @@ async def search_knowledge(
 
     results = []
     parent_ids_to_fetch = set()
+    adjacent_targets: list[tuple[int, int, int]] = []
     
     max_rrf_score = max((c.rrf_score for c in fused_candidates), default=0.0)
     for source_id, (candidate, reranker_score) in enumerate(selected_candidates, start=1):
@@ -1464,6 +1499,10 @@ async def search_knowledge(
             section_title=getattr(row, 'section_title', None),
         )
         results.append(item)
+
+        chunk_index = int(getattr(row, "chunk_index", -1) or -1)
+        if request.include_adjacent_chunks and chunk_index >= 0:
+            adjacent_targets.append((len(results) - 1, int(row.document_id), chunk_index))
         
         # [Fix 12] 收集需要回溯的父级 chunk
         parent_id = getattr(row, 'parent_chunk_id', None)
@@ -1506,6 +1545,42 @@ async def search_knowledge(
                     results[idx].parent_context = parent.content[:200] + "..."
                 if not results[idx].section_title:
                     results[idx].section_title = parent.section_title
+
+    # 相邻窗口上下文补充
+    if request.include_adjacent_chunks and adjacent_targets:
+        window = normalize_adjacent_window(request.adjacent_window)
+        neighbor_keys: set[tuple[int, int]] = set()
+        for _, doc_id, chunk_index in adjacent_targets:
+            neighbor_keys.update(build_adjacent_lookup_keys(doc_id, chunk_index, window))
+
+        adjacent_map: dict[tuple[int, int], Any] = {}
+        if neighbor_keys:
+            adjacent_rows = await db.execute(
+                select(
+                    DocumentChunk.id,
+                    DocumentChunk.document_id,
+                    DocumentChunk.chunk_index,
+                    DocumentChunk.chunk_level,
+                    DocumentChunk.section_title,
+                    DocumentChunk.content,
+                ).where(
+                    tuple_(DocumentChunk.document_id, DocumentChunk.chunk_index).in_(list(neighbor_keys))
+                )
+            )
+            adjacent_map = {
+                (int(row.document_id), int(row.chunk_index)): row
+                for row in adjacent_rows.fetchall()
+            }
+
+        for idx, doc_id, chunk_index in adjacent_targets:
+            metadata = dict(results[idx].metadata or {})
+            metadata["adjacent_context"] = merge_adjacent_context(
+                document_id=doc_id,
+                chunk_index=chunk_index,
+                window=window,
+                row_map=adjacent_map,
+            )
+            results[idx].metadata = metadata
     
     search_time = (time.time() - start_time) * 1000
     
