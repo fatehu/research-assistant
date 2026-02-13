@@ -100,6 +100,9 @@ class Settings(BaseSettings):
     contextual_compression_skip_rerank_threshold: float = 0.82
     contextual_compression_batch_retry_attempts: int = 2
 
+    # Document processing safety guard
+    document_processing_stale_timeout_seconds: int = 7200
+
     # LLM runtime
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096

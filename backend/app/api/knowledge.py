@@ -52,6 +52,10 @@ from app.services.contextual_retrieval_service import (
     merge_adjacent_context,
     normalize_adjacent_window,
 )
+from app.services.document_status_guard_service import (
+    build_timeout_error_message,
+    is_stale_processing_status,
+)
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -1001,6 +1005,28 @@ async def get_document_status(
     progress = 0
     message = "等待处理"
     
+    stale_timeout_seconds = max(
+        int(getattr(settings, "document_processing_stale_timeout_seconds", 7200)),
+        60,
+    )
+    last_updated_at = doc.updated_at or doc.created_at
+    if is_stale_processing_status(
+        status=doc.status,
+        last_updated_at=last_updated_at,
+        timeout_seconds=stale_timeout_seconds,
+    ):
+        previous_error = (doc.error_message or "").strip()
+        timeout_error = build_timeout_error_message(stale_timeout_seconds)
+        doc.status = DocumentStatus.FAILED.value
+        doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
+        await db.commit()
+        await db.refresh(doc)
+        logger.warning(
+            "document status auto-failed due to stale processing: "
+            f"doc_id={doc.id}, kb_id={kb_id}, last_updated_at={last_updated_at}, "
+            f"timeout_seconds={stale_timeout_seconds}"
+        )
+
     if doc.status == DocumentStatus.PENDING.value:
         progress = 0
         message = "等待处理"
