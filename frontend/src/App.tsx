@@ -8,6 +8,7 @@ import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import ChatPage from '@/pages/chat/ChatPage'
+import ChatManagePage from '@/pages/chat/ChatManagePage'
 import KnowledgePage from '@/pages/knowledge/KnowledgePage'
 import SmartChunkingPage from '@/pages/knowledge/SmartChunkingPage'
 import { LiteraturePage } from '@/pages/literature'
@@ -136,10 +137,6 @@ function App() {
           }
         />
 
-        import ErrorBoundary from '@/components/common/ErrorBoundary'
-
-        // ... (existing imports)
-
         {/* 私有路由 */}
         <Route
           path="/"
@@ -154,6 +151,7 @@ function App() {
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="chat" element={<ChatPage />} />
+          <Route path="chat/manage" element={<ChatManagePage />} />
           <Route path="chat/:conversationId" element={<ChatPage />} />
           <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="knowledge/:kbId" element={<KnowledgePage />} />

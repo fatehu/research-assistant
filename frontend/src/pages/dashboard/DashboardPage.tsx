@@ -551,11 +551,11 @@ const DashboardPage = () => {
                 icon={<MessageOutlined />}
                 onClick={() => {
                   setShowAllConversations(false)
-                  navigate('/chat')
+                  navigate('/chat/manage')
                 }}
                 className="!h-10 !rounded-xl !border-emerald-400/40 !bg-emerald-500/10 !text-emerald-100 hover:!border-emerald-300 hover:!text-white"
               >
-                前往聊天页
+                前往聊天管理
               </Button>
               <Button
                 key="close"
@@ -569,7 +569,7 @@ const DashboardPage = () => {
           }
         >
           <div className="mb-3 rounded-xl border border-emerald-400/25 bg-emerald-500/10 px-3 py-2.5 text-xs text-emerald-100/90">
-            可直接点击任一会话进入详情，或进入聊天页管理全部历史会话。
+            可直接点击任一会话进入详情，或进入聊天管理页面统一维护历史会话。
           </div>
           {orderedConversations.length > 0 ? (
             <div className="max-h-[62vh] overflow-y-auto space-y-2 pr-1">
