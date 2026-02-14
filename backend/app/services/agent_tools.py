@@ -67,7 +67,7 @@ class Tool:
     name: str
     description: str
     parameters: Dict[str, Any]
-    parallel_safe: bool = True
+    parallel_safe: bool = False
 
     async def execute(self, **kwargs) -> ToolResult:
         raise NotImplementedError
@@ -269,6 +269,7 @@ class WebSearchTool(ToolBase):
     """Web 搜索工具 - Serper -> Tavily -> DDGS。"""
 
     name = "web_search"
+    parallel_safe = True
     description = "搜索互联网获取最新信息。当用户问题涉及新闻、实时信息、天气、或需要网络查询时使用。"
     parameters = {
         "type": "object",
@@ -566,6 +567,7 @@ class KnowledgeRetrieveState:
 class KnowledgeSearchTool(ToolBase):
     """知识库搜索工具 - 使用 pgvector 进行向量检索"""
     name = "knowledge_search"
+    parallel_safe = True
     description = "搜索用户的知识库，检索与查询相关的文档片段。当用户问题涉及他们上传的文档、论文、资料时使用此工具。"
     parameters = {
         "type": "object",
@@ -1325,6 +1327,7 @@ class CalculatorInput(BaseModel):
 class CalculatorTool(ToolBase):
     """计算器工具 - 执行数学计算"""
     name = "calculator"
+    parallel_safe = True
     description = "执行数学计算，支持基本运算、三角函数、对数、幂运算等。当需要进行数值计算时使用。"
     parameters = {
         "type": "object",
@@ -1432,6 +1435,7 @@ class CalculatorTool(ToolBase):
 class DateTimeTool(Tool):
     """日期时间工具"""
     name = "datetime"
+    parallel_safe = True
     description = "获取当前日期时间，或进行日期计算。当用户询问时间、日期相关问题时使用。"
     parameters = {
         "type": "object",
@@ -1495,6 +1499,7 @@ class DateTimeTool(Tool):
 class TextAnalysisTool(Tool):
     """文本分析工具"""
     name = "text_analysis"
+    parallel_safe = True
     description = "分析文本的基本统计信息，如字数、词数、句子数等。用于文本分析需求。"
     parameters = {
         "type": "object",
@@ -1602,6 +1607,7 @@ class TextAnalysisTool(Tool):
 class UnitConverterTool(Tool):
     """单位转换工具"""
     name = "unit_converter"
+    parallel_safe = True
     description = "进行常见单位转换，如长度、重量、温度、数据存储等。"
     parameters = {
         "type": "object",
@@ -1726,6 +1732,7 @@ class LiteratureSearchInput(BaseModel):
 class LiteratureSearchTool(ToolBase):
     """学术文献搜索工具 - 使用 Semantic Scholar 和 arXiv API"""
     name = "literature_search"
+    parallel_safe = True
     description = "搜索学术论文和文献。可以搜索 Semantic Scholar 或 arXiv 数据库，获取论文标题、摘要、作者、引用数等信息。适用于学术研究、文献综述、找相关论文等场景。"
     parameters = {
         "type": "object",
@@ -2355,7 +2362,7 @@ class ToolRegistry:
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
-                    "x_parallel_safe": bool(getattr(tool, "parallel_safe", True)),
+                    "x_parallel_safe": bool(getattr(tool, "parallel_safe", False)),
                 }
             }
             for tool in filtered_tools

@@ -52,6 +52,10 @@ class _SafeTool:
     parallel_safe = True
 
 
+class _UnsafeTool:
+    pass
+
+
 class _ParallelTools:
     def get_tools_description(self, **kwargs):
         return "- slow_tool: 慢工具"
@@ -82,6 +86,13 @@ class _ParallelTools:
         return ToolResult(success=True, output=f"value={kwargs.get('value')}")
 
 
+class _SerialTools(_ParallelTools):
+    def get(self, name: str):
+        if name == "slow_tool":
+            return _UnsafeTool()
+        return None
+
+
 @pytest.mark.asyncio
 async def test_parallel_tool_calls_reduce_latency(monkeypatch):
     monkeypatch.setattr(settings, "agent_parallel_tool_calls_enabled", True)
@@ -100,3 +111,23 @@ async def test_parallel_tool_calls_reduce_latency(monkeypatch):
     assert len(observations) == 2
     assert len(done) == 1
     assert elapsed < 0.5
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_require_explicit_parallel_safe(monkeypatch):
+    monkeypatch.setattr(settings, "agent_parallel_tool_calls_enabled", True)
+    monkeypatch.setattr(settings, "agent_parallel_tool_calls_max_concurrency", 4)
+    agent = ReActAgent(_ParallelLLM(), _SerialTools(), max_iterations=3)
+
+    started = time.perf_counter()
+    events = []
+    async for event in agent.run([{"role": "user", "content": "并行测一下"}], stream=False):
+        events.append(event)
+    elapsed = time.perf_counter() - started
+
+    observations = [e for e in events if e.get("type") == "observation"]
+    done = [e for e in events if e.get("type") == "done"]
+
+    assert len(observations) == 2
+    assert len(done) == 1
+    assert elapsed >= 0.45

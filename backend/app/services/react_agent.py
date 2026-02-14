@@ -653,7 +653,7 @@ class AgentCore:
             pending: List[asyncio.Task[None]] = []
             for i, call in enumerate(calls):
                 tool_obj = self.tools.get(call.name) if hasattr(self.tools, "get") else None
-                is_safe = bool(getattr(tool_obj, "parallel_safe", True)) if tool_obj is not None else True
+                is_safe = bool(getattr(tool_obj, "parallel_safe", False)) if tool_obj is not None else False
                 if is_safe:
                     pending.append(asyncio.create_task(_run_one(i, sem)))
                 else:
