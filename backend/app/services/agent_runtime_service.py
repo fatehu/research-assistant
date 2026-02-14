@@ -110,16 +110,19 @@ class AgentRuntimeService:
                         if key in data:
                             metadata[key] = data.get(key)
 
+                step_type = str(step.get("type", "unknown"))
+                if step_type in {"thought", "content", "answer", "error"}:
+                    text_content = data if not isinstance(data, dict) else step.get("content", "")
+                    content = str(text_content or "")
+                else:
+                    content = str(data.get("output", "")) if isinstance(data, dict) else ""
+
                 db.add(
                     AgentStepRecord(
                         run_id=run_id,
                         step_index=idx,
-                        step_type=str(step.get("type", "unknown")),
-                        content=(
-                            str(step.get("content", ""))
-                            if step.get("type") in {"thought", "content", "answer"}
-                            else str(data.get("output", "")) if isinstance(data, dict) else ""
-                        ),
+                        step_type=step_type,
+                        content=content,
                         tool_name=str(data.get("tool", "")) if isinstance(data, dict) else None,
                         tool_input=data.get("input") if isinstance(data, dict) else None,
                         tool_output=str(data.get("output", "")) if isinstance(data, dict) else None,
