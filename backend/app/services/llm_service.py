@@ -214,24 +214,112 @@ class LLMService:
             system_prompt += f"\n\n可用工具:\n{tools_desc}"
 
         yield {"type": "start", "data": {"provider": self.provider, "model": self.config["model"]}}
+        open_think = "<think>"
+        close_think = "</think>"
+        open_answer = "<answer>"
+        close_answer = "</answer>"
+        tag_prefixes = [open_think, close_think, open_answer, close_answer]
 
-        full_response = ""
+        mode = "outside"
+        buffer = ""
+        thought_parts: List[str] = []
+        answer_parts: List[str] = []
+        thinking_started = False
+
         async for chunk in self.chat_stream(messages, system_prompt):
-            full_response += chunk
+            buffer += chunk
+            while True:
+                if mode == "outside":
+                    candidates = [
+                        (idx, "think")
+                        for idx in [buffer.find(open_think)]
+                        if idx >= 0
+                    ] + [
+                        (idx, "answer")
+                        for idx in [buffer.find(open_answer)]
+                        if idx >= 0
+                    ]
+                    if not candidates:
+                        keep = max(len(open_think), len(open_answer)) - 1
+                        if len(buffer) > keep:
+                            plain = buffer[:-keep]
+                            if plain:
+                                answer_parts.append(plain)
+                                yield {"type": "content", "data": plain}
+                            buffer = buffer[-keep:]
+                        break
 
-        think_match = re.search(r"<think>(.*?)</think>", full_response, re.DOTALL)
-        answer_match = re.search(r"<answer>(.*?)</answer>", full_response, re.DOTALL)
+                    idx, tag_type = min(candidates, key=lambda item: item[0])
+                    if idx > 0:
+                        plain = buffer[:idx]
+                        answer_parts.append(plain)
+                        yield {"type": "content", "data": plain}
 
-        thought = think_match.group(1).strip() if think_match else ""
-        answer = answer_match.group(1).strip() if answer_match else re.sub(
-            r"</?(?:think|answer)>", "", full_response
-        ).strip()
+                    if tag_type == "think":
+                        if not thinking_started:
+                            thinking_started = True
+                            yield {"type": "thinking_start", "data": ""}
+                        buffer = buffer[idx + len(open_think):]
+                        mode = "think"
+                    else:
+                        buffer = buffer[idx + len(open_answer):]
+                        mode = "answer"
+                    continue
+
+                if mode == "think":
+                    close_idx = buffer.find(close_think)
+                    if close_idx >= 0:
+                        thought_parts.append(buffer[:close_idx])
+                        buffer = buffer[close_idx + len(close_think):]
+                        mode = "outside"
+                        continue
+
+                    keep = len(close_think) - 1
+                    if len(buffer) > keep:
+                        thought_parts.append(buffer[:-keep])
+                        buffer = buffer[-keep:]
+                    break
+
+                close_idx = buffer.find(close_answer)
+                if close_idx >= 0:
+                    answer_chunk = buffer[:close_idx]
+                    if answer_chunk:
+                        answer_parts.append(answer_chunk)
+                        yield {"type": "content", "data": answer_chunk}
+                    buffer = buffer[close_idx + len(close_answer):]
+                    mode = "outside"
+                    continue
+
+                keep = len(close_answer) - 1
+                if len(buffer) > keep:
+                    answer_chunk = buffer[:-keep]
+                    if answer_chunk:
+                        answer_parts.append(answer_chunk)
+                        yield {"type": "content", "data": answer_chunk}
+                    buffer = buffer[-keep:]
+                break
+
+        if mode == "think":
+            thought_parts.append(buffer)
+            buffer = ""
+        elif mode == "answer":
+            if buffer:
+                answer_parts.append(buffer)
+                yield {"type": "content", "data": buffer}
+            buffer = ""
+
+        if mode == "outside" and buffer:
+            if not any(tag.startswith(buffer) for tag in tag_prefixes):
+                answer_parts.append(buffer)
+                yield {"type": "content", "data": buffer}
+
+        thought = "".join(thought_parts).strip()
+        answer = "".join(answer_parts).strip()
 
         if thought:
-            yield {"type": "thinking_start", "data": ""}
+            if not thinking_started:
+                yield {"type": "thinking_start", "data": ""}
             yield {"type": "thought", "data": thought}
-        if answer:
-            yield {"type": "content", "data": answer}
 
         yield {"type": "done", "data": {"thought": thought, "answer": answer}}
 
