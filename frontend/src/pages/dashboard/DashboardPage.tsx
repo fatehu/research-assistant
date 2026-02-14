@@ -76,7 +76,7 @@ const DashboardPage = () => {
       fetchMyStudents()
       fetchPendingCount()
     }
-  }, [user?.role])
+  }, [fetchKnowledgeBases, fetchMyMentorship, fetchMyStudents, fetchPendingCount, fetchPendingRequests, isMentor, isStudent, user?.role])
   
   // 计算知识库总文档数
   const totalDocuments = knowledgeBases.reduce((sum, kb) => sum + kb.document_count, 0)
@@ -119,7 +119,7 @@ const DashboardPage = () => {
       desc: isMentor() ? '管理指导关系' : '选择导师',
       gradient: 'from-violet-500 to-purple-600',
       shadow: 'shadow-violet-500/20',
-      path: '/student/mentor',
+      path: isMentor() ? '/mentor/students' : '/student/mentor',
       badge: isMentor() && pendingCount > 0 ? pendingCount : undefined,
     },
     {

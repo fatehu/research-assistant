@@ -233,7 +233,7 @@ const MainLayout = () => {
   
   useEffect(() => {
     fetchConversations()
-  }, [])
+  }, [fetchConversations])
   
   // 搜索消息（防抖）
   const handleSearch = async (value: string) => {
@@ -289,7 +289,7 @@ const MainLayout = () => {
   }, [])
   
   // 基础菜单项
-  const baseMenuItems = [
+  const baseMenuItems = useMemo(() => ([
     {
       key: '/dashboard',
       icon: <HomeOutlined />,
@@ -322,7 +322,7 @@ const MainLayout = () => {
       label: <span style={{ color: '#94a3b8' }}>资讯追踪 <span style={{ fontSize: 10, opacity: 0.7 }}>(即将推出)</span></span>,
       disabled: true,
     },
-  ]
+  ]), [])
 
   // 角色专属菜单项
   const roleMenuItems = useMemo(() => {
@@ -420,7 +420,7 @@ const MainLayout = () => {
   }, [user?.role])
 
   // 合并菜单项
-  const menuItems = [...baseMenuItems, ...roleMenuItems]
+  const menuItems = useMemo(() => [...baseMenuItems, ...roleMenuItems], [baseMenuItems, roleMenuItems])
   
   const userMenuItems = [
     {

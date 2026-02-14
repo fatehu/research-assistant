@@ -80,7 +80,7 @@ const ChatPage = () => {
     }
 
     loadConversation()
-  }, [conversationId])
+  }, [clearCurrentConversation, conversationId, isSending, selectConversation])
 
   // ─── 处理首页传来的初始消息 / 消息高亮 ──────────
   useEffect(() => {
@@ -118,7 +118,7 @@ const ChatPage = () => {
 
       setTimeout(() => setHighlightedMessageId(null), 3000)
     }
-  }, [conversationId, location.state, conversationLoaded, messages.length, isSending])
+  }, [conversationId, conversationLoaded, isSending, location.pathname, location.state, messages.length, navigate, sendMessage])
 
   // 重置 initialMessageSent 当 conversationId 改变时
   useEffect(() => {
