@@ -165,6 +165,12 @@ class Settings(BaseSettings):
     # Code execution
     code_execution_timeout: int = 30
     kernel_idle_timeout: int = 7200
+    codelab_sandbox_enabled: bool = True
+    codelab_exec_timeout_hard_seconds: int = 20
+    codelab_max_concurrency_per_user: int = 2
+    codelab_direct_execute_enabled: bool = False
+    cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    auto_create_tables: bool = False
 
     # Notebook context
     notebook_context_cells: int = 5
@@ -201,6 +207,10 @@ class Settings(BaseSettings):
             },
         }
         return configs.get(provider, configs["deepseek"])
+
+    def get_cors_allow_origins(self) -> list[str]:
+        origins = [item.strip() for item in self.cors_allow_origins.split(",")]
+        return [item for item in origins if item]
 
 
 @lru_cache
