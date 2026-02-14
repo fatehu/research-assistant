@@ -170,8 +170,10 @@ class AgentCore:
         user_text = self._latest_user_text(messages)
         intent = "general_chat"
         selected_tools: List[str] = []
+        schema_scope = "all"
+        tool_selection_enabled = bool(getattr(settings, "tool_selection_enabled", True))
 
-        if bool(getattr(settings, "tool_selection_enabled", True)):
+        if tool_selection_enabled:
             classify = getattr(self.tools, "classify_intent", None)
             if callable(classify):
                 try:
@@ -180,14 +182,17 @@ class AgentCore:
                     intent = "general_chat"
             try:
                 tools_desc = self.tools.get_tools_description(intent=intent, user_text=user_text)
+                schema_scope = "intent"
             except TypeError:
                 tools_desc = self.tools.get_tools_description()
+                schema_scope = "all"
             select_names = getattr(self.tools, "select_tool_names_for_intent", None)
             if callable(select_names):
                 try:
                     selected_tools = list(select_names(intent, user_text=user_text))
                 except Exception:
                     selected_tools = []
+                schema_scope = "selected" if selected_tools else "all"
         else:
             tools_desc = self.tools.get_tools_description()
 
@@ -196,9 +201,15 @@ class AgentCore:
             "intent": intent,
             "selected_tools": selected_tools,
             "prompt_desc_tokens": desc_tokens,
+            "schema_scope": schema_scope,
+            "tool_selection_enabled": tool_selection_enabled,
         }
         logger.info(
-            f"[AgentCore] intent={intent} selected_tools={selected_tools or 'ALL'} prompt_desc_tokens={desc_tokens}"
+            "[AgentCore] intent=%s selected_tools=%s schema_scope=%s prompt_desc_tokens=%s",
+            intent,
+            selected_tools or "ALL",
+            schema_scope,
+            desc_tokens,
         )
         return f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
 
@@ -528,13 +539,21 @@ class AgentCore:
     def _collect_llm_tool_schemas(self, user_text: str) -> List[Dict[str, Any]]:
         intent = self._last_tool_selection.get("intent")
         selected = self._last_tool_selection.get("selected_tools") or []
+        schema_scope = str(self._last_tool_selection.get("schema_scope") or "all").lower()
+        tool_selection_enabled = bool(
+            self._last_tool_selection.get("tool_selection_enabled", getattr(settings, "tool_selection_enabled", True))
+        )
         try:
             if selected:
                 return self.tools.list_tools(include_tool_names=set(selected), user_text=user_text)
-            if intent:
+            if tool_selection_enabled and schema_scope == "intent" and intent:
                 return self.tools.list_tools(intent=intent, user_text=user_text)
             return self.tools.list_tools(user_text=user_text)
         except TypeError:
+            if selected:
+                return self.tools.list_tools(include_tool_names=set(selected))
+            if tool_selection_enabled and schema_scope == "intent" and intent:
+                return self.tools.list_tools(intent=intent)
             return self.tools.list_tools()
 
     @staticmethod

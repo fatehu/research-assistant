@@ -38,6 +38,44 @@ class _SelectableTools:
         return "- web_search: 搜索互联网"
 
 
+class _SchemaCollectionTools:
+    def __init__(self, selected_tools=None):
+        self.selected_tools = list(selected_tools or [])
+        self.list_calls = []
+
+    def classify_intent(self, user_text: str) -> str:
+        return "general_chat"
+
+    def select_tool_names_for_intent(self, intent: str, user_text: str = ""):
+        return list(self.selected_tools)
+
+    def get_tools_description(self, **kwargs) -> str:
+        if kwargs.get("intent"):
+            return "- datetime: 时间\n- calculator: 计算器"
+        return "- datetime: 时间\n- calculator: 计算器\n- knowledge_search: 知识库检索"
+
+    def list_tools(self, **kwargs):
+        self.list_calls.append(kwargs)
+        if kwargs.get("include_tool_names"):
+            names = set(kwargs["include_tool_names"])
+        elif kwargs.get("intent"):
+            names = {"datetime", "calculator"}
+        else:
+            names = {"datetime", "calculator", "knowledge_search"}
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in sorted(names)
+        ]
+
+
 class _NoCompression:
     async def compress_chunks(self, *args, **kwargs):
         return []
@@ -63,6 +101,33 @@ def test_system_prompt_uses_intent_based_tool_selection(monkeypatch):
     assert tools.calls and tools.calls[0]["intent"] == "web_query"
     assert agent._last_tool_selection["intent"] == "web_query"
     assert agent._last_tool_selection["selected_tools"] == ["web_search", "datetime", "calculator"]
+
+
+def test_collect_llm_tool_schemas_falls_back_to_full_when_tool_selection_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", False)
+    tools = _SchemaCollectionTools()
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+
+    agent._build_system_prompt(messages=[{"role": "user", "content": "summarize my uploaded PDF"}])
+    schemas = agent._collect_llm_tool_schemas("summarize my uploaded PDF")
+    names = {item["function"]["name"] for item in schemas}
+
+    assert "knowledge_search" in names
+    assert "intent" not in tools.list_calls[-1]
+
+
+def test_collect_llm_tool_schemas_falls_back_to_full_when_selector_returns_empty(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    tools = _SchemaCollectionTools(selected_tools=[])
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+
+    agent._build_system_prompt(messages=[{"role": "user", "content": "summarize my uploaded PDF"}])
+    schemas = agent._collect_llm_tool_schemas("summarize my uploaded PDF")
+    names = {item["function"]["name"] for item in schemas}
+
+    assert agent._last_tool_selection["schema_scope"] == "all"
+    assert "knowledge_search" in names
+    assert "intent" not in tools.list_calls[-1]
 
 
 def test_observation_message_for_knowledge_search_requires_citation():
