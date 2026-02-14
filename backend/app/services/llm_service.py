@@ -154,6 +154,24 @@ class LLMService:
             )
             message = response.choices[0].message
             raw_tool_calls = getattr(message, "tool_calls", None) or []
+            reasoning_payload = getattr(message, "reasoning_content", None)
+            if not isinstance(reasoning_payload, str) or not reasoning_payload.strip():
+                reasoning_payload = getattr(message, "reasoning", None)
+
+            reasoning_text = ""
+            if isinstance(reasoning_payload, str):
+                reasoning_text = reasoning_payload.strip()
+            elif isinstance(reasoning_payload, list):
+                parts: List[str] = []
+                for item in reasoning_payload:
+                    if isinstance(item, str):
+                        parts.append(item)
+                        continue
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("text") or item.get("content") or ""))
+                        continue
+                    parts.append(str(getattr(item, "text", "") or getattr(item, "content", "") or ""))
+                reasoning_text = "\n".join(part.strip() for part in parts if str(part).strip())
 
             tool_calls: List[Dict[str, Any]] = []
             for call in raw_tool_calls:
@@ -169,6 +187,7 @@ class LLMService:
 
             return {
                 "content": message.content or "",
+                "reasoning": reasoning_text,
                 "tool_calls": tool_calls,
                 "usage": self._normalize_usage(response.usage),
                 "model": response.model,

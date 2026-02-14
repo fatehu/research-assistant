@@ -94,8 +94,9 @@ class LocalEmbeddingModel:
             model_name = self._model_name
             cache_dir = settings.local_embedding_cache_dir or None
 
-            # 设备选择
-            device = settings.local_embedding_device
+            # 设备选择（显式 cuda/mps 也要做可用性校验，避免容器内无驱动直接失败）
+            requested_device = str(settings.local_embedding_device or "auto").strip().lower()
+            device = requested_device
             if device == "auto":
                 if torch.cuda.is_available():
                     device = "cuda"
@@ -103,6 +104,27 @@ class LocalEmbeddingModel:
                     device = "mps"
                 else:
                     device = "cpu"
+            elif device == "cuda":
+                cuda_ok = False
+                try:
+                    cuda_ok = bool(torch.cuda.is_available())
+                except Exception as exc:
+                    logger.warning(f"检测 CUDA 可用性失败，将回退 CPU: {exc}")
+                if not cuda_ok:
+                    logger.warning("LOCAL_EMBEDDING_DEVICE=cuda 但当前环境无可用 CUDA，自动回退到 CPU")
+                    device = "cpu"
+            elif device == "mps":
+                mps_ok = False
+                try:
+                    mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+                except Exception as exc:
+                    logger.warning(f"检测 MPS 可用性失败，将回退 CPU: {exc}")
+                if not mps_ok:
+                    logger.warning("LOCAL_EMBEDDING_DEVICE=mps 但当前环境无可用 MPS，自动回退到 CPU")
+                    device = "cpu"
+
+            if device != requested_device and requested_device != "auto":
+                logger.info(f"Embedding 设备已从 {requested_device} 回退到 {device}")
 
             logger.info(f"加载本地嵌入模型: {model_name}, device={device}")
 

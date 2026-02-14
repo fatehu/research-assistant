@@ -41,6 +41,36 @@ class _FallbackTools:
         return ToolResult(success=True, output="4", data={"result": 4})
 
 
+class _DirectAnswerFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return {
+            "content": "这是一个无需调用工具的直接回答。",
+            "reasoning": "",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
+class _NoopTools:
+    def get_tools_description(self, **kwargs):
+        return "- datetime: 时间"
+
+    def list_tools(self, **kwargs):
+        return []
+
+    async def execute(self, tool_name: str, **kwargs):
+        raise AssertionError("no tool call expected")
+
+
 @pytest.mark.asyncio
 async def test_function_calling_fallback_to_xml(monkeypatch):
     monkeypatch.setattr(settings, "agent_function_calling_fallback_xml", True)
@@ -58,3 +88,19 @@ async def test_function_calling_fallback_to_xml(monkeypatch):
     assert len(observation_events) >= 1
     assert len(done_events) == 1
     assert "4" in done_events[0]["data"]["answer"]
+
+
+@pytest.mark.asyncio
+async def test_function_calling_direct_answer_emits_thought_step():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "直接回答"}], stream=False):
+        events.append(event)
+
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    done_events = [event for event in events if event.get("type") == "done"]
+
+    assert thought_events
+    assert "问题分析" in str(thought_events[0].get("data", ""))
+    assert done_events and "直接回答" in str(done_events[0]["data"]["answer"])
