@@ -526,9 +526,19 @@ class AgentCore:
                     drop = idx
                     break
             if drop is None:
+                for idx, item in enumerate(candidate):
+                    if idx != last_user and is_observation(item):
+                        drop = idx
+                        break
+            if drop is None:
                 for idx in range(last_user):
                     drop = idx
                     break
+            if drop is None:
+                for idx in range(len(candidate)):
+                    if idx != last_user:
+                        drop = idx
+                        break
             if drop is None:
                 break
             candidate.pop(drop)
