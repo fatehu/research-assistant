@@ -1,20 +1,20 @@
 ﻿import axios, { AxiosError } from 'axios'
 
-// API 鍩虹閰嶇疆
+// API base configuration
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8000'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 
-// 鍒涘缓 axios 瀹炰緥
+// Create axios instance
 const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,  // 30 绉掕秴鏃?
+  timeout: 30000, // 30s timeout
   headers: {
     'Content-Type': 'application/json',
   },
 })
 
-// 璇锋眰鎷︽埅鍣?- 娣诲姞 token
+// Request interceptor - attach token
 api.interceptors.request.use((config) => {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -26,7 +26,7 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 鍝嶅簲鎷︽埅鍣?- 澶勭悊閿欒
+// Response interceptor - normalize errors
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError<{ detail: string }>) => {
@@ -38,7 +38,6 @@ api.interceptors.response.use(
   }
 )
 
-// 绫诲瀷瀹氫箟
 export interface UserProfileData {
   title?: string
   department?: string
@@ -140,7 +139,6 @@ export interface LLMProvider {
   available: boolean
 }
 
-// ========== 鐭ヨ瘑搴撶被鍨?==========
 
 export interface KnowledgeBase {
   id: number
@@ -225,11 +223,11 @@ export interface SearchResult {
   score: number
   chunk_index: number
   metadata: Record<string, unknown>
-  // [Fix 12] 灞傜骇妫€绱㈡柊澧炲瓧娈?
-  chunk_level?: string          // 鍒嗗潡灞傜骇: paragraph / section / document
-  section_type?: string         // 绔犺妭绫诲瀷: abstract / methodology / results 绛?
-  section_title?: string        // 绔犺妭鏍囬
-  parent_context?: string       // 鐖剁骇 chunk 鐨勫唴瀹规憳瑕侊紙鍓?300 瀛楃锛?
+  // [Fix 12] Hierarchical retrieval fields
+  chunk_level?: string // paragraph / section / document
+  section_type?: string // abstract / methodology / results ...
+  section_title?: string
+  parent_context?: string // parent chunk preview
 }
 
 export interface SearchResponse {
@@ -253,7 +251,10 @@ export interface KnowledgeSearchOptions {
 }
 
 export const isApiCanceledError = (error: unknown): boolean => {
-  return axios.isAxiosError(error) && error.code === 'ERR_CANCELED'
+  if (!axios.isAxiosError(error)) {
+    return false
+  }
+  return error.code === 'ERR_CANCELED' || error.response?.status === 499
 }
 
 export const isApiTimeoutError = (error: unknown): boolean => {
@@ -275,7 +276,6 @@ export interface ProcessingStatus {
   error?: string
 }
 
-// 璁よ瘉 API
 export const authApi = {
   login: async (email: string, password: string): Promise<AuthResponse> => {
     const response = await api.post('/api/auth/login', { email, password })
@@ -307,7 +307,6 @@ export const authApi = {
   },
 }
 
-// 鐢ㄦ埛 API
 export const userApi = {
   getProfile: async (): Promise<User> => {
     const response = await api.get('/api/users/profile')
@@ -328,7 +327,6 @@ export const userApi = {
   },
 }
 
-// 鑱婂ぉ API
 export const chatApi = {
   getConversations: async (
     skip = 0,
@@ -367,7 +365,6 @@ export const chatApi = {
     return response.data
   },
 
-  // 娴佸紡鍙戦€佹秷鎭?
   sendMessageStream: async (
     message: string,
     conversationId?: number,
@@ -414,13 +411,12 @@ export const chatApi = {
               const data = JSON.parse(line.slice(6))
               onEvent?.(data.event, data.data)
             } catch {
-              // 蹇界暐瑙ｆ瀽閿欒
+              // ignore malformed stream chunk
             }
           }
         }
       }
     } catch (error) {
-      // 濡傛灉鏄腑姝㈤敊璇紝瑙﹀彂 stopped 浜嬩欢
       if (error instanceof Error && error.name === 'AbortError') {
         onEvent?.('stopped', { aborted: true })
         return
@@ -429,7 +425,6 @@ export const chatApi = {
     }
   },
 
-  // 鎼滅储娑堟伅
   searchMessages: async (query: string, limit = 20): Promise<{
     query: string
     total: number
@@ -448,7 +443,6 @@ export const chatApi = {
     return response.data
   },
 
-  // 淇濆瓨鍋滄鐨勬秷鎭?
   saveStoppedMessage: async (data: {
     conversation_id: number
     content: string
@@ -468,10 +462,8 @@ export const chatApi = {
   },
 }
 
-// ========== 鐭ヨ瘑搴?API ==========
 
 export const knowledgeApi = {
-  // 鐭ヨ瘑搴?CRUD
   getKnowledgeBases: async (skip = 0, limit = 20): Promise<{ items: KnowledgeBase[]; total: number }> => {
     const response = await api.get('/api/knowledge/knowledge-bases', {
       params: { skip, limit },
@@ -479,7 +471,6 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 鑾峰彇鍙敤鐨勭煡璇嗗簱锛堣嚜宸辩殑 + 鍏变韩鐨勶級锛岀敤浜嶢I瀵硅瘽閫夋嫨
   getAvailableKnowledgeBases: async (): Promise<{
     own: { id: number; name: string; description?: string; document_count: number; total_chunks: number }[];
     shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
@@ -513,7 +504,6 @@ export const knowledgeApi = {
     await api.delete(`/api/knowledge/knowledge-bases/${kbId}`)
   },
 
-  // 鏂囨。绠＄悊
   getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents`, {
       params: { skip, limit },
@@ -551,7 +541,6 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 鍒嗙墖
   getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
     const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
       params: { skip, limit },
@@ -559,7 +548,6 @@ export const knowledgeApi = {
     return response.data
   },
 
-  // 鎼滅储锛堟敮鎸佸眰绾ц繃婊?+ 鐖剁骇涓婁笅鏂囧洖婧級
   search: async (
     query: string,
     knowledgeBaseIds?: number[],
@@ -610,7 +598,6 @@ export const knowledgeApi = {
   },
 }
 
-// ========== 鏂囩尞绠＄悊绫诲瀷 ==========
 
 export interface PaperAuthor {
   name: string
@@ -723,16 +710,13 @@ export interface CitationGraph {
   edges: GraphEdge[]
 }
 
-// ========== 鏂囩尞绠＄悊 API ==========
 
 export const literatureApi = {
-  // 鍒濆鍖?
   init: async (): Promise<{ message: string }> => {
     const response = await api.post('/api/literature/init')
     return response.data
   },
 
-  // 鎼滅储璁烘枃
   searchPapers: async (params: {
     query: string
     source?: string
@@ -747,7 +731,6 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鑾峰彇鎼滅储鍘嗗彶
   getSearchHistory: async (limit = 20): Promise<SearchHistory[]> => {
     const response = await api.get('/api/literature/search/history', {
       params: { limit },
@@ -755,7 +738,6 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鑾峰彇璁烘枃鍒楄〃
   getPapers: async (params?: {
     collection_id?: number
     is_read?: boolean
@@ -770,13 +752,11 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鑾峰彇璁烘枃璇︽儏
   getPaper: async (paperId: number): Promise<Paper> => {
     const response = await api.get(`/api/literature/papers/${paperId}`)
     return response.data
   },
 
-  // 淇濆瓨璁烘枃
   savePaper: async (data: {
     source: string
     external_id: string
@@ -799,7 +779,6 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鏇存柊璁烘枃
   updatePaper: async (
     paperId: number,
     data: {
@@ -815,12 +794,10 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鍒犻櫎璁烘枃
   deletePaper: async (paperId: number): Promise<void> => {
     await api.delete(`/api/literature/papers/${paperId}`)
   },
 
-  // 涓嬭浇 PDF
   downloadPdf: async (
     paperId: number,
     knowledgeBaseId?: number
@@ -831,7 +808,6 @@ export const literatureApi = {
     return response.data
   },
 
-  // 鏀惰棌澶圭鐞?
   getCollections: async (): Promise<PaperCollection[]> => {
     const response = await api.get('/api/literature/collections')
     return response.data
@@ -880,7 +856,6 @@ export const literatureApi = {
   },
 }
 
-// ========== 浠ｇ爜瀹為獙瀹ょ被鍨?==========
 
 export interface CellOutput {
   output_type: 'stream' | 'execute_result' | 'display_data' | 'error'
@@ -921,28 +896,23 @@ export interface ExecuteResponse {
   execution_time_ms: number
 }
 
-// ========== 浠ｇ爜瀹為獙瀹?API ==========
 
 export const codelabApi = {
-  // 鑾峰彇 Notebook 鍒楄〃
   listNotebooks: async (): Promise<Notebook[]> => {
     const response = await api.get('/api/codelab/notebooks')
     return response.data
   },
 
-  // 鍒涘缓 Notebook
   createNotebook: async (data: { title?: string; description?: string }): Promise<Notebook> => {
     const response = await api.post('/api/codelab/notebooks', data)
     return response.data
   },
 
-  // 鑾峰彇 Notebook 璇︽儏
   getNotebook: async (notebookId: string): Promise<Notebook> => {
     const response = await api.get(`/api/codelab/notebooks/${notebookId}`)
     return response.data
   },
 
-  // 鏇存柊 Notebook
   updateNotebook: async (
     notebookId: string,
     data: { title?: string; description?: string; cells?: Cell[] }
@@ -951,24 +921,20 @@ export const codelabApi = {
     return response.data
   },
 
-  // 鍒犻櫎 Notebook
   deleteNotebook: async (notebookId: string): Promise<void> => {
     await api.delete(`/api/codelab/notebooks/${notebookId}`)
   },
 
-  // 鎵ц浠ｇ爜鍗曞厓鏍?
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/execute`, data)
     return response.data
   },
 
-  // 鐩存帴鎵ц浠ｇ爜锛堜笉淇濆瓨锛?
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
     const response = await api.post('/api/codelab/execute', data)
     return response.data
   },
 
-  // 娣诲姞鍗曞厓鏍?
   addCell: async (notebookId: string, cellType: 'code' | 'markdown', index?: number): Promise<Cell> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/cells`, null, {
       params: { cell_type: cellType, index },
@@ -976,24 +942,20 @@ export const codelabApi = {
     return response.data
   },
 
-  // 鍒犻櫎鍗曞厓鏍?
   deleteCell: async (notebookId: string, cellId: string): Promise<void> => {
     await api.delete(`/api/codelab/notebooks/${notebookId}/cells/${cellId}`)
   },
 
-  // 杩愯鎵€鏈夊崟鍏冩牸
   runAll: async (notebookId: string): Promise<{ message: string; results: any[] }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/run-all`)
     return response.data
   },
 
-  // 閲嶅惎鍐呮牳锛堟竻闄ゆ墍鏈夊彉閲忕姸鎬侊級
   restartKernel: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/restart-kernel`)
     return response.data
   },
 
-  // 鑾峰彇鍐呮牳鐘舵€?
   getKernelStatus: async (notebookId: string): Promise<{
     status: 'running' | 'stopped'
     execution_count: number
@@ -1005,14 +967,12 @@ export const codelabApi = {
     return response.data
   },
 
-  // 涓柇鍐呮牳鎵ц
   interruptKernel: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.post(`/api/codelab/notebooks/${notebookId}/interrupt`)
     return response.data
   },
 }
 
-// ========== Notebook Agent 绫诲瀷 ==========
 
 export interface AgentCodeBlock {
   id: string
@@ -1050,7 +1010,7 @@ export interface AgentChatRequest {
   message: string
   include_context?: boolean
   include_variables?: boolean
-  user_authorized?: boolean  // 鏄惁鎺堟潈 AI 鎿嶄綔 Notebook
+  user_authorized?: boolean
   stream?: boolean
 }
 
@@ -1066,25 +1026,24 @@ export interface AgentChatEvent {
   input?: Record<string, any>
   success?: boolean
   output?: string
-  action?: string  // 闇€瑕佹巿鏉冪殑鎿嶄綔
+  action?: string // action requiring approval
   provider?: string
   model?: string
-  notebook_updated?: boolean  // Notebook 鏄惁鏈夋洿鏂帮紙鏂板 Cell锛?
-  cell_id?: string  // 鏂板垱寤虹殑 Cell ID
-  new_cell?: Cell   // 鏂板垱寤虹殑瀹屾暣 Cell 鏁版嵁
-  updated_cell?: Cell  // 鏇存柊鐨?Cell 鏁版嵁
+  notebook_updated?: boolean // whether notebook content changed
+  cell_id?: string // new cell id
+  new_cell?: Cell // created cell payload
+  updated_cell?: Cell // updated cell payload
 }
 
 // ========== Notebook Agent API ==========
 
 export const agentApi = {
-  // 鑾峰彇 Notebook 涓婁笅鏂?
+  // Get notebook context
   getContext: async (notebookId: string): Promise<AgentContextResponse> => {
     const response = await api.get(`/api/codelab/notebooks/${notebookId}/agent/context`)
     return response.data
   },
 
-  // 鑾峰彇瀵硅瘽鍘嗗彶
   getHistory: async (notebookId: string): Promise<{
     notebook_id: string
     messages: AgentMessage[]
@@ -1095,13 +1054,11 @@ export const agentApi = {
     return response.data
   },
 
-  // 娓呯┖瀵硅瘽鍘嗗彶
   clearHistory: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.delete(`/api/codelab/notebooks/${notebookId}/agent/history`)
     return response.data
   },
 
-  // 娴佸紡瀵硅瘽
   chat: async (
     notebookId: string,
     request: AgentChatRequest,
@@ -1153,7 +1110,6 @@ export const agentApi = {
     }
   },
 
-  // 闈炴祦寮忓璇?
   chatSync: async (
     notebookId: string,
     request: Omit<AgentChatRequest, 'stream'>
@@ -1169,7 +1125,6 @@ export const agentApi = {
     return response.data
   },
 
-  // 鐢熸垚浠ｇ爜寤鸿
   suggestCode: async (
     notebookId: string,
     description: string
@@ -1186,7 +1141,6 @@ export const agentApi = {
     return response.data
   },
 
-  // 瑙ｉ噴閿欒
   explainError: async (
     notebookId: string,
     errorMessage: string,
@@ -1203,7 +1157,7 @@ export const agentApi = {
     return response.data
   },
 
-  // 鍒嗘瀽鏁版嵁
+  // Analyze data
   analyzeData: async (
     notebookId: string,
     variableName: string,
@@ -1223,7 +1177,6 @@ export const agentApi = {
   },
 }
 
-// 杈呭姪鍑芥暟
 function getToken(): string {
   const authStorage = localStorage.getItem('auth-storage')
   if (authStorage) {
@@ -1233,7 +1186,6 @@ function getToken(): string {
   return ''
 }
 
-// ========== 瑙掕壊绯荤粺绫诲瀷瀹氫箟 ==========
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -1260,7 +1212,6 @@ export enum SharePermission {
   ADMIN = 'admin',
 }
 
-// 甯堢敓鍏崇郴鐘舵€?
 export enum MentorshipStatus {
   NONE = 'none',
   PENDING = 'pending',
@@ -1269,7 +1220,6 @@ export enum MentorshipStatus {
   ARCHIVED = 'archived',
 }
 
-// 鐢ㄦ埛淇℃伅锛堟墿灞曚簡瑙掕壊瀛楁锛?
 export interface UserWithRole {
   id: number
   email: string
@@ -1317,7 +1267,6 @@ export interface MentorshipListResponse {
   total: number
 }
 
-// 瀛︾敓璇︽儏锛堝惈缁熻锛?
 export interface StudentDetail extends UserWithRole {
   conversation_count: number
   knowledge_base_count: number
@@ -1325,7 +1274,6 @@ export interface StudentDetail extends UserWithRole {
   notebook_count: number
 }
 
-// 鐮旂┒缁?
 export interface ResearchGroup {
   id: number
   name: string
@@ -1339,7 +1287,6 @@ export interface ResearchGroup {
   created_at: string
 }
 
-// 缁勬垚鍛?
 export interface GroupMember {
   id: number
   group_id: number
@@ -1349,7 +1296,6 @@ export interface GroupMember {
   user?: UserWithRole
 }
 
-// 閭€璇?
 export interface Invitation {
   id: number
   type: 'invite' | 'apply'
@@ -1366,7 +1312,6 @@ export interface Invitation {
   group?: ResearchGroup
 }
 
-// 鍏变韩璧勬簮
 export interface SharedResource {
   id: number
   resource_type: ShareType
@@ -1387,7 +1332,6 @@ export interface SharedResource {
   resource_detail?: Record<string, unknown>
 }
 
-// 鍏憡
 export interface Announcement {
   id: number
   mentor_id: number
@@ -1404,7 +1348,6 @@ export interface Announcement {
   read_count?: number
 }
 
-// 绯荤粺缁熻
 export interface SystemStatistics {
   total_users: number
   admin_count: number
@@ -1417,10 +1360,8 @@ export interface SystemStatistics {
   total_notebooks: number
 }
 
-// ========== 绠＄悊鍛?API ==========
 
 export const adminApi = {
-  // 鑾峰彇鎵€鏈夌敤鎴?
   getUsers: async (params?: {
     skip?: number
     limit?: number
@@ -1432,92 +1373,76 @@ export const adminApi = {
     return response.data
   },
 
-  // 鑾峰彇鐢ㄦ埛璇︽儏
   getUser: async (userId: number): Promise<UserWithRole> => {
     const response = await api.get(`/api/admin/users/${userId}`)
     return response.data
   },
 
-  // 鏇存柊鐢ㄦ埛瑙掕壊
   updateUserRole: async (userId: number, role: UserRole): Promise<UserWithRole> => {
     const response = await api.put(`/api/admin/users/${userId}/role`, { role })
     return response.data
   },
 
-  // 鍒囨崲鐢ㄦ埛婵€娲荤姸鎬?
   toggleUserActive: async (userId: number): Promise<{ is_active: boolean }> => {
     const response = await api.put(`/api/admin/users/${userId}/toggle-active`)
     return response.data
   },
 
-  // 鍒犻櫎鐢ㄦ埛
   deleteUser: async (userId: number): Promise<void> => {
     await api.delete(`/api/admin/users/${userId}`)
   },
 
-  // 鑾峰彇绯荤粺缁熻
   getStatistics: async (): Promise<SystemStatistics> => {
     const response = await api.get('/api/admin/statistics')
     return response.data
   },
 
-  // 璁剧疆鐢ㄦ埛瀵煎笀
   setUserMentor: async (userId: number, mentorId: number | null): Promise<UserWithRole> => {
     const response = await api.put(`/api/admin/users/${userId}/mentor`, { mentor_id: mentorId })
     return response.data
   },
 }
 
-// ========== 瀵煎笀 API ==========
 
 export const mentorApi = {
-  // 鑾峰彇鎴戠殑瀛︾敓鍒楄〃
   getStudents: async (): Promise<StudentDetail[]> => {
     const response = await api.get('/api/mentor/students')
     return response.data
   },
 
-  // 鑾峰彇瀛︾敓璇︽儏
   getStudentDetail: async (studentId: number): Promise<StudentDetail> => {
     const response = await api.get(`/api/mentor/students/${studentId}`)
     return response.data
   },
 
-  // 閭€璇峰鐢?
   inviteStudent: async (email: string, message?: string): Promise<Invitation> => {
     const response = await api.post('/api/mentor/students/invite', { email, message })
     return response.data
   },
 
-  // 绉婚櫎瀛︾敓
   removeStudent: async (studentId: number): Promise<void> => {
     await api.delete(`/api/mentor/students/${studentId}`)
   },
 
-  // 鑾峰彇鍙戝嚭鐨勯個璇?
   getSentInvitations: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/mentor/invitations/sent')
     return response.data
   },
 
-  // 鍙栨秷閭€璇?
   cancelInvitation: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/mentor/invitations/${invitationId}`)
   },
 
-  // 澶勭悊瀛︾敓鐢宠
   handleApplication: async (invitationId: number, accept: boolean): Promise<void> => {
     const response = await api.post(`/api/mentor/applications/${invitationId}/${accept ? 'accept' : 'reject'}`)
     return response.data
   },
 
-  // 鑾峰彇鐮旂┒缁勫垪琛?
   getGroups: async (): Promise<ResearchGroup[]> => {
     const response = await api.get('/api/mentor/groups')
     return response.data
   },
 
-  // 鍒涘缓鐮旂┒缁?
   createGroup: async (data: {
     name: string
     description?: string
@@ -1527,7 +1452,6 @@ export const mentorApi = {
     return response.data
   },
 
-  // 鏇存柊鐮旂┒缁?
   updateGroup: async (groupId: number, data: {
     name?: string
     description?: string
@@ -1538,33 +1462,27 @@ export const mentorApi = {
     return response.data
   },
 
-  // 鍒犻櫎鐮旂┒缁?
   deleteGroup: async (groupId: number): Promise<void> => {
     await api.delete(`/api/mentor/groups/${groupId}`)
   },
 
-  // 鑾峰彇缁勬垚鍛?
   getGroupMembers: async (groupId: number): Promise<GroupMember[]> => {
     const response = await api.get(`/api/mentor/groups/${groupId}/members`)
     return response.data
   },
 
-  // 娣诲姞缁勬垚鍛?
   addGroupMember: async (groupId: number, userId: number): Promise<GroupMember> => {
     const response = await api.post(`/api/mentor/groups/${groupId}/members`, { user_id: userId })
     return response.data
   },
 
-  // 绉婚櫎缁勬垚鍛?
   removeGroupMember: async (groupId: number, userId: number): Promise<void> => {
     await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`)
   },
 }
 
-// ========== 瀛︾敓 API ==========
 
 export const studentApi = {
-  // 鑾峰彇鎴戠殑瀵煎笀
   getMentor: async (): Promise<UserWithRole | null> => {
     try {
       const response = await api.get('/api/student/mentor')
@@ -1577,143 +1495,120 @@ export const studentApi = {
     }
   },
 
-  // 鎼滅储瀵煎笀
   searchMentors: async (query: string): Promise<UserWithRole[]> => {
     const response = await api.get('/api/student/mentors/search', { params: { query } })
     return response.data
   },
 
-  // 鐢宠瀵煎笀
   applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
     const response = await api.post('/api/student/mentor/apply', { mentor_id: mentorId, message })
     return response.data
   },
 
-  // 绂诲紑瀵煎笀
   leaveMentor: async (): Promise<void> => {
     await api.delete('/api/student/mentor/leave')
   },
 
-  // 鑾峰彇鎴戠殑鐢宠
   getMyApplications: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/student/applications')
     return response.data
   },
 
-  // 鍙栨秷鐢宠
   cancelApplication: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/student/applications/${invitationId}`)
   },
 
-  // 鑾峰彇鏀跺埌鐨勯個璇?
   getReceivedInvitations: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/student/invitations')
     return response.data
   },
 
-  // 鎺ュ彈閭€璇?
   acceptInvitation: async (invitationId: number): Promise<void> => {
     await api.post(`/api/student/invitations/${invitationId}/accept`)
   },
 
-  // 鎷掔粷閭€璇?
   rejectInvitation: async (invitationId: number): Promise<void> => {
     await api.post(`/api/student/invitations/${invitationId}/reject`)
   },
 
-  // 鑾峰彇鎴戝姞鍏ョ殑鐮旂┒缁?
   getMyGroups: async (): Promise<ResearchGroup[]> => {
     const response = await api.get('/api/student/groups')
     return response.data
   },
 }
 
-// ========== 閭€璇?API ==========
 
 export const invitationApi = {
-  // 鑾峰彇鎴戠殑鎵€鏈夐個璇凤紙鏀跺埌鍜屽彂鍑虹殑锛?
   getAll: async (): Promise<Invitation[]> => {
     const response = await api.get('/api/invitations')
     return response.data
   },
 
-  // 鎺ュ彈閭€璇?
   accept: async (invitationId: number): Promise<void> => {
     await api.post(`/api/invitations/${invitationId}/accept`)
   },
 
-  // 鎷掔粷閭€璇?
   reject: async (invitationId: number): Promise<void> => {
     await api.post(`/api/invitations/${invitationId}/reject`)
   },
 
-  // 鍙栨秷閭€璇?
   cancel: async (invitationId: number): Promise<void> => {
     await api.delete(`/api/invitations/${invitationId}`)
   },
 }
 
-// ========== 鍏变韩璧勬簮 API ==========
 
 export const shareApi = {
-  // 鑾峰彇鍏变韩缁欐垜鐨勮祫婧?
   getSharedWithMe: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
     const response = await api.get('/api/share/shared-with-me', { params })
     return response.data
   },
 
-  // 鑾峰彇鍏变韩缁欐垜鐨勮祫婧愭暟閲忕粺璁?
   getSharedCount: async (): Promise<{ paper: number; paper_collection: number; knowledge_base: number; notebook: number; total: number }> => {
     const response = await api.get('/api/share/shared-with-me/count')
     return response.data
   },
 
-  // 鑾峰彇鎴戝叡浜嚭鍘荤殑璧勬簮
   getMyShares: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
     const response = await api.get('/api/share/my-shares', { params })
     return response.data
   },
 
-  // 鑾峰彇鍙叡浜殑鐮旂┒缁?
   getMyGroups: async (): Promise<{ id: number; name: string; role: string }[]> => {
     const response = await api.get('/api/share/my-groups')
     return response.data
   },
 
-  // 鑾峰彇鎴戠殑璁烘枃鍒楄〃锛堢敤浜庡叡浜€夋嫨锛?
   getMyPapers: async (search?: string): Promise<{ id: number; title: string; authors: string[]; year: number; venue: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-papers', { params })
     return response.data
   },
 
-  // 鑾峰彇鎴戠殑鏂囩尞闆嗗垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyCollections: async (search?: string): Promise<{ id: number; name: string; description: string; paper_count: number; color: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-collections', { params })
     return response.data
   },
 
-  // 鑾峰彇鎴戠殑鐭ヨ瘑搴撳垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyKnowledgeBases: async (search?: string): Promise<{ id: number; name: string; description: string; document_count: number }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-knowledge-bases', { params })
     return response.data
   },
 
-  // 鑾峰彇鎴戠殑绗旇鏈垪琛紙鐢ㄤ簬鍏变韩閫夋嫨锛?
   getMyNotebooks: async (search?: string): Promise<{ id: string; title: string; description: string; cell_count: number; updated_at: string }[]> => {
     const params = search ? { search } : {}
     const response = await api.get('/api/share/my-notebooks', { params })
     return response.data
   },
 
-  // 鍏变韩璧勬簮
+  // Share a resource
   shareResource: async (data: {
     resource_type: string
-    resource_id: number | string  // 鏀寔鏁存暟鍜屽瓧绗︿覆锛堝notebook UUID锛?
+    resource_id: number | string // supports numeric id or string id (e.g. notebook UUID)
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -1723,10 +1618,10 @@ export const shareApi = {
     return response.data
   },
 
-  // 鎵归噺鍏变韩
+  // Batch share
   batchShare: async (data: {
     resource_type: string
-    resource_ids: (number | string)[]  // 鏀寔鏁存暟鍜屽瓧绗︿覆
+    resource_ids: (number | string)[] // supports numeric id or string id
     shared_with_type: 'user' | 'group' | 'all_students'
     shared_with_id?: number
     permission?: string
@@ -1735,20 +1630,17 @@ export const shareApi = {
     return response.data
   },
 
-  // 灏嗗叡浜鏂囨坊鍔犲埌鎴戠殑搴?
   copyToLibrary: async (shareId: number, collectionId?: number): Promise<{ message: string; paper_id: number }> => {
     const params = collectionId ? { collection_id: collectionId } : {}
     const response = await api.post(`/api/share/copy-to-library/${shareId}`, null, { params })
     return response.data
   },
 
-  // 鑾峰彇鍏变韩璧勬簮璇︽儏锛堝寘鍚畬鏁村唴瀹癸級
   getSharedDetail: async (shareId: number): Promise<any> => {
     const response = await api.get(`/api/share/detail/${shareId}`)
     return response.data
   },
 
-  // 鎵归噺澶嶅埗鏂囩尞闆嗕腑鐨勮鏂?
   copyCollectionPapers: async (shareId: number, paperIds?: number[], targetCollectionId?: number): Promise<{ success_count: number; skip_count: number; message: string }> => {
     const response = await api.post(`/api/share/copy-collection-papers/${shareId}`, {
       paper_ids: paperIds,
@@ -1757,28 +1649,23 @@ export const shareApi = {
     return response.data
   },
 
-  // 鍙栨秷鍏变韩
   removeShare: async (shareId: number): Promise<void> => {
     await api.delete(`/api/share/${shareId}`)
   },
 }
 
-// ========== 鍏憡 API ==========
 
 export const announcementApi = {
-  // 鑾峰彇鍏憡鍒楄〃锛堝鐢熺湅鍒扮殑锛?
   getAnnouncements: async (): Promise<Announcement[]> => {
     const response = await api.get('/api/announcements')
     return response.data
   },
 
-  // 鑾峰彇鎴戝彂甯冪殑鍏憡锛堝甯堬級
   getMyAnnouncements: async (): Promise<Announcement[]> => {
     const response = await api.get('/api/announcements/my')
     return response.data
   },
 
-  // 鍒涘缓鍏憡
   createAnnouncement: async (data: {
     title: string
     content: string
@@ -1789,7 +1676,6 @@ export const announcementApi = {
     return response.data
   },
 
-  // 鏇存柊鍏憡
   updateAnnouncement: async (announcementId: number, data: {
     title?: string
     content?: string
@@ -1800,17 +1686,14 @@ export const announcementApi = {
     return response.data
   },
 
-  // 鍒犻櫎鍏憡
   deleteAnnouncement: async (announcementId: number): Promise<void> => {
     await api.delete(`/api/announcements/${announcementId}`)
   },
 
-  // 鏍囪宸茶
   markAsRead: async (announcementId: number): Promise<void> => {
     await api.post(`/api/announcements/${announcementId}/read`)
   },
 
-  // 鑾峰彇鍏憡闃呰缁熻
   getReadStats: async (announcementId: number): Promise<{
     total_count: number
     read_count: number
@@ -1821,7 +1704,6 @@ export const announcementApi = {
   },
 }
 
-// ========== 甯堢敓鍏崇郴 API ==========
 
 const toUserBrief = (
   user: UserWithRole | null | undefined,
@@ -2074,7 +1956,6 @@ export const mentorshipApi = {
   },
 }
 
-// ========== MCP 绠＄悊绫诲瀷涓?API ==========
 
 export interface MCPServerConfigItem {
   name: string
@@ -2171,7 +2052,6 @@ export const mcpApi = {
 
 export default api
 
-// ========== 鏅鸿兘鍒嗗潡绫诲瀷瀹氫箟 ==========
 
 export enum ChunkingStrategy {
   FIXED = 'fixed',
@@ -2197,13 +2077,11 @@ export enum ChunkingPreset {
 
 export interface ChunkingConfig {
   strategy: ChunkingStrategy
-  // V3 Token 璁￠噺鏂板
   use_token_based: boolean
   base_chunk_tokens: number
   overlap_tokens: number
   min_semantic_tokens: number
   max_semantic_tokens: number
-  // 瀛楃璁￠噺锛堟棫锛?
   base_chunk_size: number
   chunk_overlap: number
   semantic_threshold: number
@@ -2293,9 +2171,8 @@ export interface DocumentAnalysis {
     section_count: number
     total_tokens?: number
   }
-  // [Fix 7] 鏂板瀛楁
-  estimated_chunks?: number      // 棰勪及鍒嗗潡鏁伴噺
-  language?: string              // 妫€娴嬪埌鐨勮瑷€ (zh / en)
+  estimated_chunks?: number
+  language?: string
 }
 
 export interface StrategyComparison {
@@ -2317,22 +2194,18 @@ export interface StrategyComparison {
   }
 }
 
-// ========== 鏅鸿兘鍒嗗潡API ==========
 
 export const chunkingApi = {
-  // 鑾峰彇鎵€鏈夐璁?
   getPresets: async (): Promise<{ presets: PresetDescription[] }> => {
     const response = await api.get('/api/chunking/presets')
     return response.data
   },
 
-  // 鑾峰彇鎸囧畾棰勮璇︽儏
   getPreset: async (presetName: ChunkingPreset): Promise<ChunkingConfigResponse> => {
     const response = await api.get(`/api/chunking/presets/${presetName}`)
     return response.data
   },
 
-  // 棰勮鍒嗗潡鏁堟灉
   previewChunking: async (
     text: string,
     config?: Partial<ChunkingConfig>,
@@ -2348,7 +2221,6 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 鍒嗘瀽鏂囨。缁撴瀯
   analyzeDocument: async (
     text: string,
     fileType = 'txt'
@@ -2360,7 +2232,6 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 姣旇緝涓嶅悓绛栫暐
   compareStrategies: async (
     text: string,
     strategies: ChunkingPreset[] = [ChunkingPreset.FAST, ChunkingPreset.PRECISE, ChunkingPreset.DEEP],
@@ -2376,7 +2247,6 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 鑾峰彇鐭ヨ瘑搴撶殑鍒嗗潡閰嶇疆
   getKnowledgeBaseConfig: async (kbId: number): Promise<ChunkingConfigResponse | null> => {
     try {
       const response = await api.get(`/api/chunking/knowledge-base/${kbId}/config`)
@@ -2386,7 +2256,6 @@ export const chunkingApi = {
     }
   },
 
-  // 鏇存柊鐭ヨ瘑搴撶殑鍒嗗潡閰嶇疆
   updateKnowledgeBaseConfig: async (
     kbId: number,
     config: Partial<ChunkingConfig> | { preset: ChunkingPreset }
@@ -2395,7 +2264,6 @@ export const chunkingApi = {
     return response.data
   },
 
-  // 灏嗛璁惧簲鐢ㄥ埌鐭ヨ瘑搴?
   applyPresetToKnowledgeBase: async (
     kbId: number,
     preset: ChunkingPreset

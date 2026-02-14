@@ -1,0 +1,7 @@
+services:
+  backend:
+    # Enable this file only on hosts with NVIDIA Container Toolkit configured.
+    gpus: ${DOCKER_BACKEND_GPUS:-all}
+    environment:
+      - LOCAL_EMBEDDING_DEVICE=${LOCAL_EMBEDDING_DEVICE:-cuda}
+      - RERANKER_DEVICE=${RERANKER_DEVICE:-cuda}

@@ -168,7 +168,7 @@ async def test_compress_chunks_batch_skip_high_reranker(monkeypatch):
             doc_name="paper.pdf",
             chunk_idx=1,
             chunk_content="高分段落",
-            reranker_score=0.95,
+            reranker_score=2.0,
         ),
         CompressionInput(
             source_id=2,

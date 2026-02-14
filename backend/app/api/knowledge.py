@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, List, Optional, Set
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_, tuple_
 from loguru import logger
@@ -618,10 +618,21 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
     from app.core.database import async_session_factory
     
     async with async_session_factory() as db:
+        task_trace_id = uuid.uuid4().hex[:8]
+        task_started_at = time.perf_counter()
+
+        def _task_elapsed_ms() -> float:
+            return (time.perf_counter() - task_started_at) * 1000
+
+        logger.info(
+            f"[doc:{task_trace_id}] 任务开始: 文档={doc_id}, "
+            f"chunk_size={chunk_size}, chunk_overlap={chunk_overlap}"
+        )
         try:
             # 获取文档
             doc = await db.get(Document, doc_id)
             if not doc:
+                logger.warning(f"[doc:{task_trace_id}] 文档不存在: 文档={doc_id}")
                 return
             
             # 更新状态为处理中
@@ -633,11 +644,20 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             # 嵌入模型与维度在分块完成后按策略动态决策
             embedding_svc = None
-            logger.info(f"文档 {doc_id} 开始处理，Embedding 维度将按规模自适应")
+            logger.info(
+                f"[doc:{task_trace_id}] 文档开始处理，嵌入维度将按规模自适应, "
+                f"elapsed={_task_elapsed_ms():.2f}ms"
+            )
             
             # 提取文本
-            logger.info(f"开始提取文档文本: {doc_id}")
+            extract_started_at = time.perf_counter()
+            logger.info(f"[doc:{task_trace_id}] 开始提取文档文本: {doc_id}")
             text = await processor.extract_text(doc.file_path, doc.file_type)
+            logger.info(
+                f"[doc:{task_trace_id}] 文本提取完成: chars={len(text)}, "
+                f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
+                f"elapsed={_task_elapsed_ms():.2f}ms"
+            )
             
             if not text.strip():
                 doc.status = DocumentStatus.FAILED.value
@@ -664,7 +684,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 return
 
             # 分片
-            logger.info(f"开始智能分块: {doc_id}")
+            chunk_started_at = time.perf_counter()
+            logger.info(f"[doc:{task_trace_id}] 开始智能分块: {doc_id}")
             
             # 准备配置
             kb_config = kb.chunking_config
@@ -694,6 +715,11 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 执行分块
             smart_service = SmartChunkingService()
             result = await smart_service.chunk_document(text, chunk_config, doc.file_type)
+            logger.info(
+                f"[doc:{task_trace_id}] 智能分块完成: 层级分块={'是' if result.get('hierarchy') else '否'}, "
+                f"stage_ms={(time.perf_counter() - chunk_started_at) * 1000:.2f}, "
+                f"elapsed={_task_elapsed_ms():.2f}ms"
+            )
             
             # ===== [Fix 1] 收集分块 =====
             # 核心原则：paragraph 级作为检索单元（生成 embedding）
@@ -741,7 +767,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 # 降级：如果 primary_chunks 为空但 context_chunks 有内容，使用 context
                 if context_chunks:
                     chunks_to_save = context_chunks
-                    logger.warning(f"文档 {doc_id} 没有 paragraph 级分块，降级使用 section 级")
+                    logger.warning(f"文档 {doc_id} 没有段落级分块，降级使用章节级")
             
             if not chunks_to_save:
                 doc.status = DocumentStatus.FAILED.value
@@ -753,7 +779,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             chunks_to_save.sort(key=lambda x: x["start_char"])
 
             # 生成嵌入向量
-            logger.info(f"开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
+            logger.info(f"[doc:{task_trace_id}] 开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
             embedding_model = (kb.embedding_model or "").strip() or settings.local_embedding_model
             policy_service = get_embedding_dimension_policy_service()
             existing_chunks = await policy_service.estimate_kb_paragraph_chunks(db, kb.id)
@@ -768,7 +794,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 decision.target_dimension,
             )
             logger.info(
-                f"[dimension_policy] kb={kb.id}, doc={doc_id}, model={embedding_model}, "
+                f"[doc:{task_trace_id}] [dimension_policy] kb={kb.id}, doc={doc_id}, model={embedding_model}, "
                 f"existing_chunks={existing_chunks}, projected_chunks={projected_chunks}, "
                 f"prev_dim={kb.embedding_dimension}, target_dim={decision.target_dimension}, reason={decision.reason}"
             )
@@ -793,7 +819,14 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     )
                 )
 
+            embedding_started_at = time.perf_counter()
             embeddings = await processor.embed_chunks(embedding_inputs, embedding_svc=embedding_svc)
+            logger.info(
+                f"[doc:{task_trace_id}] 嵌入向量完成: chunks={len(embedding_inputs)}, "
+                f"dimension={decision.target_dimension}, "
+                f"stage_ms={(time.perf_counter() - embedding_started_at) * 1000:.2f}, "
+                f"elapsed={_task_elapsed_ms():.2f}ms"
+            )
             
             # 创建分片记录
             smart_id_map = {} # str_id -> DocumentChunk
@@ -944,6 +977,10 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 )
 
             await db.commit()
+            logger.info(
+                f"[doc:{task_trace_id}] 数据落库完成: chunks_saved={len(chunks_to_save)}, "
+                f"context_chunks={len(context_chunks)}, elapsed={_task_elapsed_ms():.2f}ms"
+            )
             if should_schedule_rebuild:
                 rebuild_service = get_dimension_rebuild_service()
                 rebuild_start = await rebuild_service.schedule_kb_rebuild(
@@ -952,22 +989,32 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     trigger_reason=f"adaptive_policy_doc_{doc_id}",
                 )
                 logger.info(
-                    f"[dimension_rebuild] kb={kb.id}, target={decision.target_dimension}, "
+                    f"[doc:{task_trace_id}] [dimension_rebuild] kb={kb.id}, target={decision.target_dimension}, "
                     f"scheduled={rebuild_start.scheduled}, reason={rebuild_start.reason}"
                 )
 
-            logger.info(f"文档处理完成: {doc_id}, {len(chunks_to_save)} 个分片")
+            logger.info(
+                f"[doc:{task_trace_id}] 文档处理完成: {doc_id}, {len(chunks_to_save)} 个分片, "
+                f"total_ms={_task_elapsed_ms():.2f}"
+            )
             
         except Exception as e:
-            logger.error(f"处理文档失败 {doc_id}: {e}")
+            logger.exception(f"[doc:{task_trace_id}] 处理文档失败 {doc_id}: {e}")
+
+            # 先回滚失败事务，否则后续状态更新会被隐式拒绝
+            try:
+                await db.rollback()
+            except Exception as rollback_exc:
+                logger.warning(f"[doc:{task_trace_id}] 文档失败回滚异常 {doc_id}: {rollback_exc}")
+
             try:
                 doc = await db.get(Document, doc_id)
                 if doc:
                     doc.status = DocumentStatus.FAILED.value
-                    doc.error_message = str(e)
+                    doc.error_message = str(e)[:2000]
                     await db.commit()
-            except:
-                pass
+            except Exception as persist_exc:
+                logger.error(f"[doc:{task_trace_id}] 文档失败状态写回异常 {doc_id}: {persist_exc}")
 
 
 @router.get("/knowledge-bases/{kb_id}/documents/{doc_id}", response_model=DocumentDetailResponse)
@@ -1081,7 +1128,7 @@ async def get_document_status(
         await db.commit()
         await db.refresh(doc)
         logger.warning(
-            "document status auto-failed due to stale processing: "
+            "文档状态因处理超时自动失败: "
             f"doc_id={doc.id}, kb_id={kb_id}, last_updated_at={last_updated_at}, "
             f"timeout_seconds={stale_timeout_seconds}"
         )
@@ -1156,6 +1203,7 @@ async def list_chunks(
 @router.post("/search", response_model=SearchResponse)
 async def search_knowledge(
     request: SearchRequest,
+    http_request: Request,
     include_shared: bool = Query(True, description="是否包含共享的知识库"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -1169,7 +1217,30 @@ async def search_knowledge(
     参数:
     - include_shared: 是否包含共享的知识库，默认 True（包含共享知识库）
     """
-    start_time = time.time()
+    search_trace_id = uuid.uuid4().hex[:8]
+    search_started_at = time.perf_counter()
+
+    def _elapsed_ms() -> float:
+        return (time.perf_counter() - search_started_at) * 1000
+
+    async def _ensure_client_connected(stage: str) -> None:
+        if http_request is None:
+            return
+        if await http_request.is_disconnected():
+            logger.warning(
+                f"[search:{search_trace_id}] 客户端已断开，终止搜索: stage={stage}, elapsed={_elapsed_ms():.2f}ms"
+            )
+            raise HTTPException(status_code=499, detail="客户端已取消请求")
+
+    logger.info(
+        f"[search:{search_trace_id}] 搜索开始: 用户={current_user.id}, "
+        f"查询长度={len(request.query)}, top_k={request.top_k}, 阈值={request.score_threshold}, "
+        f"改写={request.use_query_rewrite}, 混合检索={request.use_hybrid}, "
+        f"精排={request.use_reranker}, 压缩={request.use_contextual_compression}, "
+        f"相邻上下文={request.include_adjacent_chunks}, 父级上下文={request.include_parent_context}, "
+        f"主超时ms={settings.search_timeout_primary_ms}"
+    )
+    await _ensure_client_connected("start")
     
     # 获取用户可访问的知识库ID
     own_kb_result = await db.execute(
@@ -1200,20 +1271,41 @@ async def search_knowledge(
         kb_ids = list(accessible_kb_ids)
         
         if not kb_ids:
+            logger.info(
+                f"[search:{search_trace_id}] 无可访问知识库，elapsed={_elapsed_ms():.2f}ms"
+            )
             return SearchResponse(
                 query=request.query,
                 results=[],
                 total=0,
-                search_time_ms=(time.time() - start_time) * 1000
+                search_time_ms=round(_elapsed_ms(), 2)
             )
 
+    logger.info(
+        f"[search:{search_trace_id}] 权限解析完成: 自有库={len(own_kb_ids)}, "
+        f"共享库={len(shared_kb_ids)}, 本次检索库={len(kb_ids)}, elapsed={_elapsed_ms():.2f}ms"
+    )
+    await _ensure_client_connected("access_resolved")
+
     rewrite_service = get_query_rewrite_service()
+    rewrite_started_at = time.perf_counter()
+    await _ensure_client_connected("before_query_rewrite")
     rewrite_result = await rewrite_service.rewrite_query(
         request.query,
         rewrite_mode=request.rewrite_mode,
         use_query_rewrite=request.use_query_rewrite,
         requested_strategies=request.query_rewrite_strategies,
     )
+    logger.info(
+        f"[search:{search_trace_id}] 查询改写完成: 启用={rewrite_result.enabled}, "
+        f"缓存命中={rewrite_result.cache_hit}, 调用LLM={rewrite_result.llm_called}, "
+        f"跳过原因={rewrite_result.skip_reason or '-'}, "
+        f"向量变体数={len(rewrite_result.vector_variants)}, "
+        f"文本变体数={len(rewrite_result.text_variants)}, "
+        f"stage_ms={(time.perf_counter() - rewrite_started_at) * 1000:.2f}, "
+        f"elapsed={_elapsed_ms():.2f}ms"
+    )
+    await _ensure_client_connected("query_rewrite_done")
     
     # 使用 pgvector 进行向量相似度搜索
     # <=> 是余弦距离运算符 (cosine distance = 1 - cosine similarity)
@@ -1273,6 +1365,8 @@ async def search_knowledge(
         ORDER BY chunk_count DESC
         """
     )
+    vector_group_started_at = time.perf_counter()
+    await _ensure_client_connected("before_vector_groups")
     vector_groups = (
         await db.execute(
             vector_groups_sql,
@@ -1282,6 +1376,12 @@ async def search_knowledge(
             },
         )
     ).fetchall()
+    logger.info(
+        f"[search:{search_trace_id}] 向量分组完成: 分组数={len(vector_groups)}, "
+        f"分组块总数={sum(int(getattr(g, 'chunk_count', 0) or 0) for g in vector_groups)}, "
+        f"stage_ms={(time.perf_counter() - vector_group_started_at) * 1000:.2f}, "
+        f"elapsed={_elapsed_ms():.2f}ms"
+    )
 
     vector_rows = []
     vector_group_rows = []
@@ -1297,6 +1397,8 @@ async def search_knowledge(
     retrieval_dimensions: set[int] = set()
 
     for group in vector_groups:
+        await _ensure_client_connected("vector_group_loop")
+        group_started_at = time.perf_counter()
         group_model = str(getattr(group, "embedding_model", "") or settings.local_embedding_model).strip()
         group_dimension = int(getattr(group, "embedding_dimension", 0) or 0)
         group_chunks = int(getattr(group, "chunk_count", 0) or 0)
@@ -1312,6 +1414,8 @@ async def search_knowledge(
         )
         vector_texts = [variant.text for variant in vector_variants]
         vector_embeddings: list[list[float]] = []
+        embedding_mode = "batch"
+        embedding_started_at = time.perf_counter()
         try:
             vector_embeddings = await group_embedding_svc.embed_texts(vector_texts, is_query=True)
             if len(vector_embeddings) != len(vector_texts):
@@ -1319,21 +1423,28 @@ async def search_knowledge(
                     f"embedding count mismatch: {len(vector_embeddings)} vs {len(vector_texts)}"
                 )
         except Exception as e:
+            embedding_mode = "single_fallback"
             logger.warning(
-                f"Batch query embedding failed for model={group_model}, dim={group_dimension}, "
-                f"fallback to single embedding: {e}"
+                f"[search:{search_trace_id}] 批量查询向量生成失败: 模型={group_model}, 维度={group_dimension}, "
+                f"回退单条生成: {e}"
             )
             vector_embeddings = []
             for variant in vector_variants:
+                await _ensure_client_connected("vector_embed_single_fallback")
                 try:
                     emb = await group_embedding_svc.embed_text(variant.text, is_query=True)
                 except Exception as single_exc:
                     logger.warning(
-                        f"Single query embedding failed for strategy={variant.strategy}, "
-                        f"model={group_model}, dim={group_dimension}: {single_exc}"
+                        f"[search:{search_trace_id}] 单条查询向量生成失败: 策略={variant.strategy}, "
+                        f"模型={group_model}, 维度={group_dimension}: {single_exc}"
                     )
                     emb = []
                 vector_embeddings.append(emb)
+        logger.info(
+            f"[search:{search_trace_id}] 查询向量生成完成: 模型={group_model}, 维度={group_dimension}, "
+            f"变体数={len(vector_texts)}, 模式={embedding_mode}, "
+            f"stage_ms={(time.perf_counter() - embedding_started_at) * 1000:.2f}"
+        )
 
         distance_expr = (
             f"(dc.embedding::vector({group_dimension}) <=> "
@@ -1394,14 +1505,16 @@ async def search_knowledge(
             **base_params,
             "vector_dimension": group_dimension,
         }
+        group_variant_hits = 0
         for idx, variant in enumerate(vector_variants):
+            await _ensure_client_connected("vector_variant_loop")
             query_embedding = vector_embeddings[idx] if idx < len(vector_embeddings) else []
             if not query_embedding:
                 continue
             if len(query_embedding) != group_dimension:
                 logger.warning(
-                    f"Skip variant due dimension mismatch: model={group_model}, "
-                    f"group_dim={group_dimension}, emb_dim={len(query_embedding)}"
+                    f"[search:{search_trace_id}] 跳过查询变体（维度不匹配）: 模型={group_model}, "
+                    f"分组维度={group_dimension}, 向量维度={len(query_embedding)}"
                 )
                 continue
 
@@ -1415,6 +1528,13 @@ async def search_knowledge(
             rows = (await db.execute(vector_sql, vector_params)).fetchall()
             if rows:
                 vector_group_rows.append((variant.strategy, variant.text, rows))
+                group_variant_hits += len(rows)
+
+        logger.info(
+            f"[search:{search_trace_id}] 向量分组检索完成: 模型={group_model}, 维度={group_dimension}, "
+            f"语料块={group_chunks}, ef_search={resolved_group_ef}, 命中行={group_variant_hits}, "
+            f"stage_ms={(time.perf_counter() - group_started_at) * 1000:.2f}, elapsed={_elapsed_ms():.2f}ms"
+        )
 
     vector_rows = merge_rows_by_score(
         vector_group_rows,
@@ -1423,11 +1543,18 @@ async def search_knowledge(
         strategy_attr="matched_vector_strategy",
         limit=vector_top_k,
     )
+    logger.info(
+        f"[search:{search_trace_id}] 向量结果合并完成: 合并命中={len(vector_rows)}, "
+        f"分组结果={len(vector_group_rows)}, elapsed={_elapsed_ms():.2f}ms"
+    )
     if not vector_rows and not use_hybrid:
         raise HTTPException(status_code=400, detail="无法生成有效查询向量")
 
     text_rows = []
+    text_group_rows_count = 0
     if use_hybrid:
+        await _ensure_client_connected("before_hybrid_fts")
+        text_stage_started_at = time.perf_counter()
         text_variants = rewrite_result.text_variants or [
             QueryVariant(text=request.query, strategy="original")
         ]
@@ -1467,6 +1594,7 @@ async def search_knowledge(
         """)
         text_group_rows = []
         for variant in text_variants:
+            await _ensure_client_connected("hybrid_fts_variant_loop")
             if not variant.text.strip():
                 continue
             fts_query = segment_text_for_fts(variant.text)
@@ -1483,8 +1611,8 @@ async def search_knowledge(
                     text_group_rows.append((variant.strategy, variant.text, rows))
             except Exception as e:
                 logger.warning(
-                    f"Full-text query failed for strategy={variant.strategy}, "
-                    f"fallback to other candidates: {e}"
+                    f"[search:{search_trace_id}] 全文检索失败: 策略={variant.strategy}, "
+                    f"回退其他候选: {e}"
                 )
                 continue
 
@@ -1495,16 +1623,31 @@ async def search_knowledge(
             strategy_attr="matched_text_strategy",
             limit=text_top_k,
         )
+        text_group_rows_count = len(text_group_rows)
+        logger.info(
+            f"[search:{search_trace_id}] 混合全文检索完成: 变体数={len(text_variants)}, "
+            f"分组结果={text_group_rows_count}, 合并命中={len(text_rows)}, "
+            f"stage_ms={(time.perf_counter() - text_stage_started_at) * 1000:.2f}, "
+            f"elapsed={_elapsed_ms():.2f}ms"
+        )
 
+    fuse_started_at = time.perf_counter()
+    await _ensure_client_connected("before_rrf_fuse")
     fused_candidates = fuse_rrf(
         vector_rows=vector_rows,
         text_rows=text_rows if use_hybrid else [],
         rrf_k=settings.hybrid_rrf_k,
         limit=fusion_limit,
     )
+    logger.info(
+        f"[search:{search_trace_id}] RRF融合完成: 融合候选={len(fused_candidates)}, "
+        f"stage_ms={(time.perf_counter() - fuse_started_at) * 1000:.2f}, elapsed={_elapsed_ms():.2f}ms"
+    )
 
     selected_candidates = []
     if use_reranker and fused_candidates:
+        await _ensure_client_connected("before_rerank")
+        rerank_started_at = time.perf_counter()
         try:
             reranker = get_reranker_service()
             reranked = await reranker.rerank(
@@ -1517,14 +1660,26 @@ async def search_knowledge(
                 for idx, score in reranked
                 if 0 <= idx < len(fused_candidates)
             ]
+            logger.info(
+                f"[search:{search_trace_id}] 精排完成: 输入候选={len(fused_candidates)}, "
+                f"输出候选={len(selected_candidates)}, "
+                f"stage_ms={(time.perf_counter() - rerank_started_at) * 1000:.2f}, "
+                f"elapsed={_elapsed_ms():.2f}ms"
+            )
         except Exception as e:
-            logger.warning(f"Reranker failed, fallback to retrieval ranking: {e}")
+            logger.warning(
+                f"[search:{search_trace_id}] 精排失败，回退检索排序: {e}"
+            )
 
     if not selected_candidates:
         selected_candidates = [
             (candidate, None)
             for candidate in fused_candidates[:final_top_k]
         ]
+    logger.info(
+        f"[search:{search_trace_id}] 候选选择完成: 最终候选={len(selected_candidates)}, "
+        f"elapsed={_elapsed_ms():.2f}ms"
+    )
     
     # 构建结果
     contextual_compression = get_contextual_compression_service()
@@ -1540,10 +1695,24 @@ async def search_knowledge(
                 reranker_score=float(reranker_score) if reranker_score is not None else None,
             )
         )
+    compression_started_at = time.perf_counter()
+    logger.info(
+        f"[search:{search_trace_id}] 压缩阶段开始: 输入片段={len(compression_inputs)}, "
+        f"启用压缩={request.use_contextual_compression}"
+    )
+    await _ensure_client_connected("before_compression")
     compression_results = await contextual_compression.compress_chunks(
         request.query,
         compression_inputs,
         use_contextual_compression=request.use_contextual_compression,
+    )
+    compression_used_count = sum(1 for item in compression_results if item.used_compression)
+    compression_fallback_count = sum(1 for item in compression_results if item.fallback_reason)
+    logger.info(
+        f"[search:{search_trace_id}] 压缩阶段完成: 输出片段={len(compression_results)}, "
+        f"实际压缩={compression_used_count}, 回退次数={compression_fallback_count}, "
+        f"stage_ms={(time.perf_counter() - compression_started_at) * 1000:.2f}, "
+        f"elapsed={_elapsed_ms():.2f}ms"
     )
     compression_by_source_id = {
         item.source_id: item
@@ -1669,6 +1838,8 @@ async def search_knowledge(
     
     # [Fix 12] 批量回溯父级上下文
     if parent_ids_to_fetch:
+        await _ensure_client_connected("before_parent_context")
+        parent_ctx_started_at = time.perf_counter()
         parent_ids = [pid for _, pid in parent_ids_to_fetch]
         parent_result = await db.execute(
             select(DocumentChunk.id, DocumentChunk.content, DocumentChunk.section_title)
@@ -1703,9 +1874,16 @@ async def search_knowledge(
                     results[idx].parent_context = parent.content[:200] + "..."
                 if not results[idx].section_title:
                     results[idx].section_title = parent.section_title
+        logger.info(
+            f"[search:{search_trace_id}] 父级上下文补全完成: 目标数={len(parent_ids_to_fetch)}, "
+            f"stage_ms={(time.perf_counter() - parent_ctx_started_at) * 1000:.2f}, "
+            f"elapsed={_elapsed_ms():.2f}ms"
+        )
 
     # 相邻窗口上下文补充
     if request.include_adjacent_chunks and adjacent_targets:
+        await _ensure_client_connected("before_adjacent_context")
+        adjacent_ctx_started_at = time.perf_counter()
         window = normalize_adjacent_window(request.adjacent_window)
         neighbor_keys: set[tuple[int, int]] = set()
         for _, doc_id, chunk_index in adjacent_targets:
@@ -1739,18 +1917,24 @@ async def search_knowledge(
                 row_map=adjacent_map,
             )
             results[idx].metadata = metadata
+        logger.info(
+            f"[search:{search_trace_id}] 相邻上下文补全完成: 目标数={len(adjacent_targets)}, "
+            f"窗口={window}, 查询键数={len(neighbor_keys)}, "
+            f"stage_ms={(time.perf_counter() - adjacent_ctx_started_at) * 1000:.2f}, "
+            f"elapsed={_elapsed_ms():.2f}ms"
+        )
     
-    search_time = (time.time() - start_time) * 1000
+    search_time = _elapsed_ms()
     
     logger.info(
-        f"向量搜索完成: query='{request.query[:50]}...', results={len(results)}, "
-        f"hybrid={use_hybrid}, reranker={use_reranker}, "
-        f"query_rewrite={rewrite_result.enabled}, "
-        f"rewrite_variants={len(rewrite_result.vector_variants)}, "
-        f"vector_hits={len(vector_rows)}, text_hits={len(text_rows)}, "
-        f"ef_search={resolved_ef_search}, corpus_size={total_chunks}, dims={sorted(retrieval_dimensions)}, "
-        f"ef_detail={ef_search_debug}, "
-        f"time={search_time:.2f}ms"
+        f"[search:{search_trace_id}] 向量搜索完成: 查询片段='{request.query[:50]}...', 结果数={len(results)}, "
+        f"混合检索={use_hybrid}, 精排={use_reranker}, "
+        f"查询改写={rewrite_result.enabled}, "
+        f"改写变体={len(rewrite_result.vector_variants)}, "
+        f"向量命中={len(vector_rows)}, 文本命中={len(text_rows)}, "
+        f"ef_search={resolved_ef_search}, 语料规模={total_chunks}, 维度={sorted(retrieval_dimensions)}, "
+        f"ef明细={ef_search_debug}, "
+        f"总耗时={search_time:.2f}ms"
     )
     
     return SearchResponse(

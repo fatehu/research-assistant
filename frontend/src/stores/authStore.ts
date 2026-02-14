@@ -4,7 +4,6 @@ import { authApi, UserRole as ApiUserRole } from '@/services/api'
 
 export type UserRole = ApiUserRole
 
-// 鐢ㄦ埛鎺ュ彛锛堟墿灞曚簡瑙掕壊瀛楁锛?
 export interface User {
   id: number
   email: string
@@ -12,11 +11,11 @@ export interface User {
   full_name?: string
   avatar?: string
   bio?: string
-  role: UserRole  // 鏂板锛氱敤鎴疯鑹?
-  mentor_id?: number  // 鏂板锛氬甯圛D锛堝鐢熸墠鏈夛級
-  department?: string  // 鏂板锛氭墍灞為櫌绯?
-  research_direction?: string  // 鏂板锛氱爺绌舵柟鍚?
-  joined_at?: string  // 鏂板锛氬姞鍏ュ甯堢粍鏃堕棿
+  role: UserRole
+  mentor_id?: number
+  department?: string
+  research_direction?: string
+  joined_at?: string
   is_active: boolean
   preferred_llm_provider: string
   preferences: Record<string, unknown>
@@ -38,7 +37,6 @@ interface AuthState {
   updateUser: (user: Partial<User>) => void
   checkAuth: () => Promise<void>
   
-  // 瑙掕壊鐩稿叧杈呭姪鏂规硶
   isAdmin: () => boolean
   isMentor: () => boolean
   isStudent: () => boolean
@@ -58,7 +56,7 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.login(email, password)
-          // 纭繚鐢ㄦ埛鏈夎鑹插瓧娈碉紝榛樿涓?student
+          // Ensure user has a role, default to student
           const user = {
             ...response.user,
             role: response.user.role || ApiUserRole.STUDENT,
@@ -80,7 +78,7 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true })
         try {
           const response = await authApi.register(email, username, password, fullName)
-          // 鏂版敞鍐岀敤鎴烽粯璁や负 student
+          // New users default to student
           const user = {
             ...response.user,
             role: response.user.role || ApiUserRole.STUDENT,
@@ -117,33 +115,33 @@ export const useAuthStore = create<AuthState>()(
       checkAuth: async () => {
         const { token, user } = get()
         
-        // 濡傛灉娌℃湁 token锛岀洿鎺ヨ涓烘湭璁よ瘉
+        // If no token exists, mark as unauthenticated
         if (!token) {
           set({ isAuthenticated: false, isInitialized: true })
           return
         }
         
-        // 濡傛灉宸叉湁鐢ㄦ埛淇℃伅锛屽厛璁句负宸茶璇侊紙涔愯鏇存柊锛?
+        // If user info exists, set authenticated first (optimistic update)
         if (user) {
           set({ isAuthenticated: true, isInitialized: true })
         }
         
-        // 鍚庡彴楠岃瘉 token 鏈夋晥鎬э紙涓嶉樆濉烇級
+        // Validate token in background (non-blocking)
         try {
           const userData = await authApi.me()
-          // 纭繚鐢ㄦ埛鏈夎鑹插瓧娈?
+          // Ensure user object has role field
           const userWithRole = {
             ...userData,
             role: userData.role || ApiUserRole.STUDENT,
           }
           set({ user: userWithRole as User, isAuthenticated: true, isInitialized: true })
         } catch {
-          // token 鏃犳晥锛屾竻闄ょ姸鎬?
+          // Token invalid, clear auth state
           set({ user: null, token: null, isAuthenticated: false, isInitialized: true })
         }
       },
       
-      // 瑙掕壊杈呭姪鏂规硶
+      // Role helper methods
       isAdmin: () => {
         const { user } = get()
         return user?.role === ApiUserRole.ADMIN
@@ -169,19 +167,19 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'auth-storage',
-      // 鎸佷箙鍖?token 鍜?user
+      // Persist only token and user
       partialize: (state) => ({ 
         token: state.token,
         user: state.user,
       }),
-      // hydration 瀹屾垚鍚庣殑鍥炶皟
+      // Callback after hydration completes
       onRehydrateStorage: () => (state) => {
-        // hydration 瀹屾垚鍚庯紝濡傛灉鏈?token 鍜?user锛岀珛鍗宠缃负宸茶璇?
+        // After hydration, token + user means authenticated
         if (state?.token && state?.user) {
           state.isAuthenticated = true
           state.isInitialized = true
         } else if (state) {
-          // 濡傛灉娌℃湁鏈夋晥鏁版嵁锛屼篃璁剧疆涓哄凡鍒濆鍖?
+          // If data is invalid, still mark as initialized
           state.isInitialized = true
         }
       },

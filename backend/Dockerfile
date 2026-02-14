@@ -11,8 +11,13 @@ RUN apt-get update && apt-get install -y \
 # 复制依赖文件
 COPY requirements.txt .
 
-# 安装 PyTorch CPU 版 (减小镜像体积, 如需 GPU 请注释掉此行并安装 CUDA 版)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Torch wheel source is configurable at build time.
+# CPU default:
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# CUDA example (NVIDIA):
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch --index-url ${TORCH_INDEX_URL}
 
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt

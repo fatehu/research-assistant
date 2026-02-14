@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     # Base
-    app_name: str = "AI绉戠爺鍔╂墜"
+    app_name: str = "AI科研助手"
     app_version: str = "1.0.0"
     debug: bool = True
     sqlalchemy_echo: bool = False

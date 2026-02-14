@@ -41,6 +41,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     container_name: research_backend
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://research_user:research_password_123@postgres:5432/research_assistant}
@@ -174,6 +176,10 @@ services:
       - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8888}
       - VITE_WS_BASE_URL=${VITE_WS_BASE_URL:-ws://localhost:8888}
       - VITE_SHOW_RAG_METRICS=${VITE_SHOW_RAG_METRICS:-false}
+      - VITE_DEV_WATCH_POLLING=${VITE_DEV_WATCH_POLLING:-true}
+      - VITE_DEV_WATCH_POLLING_INTERVAL=${VITE_DEV_WATCH_POLLING_INTERVAL:-300}
+      - CHOKIDAR_USEPOLLING=${CHOKIDAR_USEPOLLING:-true}
+      - CHOKIDAR_INTERVAL=${CHOKIDAR_INTERVAL:-300}
     ports:
       - "3000:3000"
     volumes:

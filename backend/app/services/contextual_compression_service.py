@@ -3,6 +3,7 @@ LLM-based contextual compression for retrieved chunks.
 """
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -103,6 +104,15 @@ class ContextualCompressionService:
         if lower_key.startswith("your-") or lower_key.startswith("your_"):
             return False
         return True
+
+    @staticmethod
+    def _normalize_reranker_score(score: float) -> float:
+        """Map raw reranker score to a stable 0-1 scale."""
+        if score >= 0:
+            z = math.exp(-score)
+            return 1.0 / (1.0 + z)
+        z = math.exp(score)
+        return z / (1.0 + z)
 
     @staticmethod
     def _extract_json(content: str) -> dict[str, Any]:
@@ -391,7 +401,7 @@ class ContextualCompressionService:
             )
 
         threshold = max(0.0, min(settings.contextual_compression_skip_rerank_threshold, 1.0))
-        if chunk.reranker_score is not None and float(chunk.reranker_score) >= threshold:
+        if chunk.reranker_score is not None and self._normalize_reranker_score(float(chunk.reranker_score)) >= threshold:
             return self._result_for_high_reranker(chunk, source_label)
 
         if not self._llm_available():
@@ -549,7 +559,7 @@ class ContextualCompressionService:
                 )
                 continue
 
-            if chunk.reranker_score is not None and float(chunk.reranker_score) >= threshold:
+            if chunk.reranker_score is not None and self._normalize_reranker_score(float(chunk.reranker_score)) >= threshold:
                 results[chunk.source_id] = self._result_for_high_reranker(chunk, source_label)
                 continue
 

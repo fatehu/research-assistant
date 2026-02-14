@@ -33,7 +33,7 @@ async def test_batch_pipeline_api_like_inputs_respects_reranker_skip(monkeypatch
             doc_name="doc-a",
             chunk_idx=1,
             chunk_content="这是最高相关片段",
-            reranker_score=0.91,
+            reranker_score=2.0,
         ),
         CompressionInput(
             source_id=2,

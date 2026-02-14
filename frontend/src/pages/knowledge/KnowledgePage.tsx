@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -35,6 +35,7 @@ import {
   ShareAltOutlined,
   SettingOutlined,
   FilterOutlined,
+  CloseOutlined,
 } from '@ant-design/icons'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
 import type { SearchResult } from '@/services/api'
@@ -55,6 +56,22 @@ const getSearchStageText = (elapsedMs: number): string => {
   if (elapsedMs < 60000) return '检索候选中'
   if (elapsedMs < 180000) return '重排压缩中'
   return '深度处理中'
+}
+
+type SearchLogLevel = 'info' | 'success' | 'warning' | 'error'
+
+interface SearchLogEntry {
+  id: number
+  time: string
+  level: SearchLogLevel
+  message: string
+}
+
+const getSearchLogClassName = (level: SearchLogLevel): string => {
+  if (level === 'success') return 'text-emerald-300'
+  if (level === 'warning') return 'text-amber-300'
+  if (level === 'error') return 'text-rose-300'
+  return 'text-slate-300'
 }
 
 /**
@@ -117,6 +134,27 @@ const KnowledgePage = () => {
   const [searchElapsedSeconds, setSearchElapsedSeconds] = useState(0)
   const [searchFallbackUsed, setSearchFallbackUsed] = useState(false)
   const [searchFallbackReason, setSearchFallbackReason] = useState('')
+  const [searchLogs, setSearchLogs] = useState<SearchLogEntry[]>([])
+
+  const buildSearchLogEntry = useCallback((level: SearchLogLevel, message: string): SearchLogEntry => {
+    return {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      time: dayjs().format('HH:mm:ss'),
+      level,
+      message,
+    }
+  }, [])
+
+  const appendSearchLog = useCallback((level: SearchLogLevel, message: string) => {
+    setSearchLogs((prev) => {
+      const next = buildSearchLogEntry(level, message)
+      return [...prev.slice(-79), next]
+    })
+  }, [buildSearchLogEntry])
+
+  const resetSearchLogsWithInitial = useCallback((level: SearchLogLevel, message: string) => {
+    setSearchLogs(() => [buildSearchLogEntry(level, message)])
+  }, [buildSearchLogEntry])
 
   // 共享知识库状态
   const [sharedKnowledgeBases, setSharedKnowledgeBases] = useState<SharedKnowledgeBase[]>([])
@@ -167,16 +205,32 @@ const KnowledgePage = () => {
     }
 
     const startedAt = Date.now()
-    setSearchStageText(getSearchStageText(0))
+    let lastStage = getSearchStageText(0)
+    let heartbeatBucket = 0
+    setSearchStageText(lastStage)
     setSearchElapsedSeconds(0)
+    appendSearchLog('info', `阶段：${lastStage}`)
     const timer = setInterval(() => {
       const elapsedMs = Date.now() - startedAt
-      setSearchStageText(getSearchStageText(elapsedMs))
-      setSearchElapsedSeconds(Math.floor(elapsedMs / 1000))
+      const stage = getSearchStageText(elapsedMs)
+      const elapsedSeconds = Math.floor(elapsedMs / 1000)
+      setSearchStageText(stage)
+      setSearchElapsedSeconds(elapsedSeconds)
+
+      if (stage !== lastStage) {
+        lastStage = stage
+        appendSearchLog('info', `阶段切换：${stage}`)
+      }
+
+      const nextBucket = Math.floor(elapsedMs / 15000)
+      if (nextBucket > heartbeatBucket) {
+        heartbeatBucket = nextBucket
+        appendSearchLog('info', `处理中，已等待 ${elapsedSeconds}s`)
+      }
     }, 1000)
 
     return () => clearInterval(timer)
-  }, [isSearching])
+  }, [appendSearchLog, isSearching])
 
   // ─── 操作回调 ──────────────────────────────────
   const handleCreate = async (values: { name: string; description?: string }) => {
@@ -226,9 +280,13 @@ const KnowledgePage = () => {
     setSearchAbortController(primaryController)
     setSearchFallbackUsed(false)
     setSearchFallbackReason('')
+    resetSearchLogsWithInitial(
+      'info',
+      `开始搜索：层级=${searchChunkLevel}，混合=${searchUseHybrid ? '开' : '关'}，改写=${searchUseQueryRewrite ? '开' : '关'}，精排=${searchUseReranker ? '开' : '关'}，压缩=${searchUseContextualCompression ? '开' : '关'}，超时=${Math.floor(searchTimeoutMs / 1000)}s`,
+    )
 
     try {
-      await search(
+      const primaryResponse = await search(
         searchInput,
         kbIds,
         undefined,
@@ -246,25 +304,55 @@ const KnowledgePage = () => {
           signal: primaryController.signal,
         },
       )
+      const dimensions = Array.from(
+        new Set(
+          primaryResponse.results
+            .map((item) => item.metadata?.retrieval_dimension)
+            .filter((dim): dim is number => typeof dim === 'number'),
+        ),
+      )
+      const rewriteCacheHit = primaryResponse.results.filter(
+        (item) => item.metadata?.query_rewrite_cache_hit === true,
+      ).length
+      const compressionEnabled = primaryResponse.results.filter(
+        (item) => item.metadata?.contextual_compression_enabled === true,
+      ).length
+      const compressionSkippedHighReranker = primaryResponse.results.filter(
+        (item) => item.metadata?.contextual_compression_fallback === 'skip_high_reranker',
+      ).length
+      const compressionFallbackCount = primaryResponse.results.filter(
+        (item) => Boolean(item.metadata?.contextual_compression_fallback),
+      ).length
+      appendSearchLog(
+        'success',
+        `主请求成功：${primaryResponse.results.length} 条，耗时 ${Math.round(primaryResponse.search_time_ms)}ms`,
+      )
+      appendSearchLog(
+        'info',
+        `结果摘要：维度=${dimensions.length > 0 ? dimensions.join('/') : '未知'}，改写缓存命中=${rewriteCacheHit}，实际压缩=${compressionEnabled}，高分跳过=${compressionSkippedHighReranker}，压缩回退=${compressionFallbackCount}`,
+      )
       setSearchAbortController(null)
       return
     } catch (error) {
       if (isApiCanceledError(error)) {
+        appendSearchLog('warning', '用户取消了主请求')
         setSearchAbortController(null)
         return
       }
       if (!isApiTimeoutError(error)) {
+        appendSearchLog('error', '主请求失败（非超时）')
         setSearchAbortController(null)
         message.error('搜索失败，请稍后重试')
         return
       }
     }
 
+    appendSearchLog('warning', '主请求超时，触发自动降级重试')
     message.warning('主请求超时，正在自动降级重试')
     const fallbackController = new AbortController()
     setSearchAbortController(fallbackController)
     try {
-      await search(
+      const fallbackResponse = await search(
         searchInput,
         kbIds,
         undefined,
@@ -284,6 +372,14 @@ const KnowledgePage = () => {
       )
       setSearchFallbackUsed(true)
       setSearchFallbackReason('主请求超时后自动降级重试')
+      appendSearchLog(
+        'success',
+        `降级重试成功：${fallbackResponse.results.length} 条，耗时 ${Math.round(fallbackResponse.search_time_ms)}ms`,
+      )
+      const fallbackFlagged = fallbackResponse.results.filter(
+        (item) => item.metadata?.fallback_retry_used === true,
+      ).length
+      appendSearchLog('info', `降级标记结果数：${fallbackFlagged}`)
       useKnowledgeStore.setState((state) => ({
         searchResults: state.searchResults.map((item) => ({
           ...item,
@@ -296,12 +392,15 @@ const KnowledgePage = () => {
       }))
     } catch (fallbackError) {
       if (isApiCanceledError(fallbackError)) {
+        appendSearchLog('warning', '用户取消了降级重试')
         return
       }
       if (isApiTimeoutError(fallbackError)) {
+        appendSearchLog('error', '主请求与降级重试均超时')
         message.error('检索超时：主请求与降级重试均超时，请缩短查询或关闭增强选项后重试')
         return
       }
+      appendSearchLog('error', '降级重试失败（非超时）')
       message.error('降级重试失败，请稍后重试')
     } finally {
       setSearchAbortController(null)
@@ -314,6 +413,7 @@ const KnowledgePage = () => {
     setSearchAbortController(null)
     setSearchStageText('')
     setSearchElapsedSeconds(0)
+    appendSearchLog('warning', '用户手动取消搜索')
     message.info('已取消搜索')
   }
 
@@ -566,6 +666,7 @@ const KnowledgePage = () => {
           setSearchFallbackReason('')
           setSearchStageText('')
           setSearchElapsedSeconds(0)
+          setSearchLogs([])
         }}
         footer={null}
         width={720}
@@ -586,7 +687,13 @@ const KnowledgePage = () => {
             <span className="text-slate-300 text-xs">
               {searchStageText || '处理中'}（已等待 {searchElapsedSeconds}s）
             </span>
-            <Button size="small" danger onClick={handleCancelSearch}>
+            <Button
+              size="small"
+              icon={<CloseOutlined />}
+              onClick={handleCancelSearch}
+              className="border-slate-600 bg-slate-800/80 text-slate-200 hover:border-cyan-400 hover:text-cyan-200 hover:bg-slate-700/80"
+              style={{ boxShadow: 'none' }}
+            >
               取消
             </Button>
           </div>
@@ -594,6 +701,24 @@ const KnowledgePage = () => {
         {searchFallbackUsed && (
           <div className="mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-amber-200 text-xs">
             降级结果：{searchFallbackReason || '已关闭改写/重排/压缩后重试返回'}
+          </div>
+        )}
+        {(isSearching || searchLogs.length > 0) && (
+          <div className="mb-3 rounded border border-slate-700/60 bg-slate-900/60">
+            <div className="border-b border-slate-700/60 px-3 py-2 text-xs text-slate-400">
+              检索过程日志（最新在下）
+            </div>
+            <div className="max-h-36 overflow-y-auto px-3 py-2 font-mono text-[12px] leading-5">
+              {searchLogs.length === 0 ? (
+                <div className="text-slate-500">等待日志输出...</div>
+              ) : (
+                searchLogs.map((log) => (
+                  <div key={log.id} className={getSearchLogClassName(log.level)}>
+                    [{log.time}] {log.message}
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         )}
         <Collapse
