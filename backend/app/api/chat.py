@@ -409,7 +409,7 @@ async def send_message(
                 if use_tools:
                     # 使用 ReAct Agent（带工具）
                     from app.core.database import async_session_factory
-                    from app.services.react_agent import create_react_agent
+                    from app.services.react_agent import AgentRuntimeContext, create_react_agent
                     
                     # 收集ReAct步骤
                     react_steps = []
@@ -420,7 +420,16 @@ async def send_message(
                         user_id=current_user.id,
                         db_session_factory=async_session_factory,
                     )
-                    agent = create_react_agent(llm_service, tool_registry, max_iterations=5)
+                    agent = create_react_agent(
+                        llm_service,
+                        tool_registry,
+                        max_iterations=5,
+                        runtime_context=AgentRuntimeContext(
+                            user_id=current_user.id,
+                            channel="chat",
+                            conversation_id=conversation_id,
+                        ),
+                    )
                     
                     async for event in agent.run(messages, stream=True):
                         event_type = event["type"]

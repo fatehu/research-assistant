@@ -1132,7 +1132,7 @@ async def notebook_agent_chat(
         """生成流式响应"""
         try:
             from app.services.agent_tools import ToolRegistry
-            from app.services.react_agent import ReActAgent
+            from app.services.react_agent import AgentRuntimeContext, create_react_agent
             from app.services.llm_service import get_llm_service
             
             # 创建带 Notebook 上下文的工具注册表
@@ -1149,11 +1149,16 @@ async def notebook_agent_chat(
             # 获取 LLM 服务 (异步)
             llm_service = await get_llm_service()
             
-            # 创建 Agent
-            agent = ReActAgent(
+            # 创建统一 Agent Core（兼容 ReActAgent 入口）
+            agent = create_react_agent(
                 llm_service=llm_service,
                 tool_registry=tool_registry,
-                max_iterations=settings.react_max_iterations
+                max_iterations=settings.react_max_iterations,
+                runtime_context=AgentRuntimeContext(
+                    user_id=current_user.id,
+                    channel="codelab_agent",
+                    notebook_id=notebook_id,
+                ),
             )
             
             # 构建 Notebook 单元格概要（使用配置的上下文参数）
