@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Input, Button, Statistic, Row, Col, Empty, message } from 'antd'
+import { Card, Input, Button, Statistic, Row, Col, Empty, Modal, message } from 'antd'
 import {
   SendOutlined,
   MessageOutlined,
@@ -38,7 +38,7 @@ const DashboardPage = () => {
   const { user, isMentor, isStudent, isAdmin } = useAuthStore()
   const { conversations, createConversation, isSending } = useChatStore()
   const { knowledgeBases, totalKnowledgeBases, fetchKnowledgeBases } = useKnowledgeStore()
-  const { 
+  const {
     myMentorship, 
     myStudents, 
     studentActivities,
@@ -49,6 +49,8 @@ const DashboardPage = () => {
     fetchPendingCount,
   } = useMentorshipStore()
   const [quickInput, setQuickInput] = useState('')
+  const [showAllActivities, setShowAllActivities] = useState(false)
+  const [showAllConversations, setShowAllConversations] = useState(false)
   
   // 获取知识库列表和角色相关数据
   useEffect(() => {
@@ -133,6 +135,11 @@ const DashboardPage = () => {
     { icon: '📊', text: '如何设计实验方案' },
     { icon: '💻', text: 'PyTorch vs TensorFlow' },
   ]
+
+  const orderedConversations = [...conversations].sort(
+    (a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf()
+  )
+  const recentConversations = orderedConversations.slice(0, 5)
   
   return (
     <div className="h-full overflow-y-auto bg-gradient-to-b from-slate-900 to-slate-950">
@@ -341,7 +348,7 @@ const DashboardPage = () => {
               <Button 
                 type="text" 
                 className="text-slate-400 hover:text-violet-400"
-                onClick={() => navigate('/student/mentor')}
+                onClick={() => setShowAllActivities(true)}
               >
                 查看全部 <ArrowRightOutlined />
               </Button>
@@ -367,7 +374,7 @@ const DashboardPage = () => {
               <Button 
                 type="text" 
                 className="text-slate-400 hover:text-emerald-400"
-                onClick={() => navigate('/chat')}
+                onClick={() => setShowAllConversations(true)}
               >
                 查看全部 <ArrowRightOutlined />
               </Button>
@@ -376,7 +383,7 @@ const DashboardPage = () => {
           <Card className="rounded-2xl border-slate-800 bg-slate-800/30">
             {conversations.length > 0 ? (
               <div className="divide-y divide-slate-800">
-                {conversations.slice(0, 5).map((conv, index) => (
+                {recentConversations.map((conv, index) => (
                   <motion.div
                     key={conv.id}
                     initial={{ opacity: 0, x: -20 }}
@@ -420,6 +427,86 @@ const DashboardPage = () => {
             )}
           </Card>
         </motion.div>
+
+        <Modal
+          title="全部学生动态"
+          open={showAllActivities}
+          onCancel={() => setShowAllActivities(false)}
+          centered
+          width={900}
+          footer={[
+            <Button
+              key="mentor"
+              onClick={() => {
+                setShowAllActivities(false)
+                navigate('/student/mentor')
+              }}
+            >
+              前往学生管理
+            </Button>,
+            <Button key="close" type="primary" onClick={() => setShowAllActivities(false)}>
+              关闭
+            </Button>,
+          ]}
+        >
+          <div className="max-h-[62vh] overflow-y-auto pr-1">
+            <StudentActivities activities={studentActivities} />
+          </div>
+        </Modal>
+
+        <Modal
+          title={`全部对话（${orderedConversations.length}）`}
+          open={showAllConversations}
+          onCancel={() => setShowAllConversations(false)}
+          centered
+          width={900}
+          footer={[
+            <Button
+              key="chat"
+              onClick={() => {
+                setShowAllConversations(false)
+                navigate('/chat')
+              }}
+            >
+              前往聊天页
+            </Button>,
+            <Button key="close" type="primary" onClick={() => setShowAllConversations(false)}>
+              关闭
+            </Button>,
+          ]}
+        >
+          {orderedConversations.length > 0 ? (
+            <div className="max-h-[62vh] overflow-y-auto divide-y divide-slate-200 dark:divide-slate-700">
+              {orderedConversations.map((conv) => (
+                <button
+                  key={conv.id}
+                  type="button"
+                  onClick={() => {
+                    setShowAllConversations(false)
+                    navigate(`/chat/${conv.id}`)
+                  }}
+                  className="w-full text-left flex items-center justify-between px-1 py-3 hover:bg-slate-100/70 dark:hover:bg-slate-800/60 rounded-lg transition-colors"
+                >
+                  <div className="min-w-0">
+                    <p className="font-medium text-slate-800 dark:text-slate-100 truncate">
+                      {conv.title || '新对话'}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {conv.message_count || 0} 条消息 · {dayjs(conv.updated_at).fromNow()}
+                    </p>
+                  </div>
+                  <ArrowRightOutlined className="text-slate-400 ml-4 flex-shrink-0" />
+                </button>
+              ))}
+            </div>
+          ) : (
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description="暂无对话记录"
+              className="py-10"
+            />
+          )}
+        </Modal>
       </div>
     </div>
   )
