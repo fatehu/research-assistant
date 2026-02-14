@@ -412,9 +412,19 @@ class AgentCore:
             return
         user_text = self._latest_user_text(context.messages)
         classify = getattr(self.tools, "classify_intent", None)
-        intent = str(classify(user_text)) if callable(classify) else "general_chat"
+        intent = "general_chat"
+        if callable(classify):
+            try:
+                intent = str(classify(user_text))
+            except Exception as exc:
+                logger.warning(f"[AgentCore] classify_intent failed, fallback to general_chat: {exc}")
         select_names = getattr(self.tools, "select_tool_names_for_intent", None)
-        selected_tools = list(select_names(intent, user_text=user_text)) if callable(select_names) else []
+        selected_tools: List[str] = []
+        if callable(select_names):
+            try:
+                selected_tools = list(select_names(intent, user_text=user_text))
+            except Exception as exc:
+                logger.warning(f"[AgentCore] select_tool_names_for_intent failed, fallback to empty: {exc}")
 
         if bool(getattr(settings, "agent_persist_steps_enabled", True)):
             try:
