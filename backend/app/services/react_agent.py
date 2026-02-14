@@ -399,6 +399,15 @@ class AgentCore:
         return f"Compressed contexts: {len(parts)}\n" + "".join(parts)
 
     async def _prepare_runtime_context(self, context: AgentContext) -> None:
+        refresh_mcp_tools = getattr(self.tools, "refresh_mcp_tools", None)
+        if callable(refresh_mcp_tools):
+            try:
+                maybe_awaitable = refresh_mcp_tools()
+                if hasattr(maybe_awaitable, "__await__"):
+                    await maybe_awaitable
+            except Exception as exc:
+                logger.warning(f"[AgentCore] MCP tool refresh failed, continue with local tools: {exc}")
+
         if not self.runtime_context.user_id:
             return
         user_text = self._latest_user_text(context.messages)
