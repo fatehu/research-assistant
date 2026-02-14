@@ -31,7 +31,7 @@ from app.services.notebook_agent_history_service import (
     load_history,
 )
 from app.services.notebook_tools import create_notebook_tools
-from app.services.react_agent import create_react_agent
+from app.services.react_agent import AgentRuntimeContext, create_react_agent
 
 router = APIRouter()
 
@@ -182,7 +182,15 @@ async def notebook_agent_chat(
     )
 
     llm_service = await get_llm_service()
-    agent = create_react_agent(llm_service, tool_registry)
+    agent = create_react_agent(
+        llm_service,
+        tool_registry,
+        runtime_context=AgentRuntimeContext(
+            user_id=current_user.id,
+            channel="notebook_agent",
+            notebook_id=notebook_id,
+        ),
+    )
 
     context_parts: List[str] = []
     if request.include_context:
