@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 from loguru import logger
+from pydantic import BaseModel
 
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -25,6 +26,23 @@ from app.schemas.role import (
 )
 
 router = APIRouter()
+
+
+class MentorActivityStudent(BaseModel):
+    id: int
+    username: str
+    full_name: str | None = None
+    avatar: str | None = None
+    role: str = "student"
+
+
+class MentorActivityItem(BaseModel):
+    id: str
+    type: str
+    title: str
+    description: str | None = None
+    timestamp: datetime
+    student: MentorActivityStudent
 
 
 # ========== 学生管理 ==========
@@ -219,6 +237,126 @@ async def get_student_progress(
     )
 
 
+@router.get("/activities", response_model=list[MentorActivityItem])
+async def get_mentor_activities(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_mentor_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取导师视角的学生动态（真实数据，按时间倒序）"""
+    student_rows = await db.execute(
+        select(User).where(User.mentor_id == current_user.id)
+    )
+    students = student_rows.scalars().all()
+    if not students:
+        return []
+
+    student_ids = [s.id for s in students]
+    student_map = {s.id: s for s in students}
+
+    source_limit = min(max(limit * 3, 20), 200)
+    items: list[MentorActivityItem] = []
+
+    def append_item(
+        *,
+        item_type: str,
+        record_id: int | str,
+        title: str,
+        description: str | None,
+        timestamp: datetime | None,
+        student_id: int,
+    ) -> None:
+        if timestamp is None:
+            return
+        student = student_map.get(student_id)
+        if not student:
+            return
+        items.append(
+            MentorActivityItem(
+                id=f"{item_type}-{record_id}",
+                type=item_type,
+                title=title,
+                description=description,
+                timestamp=timestamp,
+                student=MentorActivityStudent(
+                    id=student.id,
+                    username=student.username,
+                    full_name=student.full_name,
+                    avatar=student.avatar,
+                    role=student.role or UserRole.STUDENT.value,
+                ),
+            )
+        )
+
+    conversations = await db.execute(
+        select(Conversation)
+        .where(Conversation.user_id.in_(student_ids))
+        .order_by(Conversation.updated_at.desc())
+        .limit(source_limit)
+    )
+    for conv in conversations.scalars().all():
+        append_item(
+            item_type="conversation",
+            record_id=conv.id,
+            title=conv.title or "对话更新",
+            description="进行了 AI 对话",
+            timestamp=conv.updated_at,
+            student_id=conv.user_id,
+        )
+
+    notebooks = await db.execute(
+        select(Notebook)
+        .where(Notebook.user_id.in_(student_ids))
+        .order_by(Notebook.updated_at.desc())
+        .limit(source_limit)
+    )
+    for nb in notebooks.scalars().all():
+        append_item(
+            item_type="notebook",
+            record_id=nb.id,
+            title=nb.title or "Notebook 更新",
+            description="更新了代码实验记录",
+            timestamp=nb.updated_at,
+            student_id=nb.user_id,
+        )
+
+    knowledge_bases = await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.user_id.in_(student_ids))
+        .order_by(KnowledgeBase.updated_at.desc())
+        .limit(source_limit)
+    )
+    for kb in knowledge_bases.scalars().all():
+        append_item(
+            item_type="knowledge",
+            record_id=kb.id,
+            title=kb.name or "知识库更新",
+            description="维护了知识库内容",
+            timestamp=kb.updated_at,
+            student_id=kb.user_id,
+        )
+
+    papers = await db.execute(
+        select(Paper)
+        .where(Paper.user_id.in_(student_ids))
+        .order_by(Paper.updated_at.desc())
+        .limit(source_limit)
+    )
+    for paper in papers.scalars().all():
+        append_item(
+            item_type="literature",
+            record_id=paper.id,
+            title=paper.title or "论文更新",
+            description="更新了论文收藏/阅读状态",
+            timestamp=paper.updated_at,
+            student_id=paper.user_id,
+        )
+
+    items.sort(key=lambda x: x.timestamp, reverse=True)
+    return items[skip : skip + limit]
+
+
 # ========== 研究组管理 ==========
 
 @router.get("/groups", response_model=list[GroupResponse])
@@ -315,6 +453,46 @@ async def get_group(
     response.member_count = len(members)
     response.members = members
     return response
+
+
+@router.get("/groups/{group_id}/members", response_model=list[GroupMemberResponse])
+async def get_group_members(
+    group_id: int,
+    current_user: User = Depends(get_mentor_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取研究组成员列表"""
+    group_result = await db.execute(
+        select(ResearchGroup).where(
+            and_(
+                ResearchGroup.id == group_id,
+                ResearchGroup.mentor_id == current_user.id,
+            )
+        )
+    )
+    if not group_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="研究组不存在")
+
+    members_result = await db.execute(
+        select(GroupMember, User)
+        .join(User, GroupMember.user_id == User.id)
+        .where(GroupMember.group_id == group_id)
+        .order_by(GroupMember.joined_at.desc())
+    )
+    members: list[GroupMemberResponse] = []
+    for gm, user in members_result:
+        members.append(
+            GroupMemberResponse(
+                id=gm.id,
+                user_id=user.id,
+                username=user.username,
+                full_name=user.full_name,
+                avatar=user.avatar,
+                role=gm.role,
+                joined_at=gm.joined_at,
+            )
+        )
+    return members
 
 
 @router.put("/groups/{group_id}", response_model=GroupResponse)

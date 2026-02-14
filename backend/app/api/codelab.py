@@ -38,6 +38,7 @@ from app.services.notebook_agent_history_service import (
     clear_history as clear_history_in_db,
     load_history,
 )
+from app.services.codelab_executor import CodeLabExecutor
 from app.config import settings
 
 router = APIRouter()
@@ -96,6 +97,8 @@ class ExecuteResponse(BaseModel):
     outputs: List[CellOutput]
     execution_count: int
     execution_time_ms: int
+    terminated_reason: str = "none"  # timeout | policy_violation | resource_limit | none
+    policy_violation_code: Optional[str] = None
 
 
 # ========== 持久化执行内核 ==========
@@ -111,14 +114,23 @@ class PythonKernel:
         self.execution_count = 0
         self.created_at = datetime.utcnow()
         self.last_used_at = datetime.utcnow()
+        self._sandbox_enabled = bool(settings.codelab_sandbox_enabled)
+        self._sandbox_executor: Optional[CodeLabExecutor] = None
+        self._variable_previews: Dict[str, str] = {}
         
         # 共享的命名空间 - 所有 cell 在这里执行
         self.namespace: Dict[str, Any] = {}
+
+        if self._sandbox_enabled:
+            self._sandbox_executor = CodeLabExecutor(
+                notebook_id=notebook_id,
+                hard_timeout_seconds=settings.codelab_exec_timeout_hard_seconds,
+            )
+        else:
+            # 初始化命名空间，预导入常用库
+            self._initialize_namespace()
         
-        # 初始化命名空间，预导入常用库
-        self._initialize_namespace()
-        
-        logger.info(f"创建执行内核: notebook_id={notebook_id}")
+        logger.info(f"创建执行内核: notebook_id={notebook_id}, sandbox={self._sandbox_enabled}")
     
     def _initialize_namespace(self):
         """初始化命名空间，预导入常用库"""
@@ -212,6 +224,16 @@ except:
         在持久化的命名空间中执行代码
         返回执行结果，包括输出、图表、错误等
         """
+        if self._sandbox_executor is not None:
+            self.last_used_at = datetime.utcnow()
+            hard_timeout = max(1, int(settings.codelab_exec_timeout_hard_seconds))
+            safe_timeout = max(1, min(int(timeout or 1), hard_timeout))
+            result = self._sandbox_executor.execute(code=code, timeout_seconds=safe_timeout)
+            self.execution_count = int(result.get('execution_count', self.execution_count) or 0)
+            self.namespace = {}
+            self._variable_previews = dict(result.get("variable_previews", {}) or {})
+            return result
+
         self.execution_count += 1
         self.last_used_at = datetime.utcnow()
         
@@ -375,6 +397,14 @@ except:
     
     def reset(self):
         """重置内核状态"""
+        if self._sandbox_executor is not None:
+            self._sandbox_executor.reset()
+            self.execution_count = 0
+            self.namespace.clear()
+            self._variable_previews = {}
+            logger.info(f"沙箱内核已重置: notebook_id={self.notebook_id}")
+            return
+
         self.namespace.clear()
         self.execution_count = 0
         self._initialize_namespace()
@@ -382,6 +412,10 @@ except:
     
     def get_variables(self) -> Dict[str, str]:
         """获取当前命名空间中的变量列表（用于调试/显示）"""
+        if self._sandbox_executor is not None:
+            variables = self._sandbox_executor.get_variables()
+            return variables
+
         variables = {}
         for name, value in self.namespace.items():
             if not name.startswith('_') and not callable(value) and not isinstance(value, type):
@@ -390,6 +424,35 @@ except:
                 except:
                     pass
         return variables
+
+    def get_variable_preview(self, name: str) -> Optional[str]:
+        if not name:
+            return None
+        if self._sandbox_executor is not None:
+            return self._sandbox_executor.get_variable_preview(name)
+        value = self.namespace.get(name)
+        if value is None:
+            return None
+        try:
+            if hasattr(value, "shape"):
+                return f"shape={getattr(value, 'shape', None)}"
+            if hasattr(value, "__len__") and not isinstance(value, str):
+                return f"len={len(value)}"
+            text = repr(value)
+            return text[:160] + ("..." if len(text) > 160 else "")
+        except Exception:
+            return None
+
+    def has_variable(self, name: str) -> bool:
+        if not name:
+            return False
+        if self._sandbox_executor is not None:
+            return self._sandbox_executor.has_variable(name)
+        return name in self.namespace
+
+    def close(self) -> None:
+        if self._sandbox_executor is not None:
+            self._sandbox_executor.close()
 
 
 # ========== 内核管理器 ==========
@@ -433,6 +496,10 @@ class KernelManager:
         """销毁 Notebook 的执行内核"""
         with self._lock:
             if notebook_id in self._kernels:
+                try:
+                    self._kernels[notebook_id].close()
+                except Exception:
+                    logger.warning(f"关闭内核失败: notebook_id={notebook_id}")
                 del self._kernels[notebook_id]
                 logger.info(f"内核已销毁: notebook_id={notebook_id}")
     
@@ -458,6 +525,10 @@ class KernelManager:
                     to_remove.append(notebook_id)
             
             for notebook_id in to_remove:
+                try:
+                    self._kernels[notebook_id].close()
+                except Exception:
+                    logger.warning(f"关闭不活跃内核失败: notebook_id={notebook_id}")
                 del self._kernels[notebook_id]
                 logger.info(f"清理不活跃内核: notebook_id={notebook_id}")
 
@@ -473,6 +544,37 @@ _notebooks_cache: Dict[str, Dict] = {}
 
 # 标记已从数据库加载的用户
 _loaded_users: set = set()
+
+# 用户维度执行并发计数（避免单用户占满服务）
+_user_execution_counter: Dict[int, int] = {}
+_user_execution_lock = asyncio.Lock()
+
+
+class _ResourceLimitError(Exception):
+    pass
+
+
+class _UserExecutionSlot:
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
+
+    async def __aenter__(self):
+        limit = max(1, int(settings.codelab_max_concurrency_per_user))
+        async with _user_execution_lock:
+            current = _user_execution_counter.get(self.user_id, 0)
+            if current >= limit:
+                raise _ResourceLimitError("CodeLab 并发执行已达上限，请稍后重试")
+            _user_execution_counter[self.user_id] = current + 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        async with _user_execution_lock:
+            current = max(0, _user_execution_counter.get(self.user_id, 1) - 1)
+            if current == 0:
+                _user_execution_counter.pop(self.user_id, None)
+            else:
+                _user_execution_counter[self.user_id] = current
+        return False
 
 
 async def _sync_to_cache(notebook: Dict):
@@ -702,9 +804,29 @@ async def execute_cell(
     
     # 获取或创建执行内核
     kernel = kernel_manager.get_or_create_kernel(notebook_id)
-    
-    # 在内核中执行代码
-    result = kernel.execute(request.code, request.get_timeout())
+
+    # 在内核中执行代码（用户维度并发限制）
+    try:
+        async with _UserExecutionSlot(current_user.id):
+            result = await asyncio.to_thread(kernel.execute, request.code, request.get_timeout())
+    except _ResourceLimitError as exc:
+        return ExecuteResponse(
+            success=False,
+            outputs=[
+                CellOutput(
+                    output_type="error",
+                    content={
+                        "ename": "ResourceLimitError",
+                        "evalue": str(exc),
+                        "traceback": [],
+                    },
+                )
+            ],
+            execution_count=notebook.get("execution_count", 0),
+            execution_time_ms=0,
+            terminated_reason="resource_limit",
+            policy_violation_code=None,
+        )
     
     # 序列化输出
     serialized_outputs = []
@@ -736,12 +858,19 @@ async def execute_cell(
     notebook['updated_at'] = datetime.utcnow()
     notebook['execution_count'] = result['execution_count']
     _notebooks_cache[notebook_id] = notebook
+    logger.info(
+        f"[CodeLabExecute] user_id={current_user.id} notebook_id={notebook_id} "
+        f"success={result.get('success')} terminated_reason={result.get('terminated_reason', 'none')} "
+        f"execution_time_ms={result.get('execution_time_ms', 0)}"
+    )
     
     return ExecuteResponse(
         success=result['success'],
         outputs=result['outputs'],
         execution_count=result['execution_count'],
-        execution_time_ms=result['execution_time_ms']
+        execution_time_ms=result['execution_time_ms'],
+        terminated_reason=str(result.get("terminated_reason", "none")),
+        policy_violation_code=result.get("policy_violation_code"),
     )
 
 
@@ -751,16 +880,57 @@ async def execute_code_directly(
     current_user: User = Depends(get_current_user)
 ):
     """直接执行代码（使用临时内核，不保存状态）"""
+    if not settings.codelab_direct_execute_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="直接执行端点已关闭（CODELAB_DIRECT_EXECUTE_ENABLED=false）",
+        )
+    if current_user.role != "admin" and not settings.debug:
+        raise HTTPException(
+            status_code=403,
+            detail="仅管理员或 DEBUG 模式允许直接执行",
+        )
+
     # 创建一个临时内核
     temp_kernel = PythonKernel(f"temp_{uuid.uuid4()}")
-    result = temp_kernel.execute(request.code, request.get_timeout())
-    
-    return ExecuteResponse(
-        success=result['success'],
-        outputs=result['outputs'],
-        execution_count=0,
-        execution_time_ms=result['execution_time_ms']
-    )
+    try:
+        try:
+            async with _UserExecutionSlot(current_user.id):
+                result = await asyncio.to_thread(temp_kernel.execute, request.code, request.get_timeout())
+        except _ResourceLimitError as exc:
+            return ExecuteResponse(
+                success=False,
+                outputs=[
+                    CellOutput(
+                        output_type="error",
+                        content={
+                            "ename": "ResourceLimitError",
+                            "evalue": str(exc),
+                            "traceback": [],
+                        },
+                    )
+                ],
+                execution_count=0,
+                execution_time_ms=0,
+                terminated_reason="resource_limit",
+                policy_violation_code=None,
+            )
+        logger.info(
+            f"[CodeLabExecuteDirect] user_id={current_user.id} success={result.get('success')} "
+            f"terminated_reason={result.get('terminated_reason', 'none')} "
+            f"execution_time_ms={result.get('execution_time_ms', 0)}"
+        )
+
+        return ExecuteResponse(
+            success=result['success'],
+            outputs=result['outputs'],
+            execution_count=0,
+            execution_time_ms=result['execution_time_ms'],
+            terminated_reason=str(result.get("terminated_reason", "none")),
+            policy_violation_code=result.get("policy_violation_code"),
+        )
+    finally:
+        temp_kernel.close()
 
 
 @router.post("/notebooks/{notebook_id}/cells")
@@ -824,41 +994,64 @@ async def run_all_cells(
     service = NotebookService(db)
     
     results = []
-    for cell in notebook['cells']:
-        if cell['cell_type'] == 'code' and cell['source'].strip():
-            # 执行代码
-            result = kernel.execute(cell['source'], timeout=settings.code_execution_timeout)
-            
-            # 序列化输出
-            serialized_outputs = []
-            for o in result['outputs']:
-                if hasattr(o, 'model_dump'):
-                    serialized_outputs.append(o.model_dump())
-                elif hasattr(o, 'dict'):
-                    serialized_outputs.append(o.dict())
-                elif isinstance(o, dict):
-                    serialized_outputs.append(o)
-                else:
-                    serialized_outputs.append({'output_type': 'unknown', 'content': str(o)})
-            
-            cell['outputs'] = serialized_outputs
-            cell['execution_count'] = result['execution_count']
-            
-            # 保存到数据库
-            await service.save_cell_execution(
-                notebook_id, current_user.id, cell['id'],
-                serialized_outputs, result['execution_count']
-            )
-            
-            results.append({
-                'cell_id': cell['id'],
-                'success': result['success'],
-                'execution_count': result['execution_count']
-            })
+    try:
+        async with _UserExecutionSlot(current_user.id):
+            for cell in notebook['cells']:
+                if cell['cell_type'] == 'code' and cell['source'].strip():
+                    # 执行代码
+                    result = await asyncio.to_thread(
+                        kernel.execute,
+                        cell['source'],
+                        settings.code_execution_timeout,
+                    )
+                    
+                    # 序列化输出
+                    serialized_outputs = []
+                    for o in result['outputs']:
+                        if hasattr(o, 'model_dump'):
+                            serialized_outputs.append(o.model_dump())
+                        elif hasattr(o, 'dict'):
+                            serialized_outputs.append(o.dict())
+                        elif isinstance(o, dict):
+                            serialized_outputs.append(o)
+                        else:
+                            serialized_outputs.append({'output_type': 'unknown', 'content': str(o)})
+                    
+                    cell['outputs'] = serialized_outputs
+                    cell['execution_count'] = result['execution_count']
+                    
+                    # 保存到数据库
+                    await service.save_cell_execution(
+                        notebook_id, current_user.id, cell['id'],
+                        serialized_outputs, result['execution_count']
+                    )
+                    
+                    results.append({
+                        'cell_id': cell['id'],
+                        'success': result['success'],
+                        'execution_count': result['execution_count'],
+                        'terminated_reason': result.get('terminated_reason', 'none'),
+                        'policy_violation_code': result.get('policy_violation_code'),
+                    })
+    except _ResourceLimitError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "resource_limit",
+                "message": str(exc),
+                "terminated_reason": "resource_limit",
+            },
+        )
     
     notebook['updated_at'] = datetime.utcnow()
     notebook['execution_count'] = kernel.execution_count
     _notebooks_cache[notebook_id] = notebook
+    timeout_count = sum(1 for item in results if item.get("terminated_reason") == "timeout")
+    policy_count = sum(1 for item in results if item.get("terminated_reason") == "policy_violation")
+    logger.info(
+        f"[CodeLabRunAll] user_id={current_user.id} notebook_id={notebook_id} "
+        f"executed_cells={len(results)} timeout_cells={timeout_count} policy_cells={policy_count}"
+    )
     
     # 更新 notebook 执行计数
     await service.update_execution_count(notebook_id, current_user.id, kernel.execution_count)

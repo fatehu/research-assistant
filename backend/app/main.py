@@ -52,8 +52,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"  NOTEBOOK_CONTEXT_VARIABLES: {settings.notebook_context_variables}")
     logger.info("=" * 50)
     
-    # 启动时创建表
-    await create_tables()
+    # 启动时建表仅用于开发/测试；生产请使用 Alembic
+    if settings.auto_create_tables:
+        logger.warning("AUTO_CREATE_TABLES=true，启动时将执行 create_tables()")
+        await create_tables()
+    else:
+        logger.info("AUTO_CREATE_TABLES=false，跳过启动建表（推荐生产使用 Alembic）")
     
     yield
     
@@ -71,9 +75,12 @@ app = FastAPI(
 )
 
 # 配置 CORS
+cors_allow_origins = settings.get_cors_allow_origins()
+if "*" in cors_allow_origins:
+    raise RuntimeError("不允许在 allow_credentials=true 时使用 CORS_ALLOW_ORIGINS=*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

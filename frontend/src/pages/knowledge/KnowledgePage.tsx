@@ -170,7 +170,7 @@ const KnowledgePage = () => {
         setSharingEnabled(data.sharing_enabled || false)
       })
       .catch(() => setSharedKnowledgeBases([]))
-  }, [])
+  }, [fetchKnowledgeBases])
 
   useEffect(() => {
     if (kbId) {
@@ -178,7 +178,7 @@ const KnowledgePage = () => {
     } else {
       clearCurrentKnowledgeBase()
     }
-  }, [kbId])
+  }, [clearCurrentKnowledgeBase, kbId, selectKnowledgeBase])
 
   // 轮询处理中的文档状态
   useEffect(() => {
@@ -195,7 +195,7 @@ const KnowledgePage = () => {
     }, 3000)
 
     return () => clearInterval(interval)
-  }, [documents, currentKnowledgeBase])
+  }, [documents, currentKnowledgeBase, refreshDocumentStatus])
 
   useEffect(() => {
     if (!isSearching) {

@@ -6,14 +6,15 @@ import React, { useEffect, useState } from 'react';
 import { 
   Card, Button, Space, Input, Modal, Form, message,
   Avatar, Tag, Empty, Spin, Row, Col, Typography, List,
-  Dropdown, Tooltip, Badge, Progress, InputNumber
+  Dropdown, Badge, Progress, InputNumber
 } from 'antd';
 import {
   TeamOutlined, PlusOutlined, EditOutlined, DeleteOutlined,
-  UserOutlined, SettingOutlined, MoreOutlined, UsergroupAddOutlined,
-  CrownOutlined, CheckOutlined, CloseOutlined
+  UserOutlined, MoreOutlined, UsergroupAddOutlined,
+  CheckOutlined, CloseOutlined
 } from '@ant-design/icons';
-import { useRoleStore, ResearchGroup, StudentDetail } from '../../stores/roleStore';
+import { useRoleStore, ResearchGroup } from '../../stores/roleStore';
+import { mentorApi } from '../../services/api';
 
 const { Title, Text, Paragraph } = Typography;
 const { TextArea } = Input;
@@ -32,11 +33,26 @@ const GroupsPage: React.FC = () => {
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
   const [submitting, setSubmitting] = useState(false);
+  const [memberIds, setMemberIds] = useState<Set<number>>(new Set());
+  const [membersLoading, setMembersLoading] = useState(false);
 
   useEffect(() => {
     fetchGroups();
     fetchStudents();
-  }, []);
+  }, [fetchGroups, fetchStudents]);
+
+  const loadGroupMembers = async (groupId: number) => {
+    setMembersLoading(true);
+    try {
+      const members = await mentorApi.getGroupMembers(groupId);
+      setMemberIds(new Set(members.map((m) => m.user_id)));
+    } catch (error) {
+      message.error('加载组成员失败');
+      setMemberIds(new Set());
+    } finally {
+      setMembersLoading(false);
+    }
+  };
 
   const handleCreate = async (values: { name: string; description?: string; max_members?: number }) => {
     setSubmitting(true);
@@ -94,6 +110,7 @@ const GroupsPage: React.FC = () => {
     try {
       await addGroupMember(selectedGroup.id, studentId);
       message.success('成员添加成功');
+      await loadGroupMembers(selectedGroup.id);
     } catch (error: any) {
       message.error(error.response?.data?.detail || '添加失败');
     }
@@ -104,6 +121,7 @@ const GroupsPage: React.FC = () => {
     try {
       await removeGroupMember(selectedGroup.id, studentId);
       message.success('成员已移除');
+      await loadGroupMembers(selectedGroup.id);
     } catch (error: any) {
       message.error(error.response?.data?.detail || '移除失败');
     }
@@ -156,6 +174,7 @@ const GroupsPage: React.FC = () => {
                     label: '管理成员',
                     onClick: () => {
                       setSelectedGroup(group);
+                      loadGroupMembers(group.id);
                       setMembersModalVisible(true);
                     },
                   },
@@ -240,6 +259,7 @@ const GroupsPage: React.FC = () => {
             size="small"
             onClick={() => {
               setSelectedGroup(group);
+              loadGroupMembers(group.id);
               setMembersModalVisible(true);
             }}
           >
@@ -509,7 +529,7 @@ const GroupsPage: React.FC = () => {
             从您的学生列表中添加或移除组成员
           </Text>
 
-          <Spin spinning={studentsLoading}>
+          <Spin spinning={studentsLoading || membersLoading}>
             {students.length === 0 ? (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -519,8 +539,7 @@ const GroupsPage: React.FC = () => {
               <List
                 dataSource={students}
                 renderItem={(student) => {
-                  // 这里简化处理，实际应该检查学生是否已在组内
-                  const isInGroup = false; // TODO: 从group成员列表检查
+                  const isInGroup = memberIds.has(student.id);
 
                   return (
                     <List.Item

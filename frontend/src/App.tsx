@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { Suspense, lazy, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Spin } from 'antd'
 import { useAuthStore } from '@/stores/authStore'
@@ -8,22 +8,21 @@ import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
 import DashboardPage from '@/pages/dashboard/DashboardPage'
 import ChatPage from '@/pages/chat/ChatPage'
-import ChatManagePage from '@/pages/chat/ChatManagePage'
 import KnowledgePage from '@/pages/knowledge/KnowledgePage'
-import SmartChunkingPage from '@/pages/knowledge/SmartChunkingPage'
-import { LiteraturePage } from '@/pages/literature'
-import { CodeLabPage } from '@/pages/codelab'
-
-// 角色相关页面 - 懒加载
-import { UsersPage as AdminUsersPage } from '@/pages/admin'
-import { StudentsPage as MentorStudentsPage, GroupsPage as MentorGroupsPage, AnnouncementsPage as MentorAnnouncementsPage } from '@/pages/mentor'
-import { MentorPage as StudentMentorPage, AnnouncementsPage as StudentAnnouncementsPage } from '@/pages/student'
-
-// 用户页面
-import { ProfilePage, SettingsPage } from '@/pages/user'
-
-// 共享资源页面
-import { SharedResourcesPage, SharedResourceViewPage } from '@/pages/shared'
+const ChatManagePage = lazy(() => import('@/pages/chat/ChatManagePage'))
+const SmartChunkingPage = lazy(() => import('@/pages/knowledge/SmartChunkingPage'))
+const LiteraturePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.LiteraturePage })))
+const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
+const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
+const MentorStudentsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.StudentsPage })))
+const MentorGroupsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.GroupsPage })))
+const MentorAnnouncementsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.AnnouncementsPage })))
+const StudentMentorPage = lazy(() => import('@/pages/student').then((m) => ({ default: m.MentorPage })))
+const StudentAnnouncementsPage = lazy(() => import('@/pages/student').then((m) => ({ default: m.AnnouncementsPage })))
+const ProfilePage = lazy(() => import('@/pages/user').then((m) => ({ default: m.ProfilePage })))
+const SettingsPage = lazy(() => import('@/pages/user').then((m) => ({ default: m.SettingsPage })))
+const SharedResourcesPage = lazy(() => import('@/pages/shared').then((m) => ({ default: m.SharedResourcesPage })))
+const SharedResourceViewPage = lazy(() => import('@/pages/shared').then((m) => ({ default: m.SharedResourceViewPage })))
 
 // 路由守卫组件
 const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
@@ -106,6 +105,16 @@ const PlaceholderPage = ({ title }: { title: string }) => (
   </div>
 )
 
+const RouteLoading = () => (
+  <div className="h-full flex items-center justify-center bg-slate-950">
+    <Spin size="large" />
+  </div>
+)
+
+const withSuspense = (node: React.ReactNode) => (
+  <Suspense fallback={<RouteLoading />}>{node}</Suspense>
+)
+
 function App() {
   const { checkAuth, isInitialized } = useAuthStore()
 
@@ -151,22 +160,22 @@ function App() {
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="chat" element={<ChatPage />} />
-          <Route path="chat/manage" element={<ChatManagePage />} />
+          <Route path="chat/manage" element={withSuspense(<ChatManagePage />)} />
           <Route path="chat/:conversationId" element={<ChatPage />} />
           <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="knowledge/:kbId" element={<KnowledgePage />} />
-          <Route path="knowledge/:kbId/chunking" element={<SmartChunkingPage />} />
-          <Route path="knowledge/chunking" element={<SmartChunkingPage />} />
-          <Route path="literature" element={<LiteraturePage />} />
-          <Route path="code" element={<CodeLabPage />} />
-          <Route path="code/:notebookId" element={<CodeLabPage />} />
+          <Route path="knowledge/:kbId/chunking" element={withSuspense(<SmartChunkingPage />)} />
+          <Route path="knowledge/chunking" element={withSuspense(<SmartChunkingPage />)} />
+          <Route path="literature" element={withSuspense(<LiteraturePage />)} />
+          <Route path="code" element={withSuspense(<CodeLabPage />)} />
+          <Route path="code/:notebookId" element={withSuspense(<CodeLabPage />)} />
 
           {/* ========== 管理员路由 ========== */}
           <Route
             path="admin/users"
             element={
               <RoleRoute allowedRoles={['admin']}>
-                <AdminUsersPage />
+                {withSuspense(<AdminUsersPage />)}
               </RoleRoute>
             }
           />
@@ -184,7 +193,7 @@ function App() {
             path="mentor/students"
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <MentorStudentsPage />
+                {withSuspense(<MentorStudentsPage />)}
               </RoleRoute>
             }
           />
@@ -192,7 +201,7 @@ function App() {
             path="mentor/groups"
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <MentorGroupsPage />
+                {withSuspense(<MentorGroupsPage />)}
               </RoleRoute>
             }
           />
@@ -200,7 +209,7 @@ function App() {
             path="mentor/announcements"
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <MentorAnnouncementsPage />
+                {withSuspense(<MentorAnnouncementsPage />)}
               </RoleRoute>
             }
           />
@@ -208,7 +217,7 @@ function App() {
             path="mentor/shares"
             element={
               <RoleRoute allowedRoles={['mentor']}>
-                <SharedResourcesPage />
+                {withSuspense(<SharedResourcesPage />)}
               </RoleRoute>
             }
           />
@@ -218,7 +227,7 @@ function App() {
             path="student/mentor"
             element={
               <RoleRoute allowedRoles={['student']}>
-                <StudentMentorPage />
+                {withSuspense(<StudentMentorPage />)}
               </RoleRoute>
             }
           />
@@ -226,7 +235,7 @@ function App() {
             path="student/shared"
             element={
               <RoleRoute allowedRoles={['student']}>
-                <SharedResourcesPage />
+                {withSuspense(<SharedResourcesPage />)}
               </RoleRoute>
             }
           />
@@ -234,17 +243,17 @@ function App() {
             path="student/announcements"
             element={
               <RoleRoute allowedRoles={['student']}>
-                <StudentAnnouncementsPage />
+                {withSuspense(<StudentAnnouncementsPage />)}
               </RoleRoute>
             }
           />
 
           {/* 个人设置页面 */}
-          <Route path="profile" element={<ProfilePage />} />
-          <Route path="settings" element={<SettingsPage />} />
+          <Route path="profile" element={withSuspense(<ProfilePage />)} />
+          <Route path="settings" element={withSuspense(<SettingsPage />)} />
 
           {/* 共享资源详情页 - 所有已登录用户可访问 */}
-          <Route path="shared/view/:shareId" element={<SharedResourceViewPage />} />
+          <Route path="shared/view/:shareId" element={withSuspense(<SharedResourceViewPage />)} />
         </Route>
 
         {/* 404 */}
