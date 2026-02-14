@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.config import settings
-from app.services.react_agent import ReActAgent
+from app.services.react_agent import AgentContext, ReActAgent
 
 
 class _BudgetLLM:
@@ -62,3 +62,25 @@ async def test_context_budget_trims_history_and_strips_think(monkeypatch):
     ]
     assert all("<think>" not in content for content in assistant_contents)
     assert any(event.get("type") == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_context_budget_trims_observation_after_first_user_turn(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_budget_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_max_input_tokens", 256)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 8)
+
+    agent = ReActAgent(_BudgetLLM(), _BudgetTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[
+            {"role": "user", "content": "请总结上传文档"},
+            {"role": "tool", "content": "X" * 12000},
+        ]
+    )
+
+    trimmed = await agent._prepare_llm_messages(context, system_prompt="system")
+    roles = [str(item.get("role", "")).lower() for item in trimmed]
+
+    assert "user" in roles
+    assert "tool" not in roles
+    assert context.context_truncated is True

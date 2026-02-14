@@ -204,7 +204,7 @@ const ReActPanel = ({
                 ))}
 
                 {/* 当前正在进行的思考 */}
-                {isThinking && currentThought && (
+                {isThinking && (
                   <motion.div
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
@@ -218,7 +218,7 @@ const ReActPanel = ({
                         <span className="text-xs font-medium text-amber-400">思考中...</span>
                       </div>
                       <p className="text-sm text-slate-300 leading-relaxed">
-                        {currentThought}
+                        {currentThought || '正在分析问题并规划步骤...'}
                         <span className="inline-block w-2 h-4 bg-amber-400 animate-pulse ml-1 rounded-sm" />
                       </p>
                     </div>

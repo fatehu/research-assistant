@@ -22,21 +22,29 @@ class RerankerService:
 
     def _resolve_device(self) -> str:
         """Resolve reranker device from settings."""
-        device = settings.reranker_device
-        if device != "auto":
-            return device
+        requested = str(settings.reranker_device or "auto").strip().lower()
+        device = requested
 
         try:
             import torch
 
-            if torch.cuda.is_available():
-                return "cuda"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-        except Exception:
-            pass
+            if device == "auto":
+                if torch.cuda.is_available():
+                    return "cuda"
+                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    return "mps"
+                return "cpu"
 
-        return "cpu"
+            if device == "cuda" and not torch.cuda.is_available():
+                logger.warning("RERANKER_DEVICE=cuda 但当前环境无可用 CUDA，自动回退到 CPU")
+                return "cpu"
+            if device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                logger.warning("RERANKER_DEVICE=mps 但当前环境无可用 MPS，自动回退到 CPU")
+                return "cpu"
+            return device
+        except Exception as exc:
+            logger.warning(f"检测 reranker 设备可用性失败，将回退 CPU: {exc}")
+            return "cpu"
 
     def _load_model(self):
         """Load cross-encoder lazily and only once."""

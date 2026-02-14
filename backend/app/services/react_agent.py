@@ -205,11 +205,8 @@ class AgentCore:
             "tool_selection_enabled": tool_selection_enabled,
         }
         logger.info(
-            "[AgentCore] intent=%s selected_tools=%s schema_scope=%s prompt_desc_tokens=%s",
-            intent,
-            selected_tools or "ALL",
-            schema_scope,
-            desc_tokens,
+            f"[AgentCore] intent={intent} selected_tools={selected_tools or 'ALL'} "
+            f"schema_scope={schema_scope} prompt_desc_tokens={desc_tokens}"
         )
         return f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
 
@@ -526,9 +523,19 @@ class AgentCore:
                     drop = idx
                     break
             if drop is None:
+                for idx, item in enumerate(candidate):
+                    if idx != last_user and is_observation(item):
+                        drop = idx
+                        break
+            if drop is None:
                 for idx in range(last_user):
                     drop = idx
                     break
+            if drop is None:
+                for idx in range(len(candidate)):
+                    if idx != last_user:
+                        drop = idx
+                        break
             if drop is None:
                 break
             candidate.pop(drop)
@@ -729,13 +736,18 @@ class AgentCore:
         )
         self._accumulate_usage(context, response)
         content = str(response.get("content") or "")
+        reasoning = str(response.get("reasoning") or "").strip()
         parsed_calls = self._normalize_tool_calls(response.get("tool_calls") or [])
         events: List[Dict[str, Any]] = []
+        thought_text = ""
 
-        if content.strip() and parsed_calls:
-            thought = self._strip_think_content(content)
-            if thought:
-                events.append({"type": "thought", "data": thought})
+        if reasoning:
+            thought_text = reasoning
+
+        if not thought_text and content.strip() and parsed_calls:
+            thought_text = self._strip_think_content(content)
+        if thought_text:
+            events.append({"type": "thought", "data": thought_text})
 
         if parsed_calls:
             context.messages.append(
@@ -764,6 +776,8 @@ class AgentCore:
 
         answer = self._extract_answer_text(content)
         if answer:
+            if not thought_text:
+                events.append({"type": "thought", "data": "已完成问题分析，准备给出答案。"})
             answer = await self._ensure_citation_compliance(answer, context)
             context.final_answer = answer
             context.state = AgentState.DONE
@@ -895,6 +909,7 @@ class AgentCore:
                 context.iteration = i
                 context.state = AgentState.THINKING
                 yield {"type": "thinking_start", "data": ""}
+                yield {"type": "thinking", "data": "正在分析问题并规划下一步..."}
 
                 system_prompt = self._build_system_prompt(context.messages)
                 llm_messages = await self._prepare_llm_messages(context, system_prompt)

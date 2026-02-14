@@ -140,32 +140,39 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
           )}
 
           {SHOW_RAG_METRICS && !isUser && !isStreaming && ragMetrics && (
-            <div className="mb-3 rounded-xl border border-cyan-500/20 bg-slate-900/60">
+            <div className="relative mb-3 rounded-xl overflow-hidden border border-cyan-500/25 bg-slate-900/80 backdrop-blur-sm">
+              <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/10 via-blue-500/5 to-emerald-500/10 pointer-events-none" />
               <button
                 type="button"
                 onClick={() => setRagExpanded(!ragExpanded)}
-                className="w-full flex items-center justify-between px-3 py-2 text-left"
+                className="relative z-10 w-full flex items-center justify-between px-3 py-2 text-left bg-transparent border-0 outline-none appearance-none hover:bg-white/5 transition-colors"
               >
-                <span className="text-xs font-medium text-cyan-300">RAG质量</span>
-                <span className={`text-xs ${ragMetrics.citation_valid ? 'text-emerald-400' : 'text-amber-400'}`}>
+                <span className="text-xs font-medium text-cyan-100 tracking-wide">RAG质量</span>
+                <span
+                  className={`text-[11px] px-2 py-0.5 rounded-full border ${
+                    ragMetrics.citation_valid
+                      ? 'text-emerald-300 border-emerald-400/30 bg-emerald-500/10'
+                      : 'text-amber-300 border-amber-400/30 bg-amber-500/10'
+                  }`}
+                >
                   {ragMetrics.citation_valid ? '引用有效' : '引用待修正'}
                 </span>
               </button>
 
               {ragExpanded && (
-                <div className="px-3 pb-3 pt-1 text-xs text-slate-300 grid grid-cols-2 gap-x-3 gap-y-1">
-                  <div>检索调用: {ragMetrics.knowledge_search_calls}</div>
-                  <div>来源数: {ragMetrics.source_labels_count}</div>
-                  <div>答案引用: {ragMetrics.answer_citation_count}</div>
-                  <div>需引用: {ragMetrics.citation_required ? '是' : '否'}</div>
-                  <div>压缩调用: {ragMetrics.compression_calls}</div>
-                  <div>
+                <div className="relative z-10 px-3 pb-3 pt-2 border-t border-cyan-500/20 text-xs text-slate-200 grid grid-cols-2 gap-2">
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">检索调用: {ragMetrics.knowledge_search_calls}</div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">来源数: {ragMetrics.source_labels_count}</div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">答案引用: {ragMetrics.answer_citation_count}</div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">需引用: {ragMetrics.citation_required ? '是' : '否'}</div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">压缩调用: {ragMetrics.compression_calls}</div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">
                     压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}
                   </div>
-                  <div>
+                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">
                     修复成功/尝试: {ragMetrics.citation_repair_successes}/{ragMetrics.citation_repair_attempts}
                   </div>
-                  <div className="col-span-2 break-all">
+                  <div className="col-span-2 rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2 break-all">
                     来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
                   </div>
                 </div>
