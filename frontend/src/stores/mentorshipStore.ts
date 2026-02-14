@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { mentorshipApi, Mentorship, MentorshipStatus, UserBrief, UserRole } from '@/services/api'
+import { mentorshipApi, Mentorship, MentorshipStatus, UserBrief, UserRole, MentorActivity } from '@/services/api'
 
 // 学生活动类型（用于导师仪表板）
 export interface StudentActivity {
@@ -35,6 +35,7 @@ interface MentorshipState {
   // === 导师 Actions ===
   fetchPendingRequests: () => Promise<void>
   fetchMyStudents: () => Promise<void>
+  fetchStudentActivities: (skip?: number, limit?: number) => Promise<void>
   approveMentorship: (mentorshipId: number, message?: string) => Promise<void>
   rejectMentorship: (mentorshipId: number, message?: string) => Promise<void>
   archiveMentorship: (mentorshipId: number, message?: string) => Promise<void>
@@ -49,42 +50,6 @@ interface MentorshipState {
   reset: () => void
 }
 
-// 模拟学生活动数据（TODO: 后续接入真实 API）
-const mockStudentActivities: StudentActivity[] = [
-  {
-    id: '1',
-    type: 'conversation',
-    title: '深度学习模型优化讨论',
-    description: '与 AI 助手讨论了 Transformer 模型的优化策略',
-    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    student: { id: 1, username: 'student1', full_name: '张三', role: UserRole.STUDENT },
-  },
-  {
-    id: '2',
-    type: 'notebook',
-    title: '实验数据分析',
-    description: '完成了实验数据的可视化分析',
-    timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
-    student: { id: 2, username: 'student2', full_name: '李四', role: UserRole.STUDENT },
-  },
-  {
-    id: '3',
-    type: 'literature',
-    title: '论文收藏: Attention Is All You Need',
-    description: '收藏并标注了 Transformer 原始论文',
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-    student: { id: 1, username: 'student1', full_name: '张三', role: UserRole.STUDENT },
-  },
-  {
-    id: '4',
-    type: 'codelab',
-    title: 'PyTorch 模型训练',
-    description: '运行了 CNN 图像分类训练代码',
-    timestamp: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
-    student: { id: 2, username: 'student2', full_name: '李四', role: UserRole.STUDENT },
-  },
-]
-
 export const useMentorshipStore = create<MentorshipState>((set, get) => ({
   // 初始状态
   mentors: [],
@@ -92,7 +57,7 @@ export const useMentorshipStore = create<MentorshipState>((set, get) => ({
   pendingRequests: [],
   myStudents: [],
   allMentorships: [],
-  studentActivities: mockStudentActivities,
+  studentActivities: [],
   pendingCount: 0,
   isLoading: false,
   isSubmitting: false,
@@ -172,9 +137,28 @@ export const useMentorshipStore = create<MentorshipState>((set, get) => ({
     try {
       const students = await mentorshipApi.getMyStudents(MentorshipStatus.ACTIVE)
       set({ myStudents: students, isLoading: false })
+      await get().fetchStudentActivities(0, 50)
     } catch (error) {
       const message = error instanceof Error ? error.message : '获取学生列表失败'
-      set({ error: message, isLoading: false })
+      set({ error: message, isLoading: false, studentActivities: [] })
+    }
+  },
+
+  fetchStudentActivities: async (skip = 0, limit = 20) => {
+    try {
+      const activities = await mentorshipApi.getActivities(skip, limit)
+      const normalized: StudentActivity[] = (activities as MentorActivity[]).map((item) => ({
+        ...item,
+        type: item.type as StudentActivity['type'],
+        student: {
+          ...item.student,
+          role: (item.student.role || UserRole.STUDENT) as UserRole,
+        },
+      }))
+      set({ studentActivities: normalized })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '获取学生活动失败'
+      set({ error: message })
     }
   },
 
@@ -267,6 +251,7 @@ export const useMentorshipStore = create<MentorshipState>((set, get) => ({
     pendingRequests: [],
     myStudents: [],
     allMentorships: [],
+    studentActivities: [],
     pendingCount: 0,
     isLoading: false,
     isSubmitting: false,

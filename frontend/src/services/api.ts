@@ -894,6 +894,8 @@ export interface ExecuteResponse {
   outputs: CellOutput[]
   execution_count: number
   execution_time_ms: number
+  terminated_reason?: 'timeout' | 'policy_violation' | 'resource_limit' | 'none'
+  policy_violation_code?: string | null
 }
 
 
@@ -1289,11 +1291,23 @@ export interface ResearchGroup {
 
 export interface GroupMember {
   id: number
-  group_id: number
+  group_id?: number
   user_id: number
   role: string
   joined_at: string
+  username?: string
+  full_name?: string
+  avatar?: string
   user?: UserWithRole
+}
+
+export interface MentorActivity {
+  id: string
+  type: 'conversation' | 'notebook' | 'knowledge' | 'literature' | 'codelab'
+  title: string
+  description?: string
+  timestamp: string
+  student: UserBrief
 }
 
 export interface Invitation {
@@ -1478,6 +1492,13 @@ export const mentorApi = {
 
   removeGroupMember: async (groupId: number, userId: number): Promise<void> => {
     await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`)
+  },
+
+  getActivities: async (skip = 0, limit = 20): Promise<MentorActivity[]> => {
+    const response = await api.get('/api/mentor/activities', {
+      params: { skip, limit },
+    })
+    return response.data
   },
 }
 
@@ -1944,6 +1965,10 @@ export const mentorshipApi = {
         research_area: student.research_direction,
       },
     }))
+  },
+
+  getActivities: async (skip = 0, limit = 20): Promise<MentorActivity[]> => {
+    return mentorApi.getActivities(skip, limit)
   },
 
   deleteMentorship: async (mentorshipId: number): Promise<void> => {
