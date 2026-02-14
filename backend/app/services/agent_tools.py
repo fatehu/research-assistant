@@ -67,6 +67,7 @@ class Tool:
     name: str
     description: str
     parameters: Dict[str, Any]
+    parallel_safe: bool = True
 
     async def execute(self, **kwargs) -> ToolResult:
         raise NotImplementedError
@@ -2354,6 +2355,7 @@ class ToolRegistry:
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
+                    "x_parallel_safe": bool(getattr(tool, "parallel_safe", True)),
                 }
             }
             for tool in filtered_tools

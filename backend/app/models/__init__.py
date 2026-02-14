@@ -6,6 +6,7 @@ from app.models.conversation import Conversation, Message
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.models.literature import Paper, PaperCollection, PaperSearchHistory
 from app.models.notebook import Notebook, NotebookCell
+from app.models.agent import AgentRun, AgentStepRecord, ConversationSummary, AgentMemoryItem
 
 # 角色系统模型
 from app.models.role import (
@@ -38,6 +39,11 @@ __all__ = [
     # 笔记本
     "Notebook",
     "NotebookCell",
+    # Agent runtime persistence
+    "AgentRun",
+    "AgentStepRecord",
+    "ConversationSummary",
+    "AgentMemoryItem",
     # 角色系统
     "UserRole",
     "InvitationStatus",

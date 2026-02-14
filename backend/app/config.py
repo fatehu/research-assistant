@@ -138,6 +138,16 @@ class Settings(BaseSettings):
     react_max_iterations: int = 10
     react_temperature: float = 0.7
     react_output_max_length: int = 500
+    agent_function_calling_enabled: bool = True
+    agent_function_calling_fallback_xml: bool = True
+    agent_parallel_tool_calls_enabled: bool = True
+    agent_parallel_tool_calls_max_concurrency: int = 4
+    agent_context_budget_enabled: bool = True
+    agent_context_max_input_tokens: int = 10000
+    agent_context_window_turns: int = 8
+    agent_context_summary_trigger_tokens: int = 7000
+    agent_persist_steps_enabled: bool = True
+    agent_longterm_memory_enabled: bool = False
 
     # MCP (Phase 1)
     mcp_enabled: bool = False
