@@ -71,3 +71,6 @@ backend/mcp_servers.json
 backend/phase4_eval_report.md
 backend/tests/data/_phase4_*.tsv
 backend/docs/
+
+# Local snapshots / scratch files
+.snapshots/
