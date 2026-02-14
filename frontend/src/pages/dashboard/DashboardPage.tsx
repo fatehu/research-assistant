@@ -33,6 +33,18 @@ dayjs.locale('zh-cn')
 
 const { TextArea } = Input
 
+const hasBrokenTitle = (value?: string | null) => {
+  const text = String(value || '').trim()
+  if (!text) return true
+  const brokenCount = (text.match(/\?/g) || []).length + (text.match(/�/g) || []).length
+  return brokenCount >= Math.ceil(text.length * 0.45)
+}
+
+const safeConversationTitle = (value?: string | null) => {
+  const text = String(value || '').trim()
+  return hasBrokenTitle(text) ? '未命名对话' : text
+}
+
 const DashboardPage = () => {
   const navigate = useNavigate()
   const { user, isMentor, isStudent, isAdmin } = useAuthStore()
@@ -140,6 +152,8 @@ const DashboardPage = () => {
     (a, b) => dayjs(b.updated_at).valueOf() - dayjs(a.updated_at).valueOf()
   )
   const recentConversations = orderedConversations.slice(0, 5)
+  const mentorshipTarget = isMentor() ? '/mentor/students' : '/student/mentor'
+  const mentorshipTargetLabel = isMentor() ? '前往导师中心' : '前往我的导师'
   
   return (
     <div className="h-full overflow-y-auto bg-gradient-to-b from-slate-900 to-slate-950">
@@ -398,7 +412,7 @@ const DashboardPage = () => {
                       </div>
                       <div>
                         <h4 className="text-white font-medium group-hover:text-emerald-400 transition-colors">
-                          {conv.title || '新对话'}
+                          {safeConversationTitle(conv.title)}
                         </h4>
                         <p className="text-slate-500 text-sm mt-0.5">
                           {conv.message_count || 0} 条消息 · {dayjs(conv.updated_at).fromNow()}
@@ -429,54 +443,136 @@ const DashboardPage = () => {
         </motion.div>
 
         <Modal
-          title="全部学生动态"
+          title={
+            <div className="flex items-center gap-2">
+              <span className="w-7 h-7 rounded-lg bg-violet-500/20 border border-violet-400/30 flex items-center justify-center">
+                <UserOutlined className="text-violet-300 text-sm" />
+              </span>
+              <span className="text-slate-100">全部学生动态</span>
+            </div>
+          }
           open={showAllActivities}
           onCancel={() => setShowAllActivities(false)}
           centered
           width={900}
-          footer={[
-            <Button
-              key="mentor"
-              onClick={() => {
-                setShowAllActivities(false)
-                navigate('/student/mentor')
-              }}
-            >
-              前往学生管理
-            </Button>,
-            <Button key="close" type="primary" onClick={() => setShowAllActivities(false)}>
-              关闭
-            </Button>,
-          ]}
+          closeIcon={<span className="text-slate-400 hover:text-white">✕</span>}
+          className="dashboard-all-modal"
+          styles={{
+            content: {
+              background: 'linear-gradient(145deg, rgba(10, 16, 30, 0.96) 0%, rgba(18, 34, 64, 0.92) 100%)',
+              border: '1px solid rgba(148, 163, 184, 0.25)',
+              boxShadow: '0 24px 80px rgba(2, 6, 23, 0.65)',
+            },
+            header: {
+              background: 'transparent',
+              borderBottom: '1px solid rgba(148, 163, 184, 0.2)',
+              padding: '16px 18px',
+            },
+            body: {
+              padding: '14px 18px 10px',
+            },
+            footer: {
+              background: 'transparent',
+              borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+              padding: '12px 18px 16px',
+            },
+          }}
+          footer={
+            <div className="flex items-center justify-end gap-3">
+              <Button
+                key="mentor"
+                icon={<TeamOutlined />}
+                onClick={() => {
+                  setShowAllActivities(false)
+                  navigate(mentorshipTarget)
+                }}
+                className="!h-10 !rounded-xl !border-violet-400/40 !bg-violet-500/10 !text-violet-100 hover:!border-violet-300 hover:!text-white"
+              >
+                {mentorshipTargetLabel}
+              </Button>
+              <Button
+                key="close"
+                type="primary"
+                onClick={() => setShowAllActivities(false)}
+                className="!h-10 !rounded-xl !border-0 !bg-gradient-to-r !from-emerald-500 !to-cyan-500 hover:!from-emerald-400 hover:!to-cyan-400"
+              >
+                关闭
+              </Button>
+            </div>
+          }
         >
+          <div className="mb-3 rounded-xl border border-violet-400/25 bg-violet-500/10 px-3 py-2.5 text-xs text-violet-100/90">
+            共 {studentActivities.length} 条动态，点击下方按钮可进入完整学生管理页面。
+          </div>
           <div className="max-h-[62vh] overflow-y-auto pr-1">
             <StudentActivities activities={studentActivities} />
           </div>
         </Modal>
 
         <Modal
-          title={`全部对话（${orderedConversations.length}）`}
+          title={
+            <div className="flex items-center gap-2">
+              <span className="w-7 h-7 rounded-lg bg-emerald-500/20 border border-emerald-400/30 flex items-center justify-center">
+                <MessageOutlined className="text-emerald-300 text-sm" />
+              </span>
+              <span className="text-slate-100">全部对话（{orderedConversations.length}）</span>
+            </div>
+          }
           open={showAllConversations}
           onCancel={() => setShowAllConversations(false)}
           centered
           width={900}
-          footer={[
-            <Button
-              key="chat"
-              onClick={() => {
-                setShowAllConversations(false)
-                navigate('/chat')
-              }}
-            >
-              前往聊天页
-            </Button>,
-            <Button key="close" type="primary" onClick={() => setShowAllConversations(false)}>
-              关闭
-            </Button>,
-          ]}
+          closeIcon={<span className="text-slate-400 hover:text-white">✕</span>}
+          className="dashboard-all-modal"
+          styles={{
+            content: {
+              background: 'linear-gradient(145deg, rgba(10, 16, 30, 0.96) 0%, rgba(18, 34, 64, 0.92) 100%)',
+              border: '1px solid rgba(148, 163, 184, 0.25)',
+              boxShadow: '0 24px 80px rgba(2, 6, 23, 0.65)',
+            },
+            header: {
+              background: 'transparent',
+              borderBottom: '1px solid rgba(148, 163, 184, 0.2)',
+              padding: '16px 18px',
+            },
+            body: {
+              padding: '14px 18px 10px',
+            },
+            footer: {
+              background: 'transparent',
+              borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+              padding: '12px 18px 16px',
+            },
+          }}
+          footer={
+            <div className="flex items-center justify-end gap-3">
+              <Button
+                key="chat"
+                icon={<MessageOutlined />}
+                onClick={() => {
+                  setShowAllConversations(false)
+                  navigate('/chat')
+                }}
+                className="!h-10 !rounded-xl !border-emerald-400/40 !bg-emerald-500/10 !text-emerald-100 hover:!border-emerald-300 hover:!text-white"
+              >
+                前往聊天页
+              </Button>
+              <Button
+                key="close"
+                type="primary"
+                onClick={() => setShowAllConversations(false)}
+                className="!h-10 !rounded-xl !border-0 !bg-gradient-to-r !from-emerald-500 !to-cyan-500 hover:!from-emerald-400 hover:!to-cyan-400"
+              >
+                关闭
+              </Button>
+            </div>
+          }
         >
+          <div className="mb-3 rounded-xl border border-emerald-400/25 bg-emerald-500/10 px-3 py-2.5 text-xs text-emerald-100/90">
+            可直接点击任一会话进入详情，或进入聊天页管理全部历史会话。
+          </div>
           {orderedConversations.length > 0 ? (
-            <div className="max-h-[62vh] overflow-y-auto divide-y divide-slate-200 dark:divide-slate-700">
+            <div className="max-h-[62vh] overflow-y-auto space-y-2 pr-1">
               {orderedConversations.map((conv) => (
                 <button
                   key={conv.id}
@@ -485,17 +581,17 @@ const DashboardPage = () => {
                     setShowAllConversations(false)
                     navigate(`/chat/${conv.id}`)
                   }}
-                  className="w-full text-left flex items-center justify-between px-1 py-3 hover:bg-slate-100/70 dark:hover:bg-slate-800/60 rounded-lg transition-colors"
+                  className="w-full text-left flex items-center justify-between px-3 py-3 rounded-xl bg-slate-900/70 border border-slate-700/70 hover:bg-slate-800/85 hover:border-emerald-400/40 transition-all"
                 >
                   <div className="min-w-0">
-                    <p className="font-medium text-slate-800 dark:text-slate-100 truncate">
-                      {conv.title || '新对话'}
+                    <p className="font-medium text-slate-100 truncate">
+                      {safeConversationTitle(conv.title)}
                     </p>
-                    <p className="text-xs text-slate-500 mt-0.5">
+                    <p className="text-xs text-slate-400 mt-0.5">
                       {conv.message_count || 0} 条消息 · {dayjs(conv.updated_at).fromNow()}
                     </p>
                   </div>
-                  <ArrowRightOutlined className="text-slate-400 ml-4 flex-shrink-0" />
+                  <ArrowRightOutlined className="text-emerald-300/80 ml-4 flex-shrink-0" />
                 </button>
               ))}
             </div>
