@@ -20,6 +20,7 @@ from app.services.contextual_compression_service import (
     CompressionInput,
     get_contextual_compression_service,
 )
+from app.services.smart_chunking.token_utils import estimate_tokens
 
 
 class AgentState(Enum):
@@ -216,10 +217,55 @@ class ReActAgent:
         self.tools = tool_registry
         self.max_iterations = max_iterations if max_iterations is not None else settings.react_max_iterations
         self.contextual_compression_service = get_contextual_compression_service()
+        self._last_tool_selection: Dict[str, Any] = {}
     
-    def _build_system_prompt(self) -> str:
-        """构建系统提示词"""
-        tools_desc = self.tools.get_tools_description()
+    @staticmethod
+    def _latest_user_text(messages: Optional[List[Dict[str, str]]]) -> str:
+        if not messages:
+            return ""
+        for item in reversed(messages):
+            if str(item.get("role", "")).lower() == "user":
+                return str(item.get("content", "") or "")
+        return ""
+
+    def _build_system_prompt(self, messages: Optional[List[Dict[str, str]]] = None) -> str:
+        """构建系统提示词（支持按意图动态筛选工具描述）。"""
+        user_text = self._latest_user_text(messages)
+        intent = "general_chat"
+        selected_tools: List[str] = []
+
+        if bool(getattr(settings, "tool_selection_enabled", True)):
+            classify_intent = getattr(self.tools, "classify_intent", None)
+            if callable(classify_intent):
+                try:
+                    intent = str(classify_intent(user_text))
+                except Exception:
+                    intent = "general_chat"
+
+            try:
+                tools_desc = self.tools.get_tools_description(intent=intent, user_text=user_text)
+            except TypeError:
+                tools_desc = self.tools.get_tools_description()
+
+            select_names = getattr(self.tools, "select_tool_names_for_intent", None)
+            if callable(select_names):
+                try:
+                    selected_tools = list(select_names(intent, user_text=user_text))
+                except Exception:
+                    selected_tools = []
+        else:
+            tools_desc = self.tools.get_tools_description()
+
+        desc_tokens = estimate_tokens(tools_desc)
+        logger.info(
+            f"[ReAct] tool-selection intent={intent}, selected_tools={selected_tools or 'ALL'}, "
+            f"prompt_desc_tokens={desc_tokens}"
+        )
+        self._last_tool_selection = {
+            "intent": intent,
+            "selected_tools": selected_tools,
+            "prompt_desc_tokens": desc_tokens,
+        }
         base_prompt = self.SYSTEM_PROMPT.format(tools_description=tools_desc)
         return f"{base_prompt}\n\n{self.CITATION_POLICY_PROMPT}"
 
@@ -489,7 +535,7 @@ class ReActAgent:
             except Exception as exc:
                 logger.warning(f"[ReAct] MCP tool refresh failed, continue with local tools: {exc}")
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(messages=context.messages)
         
         # 发送开始事件
         yield {

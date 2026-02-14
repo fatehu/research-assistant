@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.services.agent_tools import ToolResult
 from app.services.react_agent import AgentContext, ReActAgent
+from app.config import settings
 
 
 class _DummyLLM:
@@ -22,6 +23,21 @@ class _DummyTools:
         return "- knowledge_search: 搜索知识库"
 
 
+class _SelectableTools:
+    def __init__(self):
+        self.calls = []
+
+    def classify_intent(self, user_text: str) -> str:
+        return "web_query"
+
+    def select_tool_names_for_intent(self, intent: str, user_text: str = ""):
+        return ["web_search", "datetime", "calculator"]
+
+    def get_tools_description(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return "- web_search: 搜索互联网"
+
+
 class _NoCompression:
     async def compress_chunks(self, *args, **kwargs):
         return []
@@ -34,6 +50,19 @@ def test_system_prompt_contains_citation_policy():
     assert "知识检索引用规范" in prompt
     assert "[来源X]" in prompt
     assert "禁止编造不存在的来源编号" in prompt
+
+
+def test_system_prompt_uses_intent_based_tool_selection(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    tools = _SelectableTools()
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "今天最新新闻"}])
+
+    assert "- web_search: 搜索互联网" in prompt
+    assert tools.calls and tools.calls[0]["intent"] == "web_query"
+    assert agent._last_tool_selection["intent"] == "web_query"
+    assert agent._last_tool_selection["selected_tools"] == ["web_search", "datetime", "calculator"]
 
 
 def test_observation_message_for_knowledge_search_requires_citation():

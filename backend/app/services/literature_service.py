@@ -871,6 +871,103 @@ class LiteratureService:
             return await self.crossref.search(query, limit, offset)
         else:
             return await self.s2.search(query, limit, offset, **kwargs)
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        normalized = re.sub(r"\s+", " ", (title or "").strip().lower())
+        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff ]+", "", normalized)
+        return normalized
+
+    @classmethod
+    def _paper_dedupe_key(cls, paper: PaperResult) -> str:
+        doi = (paper.doi or "").strip().lower()
+        if doi:
+            return f"doi:{doi}"
+
+        arxiv_id = (paper.arxiv_id or "").strip().lower()
+        if arxiv_id:
+            return f"arxiv:{arxiv_id}"
+
+        title_key = cls._normalize_title(paper.title)
+        year_key = str(paper.year or 0)
+        return f"title:{title_key}|year:{year_key}"
+
+    @staticmethod
+    def _pick_better_paper(current: PaperResult, candidate: PaperResult) -> PaperResult:
+        current_rank = (
+            int(current.citation_count or 0),
+            int(current.year or 0),
+            len(current.abstract or ""),
+        )
+        candidate_rank = (
+            int(candidate.citation_count or 0),
+            int(candidate.year or 0),
+            len(candidate.abstract or ""),
+        )
+        return candidate if candidate_rank > current_rank else current
+
+    async def search_multi(
+        self,
+        query: str,
+        limit_per_source: int = 5,
+        year_range: Optional[tuple] = None,
+    ) -> Dict[str, Any]:
+        """三源并行搜索并融合去重（Semantic Scholar + arXiv + PubMed）。"""
+        limit_per_source = max(1, int(limit_per_source))
+
+        tasks = {
+            "semantic_scholar": self.s2.search(
+                query,
+                limit=limit_per_source,
+                year_range=year_range,
+            ),
+            "arxiv": self.arxiv.search(query, limit=limit_per_source),
+            "pubmed": self.pubmed.search(query, limit=limit_per_source),
+        }
+        settled = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        merged: Dict[str, PaperResult] = {}
+        source_totals: Dict[str, int] = {}
+        errors: Dict[str, str] = {}
+
+        for source_name, result in zip(tasks.keys(), settled):
+            if isinstance(result, Exception):
+                errors[source_name] = str(result)
+                source_totals[source_name] = 0
+                continue
+
+            if not isinstance(result, dict):
+                errors[source_name] = "invalid_payload"
+                source_totals[source_name] = 0
+                continue
+
+            papers: List[PaperResult] = [p for p in result.get("papers", []) if isinstance(p, PaperResult)]
+            source_totals[source_name] = len(papers)
+            if result.get("error"):
+                errors[source_name] = str(result["error"])
+
+            for paper in papers:
+                key = self._paper_dedupe_key(paper)
+                existing = merged.get(key)
+                merged[key] = paper if existing is None else self._pick_better_paper(existing, paper)
+
+        deduped = list(merged.values())
+        deduped.sort(
+            key=lambda p: (
+                int(p.citation_count or 0),
+                int(p.year or 0),
+            ),
+            reverse=True,
+        )
+
+        payload: Dict[str, Any] = {
+            "total": len(deduped),
+            "papers": deduped,
+            "sources": source_totals,
+        }
+        if errors:
+            payload["partial_errors"] = errors
+        return payload
     
     async def search_all(
         self,

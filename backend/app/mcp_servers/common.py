@@ -32,6 +32,9 @@ def tool_result_to_payload(result: ToolResult) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "success": bool(result.success),
         "output": str(result.output),
+        "execution_time_ms": float(getattr(result, "execution_time_ms", 0.0) or 0.0),
+        "output_tokens_estimate": int(getattr(result, "output_tokens_estimate", 0) or 0),
+        "truncated": bool(getattr(result, "truncated", False)),
     }
     if result.error:
         payload["error"] = str(result.error)

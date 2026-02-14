@@ -5,6 +5,8 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+pytest.importorskip("mcp.server.fastmcp", reason="mcp package not installed")
+
 from app.mcp_servers.common import normalize_transport, tool_result_to_payload
 from app.mcp_servers.literature_server import LiteratureMCPService
 from app.mcp_servers.web_server import WebMCPService
@@ -86,9 +88,10 @@ def test_mcp_common_helpers():
     payload = tool_result_to_payload(
         ToolResult(success=False, output="failed", data={"code": 500}, error="http_error")
     )
-    assert payload == {
-        "success": False,
-        "output": "failed",
-        "error": "http_error",
-        "data": {"code": 500},
-    }
+    assert payload["success"] is False
+    assert payload["output"] == "failed"
+    assert payload["error"] == "http_error"
+    assert payload["data"] == {"code": 500}
+    assert payload["execution_time_ms"] == 0.0
+    assert payload["output_tokens_estimate"] == 0
+    assert payload["truncated"] is False

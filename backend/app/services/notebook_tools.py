@@ -15,12 +15,14 @@ import re
 import sys
 import asyncio
 import subprocess
+import time
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from datetime import datetime
 from loguru import logger
 import httpx
 from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 from difflib import SequenceMatcher
 
 # 尝试导入 bs4，如果失败则在使用时报错
@@ -30,6 +32,7 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
+from app.config import settings
 from app.services.agent_tools import Tool, ToolResult
 
 
@@ -1446,6 +1449,47 @@ class WebScrapeTool(Tool):
         },
         "required": ["url"]
     }
+    _USER_AGENT = "ResearchBot/1.0 (+https://localhost)"
+    _domain_last_request_ts: Dict[str, float] = {}
+    _domain_rate_lock = asyncio.Lock()
+
+    async def _check_robots(self, url: str, scheme: str, domain: str) -> tuple[bool, Optional[str]]:
+        if not bool(getattr(settings, "web_scrape_enforce_robots", True)):
+            return True, None
+
+        robots_url = f"{scheme}://{domain}/robots.txt"
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=True,
+                headers={"User-Agent": self._USER_AGENT},
+            ) as client:
+                response = await client.get(robots_url)
+            if response.status_code >= 400:
+                return True, None
+
+            parser = RobotFileParser()
+            parser.parse(response.text.splitlines())
+            if parser.can_fetch(self._USER_AGENT, url):
+                return True, None
+            return False, robots_url
+        except Exception as exc:
+            logger.warning(f"[WebScrape] robots 检查失败，按允许处理: {exc}")
+            return True, None
+
+    async def _check_domain_rate_limit(self, domain: str) -> Optional[float]:
+        min_interval = float(getattr(settings, "web_scrape_domain_min_interval_seconds", 1.5) or 0.0)
+        if min_interval <= 0:
+            return None
+
+        now = time.monotonic()
+        async with self._domain_rate_lock:
+            last = self._domain_last_request_ts.get(domain, 0.0)
+            wait_seconds = min_interval - (now - last)
+            if wait_seconds > 0:
+                return round(wait_seconds, 2)
+            self._domain_last_request_ts[domain] = now
+        return None
     
     async def execute(
         self,
@@ -1485,6 +1529,23 @@ class WebScrapeTool(Tool):
                         output=f"该域名被禁止访问: {domain}",
                         error="blocked_domain"
                     )
+
+            allowed, robots_url = await self._check_robots(url, parsed.scheme, domain)
+            if not allowed:
+                return ToolResult(
+                    success=False,
+                    output=f"robots.txt 禁止抓取该页面: {robots_url}",
+                    error="robots_disallowed",
+                )
+
+            wait_seconds = await self._check_domain_rate_limit(domain)
+            if wait_seconds is not None:
+                return ToolResult(
+                    success=False,
+                    output=f"请求频率过高，请在 {wait_seconds:.2f} 秒后重试",
+                    error="rate_limited",
+                    data={"retry_after_seconds": wait_seconds, "domain": domain},
+                )
         except Exception as e:
             return ToolResult(
                 success=False,
@@ -1497,7 +1558,7 @@ class WebScrapeTool(Tool):
             async with httpx.AsyncClient(
                 timeout=30,
                 follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
+                headers={"User-Agent": self._USER_AGENT}
             ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -1851,7 +1912,7 @@ class EnhancedLiteratureSearchTool(Tool):
             },
             "source": {
                 "type": "string",
-                "enum": ["semantic_scholar", "arxiv", "pubmed", "openalex", "crossref"],
+                "enum": ["semantic_scholar", "arxiv", "pubmed", "openalex", "crossref", "multi"],
                 "description": "搜索来源",
                 "default": "semantic_scholar"
             },
@@ -1902,12 +1963,21 @@ class EnhancedLiteratureSearchTool(Tool):
                 search_kwargs["fields_of_study"] = [f.strip() for f in fields.split(',')]
             
             # 执行搜索
-            result = await self.service.search(
-                query=query,
-                source=source,
-                limit=max_results,
-                **search_kwargs
-            )
+            if source == "multi":
+                per_source = max(1, int((max_results + 2) / 3))
+                result = await self.service.search_multi(
+                    query=query,
+                    limit_per_source=per_source,
+                    year_range=search_kwargs.get("year_range"),
+                )
+                result["papers"] = result.get("papers", [])[:max_results]
+            else:
+                result = await self.service.search(
+                    query=query,
+                    source=source,
+                    limit=max_results,
+                    **search_kwargs
+                )
             
             if "error" in result:
                 return ToolResult(
@@ -1931,7 +2001,8 @@ class EnhancedLiteratureSearchTool(Tool):
                 "arxiv": "arXiv",
                 "pubmed": "PubMed",
                 "openalex": "OpenAlex",
-                "crossref": "Crossref"
+                "crossref": "Crossref",
+                "multi": "Semantic Scholar + arXiv + PubMed",
             }
             
             output_parts = [f"📚 在 {source_names.get(source, source)} 搜索 '{query}' 的结果:\n"]

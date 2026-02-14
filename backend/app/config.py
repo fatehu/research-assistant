@@ -121,6 +121,19 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
 
+    # Generic tool runtime
+    tool_default_timeout_seconds: int = 20
+    tool_default_retry_count: int = 1
+    tool_output_max_tokens: int = 1200
+    tool_output_truncate_head_ratio: float = 0.75
+    tool_selection_enabled: bool = True
+    tool_selection_fallback_tools: str = "datetime,calculator"
+
+    # Search / scrape external providers
+    tavily_api_key: str = ""
+    web_scrape_enforce_robots: bool = True
+    web_scrape_domain_min_interval_seconds: float = 1.5
+
     # ReAct
     react_max_iterations: int = 10
     react_temperature: float = 0.7
