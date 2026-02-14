@@ -311,19 +311,10 @@ class NotebookVariablesTool(Tool):
                 # 如果需要值预览，获取变量值的简要描述
                 if include_values:
                     try:
-                        value = kernel.namespace.get(name)
-                        if value is not None:
-                            # 获取简要描述
-                            if hasattr(value, 'shape'):
-                                line += f" (shape: {value.shape})"
-                            elif hasattr(value, '__len__') and not isinstance(value, str):
-                                line += f" (length: {len(value)})"
-                            
-                            # 值预览
-                            repr_str = repr(value)
-                            if len(repr_str) > 100:
-                                repr_str = repr_str[:100] + "..."
-                            line += f"\n   预览: {repr_str}"
+                        preview_getter = getattr(kernel, "get_variable_preview", None)
+                        preview = preview_getter(name) if callable(preview_getter) else None
+                        if preview:
+                            line += f"\n   预览: {preview}"
                     except Exception as e:
                         logger.debug(f"获取变量 {name} 预览失败: {e}")
                 

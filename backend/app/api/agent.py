@@ -117,13 +117,11 @@ def build_context_prompt(notebook: Dict, kernel, include_variables: bool = True)
         if variables:
             context_parts.append("\n## 当前变量:")
             for name, type_str in variables.items():
-                # 尝试获取变量的简短描述
                 try:
-                    var = kernel.namespace.get(name)
-                    if hasattr(var, 'shape'):  # numpy array 或 pandas DataFrame
-                        context_parts.append(f"- `{name}`: {type_str}, shape={var.shape}")
-                    elif hasattr(var, '__len__') and not isinstance(var, str):
-                        context_parts.append(f"- `{name}`: {type_str}, len={len(var)}")
+                    preview_getter = getattr(kernel, "get_variable_preview", None)
+                    preview = preview_getter(name) if callable(preview_getter) else None
+                    if preview:
+                        context_parts.append(f"- `{name}`: {type_str}, {preview}")
                     else:
                         context_parts.append(f"- `{name}`: {type_str}")
                 except:
@@ -490,10 +488,10 @@ async def analyze_data(
         raise HTTPException(status_code=400, detail="内核未启动")
     
     # 检查变量是否存在
-    if variable_name not in kernel.namespace:
+    has_variable = getattr(kernel, "has_variable", None)
+    exists = bool(has_variable(variable_name)) if callable(has_variable) else variable_name in getattr(kernel, "namespace", {})
+    if not exists:
         raise HTTPException(status_code=400, detail=f"变量 '{variable_name}' 不存在")
-    
-    var = kernel.namespace[variable_name]
     
     # 根据分析类型生成代码
     analysis_code_templates = {
