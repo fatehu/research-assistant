@@ -37,7 +37,12 @@ cd research-assistant
 
 # 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env，配置 LLM API Key 等
+# 编辑 .env，至少配置以下关键项：
+# - POSTGRES_PASSWORD
+# - DATABASE_URL
+# - SECRET_KEY
+# - CODELAB_RUNNER_TOKEN
+# - LLM API Key（如 DEEPSEEK_API_KEY）
 
 # 3. 启动服务
 docker compose up -d
@@ -119,7 +124,7 @@ DEEPSEEK_MODEL=deepseek-chat
 ### 向量搜索
 
 ```
-POST /api/knowledge/search
+POST /api/v1/knowledge/search
 {
   "query": "深度学习在NLP中的应用",
   "knowledge_base_ids": [1, 2],
@@ -179,34 +184,34 @@ research-assistant/
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| GET | `/api/knowledge/embedding-models` | 获取可用嵌入模型列表 |
-| POST | `/api/knowledge/knowledge-bases` | 创建知识库（可选嵌入模型）|
-| POST | `/api/knowledge/knowledge-bases/{id}/documents/upload` | 上传文档 |
-| POST | `/api/knowledge/search` | 向量搜索（支持层级过滤）|
-| GET | `/api/knowledge/available` | 获取可用知识库（含共享）|
+| GET | `/api/v1/knowledge/embedding-models` | 获取可用嵌入模型列表 |
+| POST | `/api/v1/knowledge/knowledge-bases` | 创建知识库（可选嵌入模型）|
+| POST | `/api/v1/knowledge/knowledge-bases/{id}/documents/upload` | 上传文档 |
+| POST | `/api/v1/knowledge/search` | 向量搜索（支持层级过滤）|
+| GET | `/api/v1/knowledge/available` | 获取可用知识库（含共享）|
 
 ### AI 对话
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| POST | `/api/chat/send` | 流式 AI 对话 |
-| GET | `/api/chat/conversations` | 获取对话列表 |
+| POST | `/api/v1/chat/send` | 流式 AI 对话 |
+| GET | `/api/v1/chat/conversations` | 获取对话列表 |
 
 ### 文献管理
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| GET | `/api/literature/search` | 搜索论文 |
-| POST | `/api/literature/papers` | 保存论文 |
-| POST | `/api/literature/papers/{id}/download-pdf` | 下载 PDF |
+| GET | `/api/v1/literature/search` | 搜索论文 |
+| POST | `/api/v1/literature/papers` | 保存论文 |
+| POST | `/api/v1/literature/papers/{id}/download-pdf` | 下载 PDF |
 
 ### 智能分块配置
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| GET | `/api/chunking/presets` | 获取分块预设列表 |
-| GET | `/api/chunking/knowledge-bases/{id}/config` | 获取知识库分块配置 |
-| PUT | `/api/chunking/knowledge-bases/{id}/config` | 更新分块配置 |
+| GET | `/api/v1/chunking/presets` | 获取分块预设列表 |
+| GET | `/api/v1/chunking/knowledge-bases/{id}/config` | 获取知识库分块配置 |
+| PUT | `/api/v1/chunking/knowledge-bases/{id}/config` | 更新分块配置 |
 
 ## 🐛 故障排除
 

@@ -11,7 +11,7 @@ from app.main import app
 def test_cors_preflight_allows_whitelisted_origin():
     client = TestClient(app)
     response = client.options(
-        "/api/chat/send",
+        "/api/v1/chat/send",
         headers={
             "Origin": "http://localhost:3000",
             "Access-Control-Request-Method": "POST",
@@ -25,7 +25,7 @@ def test_cors_preflight_allows_whitelisted_origin():
 def test_cors_preflight_rejects_non_whitelisted_origin():
     client = TestClient(app)
     response = client.options(
-        "/api/chat/send",
+        "/api/v1/chat/send",
         headers={
             "Origin": "http://evil.example",
             "Access-Control-Request-Method": "POST",

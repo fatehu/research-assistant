@@ -1,5 +1,5 @@
 
-$baseUrl = "http://localhost:8888/api"
+$baseUrl = "http://localhost:8888/api/v1"
 $email = "test_acceptance_v2@example.com"
 $password = "Password123!"
 

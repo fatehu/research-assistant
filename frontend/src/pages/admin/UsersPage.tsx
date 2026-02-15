@@ -130,7 +130,7 @@ const UsersPage: React.FC = () => {
   const handleCreateUser = async (values: any) => {
     setCreateLoading(true);
     try {
-      await api.post('/api/admin/users', values);
+      await api.post('/api/v1/admin/users', values);
       message.success('用户创建成功');
       setCreateModalVisible(false);
       createForm.resetFields();
@@ -147,7 +147,7 @@ const UsersPage: React.FC = () => {
     if (!selectedUser) return;
     setEditLoading(true);
     try {
-      await api.put(`/api/admin/users/${selectedUser.id}`, values);
+      await api.put(`/api/v1/admin/users/${selectedUser.id}`, values);
       message.success('用户信息已更新');
       setEditModalVisible(false);
       editForm.resetFields();
@@ -164,7 +164,7 @@ const UsersPage: React.FC = () => {
     if (!selectedUser) return;
     setPasswordLoading(true);
     try {
-      await api.put(`/api/admin/users/${selectedUser.id}/password`, values);
+      await api.put(`/api/v1/admin/users/${selectedUser.id}/password`, values);
       message.success('用户密码已修改');
       setPasswordModalVisible(false);
       passwordForm.resetFields();

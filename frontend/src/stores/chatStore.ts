@@ -138,7 +138,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   archiveConversation: async (conversationId: number) => {
     try {
       // 调用归档 API
-      const response = await fetch(`/api/chat/conversations/${conversationId}/archive`, {
+      const response = await fetch(`/api/v1/chat/conversations/${conversationId}/archive`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,

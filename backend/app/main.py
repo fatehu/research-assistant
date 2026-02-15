@@ -2,13 +2,15 @@
 FastAPI 主入口文件 - 多角色系统扩展版
 """
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 import sys
 
 from app.config import settings
 from app.core.database import create_tables
+from app.core.error_handlers import register_error_handlers
+from app.core.rate_limit import build_rate_limit_dependency
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent,
     admin, mentor, student, invitations, share, announcements, mcp
@@ -85,29 +87,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+register_error_handlers(app)
+
+auth_rate_limit = build_rate_limit_dependency(
+    bucket="auth",
+    limit=int(getattr(settings, "api_rate_limit_auth_per_minute", 20)),
+    scope="ip",
+)
+chat_rate_limit = build_rate_limit_dependency(
+    bucket="chat",
+    limit=int(getattr(settings, "api_rate_limit_chat_per_minute", 60)),
+    scope="user_or_ip",
+)
+knowledge_rate_limit = build_rate_limit_dependency(
+    bucket="knowledge",
+    limit=int(getattr(settings, "api_rate_limit_knowledge_per_minute", 120)),
+    scope="user_or_ip",
+)
+codelab_rate_limit = build_rate_limit_dependency(
+    bucket="codelab",
+    limit=int(getattr(settings, "api_rate_limit_codelab_per_minute", 30)),
+    scope="user_or_ip",
+)
+
+
+@app.middleware("http")
+async def attach_rate_limit_headers(request: Request, call_next):
+    response = await call_next(request)
+    headers = getattr(request.state, "rate_limit_headers", None)
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if value is not None and key not in response.headers:
+                response.headers[key] = str(value)
+    return response
+
 
 # 注册原有路由
 app.include_router(health.router, tags=["健康检查"])
-app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
-app.include_router(users.router, prefix="/api/users", tags=["用户"])
-app.include_router(chat.router, prefix="/api/chat", tags=["对话"])
-app.include_router(knowledge.router, prefix="/api/knowledge", tags=["知识库"])
-app.include_router(literature.router, prefix="/api", tags=["文献管理"])
-app.include_router(codelab.router, prefix="/api/codelab", tags=["代码实验室"])
-app.include_router(agent.router, prefix="/api/codelab", tags=["Notebook Agent"])
-app.include_router(notebook_agent.router, prefix="/api/codelab", tags=["Notebook ReAct Agent"])
-app.include_router(mcp.router, prefix="/api/mcp", tags=["MCP 管理"])
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["认证"], dependencies=[Depends(auth_rate_limit)])
+app.include_router(users.router, prefix="/api/v1/users", tags=["用户"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["对话"], dependencies=[Depends(chat_rate_limit)])
+app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["知识库"], dependencies=[Depends(knowledge_rate_limit)])
+app.include_router(literature.router, prefix="/api/v1", tags=["文献管理"])
+app.include_router(codelab.router, prefix="/api/v1/codelab", tags=["代码实验室"], dependencies=[Depends(codelab_rate_limit)])
+app.include_router(agent.router, prefix="/api/v1/codelab", tags=["Notebook Agent"], dependencies=[Depends(codelab_rate_limit)])
+app.include_router(notebook_agent.router, prefix="/api/v1/codelab", tags=["Notebook ReAct Agent"], dependencies=[Depends(codelab_rate_limit)])
+app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["MCP 管理"])
 
 # === 注册多角色系统路由 ===
-app.include_router(admin.router, prefix="/api/admin", tags=["管理员"])
-app.include_router(mentor.router, prefix="/api/mentor", tags=["导师"])
-app.include_router(student.router, prefix="/api/student", tags=["学生"])
-app.include_router(invitations.router, prefix="/api/invitations", tags=["邀请管理"])
-app.include_router(share.router, prefix="/api/share", tags=["资源共享"])
-app.include_router(announcements.router, prefix="/api/announcements", tags=["公告管理"])
+app.include_router(admin.router, prefix="/api/v1/admin", tags=["管理员"])
+app.include_router(mentor.router, prefix="/api/v1/mentor", tags=["导师"])
+app.include_router(student.router, prefix="/api/v1/student", tags=["学生"])
+app.include_router(invitations.router, prefix="/api/v1/invitations", tags=["邀请管理"])
+app.include_router(share.router, prefix="/api/v1/share", tags=["资源共享"])
+app.include_router(announcements.router, prefix="/api/v1/announcements", tags=["公告管理"])
 
 # 注册文本分块路由
-app.include_router(chunking_router, prefix="/api/chunking", tags=["chunking"])
+app.include_router(chunking_router, prefix="/api/v1/chunking", tags=["chunking"])
 
 
 @app.get("/")
