@@ -338,9 +338,13 @@ class LiteratureAskRequest(BaseModel):
 
 
 class LiteratureAskSource(BaseModel):
+    chunk_id: Optional[int] = None
     document_id: int
     document_name: str
     page: Optional[int] = None
+    page_source: Optional[Literal["metadata", "estimated", "unknown"]] = None
+    section_title: Optional[str] = None
+    section_type: Optional[str] = None
     snippet: str
     score: float
 

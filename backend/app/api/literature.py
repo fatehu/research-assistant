@@ -4,12 +4,14 @@
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, delete, distinct, text
 from sqlalchemy.orm import selectinload
@@ -46,7 +48,9 @@ from app.schemas.literature import (
     CollectionUpdate,
     CollectionWithPapers,
     DownloadPdfRequest,
+    LiteratureAskMessage as LiteratureAskMessageSchema,
     LiteratureAskRequest,
+    LiteratureAskSession as LiteratureAskSessionSchema,
     PaperAnnotationCreate,
     PaperAnnotationResponse,
     PaperAnnotationUpdate,
@@ -122,6 +126,8 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
 ASK_CACHE_TTL_SECONDS = 600
 _ask_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ask_redis_client = None
+PAGE_COUNT_CACHE_TTL_SECONDS = 3600
+_pdf_page_count_cache: Dict[str, tuple[float, int]] = {}
 
 
 def _sse_payload(event: str, data: Any) -> str:
@@ -191,6 +197,41 @@ async def _get_owned_paper_or_404(db: AsyncSession, current_user: User, paper_id
     return paper
 
 
+def _build_paper_pdf_file_path(
+    user_id: int,
+    paper_id: int,
+    title: Optional[str],
+    *,
+    ensure_dir: bool = False,
+) -> str:
+    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+    pdf_dir = os.path.join(upload_dir, str(user_id), "papers")
+    if ensure_dir:
+        os.makedirs(pdf_dir, exist_ok=True)
+    safe_title = "".join(c for c in (title or "")[:50] if c.isalnum() or c in " -_").strip()
+    filename = f"{safe_title or f'paper_{paper_id}'}_{paper_id}.pdf"
+    return os.path.join(pdf_dir, filename)
+
+
+def _resolve_local_pdf_path(user_id: int, paper: Paper) -> Optional[str]:
+    candidates: List[str] = []
+    if isinstance(paper.pdf_path, str) and paper.pdf_path.strip():
+        candidates.append(paper.pdf_path.strip())
+    default_path = _build_paper_pdf_file_path(
+        user_id=user_id,
+        paper_id=int(paper.id),
+        title=paper.title,
+        ensure_dir=False,
+    )
+    if default_path not in candidates:
+        candidates.append(default_path)
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 async def _get_owned_collection_or_404(
     db: AsyncSession,
     current_user: User,
@@ -233,15 +274,172 @@ def _round_or_none(value: Optional[float]) -> Optional[float]:
     return round(float(value), 2)
 
 
+def _to_ask_message_response(row: LiteratureQAMessage) -> LiteratureAskMessageSchema:
+    sources: List[Dict[str, Any]] = []
+    if isinstance(row.sources, list):
+        for source in row.sources:
+            if isinstance(source, dict):
+                sources.append(source)
+    return LiteratureAskMessageSchema(
+        id=int(row.id),
+        session_id=int(row.session_id),
+        role=str(row.role),
+        content=str(row.content or ""),
+        sources=sources,
+        created_at=row.created_at,
+    )
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"-?\d+", text):
+            return int(text)
+    return None
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+    return None
+
+
 def _extract_page_from_metadata(metadata: Any) -> Optional[int]:
     if not isinstance(metadata, dict):
         return None
-    for key in ("page", "page_number", "pdf_page", "page_index"):
-        value = metadata.get(key)
-        if isinstance(value, int):
+
+    direct_keys = (
+        "page",
+        "page_number",
+        "page_num",
+        "pdf_page",
+        "pdf_page_number",
+        "source_page",
+        "source_page_number",
+    )
+    zero_based_keys = ("page_index", "page_idx", "pdf_page_index")
+
+    for key in direct_keys:
+        value = _to_int(metadata.get(key))
+        if value is not None and value > 0:
             return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
+
+    for key in zero_based_keys:
+        value = _to_int(metadata.get(key))
+        if value is not None and value >= 0:
+            return value + 1
+
+    for nested_key in ("location", "position", "source", "extra"):
+        nested = metadata.get(nested_key)
+        if isinstance(nested, dict):
+            nested_page = _extract_page_from_metadata(nested)
+            if nested_page is not None:
+                return nested_page
+
+    return None
+
+
+def _extract_position_ratio_from_metadata(metadata: Any) -> Optional[float]:
+    if not isinstance(metadata, dict):
+        return None
+
+    ratio = _to_float(metadata.get("position_ratio"))
+    if ratio is None:
+        for nested_key in ("location", "position", "source", "extra"):
+            nested = metadata.get(nested_key)
+            if isinstance(nested, dict):
+                ratio = _to_float(nested.get("position_ratio"))
+                if ratio is not None:
+                    break
+    if ratio is None:
+        return None
+    if ratio < 0:
+        return 0.0
+    if ratio > 1:
+        return 1.0
+    return ratio
+
+
+def _clean_section_title(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.strip().split())
+    if not text:
+        return None
+    return text[:220]
+
+
+def _extract_section_info(metadata: Any) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(metadata, dict):
+        return None, None
+
+    title = _clean_section_title(metadata.get("section_title") or metadata.get("heading") or metadata.get("title"))
+    section_type = metadata.get("section_type")
+    if not isinstance(section_type, str):
+        section_type = None
+    else:
+        section_type = section_type.strip().lower() or None
+
+    if title or section_type:
+        return title, section_type
+
+    for nested_key in ("location", "position", "source", "extra"):
+        nested = metadata.get(nested_key)
+        if isinstance(nested, dict):
+            nested_title, nested_type = _extract_section_info(nested)
+            if nested_title or nested_type:
+                return nested_title, nested_type
+
+    return None, None
+
+
+async def _get_pdf_page_count(file_path: Optional[str]) -> Optional[int]:
+    path = (file_path or "").strip()
+    if not path or not os.path.exists(path):
+        return None
+
+    now_ts = time.time()
+    cached = _pdf_page_count_cache.get(path)
+    if cached:
+        expire_at, page_count = cached
+        if expire_at > now_ts:
+            return page_count
+        _pdf_page_count_cache.pop(path, None)
+
+    def _read_page_count() -> Optional[int]:
+        try:
+            import pypdf
+
+            with open(path, "rb") as fp:
+                return max(0, len(pypdf.PdfReader(fp).pages))
+        except Exception as exc:
+            logger.debug(f"[Literature Ask] 读取 PDF 页数失败 path={path}: {exc}")
+            return None
+
+    page_count = await asyncio.to_thread(_read_page_count)
+    if page_count and page_count > 0:
+        _pdf_page_count_cache[path] = (now_ts + PAGE_COUNT_CACHE_TTL_SECONDS, page_count)
+        return page_count
     return None
 
 
@@ -467,8 +665,11 @@ async def _retrieve_rag_sources(
             dc.id AS chunk_id,
             dc.document_id,
             d.original_filename AS document_name,
+            d.file_path,
             dc.content,
             dc.chunk_index,
+            dc.section_type,
+            dc.section_title,
             dc.metadata,
             ts_rank_cd(
                 to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)),
@@ -511,8 +712,11 @@ async def _retrieve_rag_sources(
                 DocumentChunk.id.label("chunk_id"),
                 DocumentChunk.document_id,
                 Document.original_filename.label("document_name"),
+                Document.file_path,
                 DocumentChunk.content,
                 DocumentChunk.chunk_index,
+                DocumentChunk.section_type,
+                DocumentChunk.section_title,
                 DocumentChunk.metadata_,
             )
             .join(Document, Document.id == DocumentChunk.document_id)
@@ -534,6 +738,28 @@ async def _retrieve_rag_sources(
         if metadata is None:
             metadata = getattr(row, "metadata_", None)
         page = _extract_page_from_metadata(metadata)
+        page_source = "metadata" if page is not None else "unknown"
+        if page is None:
+            ratio = _extract_position_ratio_from_metadata(metadata)
+            if ratio is not None:
+                page_count = await _get_pdf_page_count(getattr(row, "file_path", None))
+                if page_count and page_count > 0:
+                    page = min(page_count, max(1, int(round((page_count - 1) * ratio + 1))))
+                    page_source = "estimated"
+
+        section_title = _clean_section_title(getattr(row, "section_title", None))
+        section_type = getattr(row, "section_type", None)
+        if not isinstance(section_type, str):
+            section_type = None
+        else:
+            section_type = section_type.strip().lower() or None
+        if section_title is None or section_type is None:
+            meta_title, meta_type = _extract_section_info(metadata)
+            if section_title is None:
+                section_title = meta_title
+            if section_type is None:
+                section_type = meta_type
+
         content = (getattr(row, "content", "") or "").strip()
         snippet = content[:240]
         score_value = getattr(row, "score", None)
@@ -545,6 +771,9 @@ async def _retrieve_rag_sources(
                 "document_id": int(getattr(row, "document_id")),
                 "document_name": getattr(row, "document_name") or "未知文档",
                 "page": page,
+                "page_source": page_source,
+                "section_title": section_title,
+                "section_type": section_type,
                 "snippet": snippet,
                 "content": content[:1600],
                 "score": round(score_float, 4),
@@ -1425,15 +1654,13 @@ async def download_paper_pdf(
         pdf_path = paper.pdf_path
         filename = os.path.basename(pdf_path)
     else:
-        # 创建存储目录
-        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        pdf_dir = os.path.join(upload_dir, str(current_user.id), "papers")
-        os.makedirs(pdf_dir, exist_ok=True)
-
-        # 生成文件名
-        safe_title = "".join(c for c in paper.title[:50] if c.isalnum() or c in " -_").strip()
-        filename = f"{safe_title}_{paper.id}.pdf"
-        pdf_path = os.path.join(pdf_dir, filename)
+        pdf_path = _build_paper_pdf_file_path(
+            user_id=current_user.id,
+            paper_id=int(paper.id),
+            title=paper.title,
+            ensure_dir=True,
+        )
+        filename = os.path.basename(pdf_path)
 
         # 下载 PDF
         service = get_literature_service()
@@ -1513,6 +1740,26 @@ async def download_paper_pdf(
         "knowledge_base_id": knowledge_base_id,
         "document_id": paper.document_id
     }
+
+
+@router.get("/papers/{paper_id}/pdf")
+async def stream_paper_pdf(
+    paper_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取论文 PDF 文件流（阅读器专用，只读，不触发下载）。"""
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+
+    pdf_path = _resolve_local_pdf_path(user_id=current_user.id, paper=paper)
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="论文 PDF 不存在，请先下载")
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=os.path.basename(pdf_path),
+    )
 
 
 async def process_document_background(doc_id: int, kb_id: int, file_path: str):
@@ -1977,12 +2224,12 @@ async def add_paper_to_knowledge(
     if not pdf_path or not os.path.exists(pdf_path):
         if not paper.pdf_url:
             raise HTTPException(status_code=400, detail="论文缺少 PDF 文件与下载链接，无法入库")
-        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        pdf_dir = os.path.join(upload_dir, str(current_user.id), "papers")
-        os.makedirs(pdf_dir, exist_ok=True)
-        safe_title = "".join(c for c in paper.title[:50] if c.isalnum() or c in " -_").strip() or f"paper_{paper.id}"
-        filename = f"{safe_title}_{paper.id}.pdf"
-        pdf_path = os.path.join(pdf_dir, filename)
+        pdf_path = _build_paper_pdf_file_path(
+            user_id=current_user.id,
+            paper_id=int(paper.id),
+            title=paper.title,
+            ensure_dir=True,
+        )
         success = await get_literature_service().download_pdf(paper.pdf_url, pdf_path)
         if not success:
             raise HTTPException(status_code=500, detail="PDF 下载失败，无法加入知识库")
@@ -2108,6 +2355,75 @@ async def list_paper_knowledge_links(
     return links
 
 
+@router.get("/ask/sessions", response_model=List[LiteratureAskSessionSchema])
+async def list_literature_ask_sessions(
+    scope: Optional[AskScope] = Query(default=None),
+    paper_id: Optional[int] = Query(default=None, ge=1),
+    collection_id: Optional[int] = Query(default=None, ge=1),
+    knowledge_base_id: Optional[int] = Query(default=None, ge=1),
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if paper_id is not None:
+        await _get_owned_paper_or_404(db, current_user, int(paper_id))
+    if collection_id is not None:
+        await _get_owned_collection_or_404(db, current_user, int(collection_id))
+    if knowledge_base_id is not None:
+        await _get_owned_kb_or_404(db, current_user, int(knowledge_base_id))
+
+    stmt = select(LiteratureQASession).where(LiteratureQASession.user_id == current_user.id)
+    if scope is not None:
+        stmt = stmt.where(LiteratureQASession.scope == scope.value)
+    if paper_id is not None:
+        stmt = stmt.where(LiteratureQASession.paper_id == int(paper_id))
+    if collection_id is not None:
+        stmt = stmt.where(LiteratureQASession.collection_id == int(collection_id))
+    if knowledge_base_id is not None:
+        stmt = stmt.where(LiteratureQASession.knowledge_base_id == int(knowledge_base_id))
+
+    stmt = (
+        stmt.order_by(LiteratureQASession.updated_at.desc(), LiteratureQASession.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    sessions = (await db.execute(stmt)).scalars().all()
+    return list(sessions)
+
+
+@router.get(
+    "/ask/sessions/{session_id}/messages",
+    response_model=List[LiteratureAskMessageSchema],
+)
+async def list_literature_ask_messages(
+    session_id: int,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    session_stmt = select(LiteratureQASession).where(
+        and_(
+            LiteratureQASession.id == int(session_id),
+            LiteratureQASession.user_id == current_user.id,
+        )
+    )
+    session = (await db.execute(session_stmt)).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="问答会话不存在")
+
+    msg_stmt = (
+        select(LiteratureQAMessage)
+        .where(LiteratureQAMessage.session_id == int(session_id))
+        .order_by(LiteratureQAMessage.created_at.asc(), LiteratureQAMessage.id.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = (await db.execute(msg_stmt)).scalars().all()
+    return [_to_ask_message_response(row) for row in rows]
+
+
 # ============ 询问（SSE） ============
 
 @router.post("/ask")
@@ -2204,6 +2520,7 @@ async def literature_ask(
         sources=[],
     )
     db.add(user_message)
+    session.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(user_message)
 
@@ -2225,6 +2542,7 @@ async def literature_ask(
             sources=cached_sources,
         )
         db.add(assistant)
+        session.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(assistant)
 
@@ -2266,7 +2584,10 @@ async def literature_ask(
                 DocumentChunk.id,
                 DocumentChunk.document_id,
                 Document.original_filename,
+                Document.file_path,
                 DocumentChunk.content,
+                DocumentChunk.section_type,
+                DocumentChunk.section_title,
                 DocumentChunk.metadata_,
             )
             .join(Document, Document.id == DocumentChunk.document_id)
@@ -2283,13 +2604,37 @@ async def literature_ask(
         for idx, row in enumerate(fallback_rows, start=1):
             metadata = getattr(row, "metadata_", None)
             content = (getattr(row, "content", "") or "").strip()
+            page = _extract_page_from_metadata(metadata)
+            page_source = "metadata" if page is not None else "unknown"
+            if page is None:
+                ratio = _extract_position_ratio_from_metadata(metadata)
+                if ratio is not None:
+                    page_count = await _get_pdf_page_count(getattr(row, "file_path", None))
+                    if page_count and page_count > 0:
+                        page = min(page_count, max(1, int(round((page_count - 1) * ratio + 1))))
+                        page_source = "estimated"
+            section_title = _clean_section_title(getattr(row, "section_title", None))
+            section_type = getattr(row, "section_type", None)
+            if not isinstance(section_type, str):
+                section_type = None
+            else:
+                section_type = section_type.strip().lower() or None
+            if section_title is None or section_type is None:
+                meta_title, meta_type = _extract_section_info(metadata)
+                if section_title is None:
+                    section_title = meta_title
+                if section_type is None:
+                    section_type = meta_type
             sources.append(
                 {
                     "idx": idx,
                     "chunk_id": int(getattr(row, "id")),
                     "document_id": int(getattr(row, "document_id")),
                     "document_name": getattr(row, "original_filename") or "未知文档",
-                    "page": _extract_page_from_metadata(metadata),
+                    "page": page,
+                    "page_source": page_source,
+                    "section_title": section_title,
+                    "section_type": section_type,
                     "snippet": content[:240],
                     "content": content[:1600],
                     "score": 0.0,
@@ -2345,6 +2690,9 @@ async def literature_ask(
             "document_id": source["document_id"],
             "document_name": source["document_name"],
             "page": source.get("page"),
+            "page_source": source.get("page_source"),
+            "section_title": source.get("section_title"),
+            "section_type": source.get("section_type"),
             "snippet": source["snippet"],
             "score": source["score"],
         }
