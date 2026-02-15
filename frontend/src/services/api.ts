@@ -805,6 +805,9 @@ export interface LiteratureAskSource {
   document_id: number
   document_name: string
   page?: number
+  page_source?: 'metadata' | 'estimated' | 'unknown'
+  section_title?: string
+  section_type?: string
   snippet: string
   score: number
   chunk_id?: number
@@ -813,6 +816,27 @@ export interface LiteratureAskSource {
 export interface LiteratureAskEvent {
   event: 'start' | 'token' | 'sources' | 'done' | 'error'
   data: any
+}
+
+export interface LiteratureAskSession {
+  id: number
+  user_id: number
+  scope: LiteratureAskScope
+  paper_id?: number
+  collection_id?: number
+  knowledge_base_id: number
+  title?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface LiteratureAskMessage {
+  id: number
+  session_id: number
+  role: 'user' | 'assistant'
+  content: string
+  sources: LiteratureAskSource[]
+  created_at: string
 }
 
 
@@ -862,6 +886,14 @@ export const literatureApi = {
     return response.data
   },
 
+  getPaperPdfBlob: async (paperId: number, timeoutMs = 180000): Promise<Blob> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/pdf`, {
+      responseType: 'blob',
+      timeout: timeoutMs,
+    })
+    return response.data as Blob
+  },
+
   savePaper: async (data: {
     source: string
     external_id: string
@@ -905,10 +937,12 @@ export const literatureApi = {
 
   downloadPdf: async (
     paperId: number,
-    knowledgeBaseId?: number
+    knowledgeBaseId?: number,
+    timeoutMs = 180000
   ): Promise<{ message: string; pdf_path: string }> => {
     const response = await api.post(`/api/v1/literature/papers/${paperId}/download-pdf`, null, {
       params: { knowledge_base_id: knowledgeBaseId },
+      timeout: timeoutMs,
     })
     return response.data
   },
@@ -1039,6 +1073,26 @@ export const literatureApi = {
 
   getKnowledgeLinks: async (paperId: number): Promise<PaperKnowledgeLink[]> => {
     const response = await api.get(`/api/v1/literature/papers/${paperId}/knowledge-links`)
+    return response.data
+  },
+
+  getAskSessions: async (params?: {
+    scope?: LiteratureAskScope
+    paper_id?: number
+    collection_id?: number
+    knowledge_base_id?: number
+    limit?: number
+    offset?: number
+  }): Promise<LiteratureAskSession[]> => {
+    const response = await api.get('/api/v1/literature/ask/sessions', { params })
+    return response.data
+  },
+
+  getAskMessages: async (
+    sessionId: number,
+    params?: { limit?: number; offset?: number },
+  ): Promise<LiteratureAskMessage[]> => {
+    const response = await api.get(`/api/v1/literature/ask/sessions/${sessionId}/messages`, { params })
     return response.data
   },
 
