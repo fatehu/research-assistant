@@ -38,7 +38,7 @@ from app.services.notebook_agent_history_service import (
     clear_history as clear_history_in_db,
     load_history,
 )
-from app.services.codelab_executor import CodeLabExecutor
+from app.services.codelab_executor import CodeLabExecutor, RunnerUnavailableError
 from app.config import settings
 
 router = APIRouter()
@@ -827,6 +827,14 @@ async def execute_cell(
             terminated_reason="resource_limit",
             policy_violation_code=None,
         )
+    except RunnerUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "sandbox_runner_unavailable",
+                "message": str(exc),
+            },
+        )
     
     # 序列化输出
     serialized_outputs = []
@@ -914,6 +922,14 @@ async def execute_code_directly(
                 execution_time_ms=0,
                 terminated_reason="resource_limit",
                 policy_violation_code=None,
+            )
+        except RunnerUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "sandbox_runner_unavailable",
+                    "message": str(exc),
+                },
             )
         logger.info(
             f"[CodeLabExecuteDirect] user_id={current_user.id} success={result.get('success')} "
@@ -1040,6 +1056,14 @@ async def run_all_cells(
                 "code": "resource_limit",
                 "message": str(exc),
                 "terminated_reason": "resource_limit",
+            },
+        )
+    except RunnerUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "sandbox_runner_unavailable",
+                "message": str(exc),
             },
         )
     

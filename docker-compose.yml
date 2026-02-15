@@ -5,7 +5,7 @@ services:
     container_name: research_postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-research_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-research_password_123}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-research_assistant}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -45,9 +45,10 @@ services:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     container_name: research_backend
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgresql://research_user:research_password_123@postgres:5432/research_assistant}
+      - APP_ENV=${APP_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
-      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-this-in-production-min-32-chars}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
       - ALGORITHM=${ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - SQLALCHEMY_ECHO=${SQLALCHEMY_ECHO:-false}
@@ -113,6 +114,19 @@ services:
       - MCP_ROUTE_RETRY_BACKOFF_SECONDS=${MCP_ROUTE_RETRY_BACKOFF_SECONDS:-0.5}
       - MCP_ROUTE_CIRCUIT_BREAKER_FAILURES=${MCP_ROUTE_CIRCUIT_BREAKER_FAILURES:-3}
       - MCP_ROUTE_CIRCUIT_BREAKER_OPEN_SECONDS=${MCP_ROUTE_CIRCUIT_BREAKER_OPEN_SECONDS:-120}
+      - API_RATE_LIMIT_ENABLED=${API_RATE_LIMIT_ENABLED:-true}
+      - API_RATE_LIMIT_STORAGE=${API_RATE_LIMIT_STORAGE:-auto}
+      - API_RATE_LIMIT_REDIS_URL=${API_RATE_LIMIT_REDIS_URL:-}
+      - API_RATE_LIMIT_WINDOW_SECONDS=${API_RATE_LIMIT_WINDOW_SECONDS:-60}
+      - API_RATE_LIMIT_AUTH_PER_MINUTE=${API_RATE_LIMIT_AUTH_PER_MINUTE:-20}
+      - API_RATE_LIMIT_CHAT_PER_MINUTE=${API_RATE_LIMIT_CHAT_PER_MINUTE:-60}
+      - API_RATE_LIMIT_KNOWLEDGE_PER_MINUTE=${API_RATE_LIMIT_KNOWLEDGE_PER_MINUTE:-120}
+      - API_RATE_LIMIT_CODELAB_PER_MINUTE=${API_RATE_LIMIT_CODELAB_PER_MINUTE:-30}
+      - CODELAB_RUNNER_ENABLED=${CODELAB_RUNNER_ENABLED:-true}
+      - CODELAB_RUNNER_URL=${CODELAB_RUNNER_URL:-http://codelab-runner:8099}
+      - CODELAB_RUNNER_TOKEN=${CODELAB_RUNNER_TOKEN:?CODELAB_RUNNER_TOKEN is required}
+      - CODELAB_RUNNER_TIMEOUT_SECONDS=${CODELAB_RUNNER_TIMEOUT_SECONDS:-25}
+      - CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS=${CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS:-3}
     ports:
       - "8888:8000"
     volumes:
@@ -124,8 +138,31 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      codelab-runner:
+        condition: service_started
     command: >
       sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    networks:
+      - research_network
+
+  codelab-runner:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: research_codelab_runner
+    environment:
+      - APP_ENV=${APP_ENV:-development}
+      - CODELAB_RUNNER_TOKEN=${CODELAB_RUNNER_TOKEN:?CODELAB_RUNNER_TOKEN is required}
+      - CODELAB_EXEC_TIMEOUT_HARD_SECONDS=${CODELAB_EXEC_TIMEOUT_HARD_SECONDS:-20}
+      - PYTHONUNBUFFERED=1
+      - LANG=C.UTF-8
+    command: uvicorn app.sandbox_runner.main:app --host 0.0.0.0 --port 8099
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
     networks:
       - research_network
 
