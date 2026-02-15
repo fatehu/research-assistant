@@ -74,3 +74,8 @@ backend/docs/
 
 # Local snapshots / scratch files
 .snapshots/
+
+# Temporary artifacts generated under docs
+docs/**/tmp/
+docs/**/*.tmp
+tmp/
