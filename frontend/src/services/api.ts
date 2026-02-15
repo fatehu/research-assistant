@@ -710,6 +710,135 @@ export interface CitationGraph {
   edges: GraphEdge[]
 }
 
+export type CommentFilter = 'all' | 'same_group'
+export type AnnotationType = 'highlight' | 'note'
+export type LiteratureAskScope = 'paper' | 'collection'
+
+export interface ReaderSession {
+  page: number
+  zoom: string
+  scroll_y: number
+  selected_kb_id?: number
+  last_anchor: Record<string, unknown>
+  updated_at: string
+}
+
+export interface ReaderSessionUpdate {
+  page: number
+  zoom: string
+  scroll_y: number
+  selected_kb_id?: number
+  last_anchor?: Record<string, unknown>
+}
+
+export interface PaperAnnotation {
+  id: number
+  user_id: number
+  paper_id: number
+  annotation_type: AnnotationType
+  page: number
+  quote_text?: string
+  anchor: Record<string, unknown>
+  content?: string
+  color: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PaperAnnotationCreate {
+  annotation_type: AnnotationType
+  page: number
+  quote_text?: string
+  anchor?: Record<string, unknown>
+  content?: string
+  color?: string
+}
+
+export interface PaperCommentAuthor {
+  id: number
+  username: string
+  full_name?: string
+  avatar?: string
+}
+
+export interface PaperComment {
+  id: number
+  paper_entity_id: number
+  user_id: number
+  parent_id?: number
+  content: string
+  created_at: string
+  updated_at: string
+  author: PaperCommentAuthor
+}
+
+export interface PaperRatingSummary {
+  my_rating?: number
+  global_avg?: number
+  global_count: number
+  same_group_avg?: number
+  same_group_count: number
+}
+
+export interface PaperKnowledgeLink {
+  id: number
+  user_id: number
+  paper_id: number
+  knowledge_base_id: number
+  document_id?: number
+  status: 'pending' | 'processing' | 'ready' | 'failed'
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface LiteratureAskRequest {
+  scope: LiteratureAskScope
+  paper_id?: number
+  collection_id?: number
+  knowledge_base_id: number
+  question: string
+  session_id?: number
+}
+
+export interface LiteratureAskSource {
+  document_id: number
+  document_name: string
+  page?: number
+  page_source?: 'metadata' | 'estimated' | 'unknown'
+  section_title?: string
+  section_type?: string
+  snippet: string
+  score: number
+  chunk_id?: number
+}
+
+export interface LiteratureAskEvent {
+  event: 'start' | 'token' | 'sources' | 'done' | 'error'
+  data: any
+}
+
+export interface LiteratureAskSession {
+  id: number
+  user_id: number
+  scope: LiteratureAskScope
+  paper_id?: number
+  collection_id?: number
+  knowledge_base_id: number
+  title?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface LiteratureAskMessage {
+  id: number
+  session_id: number
+  role: 'user' | 'assistant'
+  content: string
+  sources: LiteratureAskSource[]
+  created_at: string
+}
+
 
 export const literatureApi = {
   init: async (): Promise<{ message: string }> => {
@@ -757,6 +886,14 @@ export const literatureApi = {
     return response.data
   },
 
+  getPaperPdfBlob: async (paperId: number, timeoutMs = 180000): Promise<Blob> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/pdf`, {
+      responseType: 'blob',
+      timeout: timeoutMs,
+    })
+    return response.data as Blob
+  },
+
   savePaper: async (data: {
     source: string
     external_id: string
@@ -800,10 +937,12 @@ export const literatureApi = {
 
   downloadPdf: async (
     paperId: number,
-    knowledgeBaseId?: number
+    knowledgeBaseId?: number,
+    timeoutMs = 180000
   ): Promise<{ message: string; pdf_path: string }> => {
     const response = await api.post(`/api/v1/literature/papers/${paperId}/download-pdf`, null, {
       params: { knowledge_base_id: knowledgeBaseId },
+      timeout: timeoutMs,
     })
     return response.data
   },
@@ -853,6 +992,162 @@ export const literatureApi = {
       paper_id: paperId,
       collection_id: collectionId,
     })
+  },
+
+  getReaderSession: async (paperId: number): Promise<ReaderSession> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/reader/session`)
+    return response.data
+  },
+
+  updateReaderSession: async (paperId: number, data: ReaderSessionUpdate): Promise<ReaderSession> => {
+    const response = await api.put(`/api/v1/literature/papers/${paperId}/reader/session`, data)
+    return response.data
+  },
+
+  getAnnotations: async (
+    paperId: number,
+    params?: { page?: number; type?: AnnotationType }
+  ): Promise<PaperAnnotation[]> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/annotations`, { params })
+    return response.data
+  },
+
+  createAnnotation: async (paperId: number, data: PaperAnnotationCreate): Promise<PaperAnnotation> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/annotations`, data)
+    return response.data
+  },
+
+  updateAnnotation: async (
+    paperId: number,
+    annotationId: number,
+    data: Partial<PaperAnnotationCreate>
+  ): Promise<PaperAnnotation> => {
+    const response = await api.patch(`/api/v1/literature/papers/${paperId}/annotations/${annotationId}`, data)
+    return response.data
+  },
+
+  deleteAnnotation: async (paperId: number, annotationId: number): Promise<void> => {
+    await api.delete(`/api/v1/literature/papers/${paperId}/annotations/${annotationId}`)
+  },
+
+  getComments: async (paperId: number, filter: CommentFilter = 'all'): Promise<PaperComment[]> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/comments`, {
+      params: { filter },
+    })
+    return response.data
+  },
+
+  createComment: async (
+    paperId: number,
+    data: { content: string; parent_id?: number }
+  ): Promise<PaperComment> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/comments`, data)
+    return response.data
+  },
+
+  updateComment: async (paperId: number, commentId: number, content: string): Promise<PaperComment> => {
+    const response = await api.patch(`/api/v1/literature/papers/${paperId}/comments/${commentId}`, { content })
+    return response.data
+  },
+
+  deleteComment: async (paperId: number, commentId: number): Promise<void> => {
+    await api.delete(`/api/v1/literature/papers/${paperId}/comments/${commentId}`)
+  },
+
+  putRating: async (paperId: number, rating: number): Promise<PaperRatingSummary> => {
+    const response = await api.put(`/api/v1/literature/papers/${paperId}/rating`, { rating })
+    return response.data
+  },
+
+  getRatingSummary: async (paperId: number): Promise<PaperRatingSummary> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/ratings/summary`)
+    return response.data
+  },
+
+  addToKnowledge: async (paperId: number, knowledgeBaseId: number): Promise<PaperKnowledgeLink> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/add-to-knowledge`, {
+      knowledge_base_id: knowledgeBaseId,
+    })
+    return response.data
+  },
+
+  getKnowledgeLinks: async (paperId: number): Promise<PaperKnowledgeLink[]> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/knowledge-links`)
+    return response.data
+  },
+
+  getAskSessions: async (params?: {
+    scope?: LiteratureAskScope
+    paper_id?: number
+    collection_id?: number
+    knowledge_base_id?: number
+    limit?: number
+    offset?: number
+  }): Promise<LiteratureAskSession[]> => {
+    const response = await api.get('/api/v1/literature/ask/sessions', { params })
+    return response.data
+  },
+
+  getAskMessages: async (
+    sessionId: number,
+    params?: { limit?: number; offset?: number },
+  ): Promise<LiteratureAskMessage[]> => {
+    const response = await api.get(`/api/v1/literature/ask/sessions/${sessionId}/messages`, { params })
+    return response.data
+  },
+
+  askStream: async (
+    payload: LiteratureAskRequest,
+    onEvent?: (event: LiteratureAskEvent['event'], data: any) => void,
+    abortController?: AbortController
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/ask`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = await response.json()
+        detail = err?.detail?.message || err?.detail || detail
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as LiteratureAskEvent
+          onEvent?.(parsed.event, parsed.data)
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+    }
   },
 }
 

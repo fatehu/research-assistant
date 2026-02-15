@@ -4,7 +4,19 @@
 from app.models.user import User
 from app.models.conversation import Conversation, Message
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
-from app.models.literature import Paper, PaperCollection, PaperSearchHistory
+from app.models.literature import (
+    Paper,
+    PaperCollection,
+    PaperSearchHistory,
+    PaperEntity,
+    PaperReadSession,
+    PaperAnnotation,
+    PaperComment,
+    PaperRating,
+    PaperKnowledgeLink,
+    LiteratureQASession,
+    LiteratureQAMessage,
+)
 from app.models.notebook import Notebook, NotebookCell
 from app.models.agent import AgentRun, AgentStepRecord, ConversationSummary, AgentMemoryItem
 
@@ -36,6 +48,14 @@ __all__ = [
     "Paper",
     "PaperCollection",
     "PaperSearchHistory",
+    "PaperEntity",
+    "PaperReadSession",
+    "PaperAnnotation",
+    "PaperComment",
+    "PaperRating",
+    "PaperKnowledgeLink",
+    "LiteratureQASession",
+    "LiteratureQAMessage",
     # 笔记本
     "Notebook",
     "NotebookCell",

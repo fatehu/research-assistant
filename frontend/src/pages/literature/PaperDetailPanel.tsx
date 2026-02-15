@@ -10,6 +10,7 @@ import {
   FolderAddOutlined, EyeOutlined, TagsOutlined, FireOutlined,
   CloseOutlined
 } from '@ant-design/icons'
+import { useNavigate } from 'react-router-dom'
 import { Paper } from '@/services/api'
 import { useLiteratureStore } from '@/stores/literatureStore'
 
@@ -20,6 +21,7 @@ interface PaperDetailPanelProps {
 }
 
 export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
+  const navigate = useNavigate()
   const { 
     collections, 
     updatePaper, 
@@ -179,6 +181,15 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
             className="!border-slate-600 !text-slate-300"
           >
             复制引用
+          </Button>
+
+          <Button
+            icon={<FileTextOutlined />}
+            onClick={() => navigate(`/literature/${paper.id}/read`)}
+            size="small"
+            className="!border-slate-600 !text-slate-300"
+          >
+            阅读工作台
           </Button>
         </div>
 

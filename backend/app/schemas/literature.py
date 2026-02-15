@@ -2,7 +2,7 @@
 文献管理 Schema
 """
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -205,5 +205,172 @@ class SearchHistoryResponse(BaseModel):
     filters: Dict[str, Any] = {}
     created_at: datetime
     
+    class Config:
+        from_attributes = True
+
+
+# ============ Reader Session ============
+
+class ReaderSessionBase(BaseModel):
+    page: int = Field(default=1, ge=1)
+    zoom: str = Field(default="100%")
+    scroll_y: int = Field(default=0, ge=0)
+    selected_kb_id: Optional[int] = None
+    last_anchor: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderSessionUpdate(ReaderSessionBase):
+    pass
+
+
+class ReaderSessionResponse(ReaderSessionBase):
+    updated_at: datetime
+
+
+# ============ Annotation ============
+
+class PaperAnnotationBase(BaseModel):
+    annotation_type: Literal["highlight", "note"] = "highlight"
+    page: int = Field(..., ge=1)
+    quote_text: Optional[str] = None
+    anchor: Dict[str, Any] = Field(default_factory=dict)
+    content: Optional[str] = None
+    color: str = "#f59e0b"
+
+
+class PaperAnnotationCreate(PaperAnnotationBase):
+    pass
+
+
+class PaperAnnotationUpdate(BaseModel):
+    annotation_type: Optional[Literal["highlight", "note"]] = None
+    page: Optional[int] = Field(default=None, ge=1)
+    quote_text: Optional[str] = None
+    anchor: Optional[Dict[str, Any]] = None
+    content: Optional[str] = None
+    color: Optional[str] = None
+
+
+class PaperAnnotationResponse(PaperAnnotationBase):
+    id: int
+    user_id: int
+    paper_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ============ Comment ============
+
+class PaperCommentAuthor(BaseModel):
+    id: int
+    username: str
+    full_name: Optional[str] = None
+    avatar: Optional[str] = None
+
+
+class PaperCommentCreate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+    parent_id: Optional[int] = None
+
+
+class PaperCommentUpdate(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
+class PaperCommentResponse(BaseModel):
+    id: int
+    paper_entity_id: int
+    user_id: int
+    parent_id: Optional[int] = None
+    content: str
+    created_at: datetime
+    updated_at: datetime
+    author: PaperCommentAuthor
+
+
+# ============ Rating ============
+
+class PaperRatingUpdate(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+
+
+class PaperRatingSummary(BaseModel):
+    my_rating: Optional[int] = None
+    global_avg: Optional[float] = None
+    global_count: int = 0
+    same_group_avg: Optional[float] = None
+    same_group_count: int = 0
+
+
+# ============ Knowledge Link ============
+
+class AddPaperToKnowledgeRequest(BaseModel):
+    knowledge_base_id: int
+
+
+class PaperKnowledgeLinkResponse(BaseModel):
+    id: int
+    user_id: int
+    paper_id: int
+    knowledge_base_id: int
+    document_id: Optional[int] = None
+    status: Literal["pending", "processing", "ready", "failed"]
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ============ Literature Ask ============
+
+class LiteratureAskRequest(BaseModel):
+    scope: Literal["paper", "collection"]
+    paper_id: Optional[int] = None
+    collection_id: Optional[int] = None
+    knowledge_base_id: int
+    question: str = Field(..., min_length=1, max_length=4000)
+    session_id: Optional[int] = None
+
+
+class LiteratureAskSource(BaseModel):
+    chunk_id: Optional[int] = None
+    document_id: int
+    document_name: str
+    page: Optional[int] = None
+    page_source: Optional[Literal["metadata", "estimated", "unknown"]] = None
+    section_title: Optional[str] = None
+    section_type: Optional[str] = None
+    snippet: str
+    score: float
+
+
+class LiteratureAskSession(BaseModel):
+    id: int
+    user_id: int
+    scope: Literal["paper", "collection"]
+    paper_id: Optional[int] = None
+    collection_id: Optional[int] = None
+    knowledge_base_id: int
+    title: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LiteratureAskMessage(BaseModel):
+    id: int
+    session_id: int
+    role: Literal["user", "assistant"]
+    content: str
+    sources: List[LiteratureAskSource] = Field(default_factory=list)
+    created_at: datetime
+
     class Config:
         from_attributes = True

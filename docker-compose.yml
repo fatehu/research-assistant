@@ -44,6 +44,8 @@ services:
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     container_name: research_backend
+    # Default enable GPU for local NVIDIA environments; set DOCKER_BACKEND_GPUS="" to disable.
+    gpus: ${DOCKER_BACKEND_GPUS:-all}
     environment:
       - APP_ENV=${APP_ENV:-development}
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
@@ -225,7 +227,7 @@ services:
       - frontend_node_modules:/app/node_modules
     depends_on:
       - backend
-    command: npm run dev -- --host 0.0.0.0
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
     networks:
       - research_network
 
