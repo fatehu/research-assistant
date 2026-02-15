@@ -1,0 +1,86 @@
+name: Nightly E2E Full
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  e2e-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      APP_ENV: development
+      POSTGRES_USER: research_user
+      POSTGRES_PASSWORD: ci_strong_password_123
+      POSTGRES_DB: research_assistant
+      DATABASE_URL: postgresql://research_user:ci_strong_password_123@postgres:5432/research_assistant
+      SECRET_KEY: ci_secret_key_abcdefghijklmnopqrstuvwxyz_123456
+      CODELAB_RUNNER_TOKEN: ci_runner_internal_token_1234567890
+      API_RATE_LIMIT_ENABLED: "true"
+      API_RATE_LIMIT_STORAGE: memory
+      API_RATE_LIMIT_AUTH_PER_MINUTE: "200"
+      API_RATE_LIMIT_CHAT_PER_MINUTE: "240"
+      API_RATE_LIMIT_KNOWLEDGE_PER_MINUTE: "480"
+      API_RATE_LIMIT_CODELAB_PER_MINUTE: "120"
+      DEEPSEEK_API_KEY: dummy
+      SERPER_API_KEY: dummy
+      VITE_API_BASE_URL: http://localhost:8888
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Start stack
+        run: docker compose up -d --build backend frontend postgres redis codelab-runner
+
+      - name: Wait backend ready
+        run: |
+          for i in {1..80}; do
+            if curl -fsS http://localhost:8888/docs >/dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Backend not ready" >&2
+          docker compose logs --tail 200 backend
+          exit 1
+
+      - name: Run API smoke scripts
+        shell: pwsh
+        run: |
+          ./acceptance_tests.ps1
+          ./e2e/role_business_api_smoke_e2e.ps1
+          ./e2e/remaining_modules_api_smoke_e2e.ps1
+
+      - name: Run UI E2E scripts
+        shell: pwsh
+        run: |
+          ./e2e/student_role_smoke_e2e.ps1
+          ./e2e/role_route_smoke_e2e.ps1 -Role mentor
+          ./e2e/role_route_smoke_e2e.ps1 -Role admin
+          ./e2e/mcp_settings_login_e2e.ps1
+
+      - name: Broad exception guard
+        run: python backend/checks/check_no_new_broad_excepts.py
+
+      - name: Upload logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-artifacts
+          path: |
+            output/e2e/**
+            output/playwright/**
+            .playwright-cli/**
+
+      - name: Stack logs
+        if: always()
+        run: |
+          docker compose ps
+          docker compose logs --tail 150 backend
+          docker compose logs --tail 150 frontend

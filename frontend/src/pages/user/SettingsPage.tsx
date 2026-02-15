@@ -181,7 +181,7 @@ const SettingsPage: React.FC = () => {
   const handleSaveLLMSettings = async (values: any) => {
     setSavingLLM(true)
     try {
-      const response = await api.put('/api/users/profile', {
+      const response = await api.put('/api/v1/users/profile', {
         preferred_llm_provider: values.preferred_llm_provider,
         preferences: {
           ...user?.preferences,
@@ -201,7 +201,7 @@ const SettingsPage: React.FC = () => {
     setSavingNotifications(true)
     try {
       const rawPreferences = (user?.preferences || {}) as Record<string, unknown>
-      const response = await api.put('/api/users/profile', {
+      const response = await api.put('/api/v1/users/profile', {
         preferences: {
           ...rawPreferences,
           notifications: notificationPreferences,
@@ -224,7 +224,7 @@ const SettingsPage: React.FC = () => {
 
     setChangingPassword(true)
     try {
-      await api.put('/api/users/password', {
+      await api.put('/api/v1/users/password', {
         old_password: values.current_password,
         new_password: values.new_password,
       })

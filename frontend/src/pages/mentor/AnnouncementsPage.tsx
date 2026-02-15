@@ -51,7 +51,7 @@ const AnnouncementsPage: React.FC = () => {
   const fetchAnnouncements = async () => {
     setLoading(true);
     try {
-      const response = await api.get('/api/announcements/');
+      const response = await api.get('/api/v1/announcements/');
       setAnnouncements(response.data);
     } catch (error) {
       message.error('获取公告失败');
@@ -62,7 +62,7 @@ const AnnouncementsPage: React.FC = () => {
 
   const fetchGroups = async () => {
     try {
-      const response = await api.get('/api/mentor/groups');
+      const response = await api.get('/api/v1/mentor/groups');
       setGroups(response.data);
     } catch (error) {
       console.error('获取研究组失败:', error);
@@ -95,10 +95,10 @@ const AnnouncementsPage: React.FC = () => {
     setSubmitting(true);
     try {
       if (editingAnnouncement) {
-        await api.put(`/api/announcements/${editingAnnouncement.id}`, values);
+        await api.put(`/api/v1/announcements/${editingAnnouncement.id}`, values);
         message.success('公告已更新');
       } else {
-        await api.post('/api/announcements/', values);
+        await api.post('/api/v1/announcements/', values);
         message.success('公告已发布');
       }
       setModalVisible(false);
@@ -113,7 +113,7 @@ const AnnouncementsPage: React.FC = () => {
 
   const handleDelete = async (id: number) => {
     try {
-      await api.delete(`/api/announcements/${id}`);
+      await api.delete(`/api/v1/announcements/${id}`);
       message.success('公告已删除');
       fetchAnnouncements();
     } catch (error: any) {
@@ -123,7 +123,7 @@ const AnnouncementsPage: React.FC = () => {
 
   const handleTogglePin = async (record: Announcement) => {
     try {
-      await api.put(`/api/announcements/${record.id}`, {
+      await api.put(`/api/v1/announcements/${record.id}`, {
         is_pinned: !record.is_pinned,
       });
       message.success(record.is_pinned ? '已取消置顶' : '已置顶');
@@ -135,7 +135,7 @@ const AnnouncementsPage: React.FC = () => {
 
   const handleToggleActive = async (record: Announcement) => {
     try {
-      await api.put(`/api/announcements/${record.id}`, {
+      await api.put(`/api/v1/announcements/${record.id}`, {
         is_active: !record.is_active,
       });
       message.success(record.is_active ? '已隐藏' : '已显示');

@@ -38,7 +38,7 @@ const StudentAnnouncementsPage: React.FC = () => {
   const fetchAnnouncements = async () => {
     setLoading(true);
     try {
-      const response = await api.get('/api/student/announcements');
+      const response = await api.get('/api/v1/student/announcements');
       setAnnouncements(response.data);
     } catch (error) {
       message.error('获取公告失败');
@@ -49,7 +49,7 @@ const StudentAnnouncementsPage: React.FC = () => {
 
   const fetchUnreadCount = async () => {
     try {
-      const response = await api.get('/api/student/announcements/unread-count');
+      const response = await api.get('/api/v1/student/announcements/unread-count');
       setUnreadCount(response.data.count);
     } catch (error) {
       console.error('获取未读数量失败:', error);
@@ -67,7 +67,7 @@ const StudentAnnouncementsPage: React.FC = () => {
     
     if (!announcement.is_read) {
       try {
-        await api.post(`/api/student/announcements/${announcement.id}/read`);
+        await api.post(`/api/v1/student/announcements/${announcement.id}/read`);
         // 更新本地状态
         setAnnouncements(prev => 
           prev.map(a => a.id === announcement.id ? { ...a, is_read: true } : a)

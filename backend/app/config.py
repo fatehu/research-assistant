@@ -5,6 +5,7 @@ Application settings loaded from environment variables.
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,15 +21,16 @@ class Settings(BaseSettings):
     # Base
     app_name: str = "AI科研助手"
     app_version: str = "1.0.0"
+    app_env: Literal["development", "staging", "production"] = "development"
     debug: bool = True
     sqlalchemy_echo: bool = False
 
     # Database / cache
-    database_url: str = "postgresql://research_user:research_password_123@localhost:5432/research_assistant"
+    database_url: str = ""
     redis_url: str = "redis://localhost:6379/0"
 
     # Auth
-    secret_key: str = "your-super-secret-key-change-this-in-production-min-32-chars"
+    secret_key: str = ""
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
@@ -172,6 +174,23 @@ class Settings(BaseSettings):
     cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     auto_create_tables: bool = False
 
+    # API rate limiting
+    api_rate_limit_enabled: bool = True
+    api_rate_limit_storage: Literal["auto", "redis", "memory"] = "auto"
+    api_rate_limit_redis_url: str = ""
+    api_rate_limit_window_seconds: int = 60
+    api_rate_limit_auth_per_minute: int = 20
+    api_rate_limit_chat_per_minute: int = 60
+    api_rate_limit_knowledge_per_minute: int = 120
+    api_rate_limit_codelab_per_minute: int = 30
+
+    # CodeLab sandbox runner
+    codelab_runner_enabled: bool = True
+    codelab_runner_url: str = "http://codelab-runner:8099"
+    codelab_runner_token: str = ""
+    codelab_runner_timeout_seconds: int = 25
+    codelab_runner_connect_timeout_seconds: int = 3
+
     # Notebook context
     notebook_context_cells: int = 5
     notebook_context_cell_max_length: int = 200
@@ -211,6 +230,37 @@ class Settings(BaseSettings):
     def get_cors_allow_origins(self) -> list[str]:
         origins = [item.strip() for item in self.cors_allow_origins.split(",")]
         return [item for item in origins if item]
+
+    @model_validator(mode="after")
+    def validate_security_constraints(self):
+        if self.app_env not in {"staging", "production"}:
+            return self
+
+        weak_secret_markers = {
+            "",
+            "change-me",
+            "your-super-secret-key-change-this-in-production-min-32-chars",
+            "secret",
+            "password",
+        }
+        normalized_secret = (self.secret_key or "").strip()
+        if (
+            len(normalized_secret) < 32
+            or normalized_secret in weak_secret_markers
+            or normalized_secret.startswith("your-super-secret-key")
+        ):
+            raise ValueError("SECRET_KEY is missing or weak for staging/production")
+
+        normalized_db_url = (self.database_url or "").strip().lower()
+        if not normalized_db_url:
+            raise ValueError("DATABASE_URL is required for staging/production")
+        if any(token in normalized_db_url for token in ["research_password_123", ":123456@", ":password@"]):
+            raise ValueError("DATABASE_URL contains weak default credentials")
+
+        if self.codelab_runner_enabled and not (self.codelab_runner_token or "").strip():
+            raise ValueError("CODELAB_RUNNER_TOKEN is required when CODELAB_RUNNER_ENABLED=true")
+
+        return self
 
 
 @lru_cache

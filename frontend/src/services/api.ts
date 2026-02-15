@@ -278,7 +278,7 @@ export interface ProcessingStatus {
 
 export const authApi = {
   login: async (email: string, password: string): Promise<AuthResponse> => {
-    const response = await api.post('/api/auth/login', { email, password })
+    const response = await api.post('/api/v1/auth/login', { email, password })
     return response.data
   },
 
@@ -288,7 +288,7 @@ export const authApi = {
     password: string,
     fullName?: string
   ): Promise<AuthResponse> => {
-    const response = await api.post('/api/auth/register', {
+    const response = await api.post('/api/v1/auth/register', {
       email,
       username,
       password,
@@ -298,23 +298,23 @@ export const authApi = {
   },
 
   me: async (): Promise<User> => {
-    const response = await api.get('/api/auth/me')
+    const response = await api.get('/api/v1/auth/me')
     return response.data
   },
 
   logout: async (): Promise<void> => {
-    await api.post('/api/auth/logout')
+    await api.post('/api/v1/auth/logout')
   },
 }
 
 export const userApi = {
   getProfile: async (): Promise<User> => {
-    const response = await api.get('/api/users/profile')
+    const response = await api.get('/api/v1/users/profile')
     return response.data
   },
 
   updateProfile: async (data: Partial<User>): Promise<User> => {
-    const response = await api.put('/api/users/profile', data)
+    const response = await api.put('/api/v1/users/profile', data)
     return response.data
   },
 
@@ -322,7 +322,7 @@ export const userApi = {
     default: string
     providers: LLMProvider[]
   }> => {
-    const response = await api.get('/api/users/llm-providers')
+    const response = await api.get('/api/v1/users/llm-providers')
     return response.data
   },
 }
@@ -333,24 +333,24 @@ export const chatApi = {
     limit = 20,
     archived = false
   ): Promise<Conversation[]> => {
-    const response = await api.get('/api/chat/conversations', {
+    const response = await api.get('/api/v1/chat/conversations', {
       params: { skip, limit, archived },
     })
     return response.data
   },
 
   createConversation: async (title?: string): Promise<Conversation> => {
-    const response = await api.post('/api/chat/conversations', { title })
+    const response = await api.post('/api/v1/chat/conversations', { title })
     return response.data
   },
 
   getConversation: async (conversationId: number): Promise<Conversation> => {
-    const response = await api.get(`/api/chat/conversations/${conversationId}`)
+    const response = await api.get(`/api/v1/chat/conversations/${conversationId}`)
     return response.data
   },
 
   deleteConversation: async (conversationId: number): Promise<void> => {
-    await api.delete(`/api/chat/conversations/${conversationId}`)
+    await api.delete(`/api/v1/chat/conversations/${conversationId}`)
   },
 
   getMessages: async (
@@ -359,7 +359,7 @@ export const chatApi = {
     limit = 50
   ): Promise<Message[]> => {
     const response = await api.get(
-      `/api/chat/conversations/${conversationId}/messages`,
+      `/api/v1/chat/conversations/${conversationId}/messages`,
       { params: { skip, limit } }
     )
     return response.data
@@ -372,7 +372,7 @@ export const chatApi = {
     abortController?: AbortController
   ): Promise<void> => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/chat/send`, {
+      const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -437,7 +437,7 @@ export const chatApi = {
       created_at: string
     }>
   }> => {
-    const response = await api.get('/api/chat/messages/search', {
+    const response = await api.get('/api/v1/chat/messages/search', {
       params: { q: query, limit },
     })
     return response.data
@@ -457,7 +457,7 @@ export const chatApi = {
       success?: boolean
     }>
   }): Promise<Message> => {
-    const response = await api.post('/api/chat/messages/stopped', data)
+    const response = await api.post('/api/v1/chat/messages/stopped', data)
     return response.data
   },
 }
@@ -465,7 +465,7 @@ export const chatApi = {
 
 export const knowledgeApi = {
   getKnowledgeBases: async (skip = 0, limit = 20): Promise<{ items: KnowledgeBase[]; total: number }> => {
-    const response = await api.get('/api/knowledge/knowledge-bases', {
+    const response = await api.get('/api/v1/knowledge/knowledge-bases', {
       params: { skip, limit },
     })
     return response.data
@@ -476,36 +476,36 @@ export const knowledgeApi = {
     shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
     sharing_enabled: boolean;
   }> => {
-    const response = await api.get('/api/knowledge/available')
+    const response = await api.get('/api/v1/knowledge/available')
     return response.data
   },
 
   createKnowledgeBase: async (data: KnowledgeBaseCreate): Promise<KnowledgeBase> => {
-    const response = await api.post('/api/knowledge/knowledge-bases', data)
+    const response = await api.post('/api/v1/knowledge/knowledge-bases', data)
     return response.data
   },
 
   getEmbeddingModels: async (): Promise<EmbeddingModelsResponse> => {
-    const response = await api.get('/api/knowledge/embedding-models')
+    const response = await api.get('/api/v1/knowledge/embedding-models')
     return response.data
   },
 
   getKnowledgeBase: async (kbId: number): Promise<KnowledgeBase> => {
-    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}`)
+    const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}`)
     return response.data
   },
 
   updateKnowledgeBase: async (kbId: number, data: Partial<KnowledgeBaseCreate>): Promise<KnowledgeBase> => {
-    const response = await api.put(`/api/knowledge/knowledge-bases/${kbId}`, data)
+    const response = await api.put(`/api/v1/knowledge/knowledge-bases/${kbId}`, data)
     return response.data
   },
 
   deleteKnowledgeBase: async (kbId: number): Promise<void> => {
-    await api.delete(`/api/knowledge/knowledge-bases/${kbId}`)
+    await api.delete(`/api/v1/knowledge/knowledge-bases/${kbId}`)
   },
 
   getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
-    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents`, {
+    const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents`, {
       params: { skip, limit },
     })
     return response.data
@@ -516,7 +516,7 @@ export const knowledgeApi = {
     formData.append('file', file)
 
     const response = await api.post(
-      `/api/knowledge/knowledge-bases/${kbId}/documents/upload`,
+      `/api/v1/knowledge/knowledge-bases/${kbId}/documents/upload`,
       formData,
       {
         headers: {
@@ -528,21 +528,21 @@ export const knowledgeApi = {
   },
 
   getDocument: async (kbId: number, docId: number): Promise<Document> => {
-    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
+    const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
     return response.data
   },
 
   deleteDocument: async (kbId: number, docId: number): Promise<void> => {
-    await api.delete(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
+    await api.delete(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
   },
 
   getDocumentStatus: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
-    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/status`)
+    const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/status`)
     return response.data
   },
 
   getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
-    const response = await api.get(`/api/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
+    const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
       params: { skip, limit },
     })
     return response.data
@@ -573,7 +573,7 @@ export const knowledgeApi = {
     } = options
     const normalizedAdjacentWindow = Math.max(1, Math.min(3, adjacentWindow))
 
-    const response = await api.post('/api/knowledge/search', {
+    const response = await api.post('/api/v1/knowledge/search', {
       query,
       knowledge_base_ids: knowledgeBaseIds,
       top_k: topK,
@@ -713,7 +713,7 @@ export interface CitationGraph {
 
 export const literatureApi = {
   init: async (): Promise<{ message: string }> => {
-    const response = await api.post('/api/literature/init')
+    const response = await api.post('/api/v1/literature/init')
     return response.data
   },
 
@@ -727,12 +727,12 @@ export const literatureApi = {
     fields?: string
     open_access?: boolean
   }): Promise<PaperSearchResponse> => {
-    const response = await api.get('/api/literature/search', { params })
+    const response = await api.get('/api/v1/literature/search', { params })
     return response.data
   },
 
   getSearchHistory: async (limit = 20): Promise<SearchHistory[]> => {
-    const response = await api.get('/api/literature/search/history', {
+    const response = await api.get('/api/v1/literature/search/history', {
       params: { limit },
     })
     return response.data
@@ -748,12 +748,12 @@ export const literatureApi = {
     limit?: number
     offset?: number
   }): Promise<Paper[]> => {
-    const response = await api.get('/api/literature/papers', { params })
+    const response = await api.get('/api/v1/literature/papers', { params })
     return response.data
   },
 
   getPaper: async (paperId: number): Promise<Paper> => {
-    const response = await api.get(`/api/literature/papers/${paperId}`)
+    const response = await api.get(`/api/v1/literature/papers/${paperId}`)
     return response.data
   },
 
@@ -775,7 +775,7 @@ export const literatureApi = {
     raw_data?: Record<string, unknown>
     collection_ids?: number[]
   }): Promise<Paper> => {
-    const response = await api.post('/api/literature/papers', data)
+    const response = await api.post('/api/v1/literature/papers', data)
     return response.data
   },
 
@@ -790,26 +790,26 @@ export const literatureApi = {
       is_read?: boolean
     }
   ): Promise<Paper> => {
-    const response = await api.patch(`/api/literature/papers/${paperId}`, data)
+    const response = await api.patch(`/api/v1/literature/papers/${paperId}`, data)
     return response.data
   },
 
   deletePaper: async (paperId: number): Promise<void> => {
-    await api.delete(`/api/literature/papers/${paperId}`)
+    await api.delete(`/api/v1/literature/papers/${paperId}`)
   },
 
   downloadPdf: async (
     paperId: number,
     knowledgeBaseId?: number
   ): Promise<{ message: string; pdf_path: string }> => {
-    const response = await api.post(`/api/literature/papers/${paperId}/download-pdf`, null, {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/download-pdf`, null, {
       params: { knowledge_base_id: knowledgeBaseId },
     })
     return response.data
   },
 
   getCollections: async (): Promise<PaperCollection[]> => {
-    const response = await api.get('/api/literature/collections')
+    const response = await api.get('/api/v1/literature/collections')
     return response.data
   },
 
@@ -820,7 +820,7 @@ export const literatureApi = {
     icon?: string
     collection_type?: string
   }): Promise<PaperCollection> => {
-    const response = await api.post('/api/literature/collections', data)
+    const response = await api.post('/api/v1/literature/collections', data)
     return response.data
   },
 
@@ -833,23 +833,23 @@ export const literatureApi = {
       icon?: string
     }
   ): Promise<PaperCollection> => {
-    const response = await api.patch(`/api/literature/collections/${collectionId}`, data)
+    const response = await api.patch(`/api/v1/literature/collections/${collectionId}`, data)
     return response.data
   },
 
   deleteCollection: async (collectionId: number): Promise<void> => {
-    await api.delete(`/api/literature/collections/${collectionId}`)
+    await api.delete(`/api/v1/literature/collections/${collectionId}`)
   },
 
   addPaperToCollection: async (paperId: number, collectionIds: number[]): Promise<void> => {
-    await api.post('/api/literature/collections/add-paper', {
+    await api.post('/api/v1/literature/collections/add-paper', {
       paper_id: paperId,
       collection_ids: collectionIds,
     })
   },
 
   removePaperFromCollection: async (paperId: number, collectionId: number): Promise<void> => {
-    await api.post('/api/literature/collections/remove-paper', {
+    await api.post('/api/v1/literature/collections/remove-paper', {
       paper_id: paperId,
       collection_id: collectionId,
     })
@@ -901,17 +901,17 @@ export interface ExecuteResponse {
 
 export const codelabApi = {
   listNotebooks: async (): Promise<Notebook[]> => {
-    const response = await api.get('/api/codelab/notebooks')
+    const response = await api.get('/api/v1/codelab/notebooks')
     return response.data
   },
 
   createNotebook: async (data: { title?: string; description?: string }): Promise<Notebook> => {
-    const response = await api.post('/api/codelab/notebooks', data)
+    const response = await api.post('/api/v1/codelab/notebooks', data)
     return response.data
   },
 
   getNotebook: async (notebookId: string): Promise<Notebook> => {
-    const response = await api.get(`/api/codelab/notebooks/${notebookId}`)
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}`)
     return response.data
   },
 
@@ -919,42 +919,42 @@ export const codelabApi = {
     notebookId: string,
     data: { title?: string; description?: string; cells?: Cell[] }
   ): Promise<Notebook> => {
-    const response = await api.patch(`/api/codelab/notebooks/${notebookId}`, data)
+    const response = await api.patch(`/api/v1/codelab/notebooks/${notebookId}`, data)
     return response.data
   },
 
   deleteNotebook: async (notebookId: string): Promise<void> => {
-    await api.delete(`/api/codelab/notebooks/${notebookId}`)
+    await api.delete(`/api/v1/codelab/notebooks/${notebookId}`)
   },
 
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
-    const response = await api.post(`/api/codelab/notebooks/${notebookId}/execute`, data)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/execute`, data)
     return response.data
   },
 
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
-    const response = await api.post('/api/codelab/execute', data)
+    const response = await api.post('/api/v1/codelab/execute', data)
     return response.data
   },
 
   addCell: async (notebookId: string, cellType: 'code' | 'markdown', index?: number): Promise<Cell> => {
-    const response = await api.post(`/api/codelab/notebooks/${notebookId}/cells`, null, {
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/cells`, null, {
       params: { cell_type: cellType, index },
     })
     return response.data
   },
 
   deleteCell: async (notebookId: string, cellId: string): Promise<void> => {
-    await api.delete(`/api/codelab/notebooks/${notebookId}/cells/${cellId}`)
+    await api.delete(`/api/v1/codelab/notebooks/${notebookId}/cells/${cellId}`)
   },
 
   runAll: async (notebookId: string): Promise<{ message: string; results: any[] }> => {
-    const response = await api.post(`/api/codelab/notebooks/${notebookId}/run-all`)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/run-all`)
     return response.data
   },
 
   restartKernel: async (notebookId: string): Promise<{ message: string }> => {
-    const response = await api.post(`/api/codelab/notebooks/${notebookId}/restart-kernel`)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/restart-kernel`)
     return response.data
   },
 
@@ -965,12 +965,12 @@ export const codelabApi = {
     last_used_at?: string
     variables: Record<string, string>
   }> => {
-    const response = await api.get(`/api/codelab/notebooks/${notebookId}/kernel-status`)
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/kernel-status`)
     return response.data
   },
 
   interruptKernel: async (notebookId: string): Promise<{ message: string }> => {
-    const response = await api.post(`/api/codelab/notebooks/${notebookId}/interrupt`)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/interrupt`)
     return response.data
   },
 }
@@ -1042,7 +1042,7 @@ export interface AgentChatEvent {
 export const agentApi = {
   // Get notebook context
   getContext: async (notebookId: string): Promise<AgentContextResponse> => {
-    const response = await api.get(`/api/codelab/notebooks/${notebookId}/agent/context`)
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/agent/context`)
     return response.data
   },
 
@@ -1052,12 +1052,12 @@ export const agentApi = {
     created_at: string
     updated_at: string
   }> => {
-    const response = await api.get(`/api/codelab/notebooks/${notebookId}/agent/history`)
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/agent/history`)
     return response.data
   },
 
   clearHistory: async (notebookId: string): Promise<{ message: string }> => {
-    const response = await api.delete(`/api/codelab/notebooks/${notebookId}/agent/history`)
+    const response = await api.delete(`/api/v1/codelab/notebooks/${notebookId}/agent/history`)
     return response.data
   },
 
@@ -1068,7 +1068,7 @@ export const agentApi = {
     abortController?: AbortController
   ): Promise<void> => {
     const response = await fetch(
-      `${API_BASE_URL}/api/codelab/notebooks/${notebookId}/agent/chat`,
+      `${API_BASE_URL}/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       {
         method: 'POST',
         headers: {
@@ -1121,7 +1121,7 @@ export const agentApi = {
     suggested_action?: string
   }> => {
     const response = await api.post(
-      `/api/codelab/notebooks/${notebookId}/agent/chat`,
+      `/api/v1/codelab/notebooks/${notebookId}/agent/chat`,
       { ...request, stream: false }
     )
     return response.data
@@ -1136,7 +1136,7 @@ export const agentApi = {
     full_response: string
   }> => {
     const response = await api.post(
-      `/api/codelab/notebooks/${notebookId}/agent/suggest-code`,
+      `/api/v1/codelab/notebooks/${notebookId}/agent/suggest-code`,
       null,
       { params: { description } }
     )
@@ -1152,7 +1152,7 @@ export const agentApi = {
     fix_code?: string
   }> => {
     const response = await api.post(
-      `/api/codelab/notebooks/${notebookId}/agent/explain-error`,
+      `/api/v1/codelab/notebooks/${notebookId}/agent/explain-error`,
       null,
       { params: { error_message: errorMessage, code } }
     )
@@ -1171,7 +1171,7 @@ export const agentApi = {
     description: string
   }> => {
     const response = await api.post(
-      `/api/codelab/notebooks/${notebookId}/agent/analyze-data`,
+      `/api/v1/codelab/notebooks/${notebookId}/agent/analyze-data`,
       null,
       { params: { variable_name: variableName, analysis_type: analysisType } }
     )
@@ -1383,36 +1383,36 @@ export const adminApi = {
     search?: string
     is_active?: boolean
   }): Promise<UserWithRole[]> => {
-    const response = await api.get('/api/admin/users', { params })
+    const response = await api.get('/api/v1/admin/users', { params })
     return response.data
   },
 
   getUser: async (userId: number): Promise<UserWithRole> => {
-    const response = await api.get(`/api/admin/users/${userId}`)
+    const response = await api.get(`/api/v1/admin/users/${userId}`)
     return response.data
   },
 
   updateUserRole: async (userId: number, role: UserRole): Promise<UserWithRole> => {
-    const response = await api.put(`/api/admin/users/${userId}/role`, { role })
+    const response = await api.put(`/api/v1/admin/users/${userId}/role`, { role })
     return response.data
   },
 
   toggleUserActive: async (userId: number): Promise<{ is_active: boolean }> => {
-    const response = await api.put(`/api/admin/users/${userId}/toggle-active`)
+    const response = await api.put(`/api/v1/admin/users/${userId}/toggle-active`)
     return response.data
   },
 
   deleteUser: async (userId: number): Promise<void> => {
-    await api.delete(`/api/admin/users/${userId}`)
+    await api.delete(`/api/v1/admin/users/${userId}`)
   },
 
   getStatistics: async (): Promise<SystemStatistics> => {
-    const response = await api.get('/api/admin/statistics')
+    const response = await api.get('/api/v1/admin/statistics')
     return response.data
   },
 
   setUserMentor: async (userId: number, mentorId: number | null): Promise<UserWithRole> => {
-    const response = await api.put(`/api/admin/users/${userId}/mentor`, { mentor_id: mentorId })
+    const response = await api.put(`/api/v1/admin/users/${userId}/mentor`, { mentor_id: mentorId })
     return response.data
   },
 }
@@ -1420,40 +1420,40 @@ export const adminApi = {
 
 export const mentorApi = {
   getStudents: async (): Promise<StudentDetail[]> => {
-    const response = await api.get('/api/mentor/students')
+    const response = await api.get('/api/v1/mentor/students')
     return response.data
   },
 
   getStudentDetail: async (studentId: number): Promise<StudentDetail> => {
-    const response = await api.get(`/api/mentor/students/${studentId}`)
+    const response = await api.get(`/api/v1/mentor/students/${studentId}`)
     return response.data
   },
 
   inviteStudent: async (email: string, message?: string): Promise<Invitation> => {
-    const response = await api.post('/api/mentor/students/invite', { email, message })
+    const response = await api.post('/api/v1/mentor/students/invite', { email, message })
     return response.data
   },
 
   removeStudent: async (studentId: number): Promise<void> => {
-    await api.delete(`/api/mentor/students/${studentId}`)
+    await api.delete(`/api/v1/mentor/students/${studentId}`)
   },
 
   getSentInvitations: async (): Promise<Invitation[]> => {
-    const response = await api.get('/api/mentor/invitations/sent')
+    const response = await api.get('/api/v1/mentor/invitations/sent')
     return response.data
   },
 
   cancelInvitation: async (invitationId: number): Promise<void> => {
-    await api.delete(`/api/mentor/invitations/${invitationId}`)
+    await api.delete(`/api/v1/mentor/invitations/${invitationId}`)
   },
 
   handleApplication: async (invitationId: number, accept: boolean): Promise<void> => {
-    const response = await api.post(`/api/mentor/applications/${invitationId}/${accept ? 'accept' : 'reject'}`)
+    const response = await api.post(`/api/v1/mentor/applications/${invitationId}/${accept ? 'accept' : 'reject'}`)
     return response.data
   },
 
   getGroups: async (): Promise<ResearchGroup[]> => {
-    const response = await api.get('/api/mentor/groups')
+    const response = await api.get('/api/v1/mentor/groups')
     return response.data
   },
 
@@ -1462,7 +1462,7 @@ export const mentorApi = {
     description?: string
     max_members?: number
   }): Promise<ResearchGroup> => {
-    const response = await api.post('/api/mentor/groups', data)
+    const response = await api.post('/api/v1/mentor/groups', data)
     return response.data
   },
 
@@ -1472,30 +1472,30 @@ export const mentorApi = {
     max_members?: number
     is_active?: boolean
   }): Promise<ResearchGroup> => {
-    const response = await api.put(`/api/mentor/groups/${groupId}`, data)
+    const response = await api.put(`/api/v1/mentor/groups/${groupId}`, data)
     return response.data
   },
 
   deleteGroup: async (groupId: number): Promise<void> => {
-    await api.delete(`/api/mentor/groups/${groupId}`)
+    await api.delete(`/api/v1/mentor/groups/${groupId}`)
   },
 
   getGroupMembers: async (groupId: number): Promise<GroupMember[]> => {
-    const response = await api.get(`/api/mentor/groups/${groupId}/members`)
+    const response = await api.get(`/api/v1/mentor/groups/${groupId}/members`)
     return response.data
   },
 
   addGroupMember: async (groupId: number, userId: number): Promise<GroupMember> => {
-    const response = await api.post(`/api/mentor/groups/${groupId}/members`, { user_id: userId })
+    const response = await api.post(`/api/v1/mentor/groups/${groupId}/members`, { user_id: userId })
     return response.data
   },
 
   removeGroupMember: async (groupId: number, userId: number): Promise<void> => {
-    await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`)
+    await api.delete(`/api/v1/mentor/groups/${groupId}/members/${userId}`)
   },
 
   getActivities: async (skip = 0, limit = 20): Promise<MentorActivity[]> => {
-    const response = await api.get('/api/mentor/activities', {
+    const response = await api.get('/api/v1/mentor/activities', {
       params: { skip, limit },
     })
     return response.data
@@ -1506,7 +1506,7 @@ export const mentorApi = {
 export const studentApi = {
   getMentor: async (): Promise<UserWithRole | null> => {
     try {
-      const response = await api.get('/api/student/mentor')
+      const response = await api.get('/api/v1/student/mentor')
       return response.data
     } catch (error: any) {
       if (error.response?.status === 404) {
@@ -1517,43 +1517,43 @@ export const studentApi = {
   },
 
   searchMentors: async (query: string): Promise<UserWithRole[]> => {
-    const response = await api.get('/api/student/mentors/search', { params: { query } })
+    const response = await api.get('/api/v1/student/mentors/search', { params: { query } })
     return response.data
   },
 
   applyToMentor: async (mentorId: number, message?: string): Promise<Invitation> => {
-    const response = await api.post('/api/student/mentor/apply', { mentor_id: mentorId, message })
+    const response = await api.post('/api/v1/student/mentor/apply', { mentor_id: mentorId, message })
     return response.data
   },
 
   leaveMentor: async (): Promise<void> => {
-    await api.delete('/api/student/mentor/leave')
+    await api.delete('/api/v1/student/mentor/leave')
   },
 
   getMyApplications: async (): Promise<Invitation[]> => {
-    const response = await api.get('/api/student/applications')
+    const response = await api.get('/api/v1/student/applications')
     return response.data
   },
 
   cancelApplication: async (invitationId: number): Promise<void> => {
-    await api.delete(`/api/student/applications/${invitationId}`)
+    await api.delete(`/api/v1/student/applications/${invitationId}`)
   },
 
   getReceivedInvitations: async (): Promise<Invitation[]> => {
-    const response = await api.get('/api/student/invitations')
+    const response = await api.get('/api/v1/student/invitations')
     return response.data
   },
 
   acceptInvitation: async (invitationId: number): Promise<void> => {
-    await api.post(`/api/student/invitations/${invitationId}/accept`)
+    await api.post(`/api/v1/student/invitations/${invitationId}/accept`)
   },
 
   rejectInvitation: async (invitationId: number): Promise<void> => {
-    await api.post(`/api/student/invitations/${invitationId}/reject`)
+    await api.post(`/api/v1/student/invitations/${invitationId}/reject`)
   },
 
   getMyGroups: async (): Promise<ResearchGroup[]> => {
-    const response = await api.get('/api/student/groups')
+    const response = await api.get('/api/v1/student/groups')
     return response.data
   },
 }
@@ -1561,20 +1561,20 @@ export const studentApi = {
 
 export const invitationApi = {
   getAll: async (): Promise<Invitation[]> => {
-    const response = await api.get('/api/invitations')
+    const response = await api.get('/api/v1/invitations')
     return response.data
   },
 
   accept: async (invitationId: number): Promise<void> => {
-    await api.post(`/api/invitations/${invitationId}/accept`)
+    await api.post(`/api/v1/invitations/${invitationId}/accept`)
   },
 
   reject: async (invitationId: number): Promise<void> => {
-    await api.post(`/api/invitations/${invitationId}/reject`)
+    await api.post(`/api/v1/invitations/${invitationId}/reject`)
   },
 
   cancel: async (invitationId: number): Promise<void> => {
-    await api.delete(`/api/invitations/${invitationId}`)
+    await api.delete(`/api/v1/invitations/${invitationId}`)
   },
 }
 
@@ -1582,47 +1582,47 @@ export const invitationApi = {
 export const shareApi = {
   getSharedWithMe: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
-    const response = await api.get('/api/share/shared-with-me', { params })
+    const response = await api.get('/api/v1/share/shared-with-me', { params })
     return response.data
   },
 
   getSharedCount: async (): Promise<{ paper: number; paper_collection: number; knowledge_base: number; notebook: number; total: number }> => {
-    const response = await api.get('/api/share/shared-with-me/count')
+    const response = await api.get('/api/v1/share/shared-with-me/count')
     return response.data
   },
 
   getMyShares: async (resourceType?: string): Promise<SharedResource[]> => {
     const params = resourceType ? { resource_type: resourceType } : {}
-    const response = await api.get('/api/share/my-shares', { params })
+    const response = await api.get('/api/v1/share/my-shares', { params })
     return response.data
   },
 
   getMyGroups: async (): Promise<{ id: number; name: string; role: string }[]> => {
-    const response = await api.get('/api/share/my-groups')
+    const response = await api.get('/api/v1/share/my-groups')
     return response.data
   },
 
   getMyPapers: async (search?: string): Promise<{ id: number; title: string; authors: string[]; year: number; venue: string }[]> => {
     const params = search ? { search } : {}
-    const response = await api.get('/api/share/my-papers', { params })
+    const response = await api.get('/api/v1/share/my-papers', { params })
     return response.data
   },
 
   getMyCollections: async (search?: string): Promise<{ id: number; name: string; description: string; paper_count: number; color: string }[]> => {
     const params = search ? { search } : {}
-    const response = await api.get('/api/share/my-collections', { params })
+    const response = await api.get('/api/v1/share/my-collections', { params })
     return response.data
   },
 
   getMyKnowledgeBases: async (search?: string): Promise<{ id: number; name: string; description: string; document_count: number }[]> => {
     const params = search ? { search } : {}
-    const response = await api.get('/api/share/my-knowledge-bases', { params })
+    const response = await api.get('/api/v1/share/my-knowledge-bases', { params })
     return response.data
   },
 
   getMyNotebooks: async (search?: string): Promise<{ id: string; title: string; description: string; cell_count: number; updated_at: string }[]> => {
     const params = search ? { search } : {}
-    const response = await api.get('/api/share/my-notebooks', { params })
+    const response = await api.get('/api/v1/share/my-notebooks', { params })
     return response.data
   },
 
@@ -1635,7 +1635,7 @@ export const shareApi = {
     permission?: string
     message?: string
   }): Promise<SharedResource> => {
-    const response = await api.post('/api/share/', data)
+    const response = await api.post('/api/v1/share/', data)
     return response.data
   },
 
@@ -1647,23 +1647,23 @@ export const shareApi = {
     shared_with_id?: number
     permission?: string
   }): Promise<{ success_count: number; skip_count: number; message: string }> => {
-    const response = await api.post('/api/share/batch', data)
+    const response = await api.post('/api/v1/share/batch', data)
     return response.data
   },
 
   copyToLibrary: async (shareId: number, collectionId?: number): Promise<{ message: string; paper_id: number }> => {
     const params = collectionId ? { collection_id: collectionId } : {}
-    const response = await api.post(`/api/share/copy-to-library/${shareId}`, null, { params })
+    const response = await api.post(`/api/v1/share/copy-to-library/${shareId}`, null, { params })
     return response.data
   },
 
   getSharedDetail: async (shareId: number): Promise<any> => {
-    const response = await api.get(`/api/share/detail/${shareId}`)
+    const response = await api.get(`/api/v1/share/detail/${shareId}`)
     return response.data
   },
 
   copyCollectionPapers: async (shareId: number, paperIds?: number[], targetCollectionId?: number): Promise<{ success_count: number; skip_count: number; message: string }> => {
-    const response = await api.post(`/api/share/copy-collection-papers/${shareId}`, {
+    const response = await api.post(`/api/v1/share/copy-collection-papers/${shareId}`, {
       paper_ids: paperIds,
       target_collection_id: targetCollectionId,
     })
@@ -1671,19 +1671,19 @@ export const shareApi = {
   },
 
   removeShare: async (shareId: number): Promise<void> => {
-    await api.delete(`/api/share/${shareId}`)
+    await api.delete(`/api/v1/share/${shareId}`)
   },
 }
 
 
 export const announcementApi = {
   getAnnouncements: async (): Promise<Announcement[]> => {
-    const response = await api.get('/api/announcements')
+    const response = await api.get('/api/v1/announcements')
     return response.data
   },
 
   getMyAnnouncements: async (): Promise<Announcement[]> => {
-    const response = await api.get('/api/announcements/my')
+    const response = await api.get('/api/v1/announcements/my')
     return response.data
   },
 
@@ -1693,7 +1693,7 @@ export const announcementApi = {
     group_id?: number
     is_pinned?: boolean
   }): Promise<Announcement> => {
-    const response = await api.post('/api/announcements', data)
+    const response = await api.post('/api/v1/announcements', data)
     return response.data
   },
 
@@ -1703,16 +1703,16 @@ export const announcementApi = {
     is_pinned?: boolean
     is_active?: boolean
   }): Promise<Announcement> => {
-    const response = await api.put(`/api/announcements/${announcementId}`, data)
+    const response = await api.put(`/api/v1/announcements/${announcementId}`, data)
     return response.data
   },
 
   deleteAnnouncement: async (announcementId: number): Promise<void> => {
-    await api.delete(`/api/announcements/${announcementId}`)
+    await api.delete(`/api/v1/announcements/${announcementId}`)
   },
 
   markAsRead: async (announcementId: number): Promise<void> => {
-    await api.post(`/api/announcements/${announcementId}/read`)
+    await api.post(`/api/v1/announcements/${announcementId}/read`)
   },
 
   getReadStats: async (announcementId: number): Promise<{
@@ -1720,7 +1720,7 @@ export const announcementApi = {
     read_count: number
     readers: Array<{ user_id: number; username: string; read_at: string }>
   }> => {
-    const response = await api.get(`/api/announcements/${announcementId}/stats`)
+    const response = await api.get(`/api/v1/announcements/${announcementId}/stats`)
     return response.data
   },
 }
@@ -2027,12 +2027,12 @@ export interface MCPConfigResponse {
 
 export const mcpApi = {
   getTemplates: async (): Promise<{ templates: MCPServerTemplate[] }> => {
-    const response = await api.get('/api/mcp/templates')
+    const response = await api.get('/api/v1/mcp/templates')
     return response.data
   },
 
   getConfig: async (): Promise<MCPConfigResponse> => {
-    const response = await api.get('/api/mcp/config')
+    const response = await api.get('/api/v1/mcp/config')
     return response.data
   },
 
@@ -2046,7 +2046,7 @@ export const mcpApi = {
     servers: MCPServerConfigItem[]
     claude_desktop_config: Record<string, unknown>
   }> => {
-    const response = await api.post('/api/mcp/config/validate', payload)
+    const response = await api.post('/api/v1/mcp/config/validate', payload)
     return response.data
   },
 
@@ -2061,7 +2061,7 @@ export const mcpApi = {
     servers: MCPServerConfigItem[]
     claude_desktop_config: Record<string, unknown>
   }> => {
-    const response = await api.put('/api/mcp/config', payload)
+    const response = await api.put('/api/v1/mcp/config', payload)
     return response.data
   },
 
@@ -2070,7 +2070,7 @@ export const mcpApi = {
     tool_count: number
     servers: MCPServerStatusItem[]
   }> => {
-    const response = await api.post('/api/mcp/status/refresh', { force_refresh: forceRefresh })
+    const response = await api.post('/api/v1/mcp/status/refresh', { force_refresh: forceRefresh })
     return response.data
   },
 }
@@ -2222,12 +2222,12 @@ export interface StrategyComparison {
 
 export const chunkingApi = {
   getPresets: async (): Promise<{ presets: PresetDescription[] }> => {
-    const response = await api.get('/api/chunking/presets')
+    const response = await api.get('/api/v1/chunking/presets')
     return response.data
   },
 
   getPreset: async (presetName: ChunkingPreset): Promise<ChunkingConfigResponse> => {
-    const response = await api.get(`/api/chunking/presets/${presetName}`)
+    const response = await api.get(`/api/v1/chunking/presets/${presetName}`)
     return response.data
   },
 
@@ -2237,7 +2237,7 @@ export const chunkingApi = {
     preset?: ChunkingPreset,
     fileType = 'txt'
   ): Promise<ChunkingResult> => {
-    const response = await api.post('/api/chunking/preview', {
+    const response = await api.post('/api/v1/chunking/preview', {
       text,
       config,
       preset,
@@ -2250,7 +2250,7 @@ export const chunkingApi = {
     text: string,
     fileType = 'txt'
   ): Promise<DocumentAnalysis> => {
-    const response = await api.post('/api/chunking/analyze', {
+    const response = await api.post('/api/v1/chunking/analyze', {
       text,
       file_type: fileType,
     })
@@ -2265,7 +2265,7 @@ export const chunkingApi = {
     const params = new URLSearchParams()
     strategies.forEach(s => params.append('strategies', s))
 
-    const response = await api.post(`/api/chunking/compare?${params.toString()}`, {
+    const response = await api.post(`/api/v1/chunking/compare?${params.toString()}`, {
       text,
       file_type: fileType,
     })
@@ -2274,7 +2274,7 @@ export const chunkingApi = {
 
   getKnowledgeBaseConfig: async (kbId: number): Promise<ChunkingConfigResponse | null> => {
     try {
-      const response = await api.get(`/api/chunking/knowledge-base/${kbId}/config`)
+      const response = await api.get(`/api/v1/chunking/knowledge-base/${kbId}/config`)
       return response.data
     } catch {
       return null
@@ -2285,7 +2285,7 @@ export const chunkingApi = {
     kbId: number,
     config: Partial<ChunkingConfig> | { preset: ChunkingPreset }
   ): Promise<ChunkingConfigResponse> => {
-    const response = await api.put(`/api/chunking/knowledge-base/${kbId}/config`, config)
+    const response = await api.put(`/api/v1/chunking/knowledge-base/${kbId}/config`, config)
     return response.data
   },
 
@@ -2293,7 +2293,7 @@ export const chunkingApi = {
     kbId: number,
     preset: ChunkingPreset
   ): Promise<{ message: string; knowledge_base_id: number; preset: string }> => {
-    const response = await api.post(`/api/chunking/knowledge-base/${kbId}/apply-preset?preset=${preset}`)
+    const response = await api.post(`/api/v1/chunking/knowledge-base/${kbId}/apply-preset?preset=${preset}`)
     return response.data
   },
 }

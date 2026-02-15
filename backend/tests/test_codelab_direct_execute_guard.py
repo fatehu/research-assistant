@@ -11,6 +11,11 @@ from app.api.codelab import ExecuteRequest, execute_code_directly
 from app.config import settings
 
 
+@pytest.fixture(autouse=True)
+def _disable_runner(monkeypatch):
+    monkeypatch.setattr(settings, "codelab_runner_enabled", False)
+
+
 @pytest.mark.asyncio
 async def test_direct_execute_rejected_when_disabled(monkeypatch):
     monkeypatch.setattr(settings, "codelab_direct_execute_enabled", False)

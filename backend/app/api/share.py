@@ -1486,4 +1486,4 @@ async def copy_collection_papers_to_library(
 
 # 注：共享知识库采用直接引用方案，不需要复制
 # 用户可以在AI对话中直接选择和使用共享的知识库
-# 相关实现见 /api/knowledge/available 端点
+        # 相关实现见 /api/v1/knowledge/available 端点

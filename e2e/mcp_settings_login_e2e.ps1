@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$FrontendBaseUrl = "http://localhost:3000",
   [string]$BackendBaseUrl = "http://localhost:8888",
   [string]$SessionName = "mcp-login-e2e"
@@ -49,7 +49,7 @@ $registerPayload = @{
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "$BackendBaseUrl/api/auth/register" `
+  -Uri "$BackendBaseUrl/api/v1/auth/register" `
   -ContentType "application/json" `
   -Body $registerPayload | Out-Null
 
@@ -62,13 +62,13 @@ try {
 
   Invoke-PlaywrightCode -Code "(async (page) => { await page.goto('$FrontendBaseUrl/settings'); await page.waitForURL('**/settings', { timeout: 20000 }); await page.waitForSelector('textarea.ant-input', { timeout: 20000 }); const text = await page.locator('textarea.ant-input').first().inputValue(); JSON.parse(text); })"
 
-  Invoke-PlaywrightCode -Code "(async (page) => { await page.getByRole('button', { name: /Apply Template/i }).click(); await page.waitForTimeout(500); })"
+  Invoke-PlaywrightCode -Code "(async (page) => { await page.getByRole('button', { name: /\u5e94\u7528\u6a21\u677f|Apply Template/i }).click(); await page.waitForTimeout(500); })"
 
-  Invoke-PlaywrightCode -Code "(async (page) => { await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/mcp/config/validate') && resp.request().method() === 'POST' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), page.getByRole('button', { name: /Validate/i }).click()]); })"
+  Invoke-PlaywrightCode -Code "(async (page) => { await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/v1/mcp/config/validate') && resp.request().method() === 'POST' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), page.getByRole('button', { name: /\u6821\u9a8c|Validate/i }).click()]); })"
 
-  Invoke-PlaywrightCode -Code "(async (page) => { await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/mcp/config') && resp.request().method() === 'PUT' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), page.locator('button:has(.anticon-save)').nth(1).click()]); })"
+  Invoke-PlaywrightCode -Code "(async (page) => { const validateButton = page.getByRole('button', { name: /\u6821\u9a8c|Validate/i }); const saveButton = validateButton.locator('xpath=following::button[1]').first(); await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/v1/mcp/config') && resp.request().method() === 'PUT' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), saveButton.click()]); })"
 
-  Invoke-PlaywrightCode -Code "(async (page) => { await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/mcp/status/refresh') && resp.request().method() === 'POST' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), page.getByRole('button', { name: /Refresh Status/i }).click()]); const hasTransportText = (await page.getByText('transport:', { exact: false }).count()) > 0; const hasEmptyState = (await page.getByText('No status yet', { exact: false }).count()) > 0; if (!hasTransportText && !hasEmptyState) { throw new Error('MCP status section did not render expected content'); } })"
+  Invoke-PlaywrightCode -Code "(async (page) => { const [refreshResp] = await Promise.all([page.waitForResponse((resp) => resp.url().includes('/api/v1/mcp/status/refresh') && resp.request().method() === 'POST' && resp.status() >= 200 && resp.status() < 300, { timeout: 20000 }), page.getByRole('button', { name: /\u5237\u65b0\u72b6\u6001|Refresh Status/i }).click()]); const payload = await refreshResp.json(); if (typeof payload.server_count !== 'number') { throw new Error('refresh payload missing server_count'); } if (typeof payload.tool_count !== 'number') { throw new Error('refresh payload missing tool_count'); } if (!Array.isArray(payload.servers)) { throw new Error('refresh payload missing servers list'); } })"
 
   Invoke-PlaywrightCli -Arguments @("screenshot", "--filename", "output/playwright/mcp-settings-login-e2e.png", "--full-page")
   Invoke-PlaywrightCli -Arguments @("snapshot")

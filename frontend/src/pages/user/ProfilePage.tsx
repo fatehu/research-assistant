@@ -48,7 +48,7 @@ const ProfilePage: React.FC = () => {
   const handleSave = async (values: any) => {
     setSaving(true);
     try {
-      const response = await api.put('/api/users/profile', values);
+      const response = await api.put('/api/v1/users/profile', values);
       updateUser(response.data);
       message.success('个人资料已更新');
       setEditing(false);

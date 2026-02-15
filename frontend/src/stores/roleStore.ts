@@ -242,7 +242,7 @@ export const useRoleStore = create<RoleState>()(
       fetchUsers: async (params) => {
         set({ usersLoading: true });
         try {
-          const response = await api.get('/api/admin/users', { params });
+          const response = await api.get('/api/v1/admin/users', { params });
           set({ users: response.data, usersLoading: false });
         } catch (error) {
           console.error('获取用户列表失败:', error);
@@ -252,7 +252,7 @@ export const useRoleStore = create<RoleState>()(
 
       updateUserRole: async (userId, role) => {
         try {
-          await api.put(`/api/admin/users/${userId}/role`, { role });
+          await api.put(`/api/v1/admin/users/${userId}/role`, { role });
           const { users } = get();
           set({
             users: users.map(u => u.id === userId ? { ...u, role } : u)
@@ -265,7 +265,7 @@ export const useRoleStore = create<RoleState>()(
 
       toggleUserActive: async (userId) => {
         try {
-          const response = await api.put(`/api/admin/users/${userId}/toggle-active`);
+          const response = await api.put(`/api/v1/admin/users/${userId}/toggle-active`);
           const { users } = get();
           set({
             users: users.map(u => u.id === userId ? { ...u, is_active: response.data.is_active } : u)
@@ -278,7 +278,7 @@ export const useRoleStore = create<RoleState>()(
 
       deleteUser: async (userId) => {
         try {
-          await api.delete(`/api/admin/users/${userId}`);
+          await api.delete(`/api/v1/admin/users/${userId}`);
           const { users } = get();
           set({ users: users.filter(u => u.id !== userId) });
         } catch (error) {
@@ -290,7 +290,7 @@ export const useRoleStore = create<RoleState>()(
       fetchStatistics: async () => {
         set({ statisticsLoading: true });
         try {
-          const response = await api.get('/api/admin/statistics');
+          const response = await api.get('/api/v1/admin/statistics');
           set({ statistics: response.data, statisticsLoading: false });
         } catch (error) {
           console.error('获取统计数据失败:', error);
@@ -302,7 +302,7 @@ export const useRoleStore = create<RoleState>()(
       fetchStudents: async () => {
         set({ studentsLoading: true });
         try {
-          const response = await api.get('/api/mentor/students');
+          const response = await api.get('/api/v1/mentor/students');
           set({ students: response.data, studentsLoading: false });
         } catch (error) {
           console.error('获取学生列表失败:', error);
@@ -312,7 +312,7 @@ export const useRoleStore = create<RoleState>()(
 
       inviteStudent: async (email, message) => {
         try {
-          await api.post('/api/mentor/students/invite', { email, message });
+          await api.post('/api/v1/mentor/students/invite', { email, message });
         } catch (error) {
           console.error('邀请学生失败:', error);
           throw error;
@@ -321,7 +321,7 @@ export const useRoleStore = create<RoleState>()(
 
       removeStudent: async (studentId) => {
         try {
-          await api.delete(`/api/mentor/students/${studentId}`);
+          await api.delete(`/api/v1/mentor/students/${studentId}`);
           const { students } = get();
           set({ students: students.filter(s => s.id !== studentId) });
         } catch (error) {
@@ -333,7 +333,7 @@ export const useRoleStore = create<RoleState>()(
       fetchGroups: async () => {
         set({ groupsLoading: true });
         try {
-          const response = await api.get('/api/mentor/groups');
+          const response = await api.get('/api/v1/mentor/groups');
           set({ groups: response.data, groupsLoading: false });
         } catch (error) {
           console.error('获取研究组失败:', error);
@@ -343,7 +343,7 @@ export const useRoleStore = create<RoleState>()(
 
       createGroup: async (name, description, maxMembers) => {
         try {
-          const response = await api.post('/api/mentor/groups', { name, description, max_members: maxMembers });
+          const response = await api.post('/api/v1/mentor/groups', { name, description, max_members: maxMembers });
           const { groups } = get();
           set({ groups: [...groups, response.data] });
         } catch (error) {
@@ -354,7 +354,7 @@ export const useRoleStore = create<RoleState>()(
 
       updateGroup: async (groupId, data) => {
         try {
-          const response = await api.put(`/api/mentor/groups/${groupId}`, data);
+          const response = await api.put(`/api/v1/mentor/groups/${groupId}`, data);
           const { groups } = get();
           set({ groups: groups.map(g => g.id === groupId ? response.data : g) });
         } catch (error) {
@@ -365,7 +365,7 @@ export const useRoleStore = create<RoleState>()(
 
       deleteGroup: async (groupId) => {
         try {
-          await api.delete(`/api/mentor/groups/${groupId}`);
+          await api.delete(`/api/v1/mentor/groups/${groupId}`);
           const { groups } = get();
           set({ groups: groups.filter(g => g.id !== groupId) });
         } catch (error) {
@@ -376,7 +376,7 @@ export const useRoleStore = create<RoleState>()(
 
       addGroupMember: async (groupId, userId) => {
         try {
-          await api.post(`/api/mentor/groups/${groupId}/members`, { user_id: userId });
+          await api.post(`/api/v1/mentor/groups/${groupId}/members`, { user_id: userId });
           get().fetchGroups();
         } catch (error) {
           console.error('添加组成员失败:', error);
@@ -386,7 +386,7 @@ export const useRoleStore = create<RoleState>()(
 
       removeGroupMember: async (groupId, userId) => {
         try {
-          await api.delete(`/api/mentor/groups/${groupId}/members/${userId}`);
+          await api.delete(`/api/v1/mentor/groups/${groupId}/members/${userId}`);
           get().fetchGroups();
         } catch (error) {
           console.error('移除组成员失败:', error);
@@ -398,7 +398,7 @@ export const useRoleStore = create<RoleState>()(
       fetchMentor: async () => {
         set({ mentorLoading: true });
         try {
-          const response = await api.get('/api/student/mentor');
+          const response = await api.get('/api/v1/student/mentor');
           set({ mentor: response.data, mentorLoading: false });
         } catch (error: any) {
           if (error.response?.status === 404) {
@@ -412,7 +412,7 @@ export const useRoleStore = create<RoleState>()(
 
       applyToMentor: async (mentorId, message) => {
         try {
-          await api.post('/api/student/mentor/apply', { mentor_id: mentorId, message });
+          await api.post('/api/v1/student/mentor/apply', { mentor_id: mentorId, message });
         } catch (error) {
           console.error('申请导师失败:', error);
           throw error;
@@ -421,7 +421,7 @@ export const useRoleStore = create<RoleState>()(
 
       leaveMentor: async () => {
         try {
-          await api.delete('/api/student/mentor/leave');
+          await api.delete('/api/v1/student/mentor/leave');
           set({ mentor: null });
         } catch (error) {
           console.error('离开导师失败:', error);
@@ -431,7 +431,7 @@ export const useRoleStore = create<RoleState>()(
 
       searchMentors: async (query) => {
         try {
-          const response = await api.get('/api/student/mentors/search', { params: { query } });
+          const response = await api.get('/api/v1/student/mentors/search', { params: { query } });
           return response.data;
         } catch (error) {
           console.error('搜索导师失败:', error);
@@ -443,7 +443,7 @@ export const useRoleStore = create<RoleState>()(
       fetchInvitations: async () => {
         set({ invitationsLoading: true });
         try {
-          const response = await api.get('/api/invitations');
+          const response = await api.get('/api/v1/invitations');
           set({ invitations: response.data, invitationsLoading: false });
         } catch (error) {
           console.error('获取邀请列表失败:', error);
@@ -453,7 +453,7 @@ export const useRoleStore = create<RoleState>()(
 
       acceptInvitation: async (invitationId) => {
         try {
-          await api.post(`/api/invitations/${invitationId}/accept`);
+          await api.post(`/api/v1/invitations/${invitationId}/accept`);
           const { invitations } = get();
           set({
             invitations: invitations.map(i => 
@@ -468,7 +468,7 @@ export const useRoleStore = create<RoleState>()(
 
       rejectInvitation: async (invitationId) => {
         try {
-          await api.post(`/api/invitations/${invitationId}/reject`);
+          await api.post(`/api/v1/invitations/${invitationId}/reject`);
           const { invitations } = get();
           set({
             invitations: invitations.map(i => 
@@ -483,7 +483,7 @@ export const useRoleStore = create<RoleState>()(
 
       cancelInvitation: async (invitationId) => {
         try {
-          await api.delete(`/api/invitations/${invitationId}`);
+          await api.delete(`/api/v1/invitations/${invitationId}`);
           const { invitations } = get();
           set({ invitations: invitations.filter(i => i.id !== invitationId) });
         } catch (error) {
@@ -496,7 +496,7 @@ export const useRoleStore = create<RoleState>()(
       fetchAnnouncements: async () => {
         set({ announcementsLoading: true });
         try {
-          const response = await api.get('/api/announcements');
+          const response = await api.get('/api/v1/announcements');
           set({ announcements: response.data, announcementsLoading: false });
         } catch (error) {
           console.error('获取公告失败:', error);
@@ -506,7 +506,7 @@ export const useRoleStore = create<RoleState>()(
 
       createAnnouncement: async (title, content, groupId, isPinned) => {
         try {
-          const response = await api.post('/api/announcements', { 
+          const response = await api.post('/api/v1/announcements', { 
             title, content, group_id: groupId, is_pinned: isPinned 
           });
           const { announcements } = get();
@@ -519,7 +519,7 @@ export const useRoleStore = create<RoleState>()(
 
       updateAnnouncement: async (announcementId, data) => {
         try {
-          const response = await api.put(`/api/announcements/${announcementId}`, data);
+          const response = await api.put(`/api/v1/announcements/${announcementId}`, data);
           const { announcements } = get();
           set({
             announcements: announcements.map(a => a.id === announcementId ? response.data : a)
@@ -532,7 +532,7 @@ export const useRoleStore = create<RoleState>()(
 
       deleteAnnouncement: async (announcementId) => {
         try {
-          await api.delete(`/api/announcements/${announcementId}`);
+          await api.delete(`/api/v1/announcements/${announcementId}`);
           const { announcements } = get();
           set({ announcements: announcements.filter(a => a.id !== announcementId) });
         } catch (error) {
@@ -543,7 +543,7 @@ export const useRoleStore = create<RoleState>()(
 
       markAnnouncementRead: async (announcementId) => {
         try {
-          await api.post(`/api/announcements/${announcementId}/read`);
+          await api.post(`/api/v1/announcements/${announcementId}/read`);
           const { announcements } = get();
           set({
             announcements: announcements.map(a => 
@@ -559,7 +559,7 @@ export const useRoleStore = create<RoleState>()(
       fetchSharedResources: async () => {
         set({ sharedResourcesLoading: true });
         try {
-          const response = await api.get('/api/share');
+          const response = await api.get('/api/v1/share');
           set({ sharedResources: response.data, sharedResourcesLoading: false });
         } catch (error) {
           console.error('获取共享资源失败:', error);
@@ -569,7 +569,7 @@ export const useRoleStore = create<RoleState>()(
 
       shareResource: async (resourceType, resourceId, sharedWithType, sharedWithId, permission) => {
         try {
-          const response = await api.post('/api/share', {
+          const response = await api.post('/api/v1/share', {
             resource_type: resourceType,
             resource_id: resourceId,
             shared_with_type: sharedWithType,
@@ -586,7 +586,7 @@ export const useRoleStore = create<RoleState>()(
 
       updateSharePermission: async (shareId, permission) => {
         try {
-          const response = await api.put(`/api/share/${shareId}`, { permission });
+          const response = await api.put(`/api/v1/share/${shareId}`, { permission });
           const { sharedResources } = get();
           set({
             sharedResources: sharedResources.map(s => s.id === shareId ? response.data : s)
@@ -599,7 +599,7 @@ export const useRoleStore = create<RoleState>()(
 
       removeShare: async (shareId) => {
         try {
-          await api.delete(`/api/share/${shareId}`);
+          await api.delete(`/api/v1/share/${shareId}`);
           const { sharedResources } = get();
           set({ sharedResources: sharedResources.filter(s => s.id !== shareId) });
         } catch (error) {

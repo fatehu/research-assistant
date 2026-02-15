@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$apiBase = "$BackendBaseUrl/api"
+$apiBase = "$BackendBaseUrl/api/v1"
 
 function New-TestUser {
   $timestamp = Get-Date -Format "yyyyMMddHHmmss"
