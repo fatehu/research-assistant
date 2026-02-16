@@ -8,7 +8,7 @@
  * 4. cells - notebook 的所有 cells
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Button, Input, Tooltip, Spin, message, Popconfirm, Tag, Switch } from 'antd'
 import {
   RobotOutlined, SendOutlined, CloseOutlined, DeleteOutlined, CopyOutlined,
@@ -105,11 +105,19 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const inputRef = useRef<any>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
 
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior })
   }, [])
 
-  useEffect(() => { scrollToBottom() }, [messages, streamingContent, scrollToBottom])
+  useEffect(() => {
+    scrollToBottom('smooth')
+  }, [messages, scrollToBottom])
+
+  useEffect(() => {
+    if (!streamingContent && streamingReActSteps.length === 0) return
+    // 流式阶段避免每个 token 执行 smooth 动画，减少卡顿。
+    scrollToBottom('auto')
+  }, [streamingContent, streamingReActSteps.length, scrollToBottom])
 
   const loadHistory = useCallback(async () => {
     if (!notebookId) return
@@ -264,9 +272,16 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
     }
   }
 
-  const copyCode = (code: string) => { navigator.clipboard.writeText(code); message.success('代码已复制') }
-  const insertCode = (code: string) => { if (onInsertCode) onInsertCode(code) }
-  const runCode = (code: string) => { if (onRunCode) onRunCode(code) }
+  const copyCode = useCallback((code: string) => {
+    navigator.clipboard.writeText(code)
+    message.success('代码已复制')
+  }, [])
+  const insertCode = useCallback((code: string) => {
+    if (onInsertCode) onInsertCode(code)
+  }, [onInsertCode])
+  const runCode = useCallback((code: string) => {
+    if (onRunCode) onRunCode(code)
+  }, [onRunCode])
   const handleQuickAction = (action: typeof quickActions[0]) => { sendMessage(action.prompt) }
 
   const getContextInfo = () => {
@@ -279,7 +294,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
   const contextInfo = getContextInfo()
 
-  const renderMessageContent = (msg: AgentMessage) => {
+  const renderMessageContent = useCallback((msg: AgentMessage) => {
     const isUser = msg.role === 'user'
     const ragMetrics = !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
     const reactSteps =
@@ -350,13 +365,13 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
         </div>
       </div>
     )
-  }
+  }, [copyCode, insertCode, onInsertCode, onRunCode, runCode])
 
   const renderStreamingContent = () => {
     if (!streamingContent && streamingReActSteps.length === 0) return null
     return (
       <div className="space-y-3">
-        {streamingReActSteps.length > 0 ? <HistoryReActPanel steps={streamingReActSteps} /> : null}
+        {streamingReActSteps.length > 0 ? <HistoryReActPanel steps={streamingReActSteps} defaultExpanded /> : null}
         <div className="flex gap-3">
           <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
             <RobotOutlined className="text-white text-sm" />
@@ -373,6 +388,11 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
       </div>
     )
   }
+
+  const renderedMessages = useMemo(
+    () => messages.map((msg) => <div key={msg.id}>{renderMessageContent(msg)}</div>),
+    [messages, renderMessageContent],
+  )
 
   if (!isVisible) return null
 
@@ -475,7 +495,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             </div>
           ) : (
             <>
-              {messages.map(msg => <div key={msg.id}>{renderMessageContent(msg)}</div>)}
+              {renderedMessages}
               {renderStreamingContent()}
             </>
           )}

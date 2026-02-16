@@ -23,11 +23,12 @@ interface HistoryStep {
 
 interface HistoryReActPanelProps {
   steps: HistoryStep[]
+  defaultExpanded?: boolean
 }
 
 /** 历史消息的 ReAct 推理过程面板 */
-const HistoryReActPanel = ({ steps }: HistoryReActPanelProps) => {
-  const [expanded, setExpanded] = useState(false)
+const HistoryReActPanel = ({ steps, defaultExpanded = false }: HistoryReActPanelProps) => {
+  const [expanded, setExpanded] = useState(defaultExpanded)
 
   if (!steps || steps.length === 0) return null
 
