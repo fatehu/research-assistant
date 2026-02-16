@@ -2229,7 +2229,31 @@ class ToolRegistry:
 
         if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
             return "literature_task"
-        if any(token in text for token in ["代码", "notebook", "python", "cell", "运行", "debug", "报错"]):
+        if any(
+            token in text
+            for token in [
+                "代码",
+                "notebook",
+                "python",
+                "cell",
+                "运行",
+                "debug",
+                "报错",
+                "画图",
+                "绘图",
+                "可视化",
+                "plot",
+                "matplotlib",
+                "seaborn",
+                "pandas",
+                "numpy",
+                "余弦",
+                "正弦",
+                "散点图",
+                "折线图",
+                "柱状图",
+            ]
+        ):
             return "code_task"
 
         knowledge_tokens = [
@@ -2311,6 +2335,19 @@ class ToolRegistry:
         resolved_intent = intent if intent in self._INTENT_TOOL_MAP else self.classify_intent(user_text)
         selected = set(self._INTENT_TOOL_MAP.get(resolved_intent, set()))
         selected.update(self._fallback_tools())
+
+        # Notebook 场景下默认保留代码工具，避免普通表述被误判为 general_chat 后无法操作 notebook。
+        if self.notebook_id and self.kernel_manager:
+            selected.update(
+                {
+                    "notebook_execute",
+                    "notebook_variables",
+                    "notebook_cell",
+                    "notebook_cleanup",
+                    "pip_install",
+                    "code_analysis",
+                }
+            )
 
         for tool in self._iter_all_tools():
             if tool.name.startswith("mcp.") and self._mcp_tool_matches_intent(tool, resolved_intent):

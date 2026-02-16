@@ -1424,6 +1424,7 @@ export interface AgentMessage {
   timestamp: string
   metadata: {
     rag_metrics?: RagMetrics
+    react_steps?: ReactStep[]
     [key: string]: any
   }
 }
@@ -1454,6 +1455,7 @@ export interface AgentChatEvent {
   type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'answer' | 'start' | 'authorization_required'
   content?: string
   code_blocks?: AgentCodeBlock[]
+  react_steps?: ReactStep[]
   suggested_action?: string
   suggested_code?: string
   rag_metrics?: RagMetrics
@@ -1462,6 +1464,7 @@ export interface AgentChatEvent {
   input?: Record<string, any>
   success?: boolean
   output?: string
+  iteration?: number
   action?: string // action requiring approval
   provider?: string
   model?: string

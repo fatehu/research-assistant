@@ -1576,6 +1576,8 @@ async def notebook_agent_chat(
             full_content = ""
             code_blocks = []
             rag_metrics = None
+            react_steps: List[Dict[str, Any]] = []
+            current_iteration = 1
             
             # 调用 Agent - 注意: messages 构建已包含 system context
             messages = [
@@ -1599,7 +1601,14 @@ async def notebook_agent_chat(
                 
                 if event_type == "thought":
                     # data 是思考内容字符串
-                    yield f"data: {json.dumps({'type': 'thought', 'content': event_data})}\n\n"
+                    react_steps.append(
+                        {
+                            "type": "thought",
+                            "iteration": current_iteration,
+                            "content": event_data if isinstance(event_data, str) else str(event_data),
+                        }
+                    )
+                    yield f"data: {json.dumps({'type': 'thought', 'content': event_data, 'iteration': current_iteration})}\n\n"
                 
                 elif event_type == "thinking":
                     # 流式思考内容
@@ -1609,7 +1618,20 @@ async def notebook_agent_chat(
                     # data 是字典 {"tool": "...", "input": {...}}
                     tool_name = event_data.get("tool", "") if isinstance(event_data, dict) else ""
                     tool_input = event_data.get("input", {}) if isinstance(event_data, dict) else {}
-                    yield f"data: {json.dumps({'type': 'action', 'tool': tool_name, 'input': tool_input})}\n\n"
+                    iteration = event_data.get("iteration", current_iteration) if isinstance(event_data, dict) else current_iteration
+                    try:
+                        current_iteration = max(current_iteration, int(iteration))
+                    except Exception:
+                        iteration = current_iteration
+                    react_steps.append(
+                        {
+                            "type": "action",
+                            "iteration": int(iteration),
+                            "tool": tool_name,
+                            "input": tool_input if isinstance(tool_input, dict) else {},
+                        }
+                    )
+                    yield f"data: {json.dumps({'type': 'action', 'tool': tool_name, 'input': tool_input, 'iteration': int(iteration)})}\n\n"
                 
                 elif event_type == "observation":
                     # data 是字典 {"tool": "...", "success": ..., "output": ..., "data": ...}
@@ -1617,6 +1639,11 @@ async def notebook_agent_chat(
                     output_raw = event_data.get("output", "") if isinstance(event_data, dict) else event_data
                     output = output_raw if isinstance(output_raw, str) else str(output_raw)
                     tool_data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
+                    iteration = event_data.get("iteration", current_iteration) if isinstance(event_data, dict) else current_iteration
+                    try:
+                        current_iteration = max(current_iteration, int(iteration))
+                    except Exception:
+                        iteration = current_iteration
                     
                     # 检查是否有 notebook 更新
                     notebook_updated = tool_data.get("notebook_updated", False) if isinstance(tool_data, dict) else False
@@ -1692,7 +1719,17 @@ async def notebook_agent_chat(
                         except Exception as e:
                             logger.warning(f"同步到数据库失败: {e}")
                     
-                    yield f"data: {json.dumps({'type': 'observation', 'success': success, 'output': output, 'notebook_updated': notebook_updated, 'cell_id': cell_id, 'new_cell': new_cell, 'updated_cell': updated_cell})}\n\n"
+                    react_steps.append(
+                        {
+                            "type": "observation",
+                            "iteration": int(iteration),
+                            "tool": event_data.get("tool", "") if isinstance(event_data, dict) else "",
+                            "output": output,
+                            "success": success,
+                        }
+                    )
+
+                    yield f"data: {json.dumps({'type': 'observation', 'success': success, 'output': output, 'notebook_updated': notebook_updated, 'cell_id': cell_id, 'new_cell': new_cell, 'updated_cell': updated_cell, 'iteration': int(iteration)})}\n\n"
                 
                 elif event_type == "authorization_required":
                     yield f"data: {json.dumps({'type': 'authorization_required', 'action': event_data.get('action', '') if isinstance(event_data, dict) else ''})}\n\n"
@@ -1737,7 +1774,10 @@ async def notebook_agent_chat(
                 content=full_content,
                 code_blocks=[AgentCodeBlock(**cb) for cb in code_blocks],
                 timestamp=datetime.now().isoformat(),
-                metadata={"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {}
+                metadata={
+                    **({"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {}),
+                    **({"react_steps": react_steps} if react_steps else {}),
+                },
             )
             await save_agent_message(notebook_id, current_user.id, assistant_message)
             
@@ -1745,6 +1785,8 @@ async def notebook_agent_chat(
             done_payload = {"type": "done", "code_blocks": code_blocks}
             if isinstance(rag_metrics, dict):
                 done_payload["rag_metrics"] = rag_metrics
+            if react_steps:
+                done_payload["react_steps"] = react_steps
             yield f"data: {json.dumps(done_payload)}\n\n"
             
         except Exception as e:
