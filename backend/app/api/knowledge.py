@@ -2,6 +2,7 @@
 知识库 API 路由 - 支持共享知识库访问（可选）
 """
 import os
+import json
 import re
 import shutil
 import time
@@ -9,6 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any, List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_, tuple_
 from loguru import logger
@@ -68,6 +70,11 @@ from app.services.smart_chunking_service import (
     ChunkLevel,
     get_preset_config,
 )
+from app.services.status_event_bus import (
+    build_status_channel_for_user,
+    iter_status_events,
+    publish_status_event,
+)
 
 # 共享功能导入（可选，如果模块不存在则禁用共享功能）
 try:
@@ -82,6 +89,33 @@ router = APIRouter()
 # 文件上传目录
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _sse_payload(event: str, data: Any) -> str:
+    return f"data: {json.dumps({'event': event, 'data': data}, ensure_ascii=False)}\n\n"
+
+
+async def _publish_document_status_event(
+    *,
+    user_id: int,
+    kb_id: int,
+    doc: Document,
+) -> None:
+    payload = {
+        "event": "document_status",
+        "data": {
+            "kb_id": int(kb_id),
+            "document_id": int(doc.id),
+            "status": str(doc.status),
+            "chunk_count": int(doc.chunk_count or 0),
+            "error_message": (doc.error_message or None),
+            "updated_at": (doc.updated_at or datetime.utcnow()).isoformat(),
+        },
+    }
+    try:
+        await publish_status_event(build_status_channel_for_user(int(user_id)), payload)
+    except Exception as exc:  # pragma: no cover - push failures should not break main path
+        logger.warning(f"[Knowledge API] 发布文档状态事件失败 doc={doc.id}: {exc}")
 
 
 # ========== 可用嵌入模型注册表 ==========
@@ -538,6 +572,62 @@ async def list_documents(
     )
 
 
+@router.get("/events/stream")
+async def stream_knowledge_status_events(
+    request: Request,
+    kb_id: Optional[int] = Query(default=None, ge=1, description="可选：仅订阅指定知识库"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """知识库状态事件流（SSE）。"""
+    if kb_id is not None:
+        kb = await db.get(KnowledgeBase, int(kb_id))
+        if not kb or kb.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+
+    channel = build_status_channel_for_user(int(current_user.id))
+
+    async def event_generator():
+        yield _sse_payload(
+            "connected",
+            {
+                "scope": "knowledge",
+                "user_id": int(current_user.id),
+                "kb_id": int(kb_id) if kb_id is not None else None,
+                "ts": datetime.utcnow().isoformat(),
+            },
+        )
+        async for item in iter_status_events(channel):
+            if await request.is_disconnected():
+                break
+
+            event = str(item.get("event") or "").strip()
+            data = item.get("data")
+
+            if event == "heartbeat":
+                yield _sse_payload("heartbeat", data)
+                continue
+
+            if event != "document_status" or not isinstance(data, dict):
+                continue
+
+            event_kb_id = int(data.get("kb_id") or 0)
+            if kb_id is not None and event_kb_id != int(kb_id):
+                continue
+
+            yield _sse_payload("document_status", data)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/knowledge-bases/{kb_id}/documents/upload", response_model=DocumentUploadResponse)
 async def upload_document(
     kb_id: int,
@@ -591,6 +681,11 @@ async def upload_document(
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
+    await _publish_document_status_event(
+        user_id=int(current_user.id),
+        kb_id=int(kb_id),
+        doc=doc,
+    )
     
     # 后台处理文档
     background_tasks.add_task(
@@ -634,10 +729,25 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             if not doc:
                 logger.warning(f"[doc:{task_trace_id}] 文档不存在: 文档={doc_id}")
                 return
+
+            owner_user_id: Optional[int] = None
+            owner_kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
+            if owner_kb:
+                owner_user_id = int(owner_kb.user_id)
+
+            async def _emit_status() -> None:
+                if owner_user_id is None:
+                    return
+                await _publish_document_status_event(
+                    user_id=owner_user_id,
+                    kb_id=int(doc.knowledge_base_id),
+                    doc=doc,
+                )
             
             # 更新状态为处理中
             doc.status = DocumentStatus.PROCESSING.value
             await db.commit()
+            await _emit_status()
             
             # 创建处理器
             processor = get_document_processor(chunk_size, chunk_overlap)
@@ -663,6 +773,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "文档内容为空"
                 await db.commit()
+                await _emit_status()
                 return
             
             doc.content = text
@@ -681,6 +792,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "知识库不存在"
                 await db.commit()
+                await _emit_status()
                 return
 
             # 分片
@@ -773,6 +885,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "文档分片失败：无有效分块"
                 await db.commit()
+                await _emit_status()
                 return
                 
             # 按位置排序
@@ -977,6 +1090,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 )
 
             await db.commit()
+            await _emit_status()
             logger.info(
                 f"[doc:{task_trace_id}] 数据落库完成: chunks_saved={len(chunks_to_save)}, "
                 f"context_chunks={len(context_chunks)}, elapsed={_task_elapsed_ms():.2f}ms"
@@ -1013,6 +1127,13 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = str(e)[:2000]
                     await db.commit()
+                    kb_for_owner = await db.get(KnowledgeBase, doc.knowledge_base_id)
+                    if kb_for_owner:
+                        await _publish_document_status_event(
+                            user_id=int(kb_for_owner.user_id),
+                            kb_id=int(doc.knowledge_base_id),
+                            doc=doc,
+                        )
             except Exception as persist_exc:
                 logger.error(f"[doc:{task_trace_id}] 文档失败状态写回异常 {doc_id}: {persist_exc}")
 
@@ -1127,6 +1248,11 @@ async def get_document_status(
         doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
         await db.commit()
         await db.refresh(doc)
+        await _publish_document_status_event(
+            user_id=int(current_user.id),
+            kb_id=int(kb_id),
+            doc=doc,
+        )
         logger.warning(
             "文档状态因处理超时自动失败: "
             f"doc_id={doc.id}, kb_id={kb_id}, last_updated_at={last_updated_at}, "
