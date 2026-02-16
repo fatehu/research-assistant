@@ -79,6 +79,7 @@ class AgentContext:
     context_truncated: bool = False
     context_summary: str = ""
     memory_contexts: List[MemoryContext] = field(default_factory=list)
+    memory_enabled: bool = False
 
 
 @dataclass
@@ -450,10 +451,25 @@ class AgentCore:
             except Exception as exc:
                 logger.warning(f"[AgentCore] create_run failed: {exc}")
 
-        if bool(getattr(settings, "agent_longterm_memory_enabled", False)):
+        try:
+            memory_control = await self.runtime_service.get_user_memory_control(
+                user_id=self.runtime_context.user_id,
+                channel=self.runtime_context.channel,
+            )
+            context.memory_enabled = bool(memory_control.get("effective_enabled", False))
+        except Exception as exc:
+            context.memory_enabled = False
+            logger.warning(f"[AgentCore] load memory control failed: {exc}")
+
+        if context.memory_enabled:
             try:
                 if self.runtime_context.conversation_id is not None:
                     scope_type, scope_id = "conversation", str(self.runtime_context.conversation_id)
+                    latest_summary = await self.runtime_service.get_latest_conversation_summary(
+                        int(self.runtime_context.conversation_id)
+                    )
+                    if latest_summary:
+                        context.context_summary = latest_summary
                 elif self.runtime_context.notebook_id is not None:
                     scope_type, scope_id = "notebook", str(self.runtime_context.notebook_id)
                 else:
@@ -464,7 +480,7 @@ class AgentCore:
                     scope_type=scope_type,
                     scope_id=scope_id,
                     query=user_text,
-                    top_k=3,
+                    top_k=max(int(getattr(settings, "agent_memory_top_k", 3)), 1),
                 )
             except Exception as exc:
                 logger.warning(f"[AgentCore] memory recall failed: {exc}")
@@ -853,13 +869,14 @@ class AgentCore:
                     "selected_tools": self._last_tool_selection.get("selected_tools") or [],
                     "prompt_desc_tokens": self._last_tool_selection.get("prompt_desc_tokens", 0),
                     "context_truncated": context.context_truncated,
+                    "memory_enabled": context.memory_enabled,
                 },
             )
         except Exception as exc:
             logger.warning(f"[AgentCore] persist failed: {exc}")
 
     async def _persist_memory(self, context: AgentContext) -> None:
-        if not bool(getattr(settings, "agent_longterm_memory_enabled", False)):
+        if not context.memory_enabled:
             return
         if not self.runtime_context.user_id or not context.final_answer:
             return

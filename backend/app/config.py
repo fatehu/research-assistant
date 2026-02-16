@@ -151,6 +151,12 @@ class Settings(BaseSettings):
     agent_context_summary_trigger_tokens: int = 7000
     agent_persist_steps_enabled: bool = True
     agent_longterm_memory_enabled: bool = False
+    agent_memory_top_k: int = 3
+    agent_memory_retention_days: int = 180
+    agent_memory_max_items_per_user_channel: int = 2000
+    agent_memory_scan_limit: int = 200
+    agent_memory_scope_match_boost: float = 0.18
+    agent_memory_default_channels: str = "chat,codelab_agent,notebook_agent,literature_agent"
 
     # MCP (Phase 1)
     mcp_enabled: bool = False
