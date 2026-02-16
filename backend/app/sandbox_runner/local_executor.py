@@ -203,6 +203,19 @@ def _capture_plot(ns, outputs):
     try:
         import matplotlib
         matplotlib.use("Agg")
+        try:
+            matplotlib.rcParams["font.sans-serif"] = [
+                "WenQuanYi Zen Hei",
+                "Noto Sans CJK JP",
+                "Noto Serif CJK JP",
+                "SimHei",
+                "Microsoft YaHei",
+                "Arial Unicode MS",
+                "DejaVu Sans",
+            ]
+            matplotlib.rcParams["axes.unicode_minus"] = False
+        except Exception:
+            pass
         import matplotlib.pyplot as plt
         if plt.get_fignums():
             buf = io.BytesIO()
@@ -229,6 +242,7 @@ import re
 import collections
 import itertools
 import functools
+import warnings
 try:
     import numpy as np
 except Exception:
@@ -240,6 +254,17 @@ except Exception:
 try:
     import matplotlib
     matplotlib.use('Agg')
+    matplotlib.rcParams['font.sans-serif'] = [
+        'WenQuanYi Zen Hei',
+        'Noto Sans CJK JP',
+        'Noto Serif CJK JP',
+        'SimHei',
+        'Microsoft YaHei',
+        'Arial Unicode MS',
+        'DejaVu Sans',
+    ]
+    matplotlib.rcParams['axes.unicode_minus'] = False
+    warnings.filterwarnings('ignore', message='Glyph .* missing from current font.')
     import matplotlib.pyplot as plt
 except Exception:
     pass
