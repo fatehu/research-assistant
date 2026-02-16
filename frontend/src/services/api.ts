@@ -267,6 +267,65 @@ export const isApiTimeoutError = (error: unknown): boolean => {
   return code === 'ECONNABORTED' || status === 504 || msg.includes('timeout')
 }
 
+type SseEventHandler<TEvent extends string = string> = (event: TEvent, data: any) => void
+
+async function streamJsonSse<TEvent extends string = string>(
+  url: string,
+  onEvent?: SseEventHandler<TEvent>,
+  abortController?: AbortController,
+): Promise<void> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${getToken()}`,
+    },
+    signal: abortController?.signal,
+  })
+
+  if (!response.ok) {
+    let detail = `订阅失败 (${response.status})`
+    try {
+      const err = await response.json()
+      detail = err?.detail?.message || err?.detail || detail
+    } catch {
+      // ignore json parse error for non-json body
+    }
+    throw new Error(detail)
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    throw new Error('无法读取状态流')
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      const normalized = line.trim()
+      if (!normalized.startsWith('data:')) continue
+      const raw = normalized.slice(5).trim()
+      if (!raw) continue
+      try {
+        const parsed = JSON.parse(raw) as { event?: string; data?: any }
+        const event = String(parsed?.event || '')
+        if (!event) continue
+        onEvent?.(event as TEvent, parsed?.data)
+      } catch {
+        // ignore malformed chunk
+      }
+    }
+  }
+}
+
 export interface ProcessingStatus {
   document_id: number
   status: string
@@ -274,6 +333,25 @@ export interface ProcessingStatus {
   message: string
   chunk_count: number
   error?: string
+}
+
+export interface KnowledgeDocumentStatusEventData {
+  kb_id: number
+  document_id: number
+  status: Document['status']
+  chunk_count: number
+  error_message?: string
+  updated_at?: string
+}
+
+export interface PaperKnowledgeLinkStatusEventData {
+  link_id: number
+  paper_id: number
+  knowledge_base_id: number
+  document_id?: number
+  status: PaperKnowledgeLink['status']
+  error_message?: string
+  updated_at?: string
 }
 
 export const authApi = {
@@ -541,6 +619,19 @@ export const knowledgeApi = {
     return response.data
   },
 
+  streamStatusEvents: async (
+    params: { kb_id?: number } | undefined,
+    onEvent?: (event: 'connected' | 'heartbeat' | 'document_status', data: any) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const query = new URLSearchParams()
+    if (params?.kb_id && params.kb_id > 0) {
+      query.set('kb_id', String(params.kb_id))
+    }
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    await streamJsonSse(`${API_BASE_URL}/api/v1/knowledge/events/stream${suffix}`, onEvent, abortController)
+  },
+
   getChunks: async (kbId: number, docId: number, skip = 0, limit = 20): Promise<{ items: DocumentChunk[]; total: number }> => {
     const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/chunks`, {
       params: { skip, limit },
@@ -792,16 +883,40 @@ export interface PaperKnowledgeLink {
   updated_at: string
 }
 
+export interface CollectionKnowledgeReadinessItem {
+  paper_id: number
+  title: string
+  status: 'ready' | 'processing' | 'pending' | 'failed' | 'missing'
+  document_id?: number
+  error_message?: string
+  pdf_available: boolean
+}
+
+export interface CollectionKnowledgeReadiness {
+  collection_id: number
+  knowledge_base_id: number
+  total_papers: number
+  ready_papers: number
+  processing_papers: number
+  pending_papers: number
+  failed_papers: number
+  missing_papers: number
+  can_cross_paper_answer: boolean
+  papers: CollectionKnowledgeReadinessItem[]
+}
+
 export interface LiteratureAskRequest {
   scope: LiteratureAskScope
   paper_id?: number
   collection_id?: number
   knowledge_base_id: number
+  mode?: 'agentic' | 'classic'
   question: string
   session_id?: number
 }
 
 export interface LiteratureAskSource {
+  idx?: number
   document_id: number
   document_name: string
   page?: number
@@ -809,7 +924,8 @@ export interface LiteratureAskSource {
   section_title?: string
   section_type?: string
   snippet: string
-  score: number
+  score?: number | null
+  score_source?: 'fts' | 'fallback' | 'paper_read'
   chunk_id?: number
 }
 
@@ -1074,6 +1190,29 @@ export const literatureApi = {
   getKnowledgeLinks: async (paperId: number): Promise<PaperKnowledgeLink[]> => {
     const response = await api.get(`/api/v1/literature/papers/${paperId}/knowledge-links`)
     return response.data
+  },
+
+  getCollectionKnowledgeReadiness: async (
+    collectionId: number,
+    knowledgeBaseId: number,
+  ): Promise<CollectionKnowledgeReadiness> => {
+    const response = await api.get(`/api/v1/literature/collections/${collectionId}/knowledge-readiness`, {
+      params: { knowledge_base_id: knowledgeBaseId },
+    })
+    return response.data
+  },
+
+  streamStatusEvents: async (
+    params: { paper_id?: number } | undefined,
+    onEvent?: (event: 'connected' | 'heartbeat' | 'paper_link_status', data: any) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const query = new URLSearchParams()
+    if (params?.paper_id && params.paper_id > 0) {
+      query.set('paper_id', String(params.paper_id))
+    }
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    await streamJsonSse(`${API_BASE_URL}/api/v1/literature/events/stream${suffix}`, onEvent, abortController)
   },
 
   getAskSessions: async (params?: {

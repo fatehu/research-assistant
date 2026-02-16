@@ -50,6 +50,14 @@ interface KnowledgeState {
   selectDocument: (kbId: number, docId: number) => Promise<void>
   deleteDocument: (kbId: number, docId: number) => Promise<void>
   refreshDocumentStatus: (kbId: number, docId: number) => Promise<ProcessingStatus | undefined>
+  applyDocumentStatusPatch: (
+    docId: number,
+    patch: {
+      status?: Document['status']
+      chunk_count?: number
+      error_message?: string
+    },
+  ) => void
 
   fetchChunks: (kbId: number, docId: number) => Promise<void>
 
@@ -199,17 +207,38 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
   refreshDocumentStatus: async (kbId: number, docId: number) => {
     try {
       const status = await knowledgeApi.getDocumentStatus(kbId, docId)
-      set((state) => ({
-        documents: state.documents.map((d) =>
-          d.id === docId
-            ? { ...d, status: status.status as Document['status'], chunk_count: status.chunk_count }
-            : d
-        ),
-      }))
+      get().applyDocumentStatusPatch(docId, {
+        status: status.status as Document['status'],
+        chunk_count: status.chunk_count,
+        error_message: status.error,
+      })
       return status
     } catch (error) {
       handleApiError(error, '获取文档状态')
     }
+  },
+
+  applyDocumentStatusPatch: (docId, patch) => {
+    set((state) => ({
+      documents: state.documents.map((d) =>
+        d.id === docId
+          ? {
+            ...d,
+            status: patch.status ?? d.status,
+            chunk_count: patch.chunk_count ?? d.chunk_count,
+            error_message: patch.error_message ?? d.error_message,
+          }
+          : d,
+      ),
+      currentDocument: state.currentDocument?.id === docId
+        ? {
+          ...state.currentDocument,
+          status: patch.status ?? state.currentDocument.status,
+          chunk_count: patch.chunk_count ?? state.currentDocument.chunk_count,
+          error_message: patch.error_message ?? state.currentDocument.error_message,
+        }
+        : state.currentDocument,
+    }))
   },
 
   // ========== 分片操作 ==========

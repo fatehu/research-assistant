@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 
 from app.config import settings
 from app.core.database import async_session_factory
@@ -20,6 +20,7 @@ from app.models.agent import (
     AgentStepRecord,
     ConversationSummary,
 )
+from app.models.user import User
 from app.services.embedding_service import get_embedding_service
 from app.services.smart_chunking.token_utils import estimate_tokens
 
@@ -33,6 +34,72 @@ class MemoryContext:
 
 class AgentRuntimeService:
     """Service for persisting and loading agent runtime artifacts."""
+
+    @staticmethod
+    def _memory_default_channels() -> List[str]:
+        raw = str(getattr(settings, "agent_memory_default_channels", "") or "").strip()
+        if not raw:
+            return ["chat", "codelab_agent", "notebook_agent", "literature_agent"]
+        channels: List[str] = []
+        for item in raw.split(","):
+            value = str(item).strip()
+            if value and value not in channels:
+                channels.append(value)
+        return channels or ["chat", "codelab_agent", "notebook_agent", "literature_agent"]
+
+    async def get_user_memory_control(self, *, user_id: int, channel: Optional[str] = None) -> Dict[str, Any]:
+        user_preferences: Dict[str, Any] = {}
+        async with async_session_factory() as db:
+            row = await db.get(User, int(user_id))
+            if row and isinstance(row.preferences, dict):
+                user_preferences = dict(row.preferences)
+
+        memory_cfg = user_preferences.get("agent_memory") if isinstance(user_preferences, dict) else {}
+        if not isinstance(memory_cfg, dict):
+            memory_cfg = {}
+
+        enabled_channels = memory_cfg.get("enabled_channels")
+        if isinstance(enabled_channels, list):
+            normalized_channels: List[str] = []
+            for item in enabled_channels:
+                value = str(item or "").strip()
+                if value and value not in normalized_channels:
+                    normalized_channels.append(value)
+            enabled_channels = normalized_channels
+        else:
+            enabled_channels = self._memory_default_channels()
+
+        system_enabled = bool(getattr(settings, "agent_longterm_memory_enabled", False))
+        user_enabled = bool(memory_cfg.get("enabled", False))
+        channel_enabled = True if not channel else str(channel).strip() in enabled_channels
+        effective_enabled = bool(system_enabled and user_enabled and channel_enabled)
+        return {
+            "system_enabled": system_enabled,
+            "user_enabled": user_enabled,
+            "effective_enabled": effective_enabled,
+            "enabled_channels": enabled_channels,
+            "updated_at": memory_cfg.get("updated_at"),
+        }
+
+    async def clear_memories(
+        self,
+        *,
+        user_id: int,
+        channel: Optional[str] = None,
+        scope_type: Optional[str] = None,
+        scope_id: Optional[str] = None,
+    ) -> int:
+        async with async_session_factory() as db:
+            stmt = delete(AgentMemoryItem).where(AgentMemoryItem.user_id == int(user_id))
+            if channel:
+                stmt = stmt.where(AgentMemoryItem.channel == str(channel))
+            if scope_type:
+                stmt = stmt.where(AgentMemoryItem.scope_type == str(scope_type))
+            if scope_id is not None:
+                stmt = stmt.where(AgentMemoryItem.scope_id == str(scope_id))
+            result = await db.execute(stmt)
+            await db.commit()
+            return int(getattr(result, "rowcount", 0) or 0)
 
     async def create_run(
         self,
@@ -194,7 +261,8 @@ class AgentRuntimeService:
         importance: float = 0.5,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if not bool(getattr(settings, "agent_longterm_memory_enabled", False)):
+        memory_control = await self.get_user_memory_control(user_id=user_id, channel=channel)
+        if not bool(memory_control.get("effective_enabled", False)):
             return
         text = (content or "").strip()
         if not text:
@@ -206,7 +274,18 @@ class AgentRuntimeService:
         except Exception as exc:  # pragma: no cover - degraded path
             logger.warning(f"[AgentMemory] embed failed, store raw text only: {exc}")
 
+        retention_days = max(int(getattr(settings, "agent_memory_retention_days", 180)), 1)
+        retention_cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        cap_per_user_channel = max(int(getattr(settings, "agent_memory_max_items_per_user_channel", 2000)), 100)
+
         async with async_session_factory() as db:
+            await db.execute(
+                delete(AgentMemoryItem).where(
+                    AgentMemoryItem.user_id == int(user_id),
+                    AgentMemoryItem.channel == str(channel),
+                    AgentMemoryItem.created_at < retention_cutoff,
+                )
+            )
             db.add(
                 AgentMemoryItem(
                     id=str(uuid.uuid4()),
@@ -222,17 +301,32 @@ class AgentRuntimeService:
             )
             await db.commit()
 
+            result = await db.execute(
+                select(AgentMemoryItem.id)
+                .where(
+                    AgentMemoryItem.user_id == int(user_id),
+                    AgentMemoryItem.channel == str(channel),
+                )
+                .order_by(desc(AgentMemoryItem.created_at))
+                .offset(cap_per_user_channel)
+            )
+            stale_ids = [str(row[0]) for row in result.all() if row and row[0]]
+            if stale_ids:
+                await db.execute(delete(AgentMemoryItem).where(AgentMemoryItem.id.in_(stale_ids)))
+                await db.commit()
+
     async def recall(
         self,
         *,
         user_id: int,
         channel: str,
-        scope_type: str,
-        scope_id: str,
+        scope_type: Optional[str],
+        scope_id: Optional[str],
         query: str,
         top_k: int = 3,
     ) -> List[MemoryContext]:
-        if not bool(getattr(settings, "agent_longterm_memory_enabled", False)):
+        memory_control = await self.get_user_memory_control(user_id=user_id, channel=channel)
+        if not bool(memory_control.get("effective_enabled", False)):
             return []
 
         text = (query or "").strip()
@@ -246,17 +340,22 @@ class AgentRuntimeService:
         except Exception as exc:  # pragma: no cover - degraded path
             logger.warning(f"[AgentMemory] query embed failed, fallback to recency: {exc}")
 
+        retention_days = max(int(getattr(settings, "agent_memory_retention_days", 180)), 1)
+        retention_cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        scan_limit = max(int(getattr(settings, "agent_memory_scan_limit", 200)), 20)
+        scope_boost = float(getattr(settings, "agent_memory_scope_match_boost", 0.18))
+        user_scope_boost = min(max(scope_boost * 0.4, 0.02), 0.08)
+
         async with async_session_factory() as db:
             result = await db.execute(
                 select(AgentMemoryItem)
                 .where(
                     AgentMemoryItem.user_id == user_id,
                     AgentMemoryItem.channel == channel,
-                    AgentMemoryItem.scope_type == scope_type,
-                    AgentMemoryItem.scope_id == str(scope_id),
+                    AgentMemoryItem.created_at >= retention_cutoff,
                 )
                 .order_by(desc(AgentMemoryItem.created_at))
-                .limit(50)
+                .limit(scan_limit)
             )
             rows = list(result.scalars().all())
 
@@ -264,6 +363,7 @@ class AgentRuntimeService:
                 return []
 
             scored: List[tuple[AgentMemoryItem, float]] = []
+            now = datetime.utcnow()
             for row in rows:
                 score = 0.0
                 if query_embedding and isinstance(row.embedding, list):
@@ -273,13 +373,20 @@ class AgentRuntimeService:
                         score = 0.0
                 if score <= 0:
                     score = 0.1
+                if scope_type and scope_id and row.scope_type == str(scope_type) and row.scope_id == str(scope_id):
+                    score += scope_boost
+                elif row.scope_type == "user":
+                    score += user_scope_boost
+                if row.created_at:
+                    age_seconds = max((now - row.created_at).total_seconds(), 0.0)
+                    recency_ratio = max(0.0, 1.0 - min(age_seconds / (86400.0 * 30.0), 1.0))
+                    score += recency_ratio * 0.06
                 score += float(row.importance or 0.0) * 0.05
                 scored.append((row, score))
 
             scored.sort(key=lambda item: item[1], reverse=True)
-            selected = scored[: max(1, top_k)]
+            selected = scored[: max(1, int(top_k or 1))]
 
-            now = datetime.utcnow()
             contexts: List[MemoryContext] = []
             for row, score in selected:
                 row.last_accessed_at = now

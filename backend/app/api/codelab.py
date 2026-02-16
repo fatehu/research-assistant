@@ -22,7 +22,7 @@ import traceback
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -38,6 +38,7 @@ from app.services.notebook_agent_history_service import (
     clear_history as clear_history_in_db,
     load_history,
 )
+from app.services.agent_runtime_service import get_agent_runtime_service
 from app.services.codelab_executor import CodeLabExecutor, RunnerUnavailableError
 from app.config import settings
 
@@ -1194,6 +1195,71 @@ class AgentMessage(BaseModel):
     metadata: Dict[str, Any] = {}
 
 
+class AgentMemorySettingsResponse(BaseModel):
+    system_enabled: bool
+    user_enabled: bool
+    effective_enabled: bool
+    enabled_channels: List[str]
+    retention_days: int
+    max_items_per_user_channel: int
+    top_k: int
+    updated_at: Optional[str] = None
+
+
+class AgentMemorySettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    enabled_channels: Optional[List[str]] = None
+
+
+_AGENT_MEMORY_PREF_KEY = "agent_memory"
+_AGENT_MEMORY_ALLOWED_CHANNELS = {"chat", "codelab_agent", "notebook_agent", "literature_agent"}
+
+
+def _default_memory_channels() -> List[str]:
+    raw = str(getattr(settings, "agent_memory_default_channels", "") or "").strip()
+    values: List[str] = []
+    for item in raw.split(","):
+        channel = str(item or "").strip()
+        if channel and channel not in values and channel in _AGENT_MEMORY_ALLOWED_CHANNELS:
+            values.append(channel)
+    if values:
+        return values
+    return ["chat", "codelab_agent", "notebook_agent", "literature_agent"]
+
+
+def _normalize_memory_channels(channels: Optional[List[str]]) -> List[str]:
+    if not isinstance(channels, list) or not channels:
+        return _default_memory_channels()
+    normalized: List[str] = []
+    for item in channels:
+        channel = str(item or "").strip()
+        if channel and channel not in normalized and channel in _AGENT_MEMORY_ALLOWED_CHANNELS:
+            normalized.append(channel)
+    return normalized or _default_memory_channels()
+
+
+def _build_memory_settings_response(user: User) -> AgentMemorySettingsResponse:
+    preferences = user.preferences if isinstance(user.preferences, dict) else {}
+    raw = preferences.get(_AGENT_MEMORY_PREF_KEY) if isinstance(preferences, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    user_enabled = bool(raw.get("enabled", False))
+    enabled_channels = _normalize_memory_channels(raw.get("enabled_channels"))
+    system_enabled = bool(getattr(settings, "agent_longterm_memory_enabled", False))
+    current_channel_allowed = "codelab_agent" in enabled_channels
+    return AgentMemorySettingsResponse(
+        system_enabled=system_enabled,
+        user_enabled=user_enabled,
+        effective_enabled=bool(system_enabled and user_enabled and current_channel_allowed),
+        enabled_channels=enabled_channels,
+        retention_days=max(int(getattr(settings, "agent_memory_retention_days", 180)), 1),
+        max_items_per_user_channel=max(int(getattr(settings, "agent_memory_max_items_per_user_channel", 2000)), 100),
+        top_k=max(int(getattr(settings, "agent_memory_top_k", 3)), 1),
+        updated_at=raw.get("updated_at"),
+    )
+
+
 async def get_agent_history(notebook_id: str, user_id: int) -> Dict[str, Any]:
     """获取 Agent 对话历史"""
     key = f"{user_id}:{notebook_id}"
@@ -1227,6 +1293,78 @@ async def clear_agent_history_state(notebook_id: str, user_id: int) -> None:
         user_id=user_id,
         channel=AGENT_HISTORY_CHANNEL,
     )
+
+
+@router.get("/agent/memory/settings", response_model=AgentMemorySettingsResponse)
+async def get_agent_memory_settings(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取 Agent 长期记忆设置（系统开关 + 用户开关双门控）。"""
+    db_user = await db.get(User, int(current_user.id))
+    if not db_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return _build_memory_settings_response(db_user)
+
+
+@router.put("/agent/memory/settings", response_model=AgentMemorySettingsResponse)
+async def update_agent_memory_settings(
+    payload: AgentMemorySettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """更新当前用户的 Agent 长期记忆设置。"""
+    if payload.enabled is None and payload.enabled_channels is None:
+        raise HTTPException(status_code=400, detail="至少提供一个可更新字段")
+
+    db_user = await db.get(User, int(current_user.id))
+    if not db_user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    preferences = dict(db_user.preferences) if isinstance(db_user.preferences, dict) else {}
+    memory_cfg = preferences.get(_AGENT_MEMORY_PREF_KEY)
+    if not isinstance(memory_cfg, dict):
+        memory_cfg = {}
+
+    if payload.enabled is not None:
+        memory_cfg["enabled"] = bool(payload.enabled)
+    if payload.enabled_channels is not None:
+        memory_cfg["enabled_channels"] = _normalize_memory_channels(payload.enabled_channels)
+    elif "enabled_channels" not in memory_cfg:
+        memory_cfg["enabled_channels"] = _default_memory_channels()
+    memory_cfg["updated_at"] = datetime.utcnow().isoformat()
+
+    preferences[_AGENT_MEMORY_PREF_KEY] = memory_cfg
+    db_user.preferences = preferences
+    await db.commit()
+    await db.refresh(db_user)
+    return _build_memory_settings_response(db_user)
+
+
+@router.delete("/agent/memory")
+async def clear_agent_memory(
+    channel: Optional[str] = Query(default=None, description="可选：仅清理指定 channel"),
+    scope_type: Optional[str] = Query(default=None, description="可选：仅清理指定 scope_type"),
+    scope_id: Optional[str] = Query(default=None, description="可选：仅清理指定 scope_id"),
+    current_user: User = Depends(get_current_user),
+):
+    """清理当前用户的 Agent 长期记忆条目。"""
+    if channel is not None and str(channel).strip() not in _AGENT_MEMORY_ALLOWED_CHANNELS:
+        raise HTTPException(status_code=400, detail="非法 channel")
+
+    runtime_service = get_agent_runtime_service()
+    deleted_count = await runtime_service.clear_memories(
+        user_id=int(current_user.id),
+        channel=str(channel).strip() if channel else None,
+        scope_type=str(scope_type).strip() if scope_type else None,
+        scope_id=str(scope_id).strip() if scope_id else None,
+    )
+    return {
+        "deleted": int(deleted_count),
+        "channel": str(channel).strip() if channel else None,
+        "scope_type": str(scope_type).strip() if scope_type else None,
+        "scope_id": str(scope_id).strip() if scope_id else None,
+    }
 
 
 @router.get("/notebooks/{notebook_id}/agent/context")

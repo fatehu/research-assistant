@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -38,7 +38,7 @@ import {
   CloseOutlined,
 } from '@ant-design/icons'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
-import type { SearchResult } from '@/services/api'
+import type { KnowledgeDocumentStatusEventData, SearchResult } from '@/services/api'
 import { isApiCanceledError, isApiTimeoutError, knowledgeApi } from '@/services/api'
 import dayjs from 'dayjs'
 import { KnowledgeBaseCard, SharedKnowledgeBaseCard, SearchResultCard } from './components'
@@ -106,6 +106,7 @@ const KnowledgePage = () => {
     uploadDocument,
     deleteDocument,
     refreshDocumentStatus,
+    applyDocumentStatusPatch,
     search,
     clearSearch,
     clearCurrentKnowledgeBase,
@@ -135,6 +136,7 @@ const KnowledgePage = () => {
   const [searchFallbackUsed, setSearchFallbackUsed] = useState(false)
   const [searchFallbackReason, setSearchFallbackReason] = useState('')
   const [searchLogs, setSearchLogs] = useState<SearchLogEntry[]>([])
+  const knowledgeStreamWarnedRef = useRef(false)
 
   const buildSearchLogEntry = useCallback((level: SearchLogLevel, message: string): SearchLogEntry => {
     return {
@@ -180,7 +182,41 @@ const KnowledgePage = () => {
     }
   }, [clearCurrentKnowledgeBase, kbId, selectKnowledgeBase])
 
-  // 轮询处理中的文档状态
+  // 状态流：优先订阅事件，降低高频轮询开销
+  useEffect(() => {
+    if (!currentKnowledgeBase) return
+    const streamController = new AbortController()
+    knowledgeApi
+      .streamStatusEvents(
+        { kb_id: currentKnowledgeBase.id },
+        (event, payload) => {
+          if (event !== 'document_status') return
+          const data = payload as KnowledgeDocumentStatusEventData
+          const docId = Number(data?.document_id || 0)
+          if (!Number.isFinite(docId) || docId <= 0) return
+          applyDocumentStatusPatch(docId, {
+            status: data.status,
+            chunk_count: Number(data.chunk_count || 0),
+            error_message: data.error_message,
+          })
+        },
+        streamController,
+      )
+      .catch((error) => {
+        if (streamController.signal.aborted) return
+        if (!knowledgeStreamWarnedRef.current) {
+          knowledgeStreamWarnedRef.current = true
+          console.warn('[KnowledgePage] 状态流订阅失败，降级低频轮询', error)
+          message.warning('实时状态流连接失败，已降级为低频轮询')
+        }
+      })
+
+    return () => {
+      streamController.abort()
+    }
+  }, [applyDocumentStatusPatch, currentKnowledgeBase])
+
+  // 低频回退轮询：仅在存在处理中/待处理文档时触发
   useEffect(() => {
     if (!currentKnowledgeBase) return
     const processingDocs = documents.filter(
@@ -192,7 +228,7 @@ const KnowledgePage = () => {
       processingDocs.forEach((doc) => {
         refreshDocumentStatus(currentKnowledgeBase.id, doc.id)
       })
-    }, 3000)
+    }, 30000)
 
     return () => clearInterval(interval)
   }, [documents, currentKnowledgeBase, refreshDocumentStatus])

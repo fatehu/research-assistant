@@ -44,7 +44,7 @@ services:
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     container_name: research_backend
-    # Default enable GPU for local NVIDIA environments; set DOCKER_BACKEND_GPUS="" to disable.
+    # Default enable GPU for local NVIDIA environments; CI disables via .github/docker-compose.ci.yml.
     gpus: ${DOCKER_BACKEND_GPUS:-all}
     environment:
       - APP_ENV=${APP_ENV:-development}

@@ -12,7 +12,7 @@ from app.core.database import create_tables
 from app.core.error_handlers import register_error_handlers
 from app.core.rate_limit import build_rate_limit_dependency
 from app.api import (
-    auth, users, chat, health, knowledge, literature, codelab, agent, notebook_agent,
+    auth, users, chat, health, knowledge, literature, codelab,
     admin, mentor, student, invitations, share, announcements, mcp
 )
 
@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  LLM_TEMPERATURE: {settings.llm_temperature}")
     logger.info(f"  LLM_MAX_TOKENS: {settings.llm_max_tokens}")
     logger.info(f"  REACT_MAX_ITERATIONS: {settings.react_max_iterations}")
+    logger.info(f"  LITERATURE_AGENT_MAX_ITERATIONS: {settings.literature_agent_max_iterations}")
     logger.info(f"  REACT_OUTPUT_MAX_LENGTH: {settings.react_output_max_length}")
     logger.info(f"  MCP_ENABLED: {settings.mcp_enabled}")
     logger.info(f"  MCP_TOOL_PREFIX: {settings.mcp_tool_prefix}")
@@ -130,8 +131,6 @@ app.include_router(chat.router, prefix="/api/v1/chat", tags=["对话"], dependen
 app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["知识库"], dependencies=[Depends(knowledge_rate_limit)])
 app.include_router(literature.router, prefix="/api/v1", tags=["文献管理"])
 app.include_router(codelab.router, prefix="/api/v1/codelab", tags=["代码实验室"], dependencies=[Depends(codelab_rate_limit)])
-app.include_router(agent.router, prefix="/api/v1/codelab", tags=["Notebook Agent"], dependencies=[Depends(codelab_rate_limit)])
-app.include_router(notebook_agent.router, prefix="/api/v1/codelab", tags=["Notebook ReAct Agent"], dependencies=[Depends(codelab_rate_limit)])
 app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["MCP 管理"])
 
 # === 注册多角色系统路由 ===
