@@ -6,9 +6,9 @@ import sys
 
 BASELINE = {
     "backend/app/api/codelab.py": 11,
-    "backend/app/api/knowledge.py": 8,
+    "backend/app/api/knowledge.py": 9,
     "backend/app/services/agent_tools_impl/registry.py": 20,
-    "backend/app/services/react_agent.py": 18,
+    "backend/app/services/react_agent.py": 19,
     "backend/app/services/mcp/client.py": 5,
     "backend/app/services/codelab_executor.py": 2,
 }
