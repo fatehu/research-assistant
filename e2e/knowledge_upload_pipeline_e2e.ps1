@@ -26,6 +26,20 @@ function Invoke-JsonPost {
   return Invoke-RestMethod -Method Post -Uri $Uri -Headers $Headers -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 10)
 }
 
+function Get-CurlCommand {
+  $curlExe = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+  if ($null -ne $curlExe) {
+    return $curlExe.Source
+  }
+
+  $curlCmd = Get-Command "curl" -ErrorAction SilentlyContinue
+  if ($null -ne $curlCmd) {
+    return $curlCmd.Source
+  }
+
+  throw "curl command is not available in PATH"
+}
+
 function Invoke-FileUpload {
   param(
     [Parameter(Mandatory = $true)] [string]$Uri,
@@ -33,7 +47,8 @@ function Invoke-FileUpload {
     [Parameter(Mandatory = $true)] [string]$FilePath
   )
   $authHeader = "Authorization: Bearer $Token"
-  $uploadRaw = & curl.exe -sS -X POST $Uri -H $authHeader -F "file=@$FilePath;type=text/plain"
+  $curlCommand = Get-CurlCommand
+  $uploadRaw = & $curlCommand -sS -X POST $Uri -H $authHeader -F "file=@$FilePath;type=text/plain"
   if ($LASTEXITCODE -ne 0) {
     throw "curl upload failed"
   }

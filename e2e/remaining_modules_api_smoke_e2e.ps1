@@ -153,6 +153,20 @@ function Set-DbRole {
   Assert-True -Condition ($verify -match "^$Role$") -Message "Role update failed for $Email, expected $Role, got $verify"
 }
 
+function Get-CurlCommand {
+  $curlExe = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+  if ($null -ne $curlExe) {
+    return $curlExe.Source
+  }
+
+  $curlCmd = Get-Command "curl" -ErrorAction SilentlyContinue
+  if ($null -ne $curlCmd) {
+    return $curlCmd.Source
+  }
+
+  throw "curl command is not available in PATH"
+}
+
 function Invoke-CurlMultipartUpload {
   param(
     [Parameter(Mandatory = $true)]
@@ -167,7 +181,8 @@ function Invoke-CurlMultipartUpload {
   $tmpOut = New-TemporaryFile
   try {
     $authHeader = "Authorization: Bearer $Token"
-    $statusText = & curl.exe -sS -o $tmpOut -w "%{http_code}" -X POST $Uri -H $authHeader -F "file=@$FilePath;type=$MimeType"
+    $curlCommand = Get-CurlCommand
+    $statusText = & $curlCommand -sS -o $tmpOut -w "%{http_code}" -X POST $Uri -H $authHeader -F "file=@$FilePath;type=$MimeType"
     if ($LASTEXITCODE -ne 0) {
       throw "curl upload failed with exit code $LASTEXITCODE"
     }

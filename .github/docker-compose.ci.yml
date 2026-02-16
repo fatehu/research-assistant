@@ -1,3 +1,4 @@
 services:
   backend:
-    gpus: []
+    # CI runner usually has no NVIDIA runtime; remove GPU requirement from base compose.
+    gpus: !reset []
