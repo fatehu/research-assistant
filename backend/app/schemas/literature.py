@@ -154,6 +154,28 @@ class CollectionWithPapers(CollectionResponse):
     papers: List[PaperResponse] = []
 
 
+class CollectionKnowledgeReadinessItem(BaseModel):
+    paper_id: int
+    title: str
+    status: Literal["ready", "processing", "pending", "failed", "missing"]
+    document_id: Optional[int] = None
+    error_message: Optional[str] = None
+    pdf_available: bool = False
+
+
+class CollectionKnowledgeReadinessResponse(BaseModel):
+    collection_id: int
+    knowledge_base_id: int
+    total_papers: int
+    ready_papers: int
+    processing_papers: int
+    pending_papers: int
+    failed_papers: int
+    missing_papers: int
+    can_cross_paper_answer: bool
+    papers: List[CollectionKnowledgeReadinessItem] = Field(default_factory=list)
+
+
 # ============ Action Schemas ============
 
 class AddToCollectionRequest(BaseModel):
@@ -333,11 +355,13 @@ class LiteratureAskRequest(BaseModel):
     paper_id: Optional[int] = None
     collection_id: Optional[int] = None
     knowledge_base_id: int
+    mode: Literal["agentic", "classic"] = "agentic"
     question: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[int] = None
 
 
 class LiteratureAskSource(BaseModel):
+    idx: Optional[int] = None
     chunk_id: Optional[int] = None
     document_id: int
     document_name: str
@@ -346,7 +370,8 @@ class LiteratureAskSource(BaseModel):
     section_title: Optional[str] = None
     section_type: Optional[str] = None
     snippet: str
-    score: float
+    score: Optional[float] = None
+    score_source: Optional[Literal["fts", "fallback", "paper_read"]] = None
 
 
 class LiteratureAskSession(BaseModel):
