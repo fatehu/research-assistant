@@ -43,6 +43,7 @@ services:
       dockerfile: Dockerfile
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_backend
     # Default enable GPU for local NVIDIA environments; CI disables via .github/docker-compose.ci.yml.
     gpus: ${DOCKER_BACKEND_GPUS:-all}
@@ -151,6 +152,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_codelab_runner
     environment:
       - APP_ENV=${APP_ENV:-development}
@@ -174,6 +178,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_mcp_web
     environment:
       - SERPER_API_KEY=${SERPER_API_KEY}
@@ -193,6 +200,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_mcp_literature
     environment:
       - MCP_LITERATURE_HOST=${MCP_LITERATURE_HOST:-0.0.0.0}
