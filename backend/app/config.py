@@ -138,6 +138,7 @@ class Settings(BaseSettings):
 
     # ReAct
     react_max_iterations: int = 10
+    literature_agent_max_iterations: int = 8
     react_temperature: float = 0.7
     react_output_max_length: int = 500
     agent_function_calling_enabled: bool = True

@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start stack
-        run: docker compose up -d --build backend frontend postgres redis codelab-runner
+        run: docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml up -d --build backend frontend postgres redis codelab-runner
 
       - name: Wait backend ready
         run: |
@@ -41,7 +41,7 @@ jobs:
             sleep 3
           done
           echo "Backend not ready" >&2
-          docker compose logs --tail 200 backend
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml logs --tail 200 backend
           exit 1
 
       - name: Run API smoke scripts
@@ -53,6 +53,11 @@ jobs:
 
       - name: Broad exception guard
         run: python backend/checks/check_no_new_broad_excepts.py
+
+      - name: Prepare artifact folders
+        if: always()
+        run: |
+          mkdir -p output/e2e output/playwright
 
       - name: Upload logs
         if: always()
@@ -66,6 +71,6 @@ jobs:
       - name: Stack logs
         if: always()
         run: |
-          docker compose ps
-          docker compose logs --tail 120 backend
-          docker compose logs --tail 120 frontend
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml ps
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml logs --tail 120 backend
+          docker compose -f docker-compose.yml -f .github/docker-compose.ci.yml logs --tail 120 frontend
