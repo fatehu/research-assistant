@@ -83,3 +83,31 @@ VITE_WS_BASE_URL=ws://localhost:8888
         check_contract_alignment.extract_env_example_value(env_text, "VITE_WS_BASE_URL")
         == "ws://localhost:8888"
     )
+
+
+def test_extract_enum_members_from_class():
+    model_text = """
+import enum
+
+class DocumentStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+"""
+    members = check_contract_alignment.extract_enum_members_from_class(model_text, "DocumentStatus")
+    assert members == {"pending", "processing", "completed", "failed"}
+
+
+def test_extract_case_targets():
+    migration_text = """
+UPDATE documents
+SET status = CASE
+    WHEN lower(status) = 'running' THEN 'processing'
+    WHEN lower(status) IN ('ready', 'success', 'done') THEN 'completed'
+    ELSE 'failed'
+END
+WHERE status IS NOT NULL;
+"""
+    targets = check_contract_alignment.extract_case_targets(migration_text, "documents")
+    assert targets == {"processing", "completed", "failed"}
