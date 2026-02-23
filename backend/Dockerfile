@@ -2,6 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Runtime locale / encoding defaults for predictable UTF-8 behavior.
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUTF8=1 \
+    PYTHONIOENCODING=UTF-8 \
+    PYTHONUNBUFFERED=1
+
 # 安装系统依赖
 RUN apt-get update && apt-get install -y \
     gcc \
