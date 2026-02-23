@@ -13,6 +13,9 @@ export interface ApiErrorContract {
 }
 
 export type ApiErrorDetail = string | ApiErrorContract
+export interface ApiErrorResponsePayload extends ApiErrorContract {
+  detail?: ApiErrorDetail
+}
 
 export type TaskStatus =
   | 'pending'
@@ -55,6 +58,22 @@ export const extractApiErrorMessage = (detail: ApiErrorDetail | undefined, fallb
   return fallback
 }
 
+const extractApiErrorDetail = (payload: ApiErrorResponsePayload | undefined): ApiErrorDetail | undefined => {
+  if (!payload) return undefined
+  if (typeof payload.detail !== 'undefined') {
+    return payload.detail
+  }
+  if (typeof payload.message === 'string' || typeof payload.code === 'string') {
+    return {
+      code: payload.code,
+      message: payload.message,
+      details: payload.details,
+      request_id: payload.request_id,
+    }
+  }
+  return undefined
+}
+
 export const normalizeTaskStatus = (
   status: string | undefined | null,
 ): TaskStatus => {
@@ -71,12 +90,12 @@ export const normalizeTaskStatus = (
 // Response interceptor - normalize errors
 api.interceptors.response.use(
   (response) => response,
-  (error: AxiosError<{ detail?: ApiErrorDetail }>) => {
+  (error: AxiosError<ApiErrorResponsePayload>) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('auth-storage')
       window.location.href = '/login'
     }
-    const detail = error.response?.data?.detail
+    const detail = extractApiErrorDetail(error.response?.data)
     const message = extractApiErrorMessage(detail, error.message || '请求失败')
     if (message) {
       error.message = message
