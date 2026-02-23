@@ -791,7 +791,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 )
             
             # 更新状态为处理中
-            doc.status = DocumentStatus.PROCESSING.value
+            doc.status = DocumentStatus.RUNNING.value
             await db.commit()
             await _emit_status()
             
@@ -1287,7 +1287,7 @@ async def get_document_status(
     ):
         previous_error = (doc.error_message or "").strip()
         timeout_error = build_timeout_error_message(stale_timeout_seconds)
-        doc.status = DocumentStatus.FAILED.value
+        doc.status = DocumentStatus.TIMEOUT.value
         doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
         await db.commit()
         await db.refresh(doc)
@@ -1305,12 +1305,18 @@ async def get_document_status(
     if doc.status == DocumentStatus.PENDING.value:
         progress = 0
         message = "等待处理"
-    elif doc.status == DocumentStatus.PROCESSING.value:
+    elif doc.status == DocumentStatus.RUNNING.value:
         progress = 50
         message = "正在处理..."
     elif doc.status == DocumentStatus.COMPLETED.value:
         progress = 100
         message = "处理完成"
+    elif doc.status == DocumentStatus.TIMEOUT.value:
+        progress = 0
+        message = "处理超时"
+    elif doc.status == DocumentStatus.CANCELLED.value:
+        progress = 0
+        message = "处理已取消"
     elif doc.status == DocumentStatus.FAILED.value:
         progress = 0
         message = "处理失败"

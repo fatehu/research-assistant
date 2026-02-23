@@ -171,14 +171,14 @@ async def test_list_literature_ask_messages_raises_404_for_unknown_session():
 def test_derive_link_status_from_document_completed():
     doc = SimpleNamespace(id=123, status=DocumentStatus.COMPLETED.value, error_message=None)
     status, error_message, doc_id = literature_api._derive_link_status_from_document(doc)
-    assert status == KnowledgeLinkStatus.READY.value
+    assert status == KnowledgeLinkStatus.COMPLETED.value
     assert error_message is None
     assert doc_id == 123
 
 
 def test_derive_link_status_from_document_processing_clears_error():
-    doc = SimpleNamespace(id=9, status=DocumentStatus.PROCESSING.value, error_message="old error")
+    doc = SimpleNamespace(id=9, status=DocumentStatus.RUNNING.value, error_message="old error")
     status, error_message, doc_id = literature_api._derive_link_status_from_document(doc)
-    assert status == KnowledgeLinkStatus.PROCESSING.value
+    assert status == KnowledgeLinkStatus.RUNNING.value
     assert error_message is None
     assert doc_id == 9

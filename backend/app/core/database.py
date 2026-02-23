@@ -36,13 +36,14 @@ def get_async_database_url(url: str) -> str:
 
 # 创建异步引擎
 async_database_url = get_async_database_url(settings.database_url)
-engine = create_async_engine(
-    async_database_url,
-    echo=settings.sqlalchemy_echo,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-)
+engine_kwargs = {
+    "echo": settings.sqlalchemy_echo,
+    "pool_pre_ping": True,
+}
+if async_database_url.startswith("postgresql+"):
+    engine_kwargs["pool_size"] = 5
+    engine_kwargs["max_overflow"] = 10
+engine = create_async_engine(async_database_url, **engine_kwargs)
 
 # 创建异步会话工厂
 AsyncSessionLocal = async_sessionmaker(
@@ -58,13 +59,13 @@ async_session_factory = AsyncSessionLocal
 
 
 async def get_db() -> AsyncSession:
-    """获取数据库会话"""
+    """获取数据库会话（显式事务模式：业务层自行 commit）"""
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
-            await session.rollback()
+            if session.in_transaction():
+                await session.rollback()
             raise
         finally:
             await session.close()

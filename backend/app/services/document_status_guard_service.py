@@ -21,10 +21,15 @@ def is_stale_processing_status(
     timeout_seconds: int,
     now: datetime | None = None,
 ) -> bool:
-    """Return True when pending/processing has exceeded timeout."""
+    """Return True when pending/running has exceeded timeout."""
     if timeout_seconds <= 0:
         return False
-    if status not in {DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value}:
+    normalized = str(status or "").strip().lower()
+    if normalized not in {
+        DocumentStatus.PENDING.value,
+        DocumentStatus.RUNNING.value,
+        "processing",  # 兼容历史数据
+    }:
         return False
     if last_updated_at is None:
         return False

@@ -91,23 +91,26 @@ import enum
 
 class DocumentStatus(str, enum.Enum):
     PENDING = "pending"
-    PROCESSING = "processing"
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
 """
     members = check_contract_alignment.extract_enum_members_from_class(model_text, "DocumentStatus")
-    assert members == {"pending", "processing", "completed", "failed"}
+    assert members == {"pending", "running", "completed", "failed", "timeout", "cancelled"}
 
 
 def test_extract_case_targets():
     migration_text = """
 UPDATE documents
 SET status = CASE
-    WHEN lower(status) = 'running' THEN 'processing'
+    WHEN lower(status) = 'processing' THEN 'running'
     WHEN lower(status) IN ('ready', 'success', 'done') THEN 'completed'
+    WHEN lower(status) = 'timeout' THEN 'timeout'
     ELSE 'failed'
 END
 WHERE status IS NOT NULL;
 """
     targets = check_contract_alignment.extract_case_targets(migration_text, "documents")
-    assert targets == {"processing", "completed", "failed"}
+    assert targets == {"running", "completed", "timeout", "failed"}

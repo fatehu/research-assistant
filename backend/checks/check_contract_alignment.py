@@ -10,7 +10,7 @@ COMPOSE_PATH = Path("docker-compose.yml")
 ENV_EXAMPLE_PATH = Path(".env.example")
 KNOWLEDGE_MODEL_PATH = Path("backend/app/models/knowledge.py")
 LITERATURE_MODEL_PATH = Path("backend/app/models/literature.py")
-STATUS_MIGRATION_PATH = Path("backend/alembic/versions/017_status_normalization_and_conflict_cleanup.py")
+STATUS_MIGRATION_PATH = Path("backend/alembic/versions/018_task_status_contract_unification.py")
 
 EXPECTED_TASK_STATUSES = {
     "pending",
