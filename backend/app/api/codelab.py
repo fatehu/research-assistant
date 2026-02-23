@@ -1621,7 +1621,7 @@ async def notebook_agent_chat(
                     iteration = event_data.get("iteration", current_iteration) if isinstance(event_data, dict) else current_iteration
                     try:
                         current_iteration = max(current_iteration, int(iteration))
-                    except Exception:
+                    except (TypeError, ValueError):
                         iteration = current_iteration
                     react_steps.append(
                         {
@@ -1642,7 +1642,7 @@ async def notebook_agent_chat(
                     iteration = event_data.get("iteration", current_iteration) if isinstance(event_data, dict) else current_iteration
                     try:
                         current_iteration = max(current_iteration, int(iteration))
-                    except Exception:
+                    except (TypeError, ValueError):
                         iteration = current_iteration
                     
                     # 检查是否有 notebook 更新
