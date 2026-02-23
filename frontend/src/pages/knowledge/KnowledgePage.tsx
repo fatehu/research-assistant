@@ -39,7 +39,7 @@ import {
 } from '@ant-design/icons'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
 import type { KnowledgeDocumentStatusEventData, SearchResult } from '@/services/api'
-import { isApiCanceledError, isApiTimeoutError, knowledgeApi } from '@/services/api'
+import { isApiCanceledError, isApiTimeoutError, knowledgeApi, normalizeDocumentStatus } from '@/services/api'
 import dayjs from 'dayjs'
 import { KnowledgeBaseCard, SharedKnowledgeBaseCard, SearchResultCard } from './components'
 import {
@@ -220,7 +220,10 @@ const KnowledgePage = () => {
   useEffect(() => {
     if (!currentKnowledgeBase) return
     const processingDocs = documents.filter(
-      (d) => d.status === 'processing' || d.status === 'running' || d.status === 'pending'
+      (d) => {
+        const normalized = normalizeDocumentStatus(d.status)
+        return normalized === 'running' || normalized === 'pending'
+      }
     )
     if (processingDocs.length === 0) return
 

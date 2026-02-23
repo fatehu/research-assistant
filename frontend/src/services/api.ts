@@ -256,7 +256,7 @@ export interface Document {
   original_filename: string
   file_size: number
   file_type: string
-  status: 'pending' | 'processing' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled'
+  status: TaskStatus
   error_message?: string
   chunk_count: number
   token_count: number
@@ -950,7 +950,7 @@ export interface PaperKnowledgeLink {
   paper_id: number
   knowledge_base_id: number
   document_id?: number
-  status: 'pending' | 'processing' | 'running' | 'ready' | 'completed' | 'failed' | 'timeout' | 'cancelled'
+  status: TaskStatus
   error_message?: string
   created_at: string
   updated_at: string
@@ -959,7 +959,7 @@ export interface PaperKnowledgeLink {
 export interface CollectionKnowledgeReadinessItem {
   paper_id: number
   title: string
-  status: 'ready' | 'processing' | 'running' | 'pending' | 'completed' | 'failed' | 'timeout' | 'cancelled' | 'missing'
+  status: TaskStatus | 'missing'
   document_id?: number
   error_message?: string
   pdf_available: boolean
@@ -969,10 +969,12 @@ export interface CollectionKnowledgeReadiness {
   collection_id: number
   knowledge_base_id: number
   total_papers: number
-  ready_papers: number
-  processing_papers: number
+  completed_papers: number
+  running_papers: number
   pending_papers: number
   failed_papers: number
+  timeout_papers: number
+  cancelled_papers: number
   missing_papers: number
   can_cross_paper_answer: boolean
   papers: CollectionKnowledgeReadinessItem[]

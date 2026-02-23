@@ -1,9 +1,9 @@
 /**
  * 导师 - 公告管理页面
  */
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Card, Table, Button, Space, Input, Modal, Form, message,
+  App, Card, Table, Button, Space, Input, Modal, Form,
   Tag, Tooltip, Empty, Typography, Switch, Dropdown, Popconfirm, Select
 } from 'antd';
 import {
@@ -38,6 +38,7 @@ interface ResearchGroup {
 }
 
 const AnnouncementsPage: React.FC = () => {
+  const { message } = App.useApp();
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [groups, setGroups] = useState<ResearchGroup[]>([]);
   const [loading, setLoading] = useState(false);
@@ -48,7 +49,7 @@ const AnnouncementsPage: React.FC = () => {
   const [previewContent, setPreviewContent] = useState<Announcement | null>(null);
   const [form] = Form.useForm();
 
-  const fetchAnnouncements = async () => {
+  const fetchAnnouncements = useCallback(async () => {
     setLoading(true);
     try {
       const response = await api.get('/api/v1/announcements/');
@@ -58,21 +59,21 @@ const AnnouncementsPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [message]);
 
-  const fetchGroups = async () => {
+  const fetchGroups = useCallback(async () => {
     try {
       const response = await api.get('/api/v1/mentor/groups');
       setGroups(response.data);
     } catch (error) {
       console.error('获取研究组失败:', error);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchAnnouncements();
     fetchGroups();
-  }, []);
+  }, [fetchAnnouncements, fetchGroups]);
 
   const handleCreate = () => {
     setEditingAnnouncement(null);
@@ -390,7 +391,7 @@ const AnnouncementsPage: React.FC = () => {
               placeholder="选择研究组（不选则发送给所有学生）"
               allowClear
               style={{ width: '100%' }}
-              dropdownStyle={{ backgroundColor: '#161B22' }}
+              styles={{ popup: { root: { backgroundColor: '#161B22' } } }}
             >
               {groups.map(group => (
                 <Option key={group.id} value={group.id}>{group.name}</Option>

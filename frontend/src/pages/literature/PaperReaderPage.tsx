@@ -678,7 +678,7 @@ export default function PaperReaderPage() {
   }, [askSources])
   const notReadyCollectionPapers = useMemo(() => {
     if (!collectionReadiness) return []
-    return collectionReadiness.papers.filter((item) => item.status !== 'ready')
+    return collectionReadiness.papers.filter((item) => item.status !== 'completed')
   }, [collectionReadiness])
   const askScopeOptions = useMemo(
     () => [
@@ -698,7 +698,7 @@ export default function PaperReaderPage() {
         label: (
           <Space size={4}>
             <span>当前收藏夹</span>
-            <Tooltip title="仅对收藏夹中 ready 论文做联合回答；未入库/处理中论文不会参与。">
+            <Tooltip title="仅对收藏夹中 completed 论文做联合回答；未入库/处理中论文不会参与。">
               <QuestionCircleOutlined style={{ color: '#7fb2ff', fontSize: 14 }} />
             </Tooltip>
           </Space>
@@ -1351,7 +1351,7 @@ export default function PaperReaderPage() {
       collectionReadiness &&
       !collectionReadiness.can_cross_paper_answer
     ) {
-      message.warning('当前收藏夹在所选知识库暂无 ready 论文，请先入库后再询问')
+      message.warning('当前收藏夹在所选知识库暂无 completed 论文，请先入库后再询问')
       return
     }
 
@@ -2020,19 +2020,21 @@ export default function PaperReaderPage() {
                             type={collectionReadiness.can_cross_paper_answer ? 'info' : 'warning'}
                             message={
                               collectionReadiness.can_cross_paper_answer
-                                ? `可跨论文联合回答：${collectionReadiness.ready_papers}/${collectionReadiness.total_papers} 篇已就绪`
+                                ? `可跨论文联合回答：${collectionReadiness.completed_papers}/${collectionReadiness.total_papers} 篇已就绪`
                                 : '当前收藏夹暂无可联合回答论文'
                             }
                             description={(
                               <Space direction="vertical" size={6} style={{ width: '100%' }}>
                                 <Text type="secondary">
-                                  联合回答仅覆盖 `ready` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
+                                  联合回答仅覆盖 `completed` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
                                 </Text>
                                 <Space wrap size={6}>
-                                  <Tag color="green">ready: {collectionReadiness.ready_papers}</Tag>
-                                  <Tag color="blue">processing: {collectionReadiness.processing_papers}</Tag>
+                                  <Tag color="green">completed: {collectionReadiness.completed_papers}</Tag>
+                                  <Tag color="blue">running: {collectionReadiness.running_papers}</Tag>
                                   <Tag color="gold">pending: {collectionReadiness.pending_papers}</Tag>
                                   <Tag color="red">failed: {collectionReadiness.failed_papers}</Tag>
+                                  <Tag color="orange">timeout: {collectionReadiness.timeout_papers}</Tag>
+                                  <Tag color="purple">cancelled: {collectionReadiness.cancelled_papers}</Tag>
                                   <Tag>missing: {collectionReadiness.missing_papers}</Tag>
                                 </Space>
                                 {notReadyCollectionPapers.length > 0 ? (

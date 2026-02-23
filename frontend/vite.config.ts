@@ -43,6 +43,7 @@ export default defineConfig({
           'vendor-react': ['react', 'react-dom', 'react-router-dom'],
           'vendor-antd': ['antd', '@ant-design/icons'],
           'vendor-motion': ['framer-motion'],
+          'vendor-pdf': ['react-pdf', 'pdfjs-dist'],
         },
       },
     },
