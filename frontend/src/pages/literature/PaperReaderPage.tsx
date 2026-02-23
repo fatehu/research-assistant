@@ -35,6 +35,7 @@ import {
   LiteratureAskSource,
   LiteratureAskSession,
   literatureApi,
+  normalizeKnowledgeLinkStatus,
   Paper,
   PaperAnnotation,
   PaperCollection,
@@ -1187,7 +1188,10 @@ export default function PaperReaderPage() {
 
   useEffect(() => {
     if (!validPaperId) return
-    const hasProcessing = knowledgeLinks.some((item) => item.status === 'pending' || item.status === 'processing')
+    const hasProcessing = knowledgeLinks.some((item) => {
+      const normalized = normalizeKnowledgeLinkStatus(item.status)
+      return normalized === 'pending' || normalized === 'running'
+    })
     if (!hasProcessing) return
 
     const timer = setInterval(() => {
@@ -1946,17 +1950,28 @@ export default function PaperReaderPage() {
                     <List
                       size="small"
                       dataSource={knowledgeLinks}
-                      renderItem={(item) => (
-                        <List.Item>
-                          <Space direction="vertical" size={2}>
-                            <Text>KB#{item.knowledge_base_id}</Text>
-                            <Tag color={item.status === 'ready' ? 'green' : item.status === 'failed' ? 'red' : 'blue'}>
-                              {item.status}
-                            </Tag>
-                            {item.error_message ? <Text type="danger">{item.error_message}</Text> : null}
-                          </Space>
-                        </List.Item>
-                      )}
+                      renderItem={(item) => {
+                        const normalized = normalizeKnowledgeLinkStatus(item.status)
+                        const color =
+                          normalized === 'completed'
+                            ? 'green'
+                            : normalized === 'failed'
+                              ? 'red'
+                              : normalized === 'pending'
+                                ? 'gold'
+                                : normalized === 'running'
+                                  ? 'blue'
+                                  : 'default'
+                        return (
+                          <List.Item>
+                            <Space direction="vertical" size={2}>
+                              <Text>KB#{item.knowledge_base_id}</Text>
+                              <Tag color={color}>{normalized}</Tag>
+                              {item.error_message ? <Text type="danger">{item.error_message}</Text> : null}
+                            </Space>
+                          </List.Item>
+                        )
+                      }}
                     />,
                   )
                 ),

@@ -31,9 +31,16 @@ export const getStatusTag = (status: string) => {
     case 'pending':
       return <Tag icon={<ClockCircleOutlined />} color="default">等待处理</Tag>
     case 'processing':
+    case 'running':
       return <Tag icon={<LoadingOutlined spin />} color="processing">处理中</Tag>
+    case 'ready':
+      return <Tag icon={<CheckCircleOutlined />} color="success">已就绪</Tag>
     case 'completed':
       return <Tag icon={<CheckCircleOutlined />} color="success">已完成</Tag>
+    case 'timeout':
+      return <Tag icon={<ExclamationCircleOutlined />} color="warning">超时</Tag>
+    case 'cancelled':
+      return <Tag icon={<ExclamationCircleOutlined />} color="default">已取消</Tag>
     case 'failed':
       return <Tag icon={<ExclamationCircleOutlined />} color="error">失败</Tag>
     default:

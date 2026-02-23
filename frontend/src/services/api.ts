@@ -5,6 +5,23 @@ const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | und
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8000'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 
+export interface ApiErrorContract {
+  code?: string
+  message?: string
+  details?: unknown
+  request_id?: string
+}
+
+export type ApiErrorDetail = string | ApiErrorContract
+
+export type TaskStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'timeout'
+  | 'cancelled'
+
 // Create axios instance
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -26,13 +43,43 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+export const extractApiErrorMessage = (detail: ApiErrorDetail | undefined, fallback = '请求失败'): string => {
+  if (!detail) return fallback
+  if (typeof detail === 'string') {
+    const text = detail.trim()
+    return text || fallback
+  }
+  if (typeof detail.message === 'string' && detail.message.trim()) {
+    return detail.message.trim()
+  }
+  return fallback
+}
+
+export const normalizeTaskStatus = (
+  status: string | undefined | null,
+): TaskStatus => {
+  const normalized = String(status || '').trim().toLowerCase()
+  if (normalized === 'processing' || normalized === 'running') return 'running'
+  if (normalized === 'ready' || normalized === 'success' || normalized === 'done') return 'completed'
+  if (normalized === 'timeout') return 'timeout'
+  if (normalized === 'cancelled' || normalized === 'canceled') return 'cancelled'
+  if (normalized === 'failed' || normalized === 'error') return 'failed'
+  if (normalized === 'pending' || normalized === 'queued') return 'pending'
+  return 'failed'
+}
+
 // Response interceptor - normalize errors
 api.interceptors.response.use(
   (response) => response,
-  (error: AxiosError<{ detail: string }>) => {
+  (error: AxiosError<{ detail?: ApiErrorDetail }>) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('auth-storage')
       window.location.href = '/login'
+    }
+    const detail = error.response?.data?.detail
+    const message = extractApiErrorMessage(detail, error.message || '请求失败')
+    if (message) {
+      error.message = message
     }
     throw error
   }
@@ -190,7 +237,7 @@ export interface Document {
   original_filename: string
   file_size: number
   file_type: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
+  status: 'pending' | 'processing' | 'running' | 'completed' | 'failed' | 'timeout' | 'cancelled'
   error_message?: string
   chunk_count: number
   token_count: number
@@ -285,8 +332,8 @@ async function streamJsonSse<TEvent extends string = string>(
   if (!response.ok) {
     let detail = `订阅失败 (${response.status})`
     try {
-      const err = await response.json()
-      detail = err?.detail?.message || err?.detail || detail
+      const err = (await response.json()) as { detail?: ApiErrorDetail }
+      detail = extractApiErrorMessage(err?.detail, detail)
     } catch {
       // ignore json parse error for non-json body
     }
@@ -353,6 +400,13 @@ export interface PaperKnowledgeLinkStatusEventData {
   error_message?: string
   updated_at?: string
 }
+
+export const normalizeDocumentStatus = (status: Document['status'] | string | null | undefined): TaskStatus =>
+  normalizeTaskStatus(status)
+
+export const normalizeKnowledgeLinkStatus = (
+  status: PaperKnowledgeLink['status'] | string | null | undefined,
+): TaskStatus => normalizeTaskStatus(status)
 
 export const authApi = {
   login: async (email: string, password: string): Promise<AuthResponse> => {
@@ -465,8 +519,8 @@ export const chatApi = {
       })
 
       if (!response.ok) {
-        const error = await response.json()
-        throw new Error(error.detail || '请求失败')
+        const error = (await response.json()) as { detail?: ApiErrorDetail }
+        throw new Error(extractApiErrorMessage(error.detail, '请求失败'))
       }
 
       const reader = response.body?.getReader()
@@ -877,7 +931,7 @@ export interface PaperKnowledgeLink {
   paper_id: number
   knowledge_base_id: number
   document_id?: number
-  status: 'pending' | 'processing' | 'ready' | 'failed'
+  status: 'pending' | 'processing' | 'running' | 'ready' | 'completed' | 'failed' | 'timeout' | 'cancelled'
   error_message?: string
   created_at: string
   updated_at: string
@@ -886,7 +940,7 @@ export interface PaperKnowledgeLink {
 export interface CollectionKnowledgeReadinessItem {
   paper_id: number
   title: string
-  status: 'ready' | 'processing' | 'pending' | 'failed' | 'missing'
+  status: 'ready' | 'processing' | 'running' | 'pending' | 'completed' | 'failed' | 'timeout' | 'cancelled' | 'missing'
   document_id?: number
   error_message?: string
   pdf_available: boolean
@@ -1253,8 +1307,8 @@ export const literatureApi = {
     if (!response.ok) {
       let detail = '请求失败'
       try {
-        const err = await response.json()
-        detail = err?.detail?.message || err?.detail || detail
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
       } catch {
         // ignore json parse error for non-json body
       }
@@ -1464,6 +1518,7 @@ export interface AgentChatEvent {
   input?: Record<string, any>
   success?: boolean
   output?: string
+  error_contract?: ApiErrorContract
   iteration?: number
   action?: string // action requiring approval
   provider?: string
@@ -1518,8 +1573,8 @@ export const agentApi = {
     )
 
     if (!response.ok) {
-      const error = await response.json()
-      throw new Error(error.detail || '璇锋眰澶辫触')
+      const error = (await response.json()) as { detail?: ApiErrorDetail }
+      throw new Error(extractApiErrorMessage(error.detail, '请求失败'))
     }
 
     const reader = response.body?.getReader()

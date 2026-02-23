@@ -220,7 +220,7 @@ const KnowledgePage = () => {
   useEffect(() => {
     if (!currentKnowledgeBase) return
     const processingDocs = documents.filter(
-      (d) => d.status === 'processing' || d.status === 'pending'
+      (d) => d.status === 'processing' || d.status === 'running' || d.status === 'pending'
     )
     if (processingDocs.length === 0) return
 
