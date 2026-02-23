@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, 
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_, tuple_
+from sqlalchemy.exc import SQLAlchemyError
 from loguru import logger
 
 from app.config import settings
@@ -116,6 +117,33 @@ async def _publish_document_status_event(
         await publish_status_event(build_status_channel_for_user(int(user_id)), payload)
     except Exception as exc:  # pragma: no cover - push failures should not break main path
         logger.warning(f"[Knowledge API] 发布文档状态事件失败 doc={doc.id}: {exc}")
+
+
+def _build_error_detail(
+    *,
+    code: str,
+    message: str,
+    details: Optional[Any] = None,
+    request_id: Optional[str] = None,
+) -> dict:
+    payload = {
+        "code": str(code),
+        "message": str(message),
+        "details": details,
+        "request_id": request_id,
+    }
+    return payload
+
+
+def _safe_remove_file(path: Optional[str], *, context: str) -> None:
+    if not path:
+        return
+    if not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except OSError as exc:
+        logger.warning(f"[Knowledge API] 文件删除失败 context={context} path={path}: {exc}")
 
 
 # ========== 可用嵌入模型注册表 ==========
@@ -523,10 +551,7 @@ async def delete_knowledge_base(
     
     for doc in documents:
         if doc.file_path and os.path.exists(doc.file_path):
-            try:
-                os.remove(doc.file_path)
-            except:
-                pass
+            _safe_remove_file(doc.file_path, context=f"delete_kb:{kb_id}")
     
     await db.delete(kb)
     await db.commit()
@@ -664,8 +689,16 @@ async def upload_document(
         content = await file.read()
         with open(full_path, 'wb') as f:
             f.write(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件保存失败: {str(e)}")
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=_build_error_detail(
+                code="file_save_failed",
+                message="文件保存失败",
+                details=str(e),
+                request_id=file_id,
+            ),
+        )
     
     # 创建文档记录
     doc = Document(
@@ -679,7 +712,20 @@ async def upload_document(
         status=DocumentStatus.PENDING.value,
     )
     db.add(doc)
-    await db.commit()
+    try:
+        await db.commit()
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        _safe_remove_file(full_path, context=f"create_doc:{kb_id}")
+        raise HTTPException(
+            status_code=500,
+            detail=_build_error_detail(
+                code="document_create_failed",
+                message="文档记录写入失败",
+                details=str(exc),
+                request_id=file_id,
+            ),
+        )
     await db.refresh(doc)
     await _publish_document_status_event(
         user_id=int(current_user.id),
@@ -1194,10 +1240,7 @@ async def delete_document(
     
     # 删除文件
     if doc.file_path and os.path.exists(doc.file_path):
-        try:
-            os.remove(doc.file_path)
-        except:
-            pass
+        _safe_remove_file(doc.file_path, context=f"delete_doc:{doc_id}")
     
     # 更新知识库统计
     kb.document_count = max(0, (kb.document_count or 0) - 1)
