@@ -108,7 +108,11 @@ const RegisterPage = () => {
               name="password"
               rules={[
                 { required: true, message: '请输入密码' },
-                { min: 6, message: '密码至少6个字符' },
+                { min: 10, message: '密码至少10个字符' },
+                {
+                  pattern: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/,
+                  message: '密码需包含大小写字母、数字和特殊字符',
+                },
               ]}
             >
               <Input.Password

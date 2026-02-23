@@ -582,8 +582,16 @@ const UsersPage: React.FC = () => {
           </Row>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="password" label={<span style={{ color: '#8899A6' }}>密码</span>} rules={[{ required: true, message: '请输入' }, { min: 6, message: '至少6位' }]}>
-                <Input.Password prefix={<LockOutlined style={{ color: '#8899A6' }} />} placeholder="至少6位" style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }} />
+              <Form.Item
+                name="password"
+                label={<span style={{ color: '#8899A6' }}>密码</span>}
+                rules={[
+                  { required: true, message: '请输入' },
+                  { min: 10, message: '至少10位' },
+                  { pattern: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/, message: '需包含大小写字母、数字和特殊字符' },
+                ]}
+              >
+                <Input.Password prefix={<LockOutlined style={{ color: '#8899A6' }} />} placeholder="至少10位且含大小写、数字、特殊字符" style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }} />
               </Form.Item>
             </Col>
             <Col span={12}>
@@ -692,7 +700,11 @@ const UsersPage: React.FC = () => {
           <Form.Item
             name="password"
             label={<span style={{ color: '#8899A6' }}>新密码</span>}
-            rules={[{ required: true, message: '请输入新密码' }, { min: 6, message: '至少6位' }]}
+            rules={[
+              { required: true, message: '请输入新密码' },
+              { min: 10, message: '至少10位' },
+              { pattern: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/, message: '需包含大小写字母、数字和特殊字符' },
+            ]}
           >
             <Input.Password
               prefix={<LockOutlined style={{ color: '#8899A6' }} />}
