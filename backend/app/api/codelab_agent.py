@@ -641,11 +641,10 @@ async def notebook_agent_chat(
                 content=full_content,
                 code_blocks=[AgentCodeBlock(**cb) for cb in code_blocks],
                 timestamp=datetime.now().isoformat(),
-                metadata={
-                    **({"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {}),
-                    **({"react_steps": react_steps} if react_steps else {}),
-                },
+                metadata={"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {},
             )
+            if react_steps:
+                assistant_message.metadata["react_steps"] = react_steps
             await save_agent_message(notebook_id, current_user.id, assistant_message)
             
             # 发送完成事件

@@ -1203,3 +1203,6 @@ async def interrupt_kernel(
 from app.api import codelab_agent as codelab_agent_routes  # noqa: E402
 router.include_router(codelab_agent_routes.router)
 
+# Backward-compatible export for tests and legacy imports after route split.
+notebook_agent_chat = codelab_agent_routes.notebook_agent_chat
+
