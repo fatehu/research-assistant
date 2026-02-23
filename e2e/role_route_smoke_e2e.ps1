@@ -136,6 +136,33 @@ function Invoke-PlaywrightCode {
   Invoke-PlaywrightCli -Arguments @("run-code", $Code)
 }
 
+function Invoke-PlaywrightOpenWithRetry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Url,
+    [int]$Attempts = 3,
+    [int]$DelaySeconds = 3
+  )
+
+  for ($i = 1; $i -le $Attempts; $i++) {
+    try {
+      Invoke-PlaywrightCli -Arguments @("open", $Url)
+      return
+    }
+    catch {
+      if ($i -ge $Attempts) {
+        throw
+      }
+      Write-Host ("[RETRY] playwright open failed, attempt={0}/{1}, sleep={2}s" -f $i, $Attempts, $DelaySeconds) -ForegroundColor DarkYellow
+      try {
+        Invoke-PlaywrightCli -Arguments @("close")
+      }
+      catch {}
+      Start-Sleep -Seconds $DelaySeconds
+    }
+  }
+}
+
 $dbUserResolved = if ([string]::IsNullOrWhiteSpace($DbUser)) { Get-EnvValue -Path $EnvFilePath -Key "POSTGRES_USER" } else { $DbUser }
 $dbNameResolved = if ([string]::IsNullOrWhiteSpace($DbName)) { Get-EnvValue -Path $EnvFilePath -Key "POSTGRES_DB" } else { $DbName }
 if ([string]::IsNullOrWhiteSpace($dbUserResolved)) { $dbUserResolved = "research_user" }
@@ -190,7 +217,9 @@ else {
 New-Item -ItemType Directory -Force "output/playwright" | Out-Null
 
 try {
-  Invoke-PlaywrightCli -Arguments @("open", "$FrontendBaseUrl/login")
+  # Open a neutral page first to reduce flaky failures in direct open-to-login.
+  Invoke-PlaywrightOpenWithRetry -Url "about:blank"
+  Invoke-PlaywrightCode -Code "(async (page) => { await page.goto('$FrontendBaseUrl/login'); await page.waitForLoadState('domcontentloaded'); })"
 
   Invoke-PlaywrightCode -Code "(async (page) => { await page.locator('input').first().fill('$email'); await page.locator('input[type=password]').first().fill('$password'); await Promise.all([page.waitForURL('**/dashboard', { timeout: 20000 }), page.click('button[type=submit]')]); })"
 
