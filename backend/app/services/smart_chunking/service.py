@@ -481,6 +481,10 @@ class SmartChunkingService:
     def _preprocess_text(self, text: str, file_type: str = "txt") -> str:
         return preprocess_text(text, file_type=file_type)
 
+    def _empty_result(self) -> Dict[str, Any]:
+        """Backward-compatible empty result structure used by historical tests."""
+        return {"chunks": [], "hierarchy": None, "metadata": {}}
+
     def _chunk_to_dict(self, chunk: SmartChunk) -> Dict[str, Any]:
         return _chunk_to_dict(chunk)
 

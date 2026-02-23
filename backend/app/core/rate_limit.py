@@ -179,11 +179,15 @@ def _rate_headers(result: RateLimitResult) -> Dict[str, str]:
 
 
 def build_rate_limit_dependency(*, bucket: str, limit: int, scope: str = "user_or_ip"):
+    # Build a limiter per dependency so tests and runtime config overrides
+    # always apply consistently instead of reusing a stale module-level singleton.
+    limiter = APIRateLimiter()
+
     async def _dependency(request: Request):
         if not bool(getattr(settings, "api_rate_limit_enabled", True)):
             return
 
-        result = await rate_limiter.check(request=request, bucket=bucket, scope=scope, limit=max(1, int(limit)))
+        result = await limiter.check(request=request, bucket=bucket, scope=scope, limit=max(1, int(limit)))
         headers = _rate_headers(result)
         request.state.rate_limit_headers = headers
 
