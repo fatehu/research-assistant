@@ -2,7 +2,7 @@
 
 // API base configuration
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
-const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8000'
+const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 
 export interface ApiErrorContract {
