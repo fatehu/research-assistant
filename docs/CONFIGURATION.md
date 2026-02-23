@@ -155,7 +155,7 @@ docker-compose up backend
 访问配置检查端点：
 
 ```bash
-curl http://localhost:8000/health/config | jq
+curl http://localhost:8888/health/config | jq
 ```
 
 响应示例：
@@ -213,7 +213,7 @@ docker-compose restart backend
 
 3. 检查配置是否更新：
 ```bash
-curl http://localhost:8000/health/config | jq '.react_agent.max_iterations'
+curl http://localhost:8888/health/config | jq '.react_agent.max_iterations'
 # 应该返回: 20
 ```
 
