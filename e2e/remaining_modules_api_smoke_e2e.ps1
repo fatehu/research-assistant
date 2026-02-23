@@ -5,7 +5,9 @@
   [string]$DbName = "",
   [string]$EnvFilePath = ".env",
   [int]$PollIntervalSeconds = 3,
-  [int]$MaxWaitSeconds = 600
+  [int]$MaxWaitSeconds = 600,
+  [int]$MaxRetryAttempts = 4,
+  [int]$RetryBaseDelaySeconds = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,10 +68,52 @@ function Invoke-JsonRequest {
     $Body
   )
 
-  if ($null -ne $Body) {
-    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 40)
+  $attempt = 0
+  while ($attempt -lt $MaxRetryAttempts) {
+    $attempt += 1
+    try {
+      if ($null -ne $Body) {
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 40)
+      }
+      return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
+    }
+    catch {
+      $status = Get-ErrorStatusCode -ErrorRecord $_
+      if ($status -ne 429 -or $attempt -ge $MaxRetryAttempts) {
+        throw
+      }
+
+      $retryAfterSeconds = 0
+      $errorJson = $null
+      try {
+        if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+          $errorJson = $_.ErrorDetails.Message | ConvertFrom-Json
+        }
+      }
+      catch {}
+
+      if ($null -ne $errorJson -and $null -ne $errorJson.detail -and $null -ne $errorJson.detail.retry_after_seconds) {
+        $retryAfterSeconds = [int]$errorJson.detail.retry_after_seconds
+      }
+
+      try {
+        if ($retryAfterSeconds -le 0 -and $null -ne $_.Exception.Response) {
+          $retryHeader = $_.Exception.Response.Headers["Retry-After"]
+          if (-not [string]::IsNullOrWhiteSpace($retryHeader)) {
+            $retryAfterSeconds = [int]$retryHeader
+          }
+        }
+      }
+      catch {}
+
+      if ($retryAfterSeconds -le 0) {
+        $retryAfterSeconds = [Math]::Max(1, [int]($RetryBaseDelaySeconds * [Math]::Pow(2, $attempt - 1)))
+      }
+
+      Write-Host (" [RETRY] 429 detected, attempt={0}/{1}, sleep={2}s, uri={3}" -f $attempt, $MaxRetryAttempts, $retryAfterSeconds, $Uri) -ForegroundColor DarkYellow
+      Start-Sleep -Seconds $retryAfterSeconds
+    }
   }
-  return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
 }
 
 function Get-ErrorStatusCode {
