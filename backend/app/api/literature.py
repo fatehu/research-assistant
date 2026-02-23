@@ -349,7 +349,7 @@ def _to_float(value: Any) -> Optional[float]:
             return None
         try:
             return float(text)
-        except Exception:
+        except ValueError:
             return None
     return None
 
@@ -1446,8 +1446,8 @@ class LiteratureAskAgentCore(AgentCore):
         if tool_name == "paper_read":
             try:
                 context.allowed_source_labels.update(self._extract_source_labels(executed.observation_output))
-            except Exception:
-                pass
+            except (AttributeError, TypeError):
+                logger.debug("[Literature Ask] skip source-label update: context unavailable")
         return executed
 
     async def _compress_knowledge_observation(
@@ -1599,6 +1599,20 @@ async def _build_literature_agent_tool_registry(
     return registry, {name for name in allowed_tool_names if name}
 
 
+def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Optional[str], Optional[int]]:
+    """
+    根据文档状态统一推导论文入库 link 状态。
+    返回: (link_status, error_message, document_id)
+    """
+    if doc is None:
+        return KnowledgeLinkStatus.FAILED.value, "文档不存在", None
+    if doc.status == DocumentStatus.COMPLETED.value:
+        return KnowledgeLinkStatus.READY.value, None, int(doc.id)
+    if doc.status == DocumentStatus.FAILED.value:
+        return KnowledgeLinkStatus.FAILED.value, (doc.error_message or "文档处理失败"), int(doc.id)
+    return KnowledgeLinkStatus.PROCESSING.value, None, int(doc.id)
+
+
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
     """
     论文入库后台任务：
@@ -1627,13 +1641,11 @@ async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_siz
         if not link:
             return
 
-        if doc and doc.status == DocumentStatus.COMPLETED.value:
-            link.status = KnowledgeLinkStatus.READY.value
-            link.error_message = None
-            link.document_id = doc.id
-        else:
-            link.status = KnowledgeLinkStatus.FAILED.value
-            link.error_message = (doc.error_message if doc else "文档处理失败") if doc else "文档不存在"
+        link_status, error_message, resolved_doc_id = _derive_link_status_from_document(doc)
+        link.status = link_status
+        link.error_message = error_message
+        if resolved_doc_id is not None:
+            link.document_id = resolved_doc_id
 
         await db.commit()
         await db.refresh(link)
@@ -3273,18 +3285,10 @@ async def list_paper_knowledge_links(
         doc = await db.get(Document, int(link.document_id))
         if not doc:
             continue
-        if doc.status == DocumentStatus.COMPLETED.value and link.status != KnowledgeLinkStatus.READY.value:
-            link.status = KnowledgeLinkStatus.READY.value
-            link.error_message = None
-            need_commit = True
-            changed_link_ids.add(int(link.id))
-        elif doc.status == DocumentStatus.FAILED.value and link.status != KnowledgeLinkStatus.FAILED.value:
-            link.status = KnowledgeLinkStatus.FAILED.value
-            link.error_message = doc.error_message
-            need_commit = True
-            changed_link_ids.add(int(link.id))
-        elif doc.status in {DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value} and link.status != KnowledgeLinkStatus.PROCESSING.value:
-            link.status = KnowledgeLinkStatus.PROCESSING.value
+        next_status, next_error, _ = _derive_link_status_from_document(doc)
+        if link.status != next_status or (link.error_message or None) != (next_error or None):
+            link.status = next_status
+            link.error_message = next_error
             need_commit = True
             changed_link_ids.add(int(link.id))
 

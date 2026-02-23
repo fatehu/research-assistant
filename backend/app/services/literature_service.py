@@ -445,7 +445,7 @@ class ArxivService:
             if published_elem is not None:
                 try:
                     year = int(published_elem.text[:4])
-                except:
+                except (TypeError, ValueError):
                     pass
             
             # 分类（作为 venue）
