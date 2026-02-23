@@ -545,6 +545,9 @@ _notebooks_cache: Dict[str, Dict] = {}
 
 # 标记已从数据库加载的用户
 _loaded_users: set = set()
+_loaded_users_at: Dict[int, float] = {}
+_cache_lock = asyncio.Lock()
+_CACHE_TTL_SECONDS = max(60, int(getattr(settings, "codelab_cache_ttl_seconds", 300)))
 
 # 用户维度执行并发计数（避免单用户占满服务）
 _user_execution_counter: Dict[int, int] = {}
@@ -580,41 +583,75 @@ class _UserExecutionSlot:
 
 async def _sync_to_cache(notebook: Dict):
     """同步 Notebook 到缓存"""
-    _notebooks_cache[notebook['id']] = notebook
+    notebook_id = str(notebook.get("id"))
+    if not notebook_id:
+        return
+    async with _cache_lock:
+        _notebooks_cache[notebook_id] = notebook
+        user_id = notebook.get("user_id")
+        if user_id is not None:
+            _loaded_users.add(int(user_id))
+            _loaded_users_at[int(user_id)] = time.time()
+
+
+async def _remove_from_cache(notebook_id: str):
+    if not notebook_id:
+        return
+    async with _cache_lock:
+        _notebooks_cache.pop(str(notebook_id), None)
+
+
+async def _list_user_notebooks_from_cache(user_id: int) -> List[Dict]:
+    async with _cache_lock:
+        return [nb for nb in _notebooks_cache.values() if nb.get("user_id") == user_id]
+
+
+async def _get_notebook_from_cache(notebook_id: str, user_id: int) -> Optional[Dict]:
+    async with _cache_lock:
+        nb = _notebooks_cache.get(str(notebook_id))
+        if nb and nb.get("user_id") == user_id:
+            return nb
+    return None
 
 
 async def _load_user_notebooks_to_cache(db: AsyncSession, user_id: int):
     """从数据库加载用户的 Notebooks 到缓存"""
-    if user_id in _loaded_users:
+    now = time.time()
+    loaded_at = _loaded_users_at.get(int(user_id))
+    if user_id in _loaded_users and loaded_at is not None and (now - loaded_at) < _CACHE_TTL_SECONDS:
         return
-    
+
     service = NotebookService(db)
     notebooks = await service.get_user_notebooks(user_id)
-    for nb in notebooks:
-        _notebooks_cache[nb['id']] = nb
-    _loaded_users.add(user_id)
+    async with _cache_lock:
+        for nb in notebooks:
+            nb_id = str(nb.get("id"))
+            if not nb_id:
+                continue
+            _notebooks_cache[nb_id] = nb
+        _loaded_users.add(int(user_id))
+        _loaded_users_at[int(user_id)] = now
     logger.info(f"已加载用户 {user_id} 的 {len(notebooks)} 个 Notebook 到缓存")
 
 
 async def get_user_notebooks_cached(db: AsyncSession, user_id: int) -> List[Dict]:
     """获取用户的所有 Notebook（带缓存）"""
     await _load_user_notebooks_to_cache(db, user_id)
-    return [nb for nb in _notebooks_cache.values() if nb.get('user_id') == user_id]
+    return await _list_user_notebooks_from_cache(user_id)
 
 
 async def get_notebook_cached(db: AsyncSession, notebook_id: str, user_id: int) -> Optional[Dict]:
     """获取单个 Notebook（带缓存）"""
     # 先查缓存
-    if notebook_id in _notebooks_cache:
-        nb = _notebooks_cache[notebook_id]
-        if nb.get('user_id') == user_id:
-            return nb
-    
+    nb = await _get_notebook_from_cache(notebook_id, user_id)
+    if nb:
+        return nb
+
     # 缓存未命中，从数据库加载
     service = NotebookService(db)
     nb = await service.get_notebook(notebook_id, user_id)
     if nb:
-        _notebooks_cache[notebook_id] = nb
+        await _sync_to_cache(nb)
     return nb
 
 
@@ -649,7 +686,7 @@ async def list_notebooks(
     
     # 同步更新缓存
     for nb in notebooks:
-        _notebooks_cache[nb['id']] = nb
+        await _sync_to_cache(nb)
     
     # 定义排序键函数，处理 datetime 对象和 ISO 字符串的混合情况
     def sort_key(x):
@@ -683,7 +720,7 @@ async def create_notebook(
     )
     
     # 同步到缓存
-    _notebooks_cache[notebook['id']] = notebook
+    await _sync_to_cache(notebook)
     
     # 预创建内核
     kernel_manager.get_or_create_kernel(notebook['id'])
@@ -706,7 +743,7 @@ async def get_notebook_detail(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 更新缓存
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     
     return notebook
 
@@ -760,7 +797,7 @@ async def update_notebook(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 同步到缓存
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     
     return notebook
 
@@ -779,8 +816,7 @@ async def delete_notebook(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 从缓存中移除
-    if notebook_id in _notebooks_cache:
-        del _notebooks_cache[notebook_id]
+    await _remove_from_cache(notebook_id)
     
     # 销毁对应的内核
     kernel_manager.destroy_kernel(notebook_id)
@@ -866,7 +902,7 @@ async def execute_cell(
     
     notebook['updated_at'] = datetime.utcnow()
     notebook['execution_count'] = result['execution_count']
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     logger.info(
         f"[CodeLabExecute] user_id={current_user.id} notebook_id={notebook_id} "
         f"success={result.get('success')} terminated_reason={result.get('terminated_reason', 'none')} "
@@ -966,7 +1002,7 @@ async def add_cell(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 同步到缓存
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     
     # 返回新创建的单元格
     cells = notebook['cells']
@@ -990,7 +1026,7 @@ async def delete_cell(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 同步到缓存
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     
     return {"message": "单元格已删除"}
 
@@ -1070,7 +1106,7 @@ async def run_all_cells(
     
     notebook['updated_at'] = datetime.utcnow()
     notebook['execution_count'] = kernel.execution_count
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     timeout_count = sum(1 for item in results if item.get("terminated_reason") == "timeout")
     policy_count = sum(1 for item in results if item.get("terminated_reason") == "policy_violation")
     logger.info(
@@ -1110,7 +1146,7 @@ async def restart_kernel(
     
     notebook['execution_count'] = 0
     notebook['updated_at'] = datetime.utcnow()
-    _notebooks_cache[notebook_id] = notebook
+    await _sync_to_cache(notebook)
     
     await service.update_execution_count(notebook_id, current_user.id, 0)
     
