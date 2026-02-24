@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Card, Button, Tag, Space, Avatar, Typography, Empty, Spin,
@@ -75,13 +75,7 @@ const SharedResourceViewPage: React.FC = () => {
   const [copyLoading, setCopyLoading] = useState(false);
   const [selectedPapers, setSelectedPapers] = useState<number[]>([]);
 
-  useEffect(() => {
-    if (shareId) {
-      loadDetail();
-    }
-  }, [shareId]);
-
-  const loadDetail = async () => {
+  const loadDetail = useCallback(async () => {
     setLoading(true);
     try {
       const data = await shareApi.getSharedDetail(Number(shareId));
@@ -92,7 +86,13 @@ const SharedResourceViewPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [navigate, shareId]);
+
+  useEffect(() => {
+    if (shareId) {
+      loadDetail();
+    }
+  }, [shareId, loadDetail]);
 
   const handleCopyPaperToLibrary = async () => {
     if (!detail) return;

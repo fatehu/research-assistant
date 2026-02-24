@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -118,7 +118,7 @@ const PresetCard = ({
         : 'border-slate-700 bg-slate-800/50 hover:border-slate-600'
         }`}
       onClick={onClick}
-      bodyStyle={{ padding: 16 }}
+      styles={{ body: { padding: 16 } }}
     >
       <div className="flex items-start gap-3">
         <div className={`text-2xl ${selected ? 'text-emerald-400' : 'text-slate-400'}`}>
@@ -225,15 +225,7 @@ export default function SmartChunkingPage() {
   })
 
   // 加载预设列表
-  useEffect(() => {
-    loadPresets()
-    if (kbId) {
-      loadKnowledgeBase()
-      loadCurrentConfig()
-    }
-  }, [kbId])
-
-  const loadPresets = async () => {
+  const loadPresets = useCallback(async () => {
     try {
       const data = await chunkingApi.getPresets()
       setPresets(data.presets)
@@ -241,9 +233,9 @@ export default function SmartChunkingPage() {
       console.error('Failed to load presets:', error)
       message.error('加载预设配置失败')
     }
-  }
+  }, [])
 
-  const loadKnowledgeBase = async () => {
+  const loadKnowledgeBase = useCallback(async () => {
     if (!kbId) return
     try {
       const kb = await knowledgeApi.getKnowledgeBase(parseInt(kbId))
@@ -251,9 +243,9 @@ export default function SmartChunkingPage() {
     } catch (error) {
       console.error('Failed to load knowledge base:', error)
     }
-  }
+  }, [kbId])
 
-  const loadCurrentConfig = async () => {
+  const loadCurrentConfig = useCallback(async () => {
     if (!kbId) return
     try {
       const config = await chunkingApi.getKnowledgeBaseConfig(parseInt(kbId))
@@ -264,7 +256,16 @@ export default function SmartChunkingPage() {
     } catch (error) {
       console.error('Failed to load config:', error)
     }
-  }
+  }, [kbId])
+
+  // Load preset list
+  useEffect(() => {
+    loadPresets()
+    if (kbId) {
+      loadKnowledgeBase()
+      loadCurrentConfig()
+    }
+  }, [kbId, loadCurrentConfig, loadKnowledgeBase, loadPresets])
 
   // 测试分块
   const handlePreviewChunking = async () => {

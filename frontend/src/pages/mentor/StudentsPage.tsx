@@ -36,7 +36,7 @@ const StudentsPage: React.FC = () => {
   useEffect(() => {
     fetchStudents();
     fetchInvitations();
-  }, []);
+  }, [fetchInvitations, fetchStudents]);
 
   // 过滤出待处理的邀请
   const pendingInvitations = invitations.filter(
@@ -392,7 +392,7 @@ const StudentsPage: React.FC = () => {
           borderColor: '#30363D',
           borderRadius: 12,
         }}
-        bodyStyle={{ padding: 0 }}
+        styles={{ body: { padding: 0 } }}
       >
         <Tabs
           defaultActiveKey="students"
@@ -701,7 +701,7 @@ const StudentsPage: React.FC = () => {
             {/* 研究数据统计 */}
             <Card 
               style={{ backgroundColor: '#0D1117', borderColor: '#30363D' }}
-              bodyStyle={{ padding: 20 }}
+              styles={{ body: { padding: 20 } }}
             >
               <Row gutter={[16, 16]}>
                 <Col span={6}>

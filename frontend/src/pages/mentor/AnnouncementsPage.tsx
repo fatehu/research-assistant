@@ -307,7 +307,7 @@ const AnnouncementsPage: React.FC = () => {
           borderColor: '#30363D',
           borderRadius: 12,
         }}
-        bodyStyle={{ padding: 0 }}
+        styles={{ body: { padding: 0 } }}
       >
         <Table
           columns={columns}

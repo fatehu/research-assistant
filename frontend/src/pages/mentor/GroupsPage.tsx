@@ -140,7 +140,7 @@ const GroupsPage: React.FC = () => {
           borderRadius: 16,
           overflow: 'hidden',
         }}
-        bodyStyle={{ padding: 0 }}
+        styles={{ body: { padding: 0 } }}
       >
         {/* 卡片头部 - 渐变背景 */}
         <div style={{
