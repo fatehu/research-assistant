@@ -16,7 +16,7 @@ def test_stale_processing_detected():
     now = datetime(2026, 2, 13, 18, 0, 0)
     updated_at = now - timedelta(hours=3)
     assert is_stale_processing_status(
-        status=DocumentStatus.PROCESSING.value,
+        status=DocumentStatus.RUNNING.value,
         last_updated_at=updated_at,
         timeout_seconds=7200,
         now=now,
@@ -27,7 +27,7 @@ def test_recent_processing_not_stale():
     now = datetime(2026, 2, 13, 18, 0, 0)
     updated_at = now - timedelta(minutes=20)
     assert not is_stale_processing_status(
-        status=DocumentStatus.PROCESSING.value,
+        status=DocumentStatus.RUNNING.value,
         last_updated_at=updated_at,
         timeout_seconds=7200,
         now=now,

@@ -3,9 +3,36 @@
 """
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+import re
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 
 from app.models.role import UserRole
+
+_PASSWORD_MIN_LENGTH = 10
+_PASSWORD_COMPLEXITY_REGEX = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$")
+_COMMON_WEAK_PASSWORDS = {
+    "123456",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "password",
+    "password123",
+    "qwerty",
+    "qwerty123",
+    "admin123",
+    "abc123",
+}
+
+
+def _validate_password_strength(value: str) -> str:
+    if len(value) < _PASSWORD_MIN_LENGTH:
+        raise ValueError(f"密码长度至少 {_PASSWORD_MIN_LENGTH} 位")
+    lowered = value.lower()
+    if lowered in _COMMON_WEAK_PASSWORDS:
+        raise ValueError("密码过于简单，请勿使用常见弱口令")
+    if not _PASSWORD_COMPLEXITY_REGEX.match(value):
+        raise ValueError("密码必须同时包含大小写字母、数字和特殊字符")
+    return value
 
 
 class UserBase(BaseModel):
@@ -16,8 +43,13 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     """用户创建模式"""
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=_PASSWORD_MIN_LENGTH, max_length=100)
     full_name: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, value: str) -> str:
+        return _validate_password_strength(value)
 
 
 class UserLogin(BaseModel):
@@ -40,7 +72,12 @@ class UserUpdate(BaseModel):
 class UserPasswordChange(BaseModel):
     """用户修改密码请求"""
     old_password: str = Field(..., min_length=6, max_length=100)
-    new_password: str = Field(..., min_length=6, max_length=100)
+    new_password: str = Field(..., min_length=_PASSWORD_MIN_LENGTH, max_length=100)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password_strength(cls, value: str) -> str:
+        return _validate_password_strength(value)
 
 
 class UserResponse(BaseModel):

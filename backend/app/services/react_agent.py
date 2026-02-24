@@ -22,6 +22,10 @@ from app.services.contextual_compression_service import (
     CompressionInput,
     get_contextual_compression_service,
 )
+from app.services.agent_tool_error_contract import (
+    build_tool_error_contract,
+    merge_error_contract,
+)
 from app.services.llm_service import LLMService
 from app.services.smart_chunking.token_utils import estimate_tokens
 
@@ -649,7 +653,21 @@ class AgentCore:
         try:
             result = await self.tools.execute(call.name, **call.arguments)
         except Exception as exc:
-            result = ToolResult(success=False, output=f"工具执行失败: {exc}", error=type(exc).__name__)
+            contract = build_tool_error_contract(
+                code="tool_dispatch_failed",
+                message="工具调度失败",
+                tool_name=call.name,
+                stage="agent_execute",
+                detail=str(exc),
+                retryable=False,
+                metadata={"exception_type": type(exc).__name__},
+            )
+            result = ToolResult(
+                success=False,
+                output=f"{contract['message']}: {exc}",
+                error=str(contract["code"]),
+                data=merge_error_contract(None, contract),
+            )
 
         observation_output = result.output
         if call.name == "knowledge_search":
@@ -669,6 +687,7 @@ class AgentCore:
                 "output": observation_output,
                 "data": result.data,
                 "error": result.error,
+                "error_contract": (result.data or {}).get("error_contract") if isinstance(result.data, dict) else None,
                 "execution_time_ms": float(getattr(result, "execution_time_ms", 0.0) or 0.0),
                 "output_tokens_estimate": int(getattr(result, "output_tokens_estimate", 0) or 0),
                 "truncated": bool(getattr(result, "truncated", False)),

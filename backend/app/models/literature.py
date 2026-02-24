@@ -46,9 +46,16 @@ class AnnotationType(str, enum.Enum):
 class KnowledgeLinkStatus(str, enum.Enum):
     """论文入知识库链路状态"""
     PENDING = "pending"
-    PROCESSING = "processing"
-    READY = "ready"
+    RUNNING = "running"
+    COMPLETED = "completed"
     FAILED = "failed"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+
+    # 兼容历史状态名（语义统一到新契约值）
+    PROCESSING = "running"
+    READY = "completed"
+    CANCELED = "cancelled"
 
 
 class AskScope(str, enum.Enum):

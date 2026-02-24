@@ -7,7 +7,9 @@ param(
   [string]$DbContainer = "research_postgres",
   [string]$DbUser = "",
   [string]$DbName = "",
-  [string]$EnvFilePath = ".env"
+  [string]$EnvFilePath = ".env",
+  [int]$MaxRetryAttempts = 4,
+  [int]$RetryBaseDelaySeconds = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +33,79 @@ function Get-EnvValue {
 
   $value = $line.Matches[0].Groups[1].Value.Trim()
   return $value
+}
+
+function Get-ErrorStatusCode {
+  param(
+    [Parameter(Mandatory = $true)]
+    $ErrorRecord
+  )
+
+  try {
+    if ($null -ne $ErrorRecord.Exception.Response -and $null -ne $ErrorRecord.Exception.Response.StatusCode) {
+      return [int]$ErrorRecord.Exception.Response.StatusCode
+    }
+  }
+  catch {}
+
+  $msg = [string]$ErrorRecord.Exception.Message
+  if ($msg -match "(\d{3})") {
+    return [int]$matches[1]
+  }
+  return -1
+}
+
+function Invoke-RestWith429Retry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Action,
+    [Parameter(Mandatory = $true)]
+    [string]$ActionName
+  )
+
+  $attempt = 0
+  while ($attempt -lt $MaxRetryAttempts) {
+    $attempt += 1
+    try {
+      return & $Action
+    }
+    catch {
+      $status = Get-ErrorStatusCode -ErrorRecord $_
+      if ($status -ne 429 -or $attempt -ge $MaxRetryAttempts) {
+        throw
+      }
+
+      $retryAfterSeconds = 0
+      $errorJson = $null
+      try {
+        if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+          $errorJson = $_.ErrorDetails.Message | ConvertFrom-Json
+        }
+      }
+      catch {}
+
+      if ($null -ne $errorJson -and $null -ne $errorJson.detail -and $null -ne $errorJson.detail.retry_after_seconds) {
+        $retryAfterSeconds = [int]$errorJson.detail.retry_after_seconds
+      }
+
+      try {
+        if ($retryAfterSeconds -le 0 -and $null -ne $_.Exception.Response) {
+          $retryHeader = $_.Exception.Response.Headers["Retry-After"]
+          if (-not [string]::IsNullOrWhiteSpace($retryHeader)) {
+            $retryAfterSeconds = [int]$retryHeader
+          }
+        }
+      }
+      catch {}
+
+      if ($retryAfterSeconds -le 0) {
+        $retryAfterSeconds = [Math]::Max(1, [int]($RetryBaseDelaySeconds * [Math]::Pow(2, $attempt - 1)))
+      }
+
+      Write-Host ("[RETRY] action={0}, attempt={1}/{2}, sleep={3}s" -f $ActionName, $attempt, $MaxRetryAttempts, $retryAfterSeconds) -ForegroundColor DarkYellow
+      Start-Sleep -Seconds $retryAfterSeconds
+    }
+  }
 }
 
 function Invoke-PlaywrightCli {
@@ -61,6 +136,33 @@ function Invoke-PlaywrightCode {
   Invoke-PlaywrightCli -Arguments @("run-code", $Code)
 }
 
+function Invoke-PlaywrightOpenWithRetry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Url,
+    [int]$Attempts = 3,
+    [int]$DelaySeconds = 3
+  )
+
+  for ($i = 1; $i -le $Attempts; $i++) {
+    try {
+      Invoke-PlaywrightCli -Arguments @("open", $Url)
+      return
+    }
+    catch {
+      if ($i -ge $Attempts) {
+        throw
+      }
+      Write-Host ("[RETRY] playwright open failed, attempt={0}/{1}, sleep={2}s" -f $i, $Attempts, $DelaySeconds) -ForegroundColor DarkYellow
+      try {
+        Invoke-PlaywrightCli -Arguments @("close")
+      }
+      catch {}
+      Start-Sleep -Seconds $DelaySeconds
+    }
+  }
+}
+
 $dbUserResolved = if ([string]::IsNullOrWhiteSpace($DbUser)) { Get-EnvValue -Path $EnvFilePath -Key "POSTGRES_USER" } else { $DbUser }
 $dbNameResolved = if ([string]::IsNullOrWhiteSpace($DbName)) { Get-EnvValue -Path $EnvFilePath -Key "POSTGRES_DB" } else { $DbName }
 if ([string]::IsNullOrWhiteSpace($dbUserResolved)) { $dbUserResolved = "research_user" }
@@ -79,11 +181,13 @@ $registerPayload = @{
   full_name = "$Role Smoke User"
 } | ConvertTo-Json
 
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "$BackendBaseUrl/api/v1/auth/register" `
-  -ContentType "application/json" `
-  -Body $registerPayload | Out-Null
+Invoke-RestWith429Retry -ActionName "auth/register" -Action {
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri "$BackendBaseUrl/api/v1/auth/register" `
+    -ContentType "application/json" `
+    -Body $registerPayload | Out-Null
+} | Out-Null
 
 $setRoleSql = "UPDATE users SET role='$Role' WHERE email='$email';"
 $verifySql = "SELECT role FROM users WHERE email='$email';"
@@ -113,7 +217,9 @@ else {
 New-Item -ItemType Directory -Force "output/playwright" | Out-Null
 
 try {
-  Invoke-PlaywrightCli -Arguments @("open", "$FrontendBaseUrl/login")
+  # Open a neutral page first to reduce flaky failures in direct open-to-login.
+  Invoke-PlaywrightOpenWithRetry -Url "about:blank"
+  Invoke-PlaywrightCode -Code "(async (page) => { await page.goto('$FrontendBaseUrl/login'); await page.waitForLoadState('domcontentloaded'); })"
 
   Invoke-PlaywrightCode -Code "(async (page) => { await page.locator('input').first().fill('$email'); await page.locator('input[type=password]').first().fill('$password'); await Promise.all([page.waitForURL('**/dashboard', { timeout: 20000 }), page.click('button[type=submit]')]); })"
 

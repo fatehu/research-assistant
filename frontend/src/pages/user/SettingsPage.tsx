@@ -1,5 +1,6 @@
-﻿import React, { useEffect, useMemo, useState } from 'react'
+﻿import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  App,
   Alert,
   Button,
   Card,
@@ -8,7 +9,6 @@ import {
   Form,
   Input,
   List,
-  message,
   Modal,
   Row,
   Select,
@@ -54,6 +54,7 @@ const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
 }
 
 const SettingsPage: React.FC = () => {
+  const { message } = App.useApp()
   const { user, updateUser } = useAuthStore()
   const [llmForm] = Form.useForm()
   const [passwordForm] = Form.useForm()
@@ -89,7 +90,7 @@ const SettingsPage: React.FC = () => {
     }
   }, [user, llmForm])
 
-  const loadMcpConfig = async () => {
+  const loadMcpConfig = useCallback(async () => {
     setMcpLoading(true)
     try {
       const data = await mcpApi.getConfig()
@@ -100,9 +101,9 @@ const SettingsPage: React.FC = () => {
     } finally {
       setMcpLoading(false)
     }
-  }
+  }, [message])
 
-  const loadMcpTemplates = async () => {
+  const loadMcpTemplates = useCallback(async () => {
     try {
       const data = await mcpApi.getTemplates()
       const templates = data.templates || []
@@ -113,7 +114,7 @@ const SettingsPage: React.FC = () => {
     } catch (error) {
       console.error('加载 MCP 模板失败:', error)
     }
-  }
+  }, [])
 
   const applyTemplate = () => {
     const template = mcpTemplates.find((item) => item.id === selectedTemplateId)
@@ -173,7 +174,7 @@ const SettingsPage: React.FC = () => {
   useEffect(() => {
     loadMcpTemplates()
     loadMcpConfig()
-  }, [])
+  }, [loadMcpConfig, loadMcpTemplates])
 
   const mcpReachableCount = useMemo(() => mcpStatus.filter((item) => item.reachable === true).length, [mcpStatus])
   const mcpToolCount = useMemo(() => mcpStatus.reduce((sum, item) => sum + (item.discovered_tools || 0), 0), [mcpStatus])
@@ -267,7 +268,10 @@ const SettingsPage: React.FC = () => {
             name="preferred_llm_provider"
             label={<span style={{ color: '#8899A6' }}>默认服务商</span>}
           >
-            <Select style={{ width: '100%' }} dropdownStyle={{ backgroundColor: '#161B22', borderColor: '#30363D' }}>
+            <Select
+              style={{ width: '100%' }}
+              styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
+            >
               <Option value="deepseek">DeepSeek (deepseek-chat)</Option>
               <Option value="openai">OpenAI (GPT-4o)</Option>
               <Option value="aliyun">Aliyun (qwen-plus)</Option>
@@ -542,7 +546,11 @@ const SettingsPage: React.FC = () => {
             label={<span style={{ color: '#8899A6' }}>新密码</span>}
             rules={[
               { required: true, message: '请输入新密码' },
-              { min: 6, message: '密码长度至少 6 位' },
+              { min: 10, message: '密码长度至少 10 位' },
+              {
+                pattern: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/,
+                message: '密码需包含大小写字母、数字和特殊字符',
+              },
             ]}
           >
             <Input.Password />
@@ -600,3 +608,4 @@ const SettingsPage: React.FC = () => {
 }
 
 export default SettingsPage
+

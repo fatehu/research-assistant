@@ -349,7 +349,7 @@ def _to_float(value: Any) -> Optional[float]:
             return None
         try:
             return float(text)
-        except Exception:
+        except ValueError:
             return None
     return None
 
@@ -665,7 +665,7 @@ async def _retrieve_scope_ready_links(
         if not item:
             missing_paper_ids.append(int(paper_id))
             continue
-        if item.status == KnowledgeLinkStatus.READY.value and item.document_id:
+        if item.status == KnowledgeLinkStatus.COMPLETED.value and item.document_id:
             ready_links.append(item)
             continue
         not_ready.append(
@@ -964,7 +964,7 @@ class LiteratureScopedKnowledgeSearchTool(ToolBase):
                 success=False,
                 output="当前范围没有可检索文档，请先完成入库处理。",
                 data={"results": [], "total": 0},
-                error="no_ready_documents",
+                error="no_completed_documents",
             )
 
         started_at = time.perf_counter()
@@ -1446,8 +1446,8 @@ class LiteratureAskAgentCore(AgentCore):
         if tool_name == "paper_read":
             try:
                 context.allowed_source_labels.update(self._extract_source_labels(executed.observation_output))
-            except Exception:
-                pass
+            except (AttributeError, TypeError):
+                logger.debug("[Literature Ask] skip source-label update: context unavailable")
         return executed
 
     async def _compress_knowledge_observation(
@@ -1599,10 +1599,31 @@ async def _build_literature_agent_tool_registry(
     return registry, {name for name in allowed_tool_names if name}
 
 
+def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Optional[str], Optional[int]]:
+    """
+    根据文档状态统一推导论文入库 link 状态。
+    返回: (link_status, error_message, document_id)
+    """
+    if doc is None:
+        return KnowledgeLinkStatus.FAILED.value, "文档不存在", None
+    normalized_status = str(doc.status or "").strip().lower()
+    if normalized_status == DocumentStatus.COMPLETED.value:
+        return KnowledgeLinkStatus.COMPLETED.value, None, int(doc.id)
+    if normalized_status == DocumentStatus.TIMEOUT.value:
+        return KnowledgeLinkStatus.TIMEOUT.value, (doc.error_message or "文档处理超时"), int(doc.id)
+    if normalized_status in {DocumentStatus.CANCELLED.value, "canceled"}:
+        return KnowledgeLinkStatus.CANCELLED.value, (doc.error_message or "文档处理已取消"), int(doc.id)
+    if normalized_status == DocumentStatus.FAILED.value:
+        return KnowledgeLinkStatus.FAILED.value, (doc.error_message or "文档处理失败"), int(doc.id)
+    if normalized_status == DocumentStatus.PENDING.value:
+        return KnowledgeLinkStatus.PENDING.value, None, int(doc.id)
+    return KnowledgeLinkStatus.RUNNING.value, None, int(doc.id)
+
+
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
     """
     论文入库后台任务：
-    1) link -> processing
+    1) link -> running
     2) 复用 knowledge.process_document_task
     3) 根据 document.status 回写 link 状态
     """
@@ -1613,7 +1634,7 @@ async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_siz
         link = await db.get(PaperKnowledgeLink, link_id)
         if not link:
             return
-        link.status = KnowledgeLinkStatus.PROCESSING.value
+        link.status = KnowledgeLinkStatus.RUNNING.value
         link.error_message = None
         await db.commit()
         await db.refresh(link)
@@ -1627,13 +1648,11 @@ async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_siz
         if not link:
             return
 
-        if doc and doc.status == DocumentStatus.COMPLETED.value:
-            link.status = KnowledgeLinkStatus.READY.value
-            link.error_message = None
-            link.document_id = doc.id
-        else:
-            link.status = KnowledgeLinkStatus.FAILED.value
-            link.error_message = (doc.error_message if doc else "文档处理失败") if doc else "文档不存在"
+        link_status, error_message, resolved_doc_id = _derive_link_status_from_document(doc)
+        link.status = link_status
+        link.error_message = error_message
+        if resolved_doc_id is not None:
+            link.document_id = resolved_doc_id
 
         await db.commit()
         await db.refresh(link)
@@ -2299,10 +2318,12 @@ async def get_collection_knowledge_readiness(
             collection_id=int(collection_id),
             knowledge_base_id=int(knowledge_base_id),
             total_papers=0,
-            ready_papers=0,
-            processing_papers=0,
+            completed_papers=0,
+            running_papers=0,
             pending_papers=0,
             failed_papers=0,
+            timeout_papers=0,
+            cancelled_papers=0,
             missing_papers=0,
             can_cross_paper_answer=False,
             papers=[],
@@ -2320,10 +2341,12 @@ async def get_collection_knowledge_readiness(
     link_by_paper_id = {int(item.paper_id): item for item in links}
 
     counts = {
-        "ready": 0,
-        "processing": 0,
+        "completed": 0,
+        "running": 0,
         "pending": 0,
         "failed": 0,
+        "timeout": 0,
+        "cancelled": 0,
         "missing": 0,
     }
     items: List[CollectionKnowledgeReadinessItem] = []
@@ -2335,14 +2358,18 @@ async def get_collection_knowledge_readiness(
             error_message = None
         else:
             raw_status = str(link.status or "").strip().lower()
-            if raw_status == KnowledgeLinkStatus.READY.value and link.document_id:
-                status_value = "ready"
-            elif raw_status == KnowledgeLinkStatus.PROCESSING.value:
-                status_value = "processing"
+            if raw_status == KnowledgeLinkStatus.COMPLETED.value and link.document_id:
+                status_value = "completed"
+            elif raw_status == KnowledgeLinkStatus.RUNNING.value:
+                status_value = "running"
             elif raw_status == KnowledgeLinkStatus.PENDING.value:
                 status_value = "pending"
             elif raw_status == KnowledgeLinkStatus.FAILED.value:
                 status_value = "failed"
+            elif raw_status == KnowledgeLinkStatus.TIMEOUT.value:
+                status_value = "timeout"
+            elif raw_status in {KnowledgeLinkStatus.CANCELLED.value, "canceled"}:
+                status_value = "cancelled"
             else:
                 status_value = "missing"
             document_id = int(link.document_id) if link.document_id else None
@@ -2364,12 +2391,14 @@ async def get_collection_knowledge_readiness(
         collection_id=int(collection_id),
         knowledge_base_id=int(knowledge_base_id),
         total_papers=len(paper_ids),
-        ready_papers=int(counts["ready"]),
-        processing_papers=int(counts["processing"]),
+        completed_papers=int(counts["completed"]),
+        running_papers=int(counts["running"]),
         pending_papers=int(counts["pending"]),
         failed_papers=int(counts["failed"]),
+        timeout_papers=int(counts["timeout"]),
+        cancelled_papers=int(counts["cancelled"]),
         missing_papers=int(counts["missing"]),
-        can_cross_paper_answer=bool(counts["ready"] > 0),
+        can_cross_paper_answer=bool(counts["completed"] > 0),
         papers=items,
     )
 
@@ -3273,18 +3302,10 @@ async def list_paper_knowledge_links(
         doc = await db.get(Document, int(link.document_id))
         if not doc:
             continue
-        if doc.status == DocumentStatus.COMPLETED.value and link.status != KnowledgeLinkStatus.READY.value:
-            link.status = KnowledgeLinkStatus.READY.value
-            link.error_message = None
-            need_commit = True
-            changed_link_ids.add(int(link.id))
-        elif doc.status == DocumentStatus.FAILED.value and link.status != KnowledgeLinkStatus.FAILED.value:
-            link.status = KnowledgeLinkStatus.FAILED.value
-            link.error_message = doc.error_message
-            need_commit = True
-            changed_link_ids.add(int(link.id))
-        elif doc.status in {DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value} and link.status != KnowledgeLinkStatus.PROCESSING.value:
-            link.status = KnowledgeLinkStatus.PROCESSING.value
+        next_status, next_error, _ = _derive_link_status_from_document(doc)
+        if link.status != next_status or (link.error_message or None) != (next_error or None):
+            link.status = next_status
+            link.error_message = next_error
             need_commit = True
             changed_link_ids.add(int(link.id))
 

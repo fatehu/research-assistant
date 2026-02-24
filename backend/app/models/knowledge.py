@@ -16,8 +16,12 @@ from app.core.database import Base
 # 从 embedding_service 获取实际维度，避免硬编码
 def _get_embedding_dimension() -> int:
     """获取当前配置的嵌入模型维度"""
-    from app.services.embedding_service import MODEL_DIMENSIONS
     from app.config import settings
+    try:
+        # 测试/最小环境下允许 embedding_service 缺省，回退到内置维度映射。
+        from app.services.embedding_service import MODEL_DIMENSIONS
+    except Exception:
+        MODEL_DIMENSIONS = {}
     
     if settings.embedding_provider == "local":
         model = settings.local_embedding_model
@@ -39,10 +43,16 @@ EMBEDDING_DIMENSION = _get_embedding_dimension()
 
 class DocumentStatus(str, enum.Enum):
     """文档状态"""
-    PENDING = "pending"       # 等待处理
-    PROCESSING = "processing" # 处理中
-    COMPLETED = "completed"   # 完成
-    FAILED = "failed"         # 失败
+    PENDING = "pending"         # 等待处理
+    RUNNING = "running"         # 处理中
+    COMPLETED = "completed"     # 完成
+    FAILED = "failed"           # 失败
+    TIMEOUT = "timeout"         # 处理超时
+    CANCELLED = "cancelled"     # 已取消
+
+    # 兼容历史状态名（语义统一到新契约值）
+    PROCESSING = "running"
+    CANCELED = "cancelled"
 
 
 class DocumentType(str, enum.Enum):

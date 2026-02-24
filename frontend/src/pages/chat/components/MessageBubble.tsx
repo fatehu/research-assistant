@@ -32,7 +32,7 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
     return null
   }
 
-  return {
+  const normalized: RagMetrics = {
     knowledge_search_calls: metrics.knowledge_search_calls,
     source_labels_count: Number(metrics.source_labels_count || 0),
     source_labels: Array.isArray(metrics.source_labels) ? metrics.source_labels : [],
@@ -45,6 +45,16 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
     compression_success_chunks: Number(metrics.compression_success_chunks || 0),
     compression_fallback_chunks: Number(metrics.compression_fallback_chunks || 0),
   }
+
+  const ragUsed =
+    normalized.knowledge_search_calls > 0 ||
+    normalized.source_labels_count > 0 ||
+    normalized.answer_citation_count > 0 ||
+    normalized.compression_calls > 0 ||
+    normalized.citation_repair_attempts > 0 ||
+    normalized.citation_repair_successes > 0
+
+  return ragUsed ? normalized : null
 }
 
 /** 消息气泡 - 美化版 */

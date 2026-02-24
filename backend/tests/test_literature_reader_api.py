@@ -11,6 +11,8 @@ from fastapi.responses import FileResponse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.api import literature as literature_api
+from app.models.knowledge import DocumentStatus
+from app.models.literature import KnowledgeLinkStatus
 
 
 class _FakeResult:
@@ -164,3 +166,19 @@ async def test_list_literature_ask_messages_raises_404_for_unknown_session():
         )
 
     assert exc.value.status_code == 404
+
+
+def test_derive_link_status_from_document_completed():
+    doc = SimpleNamespace(id=123, status=DocumentStatus.COMPLETED.value, error_message=None)
+    status, error_message, doc_id = literature_api._derive_link_status_from_document(doc)
+    assert status == KnowledgeLinkStatus.COMPLETED.value
+    assert error_message is None
+    assert doc_id == 123
+
+
+def test_derive_link_status_from_document_processing_clears_error():
+    doc = SimpleNamespace(id=9, status=DocumentStatus.RUNNING.value, error_message="old error")
+    status, error_message, doc_id = literature_api._derive_link_status_from_document(doc)
+    assert status == KnowledgeLinkStatus.RUNNING.value
+    assert error_message is None
+    assert doc_id == 9

@@ -27,6 +27,7 @@
 
 - Docker & Docker Compose
 - 至少 4GB 内存（本地嵌入模型需要）
+- Windows PowerShell 建议执行 `chcp 65001`（避免中文乱码）
 
 ### 部署步骤
 
@@ -44,12 +45,19 @@ cp .env.example .env
 # - CODELAB_RUNNER_TOKEN
 # - LLM API Key（如 DEEPSEEK_API_KEY）
 
-# 3. 启动服务
-docker compose up -d
+# 3. 启动服务（后端/前端强制重建，避免旧镜像残留）
+docker compose up -d --build backend frontend
 
 # 4. 访问
 # 前端: http://localhost:3000
 # 后端 API: http://localhost:8888
+```
+
+```bash
+# 5. 健康检查
+docker compose ps
+docker compose logs --tail 100 backend
+docker compose logs --tail 100 frontend
 ```
 
 ### 服务端口
@@ -60,6 +68,12 @@ docker compose up -d
 | Backend | 8888 | FastAPI 后端 API |
 | PostgreSQL | 5432 | 数据库（含 pgvector 扩展）|
 | Redis | 6379 | 缓存 & 会话管理 |
+
+### 编码与容器闭环约束
+
+- 文本文件统一 UTF-8；容器默认使用 `LANG=C.UTF-8`。
+- 涉及 `Dockerfile`、`requirements.txt`、`.env.example`、迁移脚本改动时，必须使用 `docker compose up -d --build`，不要只 `restart`。
+- 手测前至少完成一次链路：上传文档 -> 处理完成 -> 检索 -> 结果卡片可见。
 
 ## 🔧 配置说明
 

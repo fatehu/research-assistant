@@ -43,11 +43,17 @@ services:
       dockerfile: Dockerfile
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_backend
     # Default enable GPU for local NVIDIA environments; CI disables via .github/docker-compose.ci.yml.
     gpus: ${DOCKER_BACKEND_GPUS:-all}
     environment:
       - APP_ENV=${APP_ENV:-development}
+      # UTF-8 runtime guard: keep logs / Chinese text stable across host shells.
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
+      - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
+      - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
       - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
@@ -75,6 +81,7 @@ services:
       - LOCAL_EMBEDDING_BATCH_SIZE=${LOCAL_EMBEDDING_BATCH_SIZE:-32}
       - LOCAL_EMBEDDING_MAX_LENGTH=${LOCAL_EMBEDDING_MAX_LENGTH:-8192}
       - LOCAL_EMBEDDING_CACHE_DIR=/app/model_cache
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - LOCAL_EMBEDDING_NORMALIZE=${LOCAL_EMBEDDING_NORMALIZE:-true}
       - LOCAL_EMBEDDING_DIMENSION=${LOCAL_EMBEDDING_DIMENSION:-0}
       - ENABLE_RERANKER=${ENABLE_RERANKER:-true}
@@ -151,13 +158,19 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_codelab_runner
     environment:
       - APP_ENV=${APP_ENV:-development}
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
+      - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
+      - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
       - CODELAB_RUNNER_TOKEN=${CODELAB_RUNNER_TOKEN:?CODELAB_RUNNER_TOKEN is required}
       - CODELAB_EXEC_TIMEOUT_HARD_SECONDS=${CODELAB_EXEC_TIMEOUT_HARD_SECONDS:-20}
       - PYTHONUNBUFFERED=1
-      - LANG=C.UTF-8
     command: uvicorn app.sandbox_runner.main:app --host 0.0.0.0 --port 8099
     restart: unless-stopped
     deploy:
@@ -174,9 +187,16 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_mcp_web
     environment:
       - SERPER_API_KEY=${SERPER_API_KEY}
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
+      - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
+      - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
       - MCP_WEB_HOST=${MCP_WEB_HOST:-0.0.0.0}
       - MCP_WEB_PORT=${MCP_WEB_PORT:-8091}
       - MCP_WEB_TRANSPORT=${MCP_WEB_TRANSPORT:-streamable-http}
@@ -193,8 +213,15 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     container_name: research_mcp_literature
     environment:
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
+      - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
+      - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
       - MCP_LITERATURE_HOST=${MCP_LITERATURE_HOST:-0.0.0.0}
       - MCP_LITERATURE_PORT=${MCP_LITERATURE_PORT:-8092}
       - MCP_LITERATURE_TRANSPORT=${MCP_LITERATURE_TRANSPORT:-streamable-http}
@@ -212,6 +239,8 @@ services:
       dockerfile: Dockerfile
     container_name: research_frontend
     environment:
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
       - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8888}
       - VITE_WS_BASE_URL=${VITE_WS_BASE_URL:-ws://localhost:8888}
       - VITE_SHOW_RAG_METRICS=${VITE_SHOW_RAG_METRICS:-false}

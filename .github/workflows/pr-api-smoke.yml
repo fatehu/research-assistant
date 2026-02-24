@@ -54,6 +54,9 @@ jobs:
       - name: Broad exception guard
         run: python backend/checks/check_no_new_broad_excepts.py
 
+      - name: Contract alignment guard
+        run: python backend/checks/check_contract_alignment.py
+
       - name: Prepare artifact folders
         if: always()
         run: |

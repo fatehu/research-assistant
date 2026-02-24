@@ -157,7 +157,7 @@ class CollectionWithPapers(CollectionResponse):
 class CollectionKnowledgeReadinessItem(BaseModel):
     paper_id: int
     title: str
-    status: Literal["ready", "processing", "pending", "failed", "missing"]
+    status: Literal["completed", "running", "pending", "failed", "timeout", "cancelled", "missing"]
     document_id: Optional[int] = None
     error_message: Optional[str] = None
     pdf_available: bool = False
@@ -167,10 +167,12 @@ class CollectionKnowledgeReadinessResponse(BaseModel):
     collection_id: int
     knowledge_base_id: int
     total_papers: int
-    ready_papers: int
-    processing_papers: int
+    completed_papers: int
+    running_papers: int
     pending_papers: int
     failed_papers: int
+    timeout_papers: int
+    cancelled_papers: int
     missing_papers: int
     can_cross_paper_answer: bool
     papers: List[CollectionKnowledgeReadinessItem] = Field(default_factory=list)
@@ -339,7 +341,7 @@ class PaperKnowledgeLinkResponse(BaseModel):
     paper_id: int
     knowledge_base_id: int
     document_id: Optional[int] = None
-    status: Literal["pending", "processing", "ready", "failed"]
+    status: Literal["pending", "running", "completed", "failed", "timeout", "cancelled"]
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime

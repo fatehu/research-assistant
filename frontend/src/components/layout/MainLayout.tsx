@@ -33,7 +33,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAuthStore } from '@/stores/authStore'
 import { useChatStore } from '@/stores/chatStore'
-import type { Conversation } from '@/services/api'
+import { chatApi, type Conversation } from '@/services/api'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import 'dayjs/locale/zh-cn'
@@ -254,7 +254,6 @@ const MainLayout = () => {
     searchTimeoutRef.current = setTimeout(async () => {
       setIsSearching(true)
       try {
-        const { chatApi } = await import('@/services/api')
         const response = await chatApi.searchMessages(value.trim(), 20)
         setSearchResults(response.results)
         setShowSearchResults(true)

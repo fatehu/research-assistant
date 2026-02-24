@@ -8,7 +8,7 @@
  * 4. cells - notebook 的所有 cells
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Button, Input, Tooltip, Spin, message, Popconfirm, Tag, Switch } from 'antd'
 import {
   RobotOutlined, SendOutlined, CloseOutlined, DeleteOutlined, CopyOutlined,
@@ -21,7 +21,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { SHOW_RAG_METRICS, agentApi, AgentMessage, AgentCodeBlock, Cell, RagMetrics } from '@/services/api'
+import { SHOW_RAG_METRICS, agentApi, AgentMessage, AgentCodeBlock, Cell, RagMetrics, ReactStep } from '@/services/api'
+import HistoryReActPanel from '@/pages/chat/components/HistoryReActPanel'
 
 const { TextArea } = Input
 
@@ -61,7 +62,7 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
     return null
   }
 
-  return {
+  const normalized: RagMetrics = {
     knowledge_search_calls: metrics.knowledge_search_calls,
     source_labels_count: Number(metrics.source_labels_count || 0),
     source_labels: Array.isArray(metrics.source_labels) ? metrics.source_labels : [],
@@ -74,6 +75,16 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
     compression_success_chunks: Number(metrics.compression_success_chunks || 0),
     compression_fallback_chunks: Number(metrics.compression_fallback_chunks || 0),
   }
+
+  const ragUsed =
+    normalized.knowledge_search_calls > 0 ||
+    normalized.source_labels_count > 0 ||
+    normalized.answer_citation_count > 0 ||
+    normalized.compression_calls > 0 ||
+    normalized.citation_repair_attempts > 0 ||
+    normalized.citation_repair_successes > 0
+
+  return ragUsed ? normalized : null
 }
 
 const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
@@ -86,6 +97,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const [streamingReActSteps, setStreamingReActSteps] = useState<ReactStep[]>([])
   const [isAuthorized, setIsAuthorized] = useState(false)  // 授权状态
   const [, setPendingAuthAction] = useState<string | null>(null)
   
@@ -93,11 +105,19 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const inputRef = useRef<any>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
 
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior })
   }, [])
 
-  useEffect(() => { scrollToBottom() }, [messages, streamingContent, scrollToBottom])
+  useEffect(() => {
+    scrollToBottom('smooth')
+  }, [messages, scrollToBottom])
+
+  useEffect(() => {
+    if (!streamingContent && streamingReActSteps.length === 0) return
+    // 流式阶段避免每个 token 执行 smooth 动画，减少卡顿。
+    scrollToBottom('auto')
+  }, [streamingContent, streamingReActSteps.length, scrollToBottom])
 
   const loadHistory = useCallback(async () => {
     if (!notebookId) return
@@ -142,11 +162,18 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
     setInputValue('')
     setIsLoading(true)
     setStreamingContent('')
+    setStreamingReActSteps([])
     abortControllerRef.current = new AbortController()
 
     try {
       let fullContent = ''
       let codeBlocks: AgentCodeBlock[] = []
+      const reactSteps: ReactStep[] = []
+
+      const pushReactStep = (step: ReactStep) => {
+        reactSteps.push(step)
+        setStreamingReActSteps([...reactSteps])
+      }
 
       await agentApi.chat(
         notebookId,
@@ -156,18 +183,30 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             fullContent += event.content
             setStreamingContent(fullContent)
           } else if (event.type === 'thought') {
-            // 可选：显示思考过程
-            fullContent += `\n💭 *${event.content}*\n`
-            setStreamingContent(fullContent)
+            const iteration = Number(event.iteration || 0)
+            pushReactStep({
+              type: 'thought',
+              iteration: Number.isFinite(iteration) && iteration > 0
+                ? iteration
+                : Math.max(1, reactSteps.filter((s) => s.type === 'thought').length + 1),
+              content: String(event.content || ''),
+            })
           } else if (event.type === 'action') {
-            // 显示工具调用
-            fullContent += `\n🔧 调用工具: ${event.tool}\n`
-            setStreamingContent(fullContent)
+            const iteration = Number(event.iteration || 0)
+            pushReactStep({
+              type: 'action',
+              iteration: Number.isFinite(iteration) && iteration > 0 ? iteration : 1,
+              tool: event.tool,
+              input: event.input || {},
+            })
           } else if (event.type === 'observation') {
-            // 显示工具结果
-            const status = event.success ? '✅' : '❌'
-            fullContent += `\n${status} 结果: ${event.output || ''}\n`
-            setStreamingContent(fullContent)
+            const iteration = Number(event.iteration || 0)
+            pushReactStep({
+              type: 'observation',
+              iteration: Number.isFinite(iteration) && iteration > 0 ? iteration : 1,
+              output: String(event.output || ''),
+              success: Boolean(event.success),
+            })
             
             // 如果有新 Cell，直接添加到 Notebook（实时更新）
             if (event.notebook_updated && event.new_cell && onAddCell) {
@@ -188,20 +227,24 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             message.warning(`操作需要授权: ${event.action}`)
           } else if (event.type === 'done') {
             codeBlocks = event.code_blocks || []
+            const normalizedRag = parseRagMetrics(event.rag_metrics)
+            const metadata: Record<string, unknown> = {}
+            if (event.suggested_action) metadata.suggested_action = event.suggested_action
+            if (event.suggested_code) metadata.suggested_code = event.suggested_code
+            if (normalizedRag) metadata.rag_metrics = normalizedRag
+            if (reactSteps.length > 0) metadata.react_steps = [...reactSteps]
+
             const assistantMessage: AgentMessage = {
               id: Date.now().toString(),
               role: 'assistant',
               content: fullContent,
               code_blocks: codeBlocks,
               timestamp: new Date().toISOString(),
-              metadata: {
-                suggested_action: event.suggested_action,
-                suggested_code: event.suggested_code,
-                rag_metrics: event.rag_metrics,
-              },
+              metadata,
             }
             setMessages(prev => [...prev, assistantMessage])
             setStreamingContent('')
+            setStreamingReActSteps([])
           } else if (event.type === 'error') {
             message.error(event.error || '请求失败')
           }
@@ -215,6 +258,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
       }
     } finally {
       setIsLoading(false)
+      setStreamingReActSteps([])
       abortControllerRef.current = null
     }
   }
@@ -224,12 +268,20 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
       abortControllerRef.current.abort()
       setIsLoading(false)
       setStreamingContent('')
+      setStreamingReActSteps([])
     }
   }
 
-  const copyCode = (code: string) => { navigator.clipboard.writeText(code); message.success('代码已复制') }
-  const insertCode = (code: string) => { if (onInsertCode) onInsertCode(code) }
-  const runCode = (code: string) => { if (onRunCode) onRunCode(code) }
+  const copyCode = useCallback((code: string) => {
+    navigator.clipboard.writeText(code)
+    message.success('代码已复制')
+  }, [])
+  const insertCode = useCallback((code: string) => {
+    if (onInsertCode) onInsertCode(code)
+  }, [onInsertCode])
+  const runCode = useCallback((code: string) => {
+    if (onRunCode) onRunCode(code)
+  }, [onRunCode])
   const handleQuickAction = (action: typeof quickActions[0]) => { sendMessage(action.prompt) }
 
   const getContextInfo = () => {
@@ -242,9 +294,11 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
   const contextInfo = getContextInfo()
 
-  const renderMessageContent = (msg: AgentMessage) => {
+  const renderMessageContent = useCallback((msg: AgentMessage) => {
     const isUser = msg.role === 'user'
     const ragMetrics = !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
+    const reactSteps =
+      !isUser && Array.isArray(msg.metadata?.react_steps) ? (msg.metadata.react_steps as ReactStep[]) : []
     
     return (
       <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
@@ -252,6 +306,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
           {isUser ? <span className="text-white text-sm font-medium">U</span> : <RobotOutlined className="text-white text-sm" />}
         </div>
         <div className={`flex-1 max-w-[85%] ${isUser ? 'text-right' : ''}`}>
+          {!isUser && reactSteps.length > 0 ? <HistoryReActPanel steps={reactSteps} /> : null}
           <div className={`inline-block rounded-2xl px-4 py-2 ${isUser ? 'bg-blue-500 text-white rounded-tr-sm' : 'bg-slate-800 text-slate-200 rounded-tl-sm'}`}>
             {isUser ? (
               <p className="whitespace-pre-wrap">{msg.content}</p>
@@ -310,26 +365,34 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
         </div>
       </div>
     )
-  }
+  }, [copyCode, insertCode, onInsertCode, onRunCode, runCode])
 
   const renderStreamingContent = () => {
-    if (!streamingContent) return null
+    if (!streamingContent && streamingReActSteps.length === 0) return null
     return (
-      <div className="flex gap-3">
-        <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
-          <RobotOutlined className="text-white text-sm" />
-        </div>
-        <div className="flex-1 max-w-[85%]">
-          <div className="inline-block rounded-2xl rounded-tl-sm px-4 py-2 bg-slate-800 text-slate-200">
-            <div className="prose prose-invert prose-sm max-w-none">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingContent}</ReactMarkdown>
+      <div className="space-y-3">
+        {streamingReActSteps.length > 0 ? <HistoryReActPanel steps={streamingReActSteps} defaultExpanded /> : null}
+        <div className="flex gap-3">
+          <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
+            <RobotOutlined className="text-white text-sm" />
+          </div>
+          <div className="flex-1 max-w-[85%]">
+            <div className="inline-block rounded-2xl rounded-tl-sm px-4 py-2 bg-slate-800 text-slate-200">
+              <div className="prose prose-invert prose-sm max-w-none">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingContent}</ReactMarkdown>
+              </div>
+              <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse ml-1" />
             </div>
-            <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse ml-1" />
           </div>
         </div>
       </div>
     )
   }
+
+  const renderedMessages = useMemo(
+    () => messages.map((msg) => <div key={msg.id}>{renderMessageContent(msg)}</div>),
+    [messages, renderMessageContent],
+  )
 
   if (!isVisible) return null
 
@@ -353,35 +416,61 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
         </div>
 
         {/* Notebook 控制面板 */}
-        {contextInfo && (
-          <div className="flex-shrink-0 px-4 py-2 border-b border-slate-800 bg-slate-800/30">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-slate-400 text-xs">Notebook 上下文</span>
-              <div className="flex gap-2">
-                {onFocusCell && <Tooltip title="跳转到当前 Cell"><Button type="text" size="small" icon={<AimOutlined />} onClick={() => onFocusCell(currentCellIndex)} className="text-slate-400 hover:text-emerald-400 text-xs">Cell {currentCellIndex + 1}</Button></Tooltip>}
-                {onClearOutputs && <Tooltip title="清除所有输出"><Button type="text" size="small" icon={<ClearOutlined />} onClick={onClearOutputs} className="text-slate-400 hover:text-amber-400" /></Tooltip>}
-              </div>
-            </div>
-            <div className="flex items-center justify-between">
-              <div className="flex gap-2 flex-wrap">
-                <Tag color="green" className="text-xs">{contextInfo.codeCount} 代码</Tag>
-                <Tag color="blue" className="text-xs">{contextInfo.mdCount} Markdown</Tag>
-                {contextInfo.hasOutputs && <Tag color="orange" className="text-xs">有输出</Tag>}
-              </div>
-              <Tooltip title={isAuthorized ? 'AI 可以执行代码、安装包、操作单元格' : '开启后 AI 可以直接操作 Notebook'}>
-                <div className="flex items-center gap-2">
-                  <span className="text-slate-500 text-xs">允许 AI 操作</span>
-                  <Switch 
-                    size="small" 
-                    checked={isAuthorized} 
-                    onChange={setIsAuthorized}
-                    className={isAuthorized ? 'bg-emerald-500' : ''}
+        <div className="flex-shrink-0 px-4 py-2 border-b border-slate-800 bg-slate-800/30">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-slate-400 text-xs">Notebook 上下文</span>
+            <div className="flex gap-2">
+              {onFocusCell && contextInfo ? (
+                <Tooltip title="跳转到当前 Cell">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<AimOutlined />}
+                    onClick={() => onFocusCell(currentCellIndex)}
+                    className="text-slate-400 hover:text-emerald-400 text-xs"
+                  >
+                    Cell {currentCellIndex + 1}
+                  </Button>
+                </Tooltip>
+              ) : null}
+              {onClearOutputs && contextInfo ? (
+                <Tooltip title="清除所有输出">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<ClearOutlined />}
+                    onClick={onClearOutputs}
+                    className="text-slate-400 hover:text-amber-400"
                   />
-                </div>
-              </Tooltip>
+                </Tooltip>
+              ) : null}
             </div>
           </div>
-        )}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex gap-2 flex-wrap">
+              {contextInfo ? (
+                <>
+                  <Tag color="green" className="text-xs">{contextInfo.codeCount} 代码</Tag>
+                  <Tag color="blue" className="text-xs">{contextInfo.mdCount} Markdown</Tag>
+                  {contextInfo.hasOutputs ? <Tag color="orange" className="text-xs">有输出</Tag> : null}
+                </>
+              ) : (
+                <Tag className="text-xs" color="default">尚未添加单元格</Tag>
+              )}
+            </div>
+            <Tooltip title={isAuthorized ? 'AI 可以执行代码、安装包、操作单元格' : '开启后 AI 可以直接操作 Notebook'}>
+              <div className="flex items-center gap-2">
+                <span className="text-slate-500 text-xs">允许 AI 操作</span>
+                <Switch
+                  size="small"
+                  checked={isAuthorized}
+                  onChange={setIsAuthorized}
+                  className={isAuthorized ? 'bg-emerald-500' : ''}
+                />
+              </div>
+            </Tooltip>
+          </div>
+        </div>
 
         {/* 快捷操作 */}
         <div className="flex-shrink-0 px-4 py-2 border-b border-slate-800 bg-slate-900/50">
@@ -398,7 +487,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {isLoadingHistory ? (
             <div className="flex items-center justify-center h-full"><Spin /></div>
-          ) : messages.length === 0 && !streamingContent ? (
+          ) : messages.length === 0 && !streamingContent && streamingReActSteps.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/20 to-teal-500/20 flex items-center justify-center mb-4"><RobotOutlined className="text-3xl text-emerald-400" /></div>
               <h4 className="text-white font-medium mb-2">AI 编程助手</h4>
@@ -406,7 +495,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             </div>
           ) : (
             <>
-              {messages.map(msg => <div key={msg.id}>{renderMessageContent(msg)}</div>)}
+              {renderedMessages}
               {renderStreamingContent()}
             </>
           )}

@@ -34,6 +34,10 @@ from app.services.contextual_retrieval_service import (
     merge_adjacent_context,
     normalize_adjacent_window,
 )
+from app.services.agent_tool_error_contract import (
+    build_tool_error_contract,
+    merge_error_contract,
+)
 from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
 
 # 尝试导入共享模块（可选）
@@ -105,11 +109,18 @@ class ToolBase(Tool, ABC):
 
     @staticmethod
     def _validation_error_result(exc: ValidationError) -> ToolResult:
+        contract = build_tool_error_contract(
+            code="validation_error",
+            message="工具参数校验失败，请检查输入格式。",
+            stage="validate_input",
+            detail=str(exc),
+            retryable=False,
+        )
         return ToolResult(
             success=False,
-            output="工具参数校验失败，请检查输入格式。",
-            error="validation_error",
-            data={"validation_errors": exc.errors()},
+            output=str(contract["message"]),
+            error=str(contract["code"]),
+            data=merge_error_contract({"validation_errors": exc.errors()}, contract),
         )
 
     @staticmethod
@@ -193,16 +204,43 @@ class ToolBase(Tool, ABC):
                         retry_attempt=attempt,
                     )
             except asyncio.TimeoutError:
+                contract = build_tool_error_contract(
+                    code="timeout",
+                    message=f"工具执行超时（>{timeout_seconds:.1f}s）",
+                    tool_name=self.name,
+                    stage="execute",
+                    retryable=(attempt < max_attempts),
+                    metadata={
+                        "timeout_seconds": timeout_seconds,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                    },
+                )
                 last_result = ToolResult(
                     success=False,
-                    output=f"工具执行超时（>{timeout_seconds:.1f}s）",
-                    error="timeout",
+                    output=str(contract["message"]),
+                    error=str(contract["code"]),
+                    data=merge_error_contract(None, contract),
                 )
             except Exception as exc:
+                contract = build_tool_error_contract(
+                    code="tool_execution_exception",
+                    message="工具执行失败",
+                    tool_name=self.name,
+                    stage="execute",
+                    detail=str(exc),
+                    retryable=(attempt < max_attempts),
+                    metadata={
+                        "exception_type": type(exc).__name__,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                    },
+                )
                 last_result = ToolResult(
                     success=False,
-                    output=f"工具执行失败: {exc}",
-                    error=type(exc).__name__,
+                    output=f"{contract['message']}: {exc}",
+                    error=str(contract["code"]),
+                    data=merge_error_contract(None, contract),
                 )
 
             if attempt < max_attempts:
@@ -2229,7 +2267,31 @@ class ToolRegistry:
 
         if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
             return "literature_task"
-        if any(token in text for token in ["代码", "notebook", "python", "cell", "运行", "debug", "报错"]):
+        if any(
+            token in text
+            for token in [
+                "代码",
+                "notebook",
+                "python",
+                "cell",
+                "运行",
+                "debug",
+                "报错",
+                "画图",
+                "绘图",
+                "可视化",
+                "plot",
+                "matplotlib",
+                "seaborn",
+                "pandas",
+                "numpy",
+                "余弦",
+                "正弦",
+                "散点图",
+                "折线图",
+                "柱状图",
+            ]
+        ):
             return "code_task"
 
         knowledge_tokens = [
@@ -2311,6 +2373,19 @@ class ToolRegistry:
         resolved_intent = intent if intent in self._INTENT_TOOL_MAP else self.classify_intent(user_text)
         selected = set(self._INTENT_TOOL_MAP.get(resolved_intent, set()))
         selected.update(self._fallback_tools())
+
+        # Notebook 场景下默认保留代码工具，避免普通表述被误判为 general_chat 后无法操作 notebook。
+        if self.notebook_id and self.kernel_manager:
+            selected.update(
+                {
+                    "notebook_execute",
+                    "notebook_variables",
+                    "notebook_cell",
+                    "notebook_cleanup",
+                    "pip_install",
+                    "code_analysis",
+                }
+            )
 
         for tool in self._iter_all_tools():
             if tool.name.startswith("mcp.") and self._mcp_tool_matches_intent(tool, resolved_intent):
@@ -2425,10 +2500,20 @@ class ToolRegistry:
                 return result
             except Exception as e:
                 logger.error(f"工具执行失败 {tool_name}: {e}")
+                contract = build_tool_error_contract(
+                    code="tool_execute_failed",
+                    message="工具执行失败",
+                    tool_name=tool_name,
+                    stage="dispatch",
+                    detail=str(e),
+                    retryable=False,
+                    metadata={"exception_type": type(e).__name__},
+                )
                 return ToolResult(
                     success=False,
-                    output=f"工具执行失败: {str(e)}",
-                    error=str(e)
+                    output=f"{contract['message']}: {e}",
+                    error=str(contract["code"]),
+                    data=merge_error_contract(None, contract),
                 )
 
         if self._mcp_client_manager:
@@ -2441,10 +2526,19 @@ class ToolRegistry:
                     error=mcp_result.error,
                 )
 
+        contract = build_tool_error_contract(
+            code="tool_not_found",
+            message=f"未找到工具: {tool_name}",
+            tool_name=tool_name,
+            stage="dispatch",
+            retryable=False,
+            metadata={"available_tools": [t.name for t in self._iter_all_tools()]},
+        )
         return ToolResult(
             success=False,
-            output=f"未找到工具: {tool_name}。可用工具: {', '.join([t.name for t in self._iter_all_tools()])}",
-            error="tool_not_found"
+            output=f"{contract['message']}。可用工具: {', '.join(contract['metadata']['available_tools'])}",
+            error=str(contract["code"]),
+            data=merge_error_contract(None, contract),
         )
 
 

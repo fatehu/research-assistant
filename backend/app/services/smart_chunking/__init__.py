@@ -23,6 +23,9 @@ from .service import (
     chunk_document_smart,
     get_preset_config,
 )
+from .academic_detector import AcademicStructureDetector
+from .semantic_chunker import SemanticChunker
+from .hierarchical_chunker import HierarchicalChunker
 
 from .token_utils import (
     estimate_tokens,
@@ -48,6 +51,10 @@ __all__ = [
     "smart_chunking_service",
     "chunk_document_smart",
     "get_preset_config",
+    # Backward-compatible concrete classes
+    "AcademicStructureDetector",
+    "SemanticChunker",
+    "HierarchicalChunker",
     # Token utils
     "estimate_tokens",
     "tokens_to_chars",
