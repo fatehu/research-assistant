@@ -933,6 +933,12 @@ export default function PaperReaderPage() {
     await loadPdfSource()
   }
 
+  const reloadCoreDataRef = useRef(reloadCoreData)
+  reloadCoreDataRef.current = reloadCoreData
+
+  const reloadAskSessionsRef = useRef(reloadAskSessions)
+  reloadAskSessionsRef.current = reloadAskSessions
+
   useEffect(() => {
     if (!validPaperId) return
     let mounted = true
@@ -942,7 +948,7 @@ export default function PaperReaderPage() {
     setReaderAutoSaveError('')
     setReaderAutoSaveAt('')
     setLoading(true)
-    reloadCoreData()
+    reloadCoreDataRef.current()
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : '加载论文阅读页失败'
         message.error(msg)
@@ -1110,7 +1116,7 @@ export default function PaperReaderPage() {
 
   useEffect(() => {
     if (!validPaperId) return
-    reloadAskSessions(askScope, askCollectionId).catch(() => {
+    reloadAskSessionsRef.current(askScope, askCollectionId).catch(() => {
       message.error('加载询问会话失败')
     })
   }, [validPaperId, askScope, askCollectionId, parsedPaperId])

@@ -264,7 +264,7 @@ const AnnouncementCard: React.FC<{
       marginBottom: 12,
       borderWidth: announcement.is_read ? 1 : 2,
     }}
-    bodyStyle={{ padding: '16px 20px' }}
+    styles={{ body: { padding: '16px 20px' } }}
   >
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
       <div style={{ flex: 1 }}>

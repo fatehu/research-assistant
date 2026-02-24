@@ -2,7 +2,7 @@
  * 管理员 - 用户管理页面
  * 设计风格: 学术深空 - 深色背景配合优雅的金色与蓝色点缀
  */
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Table, Tag, Space, Button, Input, Select, Modal, message,
   Card, Row, Col, Avatar, Tooltip, Dropdown, Badge, Form,
@@ -66,27 +66,51 @@ const UsersPage: React.FC = () => {
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
   const [passwordForm] = Form.useForm();
+  const queryStateRef = useRef({
+    pagination,
+    roleFilter,
+    activeFilter,
+    searchText,
+  });
+
+  useEffect(() => {
+    queryStateRef.current = {
+      pagination,
+      roleFilter,
+      activeFilter,
+      searchText,
+    };
+  }, [pagination, roleFilter, activeFilter, searchText]);
+
+  const loadUsers = useCallback((params?: { current?: number; pageSize?: number }) => {
+    const {
+      pagination: currentPagination,
+      roleFilter: currentRoleFilter,
+      activeFilter: currentActiveFilter,
+      searchText: currentSearchText,
+    } = queryStateRef.current;
+    const current = params?.current || currentPagination.current;
+    const pageSize = params?.pageSize || currentPagination.pageSize;
+
+    fetchUsers({
+      skip: (current - 1) * pageSize,
+      limit: pageSize,
+      role: currentRoleFilter,
+      search: currentSearchText || undefined,
+      is_active: currentActiveFilter,
+    });
+  }, [fetchUsers]);
 
   useEffect(() => {
     fetchStatistics();
     loadUsers();
-  }, []);
+  }, [fetchStatistics, loadUsers]);
 
   // 当筛选条件改变时重新加载
   useEffect(() => {
     loadUsers({ current: 1 });
     setPagination(p => ({ ...p, current: 1 }));
-  }, [roleFilter, activeFilter]);
-
-  const loadUsers = (params?: any) => {
-    fetchUsers({
-      skip: ((params?.current || pagination.current) - 1) * (params?.pageSize || pagination.pageSize),
-      limit: params?.pageSize || pagination.pageSize,
-      role: roleFilter,
-      search: searchText || undefined,
-      is_active: activeFilter,
-    });
-  };
+  }, [roleFilter, activeFilter, loadUsers]);
 
   const handleSearch = () => {
     setPagination({ ...pagination, current: 1 });

@@ -52,14 +52,12 @@ export const TeamPage = () => {
   useEffect(() => {
     if (isStudent()) {
       fetchMyMentorship()
-      if (!myMentorship) {
-        fetchMentors()
-      }
+      fetchMentors()
     } else if (isMentor()) {
       fetchPendingRequests()
       fetchMyStudents()
     }
-  }, [user?.role])
+  }, [fetchMentors, fetchMyMentorship, fetchMyStudents, fetchPendingRequests, isMentor, isStudent, user?.role])
 
   // 刷新数据
   const handleRefresh = () => {
@@ -88,7 +86,7 @@ export const TeamPage = () => {
       message.error(error)
       clearError()
     }
-  }, [error])
+  }, [clearError, error])
 
   // 过滤导师列表
   const filteredMentors = mentors.filter(mentor => {

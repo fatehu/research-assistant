@@ -164,7 +164,7 @@ export default function CitationGraph({ data, onNodeClick, loading }: CitationGr
         networkRef.current = null
       }
     }
-  }, [data, layout, physics])
+  }, [data, layout, physics, onNodeClick])
 
   // 获取布局配置
   const getLayoutOptions = (layoutType: string) => {

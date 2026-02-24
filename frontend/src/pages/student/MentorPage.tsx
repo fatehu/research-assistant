@@ -38,7 +38,7 @@ const MentorPage: React.FC = () => {
   useEffect(() => {
     fetchMentor();
     fetchInvitations();
-  }, []);
+  }, [fetchInvitations, fetchMentor]);
 
   // 收到的邀请（从导师发来的）
   const receivedInvitations = invitations.filter(
@@ -154,7 +154,7 @@ const MentorPage: React.FC = () => {
             borderRadius: 20,
             overflow: 'hidden',
           }}
-          bodyStyle={{ padding: 0 }}
+          styles={{ body: { padding: 0 } }}
         >
           <div style={{
             background: 'linear-gradient(135deg, #D4AF3715 0%, #fa8c1610 100%)',
@@ -209,7 +209,7 @@ const MentorPage: React.FC = () => {
           borderRadius: 20,
           overflow: 'hidden',
         }}
-        bodyStyle={{ padding: 0 }}
+        styles={{ body: { padding: 0 } }}
       >
         {/* 导师头部 */}
         <div style={{
@@ -300,7 +300,7 @@ const MentorPage: React.FC = () => {
         borderColor: '#52c41a50',
         borderRadius: 16,
       }}
-      bodyStyle={{ padding: '20px 24px' }}
+      styles={{ body: { padding: '20px 24px' } }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <Avatar 

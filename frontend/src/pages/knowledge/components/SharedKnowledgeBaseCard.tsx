@@ -20,7 +20,7 @@ const SharedKnowledgeBaseCard = ({ kb, onClick }: SharedKnowledgeBaseCardProps) 
     >
       <Card
         className="bg-slate-800/50 border-slate-700/50 hover:border-purple-500/50 transition-all"
-        bodyStyle={{ padding: '20px' }}
+        styles={{ body: { padding: '20px' } }}
       >
         <div className="flex items-start justify-between mb-4">
           <div className="flex items-center gap-3">
