@@ -1,6 +1,6 @@
 import { Fragment, type CSSProperties, type ReactNode, useState } from 'react'
-import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Typography, message } from 'antd'
-import { DownOutlined, DragOutlined, LinkOutlined, ReloadOutlined, ShrinkOutlined } from '@ant-design/icons'
+import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Popover, Typography, message } from 'antd'
+import { DownOutlined, DragOutlined, LinkOutlined, ReloadOutlined, ShrinkOutlined, PlusOutlined } from '@ant-design/icons'
 
 import type {
   ReaderComponentNode,
@@ -19,6 +19,7 @@ export type ReaderComponentRenderContext = {
   onNodeAction?: (node: ReaderComponentNode, action: 'regenerate' | 'degrade') => void
   onInlineQuery?: (node: ReaderComponentNode, question: string) => Promise<void> | void
   onDropMarkdown?: (markdown: string, node?: ReaderComponentNode) => void
+  onManualInsertSlot?: (nodeId: string) => void
 }
 
 function asString(value: unknown): string {
@@ -120,50 +121,62 @@ function ActionBar(props: {
   extraActions?: ReactNode
 }): ReactNode {
   const { node, ctx, extraActions } = props
+  const [hovered, setHovered] = useState(false)
   const markdown = componentToMarkdown(node)
   const canJump = Array.isArray(node.source_anchor_refs) && node.source_anchor_refs.length > 0
   return (
-    <Space size={6} wrap style={{ marginBottom: 8 }}>
-      <Button
-        size="small"
-        icon={<ReloadOutlined />}
-        onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
-      >
-        修复
-      </Button>
-      <Button
-        size="small"
-        icon={<ShrinkOutlined />}
-        onClick={() => ctx.onNodeAction?.(node, 'degrade')}
-      >
-        降级
-      </Button>
-      <Button
-        size="small"
-        icon={<LinkOutlined />}
-        disabled={!canJump}
-        onClick={() => ctx.onJumpAnchor?.(node.source_anchor_refs || [], { pinPreview: true })}
-      >
-        定位到证据
-      </Button>
-      <Button
-        size="small"
-        onClick={async () => {
-          try {
-            await navigator.clipboard.writeText(markdown)
-            message.success('已复制为 Markdown')
-          } catch {
-            message.warning('复制失败，请检查浏览器权限')
-          }
-        }}
-      >
-        复制Markdown
-      </Button>
-      {extraActions}
-    </Space>
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        opacity: hovered ? 1 : 0.15,
+        transition: 'opacity 0.25s',
+        marginBottom: 8,
+        display: 'flex',
+        justifyContent: 'flex-end', // 靠右对齐更不影响阅读
+      }}
+    >
+      <Space size={6} wrap>
+        <Button
+          size="small"
+          icon={<ReloadOutlined />}
+          onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
+        >
+          修复
+        </Button>
+        <Button
+          size="small"
+          icon={<ShrinkOutlined />}
+          onClick={() => ctx.onNodeAction?.(node, 'degrade')}
+        >
+          降级
+        </Button>
+        <Button
+          size="small"
+          icon={<LinkOutlined />}
+          disabled={!canJump}
+          onClick={() => ctx.onJumpAnchor?.(node.source_anchor_refs || [], { pinPreview: true })}
+        >
+          定位到证据
+        </Button>
+        <Button
+          size="small"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(markdown)
+              message.success('已复制为 Markdown')
+            } catch {
+              message.warning('复制失败，请检查浏览器权限')
+            }
+          }}
+        >
+          复制Markdown
+        </Button>
+        {extraActions}
+      </Space>
+    </div>
   )
 }
-
 function DraggableContainer(props: {
   node: ReaderComponentNode
   children: ReactNode
@@ -235,12 +248,73 @@ function InlineQuerySlotNode(props: {
   )
 }
 
+function ParagraphProseNode(props: {
+  node: ReaderComponentNode
+  ctx: ReaderComponentRenderContext
+  withAnchorPreview: (child: ReactNode) => ReactNode
+}): ReactNode {
+  const { node, ctx, withAnchorPreview } = props
+  const text = asString(node.props?.text)
+  const [hovered, setHovered] = useState(false)
+
+  return withAnchorPreview(
+    <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{ position: 'relative', marginBottom: 14 }}
+    >
+      <DraggableContainer node={node}>
+        <div>
+          <ActionBar node={node} ctx={ctx} />
+          <p style={{ margin: 0, lineHeight: 1.95, fontSize: 18, textAlign: 'justify' }}>
+            {text}
+            {renderChildren(node.children || [], ctx)}
+          </p>
+        </div>
+      </DraggableContainer>
+
+      <div
+        style={{
+          position: 'absolute',
+          bottom: -18,
+          left: '50%',
+          transform: hovered ? 'translate(-50%, 0) scale(1)' : 'translate(-50%, -10px) scale(0.9)',
+          opacity: hovered ? 1 : 0,
+          transition: 'all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
+          zIndex: 10,
+          pointerEvents: hovered ? 'auto' : 'none',
+        }}
+      >
+        <Button
+          type="primary"
+          shape="circle"
+          size="small"
+          icon={<PlusOutlined />}
+          onClick={() => ctx.onManualInsertSlot?.(String(node.id))}
+          title="在此段落后插入提问"
+          style={{ boxShadow: '0 4px 12px rgba(22, 119, 255, 0.35)' }}
+        />
+      </div>
+    </div>
+  )
+}
+
 export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponentRenderContext): ReactNode {
   const props = node.props || {}
   const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
 
+  const layoutStyle: React.CSSProperties = {}
+  if (node.layout_slot?.reserved_height) {
+    layoutStyle.minHeight = node.layout_slot.reserved_height
+    if (node.layout_slot.lock_height) {
+      layoutStyle.height = node.layout_slot.reserved_height
+      layoutStyle.overflow = 'hidden'
+    }
+  }
+
   const withAnchorPreview = (child: ReactNode): ReactNode => (
     <div
+      style={layoutStyle}
       onMouseEnter={() => {
         if (anchorRefs.length > 0) {
           ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: false })
@@ -354,18 +428,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     }
 
     case 'ParagraphProse': {
-      const text = asString(props.text)
-      return withAnchorPreview(
-        <DraggableContainer node={node}>
-          <div>
-            <ActionBar node={node} ctx={ctx} />
-            <p style={{ marginBottom: 14, lineHeight: 1.95, fontSize: 18, textAlign: 'justify' }}>
-              {text}
-              {renderChildren(node.children || [], ctx)}
-            </p>
-          </div>
-        </DraggableContainer>,
-      )
+      return <ParagraphProseNode key={node.id} node={node} ctx={ctx} withAnchorPreview={withAnchorPreview} />
     }
 
     case 'ListBlock': {
@@ -389,7 +452,26 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       return withAnchorPreview(
         <DraggableContainer node={node}>
           <Card size="small" style={{ ...baseCardStyle(), marginBottom: 14 }}>
-            <ActionBar node={node} ctx={ctx} />
+            <ActionBar
+              node={node}
+              ctx={ctx}
+              extraActions={(
+                <Button
+                  size="small"
+                  onClick={async () => {
+                    const markdown = componentToMarkdown(node)
+                    try {
+                      await navigator.clipboard.writeText(markdown)
+                      message.success('图表 Markdown 已复制')
+                    } catch {
+                      message.warning('复制失败')
+                    }
+                  }}
+                >
+                  导出/复制Markdown
+                </Button>
+              )}
+            />
             {imageUrl ? (
               <img
                 src={imageUrl}
@@ -400,10 +482,10 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             {caption ? <Text type="secondary" style={{ display: 'block', marginTop: 10 }}>{caption}</Text> : null}
             {sourceLabel ? <Tag style={{ marginTop: 8 }}>{sourceLabel}</Tag> : null}
             {aiInsight ? (
-              <Paragraph style={{ marginTop: 10, marginBottom: 0 }}>
-                <Text strong>AI Insight：</Text>
+              <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(23, 119, 255, 0.04)', borderRadius: 8, borderLeft: '3px solid #1677ff' }}>
+                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 4 }}>AI 深度洞察</Text>
                 <Text>{aiInsight}</Text>
-              </Paragraph>
+              </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
           </Card>
@@ -448,10 +530,10 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               )}
             />
             {aiInsight ? (
-              <Paragraph style={{ marginTop: 10, marginBottom: 0 }}>
-                <Text strong>AI Insight：</Text>
+              <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(23, 119, 255, 0.04)', borderRadius: 8, borderLeft: '3px solid #1677ff' }}>
+                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 4 }}>AI 数据解读</Text>
                 <Text>{aiInsight}</Text>
-              </Paragraph>
+              </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
           </Card>
@@ -462,19 +544,45 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'CitationLinks': {
       const links = asRecordArray(props.links)
       return (
-        <Card size="small" title="资源链接" style={baseCardStyle()}>
-          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Card size="small" title="文献资源链接" style={baseCardStyle()}>
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
             {links.map((link, idx) => {
               const href = asString(link.href)
               const label = asString(link.label) || href
               const tldr = asString(link.tldr || (link.meta as Record<string, unknown> | undefined)?.tldr)
               if (!href) return null
               return (
-                <Tooltip key={`link-${idx}`} title={tldr || undefined} placement="topLeft">
-                  <a href={href} target="_blank" rel="noreferrer">
-                    {label}
+                <Popover
+                  key={`link-${idx}`}
+                  title="文献智能摘要 (TL;DR)"
+                  placement="topLeft"
+                  content={
+                    <div style={{ maxWidth: 320, whiteSpace: 'normal' }}>
+                      <Text style={{ color: tldr ? '#333' : '#999', lineHeight: 1.6 }}>
+                        {tldr || '暂无该文献的核心摘要...（可由 Web Search Agent 异步挂载）'}
+                      </Text>
+                    </div>
+                  }
+                >
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      padding: '4px 8px',
+                      background: 'rgba(22, 119, 255, 0.06)',
+                      borderRadius: 6,
+                      border: '1px solid rgba(22, 119, 255, 0.15)',
+                      color: '#1677ff',
+                      fontWeight: 500,
+                    }}
+                  >
+                    <LinkOutlined /> {label}
                   </a>
-                </Tooltip>
+                </Popover>
               )
             })}
           </Space>
