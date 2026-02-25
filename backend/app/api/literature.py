@@ -2280,7 +2280,7 @@ async def delete_paper(
     await db.delete(paper)
     await db.commit()
     
-    return {"message": "璁烘枃宸插垹闄?"}
+    return {"message": "论文已删除"}
 
 
 # ============ 鏀惰棌澶圭鐞?============
@@ -2459,7 +2459,7 @@ async def update_collection(
         raise HTTPException(status_code=404, detail="收藏夹不存在")
     
     if collection.is_default:
-        raise HTTPException(status_code=400, detail="榛樿鏀惰棌澶逛笉鍙慨鏀?")
+        raise HTTPException(status_code=400, detail="默认收藏夹不允许修改")
     
     update_data = update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -2491,7 +2491,7 @@ async def delete_collection(
         raise HTTPException(status_code=404, detail="收藏夹不存在")
     
     if collection.is_default:
-        raise HTTPException(status_code=400, detail="榛樿鏀惰棌澶逛笉鍙垹闄?")
+        raise HTTPException(status_code=400, detail="默认收藏夹不可删除")
     
     await db.delete(collection)
     await db.commit()
@@ -2505,7 +2505,7 @@ async def add_paper_to_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """灏嗚鏂囨坊鍔犲埌鏀惰棌澶?"""
+    """将论文添加到收藏夹"""
     # 验证论文
     paper_stmt = select(Paper).where(
         and_(Paper.id == request.paper_id, Paper.user_id == current_user.id)
@@ -2555,7 +2555,7 @@ async def add_paper_to_collection(
     await db.commit()
     for coll_id in request.collection_ids:
         await _invalidate_ask_cache_for_collection(current_user.id, int(coll_id))
-    return {"message": "宸叉坊鍔犲埌鏀惰棌澶?"}
+    return {"message": "已添加到收藏夹"}
 
 
 @router.post("/collections/remove-paper")
@@ -2595,7 +2595,7 @@ async def remove_paper_from_collection(
     
     await db.commit()
     await _invalidate_ask_cache_for_collection(current_user.id, int(request.collection_id))
-    return {"message": "宸蹭粠鏀惰棌澶圭Щ闄?"}
+    return {"message": "已从收藏夹移除"}
 
 
 # ============ PDF 下载 ============
@@ -2623,7 +2623,7 @@ async def download_paper_pdf(
         raise HTTPException(status_code=400, detail="该论文没有 PDF 下载链接")
     
     if paper.pdf_downloaded and paper.pdf_path and not knowledge_base_id:
-        return {"message": "PDF 宸蹭笅杞?", "pdf_path": paper.pdf_path}
+        return {"message": "PDF 已下载", "pdf_path": paper.pdf_path}
     
     if paper.pdf_downloaded and paper.pdf_path and os.path.exists(paper.pdf_path):
         pdf_path = paper.pdf_path
@@ -3439,7 +3439,7 @@ async def delete_annotation(
 
     await db.delete(item)
     await db.commit()
-    return {"message": "鎵规敞宸插垹闄?"}
+    return {"message": "批注已删除"}
 
 
 # ============ 评论 ============
@@ -4001,7 +4001,7 @@ async def literature_ask(
             or int(session.paper_id or 0) != (target_id if scope == AskScope.PAPER.value else 0)
             or int(session.collection_id or 0) != (target_id if scope == AskScope.COLLECTION.value else 0)
         ):
-            raise HTTPException(status_code=400, detail="浼氳瘽涓庡綋鍓嶆彁闂寖鍥翠笉涓€鑷?")
+            raise HTTPException(status_code=400, detail="会话与当前提问范围不一致")
     else:
         session = LiteratureQASession(
             user_id=current_user.id,
