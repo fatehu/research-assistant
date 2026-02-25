@@ -2470,6 +2470,16 @@ export default function PaperReaderPage() {
                   onDropMarkdown: (markdown) => {
                     appendMarkdownToAnnotation(markdown)
                   },
+                  onManualInsertSlot: (nodeId) => {
+                    const slotNode: ReaderComponentNode = {
+                      id: `manual-slot-${Date.now()}`,
+                      type: 'InlineQuerySlot',
+                      props: { placeholder: '请输入您关于上述段落的疑问...' },
+                      children: [],
+                      source_anchor_refs: [],
+                    }
+                    applyNodeInsertToComposeState(nodeId, slotNode)
+                  },
                 })}
               </div>
             ) : null}
