@@ -221,8 +221,8 @@ function isLikelySectionHeading(text: string): boolean {
   const hasSentencePunctuation = /[。！？!?]/.test(value)
   return Boolean(
     !hasSentencePunctuation &&
-      latinOnly.length >= 4 &&
-      (uppercaseRatio >= 0.72 || /^[\d.\-()ivxIVX]+\s+[A-Za-z]/.test(value)),
+    latinOnly.length >= 4 &&
+    (uppercaseRatio >= 0.72 || /^[\d.\-()ivxIVX]+\s+[A-Za-z]/.test(value)),
   )
 }
 
@@ -544,7 +544,7 @@ function extractAcademicPageText(textContent: any): string {
     leftLines.length >= 6 &&
     rightLines.length >= 6 &&
     getMedian(rightLines.map((line) => line.xMin)) - getMedian(leftLines.map((line) => line.xMin)) >
-      pageWidth * 0.18
+    pageWidth * 0.18
 
   let orderedLines: ExtractedTextLine[] = []
   if (!likelyTwoColumns) {
@@ -1153,7 +1153,7 @@ export default function PaperReaderPage() {
     )
     const restoredFitWidth = Boolean(
       sessionAnchor.fit_width ??
-        true,
+      true,
     )
     const restoredReaderMode = String(sessionAnchor.reader_mode || '').toLowerCase()
     const restoredStyleKey = normalizeGenerativeStyleKey(String(sessionAnchor.style_key || 'journal_classic'))
@@ -1353,10 +1353,10 @@ export default function PaperReaderPage() {
         const extracted = extractAcademicPageText(textContent)
         const fallback = Array.isArray(textContent?.items)
           ? textContent.items
-              .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
-              .join(' ')
-              .replace(/\s+/g, ' ')
-              .trim()
+            .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
           : ''
         if (!cancelled) {
           setRawPageText(fallback)
@@ -2220,10 +2220,10 @@ export default function PaperReaderPage() {
           const extracted = extractAcademicPageText(textContent)
           const fallback = Array.isArray(textContent?.items)
             ? textContent.items
-                .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
-                .join(' ')
-                .replace(/\s+/g, ' ')
-                .trim()
+              .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+              .join(' ')
+              .replace(/\s+/g, ' ')
+              .trim()
             : ''
           const source = extracted || fallback
           const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
@@ -2439,57 +2439,9 @@ export default function PaperReaderPage() {
                 style={{ marginBottom: 12 }}
               />
             ) : null}
-            {anchorPreview.visible ? (
-              <Card
-                size="small"
-                title={anchorPreview.title || `原文证据 · 第 ${anchorPreview.page} 页`}
-                style={{
-                  marginBottom: 12,
-                  borderRadius: 12,
-                  border: `1px solid ${activeGenerativeStyle.borderColor}`,
-                  background: activeGenerativeStyle.panelBackground,
-                }}
-                extra={(
-                  <Space size={8}>
-                    {anchorPreview.pinned ? (
-                      <Tag color="blue">已钉住</Tag>
-                    ) : (
-                      <Button
-                        size="small"
-                        onClick={() => setAnchorPreview((prev) => ({ ...prev, pinned: true, visible: true }))}
-                      >
-                        钉住
-                      </Button>
-                    )}
-                    <Button
-                      size="small"
-                      onClick={() => {
-                        setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
-                      }}
-                    >
-                      关闭
-                    </Button>
-                  </Space>
-                )}
-              >
-                <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
-                  悬停组件可预览证据，点击“定位到证据”可固定并跳转 PDF。
-                </Text>
-                {anchorPreview.loading ? <Spin size="small" /> : (
-                  <div
-                    style={{
-                      whiteSpace: 'pre-wrap',
-                      lineHeight: 1.75,
-                      color: activeGenerativeStyle.bodyColor,
-                    }}
-                  >
-                    {anchorPreview.text || '暂无可展示的锚点原文。'}
-                  </div>
-                )}
-              </Card>
-            ) : null}
 
             {composedLoading && !hasComposedPlan ? (
+
               <div className="h-[360px] flex items-center justify-center">
                 <Spin />
               </div>
@@ -3399,6 +3351,73 @@ export default function PaperReaderPage() {
           />
         </Col>
       </Row>
+
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 32,
+          right: 'calc(33.33vw + 24px)',
+          width: 440,
+          zIndex: 1000,
+          opacity: anchorPreview.visible ? 1 : 0,
+          transform: anchorPreview.visible ? 'translateY(0)' : 'translateY(20px)',
+          pointerEvents: anchorPreview.visible ? 'auto' : 'none',
+          transition: 'all 0.25s cubic-bezier(0.16, 1, 0.3, 1)',
+          boxShadow: '0 12px 48px rgba(0, 0, 0, 0.15), 0 4px 16px rgba(0,0,0,0.08)',
+          borderRadius: 12,
+        }}
+      >
+        <Card
+          size="small"
+          title={anchorPreview.title || `原文证据 · 第 ${anchorPreview.page} 页`}
+          style={{
+            margin: 0,
+            borderRadius: 12,
+            border: `1px solid ${activeGenerativeStyle.borderColor}`,
+            background: activeGenerativeStyle.panelBackground,
+          }}
+          extra={(
+            <Space size={8}>
+              {anchorPreview.pinned ? (
+                <Tag color="blue">已钉住</Tag>
+              ) : (
+                <Button
+                  size="small"
+                  onClick={() => setAnchorPreview((prev) => ({ ...prev, pinned: true, visible: true }))}
+                >
+                  钉住
+                </Button>
+              )}
+              <Button
+                size="small"
+                onClick={() => {
+                  setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
+                }}
+              >
+                关闭
+              </Button>
+            </Space>
+          )}
+        >
+          <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
+            悬停组件可预览局部证据，点击“定位到证据”可固定并联动原 PDF 跳转。
+          </Text>
+          {anchorPreview.loading ? <Spin size="small" /> : (
+            <div
+              style={{
+                whiteSpace: 'pre-wrap',
+                lineHeight: 1.75,
+                maxHeight: 280,
+                overflowY: 'auto',
+                color: activeGenerativeStyle.bodyColor,
+                fontSize: 14,
+              }}
+            >
+              {anchorPreview.text || '暂无可展示的锚点原文。'}
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   )
 }
