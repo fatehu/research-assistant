@@ -1079,8 +1079,8 @@ _PAPER_READ_EN_TO_CN_TERMS: Dict[str, List[str]] = {
     "results": ["结果"],
     "analysis": ["分析", "数据分析"],
     "discussion": ["讨论"],
-    "limitation": ["灞€闄愭€?"],
-    "limitations": ["灞€闄愭€?"],
+    "limitation": ["局限性"],
+    "limitations": ["局限性"],
     "conclusion": ["结论"],
     "conclusions": ["结论"],
 }
@@ -1103,7 +1103,6 @@ _PAPER_READ_SECTION_BACKOFF_TERMS_ZH: List[str] = [
     "讨论",
     "结论",
 ]
-
 
 def _detect_text_language(text: str) -> str:
     value = str(text or "")
@@ -4524,5 +4523,3 @@ async def init_user_literature(
             return {"message": "已初始化"}
     
     return {"message": "已初始化"}
-
-

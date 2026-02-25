@@ -205,6 +205,21 @@ def test_reader_compose_validate_rejects_invalid_anchor():
     assert any("anchor" in err.lower() for err in result["errors"])
 
 
+def test_build_link_tldr_empty_doi_should_not_match_all_links():
+    tldr = LiteratureReaderComposeService._build_link_tldr(
+        href="https://example.com/resource",
+        label="Example Resource",
+        paper=SimpleNamespace(doi=None),
+    )
+
+    assert "正式标识入口" not in tldr
+
+
+def test_extract_query_terms_should_expand_limitations_to_valid_chinese_term():
+    terms = literature_api._extract_query_terms("limitations")
+    assert "局限性" in terms
+
+
 class _FakeDB:
     async def execute(self, _stmt):
         return None
