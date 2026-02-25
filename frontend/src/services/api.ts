@@ -543,7 +543,7 @@ export const chatApi = {
       }
 
       const reader = response.body?.getReader()
-      if (!reader) throw new Error('鏃犳硶璇诲彇鍝嶅簲')
+      if (!reader) throw new Error('无法读取响应')
 
       const decoder = new TextDecoder()
       let buffer = ''
@@ -2169,7 +2169,7 @@ export const agentApi = {
     }
 
     const reader = response.body?.getReader()
-    if (!reader) throw new Error('鏃犳硶璇诲彇鍝嶅簲')
+    if (!reader) throw new Error('无法读取响应')
 
     const decoder = new TextDecoder()
     let buffer = ''
@@ -2188,7 +2188,7 @@ export const agentApi = {
             const data = JSON.parse(line.slice(6))
             onEvent(data as AgentChatEvent)
           } catch (e) {
-            console.error('瑙ｆ瀽浜嬩欢澶辫触:', e)
+            console.error('解析事件失败:', e)
           }
         }
       }

@@ -106,7 +106,7 @@ router = APIRouter(prefix="/literature", tags=["literature"])
 
 
 def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
-    """灏?Paper 妯″瀷杞崲涓哄搷搴斿瓧鍏?"""
+    """将 Paper 模型转换为响应字典"""
     if collection_ids is None:
         collection_ids = []
     
@@ -584,7 +584,7 @@ async def _invalidate_ask_cache_for_collection(user_id: int, collection_id: int)
                 if cursor == 0 or cursor == "0":
                     break
         except Exception as exc:
-            logger.warning(f"[Literature Ask] 鏀惰棌澶圭紦瀛樺け鏁堝け璐? {exc}")
+            logger.warning(f"[Literature Ask] 收藏夹缓存失效失败: {exc}")
 
     for key in list(_ask_cache_memory.keys()):
         if key.startswith(prefix) and f":collection:{collection_id}:" in key:
@@ -1747,10 +1747,10 @@ async def search_papers(
     
     支持的数据源:
     - semantic_scholar: Semantic Scholar (综合学术搜索，有引用数据)
-    - arxiv: arXiv (棰勫嵃鏈紝璁＄畻鏈?鐗╃悊/鏁板)
+    - arxiv: arXiv (预印本平台，含 cs/physics/math 等学科)
     - pubmed: PubMed (生物医学文献)
-    - openalex: OpenAlex (寮€鏀惧鏈浘璋?
-    - crossref: CrossRef (DOI 鍏冩暟鎹?
+    - openalex: OpenAlex (开放学术图谱)
+    - crossref: CrossRef (DOI 元数据)
     """
     logger.info(f"[Literature API] 搜索: {query}, source={source}, user={current_user.id}")
     
@@ -1881,7 +1881,7 @@ async def get_search_history(
 
 @router.get("/papers", response_model=List[PaperResponse])
 async def get_papers(
-    collection_id: Optional[int] = Query(None, description="鏀惰棌澶?ID"),
+    collection_id: Optional[int] = Query(None, description="收藏夹ID"),
     is_read: Optional[bool] = Query(None, description="阅读状态"),
     tag: Optional[str] = Query(None, description="标签"),
     min_rating: Optional[int] = Query(None, ge=1, le=5, description="最低评分"),
@@ -1896,10 +1896,10 @@ async def get_papers(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """鑾峰彇鐢ㄦ埛鐨勮鏂囧垪琛?"""
+    """获取用户的论文列表"""
     stmt = select(Paper).where(Paper.user_id == current_user.id)
     
-    # 鏀惰棌澶硅繃婊?
+    # 收藏夹过滤
     if collection_id:
         stmt = stmt.join(paper_collection_association).where(
             paper_collection_association.c.collection_id == collection_id
@@ -1948,10 +1948,10 @@ async def get_papers(
     result = await db.execute(stmt)
     papers = result.scalars().all()
     
-    # 鑾峰彇鏀惰棌澶瑰叧鑱?
+    # 获取收藏夹关联
     paper_responses = []
     for paper in papers:
-        # 鑾峰彇璁烘枃鎵€灞炵殑鏀惰棌澶?
+        # 获取论文所属的收藏夹
         coll_stmt = select(paper_collection_association.c.collection_id).where(
             paper_collection_association.c.paper_id == paper.id
         )
@@ -1979,7 +1979,7 @@ async def get_paper(
     if not paper:
         raise HTTPException(status_code=404, detail="论文不存在")
     
-    # 鑾峰彇鏀惰棌澶?
+    # 获取收藏夹
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -2077,7 +2077,7 @@ async def save_paper(
                 collection_id=coll_id
             )
         )
-        # 鏇存柊鏀惰棌澶硅鏁?
+        # 更新收藏夹计数
         await db.execute(
             select(PaperCollection).where(PaperCollection.id == coll_id).with_for_update()
         )
@@ -2239,7 +2239,7 @@ async def update_paper(
     
     await db.commit()
     
-    # 鑾峰彇鏀惰棌澶?
+    # 获取收藏夹
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -2265,7 +2265,7 @@ async def delete_paper(
     if not paper:
         raise HTTPException(status_code=404, detail="论文不存在")
     
-    # 鏇存柊鏀惰棌澶硅鏁?
+    # 更新收藏夹计数
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -2283,14 +2283,14 @@ async def delete_paper(
     return {"message": "论文已删除"}
 
 
-# ============ 鏀惰棌澶圭鐞?============
+# ============ 收藏夹管理 ============
 
 @router.get("/collections", response_model=List[CollectionResponse])
 async def get_collections(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """鑾峰彇鏀惰棌澶瑰垪琛?"""
+    """获取收藏夹列表"""
     stmt = select(PaperCollection).where(
         PaperCollection.user_id == current_user.id
     ).order_by(PaperCollection.is_default.desc(), PaperCollection.created_at.asc())
@@ -2421,7 +2421,7 @@ async def create_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """鍒涘缓鏀惰棌澶?"""
+    """创建收藏夹"""
     new_collection = PaperCollection(
         user_id=current_user.id,
         name=collection.name,
@@ -2445,7 +2445,7 @@ async def update_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """鏇存柊鏀惰棌澶?"""
+    """更新收藏夹"""
     stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == collection_id,
@@ -2477,7 +2477,7 @@ async def delete_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """鍒犻櫎鏀惰棌澶?"""
+    """删除收藏夹"""
     stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == collection_id,
@@ -2565,7 +2565,7 @@ async def remove_paper_from_collection(
     current_user: User = Depends(get_current_user)
 ):
     """从收藏夹移除论文"""
-    # 楠岃瘉鏀惰棌澶?
+    # 验证收藏夹
     coll_stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == request.collection_id,
@@ -2608,7 +2608,7 @@ async def download_paper_pdf(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """涓嬭浇璁烘枃 PDF 骞跺彲閫夋坊鍔犲埌鐭ヨ瘑搴?"""
+    """下载论文 PDF 并可选添加到知识库"""
     # 获取论文
     stmt = select(Paper).where(
         and_(Paper.id == paper_id, Paper.user_id == current_user.id)
