@@ -1,4 +1,4 @@
-﻿import axios, { AxiosError } from 'axios'
+import axios, { AxiosError } from 'axios'
 
 // API base configuration
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
@@ -895,6 +895,369 @@ export interface ReaderSessionUpdate {
   last_anchor?: Record<string, unknown>
 }
 
+export type ReaderGenerativeStyleKey = 'journal_classic' | 'clinical_brief' | 'preprint_modern'
+
+export interface ReaderGenerativeSourceAnchor {
+  page: number
+  start_char: number
+  end_char: number
+}
+
+export interface ReaderGenerativeRequest {
+  page: number
+  selected_kb_id?: number
+  force_refresh?: boolean
+  prefer_agent?: boolean
+  style_hint?: ReaderGenerativeStyleKey | string
+}
+
+export interface ReaderGenerativeBlock {
+  id: string
+  kind: 'heading' | 'paragraph' | 'list_item' | 'caption'
+  text: string
+  order: number
+  section_title?: string
+  source_anchor: ReaderGenerativeSourceAnchor
+}
+
+export interface ReaderGenerativeSection {
+  title: string
+  level: number
+  block_ids: string[]
+  source_anchor?: ReaderGenerativeSourceAnchor
+}
+
+export interface ReaderGenerativeAsset {
+  kind: 'link' | 'annotation' | 'image_hint'
+  label: string
+  source: 'metadata' | 'text' | 'annotation' | 'pdf'
+  href?: string | null
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeStyleTuning {
+  body_scale: number
+  line_height: number
+  heading_scale: number
+}
+
+export interface ReaderGenerativePagePayload {
+  paper_id: number
+  page: number
+  parser_version: string
+  source_signature: string
+  style_key: ReaderGenerativeStyleKey | string
+  build_mode: string
+  structure_confidence: number
+  summary: string
+  style_tuning?: ReaderGenerativeStyleTuning
+  sections: ReaderGenerativeSection[]
+  blocks: ReaderGenerativeBlock[]
+  assets: ReaderGenerativeAsset[]
+  generated_at: string
+  cache_hit?: boolean
+  cache_layer?: 'redis' | 'db' | 'none' | string
+}
+
+export interface ReaderGenerativePrefetchRequest {
+  pages: number[]
+  selected_kb_id?: number
+  style_hint?: ReaderGenerativeStyleKey | string
+}
+
+export interface ReaderGenerativePrefetchResponse {
+  queued: number[]
+  skipped: number[]
+}
+
+export interface ReaderComposeRequest {
+  page: number
+  selected_kb_id?: number
+  force_refresh?: boolean
+  regenerate?: boolean
+  latency_budget_ms?: number
+  quality_target?: number
+  style_intent?: string
+  theme_mode?: 'light' | 'dark'
+  detail_level?: 'concise' | 'standard' | 'deep'
+  compare_mode?: boolean
+  citation_tldr?: boolean
+}
+
+export interface ReaderComponentBBoxHint {
+  x0: number
+  x1: number
+  top: number
+  bottom: number
+  page_width?: number | null
+  page_height?: number | null
+}
+
+export interface ReaderComponentSourceAnchor {
+  page: number
+  start_char: number
+  end_char: number
+  quote_text?: string | null
+  bbox_hint?: ReaderComponentBBoxHint | null
+}
+
+export interface ReaderComponentAction {
+  key: string
+  label: string
+  kind?: 'primary' | 'default' | 'danger' | 'link'
+  payload?: Record<string, unknown>
+}
+
+export interface ReaderComponentLayoutSlot {
+  reserved_height?: number
+  lock_height?: boolean
+}
+
+export interface ReaderComponentNode {
+  id: string
+  type:
+    | 'PaperHeaderCard'
+    | 'MetadataSidebarCard'
+    | 'SectionTOC'
+    | 'SectionHeading'
+    | 'ParagraphProse'
+    | 'ListBlock'
+    | 'FigurePanel'
+    | 'TablePanel'
+    | 'CitationLinks'
+    | 'KeyTakeaways'
+    | 'AnnotationRail'
+    | 'QualityBadge'
+    | 'QualityPanel'
+    | 'InlineQuerySlot'
+    | 'AnswerCard'
+    | 'CompareInsightsCard'
+    | 'PdfSnippetCard'
+    | string
+  props: Record<string, unknown>
+  children: ReaderComponentNode[]
+  source_anchor_refs: ReaderComponentSourceAnchor[]
+  capabilities?: string[]
+  actions?: ReaderComponentAction[]
+  layout_slot?: ReaderComponentLayoutSlot | null
+}
+
+export interface ReaderComposeQualityReport {
+  overall: number
+  structure_fidelity: number
+  readability: number
+  evidence_alignment: number
+  layout_consistency: number
+  hard_constraints_passed: boolean
+  sidebar_leak_detected: boolean
+  title_integrity_ok: boolean
+  anchors_valid: boolean
+  validation_errors: string[]
+  quality_target: number
+  iterations: number
+  degraded: boolean
+  stop_reason: string
+  latency_budget_ms: number
+  deductions?: Array<Record<string, unknown>>
+  fix_suggestions?: string[]
+  iteration_trace_summary?: Array<Record<string, unknown>>
+}
+
+export interface ReaderUIPlan {
+  plan_id: string
+  components: ReaderComponentNode[]
+  layout: Record<string, unknown>
+  style_tokens: Record<string, unknown>
+  trace_meta: Record<string, unknown>
+}
+
+export interface ReaderComposeAsset {
+  kind: 'link' | 'annotation' | 'image_hint' | 'external_image'
+  label: string
+  source: 'metadata' | 'text' | 'annotation' | 'pdf' | 'web'
+  href?: string | null
+  meta: Record<string, unknown>
+  tldr?: string | null
+}
+
+export interface ReaderComposePayload {
+  paper_id: number
+  page: number
+  engine_version: string
+  source_signature: string
+  build_mode: string
+  ui_plan: ReaderUIPlan
+  assets: ReaderComposeAsset[]
+  quality_report: ReaderComposeQualityReport
+  iteration_trace: Array<Record<string, unknown>>
+  asset_policy: Record<string, unknown>
+  generated_at: string
+  cache_hit?: boolean
+  cache_layer?: 'redis' | 'db' | 'none' | string
+  overlay_applied?: boolean
+  overlay_count?: number
+}
+
+export interface ReaderComposePrefetchRequest {
+  pages: number[]
+  selected_kb_id?: number
+  style_intent?: string
+  latency_budget_ms?: number
+  quality_target?: number
+  theme_mode?: 'light' | 'dark'
+  detail_level?: 'concise' | 'standard' | 'deep'
+  compare_mode?: boolean
+  citation_tldr?: boolean
+}
+
+export interface ReaderComposePrefetchResponse {
+  queued: number[]
+  skipped: number[]
+}
+
+export interface ReaderComposeStreamEventMap {
+  start: {
+    cache_hit: boolean
+    cache_layer?: 'redis' | 'db' | 'none' | string
+    build_mode: string
+    page: number
+    engine_version?: string
+    budget?: {
+      latency_budget_ms?: number
+      quality_target?: number
+    }
+  }
+  plan_draft: {
+    iteration: number
+    ui_plan: ReaderUIPlan
+    phase?: 'skeleton' | 'semantic' | 'enhance' | string
+    layout_lock?: boolean
+  }
+  plan_patch: {
+    iteration: number
+    ui_plan: ReaderUIPlan
+    phase?: 'skeleton' | 'semantic' | 'enhance' | string
+    patch_type?: 'node_replace' | 'node_insert' | 'node_update' | string
+  }
+  assets: {
+    assets: ReaderComposeAsset[]
+  }
+  quality: {
+    iteration: number
+    quality_report: ReaderComposeQualityReport
+  }
+  done: {
+    payload: ReaderComposePayload
+    cache_meta?: Record<string, unknown>
+    iteration_stats?: Record<string, unknown>
+    overlay_meta?: Record<string, unknown>
+  }
+  error: {
+    message: string
+  }
+}
+
+export type ReaderComposeStreamEvent = keyof ReaderComposeStreamEventMap
+
+export interface ReaderNodeActionRequest {
+  page: number
+  node_id: string
+  action: 'regenerate' | 'degrade'
+  reason?: string
+  selected_kb_id?: number
+  style_intent?: string
+  theme_mode?: 'light' | 'dark'
+  detail_level?: 'concise' | 'standard' | 'deep'
+  compare_mode?: boolean
+  citation_tldr?: boolean
+}
+
+export interface ReaderNodeActionResponse {
+  patch_type: 'node_replace' | 'node_insert' | 'node_update'
+  node_before?: ReaderComponentNode | null
+  node_after?: ReaderComponentNode | null
+  quality_delta: number
+  overlay_saved: boolean
+  message: string
+}
+
+export interface ReaderInlineQueryRequest {
+  page: number
+  node_id: string
+  question: string
+  scope?: 'page' | 'section'
+  selected_kb_id?: number
+  style_intent?: string
+  detail_level?: 'concise' | 'standard' | 'deep'
+  compare_mode?: boolean
+}
+
+export interface ReaderInlineQuerySource {
+  page: number
+  start_char: number
+  end_char: number
+  quote_text?: string | null
+}
+
+export interface ReaderInlineQueryEventMap {
+  start: {
+    page: number
+    node_id: string
+  }
+  token: {
+    text: string
+  }
+  sources: ReaderInlineQuerySource[]
+  done: {
+    node: ReaderComponentNode
+    sources: ReaderInlineQuerySource[]
+  }
+  error: {
+    message: string
+  }
+}
+
+export type ReaderInlineQueryEvent = keyof ReaderInlineQueryEventMap
+
+export interface ReaderGenerativeStreamEventMap {
+  start: {
+    cache_hit: boolean
+    cache_layer?: 'redis' | 'db' | 'none' | string
+    build_mode: string
+    page: number
+    parser_version?: string
+  }
+  skeleton: {
+    sections: ReaderGenerativeSection[]
+    summary: string
+    style_recommendation?: ReaderGenerativeStyleKey | string
+    style_tuning?: ReaderGenerativeStyleTuning
+    structure_confidence?: number
+  }
+  chunk: {
+    blocks: ReaderGenerativeBlock[]
+  }
+  assets: {
+    assets: ReaderGenerativeAsset[]
+  }
+  done: {
+    payload: ReaderGenerativePagePayload
+    cache_meta?: Record<string, unknown>
+  }
+  error: {
+    message: string
+  }
+}
+
+export type ReaderGenerativeStreamEvent = keyof ReaderGenerativeStreamEventMap
+
+export interface ReaderPageReadyEventData {
+  paper_id: number
+  page: number
+  source_signature: string
+  updated_at?: string
+}
+
 export interface PaperAnnotation {
   id: number
   user_id: number
@@ -1195,6 +1558,213 @@ export const literatureApi = {
     return response.data
   },
 
+  streamReaderGenerative: async (
+    paperId: number,
+    payload: ReaderGenerativeRequest,
+    onEvent?: (
+      event: ReaderGenerativeStreamEvent,
+      data: ReaderGenerativeStreamEventMap[ReaderGenerativeStreamEvent],
+    ) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/generative/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as {
+            event?: ReaderGenerativeStreamEvent
+            data?: ReaderGenerativeStreamEventMap[ReaderGenerativeStreamEvent]
+          }
+          const event = parsed?.event
+          if (!event) continue
+          onEvent?.(event, parsed.data as ReaderGenerativeStreamEventMap[ReaderGenerativeStreamEvent])
+        } catch {
+          // ignore malformed stream chunk
+        }
+      }
+    }
+  },
+
+  prefetchReaderGenerative: async (
+    paperId: number,
+    payload: ReaderGenerativePrefetchRequest,
+  ): Promise<ReaderGenerativePrefetchResponse> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/generative/prefetch`, payload)
+    return response.data
+  },
+
+  streamReaderComposed: async (
+    paperId: number,
+    payload: ReaderComposeRequest,
+    onEvent?: (
+      event: ReaderComposeStreamEvent,
+      data: ReaderComposeStreamEventMap[ReaderComposeStreamEvent],
+    ) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as {
+            event?: ReaderComposeStreamEvent
+            data?: ReaderComposeStreamEventMap[ReaderComposeStreamEvent]
+          }
+          const event = parsed?.event
+          if (!event) continue
+          onEvent?.(event, parsed.data as ReaderComposeStreamEventMap[ReaderComposeStreamEvent])
+        } catch {
+          // ignore malformed stream chunk
+        }
+      }
+    }
+  },
+
+  prefetchReaderComposed: async (
+    paperId: number,
+    payload: ReaderComposePrefetchRequest,
+  ): Promise<ReaderComposePrefetchResponse> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/prefetch`, payload)
+    return response.data
+  },
+
+  actionReaderComposedNode: async (
+    paperId: number,
+    payload: ReaderNodeActionRequest,
+  ): Promise<ReaderNodeActionResponse> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/node/action`, payload)
+    return response.data
+  },
+
+  streamReaderComposedInlineQuery: async (
+    paperId: number,
+    payload: ReaderInlineQueryRequest,
+    onEvent?: (
+      event: ReaderInlineQueryEvent,
+      data: ReaderInlineQueryEventMap[ReaderInlineQueryEvent],
+    ) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/reader/composed/inline-query/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as {
+            event?: ReaderInlineQueryEvent
+            data?: ReaderInlineQueryEventMap[ReaderInlineQueryEvent]
+          }
+          const event = parsed?.event
+          if (!event) continue
+          onEvent?.(event, parsed.data as ReaderInlineQueryEventMap[ReaderInlineQueryEvent])
+        } catch {
+          // ignore malformed stream chunk
+        }
+      }
+    }
+  },
+
   getAnnotations: async (
     paperId: number,
     params?: { page?: number; type?: AnnotationType }
@@ -1279,7 +1849,7 @@ export const literatureApi = {
 
   streamStatusEvents: async (
     params: { paper_id?: number } | undefined,
-    onEvent?: (event: 'connected' | 'heartbeat' | 'paper_link_status', data: any) => void,
+    onEvent?: (event: 'connected' | 'heartbeat' | 'paper_link_status' | 'reader_page_ready', data: any) => void,
     abortController?: AbortController,
   ): Promise<void> => {
     const query = new URLSearchParams()

@@ -1,6 +1,14 @@
-import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { type CSSProperties, type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeftOutlined, LeftOutlined, QuestionCircleOutlined, RightOutlined } from '@ant-design/icons'
+import {
+  ArrowLeftOutlined,
+  LeftOutlined,
+  LinkOutlined,
+  PushpinOutlined,
+  QuestionCircleOutlined,
+  ReloadOutlined,
+  RightOutlined,
+} from '@ant-design/icons'
 import {
   Alert,
   Button,
@@ -43,8 +51,32 @@ import {
   PaperKnowledgeLink,
   PaperKnowledgeLinkStatusEventData,
   PaperRatingSummary,
+  ReaderComposeAsset,
+  ReaderComponentNode,
+  ReaderComponentSourceAnchor,
+  ReaderInlineQueryEvent,
+  ReaderInlineQuerySource,
+  ReaderNodeActionRequest,
+  ReaderComposePayload,
+  ReaderComposeQualityReport,
+  ReaderUIPlan,
+  ReaderGenerativeAsset,
+  ReaderGenerativeBlock,
+  ReaderGenerativePagePayload,
+  ReaderGenerativeSection,
+  ReaderGenerativeStyleKey,
+  ReaderGenerativeStyleTuning,
+  ReaderPageReadyEventData,
   ReaderSession,
 } from '@/services/api'
+import {
+  GENERATIVE_STYLE_LABELS,
+  GENERATIVE_STYLE_TOKENS,
+  normalizeGenerativeStyleKey,
+  type ReaderThemeMode,
+  resolveGenerativeStyleTokens,
+} from './generativeStyles'
+import { renderReaderComponentTree } from './readerComponents'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 
@@ -124,6 +156,34 @@ type ExtractedTextLine = {
   column: 'single' | 'wide' | 'left' | 'right'
 }
 
+type PageResourceLink = {
+  label: string
+  href: string
+  source: 'metadata' | 'text'
+}
+
+const DEFAULT_READER_STYLE_TUNING: ReaderGenerativeStyleTuning = {
+  body_scale: 1,
+  line_height: 1.9,
+  heading_scale: 1,
+}
+
+function normalizeReaderStyleTuning(
+  raw: unknown,
+  fallbackLineHeight: number,
+): ReaderGenerativeStyleTuning {
+  const source = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const readNumber = (key: string, fallback: number): number => {
+    const value = Number(source[key])
+    return Number.isFinite(value) ? value : fallback
+  }
+  return {
+    body_scale: Math.max(0.9, Math.min(1.25, readNumber('body_scale', DEFAULT_READER_STYLE_TUNING.body_scale))),
+    line_height: Math.max(1.55, Math.min(2.2, readNumber('line_height', fallbackLineHeight))),
+    heading_scale: Math.max(0.95, Math.min(1.35, readNumber('heading_scale', DEFAULT_READER_STYLE_TUNING.heading_scale))),
+  }
+}
+
 const ACADEMIC_SECTION_KEYWORDS = [
   'abstract',
   'introduction',
@@ -187,6 +247,70 @@ function splitCompactedNumberedLine(line: string): string[] {
   return parts.length > 1 ? parts : [value]
 }
 
+function normalizeAcademicArtifacts(text: string): string {
+  return String(text || '')
+    .replace(/([A-Za-z]{2,})-\s+([a-z]{2,})/g, '$1$2')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/([([{])\s+/g, '$1')
+    .replace(/\s+([)\]}])/g, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function normalizeAbsoluteLink(raw: string | undefined): string | null {
+  const value = String(raw || '').trim().replace(/[)\].,;:]+$/g, '')
+  if (!value) return null
+  if (/^https?:\/\//i.test(value)) return value
+  if (/^(?:dx\.)?doi\.org\//i.test(value)) return `https://${value}`
+  if (/^10\.\d{4,9}\/\S+/i.test(value)) return `https://doi.org/${value}`
+  if (/^www\./i.test(value)) return `https://${value}`
+  return null
+}
+
+function collectPageResourceLinks(paper: Paper | null, pageText: string): PageResourceLink[] {
+  const linkMap = new Map<string, PageResourceLink>()
+  const pushLink = (label: string, rawHref: string | undefined, source: PageResourceLink['source']) => {
+    const href = normalizeAbsoluteLink(rawHref)
+    if (!href) return
+    const key = href.toLowerCase()
+    if (linkMap.has(key)) return
+    linkMap.set(key, { label, href, source })
+  }
+
+  if (paper) {
+    pushLink('论文主页', paper.url, 'metadata')
+    pushLink('PDF原链接', paper.pdf_url, 'metadata')
+    if (paper.arxiv_url) {
+      pushLink('arXiv', paper.arxiv_url, 'metadata')
+    } else if (paper.arxiv_id) {
+      pushLink('arXiv', `https://arxiv.org/abs/${paper.arxiv_id}`, 'metadata')
+    }
+    if (paper.doi) {
+      const doiLabel = `DOI: ${paper.doi}`
+      pushLink(doiLabel, paper.doi, 'metadata')
+    }
+  }
+
+  const text = String(pageText || '')
+  const doiMatches = text.match(/\b10\.\d{4,9}\/[^\s"'<>]+/gi) || []
+  doiMatches.slice(0, 8).forEach((doi) => {
+    pushLink(`DOI: ${doi}`, doi, 'text')
+  })
+
+  const doiOrgMatches = text.match(/\b(?:https?:\/\/)?(?:dx\.)?doi\.org\/[^\s"'<>]+/gi) || []
+  doiOrgMatches.slice(0, 8).forEach((url) => {
+    pushLink('DOI链接', url, 'text')
+  })
+
+  const urlMatches = text.match(/\bhttps?:\/\/[^\s"'<>]+/gi) || []
+  urlMatches.slice(0, 12).forEach((url) => {
+    if (/doi\.org\//i.test(url)) return
+    pushLink('页内链接', url, 'text')
+  })
+
+  return Array.from(linkMap.values()).slice(0, 12)
+}
+
 function isLikelyStandalonePageNumber(text: string): boolean {
   const value = text.trim()
   if (!value) return false
@@ -214,7 +338,7 @@ function buildAcademicTextBlocks(rawText: string): AcademicTextBlock[] {
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .flatMap((line) => splitCompactedNumberedLine(line))
-    .map((line) => stripLikelyPageNumberSuffix(line))
+    .map((line) => normalizeAcademicArtifacts(stripLikelyPageNumberSuffix(line)))
     .filter((line) => Boolean(line) && !isLikelyStandalonePageNumber(line))
 
   if (lines.length === 0) return []
@@ -446,7 +570,8 @@ function extractAcademicPageText(textContent: any): string {
   const output: string[] = []
   let prevLine: ExtractedTextLine | null = null
   for (const line of orderedLines) {
-    if (isLikelyStandalonePageNumber(line.text)) {
+    const normalizedLineText = normalizeAcademicArtifacts(line.text)
+    if (!normalizedLineText || isLikelyStandalonePageNumber(normalizedLineText)) {
       continue
     }
     if (prevLine) {
@@ -461,7 +586,7 @@ function extractAcademicPageText(textContent: any): string {
         output.push('')
       }
     }
-    output.push(line.text)
+    output.push(normalizedLineText)
     prevLine = line
   }
 
@@ -475,6 +600,18 @@ type AnswerSegment =
 type PendingSectionJump = {
   sectionTitle: string
   expectedPage?: number
+}
+
+type ReaderDetailLevel = 'concise' | 'standard' | 'deep'
+
+type AnchorPreviewState = {
+  visible: boolean
+  pinned: boolean
+  loading: boolean
+  page: number
+  text: string
+  title: string
+  anchors: ReaderComponentSourceAnchor[]
 }
 
 function splitAnswerByCitation(answer: string): AnswerSegment[] {
@@ -559,6 +696,64 @@ function findBestSectionHeadingIndex(blocks: AcademicTextBlock[], sectionTitle: 
   return bestScore >= 60 ? bestIdx : null
 }
 
+function replaceNodeInTree(
+  nodes: ReaderComponentNode[],
+  nodeId: string,
+  nodeAfter: ReaderComponentNode,
+): ReaderComponentNode[] {
+  return nodes.map((node) => {
+    if (node.id === nodeId) {
+      return nodeAfter
+    }
+    const children = Array.isArray(node.children) ? node.children : []
+    if (children.length === 0) return node
+    return {
+      ...node,
+      children: replaceNodeInTree(children, nodeId, nodeAfter),
+    }
+  })
+}
+
+function insertNodeAfterInTree(
+  nodes: ReaderComponentNode[],
+  nodeId: string,
+  nodeAfter: ReaderComponentNode,
+): ReaderComponentNode[] {
+  const output: ReaderComponentNode[] = []
+  for (const node of nodes) {
+    output.push(node)
+    if (node.id === nodeId) {
+      output.push(nodeAfter)
+      continue
+    }
+    const children = Array.isArray(node.children) ? node.children : []
+    if (children.length > 0) {
+      output[output.length - 1] = {
+        ...node,
+        children: insertNodeAfterInTree(children, nodeId, nodeAfter),
+      }
+    }
+  }
+  return output
+}
+
+function pickPrimaryAnchor(anchors: ReaderComponentSourceAnchor[]): ReaderComponentSourceAnchor | null {
+  if (!Array.isArray(anchors) || anchors.length === 0) return null
+  const anchor = anchors[0]
+  if (!anchor || !Number.isFinite(anchor.page) || anchor.page <= 0) return null
+  return anchor
+}
+
+function buildAnchorPreviewSnippet(rawText: string, anchor: ReaderComponentSourceAnchor): string {
+  const text = String(rawText || '')
+  if (!text) return ''
+  const start = Math.max(0, Math.min(text.length, Number(anchor.start_char || 0)))
+  const end = Math.max(start + 1, Math.min(text.length, Number(anchor.end_char || start + 1)))
+  const previewStart = Math.max(0, start - 120)
+  const previewEnd = Math.min(text.length, end + 180)
+  return text.slice(previewStart, previewEnd).replace(/\s+/g, ' ').trim()
+}
+
 export default function PaperReaderPage() {
   const navigate = useNavigate()
   const { paperId } = useParams<{ paperId: string }>()
@@ -612,11 +807,55 @@ export default function PaperReaderPage() {
   const [pdfNumPages, setPdfNumPages] = useState<number>(0)
   const [pdfDoc, setPdfDoc] = useState<any>(null)
   const [pageText, setPageText] = useState<string>('')
+  const [rawPageText, setRawPageText] = useState<string>('')
+  const [generativeLoading, setGenerativeLoading] = useState<boolean>(false)
+  const [generativeError, setGenerativeError] = useState<string>('')
+  const [generativeSections, setGenerativeSections] = useState<ReaderGenerativeSection[]>([])
+  const [generativeBlocks, setGenerativeBlocks] = useState<ReaderGenerativeBlock[]>([])
+  const [generativeAssets, setGenerativeAssets] = useState<ReaderGenerativeAsset[]>([])
+  const [generativeSummary, setGenerativeSummary] = useState<string>('')
+  const [generativePayload, setGenerativePayload] = useState<ReaderGenerativePagePayload | null>(null)
+  const [generativeStyleKey, setGenerativeStyleKey] = useState<ReaderGenerativeStyleKey>('journal_classic')
+  const [themeMode, setThemeMode] = useState<ReaderThemeMode>('light')
+  const [detailLevel, setDetailLevel] = useState<ReaderDetailLevel>('standard')
+  const [compareMode, setCompareMode] = useState<boolean>(false)
+  const [citationTldr, setCitationTldr] = useState<boolean>(false)
+  const [generativeStyleTuning, setGenerativeStyleTuning] = useState<ReaderGenerativeStyleTuning>(
+    DEFAULT_READER_STYLE_TUNING,
+  )
+  const [generativeCacheLabel, setGenerativeCacheLabel] = useState<string>('')
+  const [composedLoading, setComposedLoading] = useState<boolean>(false)
+  const [composedError, setComposedError] = useState<string>('')
+  const [composedPlan, setComposedPlan] = useState<ReaderUIPlan | null>(null)
+  const [composedAssets, setComposedAssets] = useState<ReaderComposeAsset[]>([])
+  const [composedPayload, setComposedPayload] = useState<ReaderComposePayload | null>(null)
+  const [composedQuality, setComposedQuality] = useState<ReaderComposeQualityReport | null>(null)
+  const [composedCacheLabel, setComposedCacheLabel] = useState<string>('')
+  const [composedRunSeed, setComposedRunSeed] = useState<number>(0)
+  const [inlineQueryLoadingNodeId, setInlineQueryLoadingNodeId] = useState<string | null>(null)
+  const [anchorPreview, setAnchorPreview] = useState<AnchorPreviewState>({
+    visible: false,
+    pinned: false,
+    loading: false,
+    page: 0,
+    text: '',
+    title: '',
+    anchors: [],
+  })
 
   const viewerRef = useRef<HTMLDivElement | null>(null)
   const textModeContainerRef = useRef<HTMLDivElement | null>(null)
   const headingRefMap = useRef<Map<number, HTMLDivElement>>(new Map())
   const sectionPageCacheRef = useRef<Map<string, number>>(new Map())
+  const generativeStreamControllerRef = useRef<AbortController | null>(null)
+  const composedStreamControllerRef = useRef<AbortController | null>(null)
+  const pendingComposedRunRef = useRef<{ forceRefresh: boolean; regenerate: boolean }>({
+    forceRefresh: false,
+    regenerate: false,
+  })
+  const inlineQueryStreamControllerRef = useRef<AbortController | null>(null)
+  const annotationInputRef = useRef<any>(null)
+  const prefetchedPagesRef = useRef<Set<number>>(new Set())
   const [viewerWidth, setViewerWidth] = useState<number>(860)
   const pdfObjectUrlRef = useRef<string | null>(null)
   const readerSessionHydratedRef = useRef<boolean>(false)
@@ -648,12 +887,56 @@ export default function PaperReaderPage() {
     [collections],
   )
   const academicTextBlocks = useMemo(() => buildAcademicTextBlocks(pageText), [pageText])
+  const displayedTextBlocks = useMemo<AcademicTextBlock[]>(() => {
+    if (generativeBlocks.length > 0) {
+      return generativeBlocks.map((item) => ({
+        kind: item.kind === 'heading' ? 'heading' : 'paragraph',
+        text: String(item.text || ''),
+      }))
+    }
+    return academicTextBlocks
+  }, [academicTextBlocks, generativeBlocks])
   const pageWordCount = useMemo(() => {
-    const text = pageText.trim()
+    const text = displayedTextBlocks.map((item) => item.text).join(' ').trim()
     if (!text) return 0
     return text.split(/\s+/).filter(Boolean).length
-  }, [pageText])
-  const textColumnCount = useMemo(() => (viewerWidth >= 1080 ? 2 : 1), [viewerWidth])
+  }, [displayedTextBlocks])
+  const baseGenerativeStyle = useMemo(
+    () => resolveGenerativeStyleTokens(generativeStyleKey, themeMode),
+    [generativeStyleKey, themeMode],
+  )
+  const normalizedStyleTuning = useMemo(
+    () => normalizeReaderStyleTuning(generativeStyleTuning, baseGenerativeStyle.bodyLineHeight),
+    [baseGenerativeStyle.bodyLineHeight, generativeStyleTuning],
+  )
+  const activeGenerativeStyle = useMemo(() => {
+    const base = baseGenerativeStyle
+    const tunedBodyFontSize = Math.round(base.bodyFontSize * normalizedStyleTuning.body_scale * 10) / 10
+    return {
+      ...base,
+      bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
+      bodyLineHeight: normalizedStyleTuning.line_height,
+    }
+  }, [baseGenerativeStyle, normalizedStyleTuning])
+  const generativeLayoutMode = useMemo<'split' | 'stack'>(() => (
+    viewerWidth >= 1080 ? 'split' : 'stack'
+  ), [viewerWidth])
+  const currentPageAnnotations = useMemo(
+    () =>
+      annotations
+        .filter((item) => item.page === readPage)
+        .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()),
+    [annotations, readPage],
+  )
+  const pageResourceLinks = useMemo(
+    () => collectPageResourceLinks(paper, rawPageText || pageText),
+    [paper, rawPageText, pageText],
+  )
+  const rawPageTextPreview = useMemo(() => {
+    const normalized = normalizeAcademicArtifacts(rawPageText || pageText)
+    if (!normalized) return ''
+    return normalized.length > 2400 ? `${normalized.slice(0, 2400)}...` : normalized
+  }, [rawPageText, pageText])
   const readerAutoSaveAtText = useMemo(() => {
     if (!readerAutoSaveAt) return '尚未同步'
     const ts = new Date(readerAutoSaveAt)
@@ -863,14 +1146,36 @@ export default function PaperReaderPage() {
     setReaderSession(nextSession)
     const restoredPage = Math.max(1, Number(cachedReader?.page || 0) || Number(nextSession.page || 1))
     const restoredZoom = parseZoomPercent(String(cachedReader?.zoom || nextSession.zoom || '120%'))
+    const sessionAnchor = (
+      (cachedReader?.last_anchor as Record<string, unknown> | undefined) ||
+      (nextSession.last_anchor as Record<string, unknown> | undefined) ||
+      {}
+    )
     const restoredFitWidth = Boolean(
-      (cachedReader?.last_anchor as Record<string, unknown> | undefined)?.fit_width ??
-        (nextSession.last_anchor as Record<string, unknown> | undefined)?.fit_width ??
+      sessionAnchor.fit_width ??
         true,
     )
+    const restoredReaderMode = String(sessionAnchor.reader_mode || '').toLowerCase()
+    const restoredStyleKey = normalizeGenerativeStyleKey(String(sessionAnchor.style_key || 'journal_classic'))
+    const restoredThemeMode: ReaderThemeMode =
+      String(sessionAnchor.theme_mode || 'light').toLowerCase() === 'dark' ? 'dark' : 'light'
+    const rawDetailLevel = String(sessionAnchor.detail_level || 'standard').toLowerCase()
+    const restoredDetailLevel: ReaderDetailLevel =
+      rawDetailLevel === 'concise' || rawDetailLevel === 'deep' ? rawDetailLevel : 'standard'
+    const restoredCompareMode = Boolean(sessionAnchor.compare_mode)
+    const restoredCitationTldr = Boolean(sessionAnchor.citation_tldr)
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
+    setTextMode(restoredReaderMode === 'generative')
+    setGenerativeStyleKey(restoredStyleKey)
+    setThemeMode(restoredThemeMode)
+    setDetailLevel(restoredDetailLevel)
+    setCompareMode(restoredCompareMode)
+    setCitationTldr(restoredCitationTldr)
+    setGenerativeStyleTuning(
+      normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[restoredStyleKey].bodyLineHeight),
+    )
     setAnnotations(nextAnnotations)
     setComments(nextComments)
     setRatingSummary(nextRating)
@@ -889,7 +1194,16 @@ export default function PaperReaderPage() {
       zoom: `${restoredZoom}%`,
       scroll_y: 0,
       selected_kb_id: fallbackKb,
-      last_anchor: { fit_width: restoredFitWidth },
+      last_anchor: {
+        fit_width: restoredFitWidth,
+        reader_mode: restoredReaderMode === 'generative' ? 'generative' : 'pdf',
+        style_key: restoredStyleKey,
+        theme_mode: restoredThemeMode,
+        detail_level: restoredDetailLevel,
+        compare_mode: restoredCompareMode,
+        citation_tldr: restoredCitationTldr,
+        compose_quality_target: 0.86,
+      },
     })
     setReaderAutoSaveStatus('saved')
     setReaderAutoSaveError('')
@@ -963,6 +1277,10 @@ export default function PaperReaderPage() {
 
   useEffect(() => {
     return () => {
+      generativeStreamControllerRef.current?.abort()
+      generativeStreamControllerRef.current = null
+      inlineQueryStreamControllerRef.current?.abort()
+      inlineQueryStreamControllerRef.current = null
       if (pdfObjectUrlRef.current) {
         URL.revokeObjectURL(pdfObjectUrlRef.current)
         pdfObjectUrlRef.current = null
@@ -998,6 +1316,7 @@ export default function PaperReaderPage() {
       setPdfDoc(null)
       setPdfNumPages(0)
       setPageText('')
+      setRawPageText('')
       return
     }
     let cancelled = false
@@ -1025,6 +1344,7 @@ export default function PaperReaderPage() {
     const loadPageText = async () => {
       if (!pdfDoc || !readPage || (pdfNumPages > 0 && readPage > pdfNumPages)) {
         setPageText('')
+        setRawPageText('')
         return
       }
       try {
@@ -1038,9 +1358,15 @@ export default function PaperReaderPage() {
               .replace(/\s+/g, ' ')
               .trim()
           : ''
-        if (!cancelled) setPageText(extracted || fallback)
+        if (!cancelled) {
+          setRawPageText(fallback)
+          setPageText(extracted || fallback)
+        }
       } catch {
-        if (!cancelled) setPageText('')
+        if (!cancelled) {
+          setPageText('')
+          setRawPageText('')
+        }
       }
     }
     loadPageText()
@@ -1049,16 +1375,208 @@ export default function PaperReaderPage() {
     }
   }, [pdfDoc, readPage, pdfNumPages])
 
+  const requestGenerativeRefresh = (options?: { forceRefresh?: boolean; preferAgent?: boolean }) => {
+    // 中文注释：把“本次刷新参数”写入 ref，仅供下一次请求消费。
+    pendingComposedRunRef.current = {
+      forceRefresh: Boolean(options?.forceRefresh),
+      regenerate: Boolean(options?.preferAgent),
+    }
+    setComposedRunSeed((prev) => prev + 1)
+  }
+
+  useEffect(() => {
+    if (!validPaperId || !textMode) {
+      generativeStreamControllerRef.current?.abort()
+      composedStreamControllerRef.current?.abort()
+      setGenerativeLoading(false)
+      setComposedLoading(false)
+      return
+    }
+
+    const runOptions = pendingComposedRunRef.current
+    pendingComposedRunRef.current = { forceRefresh: false, regenerate: false }
+
+    const controller = new AbortController()
+    composedStreamControllerRef.current?.abort()
+    composedStreamControllerRef.current = controller
+
+    setComposedLoading(true)
+    setComposedError('')
+    setComposedCacheLabel('')
+    setComposedPlan(null)
+    setComposedAssets([])
+    setComposedPayload(null)
+    setComposedQuality(null)
+
+    literatureApi
+      .streamReaderComposed(
+        parsedPaperId,
+        {
+          page: readPage,
+          selected_kb_id: selectedKbId,
+          force_refresh: runOptions.forceRefresh,
+          regenerate: runOptions.regenerate,
+          style_intent: generativeStyleKey,
+          theme_mode: themeMode,
+          detail_level: detailLevel,
+          compare_mode: compareMode,
+          citation_tldr: citationTldr,
+        },
+        (event, data) => {
+          if (controller.signal.aborted) return
+
+          if (event === 'start') {
+            const startData = data as {
+              cache_hit?: boolean
+              cache_layer?: string
+              build_mode?: string
+            }
+            const cacheLabel = startData.cache_hit
+              ? `Cache hit (${startData.cache_layer || 'unknown'})`
+              : `Built (${startData.build_mode || 'compose_agent'})`
+            setComposedCacheLabel(cacheLabel)
+            return
+          }
+
+          if (event === 'plan_draft' || event === 'plan_patch') {
+            const planData = data as {
+              ui_plan?: ReaderUIPlan
+            }
+            if (planData.ui_plan) {
+              setComposedPlan(planData.ui_plan)
+            }
+            return
+          }
+
+          if (event === 'assets') {
+            const assetData = data as { assets?: ReaderComposeAsset[] }
+            setComposedAssets(Array.isArray(assetData.assets) ? assetData.assets : [])
+            return
+          }
+
+          if (event === 'quality') {
+            const qualityData = data as { quality_report?: ReaderComposeQualityReport }
+            if (qualityData.quality_report) {
+              setComposedQuality(qualityData.quality_report)
+            }
+            return
+          }
+
+          if (event === 'done') {
+            const doneData = data as { payload?: ReaderComposePayload }
+            if (doneData.payload) {
+              setComposedPayload(doneData.payload)
+              setComposedPlan(doneData.payload.ui_plan || null)
+              setComposedAssets(Array.isArray(doneData.payload.assets) ? doneData.payload.assets : [])
+              setComposedQuality(doneData.payload.quality_report || null)
+            }
+            setComposedLoading(false)
+            return
+          }
+
+          if (event === 'error') {
+            const errorData = data as { message?: string }
+            setComposedError(String(errorData.message || 'AI 组件编排失败，已降级到本地提取'))
+            setComposedLoading(false)
+          }
+        },
+        controller,
+      )
+      .catch((error) => {
+        if (controller.signal.aborted) return
+        const msg = error instanceof Error ? error.message : 'AI 组件编排失败，已降级到本地提取'
+        setComposedError(msg)
+        setComposedLoading(false)
+      })
+
+    return () => {
+      controller.abort()
+      if (composedStreamControllerRef.current === controller) {
+        composedStreamControllerRef.current = null
+      }
+    }
+  }, [
+    validPaperId,
+    parsedPaperId,
+    textMode,
+    readPage,
+    selectedKbId,
+    generativeStyleKey,
+    themeMode,
+    detailLevel,
+    compareMode,
+    citationTldr,
+    composedRunSeed,
+  ])
+
+  useEffect(() => {
+    if (!validPaperId) return
+    const candidates = [readPage - 1, readPage + 1, readPage + 2].filter(
+      (value) => value > 0 && (pdfNumPages <= 0 || value <= pdfNumPages),
+    )
+    if (candidates.length === 0) return
+    literatureApi
+      .prefetchReaderComposed(parsedPaperId, {
+        pages: candidates,
+        selected_kb_id: selectedKbId,
+        style_intent: generativeStyleKey,
+        theme_mode: themeMode,
+        detail_level: detailLevel,
+        compare_mode: compareMode,
+        citation_tldr: citationTldr,
+      })
+      .then((result) => {
+        if (Array.isArray(result.queued)) {
+          result.queued.forEach((item) => prefetchedPagesRef.current.add(Number(item)))
+        }
+      })
+      .catch(() => {
+        // keep silent for prefetch errors
+      })
+  }, [
+    validPaperId,
+    parsedPaperId,
+    readPage,
+    pdfNumPages,
+    selectedKbId,
+    generativeStyleKey,
+    themeMode,
+    detailLevel,
+    compareMode,
+    citationTldr,
+  ])
+
   useEffect(() => {
     writeJsonCache(readerCacheKey, {
       page: readPage,
       zoom: `${zoomPercent}%`,
       scroll_y: 0,
       selected_kb_id: selectedKbId,
-      last_anchor: { fit_width: fitWidth },
+      last_anchor: {
+        fit_width: fitWidth,
+        reader_mode: textMode ? 'generative' : 'pdf',
+        style_key: generativeStyleKey,
+        theme_mode: themeMode,
+        detail_level: detailLevel,
+        compare_mode: compareMode,
+        citation_tldr: citationTldr,
+        compose_quality_target: 0.86,
+      },
       updated_at: new Date().toISOString(),
     })
-  }, [readerCacheKey, readPage, zoomPercent, selectedKbId, fitWidth])
+  }, [
+    readerCacheKey,
+    readPage,
+    zoomPercent,
+    selectedKbId,
+    fitWidth,
+    textMode,
+    generativeStyleKey,
+    themeMode,
+    detailLevel,
+    compareMode,
+    citationTldr,
+  ])
 
   useEffect(() => {
     if (!validPaperId || !readerSessionHydratedRef.current) return
@@ -1067,7 +1585,16 @@ export default function PaperReaderPage() {
       zoom: `${zoomPercent}%`,
       scroll_y: 0,
       selected_kb_id: selectedKbId,
-      last_anchor: { fit_width: fitWidth },
+      last_anchor: {
+        fit_width: fitWidth,
+        reader_mode: textMode ? 'generative' : 'pdf',
+        style_key: generativeStyleKey,
+        theme_mode: themeMode,
+        detail_level: detailLevel,
+        compare_mode: compareMode,
+        citation_tldr: citationTldr,
+        compose_quality_target: 0.86,
+      },
     }
     const signature = JSON.stringify(payload)
     if (signature === lastSavedReaderSignatureRef.current) return
@@ -1092,7 +1619,20 @@ export default function PaperReaderPage() {
     }, 650)
 
     return () => window.clearTimeout(timer)
-  }, [validPaperId, parsedPaperId, readPage, zoomPercent, selectedKbId, fitWidth])
+  }, [
+    validPaperId,
+    parsedPaperId,
+    readPage,
+    zoomPercent,
+    selectedKbId,
+    fitWidth,
+    textMode,
+    generativeStyleKey,
+    themeMode,
+    detailLevel,
+    compareMode,
+    citationTldr,
+  ])
 
   useEffect(() => {
     writeJsonCache(annotationDraftKey, {
@@ -1159,6 +1699,14 @@ export default function PaperReaderPage() {
       .streamStatusEvents(
         { paper_id: parsedPaperId },
         (event, payload) => {
+          if (event === 'reader_page_ready') {
+            const ready = payload as ReaderPageReadyEventData
+            const readyPage = Number(ready?.page || 0)
+            if (Number.isFinite(readyPage) && readyPage > 0) {
+              prefetchedPagesRef.current.add(readyPage)
+            }
+            return
+          }
           if (event !== 'paper_link_status') return
           const data = payload as PaperKnowledgeLinkStatusEventData
           const incomingLinkId = Number(data?.link_id || 0)
@@ -1215,7 +1763,7 @@ export default function PaperReaderPage() {
     if (!pendingSectionJump || !textMode) return
     if (pendingSectionJump.expectedPage && pendingSectionJump.expectedPage !== readPage) return
 
-    const targetIndex = findBestSectionHeadingIndex(academicTextBlocks, pendingSectionJump.sectionTitle)
+    const targetIndex = findBestSectionHeadingIndex(displayedTextBlocks, pendingSectionJump.sectionTitle)
     if (targetIndex == null) {
       if (pendingSectionJump.expectedPage && pendingSectionJump.expectedPage === readPage) {
         message.info(`未在第 ${readPage} 页命中章节“${pendingSectionJump.sectionTitle}”`)
@@ -1240,7 +1788,15 @@ export default function PaperReaderPage() {
       setSectionJumpHighlightIndex((current) => (current === targetIndex ? null : current))
     }, 2200)
     setPendingSectionJump(null)
-  }, [pendingSectionJump, textMode, readPage, academicTextBlocks])
+  }, [pendingSectionJump, textMode, readPage, displayedTextBlocks])
+
+  useEffect(() => {
+    if (textMode) return
+    setAnchorPreview((prev) => {
+      if (!prev.visible) return prev
+      return { ...prev, visible: false, pinned: false, loading: false }
+    })
+  }, [textMode])
 
   const handleBackToList = () => {
     if (window.history.length > 1) {
@@ -1421,7 +1977,7 @@ export default function PaperReaderPage() {
         return
       }
 
-      const localHeadingIndex = findBestSectionHeadingIndex(academicTextBlocks, title)
+      const localHeadingIndex = findBestSectionHeadingIndex(displayedTextBlocks, title)
       if (localHeadingIndex != null) {
         setTextMode(true)
         setPendingSectionJump({ sectionTitle: title, expectedPage: readPage })
@@ -1430,7 +1986,7 @@ export default function PaperReaderPage() {
 
       if (!pdfDoc || pdfNumPages <= 0) {
         setTextMode(true)
-        message.info(`该引用缺少页码，已切换文本模式，请手动查找章节：${title}`)
+        message.info(`该引用缺少页码，已切换生成式模式，请手动查找章节：${title}`)
         return
       }
 
@@ -1446,7 +2002,7 @@ export default function PaperReaderPage() {
           message.success({ key: msgKey, content: `已定位章节到第 ${page} 页`, duration: 2 })
         } else {
           setTextMode(true)
-          message.info({ key: msgKey, content: `未定位到章节“${title}”，已切换文本模式`, duration: 2.4 })
+          message.info({ key: msgKey, content: `未定位到章节“${title}”，已切换生成式模式`, duration: 2.4 })
         }
       } catch {
         message.error({ key: msgKey, content: '章节定位失败，请稍后重试', duration: 2 })
@@ -1456,6 +2012,292 @@ export default function PaperReaderPage() {
       return
     }
     message.info('该引用缺少可跳转定位信息')
+  }
+
+  const applyNodeReplaceToComposeState = (nodeId: string, nodeAfter: ReaderComponentNode) => {
+    setComposedPlan((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        components: replaceNodeInTree(prev.components || [], nodeId, nodeAfter),
+      }
+    })
+    setComposedPayload((prev) => {
+      if (!prev?.ui_plan) return prev
+      return {
+        ...prev,
+        ui_plan: {
+          ...prev.ui_plan,
+          components: replaceNodeInTree(prev.ui_plan.components || [], nodeId, nodeAfter),
+        },
+        overlay_applied: true,
+        overlay_count: Math.max(1, Number(prev.overlay_count || 0) + 1),
+      }
+    })
+  }
+
+  const applyNodeInsertToComposeState = (nodeId: string, nodeAfter: ReaderComponentNode) => {
+    setComposedPlan((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        components: insertNodeAfterInTree(prev.components || [], nodeId, nodeAfter),
+      }
+    })
+    setComposedPayload((prev) => {
+      if (!prev?.ui_plan) return prev
+      return {
+        ...prev,
+        ui_plan: {
+          ...prev.ui_plan,
+          components: insertNodeAfterInTree(prev.ui_plan.components || [], nodeId, nodeAfter),
+        },
+      }
+    })
+  }
+
+  const handleComposedNodeAction = async (node: ReaderComponentNode, action: 'regenerate' | 'degrade') => {
+    if (!validPaperId) return
+    try {
+      const requestPayload: ReaderNodeActionRequest = {
+        page: readPage,
+        node_id: String(node.id),
+        action,
+        reason: action === 'degrade' ? '用户手动触发降级' : '用户手动触发修复',
+        selected_kb_id: selectedKbId,
+        style_intent: generativeStyleKey,
+        theme_mode: themeMode,
+        detail_level: detailLevel,
+        compare_mode: compareMode,
+        citation_tldr: citationTldr,
+      }
+      const result = await literatureApi.actionReaderComposedNode(parsedPaperId, requestPayload)
+      const nextNode = result.node_after
+      if (nextNode?.id) {
+        applyNodeReplaceToComposeState(String(node.id), nextNode)
+      }
+      message.success(result.message || '节点已更新')
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : '节点操作失败'
+      message.error(msg)
+    }
+  }
+
+  const toAnchorList = (rows: ReaderInlineQuerySource[]): ReaderComponentSourceAnchor[] =>
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        page: Number(row.page || readPage),
+        start_char: Number(row.start_char || 0),
+        end_char: Number(row.end_char || 0),
+        quote_text: row.quote_text || undefined,
+      }))
+      .filter((row) => row.page > 0 && row.end_char > row.start_char)
+
+  const handleInlineQuery = async (node: ReaderComponentNode, question: string) => {
+    if (!validPaperId) return
+    const compactQuestion = String(question || '').trim()
+    if (!compactQuestion) return
+
+    setInlineQueryLoadingNodeId(String(node.id))
+    inlineQueryStreamControllerRef.current?.abort()
+    const controller = new AbortController()
+    inlineQueryStreamControllerRef.current = controller
+
+    let aggregatedAnswer = ''
+    let sourceRows: ReaderInlineQuerySource[] = []
+    let inserted = false
+
+    try {
+      await literatureApi.streamReaderComposedInlineQuery(
+        parsedPaperId,
+        {
+          page: readPage,
+          node_id: String(node.id),
+          question: compactQuestion,
+          scope: 'section',
+          selected_kb_id: selectedKbId,
+          style_intent: generativeStyleKey,
+          detail_level: detailLevel,
+          compare_mode: compareMode,
+        },
+        (event: ReaderInlineQueryEvent, data) => {
+          if (event === 'token') {
+            aggregatedAnswer += String((data as { text?: string })?.text || '')
+            return
+          }
+          if (event === 'sources') {
+            sourceRows = Array.isArray(data) ? (data as ReaderInlineQuerySource[]) : []
+            return
+          }
+          if (event === 'done') {
+            const doneData = data as { node?: ReaderComponentNode; sources?: ReaderInlineQuerySource[] }
+            const sourceAnchors = toAnchorList(
+              Array.isArray(doneData.sources) ? doneData.sources : sourceRows,
+            )
+            const fallbackNode: ReaderComponentNode = {
+              id: `answer_${Date.now()}`,
+              type: 'AnswerCard',
+              props: {
+                question: compactQuestion,
+                answer: aggregatedAnswer || '暂无回答，请稍后重试。',
+                foldable: true,
+              },
+              children: [],
+              source_anchor_refs: sourceAnchors,
+            }
+            const answerNode = doneData.node?.id ? doneData.node : fallbackNode
+            applyNodeInsertToComposeState(String(node.id), answerNode)
+            inserted = true
+          }
+          if (event === 'error') {
+            const msg = String((data as { message?: string })?.message || '内联问答失败')
+            message.error(msg)
+          }
+        },
+        controller,
+      )
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : '内联问答失败'
+      message.error(msg)
+    } finally {
+      if (!inserted && aggregatedAnswer.trim()) {
+        const fallbackNode: ReaderComponentNode = {
+          id: `answer_${Date.now()}`,
+          type: 'AnswerCard',
+          props: {
+            question: compactQuestion,
+            answer: aggregatedAnswer,
+            foldable: true,
+          },
+          children: [],
+          source_anchor_refs: toAnchorList(sourceRows),
+        }
+        applyNodeInsertToComposeState(String(node.id), fallbackNode)
+      }
+      if (inlineQueryStreamControllerRef.current === controller) {
+        inlineQueryStreamControllerRef.current = null
+      }
+      setInlineQueryLoadingNodeId((current) => (current === node.id ? null : current))
+    }
+  }
+
+  const buildPreviewTextFromAnchor = (anchor: ReaderComponentSourceAnchor): string => {
+    const quote = String(anchor.quote_text || '').trim()
+    if (quote) return quote
+    if (Number(anchor.page || 0) === readPage) {
+      return buildAnchorPreviewSnippet(rawPageText || pageText, anchor)
+    }
+    return ''
+  }
+
+  const showAnchorPreview = (
+    anchors: ReaderComponentSourceAnchor[],
+    options?: { pinPreview?: boolean },
+  ) => {
+    const anchor = pickPrimaryAnchor(anchors)
+    if (!anchor) return
+    const nextPinned = Boolean(options?.pinPreview)
+    const previewText = buildPreviewTextFromAnchor(anchor)
+    setAnchorPreview({
+      visible: true,
+      pinned: nextPinned,
+      loading: !previewText,
+      page: Number(anchor.page || readPage),
+      text: previewText || '正在加载该锚点原文片段...',
+      title: `原文证据 · 第 ${Number(anchor.page || readPage)} 页`,
+      anchors,
+    })
+    if (nextPinned && Number(anchor.page || 0) > 0 && Number(anchor.page || 0) !== readPage) {
+      setReadPage(Number(anchor.page))
+    }
+
+    if (!previewText && pdfDoc && Number(anchor.page || 0) > 0) {
+      const targetPage = Number(anchor.page)
+      void (async () => {
+        try {
+          const page = await pdfDoc.getPage(targetPage)
+          const textContent = await page.getTextContent()
+          const extracted = extractAcademicPageText(textContent)
+          const fallback = Array.isArray(textContent?.items)
+            ? textContent.items
+                .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+            : ''
+          const source = extracted || fallback
+          const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
+          setAnchorPreview((prev) => {
+            if (!prev.visible) return prev
+            return {
+              ...prev,
+              loading: false,
+              text: resolvedText || prev.text || '未检索到可展示的原文片段。',
+            }
+          })
+        } catch {
+          setAnchorPreview((prev) => {
+            if (!prev.visible) return prev
+            return { ...prev, loading: false, text: prev.text || '原文片段加载失败，请切换 PDF 模式核对。' }
+          })
+        }
+      })()
+    }
+  }
+
+  const hideAnchorPreview = () => {
+    setAnchorPreview((prev) => {
+      if (prev.pinned) return prev
+      return { ...prev, visible: false, loading: false }
+    })
+  }
+
+  const appendMarkdownToAnnotation = (markdown: string) => {
+    const text = String(markdown || '').trim()
+    if (!text) return
+    setAnnotationContent((prev) => {
+      const current = String(prev || '')
+      const textarea = annotationInputRef.current?.resizableTextArea?.textArea as HTMLTextAreaElement | undefined
+      if (!textarea) {
+        return current ? `${current}\n\n${text}` : text
+      }
+      const start = Number(textarea.selectionStart || 0)
+      const end = Number(textarea.selectionEnd || start)
+      const before = current.slice(0, start)
+      const after = current.slice(end)
+      const glue = before && !before.endsWith('\n') ? '\n\n' : ''
+      const next = `${before}${glue}${text}${after}`
+      window.requestAnimationFrame(() => {
+        textarea.focus()
+        const cursor = before.length + glue.length + text.length
+        textarea.setSelectionRange(cursor, cursor)
+      })
+      return next
+    })
+    setAnnotationPage(readPage)
+  }
+
+  const handleAnnotationDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleAnnotationDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    const customPayload = event.dataTransfer.getData('application/x-reader-component+json')
+    const markdownPayload = event.dataTransfer.getData('text/markdown') || event.dataTransfer.getData('text/plain')
+    let markdown = markdownPayload
+    if (!markdown && customPayload) {
+      try {
+        const parsed = JSON.parse(customPayload) as { markdown?: string }
+        markdown = String(parsed.markdown || '')
+      } catch {
+        markdown = ''
+      }
+    }
+    if (!markdown.trim()) return
+    appendMarkdownToAnnotation(markdown)
+    message.success('组件内容已放入批注草稿')
   }
 
   const renderAnswerWithCitations = () => {
@@ -1485,6 +2327,542 @@ export default function PaperReaderPage() {
             </Button>
           )
         })}
+      </div>
+    )
+  }
+
+  const renderGenerativeTextPanel = () => {
+    const activeComposedPlan = composedPlan || composedPayload?.ui_plan || null
+    const hasComposedPlan = Boolean(activeComposedPlan?.components?.length)
+    const useComposedView =
+      hasComposedPlan ||
+      composedLoading ||
+      Boolean(composedError) ||
+      Boolean(composedPayload)
+    const composedLinkAssets = composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image')
+
+    if (useComposedView) {
+      return (
+        <div
+          style={{
+            border: `1px solid ${activeGenerativeStyle.borderColor}`,
+            borderRadius: 12,
+            background: activeGenerativeStyle.pageBackground,
+            boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
+          }}
+        >
+          <div
+            style={{
+              borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
+              padding: '10px 14px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 10,
+              flexWrap: 'wrap',
+            }}
+          >
+            <Space size={8} wrap>
+              <Tag color="blue">AI Composed Reader</Tag>
+              <Text style={{ color: activeGenerativeStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
+              {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+              {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
+              {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
+            </Space>
+            <Space size={8} wrap>
+              <Select
+                size="small"
+                style={{ minWidth: 98 }}
+                value={themeMode}
+                onChange={(value) => setThemeMode(value as ReaderThemeMode)}
+                options={[
+                  { label: '浅色', value: 'light' },
+                  { label: '深色', value: 'dark' },
+                ]}
+              />
+              <Select
+                size="small"
+                style={{ minWidth: 118 }}
+                value={detailLevel}
+                onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
+                options={[
+                  { label: '简洁', value: 'concise' },
+                  { label: '标准', value: 'standard' },
+                  { label: '深入', value: 'deep' },
+                ]}
+              />
+              <Button
+                size="small"
+                type={compareMode ? 'primary' : 'default'}
+                onClick={() => setCompareMode((prev) => !prev)}
+              >
+                对比模式
+              </Button>
+              <Button
+                size="small"
+                type={citationTldr ? 'primary' : 'default'}
+                onClick={() => setCitationTldr((prev) => !prev)}
+              >
+                引用TL;DR
+              </Button>
+              <Select
+                size="small"
+                style={{ minWidth: 168 }}
+                value={generativeStyleKey}
+                onChange={(value) => {
+                  const nextStyle = value as ReaderGenerativeStyleKey
+                  setGenerativeStyleKey(nextStyle)
+                  setGenerativeStyleTuning(
+                    normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
+                  )
+                }}
+                options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+              />
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={composedLoading}
+                onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
+              >
+                重新生成
+              </Button>
+            </Space>
+          </div>
+
+          <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '18px 20px 24px' }}>
+            {composedError ? (
+              <Alert
+                showIcon
+                type="warning"
+                message="AI 编排视图生成失败"
+                description={`${composedError}；已降级为本地结构化文本。`}
+                style={{ marginBottom: 12 }}
+              />
+            ) : null}
+            {anchorPreview.visible ? (
+              <Card
+                size="small"
+                title={anchorPreview.title || `原文证据 · 第 ${anchorPreview.page} 页`}
+                style={{
+                  marginBottom: 12,
+                  borderRadius: 12,
+                  border: `1px solid ${activeGenerativeStyle.borderColor}`,
+                  background: activeGenerativeStyle.panelBackground,
+                }}
+                extra={(
+                  <Space size={8}>
+                    {anchorPreview.pinned ? (
+                      <Tag color="blue">已钉住</Tag>
+                    ) : (
+                      <Button
+                        size="small"
+                        onClick={() => setAnchorPreview((prev) => ({ ...prev, pinned: true, visible: true }))}
+                      >
+                        钉住
+                      </Button>
+                    )}
+                    <Button
+                      size="small"
+                      onClick={() => {
+                        setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
+                      }}
+                    >
+                      关闭
+                    </Button>
+                  </Space>
+                )}
+              >
+                <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                  悬停组件可预览证据，点击“定位到证据”可固定并跳转 PDF。
+                </Text>
+                {anchorPreview.loading ? <Spin size="small" /> : (
+                  <div
+                    style={{
+                      whiteSpace: 'pre-wrap',
+                      lineHeight: 1.75,
+                      color: activeGenerativeStyle.bodyColor,
+                    }}
+                  >
+                    {anchorPreview.text || '暂无可展示的锚点原文。'}
+                  </div>
+                )}
+              </Card>
+            ) : null}
+
+            {composedLoading && !hasComposedPlan ? (
+              <div className="h-[360px] flex items-center justify-center">
+                <Spin />
+              </div>
+            ) : null}
+
+            {hasComposedPlan && activeComposedPlan ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {renderReaderComponentTree(activeComposedPlan.components, {
+                  qualityReport: composedQuality || composedPayload?.quality_report || null,
+                  inlineQueryLoadingNodeId,
+                  onNodeAction: (node, action) => {
+                    void handleComposedNodeAction(node, action)
+                  },
+                  onInlineQuery: async (node, question) => {
+                    await handleInlineQuery(node, question)
+                  },
+                  onPreviewAnchors: (anchors, options) => {
+                    showAnchorPreview(anchors, options)
+                  },
+                  onJumpAnchor: (anchors, options) => {
+                    showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
+                  },
+                  onHidePreview: () => {
+                    hideAnchorPreview()
+                  },
+                  onDropMarkdown: (markdown) => {
+                    appendMarkdownToAnnotation(markdown)
+                  },
+                })}
+              </div>
+            ) : null}
+
+            {!composedLoading && !hasComposedPlan ? (
+              <Empty description="当前页暂未生成可用的 AI 组件视图" />
+            ) : null}
+
+            {composedLinkAssets.length > 0 ? (
+              <Card size="small" title="补充资源" style={{ marginTop: 12, borderRadius: 12 }}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {composedLinkAssets.slice(0, 6).map((item, idx) => {
+                    const href = String(item.href || '').trim()
+                    if (!href) return null
+                    return (
+                      <a key={`compose-link-${idx}`} href={href} target="_blank" rel="noreferrer">
+                        {item.label || href}
+                      </a>
+                    )
+                  })}
+                </Space>
+              </Card>
+            ) : null}
+          </div>
+        </div>
+      )
+    }
+
+    const linkAssets = generativeAssets.filter((item) => item.kind === 'link')
+    const annotationAssets = generativeAssets.filter((item) => item.kind === 'annotation')
+    const imageHintAssets = generativeAssets.filter((item) => item.kind === 'image_hint')
+    const effectiveLinks = linkAssets.length > 0
+      ? linkAssets
+        .map((item, index) => ({
+          label: item.label || `链接${index + 1}`,
+          href: String(item.href || ''),
+          source: item.source === 'metadata' ? 'metadata' : 'text',
+        }))
+        .filter((item) => Boolean(item.href))
+      : pageResourceLinks
+    const sectionCount = generativeSections.length > 0 ? generativeSections.length : 0
+    const summaryText = String(generativeSummary || generativePayload?.summary || '').trim()
+    const sideCardStyle: CSSProperties = {
+      border: `1px solid ${activeGenerativeStyle.borderColor}`,
+      background: activeGenerativeStyle.panelBackground,
+      borderRadius: 12,
+      padding: '12px',
+    }
+    return (
+      <div
+        style={{
+          border: `1px solid ${activeGenerativeStyle.borderColor}`,
+          borderRadius: 12,
+          background: activeGenerativeStyle.pageBackground,
+          boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
+        }}
+      >
+        <div
+          style={{
+            borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
+            padding: '10px 14px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 10,
+            flexWrap: 'wrap',
+          }}
+        >
+          <Space size={8} wrap>
+            <Tag color="blue">Generative Reader</Tag>
+            <Text style={{ color: '#1e3a8a' }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
+            {sectionCount > 0 ? <Tag color="geekblue">{sectionCount} 个章节</Tag> : null}
+            {generativeCacheLabel ? <Tag color="cyan">{generativeCacheLabel}</Tag> : null}
+            {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
+          </Space>
+          <Space size={8} wrap>
+            <Text style={{ color: '#3b567a' }}>
+              {generativeLayoutMode === 'split' ? '双列生成流' : '单列生成流'} · 原文增强阅读
+            </Text>
+            <Select
+              size="small"
+              style={{ minWidth: 168 }}
+              value={generativeStyleKey}
+              onChange={(value) => {
+                // 中文注释：切换风格会触发 useEffect 重新拉取该风格对应内容。
+                const nextStyle = value as ReaderGenerativeStyleKey
+                setGenerativeStyleKey(nextStyle)
+                setGenerativeStyleTuning(
+                  normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
+                )
+              }}
+              options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+            />
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              loading={generativeLoading}
+              onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
+            >
+              重新生成
+            </Button>
+          </Space>
+        </div>
+        <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '18px 20px 24px' }}>
+          {generativeError ? (
+            <Alert
+              showIcon
+              type="warning"
+              message="生成式阅读服务暂不可用"
+              description={`${generativeError}；已自动降级为本地文本提取。`}
+              style={{ marginBottom: 12 }}
+            />
+          ) : null}
+          {generativeLoading && generativeBlocks.length === 0 ? (
+            <div className="h-[560px] flex items-center justify-center">
+              <Spin />
+            </div>
+          ) : displayedTextBlocks.length > 0 || rawPageTextPreview ? (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: generativeLayoutMode === 'split' ? '320px minmax(0, 1fr)' : '1fr',
+                gap: 14,
+                alignItems: 'start',
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={sideCardStyle}>
+                  <Text strong style={{ display: 'block', color: '#12305c' }}>{paper?.title || '未命名论文'}</Text>
+                  <Text type="secondary">
+                    {paper?.venue || '未知期刊'} {paper?.year ? `· ${paper?.year}` : ''}
+                  </Text>
+                  <div style={{ marginTop: 8 }}>
+                    <Text type="secondary">
+                      作者：{paper?.authors?.slice(0, 3).map((item) => item.name).join(', ') || '未知作者'}
+                      {paper?.authors && paper?.authors.length > 3 ? ` 等 ${paper?.authors.length} 位` : ''}
+                    </Text>
+                  </div>
+                </div>
+
+                <div style={sideCardStyle}>
+                  <Text strong style={{ color: '#12305c' }}>章节摘要</Text>
+                  <div style={{ marginTop: 8 }}>
+                    <Text type="secondary">
+                      {summaryText || '当前页暂未生成摘要'}
+                    </Text>
+                  </div>
+                </div>
+
+                <div style={sideCardStyle}>
+                  <Text strong style={{ color: '#12305c' }}>图注/图表线索</Text>
+                  <div style={{ marginTop: 10 }}>
+                    {imageHintAssets.length > 0 ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {imageHintAssets.slice(0, 6).map((item, idx) => (
+                          <Tag key={`img-hint-${idx}`} color="default" style={{ marginInlineEnd: 0, whiteSpace: 'normal' }}>
+                            {item.label}
+                          </Tag>
+                        ))}
+                      </div>
+                    ) : (
+                      <Text type="secondary">当前页无图注线索；可切换 PDF 模式查看原页。</Text>
+                    )}
+                  </div>
+                </div>
+
+                <div style={sideCardStyle}>
+                  <Space align="center" size={6}>
+                    <LinkOutlined style={{ color: '#2f67ca' }} />
+                    <Text strong style={{ color: '#12305c' }}>资源链接</Text>
+                  </Space>
+                  {effectiveLinks.length > 0 ? (
+                    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {effectiveLinks.map((link, index) => (
+                        <a
+                          key={`${link.href}-${index}`}
+                          href={link.href}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: 8,
+                            border: '1px solid rgba(93, 134, 210, 0.22)',
+                            background: 'rgba(242, 247, 255, 0.95)',
+                            borderRadius: 8,
+                            padding: '8px 10px',
+                            color: '#1f4f9d',
+                            textDecoration: 'none',
+                            fontSize: 12,
+                          }}
+                        >
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {link.label}
+                          </span>
+                          <Tag color={link.source === 'metadata' ? 'blue' : 'default'} style={{ marginInlineEnd: 0 }}>
+                            {link.source === 'metadata' ? '元数据' : '页内'}
+                          </Tag>
+                        </a>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 10 }}>
+                      <Text type="secondary">当前页未识别到可用链接</Text>
+                    </div>
+                  )}
+                </div>
+
+                <div style={sideCardStyle}>
+                  <Space align="center" size={6}>
+                    <PushpinOutlined style={{ color: '#2f67ca' }} />
+                    <Text strong style={{ color: '#12305c' }}>页内注释</Text>
+                  </Space>
+                  {annotationAssets.length > 0 ? (
+                    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {annotationAssets.slice(0, 6).map((item, idx) => (
+                        <div
+                          key={`anno-asset-${idx}`}
+                          style={{
+                            border: '1px solid rgba(93, 134, 210, 0.2)',
+                            background: 'rgba(245, 249, 255, 0.94)',
+                            borderRadius: 8,
+                            padding: '8px 10px',
+                          }}
+                        >
+                          <Text>{item.label || '(空内容)'}</Text>
+                        </div>
+                      ))}
+                    </div>
+                  ) : currentPageAnnotations.length > 0 ? (
+                    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {currentPageAnnotations.slice(0, 6).map((item) => (
+                        <div
+                          key={item.id}
+                          style={{
+                            border: '1px solid rgba(93, 134, 210, 0.2)',
+                            background: 'rgba(245, 249, 255, 0.94)',
+                            borderRadius: 8,
+                            padding: '8px 10px',
+                          }}
+                        >
+                          <Space wrap size={6}>
+                            <Tag color={item.annotation_type === 'highlight' ? 'gold' : 'blue'} style={{ marginInlineEnd: 0 }}>
+                              {item.annotation_type === 'highlight' ? '高亮' : '笔记'}
+                            </Tag>
+                            <Text type="secondary">{String(item.updated_at || '').replace('T', ' ').slice(0, 16)}</Text>
+                          </Space>
+                          <div style={{ marginTop: 4 }}>
+                            <Text>{item.content || item.quote_text || '(空内容)'}</Text>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 10 }}>
+                      <Text type="secondary">当前页暂无批注，可在右侧“批注”面板添加。</Text>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div
+                  style={{
+                    border: '1px solid rgba(101, 154, 244, 0.22)',
+                    background: activeGenerativeStyle.panelBackground,
+                    borderRadius: 12,
+                    padding: '16px 18px 14px',
+                  }}
+                >
+                  <Text strong style={{ color: '#12305c' }}>页面正文（提取后结构化）</Text>
+                  <div
+                    style={{
+                      marginTop: 14,
+                      fontFamily: activeGenerativeStyle.bodyFontFamily,
+                      fontSize: activeGenerativeStyle.bodyFontSize,
+                      lineHeight: activeGenerativeStyle.bodyLineHeight,
+                      color: activeGenerativeStyle.bodyColor,
+                      textAlign: 'justify',
+                      letterSpacing: '0.01em',
+                    }}
+                  >
+                    {displayedTextBlocks.map((block, index) => {
+                      if (block.kind === 'heading') {
+                        const headingMatch = block.text.match(/^(\d+(?:\.\d+)*)/)
+                        const headingDepth = headingMatch ? headingMatch[1].split('.').length : 1
+                        const baseHeadingSize =
+                          headingDepth <= 1
+                            ? 26
+                            : headingDepth === 2
+                              ? 22
+                              : 19
+                        const headingSize = Math.round(baseHeadingSize * normalizedStyleTuning.heading_scale)
+                        return (
+                          <div
+                            key={`heading-${index}`}
+                            ref={(node) => {
+                              if (node) headingRefMap.current.set(index, node)
+                              else headingRefMap.current.delete(index)
+                            }}
+                            style={{
+                              fontFamily: activeGenerativeStyle.headingFontFamily,
+                              fontWeight: 700,
+                              fontSize: headingSize,
+                              letterSpacing: headingDepth <= 1 ? '0.005em' : '0.002em',
+                              lineHeight: 1.45,
+                              color: activeGenerativeStyle.headingColor,
+                              borderBottom: '1px solid rgba(15, 76, 129, 0.18)',
+                              paddingBottom: 4,
+                              margin: headingDepth <= 1 ? '0.78em 0 0.52em' : '0.62em 0 0.4em',
+                              textAlign: 'left',
+                              background: sectionJumpHighlightIndex === index ? 'rgba(112, 184, 255, 0.22)' : 'transparent',
+                              borderRadius: 8,
+                              transition: 'background 0.25s ease',
+                            }}
+                          >
+                            {block.text}
+                          </div>
+                        )
+                      }
+
+                      const prevBlock = index > 0 ? displayedTextBlocks[index - 1] : null
+                      const noIndent = !prevBlock || prevBlock.kind === 'heading'
+                      return (
+                        <p
+                          key={`paragraph-${index}`}
+                          style={{
+                            margin: '0 0 1.05em',
+                            textIndent: noIndent ? 0 : '2em',
+                          }}
+                        >
+                          {block.text}
+                        </p>
+                      )
+                    })}
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          ) : (
+            <Empty description="当前页暂无可提取文本（可能是扫描图像页）" />
+          )}
+        </div>
       </div>
     )
   }
@@ -1601,7 +2979,7 @@ export default function PaperReaderPage() {
                     {fitWidth ? '已适宽' : '适宽'}
                   </Button>
                   <Button onClick={() => setTextMode((prev) => !prev)}>
-                    {textMode ? 'PDF模式' : '文本模式'}
+                    {textMode ? 'PDF模式' : '生成式模式'}
                   </Button>
                   <Tag color={readerAutoSaveTag.color}>{readerAutoSaveTag.label}</Tag>
                 </Space>
@@ -1675,125 +3053,7 @@ export default function PaperReaderPage() {
                     </PdfDocument>
                   </div>
 
-                  {textMode ? (
-                    <div
-                      style={{
-                        border: '1px solid rgba(79, 148, 255, 0.35)',
-                        borderRadius: 12,
-                        background:
-                          'linear-gradient(180deg, rgba(249, 251, 255, 0.98) 0%, rgba(241, 246, 255, 0.98) 100%)',
-                        boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
-                      }}
-                    >
-                      <div
-                        style={{
-                          borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
-                          padding: '10px 14px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: 10,
-                          flexWrap: 'wrap',
-                        }}
-                      >
-                        <Space size={8} wrap>
-                          <Tag color="blue">Academic Text</Tag>
-                          <Text style={{ color: '#1e3a8a' }}>第 {readPage} 页</Text>
-                          <Text style={{ color: '#1e3a8a' }}>词数: {pageWordCount}</Text>
-                        </Space>
-                        <Text style={{ color: '#3b567a' }}>
-                          {textColumnCount === 2 ? '双栏阅读' : '单栏阅读'} · 学术排版
-                        </Text>
-                      </div>
-                      <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '24px 28px' }}>
-                        {!pdfDoc ? (
-                          <div className="h-[560px] flex items-center justify-center">
-                            <Spin />
-                          </div>
-                        ) : academicTextBlocks.length > 0 ? (
-                          <div
-                            style={{
-                              margin: '0 auto',
-                              maxWidth: textColumnCount === 2 ? 980 : 760,
-                              fontFamily:
-                                '"Source Han Serif SC","Noto Serif SC","Source Serif 4","Times New Roman",serif',
-                              fontSize: textColumnCount === 2 ? 17 : 18,
-                              lineHeight: 2,
-                              color: '#14223b',
-                              textAlign: 'justify',
-                              letterSpacing: '0.01em',
-                              columnCount: textColumnCount,
-                              columnGap: textColumnCount === 2 ? '3rem' : 'normal',
-                            }}
-                          >
-                            {academicTextBlocks.map((block, index) => {
-                              if (block.kind === 'heading') {
-                                const headingMatch = block.text.match(/^(\d+(?:\.\d+)*)/)
-                                const headingDepth = headingMatch ? headingMatch[1].split('.').length : 1
-                                const headingSize =
-                                  headingDepth <= 1
-                                    ? textColumnCount === 2
-                                      ? 24
-                                      : 26
-                                    : headingDepth === 2
-                                      ? textColumnCount === 2
-                                        ? 20
-                                        : 22
-                                      : textColumnCount === 2
-                                        ? 18
-                                        : 19
-                                return (
-                                  <div
-                                    key={`heading-${index}`}
-                                    ref={(node) => {
-                                      if (node) headingRefMap.current.set(index, node)
-                                      else headingRefMap.current.delete(index)
-                                    }}
-                                    style={{
-                                      fontFamily:
-                                        '"Source Han Serif SC","Noto Serif SC","Source Serif 4","Times New Roman",serif',
-                                      fontWeight: 700,
-                                      fontSize: headingSize,
-                                      letterSpacing: headingDepth <= 1 ? '0.005em' : '0.002em',
-                                      lineHeight: 1.5,
-                                      color: '#102a50',
-                                      borderBottom: '1px solid rgba(15, 76, 129, 0.18)',
-                                      paddingBottom: 4,
-                                      margin: headingDepth <= 1 ? '0.78em 0 0.52em' : '0.62em 0 0.4em',
-                                      breakInside: 'avoid-column',
-                                      textAlign: 'left',
-                                      background: sectionJumpHighlightIndex === index ? 'rgba(112, 184, 255, 0.22)' : 'transparent',
-                                      borderRadius: 8,
-                                      transition: 'background 0.25s ease',
-                                    }}
-                                  >
-                                    {block.text}
-                                  </div>
-                                )
-                              }
-
-                              const prevBlock = index > 0 ? academicTextBlocks[index - 1] : null
-                              const noIndent = !prevBlock || prevBlock.kind === 'heading'
-                              return (
-                                <p
-                                  key={`paragraph-${index}`}
-                                  style={{
-                                    margin: '0 0 1.05em',
-                                    textIndent: noIndent ? 0 : '2em',
-                                    breakInside: 'avoid',
-                                  }}
-                                >
-                                  {block.text}
-                                </p>
-                              )
-                            })}
-                          </div>
-                        ) : (
-                          <Empty description="当前页暂无可提取文本（可能是扫描图像页）" />
-                        )}
-                      </div>
-                    </div>
-                  ) : null}
+                  {textMode ? renderGenerativeTextPanel() : null}
                 </>
               )}
             </div>
@@ -1841,13 +3101,16 @@ export default function PaperReaderPage() {
                         />
                         <Button onClick={() => setAnnotationPage(readPage)}>定位到当前页</Button>
                       </Space>
-                      <TextArea
-                        rows={4}
-                        value={annotationContent}
-                        onChange={(e) => setAnnotationContent(e.target.value)}
-                        placeholder="输入批注内容"
-                        style={{ borderRadius: 10 }}
-                      />
+                      <div onDragOver={handleAnnotationDragOver} onDrop={handleAnnotationDrop}>
+                        <TextArea
+                          ref={annotationInputRef}
+                          rows={4}
+                          value={annotationContent}
+                          onChange={(e) => setAnnotationContent(e.target.value)}
+                          placeholder="输入批注内容（支持从左侧拖拽组件 Markdown 到此处）"
+                          style={{ borderRadius: 10 }}
+                        />
+                      </div>
                       <Button type="primary" onClick={handleAddAnnotation} style={{ alignSelf: 'flex-start', height: 40, paddingInline: 22 }}>
                         新增批注
                       </Button>
@@ -2139,3 +3402,5 @@ export default function PaperReaderPage() {
     </div>
   )
 }
+
+
