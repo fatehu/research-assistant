@@ -61,6 +61,15 @@ from app.schemas.literature import (
     PaperCommentResponse,
     PaperCommentUpdate,
     PaperCreate,
+    ReaderGenerativePrefetchRequest,
+    ReaderGenerativePrefetchResponse,
+    ReaderGenerativeRequest,
+    ReaderComposePrefetchRequest,
+    ReaderComposePrefetchResponse,
+    ReaderComposeRequest,
+    ReaderInlineQueryRequest,
+    ReaderNodeActionRequest,
+    ReaderNodeActionResponse,
     PaperKnowledgeLinkResponse,
     PaperRatingSummary,
     PaperRatingUpdate,
@@ -77,6 +86,8 @@ from app.schemas.literature import (
 from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.contextual_compression_service import CompressionInput
 from app.services.literature_service import PaperResult, get_literature_service
+from app.services.literature_reader_compose_service import get_literature_reader_compose_service
+from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
@@ -95,7 +106,7 @@ router = APIRouter(prefix="/literature", tags=["literature"])
 
 
 def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
-    """将 Paper 模型转换为响应字典"""
+    """灏?Paper 妯″瀷杞崲涓哄搷搴斿瓧鍏?"""
     if collection_ids is None:
         collection_ids = []
     
@@ -573,7 +584,7 @@ async def _invalidate_ask_cache_for_collection(user_id: int, collection_id: int)
                 if cursor == 0 or cursor == "0":
                     break
         except Exception as exc:
-            logger.warning(f"[Literature Ask] 收藏夹缓存失效失败: {exc}")
+            logger.warning(f"[Literature Ask] 鏀惰棌澶圭紦瀛樺け鏁堝け璐? {exc}")
 
     for key in list(_ask_cache_memory.keys()):
         if key.startswith(prefix) and f":collection:{collection_id}:" in key:
@@ -735,7 +746,7 @@ async def _retrieve_rag_sources(
                 )
             ).fetchall()
         except Exception as exc:
-            logger.warning(f"[Literature Ask] FTS检索失败，回退ILIKE: {exc}")
+            logger.warning(f"[Literature Ask] FTS 检索失败，回退 ILIKE: {exc}")
 
     if not rows:
         fallback_stmt = (
@@ -1068,8 +1079,8 @@ _PAPER_READ_EN_TO_CN_TERMS: Dict[str, List[str]] = {
     "results": ["结果"],
     "analysis": ["分析", "数据分析"],
     "discussion": ["讨论"],
-    "limitation": ["局限性"],
-    "limitations": ["局限性"],
+    "limitation": ["灞€闄愭€?"],
+    "limitations": ["灞€闄愭€?"],
     "conclusion": ["结论"],
     "conclusions": ["结论"],
 }
@@ -1272,7 +1283,7 @@ class LiteratureDirectPaperReadTool(ToolBase):
                 if term.lower() in lower:
                     hit_count += 1
             ratio = (hit_count / max(len(terms), 1)) if terms else 0.0
-            # 对首屏摘要页给予轻微偏置，避免零命中时完全随机。
+            # 中文注释：对首屏摘要页给予轻微偏置，避免零命中时完全随机。
             page_bias = 0.04 if page_idx <= 2 else 0.0
             score = ratio + page_bias
             ranked.append((score, page_idx, content))
@@ -1350,7 +1361,7 @@ class LiteratureAskAgentCore(AgentCore):
     SYSTEM_PROMPT = """你是论文阅读问答助手（Agent 模式）。
 
 你的目标是基于可验证证据给出高质量回答。
-你需要自行决定是否调用工具、调用哪个工具以及调用次数。
+你需要自行决定是否调用工具、调用哪一个工具以及调用次数。
 不要机械套用固定流程，应根据问题类型动态选择 strategy（例如 knowledge_search、paper_read、web_search/MCP 网页工具）。
 
 决策原则：
@@ -1358,7 +1369,7 @@ class LiteratureAskAgentCore(AgentCore):
 1.1 调用 paper_read 时，query 必须尽量复用用户问题原文，不要固定套用中文模板词。
 1.2 若 paper_read 首次命中较弱（例如 quality=low 或片段明显不相关），可将 query 做中英互换后重试一次。
 2. 需要知识库片段或跨文档证据时，可使用 knowledge_search。
-3. 本地证据不足且确有必要时，再使用网页/MCP 工具，并标注时效风险。
+3. 本地证据不足且确有必要时，再使用网页/MCP 工具，并标注时效性风险。
 4. 避免无意义重复调用，证据充分后直接作答。
 
 边界：
@@ -1372,7 +1383,7 @@ class LiteratureAskAgentCore(AgentCore):
     CITATION_POLICY_PROMPT = """## 引用规范（必须遵守）
 1. 基于检索证据回答时，关键结论后必须加 `[来源X]`。
 2. `X` 只能来自工具 observation 已出现过的来源编号。
-3. 若使用网页来源，需在结论中明确“网页来源”与时间性风险。
+3. 若使用网页来源，需在结论中明确“网页来源”与时效性风险。
 4. 不得输出未在证据中出现的来源编号。
 """.strip()
 
@@ -1397,18 +1408,20 @@ class LiteratureAskAgentCore(AgentCore):
     def _build_observation_message(tool_name: str, observation_output: str) -> str:
         if tool_name == "paper_read":
             followup = (
-                "请根据工具返回的信息继续。若检索诊断为 quality=low 或片段不相关，可将 query 做中英互换后再调用一次 paper_read。"
-                "若要给出最终回答，必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中出现过的来源编号。"
-                "如证据不足，请明确说明。请用<answer>标签给出最终回答。"
+                "请根据工具返回的信息继续。若检索诊断为 quality=low 或片段不相关，"
+                "可将 query 做中英互换后再调用一次 paper_read。"
+                "若要给出最终回答，必须在关键结论后保留对应的 [来源X] 标注，"
+                "且只能使用 observation 中已出现过的来源编号。"
+                "如证据不足，请明确说明。请用 <answer> 标签给出最终回答。"
             )
         elif tool_name == "knowledge_search":
             followup = (
                 "请根据工具返回的信息继续。若要给出最终回答，"
-                "必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中出现过的来源编号。"
-                "如证据不足，请明确说明。请用<answer>标签给出最终回答。"
+                "必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中已出现过的来源编号。"
+                "如证据不足，请明确说明。请用 <answer> 标签给出最终回答。"
             )
         else:
-            followup = "请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
+            followup = "请根据工具返回的信息继续。如果已有足够信息，请用 <answer> 标签给出最终回答。"
         return f"<observation>\n{observation_output}\n</observation>\n\n{followup}"
 
     @classmethod
@@ -1720,7 +1733,7 @@ def _to_comment_response(comment: PaperComment) -> PaperCommentResponse:
 @router.get("/search", response_model=PaperSearchResponse)
 async def search_papers(
     query: str = Query(..., min_length=1, description="搜索关键词"),
-    source: str = Query("semantic_scholar", description="数据源: semantic_scholar, arxiv, pubmed, openalex, crossref"),
+    source: str = Query("semantic_scholar", description="数据源：semantic_scholar, arxiv, pubmed, openalex, crossref"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     year_start: Optional[int] = Query(None, description="起始年份"),
@@ -1735,10 +1748,10 @@ async def search_papers(
     
     支持的数据源:
     - semantic_scholar: Semantic Scholar (综合学术搜索，有引用数据)
-    - arxiv: arXiv (预印本，计算机/物理/数学)
+    - arxiv: arXiv (棰勫嵃鏈紝璁＄畻鏈?鐗╃悊/鏁板)
     - pubmed: PubMed (生物医学文献)
-    - openalex: OpenAlex (开放学术图谱)
-    - crossref: CrossRef (DOI 元数据)
+    - openalex: OpenAlex (寮€鏀惧鏈浘璋?
+    - crossref: CrossRef (DOI 鍏冩暟鎹?
     """
     logger.info(f"[Literature API] 搜索: {query}, source={source}, user={current_user.id}")
     
@@ -1869,7 +1882,7 @@ async def get_search_history(
 
 @router.get("/papers", response_model=List[PaperResponse])
 async def get_papers(
-    collection_id: Optional[int] = Query(None, description="收藏夹 ID"),
+    collection_id: Optional[int] = Query(None, description="鏀惰棌澶?ID"),
     is_read: Optional[bool] = Query(None, description="阅读状态"),
     tag: Optional[str] = Query(None, description="标签"),
     min_rating: Optional[int] = Query(None, ge=1, le=5, description="最低评分"),
@@ -1884,10 +1897,10 @@ async def get_papers(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """获取用户的论文列表"""
+    """鑾峰彇鐢ㄦ埛鐨勮鏂囧垪琛?"""
     stmt = select(Paper).where(Paper.user_id == current_user.id)
     
-    # 收藏夹过滤
+    # 鏀惰棌澶硅繃婊?
     if collection_id:
         stmt = stmt.join(paper_collection_association).where(
             paper_collection_association.c.collection_id == collection_id
@@ -1936,10 +1949,10 @@ async def get_papers(
     result = await db.execute(stmt)
     papers = result.scalars().all()
     
-    # 获取收藏夹关联
+    # 鑾峰彇鏀惰棌澶瑰叧鑱?
     paper_responses = []
     for paper in papers:
-        # 获取论文所属的收藏夹
+        # 鑾峰彇璁烘枃鎵€灞炵殑鏀惰棌澶?
         coll_stmt = select(paper_collection_association.c.collection_id).where(
             paper_collection_association.c.paper_id == paper.id
         )
@@ -1967,7 +1980,7 @@ async def get_paper(
     if not paper:
         raise HTTPException(status_code=404, detail="论文不存在")
     
-    # 获取收藏夹
+    # 鑾峰彇鏀惰棌澶?
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -1983,7 +1996,7 @@ async def save_paper(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """保存论文（从搜索结果）"""
+    """保存论文（从搜索结果）。"""
     logger.info(f"[Literature API] 保存论文: {request.title[:50]}...")
     
     # 检查是否已存在
@@ -2052,7 +2065,7 @@ async def save_paper(
             )
         )
         default_result = await db.execute(default_stmt)
-        # 使用 scalars().first() 来安全处理可能存在的多个默认收藏夹
+        # 使用 scalars().first() 安全处理可能存在的多个默认收藏夹
         default_collection = default_result.scalars().first()
         
         if default_collection:
@@ -2065,7 +2078,7 @@ async def save_paper(
                 collection_id=coll_id
             )
         )
-        # 更新收藏夹计数
+        # 鏇存柊鏀惰棌澶硅鏁?
         await db.execute(
             select(PaperCollection).where(PaperCollection.id == coll_id).with_for_update()
         )
@@ -2108,7 +2121,7 @@ async def update_paper(
     if is_becoming_read:
         update_data["read_at"] = datetime.utcnow()
     
-    # 处理评分变更（5星自动收藏）
+    # 处理评分变更（5 星自动收藏）
     was_favorited = paper.rating == 5 if paper.rating else False
     is_becoming_favorited = "rating" in update_data and update_data["rating"] == 5 and not was_favorited
     
@@ -2206,7 +2219,7 @@ async def update_paper(
                 )
                 unread_collection.paper_count += 1
     
-    # 5星评分自动添加到「收藏」
+    # 5 星评分自动添加到「收藏」
     if is_becoming_favorited and fav_collection:
         exists = await db.execute(
             select(paper_collection_association).where(
@@ -2227,7 +2240,7 @@ async def update_paper(
     
     await db.commit()
     
-    # 获取收藏夹
+    # 鑾峰彇鏀惰棌澶?
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -2253,7 +2266,7 @@ async def delete_paper(
     if not paper:
         raise HTTPException(status_code=404, detail="论文不存在")
     
-    # 更新收藏夹计数
+    # 鏇存柊鏀惰棌澶硅鏁?
     coll_stmt = select(paper_collection_association.c.collection_id).where(
         paper_collection_association.c.paper_id == paper.id
     )
@@ -2268,17 +2281,17 @@ async def delete_paper(
     await db.delete(paper)
     await db.commit()
     
-    return {"message": "论文已删除"}
+    return {"message": "璁烘枃宸插垹闄?"}
 
 
-# ============ 收藏夹管理 ============
+# ============ 鏀惰棌澶圭鐞?============
 
 @router.get("/collections", response_model=List[CollectionResponse])
 async def get_collections(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """获取收藏夹列表"""
+    """鑾峰彇鏀惰棌澶瑰垪琛?"""
     stmt = select(PaperCollection).where(
         PaperCollection.user_id == current_user.id
     ).order_by(PaperCollection.is_default.desc(), PaperCollection.created_at.asc())
@@ -2409,7 +2422,7 @@ async def create_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """创建收藏夹"""
+    """鍒涘缓鏀惰棌澶?"""
     new_collection = PaperCollection(
         user_id=current_user.id,
         name=collection.name,
@@ -2433,7 +2446,7 @@ async def update_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """更新收藏夹"""
+    """鏇存柊鏀惰棌澶?"""
     stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == collection_id,
@@ -2447,7 +2460,7 @@ async def update_collection(
         raise HTTPException(status_code=404, detail="收藏夹不存在")
     
     if collection.is_default:
-        raise HTTPException(status_code=400, detail="默认收藏夹不可修改")
+        raise HTTPException(status_code=400, detail="榛樿鏀惰棌澶逛笉鍙慨鏀?")
     
     update_data = update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -2465,7 +2478,7 @@ async def delete_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """删除收藏夹"""
+    """鍒犻櫎鏀惰棌澶?"""
     stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == collection_id,
@@ -2479,7 +2492,7 @@ async def delete_collection(
         raise HTTPException(status_code=404, detail="收藏夹不存在")
     
     if collection.is_default:
-        raise HTTPException(status_code=400, detail="默认收藏夹不可删除")
+        raise HTTPException(status_code=400, detail="榛樿鏀惰棌澶逛笉鍙垹闄?")
     
     await db.delete(collection)
     await db.commit()
@@ -2493,7 +2506,7 @@ async def add_paper_to_collection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """将论文添加到收藏夹"""
+    """灏嗚鏂囨坊鍔犲埌鏀惰棌澶?"""
     # 验证论文
     paper_stmt = select(Paper).where(
         and_(Paper.id == request.paper_id, Paper.user_id == current_user.id)
@@ -2543,7 +2556,7 @@ async def add_paper_to_collection(
     await db.commit()
     for coll_id in request.collection_ids:
         await _invalidate_ask_cache_for_collection(current_user.id, int(coll_id))
-    return {"message": "已添加到收藏夹"}
+    return {"message": "宸叉坊鍔犲埌鏀惰棌澶?"}
 
 
 @router.post("/collections/remove-paper")
@@ -2553,7 +2566,7 @@ async def remove_paper_from_collection(
     current_user: User = Depends(get_current_user)
 ):
     """从收藏夹移除论文"""
-    # 验证收藏夹
+    # 楠岃瘉鏀惰棌澶?
     coll_stmt = select(PaperCollection).where(
         and_(
             PaperCollection.id == request.collection_id,
@@ -2583,7 +2596,7 @@ async def remove_paper_from_collection(
     
     await db.commit()
     await _invalidate_ask_cache_for_collection(current_user.id, int(request.collection_id))
-    return {"message": "已从收藏夹移除"}
+    return {"message": "宸蹭粠鏀惰棌澶圭Щ闄?"}
 
 
 # ============ PDF 下载 ============
@@ -2596,7 +2609,7 @@ async def download_paper_pdf(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """下载论文 PDF 并可选添加到知识库"""
+    """涓嬭浇璁烘枃 PDF 骞跺彲閫夋坊鍔犲埌鐭ヨ瘑搴?"""
     # 获取论文
     stmt = select(Paper).where(
         and_(Paper.id == paper_id, Paper.user_id == current_user.id)
@@ -2611,7 +2624,7 @@ async def download_paper_pdf(
         raise HTTPException(status_code=400, detail="该论文没有 PDF 下载链接")
     
     if paper.pdf_downloaded and paper.pdf_path and not knowledge_base_id:
-        return {"message": "PDF 已下载", "pdf_path": paper.pdf_path}
+        return {"message": "PDF 宸蹭笅杞?", "pdf_path": paper.pdf_path}
     
     if paper.pdf_downloaded and paper.pdf_path and os.path.exists(paper.pdf_path):
         pdf_path = paper.pdf_path
@@ -2741,6 +2754,76 @@ async def process_document_background(doc_id: int, kb_id: int, file_path: str):
     await process_document_task(doc_id, chunk_size, chunk_overlap)
 
 
+def _chunk_reader_blocks(blocks: Sequence[Dict[str, Any]], size: int = 5) -> List[List[Dict[str, Any]]]:
+    batch_size = max(1, int(size))
+    values = list(blocks or [])
+    return [values[i: i + batch_size] for i in range(0, len(values), batch_size)]
+
+
+async def _prefetch_reader_pages_background(
+    *,
+    user_id: int,
+    paper_id: int,
+    pages: Sequence[int],
+    selected_kb_id: Optional[int],
+    style_hint: Optional[str],
+) -> None:
+    if not pages:
+        return
+    service = get_literature_reader_service()
+    async with async_session_factory() as db:
+        stmt = select(Paper).where(and_(Paper.id == int(paper_id), Paper.user_id == int(user_id)))
+        paper = (await db.execute(stmt)).scalar_one_or_none()
+        if paper is None:
+            return
+        await service.prefetch_pages(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            pages=pages,
+            selected_kb_id=selected_kb_id,
+            style_hint=style_hint,
+        )
+
+
+async def _prefetch_reader_composed_pages_background(
+    *,
+    user_id: int,
+    paper_id: int,
+    pages: Sequence[int],
+    selected_kb_id: Optional[int],
+    style_intent: Optional[str],
+    latency_budget_ms: Optional[int],
+    quality_target: Optional[float],
+    theme_mode: Optional[str],
+    detail_level: Optional[str],
+    compare_mode: Optional[bool],
+    citation_tldr: Optional[bool],
+) -> None:
+    if not pages:
+        return
+    service = get_literature_reader_compose_service()
+    async with async_session_factory() as db:
+        stmt = select(Paper).where(and_(Paper.id == int(paper_id), Paper.user_id == int(user_id)))
+        paper = (await db.execute(stmt)).scalar_one_or_none()
+        if paper is None:
+            return
+        await service.prefetch_pages(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            pages=pages,
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            latency_budget_ms=latency_budget_ms,
+            quality_target=quality_target,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+        )
+
+
 # ============ 阅读会话 ============
 
 @router.get("/papers/{paper_id}/reader/session", response_model=ReaderSessionResponse)
@@ -2822,7 +2905,395 @@ async def update_reader_session(
     )
 
 
+@router.post("/papers/{paper_id}/reader/generative/stream")
+async def stream_reader_generative_page(
+    paper_id: int,
+    payload: ReaderGenerativeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_service()
+    page_num = max(1, int(payload.page))
+
+    async def event_generator():
+        try:
+            page_payload, meta = await service.build_or_get_page_payload(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=page_num,
+                selected_kb_id=payload.selected_kb_id,
+                force_refresh=bool(payload.force_refresh),
+                prefer_agent=bool(getattr(payload, "prefer_agent", False)),
+                style_hint=payload.style_hint,
+                publish_ready_event_enabled=False,
+            )
+            if await request.is_disconnected():
+                return
+
+            yield _sse_payload(
+                "start",
+                {
+                    "cache_hit": bool(meta.cache_hit),
+                    "cache_layer": meta.cache_layer,
+                    "build_mode": str(meta.build_mode),
+                    "page": int(page_num),
+                    "parser_version": meta.parser_version,
+                },
+            )
+            yield _sse_payload(
+                "skeleton",
+                {
+                    "sections": list(page_payload.get("sections") or []),
+                    "summary": str(page_payload.get("summary") or ""),
+                    "style_recommendation": str(page_payload.get("style_key") or "journal_classic"),
+                    "style_tuning": dict(page_payload.get("style_tuning") or {}),
+                    "structure_confidence": float(page_payload.get("structure_confidence") or 0.0),
+                },
+            )
+
+            for block_chunk in _chunk_reader_blocks(page_payload.get("blocks") or [], size=6):
+                if await request.is_disconnected():
+                    return
+                yield _sse_payload("chunk", {"blocks": block_chunk})
+
+            yield _sse_payload("assets", {"assets": list(page_payload.get("assets") or [])})
+            yield _sse_payload(
+                "done",
+                {
+                    "payload": page_payload,
+                    "cache_meta": {
+                        "cache_hit": bool(meta.cache_hit),
+                        "cache_layer": meta.cache_layer,
+                        "build_mode": str(meta.build_mode),
+                        "source_signature": meta.source_signature,
+                        "source_sig_hash": meta.source_sig_hash,
+                    },
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"[Literature API] generative stream failed paper={paper_id}, page={page_num}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/generative/prefetch",
+    response_model=ReaderGenerativePrefetchResponse,
+)
+async def prefetch_reader_generative_pages(
+    paper_id: int,
+    payload: ReaderGenerativePrefetchRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_service()
+    pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    max_page = await _get_pdf_page_count(pdf_path)
+    queued, skipped = service.queue_prefetch(
+        pages=list(payload.pages or []),
+        max_page=max_page,
+    )
+
+    if queued:
+        background_tasks.add_task(
+            _prefetch_reader_pages_background,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            pages=queued,
+            selected_kb_id=payload.selected_kb_id,
+            style_hint=payload.style_hint,
+        )
+
+    return ReaderGenerativePrefetchResponse(queued=queued, skipped=skipped)
+
+
 # ============ 批注 ============
+
+
+# ============ Reader Composed ============
+
+@router.post("/papers/{paper_id}/reader/composed/stream")
+async def stream_reader_composed_page(
+    paper_id: int,
+    payload: ReaderComposeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    page_num = max(1, int(payload.page))
+
+    async def event_generator():
+        try:
+            composed_payload, meta = await service.build_or_get_composed_payload(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=page_num,
+                selected_kb_id=payload.selected_kb_id,
+                force_refresh=bool(payload.force_refresh),
+                regenerate=bool(payload.regenerate),
+                latency_budget_ms=payload.latency_budget_ms,
+                quality_target=payload.quality_target,
+                style_intent=payload.style_intent,
+                theme_mode=getattr(payload, "theme_mode", None),
+                detail_level=getattr(payload, "detail_level", None),
+                compare_mode=getattr(payload, "compare_mode", None),
+                citation_tldr=getattr(payload, "citation_tldr", None),
+                publish_ready_event_enabled=False,
+            )
+            if await request.is_disconnected():
+                return
+
+            yield _sse_payload(
+                "start",
+                {
+                    "cache_hit": bool(meta.cache_hit),
+                    "cache_layer": meta.cache_layer,
+                    "build_mode": str(meta.build_mode),
+                    "page": int(page_num),
+                    "engine_version": meta.engine_version,
+                    "budget": {
+                        "latency_budget_ms": int(
+                            (composed_payload.get("quality_report") or {}).get("latency_budget_ms")
+                            or (payload.latency_budget_ms or 8500)
+                        ),
+                        "quality_target": float(
+                            (composed_payload.get("quality_report") or {}).get("quality_target")
+                            or (payload.quality_target or 0.86)
+                        ),
+                    },
+                },
+            )
+
+            trace_rows = list(composed_payload.get("iteration_trace") or [])
+            if trace_rows:
+                first = trace_rows[0]
+                yield _sse_payload(
+                    "plan_draft",
+                    {
+                        "iteration": int(first.get("iteration") or 1),
+                        "ui_plan": first.get("ui_plan") or composed_payload.get("ui_plan") or {},
+                        "phase": "skeleton",
+                        "layout_lock": True,
+                    },
+                )
+                for row in trace_rows[1:]:
+                    if await request.is_disconnected():
+                        return
+                    yield _sse_payload(
+                        "plan_patch",
+                        {
+                            "iteration": int(row.get("iteration") or 0),
+                            "ui_plan": row.get("ui_plan") or {},
+                            "phase": "semantic",
+                            "patch_type": "node_replace",
+                        },
+                    )
+                    yield _sse_payload(
+                        "quality",
+                        {
+                            "iteration": int(row.get("iteration") or 0),
+                            "quality_report": row.get("quality_report") or {},
+                        },
+                    )
+            else:
+                yield _sse_payload(
+                    "plan_draft",
+                    {
+                        "iteration": 1,
+                        "ui_plan": composed_payload.get("ui_plan") or {},
+                        "phase": "skeleton",
+                        "layout_lock": True,
+                    },
+                )
+
+            yield _sse_payload("assets", {"assets": list(composed_payload.get("assets") or [])})
+            yield _sse_payload(
+                "quality",
+                {
+                    "iteration": int(meta.iterations or 0),
+                    "quality_report": composed_payload.get("quality_report") or {},
+                },
+            )
+            yield _sse_payload(
+                "done",
+                {
+                    "payload": composed_payload,
+                    "cache_meta": {
+                        "cache_hit": bool(meta.cache_hit),
+                        "cache_layer": meta.cache_layer,
+                        "build_mode": str(meta.build_mode),
+                        "source_signature": meta.source_signature,
+                        "source_sig_hash": meta.source_sig_hash,
+                    },
+                    "iteration_stats": {
+                        "iterations": int(meta.iterations or 0),
+                        "degraded": bool(meta.degraded),
+                        "stop_reason": str(meta.stop_reason or ""),
+                    },
+                    "overlay_meta": {
+                        "overlay_applied": bool(composed_payload.get("overlay_applied")),
+                        "overlay_count": int(composed_payload.get("overlay_count") or 0),
+                    },
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/prefetch",
+    response_model=ReaderComposePrefetchResponse,
+)
+async def prefetch_reader_composed_pages(
+    paper_id: int,
+    payload: ReaderComposePrefetchRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    max_page = await _get_pdf_page_count(pdf_path)
+    queued, skipped = service.queue_prefetch(
+        pages=list(payload.pages or []),
+        max_page=max_page,
+    )
+
+    if queued:
+        background_tasks.add_task(
+            _prefetch_reader_composed_pages_background,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            pages=queued,
+            selected_kb_id=payload.selected_kb_id,
+            style_intent=payload.style_intent,
+            latency_budget_ms=payload.latency_budget_ms,
+            quality_target=payload.quality_target,
+            theme_mode=getattr(payload, "theme_mode", None),
+            detail_level=getattr(payload, "detail_level", None),
+            compare_mode=getattr(payload, "compare_mode", None),
+            citation_tldr=getattr(payload, "citation_tldr", None),
+        )
+
+    return ReaderComposePrefetchResponse(queued=queued, skipped=skipped)
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/node/action",
+    response_model=ReaderNodeActionResponse,
+)
+async def action_reader_composed_node(
+    paper_id: int,
+    payload: ReaderNodeActionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.perform_node_action(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            page=int(payload.page),
+            node_id=str(payload.node_id),
+            action=str(payload.action),
+            reason=payload.reason,
+            selected_kb_id=payload.selected_kb_id,
+            style_intent=payload.style_intent,
+            theme_mode=getattr(payload, "theme_mode", None),
+            detail_level=getattr(payload, "detail_level", None),
+            compare_mode=getattr(payload, "compare_mode", None),
+            citation_tldr=getattr(payload, "citation_tldr", None),
+        )
+        return ReaderNodeActionResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/papers/{paper_id}/reader/composed/inline-query/stream")
+async def stream_reader_composed_inline_query(
+    paper_id: int,
+    payload: ReaderInlineQueryRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+
+    async def event_generator():
+        try:
+            result = await service.build_inline_answer_card(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=int(payload.page),
+                node_id=str(payload.node_id),
+                question=str(payload.question),
+                scope=str(payload.scope),
+                selected_kb_id=payload.selected_kb_id,
+                style_intent=payload.style_intent,
+                detail_level=getattr(payload, "detail_level", None),
+                compare_mode=getattr(payload, "compare_mode", None),
+            )
+            if await request.is_disconnected():
+                return
+            node = dict(result.get("node") or {})
+            sources = list(result.get("sources") or [])
+            answer_text = str((node.get("props") or {}).get("answer") or "")
+
+            yield _sse_payload("start", {"page": int(payload.page), "node_id": str(payload.node_id)})
+            for idx in range(0, len(answer_text), 42):
+                if await request.is_disconnected():
+                    return
+                token = answer_text[idx : idx + 42]
+                if token:
+                    yield _sse_payload("token", {"text": token})
+            yield _sse_payload("sources", sources)
+            yield _sse_payload("done", {"node": node, "sources": sources})
+        except Exception as exc:
+            logger.exception(f"[Literature API] composed inline query failed paper={paper_id}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @router.get("/papers/{paper_id}/annotations", response_model=List[PaperAnnotationResponse])
 async def list_annotations(
@@ -2969,7 +3440,7 @@ async def delete_annotation(
 
     await db.delete(item)
     await db.commit()
-    return {"message": "批注已删除"}
+    return {"message": "鎵规敞宸插垹闄?"}
 
 
 # ============ 评论 ============
@@ -3352,14 +3823,14 @@ async def stream_literature_status_events(
                 yield _sse_payload("heartbeat", data)
                 continue
 
-            if event != "paper_link_status" or not isinstance(data, dict):
+            if event not in {"paper_link_status", "reader_page_ready"} or not isinstance(data, dict):
                 continue
 
             event_paper_id = int(data.get("paper_id") or 0)
             if paper_id is not None and event_paper_id != int(paper_id):
                 continue
 
-            yield _sse_payload("paper_link_status", data)
+            yield _sse_payload(event, data)
 
     return StreamingResponse(
         event_generator(),
@@ -3531,7 +4002,7 @@ async def literature_ask(
             or int(session.paper_id or 0) != (target_id if scope == AskScope.PAPER.value else 0)
             or int(session.collection_id or 0) != (target_id if scope == AskScope.COLLECTION.value else 0)
         ):
-            raise HTTPException(status_code=400, detail="会话与当前提问范围不一致")
+            raise HTTPException(status_code=400, detail="浼氳瘽涓庡綋鍓嶆彁闂寖鍥翠笉涓€鑷?")
     else:
         session = LiteratureQASession(
             user_id=current_user.id,
@@ -3895,8 +4366,8 @@ async def literature_ask(
     joined_context = "\n\n".join(context_blocks)
     enriched_user_content = (
         f"问题：{payload.question.strip()}\n\n"
-        f"请仅基于以下检索片段回答。\n"
-        f"若证据不足，请明确说明“无法从当前资料确定”。\n\n"
+        "请仅基于以下检索片段回答。\n"
+        "若证据不足，请明确说明“无法从当前资料确定”。\n\n"
         f"检索片段：\n{joined_context}"
     )
     messages.append({"role": "user", "content": enriched_user_content})
@@ -3904,7 +4375,7 @@ async def literature_ask(
     system_prompt = (
         "你是论文阅读问答助手。"
         "必须基于提供的检索片段回答，不得编造事实。"
-        "回答尽量简洁准确，引用时使用[序号]标注。"
+        "回答尽量简洁准确，引用时使用 [序号] 标注。"
     )
 
     llm_service = await get_llm_service()
@@ -4005,7 +4476,7 @@ async def init_user_literature(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """初始化用户的文献管理（创建默认收藏夹）"""
+    """初始化用户的文献管理（创建默认收藏夹）。"""
     # 预定义的收藏夹配置
     default_collection_configs = [
         ("所有论文", "所有保存的论文", "#3b82f6", "folder", "default", True),
@@ -4053,3 +4524,5 @@ async def init_user_literature(
             return {"message": "已初始化"}
     
     return {"message": "已初始化"}
+
+
