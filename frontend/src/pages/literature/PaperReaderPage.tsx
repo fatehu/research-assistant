@@ -27,6 +27,8 @@ import {
   Spin,
   Tabs,
   Tag,
+  ConfigProvider,
+  theme,
   Tooltip,
   Typography,
 } from 'antd'
@@ -2343,168 +2345,186 @@ export default function PaperReaderPage() {
 
     if (useComposedView) {
       return (
-        <div
-          style={{
-            border: `1px solid ${activeGenerativeStyle.borderColor}`,
-            borderRadius: 12,
-            background: activeGenerativeStyle.pageBackground,
-            boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
+        <ConfigProvider
+          theme={{
+            algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+            token: {
+              colorText: activeGenerativeStyle.bodyColor,
+              colorTextHeading: activeGenerativeStyle.headingColor,
+              colorBorder: activeGenerativeStyle.borderColor,
+            },
+            components: {
+              Typography: {
+                colorText: activeGenerativeStyle.bodyColor,
+                colorTextHeading: activeGenerativeStyle.headingColor,
+              }
+            }
           }}
         >
           <div
             style={{
-              borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
-              padding: '10px 14px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: 10,
-              flexWrap: 'wrap',
+              border: `1px solid ${activeGenerativeStyle.borderColor}`,
+              borderRadius: 12,
+              background: activeGenerativeStyle.pageBackground,
+              boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
+              color: activeGenerativeStyle.bodyColor,
             }}
           >
-            <Space size={8} wrap>
-              <Tag color="blue">AI Composed Reader</Tag>
-              <Text style={{ color: activeGenerativeStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
-              {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
-              {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
-              {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
-            </Space>
-            <Space size={8} wrap>
-              <Select
-                size="small"
-                style={{ minWidth: 98 }}
-                value={themeMode}
-                onChange={(value) => setThemeMode(value as ReaderThemeMode)}
-                options={[
-                  { label: '浅色', value: 'light' },
-                  { label: '深色', value: 'dark' },
-                ]}
-              />
-              <Select
-                size="small"
-                style={{ minWidth: 118 }}
-                value={detailLevel}
-                onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
-                options={[
-                  { label: '简洁', value: 'concise' },
-                  { label: '标准', value: 'standard' },
-                  { label: '深入', value: 'deep' },
-                ]}
-              />
-              <Button
-                size="small"
-                type={compareMode ? 'primary' : 'default'}
-                onClick={() => setCompareMode((prev) => !prev)}
-              >
-                对比模式
-              </Button>
-              <Button
-                size="small"
-                type={citationTldr ? 'primary' : 'default'}
-                onClick={() => setCitationTldr((prev) => !prev)}
-              >
-                引用TL;DR
-              </Button>
-              <Select
-                size="small"
-                style={{ minWidth: 168 }}
-                value={generativeStyleKey}
-                onChange={(value) => {
-                  const nextStyle = value as ReaderGenerativeStyleKey
-                  setGenerativeStyleKey(nextStyle)
-                  setGenerativeStyleTuning(
-                    normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
-                  )
-                }}
-                options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
-              />
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                loading={composedLoading}
-                onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
-              >
-                重新生成
-              </Button>
-            </Space>
-          </div>
-
-          <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '18px 20px 24px' }}>
-            {composedError ? (
-              <Alert
-                showIcon
-                type="warning"
-                message="AI 编排视图生成失败"
-                description={`${composedError}；已降级为本地结构化文本。`}
-                style={{ marginBottom: 12 }}
-              />
-            ) : null}
-
-            {composedLoading && !hasComposedPlan ? (
-
-              <div className="h-[360px] flex items-center justify-center">
-                <Spin />
-              </div>
-            ) : null}
-
-            {hasComposedPlan && activeComposedPlan ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {renderReaderComponentTree(activeComposedPlan.components, {
-                  qualityReport: composedQuality || composedPayload?.quality_report || null,
-                  inlineQueryLoadingNodeId,
-                  onNodeAction: (node, action) => {
-                    void handleComposedNodeAction(node, action)
-                  },
-                  onInlineQuery: async (node, question) => {
-                    await handleInlineQuery(node, question)
-                  },
-                  onPreviewAnchors: (anchors, options) => {
-                    showAnchorPreview(anchors, options)
-                  },
-                  onJumpAnchor: (anchors, options) => {
-                    showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
-                  },
-                  onHidePreview: () => {
-                    hideAnchorPreview()
-                  },
-                  onDropMarkdown: (markdown) => {
-                    appendMarkdownToAnnotation(markdown)
-                  },
-                  onManualInsertSlot: (nodeId) => {
-                    const slotNode: ReaderComponentNode = {
-                      id: `manual-slot-${Date.now()}`,
-                      type: 'InlineQuerySlot',
-                      props: { placeholder: '请输入您关于上述段落的疑问...' },
-                      children: [],
-                      source_anchor_refs: [],
-                    }
-                    applyNodeInsertToComposeState(nodeId, slotNode)
-                  },
-                })}
-              </div>
-            ) : null}
-
-            {!composedLoading && !hasComposedPlan ? (
-              <Empty description="当前页暂未生成可用的 AI 组件视图" />
-            ) : null}
-
-            {composedLinkAssets.length > 0 ? (
-              <Card size="small" title="补充资源" style={{ marginTop: 12, borderRadius: 12 }}>
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  {composedLinkAssets.slice(0, 6).map((item, idx) => {
-                    const href = String(item.href || '').trim()
-                    if (!href) return null
-                    return (
-                      <a key={`compose-link-${idx}`} href={href} target="_blank" rel="noreferrer">
-                        {item.label || href}
-                      </a>
+            <div
+              style={{
+                borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
+                padding: '10px 14px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}
+            >
+              <Space size={8} wrap>
+                <Tag color="blue">AI Composed Reader</Tag>
+                <Text style={{ color: activeGenerativeStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
+                {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+                {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
+                {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
+              </Space>
+              <Space size={8} wrap>
+                <Select
+                  size="small"
+                  style={{ minWidth: 98 }}
+                  value={themeMode}
+                  onChange={(value) => setThemeMode(value as ReaderThemeMode)}
+                  options={[
+                    { label: '浅色', value: 'light' },
+                    { label: '深色', value: 'dark' },
+                  ]}
+                />
+                <Select
+                  size="small"
+                  style={{ minWidth: 118 }}
+                  value={detailLevel}
+                  onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
+                  options={[
+                    { label: '简洁', value: 'concise' },
+                    { label: '标准', value: 'standard' },
+                    { label: '深入', value: 'deep' },
+                  ]}
+                />
+                <Button
+                  size="small"
+                  type={compareMode ? 'primary' : 'default'}
+                  onClick={() => setCompareMode((prev) => !prev)}
+                >
+                  对比模式
+                </Button>
+                <Button
+                  size="small"
+                  type={citationTldr ? 'primary' : 'default'}
+                  onClick={() => setCitationTldr((prev) => !prev)}
+                >
+                  引用TL;DR
+                </Button>
+                <Select
+                  size="small"
+                  style={{ minWidth: 168 }}
+                  value={generativeStyleKey}
+                  onChange={(value) => {
+                    const nextStyle = value as ReaderGenerativeStyleKey
+                    setGenerativeStyleKey(nextStyle)
+                    setGenerativeStyleTuning(
+                      normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
                     )
+                  }}
+                  options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+                />
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={composedLoading}
+                  onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
+                >
+                  重新生成
+                </Button>
+              </Space>
+            </div>
+
+            <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '18px 20px 24px' }}>
+              {composedError ? (
+                <Alert
+                  showIcon
+                  type="warning"
+                  message="AI 编排视图生成失败"
+                  description={`${composedError}；已降级为本地结构化文本。`}
+                  style={{ marginBottom: 12 }}
+                />
+              ) : null}
+
+              {composedLoading && !hasComposedPlan ? (
+
+                <div className="h-[360px] flex items-center justify-center">
+                  <Spin />
+                </div>
+              ) : null}
+
+              {hasComposedPlan && activeComposedPlan ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {renderReaderComponentTree(activeComposedPlan.components, {
+                    qualityReport: composedQuality || composedPayload?.quality_report || null,
+                    inlineQueryLoadingNodeId,
+                    onNodeAction: (node, action) => {
+                      void handleComposedNodeAction(node, action)
+                    },
+                    onInlineQuery: async (node, question) => {
+                      await handleInlineQuery(node, question)
+                    },
+                    onPreviewAnchors: (anchors, options) => {
+                      showAnchorPreview(anchors, options)
+                    },
+                    onJumpAnchor: (anchors, options) => {
+                      showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
+                    },
+                    onHidePreview: () => {
+                      hideAnchorPreview()
+                    },
+                    onDropMarkdown: (markdown) => {
+                      appendMarkdownToAnnotation(markdown)
+                    },
+                    onManualInsertSlot: (nodeId) => {
+                      const slotNode: ReaderComponentNode = {
+                        id: `manual-slot-${Date.now()}`,
+                        type: 'InlineQuerySlot',
+                        props: { placeholder: '请输入您关于上述段落的疑问...' },
+                        children: [],
+                        source_anchor_refs: [],
+                      }
+                      applyNodeInsertToComposeState(nodeId, slotNode)
+                    },
                   })}
-                </Space>
-              </Card>
-            ) : null}
+                </div>
+              ) : null}
+
+              {!composedLoading && !hasComposedPlan ? (
+                <Empty description="当前页暂未生成可用的 AI 组件视图" />
+              ) : null}
+
+              {composedLinkAssets.length > 0 ? (
+                <Card size="small" title="补充资源" style={{ marginTop: 12, borderRadius: 12 }}>
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    {composedLinkAssets.slice(0, 6).map((item, idx) => {
+                      const href = String(item.href || '').trim()
+                      if (!href) return null
+                      return (
+                        <a key={`compose-link-${idx}`} href={href} target="_blank" rel="noreferrer">
+                          {item.label || href}
+                        </a>
+                      )
+                    })}
+                  </Space>
+                </Card>
+              ) : null}
+            </div>
           </div>
-        </div>
+        </ConfigProvider>
       )
     }
 
@@ -3377,56 +3397,74 @@ export default function PaperReaderPage() {
           borderRadius: 12,
         }}
       >
-        <Card
-          size="small"
-          title={anchorPreview.title || `原文证据 · 第 ${anchorPreview.page} 页`}
-          style={{
-            margin: 0,
-            borderRadius: 12,
-            border: `1px solid ${activeGenerativeStyle.borderColor}`,
-            background: activeGenerativeStyle.panelBackground,
+        <ConfigProvider
+          theme={{
+            algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+            token: {
+              colorText: activeGenerativeStyle.bodyColor,
+              colorTextHeading: activeGenerativeStyle.headingColor,
+              colorBorder: activeGenerativeStyle.borderColor,
+            },
+            components: {
+              Typography: {
+                colorText: activeGenerativeStyle.bodyColor,
+                colorTextHeading: activeGenerativeStyle.headingColor,
+              }
+            }
           }}
-          extra={(
-            <Space size={8}>
-              {anchorPreview.pinned ? (
-                <Tag color="blue">已钉住</Tag>
-              ) : (
+        >
+          <Card
+            size="small"
+            title={anchorPreview.title || `原文证据 · 第 ${anchorPreview.page} 页`}
+            style={{
+              margin: 0,
+              borderRadius: 12,
+              border: `1px solid ${activeGenerativeStyle.borderColor}`,
+              background: activeGenerativeStyle.panelBackground,
+              color: activeGenerativeStyle.bodyColor,
+            }}
+            extra={(
+              <Space size={8}>
+                {anchorPreview.pinned ? (
+                  <Tag color="blue">已钉住</Tag>
+                ) : (
+                  <Button
+                    size="small"
+                    onClick={() => setAnchorPreview((prev) => ({ ...prev, pinned: true, visible: true }))}
+                  >
+                    钉住
+                  </Button>
+                )}
                 <Button
                   size="small"
-                  onClick={() => setAnchorPreview((prev) => ({ ...prev, pinned: true, visible: true }))}
+                  onClick={() => {
+                    setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
+                  }}
                 >
-                  钉住
+                  关闭
                 </Button>
-              )}
-              <Button
-                size="small"
-                onClick={() => {
-                  setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
+              </Space>
+            )}
+          >
+            <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
+              悬停组件可预览局部证据，点击“定位到证据”可固定并联动原 PDF 跳转。
+            </Text>
+            {anchorPreview.loading ? <Spin size="small" /> : (
+              <div
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  lineHeight: 1.75,
+                  maxHeight: 280,
+                  overflowY: 'auto',
+                  color: activeGenerativeStyle.bodyColor,
+                  fontSize: 14,
                 }}
               >
-                关闭
-              </Button>
-            </Space>
-          )}
-        >
-          <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
-            悬停组件可预览局部证据，点击“定位到证据”可固定并联动原 PDF 跳转。
-          </Text>
-          {anchorPreview.loading ? <Spin size="small" /> : (
-            <div
-              style={{
-                whiteSpace: 'pre-wrap',
-                lineHeight: 1.75,
-                maxHeight: 280,
-                overflowY: 'auto',
-                color: activeGenerativeStyle.bodyColor,
-                fontSize: 14,
-              }}
-            >
-              {anchorPreview.text || '暂无可展示的锚点原文。'}
-            </div>
-          )}
-        </Card>
+                {anchorPreview.text || '暂无可展示的锚点原文。'}
+              </div>
+            )}
+          </Card>
+        </ConfigProvider>
       </div>
     </div>
   )

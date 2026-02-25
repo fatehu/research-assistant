@@ -23,7 +23,7 @@ dayjs.locale('zh-cn')
 const hasBrokenTitle = (value?: string | null) => {
   const text = String(value || '').trim()
   if (!text) return true
-  const brokenCount = (text.match(/\?/g) || []).length + (text.match(/�/g) || []).length
+  const brokenCount = (text.match(/\?/g) || []).length + (text.match(/\uFFFD/g) || []).length
   return brokenCount >= Math.ceil(text.length * 0.45)
 }
 
