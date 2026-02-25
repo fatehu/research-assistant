@@ -1741,7 +1741,9 @@ class LiteratureReaderComposeService:
     def _build_link_tldr(*, href: str, label: str, paper: Paper) -> str:
         normalized_href = str(href or "").strip().lower()
         normalized_label = str(label or "").strip()
-        if "doi.org" in normalized_href or str(paper.doi or "").lower() in normalized_href:
+        paper_doi = str(paper.doi or "").strip().lower()
+        # 仅在 DOI 非空时再做子串匹配，避免空字符串导致所有链接都被误判为 DOI。
+        if "doi.org" in normalized_href or (paper_doi and paper_doi in normalized_href):
             return "TL;DR：该链接是论文正式标识入口，可用于快速核对题目、期刊与年份信息。"
         if "arxiv.org" in normalized_href:
             return "TL;DR：该链接可查看预印本版本，适合核查方法细节和补充材料。"
