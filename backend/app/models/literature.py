@@ -14,6 +14,7 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     Index,
+    Float,
 )
 from sqlalchemy.orm import relationship
 import enum
@@ -293,6 +294,67 @@ class PaperReadSession(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "paper_id", name="uq_read_session_user_paper"),
+    )
+
+
+class PaperReaderPageCache(Base):
+    """论文阅读生成式页缓存（论文共享）"""
+    __tablename__ = "paper_reader_page_caches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    page = Column(Integer, nullable=False, default=1, index=True)
+    source_signature = Column(String(255), nullable=False)
+    parser_version = Column(String(64), nullable=False)
+    build_mode = Column(String(32), nullable=False, default="parser")
+    structure_confidence = Column(Float, nullable=False, default=0.0)
+    payload_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    paper = relationship("Paper")
+
+    __table_args__ = (
+        UniqueConstraint("paper_id", "page", "source_signature", name="uq_reader_page_cache_sig"),
+        Index("idx_reader_page_cache_paper_page", "paper_id", "page"),
+        Index("idx_reader_page_cache_updated_at", "updated_at"),
+    )
+
+
+class PaperReaderComponentOverlay(Base):
+    """论文阅读组件覆盖缓存（用户个性化，不污染共享缓存）"""
+    __tablename__ = "paper_reader_component_overlays"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    page = Column(Integer, nullable=False, default=1, index=True)
+    source_signature = Column(String(255), nullable=False)
+    node_id = Column(String(96), nullable=False)
+    action_type = Column(String(32), nullable=False, default="patch")
+    overlay_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+    paper = relationship("Paper")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "paper_id",
+            "page",
+            "source_signature",
+            "node_id",
+            name="uq_reader_overlay_user_paper_page_sig_node",
+        ),
+        Index(
+            "idx_reader_overlay_user_paper_page",
+            "user_id",
+            "paper_id",
+            "page",
+        ),
+        Index("idx_reader_overlay_updated_at", "updated_at"),
     )
 
 

@@ -251,6 +251,258 @@ class ReaderSessionResponse(ReaderSessionBase):
     updated_at: datetime
 
 
+# ============ Reader Generative ============ #
+
+class ReaderGenerativeSourceAnchor(BaseModel):
+    page: int = Field(..., ge=1)
+    start_char: int = Field(..., ge=0)
+    end_char: int = Field(..., ge=0)
+
+
+class ReaderGenerativeRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    selected_kb_id: Optional[int] = None
+    force_refresh: bool = False
+    prefer_agent: bool = False
+    style_hint: Optional[str] = None
+
+
+class ReaderGenerativeBlock(BaseModel):
+    id: str
+    kind: Literal["heading", "paragraph", "list_item", "caption"]
+    text: str
+    order: int = Field(..., ge=0)
+    section_title: Optional[str] = None
+    source_anchor: ReaderGenerativeSourceAnchor
+
+
+class ReaderGenerativeSection(BaseModel):
+    title: str
+    level: int = Field(default=1, ge=1, le=4)
+    block_ids: List[str] = Field(default_factory=list)
+    source_anchor: Optional[ReaderGenerativeSourceAnchor] = None
+
+
+class ReaderGenerativeAsset(BaseModel):
+    kind: Literal["link", "annotation", "image_hint"]
+    label: str
+    source: Literal["metadata", "text", "annotation", "pdf"]
+    href: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativeStyleTuning(BaseModel):
+    body_scale: float = Field(default=1.0, ge=0.9, le=1.25)
+    line_height: float = Field(default=1.9, ge=1.55, le=2.2)
+    heading_scale: float = Field(default=1.0, ge=0.95, le=1.35)
+
+
+class ReaderGenerativePageResponse(BaseModel):
+    paper_id: int
+    page: int
+    parser_version: str
+    source_signature: str
+    style_key: str
+    build_mode: str
+    structure_confidence: float = Field(..., ge=0.0, le=1.0)
+    summary: str = ""
+    style_tuning: ReaderGenerativeStyleTuning = Field(default_factory=ReaderGenerativeStyleTuning)
+    sections: List[ReaderGenerativeSection] = Field(default_factory=list)
+    blocks: List[ReaderGenerativeBlock] = Field(default_factory=list)
+    assets: List[ReaderGenerativeAsset] = Field(default_factory=list)
+    cache_hit: bool = False
+    cache_layer: Optional[Literal["redis", "db", "none"]] = None
+    generated_at: datetime
+
+
+class ReaderGenerativePrefetchRequest(BaseModel):
+    pages: List[int] = Field(default_factory=list, max_length=16)
+    selected_kb_id: Optional[int] = None
+    style_hint: Optional[str] = None
+
+
+class ReaderGenerativePrefetchResponse(BaseModel):
+    queued: List[int] = Field(default_factory=list)
+    skipped: List[int] = Field(default_factory=list)
+
+
+# ============ Reader Composed ============ #
+
+class ReaderComposeRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    selected_kb_id: Optional[int] = None
+    force_refresh: bool = False
+    regenerate: bool = False
+    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
+    quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
+    style_intent: Optional[str] = None
+    theme_mode: Optional[Literal["light", "dark"]] = None
+    detail_level: Optional[Literal["concise", "standard", "deep"]] = None
+    compare_mode: Optional[bool] = None
+    citation_tldr: Optional[bool] = None
+
+
+class ReaderComponentBBoxHint(BaseModel):
+    x0: float = 0.0
+    x1: float = 0.0
+    top: float = 0.0
+    bottom: float = 0.0
+    page_width: Optional[float] = None
+    page_height: Optional[float] = None
+
+
+class ReaderComponentSourceAnchor(BaseModel):
+    page: int = Field(..., ge=1)
+    start_char: int = Field(..., ge=0)
+    end_char: int = Field(..., ge=0)
+    quote_text: Optional[str] = None
+    bbox_hint: Optional[ReaderComponentBBoxHint] = None
+
+
+class ReaderComponentAction(BaseModel):
+    key: str
+    label: str
+    kind: Literal["primary", "default", "danger", "link"] = "default"
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderComponentLayoutSlot(BaseModel):
+    reserved_height: Optional[int] = Field(default=None, ge=64, le=1600)
+    lock_height: bool = False
+
+
+class ReaderComponentNode(BaseModel):
+    id: str
+    type: str
+    props: Dict[str, Any] = Field(default_factory=dict)
+    children: List["ReaderComponentNode"] = Field(default_factory=list)
+    source_anchor_refs: List[ReaderComponentSourceAnchor] = Field(default_factory=list)
+    capabilities: List[str] = Field(default_factory=list)
+    actions: List[ReaderComponentAction] = Field(default_factory=list)
+    layout_slot: Optional[ReaderComponentLayoutSlot] = None
+
+
+class ReaderComposeQualityReport(BaseModel):
+    overall: float = Field(default=0.0, ge=0.0, le=1.0)
+    structure_fidelity: float = Field(default=0.0, ge=0.0, le=1.0)
+    readability: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_alignment: float = Field(default=0.0, ge=0.0, le=1.0)
+    layout_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
+    hard_constraints_passed: bool = False
+    sidebar_leak_detected: bool = False
+    title_integrity_ok: bool = False
+    anchors_valid: bool = False
+    validation_errors: List[str] = Field(default_factory=list)
+    quality_target: float = Field(default=0.86, ge=0.6, le=0.97)
+    iterations: int = Field(default=0, ge=0)
+    degraded: bool = False
+    stop_reason: str = ""
+    latency_budget_ms: int = Field(default=8500, ge=1200, le=25000)
+    deductions: List[Dict[str, Any]] = Field(default_factory=list)
+    fix_suggestions: List[str] = Field(default_factory=list)
+    iteration_trace_summary: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ReaderUIPlan(BaseModel):
+    plan_id: str
+    components: List[ReaderComponentNode] = Field(default_factory=list)
+    layout: Dict[str, Any] = Field(default_factory=dict)
+    style_tokens: Dict[str, Any] = Field(default_factory=dict)
+    trace_meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderComposeAsset(BaseModel):
+    kind: Literal["link", "annotation", "image_hint", "external_image"]
+    label: str
+    source: Literal["metadata", "text", "annotation", "pdf", "web"]
+    href: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    tldr: Optional[str] = None
+
+
+class ReaderComposePayload(BaseModel):
+    paper_id: int
+    page: int
+    engine_version: str
+    source_signature: str
+    build_mode: str
+    ui_plan: ReaderUIPlan
+    assets: List[ReaderComposeAsset] = Field(default_factory=list)
+    quality_report: ReaderComposeQualityReport = Field(default_factory=ReaderComposeQualityReport)
+    iteration_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    asset_policy: Dict[str, Any] = Field(default_factory=dict)
+    generated_at: datetime
+    cache_hit: bool = False
+    cache_layer: Optional[Literal["redis", "db", "none"]] = None
+    overlay_applied: bool = False
+    overlay_count: int = 0
+
+
+class ReaderComposePrefetchRequest(BaseModel):
+    pages: List[int] = Field(default_factory=list, max_length=16)
+    selected_kb_id: Optional[int] = None
+    style_intent: Optional[str] = None
+    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
+    quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
+    theme_mode: Optional[Literal["light", "dark"]] = None
+    detail_level: Optional[Literal["concise", "standard", "deep"]] = None
+    compare_mode: Optional[bool] = None
+    citation_tldr: Optional[bool] = None
+
+
+class ReaderComposePrefetchResponse(BaseModel):
+    queued: List[int] = Field(default_factory=list)
+    skipped: List[int] = Field(default_factory=list)
+
+
+class ReaderNodeActionRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    node_id: str = Field(..., min_length=1, max_length=96)
+    action: Literal["regenerate", "degrade"]
+    reason: Optional[str] = None
+    selected_kb_id: Optional[int] = None
+    style_intent: Optional[str] = None
+    theme_mode: Optional[Literal["light", "dark"]] = None
+    detail_level: Optional[Literal["concise", "standard", "deep"]] = None
+    compare_mode: Optional[bool] = None
+    citation_tldr: Optional[bool] = None
+
+
+class ReaderNodeActionResponse(BaseModel):
+    patch_type: Literal["node_replace", "node_insert", "node_update"] = "node_replace"
+    node_before: Optional[ReaderComponentNode] = None
+    node_after: Optional[ReaderComponentNode] = None
+    quality_delta: float = 0.0
+    overlay_saved: bool = False
+    message: str = ""
+
+
+class ReaderInlineQueryRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    node_id: str = Field(..., min_length=1, max_length=96)
+    question: str = Field(..., min_length=1, max_length=2000)
+    scope: Literal["page", "section"] = "section"
+    selected_kb_id: Optional[int] = None
+    style_intent: Optional[str] = None
+    detail_level: Optional[Literal["concise", "standard", "deep"]] = None
+    compare_mode: Optional[bool] = None
+
+
+class ReaderInlineQuerySource(BaseModel):
+    page: int = Field(..., ge=1)
+    start_char: int = Field(..., ge=0)
+    end_char: int = Field(..., ge=0)
+    quote_text: Optional[str] = None
+
+
+class ReaderInlineQueryDonePayload(BaseModel):
+    node: ReaderComponentNode
+    sources: List[ReaderInlineQuerySource] = Field(default_factory=list)
+
+
+ReaderComponentNode.model_rebuild()
+
+
 # ============ Annotation ============
 
 class PaperAnnotationBase(BaseModel):
