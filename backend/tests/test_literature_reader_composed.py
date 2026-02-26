@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.api import literature as literature_api
+from app.config import settings
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
 from app.services.literature_reader_compose_service import LiteratureReaderComposeService
 
@@ -103,6 +104,7 @@ async def test_reader_compose_budget_timeout_returns_best_effort(monkeypatch):
 @pytest.mark.asyncio
 async def test_reader_compose_external_image_requires_attribution(monkeypatch):
     service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_external_image_enabled", True)
 
     monkeypatch.setattr(service, "_build_external_image_query", lambda **_: "demo")
     monkeypatch.setattr(
@@ -203,6 +205,163 @@ def test_reader_compose_validate_rejects_invalid_anchor():
 
     assert result["valid"] is False
     assert any("anchor" in err.lower() for err in result["errors"])
+
+
+def test_reader_compose_sanitize_anchor_can_recover_invalid_range():
+    service = LiteratureReaderComposeService()
+    raw_plan = {
+        "plan_id": "x",
+        "components": [
+            {
+                "id": "n1",
+                "type": "SectionHeading",
+                "props": {"text": "Introduction"},
+                "children": [],
+                "source_anchor_refs": [{"page": 0, "start_char": 15, "end_char": 10, "quote_text": "Introduction"}],
+            }
+        ],
+        "layout": {},
+        "style_tokens": {},
+        "trace_meta": {},
+    }
+
+    sanitized = service._sanitize_ui_plan_anchors(raw_plan, page=1)
+    result = service.validate_ui_plan(sanitized, page=1)
+
+    assert result["valid"] is True
+    anchor = sanitized["components"][0]["source_anchor_refs"][0]
+    assert anchor["page"] == 1
+    assert anchor["end_char"] > anchor["start_char"]
+
+
+def test_reader_compose_normalize_blocks_merge_split_heading_lines():
+    service = LiteratureReaderComposeService()
+    rows = service._normalize_blocks_for_render(
+        blocks=[
+            {"kind": "heading", "text": "Performance of ChatGPT on USMLE: Potential"},
+            {"kind": "heading", "text": "for AI-assisted medical education using large"},
+            {"kind": "heading", "text": "language models"},
+            {"kind": "heading", "text": "RESEA RCH ARTICLE"},
+        ],
+        page=1,
+    )
+
+    headings = [str(item.get("text") or "") for item in rows if str(item.get("kind") or "") == "heading"]
+    assert any("Performance of ChatGPT on USMLE: Potential for AI-assisted medical education using large language models" in item for item in headings)
+    assert any("RESEARCH ARTICLE" in item for item in headings)
+
+
+def test_inline_query_slot_should_resolve_target_node_text():
+    service = LiteratureReaderComposeService()
+    components = [
+        {
+            "id": "paragraph_1",
+            "type": "ParagraphProse",
+            "props": {"text": "Step 1, Step 2CK, and Step 3 are evaluated in this section."},
+            "children": [],
+            "source_anchor_refs": [{"page": 1, "start_char": 20, "end_char": 88, "quote_text": "Step 1, Step 2CK, and Step 3"}],
+        },
+        {
+            "id": "slot_1",
+            "type": "InlineQuerySlot",
+            "props": {"target_node_ref": "paragraph_1"},
+            "children": [],
+            "source_anchor_refs": [],
+        },
+    ]
+    query_node = components[1]
+    target = service._resolve_inline_query_target_node(query_node=query_node, components=components)
+    context = service._build_inline_query_context(
+        query_node=query_node,
+        target_node=target,
+        components=components,
+        page=1,
+    )
+
+    assert target["id"] == "paragraph_1"
+    assert "Step 1" in context
+
+
+def test_revise_ui_plan_should_recover_heading_when_missing():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "plan_id": "demo",
+        "components": [
+            {
+                "id": "paragraph_1",
+                "type": "ParagraphProse",
+                "props": {"text": "This is paragraph text."},
+                "children": [],
+                "source_anchor_refs": [],
+            }
+        ],
+        "layout": {},
+        "style_tokens": {},
+        "trace_meta": {},
+    }
+    base_payload = {
+        "sections": [
+            {
+                "title": "Introduction",
+                "level": 1,
+                "page": 1,
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 0,
+                    "end_char": 12,
+                    "quote_text": "Introduction",
+                },
+            }
+        ]
+    }
+
+    revised = service._revise_ui_plan(
+        ui_plan=ui_plan,
+        base_payload=base_payload,
+        quality_report={"stop_reason": "max_iterations_reached"},
+    )
+    heading_nodes = [item for item in revised.get("components") or [] if item.get("type") == "SectionHeading"]
+
+    assert heading_nodes
+    assert str(heading_nodes[0].get("props", {}).get("text") or "") == "Introduction"
+
+
+def test_inline_query_anchor_fallback_should_use_neighbor_anchors():
+    service = LiteratureReaderComposeService()
+    components = [
+        {
+            "id": "p1",
+            "type": "ParagraphProse",
+            "props": {"text": "Neighbor paragraph"},
+            "children": [],
+            "source_anchor_refs": [{"page": 1, "start_char": 10, "end_char": 40, "quote_text": "Neighbor paragraph"}],
+        },
+        {
+            "id": "slot_1",
+            "type": "InlineQuerySlot",
+            "props": {"target_node_ref": "target_1"},
+            "children": [],
+            "source_anchor_refs": [],
+        },
+        {
+            "id": "target_1",
+            "type": "ParagraphProse",
+            "props": {"text": "Target paragraph"},
+            "children": [],
+            "source_anchor_refs": [],
+        },
+    ]
+
+    anchors = service._resolve_inline_query_anchors(
+        query_node=components[1],
+        target_node=components[2],
+        components=components,
+        page=1,
+    )
+
+    assert anchors
+    assert int(anchors[0].get("page") or 0) == 1
+    assert int(anchors[0].get("end_char") or 0) > int(anchors[0].get("start_char") or 0)
 
 
 def test_build_link_tldr_empty_doi_should_not_match_all_links():
@@ -343,3 +502,305 @@ async def test_reader_compose_sse_event_order(monkeypatch):
     assert "assets" in events
     assert "quality" in events
     assert events[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_reader_compose_signature_should_change_with_mode_even_with_long_pdf_path(monkeypatch):
+    service = LiteratureReaderComposeService()
+    long_path = f"/tmp/{'very_long_pdf_name_' * 12}.pdf"
+
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_: long_path,
+    )
+    monkeypatch.setattr(os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        os,
+        "stat",
+        lambda _path: SimpleNamespace(st_mtime=1739000000, st_size=12345678),
+    )
+
+    class _NoopDb:
+        async def execute(self, *_args, **_kwargs):
+            raise AssertionError("selected_kb_id=None 时不应触发 DB 查询")
+
+    paper = SimpleNamespace(id=11, user_id=1, pdf_path=long_path, title="Demo")
+    sig_a = await service._build_source_signature(
+        db=_NoopDb(),
+        user_id=1,
+        paper=paper,
+        selected_kb_id=None,
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        citation_tldr=False,
+        max_iterations=8,
+    )
+    sig_b = await service._build_source_signature(
+        db=_NoopDb(),
+        user_id=1,
+        paper=paper,
+        selected_kb_id=None,
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=True,
+        citation_tldr=False,
+        max_iterations=8,
+    )
+
+    assert len(sig_a) <= 255
+    assert len(sig_b) <= 255
+    assert sig_a != sig_b
+
+
+def test_reader_compose_style_tokens_should_accept_frontend_style_keys():
+    service = LiteratureReaderComposeService()
+    journal = service._build_style_tokens(
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+    )
+    clinical = service._build_style_tokens(
+        style_intent="clinical_brief",
+        theme_mode="light",
+        detail_level="standard",
+    )
+    preprint = service._build_style_tokens(
+        style_intent="preprint_modern",
+        theme_mode="light",
+        detail_level="standard",
+    )
+
+    assert journal["style_intent"] == "journal"
+    assert clinical["style_intent"] == "clinical"
+    assert preprint["style_intent"] == "preprint"
+
+
+@pytest.mark.asyncio
+async def test_reader_inline_query_should_forward_theme_and_citation_flags(monkeypatch):
+    service = LiteratureReaderComposeService()
+    captured: dict = {}
+
+    async def _fake_build_or_get(**kwargs):
+        captured["theme_mode"] = kwargs.get("theme_mode")
+        captured["citation_tldr"] = kwargs.get("citation_tldr")
+        return (
+            {
+                "ui_plan": {
+                    "components": [
+                        {
+                            "id": "n1",
+                            "type": "ParagraphProse",
+                            "props": {"text": "Demo paragraph for inline query."},
+                            "children": [],
+                            "source_anchor_refs": [
+                                {"page": 1, "start_char": 0, "end_char": 20, "quote_text": "Demo paragraph"}
+                            ],
+                        }
+                    ]
+                }
+            },
+            ReaderComposeBuildMeta(
+                cache_hit=True,
+                cache_layer="redis",
+                build_mode="compose_cache",
+                source_signature="sig",
+                source_sig_hash="hash",
+            ),
+        )
+
+    async def _fake_answer(**_kwargs):
+        return "结论：可回答。证据：来自当前段落。"
+
+    monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build_or_get)
+    monkeypatch.setattr(service, "_generate_inline_answer", _fake_answer)
+
+    result = await service.build_inline_answer_card(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=1),
+        page=1,
+        node_id="n1",
+        question="测试",
+        scope="section",
+        theme_mode="dark",
+        citation_tldr=True,
+    )
+
+    assert captured["theme_mode"] == "dark"
+    assert captured["citation_tldr"] is True
+    assert isinstance(result.get("node"), dict)
+
+
+@pytest.mark.asyncio
+async def test_reader_compose_mm_gate_not_hit_should_skip_mm_call(monkeypatch):
+    service = LiteratureReaderComposeService()
+
+    class _StubMMService:
+        def should_trigger_mm(self, **_kwargs):
+            return False, {
+                "reason": "quality_gate_not_hit",
+                "cross_column_merge_ratio": 0.02,
+            }
+
+    service._mm_layout_service = _StubMMService()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_kwargs: "demo.pdf",
+    )
+    monkeypatch.setattr(os.path, "exists", lambda _path: True)
+
+    payload = await service._apply_multimodal_layout_assist(
+        paper=SimpleNamespace(id=19, user_id=1, title="Demo", pdf_path="demo.pdf"),
+        page=1,
+        base_payload={
+            "page": 1,
+            "structure_confidence": 0.9,
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph"}],
+            "sections": [],
+        },
+    )
+
+    meta = payload.get("mm_assist_meta") or {}
+    assert meta.get("used") is False
+    assert meta.get("reason") == "quality_gate_not_hit"
+    assert "layout_channels" in payload
+
+
+@pytest.mark.asyncio
+async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypatch):
+    service = LiteratureReaderComposeService()
+
+    class _StubMMService:
+        def should_trigger_mm(self, **_kwargs):
+            return True, {"trigger_reasons": ["low_structure_confidence"]}
+
+        async def build_mm_prompt_payload(self, **_kwargs):
+            return {"image_data_url": "data:image/jpeg;base64,AA==", "line_candidates": []}
+
+        async def call_primary_then_fallback(self, **_kwargs):
+            return (
+                {"headings": [], "zones": [], "toc_candidates": [], "notes": []},
+                {"used": True, "model": "qwen3-vl-flash", "fallback_used": True, "error": None},
+            )
+
+        def merge_mm_decision_into_blocks(self, *, base_payload, mm_decision):
+            _ = mm_decision
+            merged = dict(base_payload)
+            merged["toc_quality"] = 0.7
+            merged["toc_hidden"] = False
+            merged["side_context_blocks"] = [
+                {
+                    "id": "sb1",
+                    "kind": "paragraph",
+                    "text": "OPEN ACCESS",
+                    "source_anchor": {"page": 1, "start_char": 2, "end_char": 20},
+                    "zone_type": "side_context",
+                    "column_id": "sidebar_left",
+                }
+            ]
+            merged["figure_meta_blocks"] = []
+            merged["layout_channels"] = {
+                "main_body": ["b1"],
+                "side_context": ["sb1"],
+                "figure_meta": [],
+            }
+            return merged
+
+        def mark_mm_triggered(self, **_kwargs):
+            return None
+
+    service._mm_layout_service = _StubMMService()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_kwargs: "demo.pdf",
+    )
+    monkeypatch.setattr(os.path, "exists", lambda _path: True)
+
+    payload = await service._apply_multimodal_layout_assist(
+        paper=SimpleNamespace(id=20, user_id=1, title="Demo", pdf_path="demo.pdf"),
+        page=1,
+        base_payload={
+            "page": 1,
+            "structure_confidence": 0.5,
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "zone_type": "main_body"}],
+            "sections": [],
+        },
+    )
+
+    mm_meta = payload.get("mm_assist_meta") or {}
+    assert mm_meta.get("used") is True
+    assert mm_meta.get("fallback_used") is True
+    channels = payload.get("layout_channels") or {}
+    assert "main_body" in channels
+    assert "side_context" in channels
+
+
+def test_reader_compose_toc_should_hide_when_low_quality():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=21, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)
+    ui_plan = service._build_initial_ui_plan(
+        paper=paper,
+        page=1,
+        base_payload={
+            "sections": [{"title": "Body", "level": 1, "source_anchor": {"page": 1, "start_char": 0, "end_char": 5}}],
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "source_anchor": {"page": 1, "start_char": 0, "end_char": 14}}],
+            "assets": [],
+            "summary": "Summary",
+            "style_cues": {},
+            "toc_quality": 0.2,
+            "toc_hidden": True,
+        },
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    toc_nodes = [node for node in ui_plan.get("components") or [] if node.get("type") == "SectionTOC"]
+    assert toc_nodes
+    toc_props = toc_nodes[0].get("props") or {}
+    assert toc_props.get("items") == []
+    assert "已隐藏" in str(toc_props.get("hidden_reason") or "")
+
+
+def test_reader_compose_quality_should_include_layout_metrics():
+    service = LiteratureReaderComposeService()
+    quality = service.score_ui_plan(
+        ui_plan={
+            "plan_id": "p1",
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+            "components": [
+                {"id": "h1", "type": "PaperHeaderCard", "props": {"title": "Demo title"}, "children": [], "source_anchor_refs": []},
+                {"id": "t1", "type": "SectionTOC", "props": {"items": [], "hidden_reason": "本页目录质量不足，已隐藏。"}, "children": [], "source_anchor_refs": []},
+                {"id": "p1", "type": "ParagraphProse", "props": {"text": "demo body"}, "children": [], "source_anchor_refs": [{"page": 1, "start_char": 0, "end_char": 8}]},
+                {"id": "c1", "type": "ContextRail", "props": {"items": [{"text": "OPEN ACCESS"}]}, "children": [], "source_anchor_refs": []},
+            ],
+        },
+        base_payload={
+            "blocks": [{"id": "b1", "kind": "heading", "text": "Introduction"}],
+            "assets": [],
+            "style_cues": {"layout_mode": "two_column"},
+            "side_context_blocks": [{"id": "sb1", "text": "OPEN ACCESS"}],
+            "cross_column_merge_ratio": 0.03,
+            "toc_quality": 0.2,
+            "toc_hidden": True,
+            "mm_assist_meta": {"used": True, "model": "qwen3-vl-flash", "fallback_used": True},
+        },
+        validation_errors=[],
+        quality_target=0.86,
+    )
+
+    assert "cross_column_merge_ratio" in quality
+    assert "sidebar_recall" in quality
+    assert "toc_quality" in quality
+    assert quality.get("mm_assist_used") is True

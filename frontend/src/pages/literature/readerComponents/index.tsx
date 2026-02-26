@@ -7,10 +7,12 @@ import type {
   ReaderComponentSourceAnchor,
   ReaderComposeQualityReport,
 } from '@/services/api'
+import type { GenerativeStyleTokens } from '../generativeStyles'
 
 const { Text, Title, Paragraph } = Typography
 
 export type ReaderComponentRenderContext = {
+  themeStyle?: GenerativeStyleTokens
   qualityReport?: ReaderComposeQualityReport | null
   inlineQueryLoadingNodeId?: string | null
   onJumpAnchor?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
@@ -63,12 +65,19 @@ function normalizeAnchorRows(value: unknown): ReaderComponentSourceAnchor[] {
   return rows
 }
 
-function baseCardStyle(): CSSProperties {
+function baseCardStyle(ctx?: ReaderComponentRenderContext): CSSProperties {
+  const isDark = ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44')
   return {
-    borderRadius: 14,
-    border: '1px solid rgba(9, 30, 66, 0.12)',
-    boxShadow: '0 8px 24px rgba(11, 18, 32, 0.06)',
+    borderRadius: 16,
+    border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+    boxShadow: isDark ? '0 8px 32px rgba(0, 0, 0, 0.4)' : '0 12px 32px rgba(11, 18, 32, 0.05)',
+    background: ctx?.themeStyle?.panelBackground || '#ffffff',
+    overflow: 'hidden',
   }
+}
+
+function isDarkTheme(ctx?: ReaderComponentRenderContext): boolean {
+  return Boolean(ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44'))
 }
 
 export function componentToMarkdown(node: ReaderComponentNode): string {
@@ -101,6 +110,14 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
   if (node.type === 'AnswerCard') {
     return [`### 问答`, `- 问题：${text('question')}`, `- 回答：${text('answer')}`].join('\n')
   }
+  if (node.type === 'ContextRail') {
+    const rows = asRecordArray((props as Record<string, unknown>).items)
+    const lines = rows
+      .map((row) => asString(row.text || row.label || row.value))
+      .filter(Boolean)
+      .slice(0, 12)
+    return [`### 侧栏信息`, ...lines.map((line) => `- ${line}`)].join('\n')
+  }
   return JSON.stringify(node.props || {}, null, 2)
 }
 
@@ -124,12 +141,19 @@ function ActionBar(props: {
   const [hovered, setHovered] = useState(false)
   const markdown = componentToMarkdown(node)
   const canJump = Array.isArray(node.source_anchor_refs) && node.source_anchor_refs.length > 0
+  const darkTheme = isDarkTheme(ctx)
+  const idleOpacity = darkTheme ? 0.62 : 0.9
+  const actionBtnStyle: CSSProperties = {
+    color: ctx?.themeStyle?.bodyColor,
+    borderColor: ctx?.themeStyle?.borderColor,
+  }
   return (
     <div
+      className="reader-action-bar"
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
-        opacity: hovered ? 1 : 0.15,
+        opacity: hovered ? 1 : idleOpacity,
         transition: 'opacity 0.25s',
         marginBottom: 8,
         display: 'flex',
@@ -140,6 +164,7 @@ function ActionBar(props: {
         <Button
           size="small"
           icon={<ReloadOutlined />}
+          style={actionBtnStyle}
           onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
         >
           修复
@@ -147,6 +172,7 @@ function ActionBar(props: {
         <Button
           size="small"
           icon={<ShrinkOutlined />}
+          style={actionBtnStyle}
           onClick={() => ctx.onNodeAction?.(node, 'degrade')}
         >
           降级
@@ -154,6 +180,7 @@ function ActionBar(props: {
         <Button
           size="small"
           icon={<LinkOutlined />}
+          style={actionBtnStyle}
           disabled={!canJump}
           onClick={() => ctx.onJumpAnchor?.(node.source_anchor_refs || [], { pinPreview: true })}
         >
@@ -161,6 +188,7 @@ function ActionBar(props: {
         </Button>
         <Button
           size="small"
+          style={actionBtnStyle}
           onClick={async () => {
             try {
               await navigator.clipboard.writeText(markdown)
@@ -211,7 +239,7 @@ function InlineQuerySlotNode(props: {
   const [value, setValue] = useState('')
   const loading = ctx.inlineQueryLoadingNodeId === node.id
   return (
-    <Card size="small" style={{ ...baseCardStyle(), margin: '8px 0' }}>
+    <Card size="small" style={{ ...baseCardStyle(ctx), margin: '8px 0' }}>
       {!expanded ? (
         <Button size="small" type="dashed" icon={<DownOutlined />} onClick={() => setExpanded(true)}>
           + 在这里提问
@@ -266,7 +294,16 @@ function ParagraphProseNode(props: {
       <DraggableContainer node={node}>
         <div>
           <ActionBar node={node} ctx={ctx} />
-          <p style={{ margin: 0, lineHeight: 1.95, fontSize: 18, textAlign: 'justify' }}>
+          <p
+            style={{
+              margin: 0,
+              lineHeight: ctx.themeStyle?.bodyLineHeight || 1.95,
+              fontSize: ctx.themeStyle?.bodyFontSize || 18,
+              textAlign: 'justify',
+              color: ctx.themeStyle?.bodyColor,
+              fontFamily: ctx.themeStyle?.bodyFontFamily,
+            }}
+          >
             {text}
             {renderChildren(node.children || [], ctx)}
           </p>
@@ -335,8 +372,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const year = asString(props.year)
       const authors = asStringArray(props.authors)
       return withAnchorPreview(
-        <Card size="small" style={baseCardStyle()}>
-          <Title level={2} style={{ marginBottom: 10 }}>{title || 'Untitled Paper'}</Title>
+        <Card size="small" style={{ ...baseCardStyle(ctx), border: 'none' }}>
+          <Title level={2} style={{ marginBottom: 10, color: ctx.themeStyle?.headingColor }}>{title || 'Untitled Paper'}</Title>
           <Space wrap>
             {venue ? <Tag color="geekblue">{venue}</Tag> : null}
             {year ? <Tag>{year}</Tag> : null}
@@ -350,7 +387,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'MetadataSidebarCard': {
       const items = asRecordArray(props.items)
       return (
-        <Card size="small" title="元数据" style={baseCardStyle()}>
+        <Card size="small" title="元数据" style={baseCardStyle(ctx)}>
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             {items.map((item, idx) => (
               <div key={`meta-${idx}`}>
@@ -364,8 +401,51 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       )
     }
 
+    case 'ContextRail': {
+      const title = asString(props.title) || '侧栏信息'
+      const rows = asRecordArray(props.items)
+      const items = rows
+        .map((row) => ({
+          text: asString(row.text || row.label || row.value),
+          anchor: normalizeAnchorRows(row.anchor),
+        }))
+        .filter((item) => item.text)
+      const defaultCollapsed = props.default_collapsed !== false
+      return (
+        <Card size="small" title={title} style={baseCardStyle(ctx)}>
+          <details open={!defaultCollapsed}>
+            <summary style={{ cursor: 'pointer', marginBottom: 10, color: ctx.themeStyle?.bodyColor }}>
+              点击展开/收起侧栏上下文
+            </summary>
+            <List
+              size="small"
+              dataSource={items}
+              renderItem={(item, idx) => (
+                <List.Item key={`ctx-${idx}`}>
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    <Text style={{ color: ctx.themeStyle?.bodyColor }}>{item.text}</Text>
+                    {item.anchor.length > 0 ? (
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => ctx.onJumpAnchor?.(item.anchor, { pinPreview: true })}
+                      >
+                        定位到证据
+                      </Button>
+                    ) : null}
+                  </Space>
+                </List.Item>
+              )}
+            />
+          </details>
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
+        </Card>
+      )
+    }
+
     case 'SectionTOC': {
       const rawItems = Array.isArray(props.items) ? props.items : []
+      const hiddenReason = asString((props as Record<string, unknown>).hidden_reason)
       const items = rawItems.map((row) => {
         if (typeof row === 'string') {
           return { title: row, anchor: [] as ReaderComponentSourceAnchor[] }
@@ -380,7 +460,15 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
         return { title: '', anchor: [] as ReaderComponentSourceAnchor[] }
       }).filter((item) => item.title)
       return (
-        <Card size="small" title="章节目录" style={baseCardStyle()}>
+        <Card size="small" title="章节目录" style={baseCardStyle(ctx)}>
+          {hiddenReason ? (
+            <Alert
+              showIcon
+              type="info"
+              message={hiddenReason}
+              style={{ marginBottom: 10 }}
+            />
+          ) : null}
           <List
             size="small"
             dataSource={items}
@@ -418,6 +506,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               fontSize: levelToSize[level as 1 | 2 | 3 | 4],
               lineHeight: 1.2,
               letterSpacing: 0.2,
+              color: ctx.themeStyle?.headingColor,
+              fontFamily: ctx.themeStyle?.headingFontFamily,
             }}
           >
             {text}
@@ -436,7 +526,15 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       return withAnchorPreview(
         <DraggableContainer node={node}>
           <ActionBar node={node} ctx={ctx} />
-          <ul style={{ marginBottom: 14, paddingInlineStart: 24, lineHeight: 1.9 }}>
+          <ul
+            style={{
+              marginBottom: 14,
+              paddingInlineStart: 24,
+              lineHeight: 1.9,
+              color: ctx.themeStyle?.bodyColor,
+              fontFamily: ctx.themeStyle?.bodyFontFamily,
+            }}
+          >
             {items.map((item, idx) => <li key={`li-${idx}`}>{item}</li>)}
             {renderChildren(node.children || [], ctx)}
           </ul>
@@ -451,7 +549,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const aiInsight = asString(props.ai_insight)
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <Card size="small" style={{ ...baseCardStyle(), marginBottom: 14 }}>
+          <Card size="small" style={{ ...baseCardStyle(ctx), marginBottom: 14 }}>
             <ActionBar
               node={node}
               ctx={ctx}
@@ -479,12 +577,16 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 style={{ width: '100%', maxHeight: 360, objectFit: 'cover', borderRadius: 10 }}
               />
             ) : null}
-            {caption ? <Text type="secondary" style={{ display: 'block', marginTop: 10 }}>{caption}</Text> : null}
+            {caption ? <Text type="secondary" style={{ display: 'block', marginTop: 10, color: ctx?.themeStyle?.bodyColor, opacity: 0.85 }}>{caption}</Text> : null}
             {sourceLabel ? <Tag style={{ marginTop: 8 }}>{sourceLabel}</Tag> : null}
             {aiInsight ? (
-              <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(23, 119, 255, 0.04)', borderRadius: 8, borderLeft: '3px solid #1677ff' }}>
-                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 4 }}>AI 深度洞察</Text>
-                <Text>{aiInsight}</Text>
+              <div style={{
+                marginTop: 14, padding: '12px 16px',
+                background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(22, 119, 255, 0.05)' : 'rgba(23, 119, 255, 0.04)',
+                borderRadius: 10, borderLeft: '4px solid #1677ff'
+              }}>
+                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>✨ AI 深度洞察</Text>
+                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7 }}>{aiInsight}</Text>
               </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
@@ -499,7 +601,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const aiInsight = asString(props.ai_insight)
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <Card size="small" title={title || '表格'} style={baseCardStyle()}>
+          <Card size="small" title={title || '表格'} style={baseCardStyle(ctx)}>
             <ActionBar
               node={node}
               ctx={ctx}
@@ -525,14 +627,18 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               dataSource={rows}
               renderItem={(row, idx) => (
                 <List.Item key={`row-${idx}`}>
-                  <Text>{Object.values(row).map((item) => asString(item)).join(' | ')}</Text>
+                  <Text style={{ color: ctx?.themeStyle?.bodyColor }}>{Object.values(row).map((item) => asString(item)).join(' | ')}</Text>
                 </List.Item>
               )}
             />
             {aiInsight ? (
-              <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(23, 119, 255, 0.04)', borderRadius: 8, borderLeft: '3px solid #1677ff' }}>
-                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 4 }}>AI 数据解读</Text>
-                <Text>{aiInsight}</Text>
+              <div style={{
+                marginTop: 14, padding: '12px 16px',
+                background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(22, 119, 255, 0.05)' : 'rgba(23, 119, 255, 0.04)',
+                borderRadius: 10, borderLeft: '4px solid #1677ff'
+              }}>
+                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>📊 AI 数据解读</Text>
+                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7 }}>{aiInsight}</Text>
               </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
@@ -544,7 +650,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'CitationLinks': {
       const links = asRecordArray(props.links)
       return (
-        <Card size="small" title="文献资源链接" style={baseCardStyle()}>
+        <Card size="small" title="文献资源链接" style={baseCardStyle(ctx)}>
           <Space direction="vertical" size={10} style={{ width: '100%' }}>
             {links.map((link, idx) => {
               const href = asString(link.href)
@@ -554,11 +660,25 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               return (
                 <Popover
                   key={`link-${idx}`}
+                  overlayClassName="reader-composed-popover"
+                  overlayStyle={
+                    {
+                      '--reader-card-bg': ctx?.themeStyle?.panelBackground,
+                      '--reader-card-border': ctx?.themeStyle?.borderColor,
+                      '--reader-text': ctx?.themeStyle?.bodyColor,
+                    } as CSSProperties
+                  }
                   title="文献智能摘要 (TL;DR)"
                   placement="topLeft"
                   content={
                     <div style={{ maxWidth: 320, whiteSpace: 'normal' }}>
-                      <Text style={{ color: tldr ? '#333' : '#999', lineHeight: 1.6 }}>
+                      <Text
+                        style={{
+                          color: tldr ? ctx?.themeStyle?.bodyColor : ctx?.themeStyle?.bodyColor,
+                          lineHeight: 1.6,
+                          opacity: tldr ? 1 : 0.72,
+                        }}
+                      >
                         {tldr || '暂无该文献的核心摘要...（可由 Web Search Agent 异步挂载）'}
                       </Text>
                     </div>
@@ -573,9 +693,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                       alignItems: 'center',
                       gap: 4,
                       padding: '4px 8px',
-                      background: 'rgba(22, 119, 255, 0.06)',
+                      background: isDarkTheme(ctx) ? 'rgba(98, 170, 255, 0.14)' : 'rgba(22, 119, 255, 0.08)',
                       borderRadius: 6,
-                      border: '1px solid rgba(22, 119, 255, 0.15)',
+                      border: isDarkTheme(ctx) ? '1px solid rgba(131, 188, 255, 0.35)' : '1px solid rgba(22, 119, 255, 0.2)',
                       color: '#1677ff',
                       fontWeight: 500,
                     }}
@@ -600,23 +720,61 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
         }))
         : asStringArray(props.items).map((text) => ({ text, evidenceAnchors: [] as ReaderComponentSourceAnchor[] }))
       return (
-        <Card size="small" title="关键要点" style={baseCardStyle()}>
-          <ul style={{ marginBottom: 0, paddingInlineStart: 24, lineHeight: 1.9 }}>
-            {itemRows.map((item, idx) => (
-              <li key={`take-${idx}`} style={{ marginBottom: 6 }}>
-                <Space size={6} wrap>
-                  <Text>{item.text}</Text>
-                  <Button
-                    size="small"
-                    type="link"
-                    onClick={() => ctx.onJumpAnchor?.(item.evidenceAnchors.length > 0 ? item.evidenceAnchors : anchorRefs, { pinPreview: true })}
-                  >
-                    定位到证据
-                  </Button>
-                </Space>
-              </li>
-            ))}
-          </ul>
+        <Card size="small" title="关键要点" style={baseCardStyle(ctx)}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {itemRows.map((item, idx) => {
+              const hasAnchors = item.evidenceAnchors.length > 0 || anchorRefs.length > 0
+              return (
+                <div
+                  key={`take-${idx}`}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 12,
+                    padding: '12px 14px',
+                    background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44')
+                      ? 'rgba(255, 255, 255, 0.03)'
+                      : 'rgba(22, 119, 255, 0.03)',
+                    borderRadius: 10,
+                    border: `1px solid ${ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255, 255, 255, 0.06)' : 'rgba(22, 119, 255, 0.08)'}`,
+                    transition: 'all 0.3s ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = 'translateY(-2px)'
+                    e.currentTarget.style.boxShadow = '0 6px 16px rgba(0,0,0,0.06)'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = 'translateY(0)'
+                    e.currentTarget.style.boxShadow = 'none'
+                  }}
+                >
+                  <div style={{
+                    width: 24, height: 24, borderRadius: '50%', background: 'linear-gradient(135deg, #1677ff 0%, #0958d9 100%)',
+                    color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 13, fontWeight: 'bold', flexShrink: 0, marginTop: 2,
+                    boxShadow: '0 2px 6px rgba(22, 119, 255, 0.4)'
+                  }}>
+                    {idx + 1}
+                  </div>
+                  <div style={{ flex: 1, lineHeight: 1.8 }}>
+                    <Text style={{ fontSize: 15, color: ctx?.themeStyle?.bodyColor }}>{item.text}</Text>
+                    {hasAnchors ? (
+                      <div style={{ marginTop: 8 }}>
+                        <Button
+                          size="small"
+                          type="dashed"
+                          icon={<LinkOutlined />}
+                          onClick={() => ctx.onJumpAnchor?.(item.evidenceAnchors.length > 0 ? item.evidenceAnchors : anchorRefs, { pinPreview: true })}
+                        >
+                          定位到证据
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
           <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
         </Card>
       )
@@ -625,7 +783,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'AnnotationRail': {
       const items = asStringArray(props.items)
       return (
-        <Card size="small" title="页内批注" style={baseCardStyle()}>
+        <Card size="small" title="页内批注" style={baseCardStyle(ctx)}>
           <List
             size="small"
             dataSource={items}
@@ -645,7 +803,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const foldable = props.foldable !== false
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <Card size="small" title="内联问答" style={baseCardStyle()}>
+          <Card size="small" title="内联问答" style={baseCardStyle(ctx)}>
             <ActionBar node={node} ctx={ctx} />
             <Paragraph style={{ marginBottom: 8 }}>
               <Text strong>问题：</Text>
@@ -663,7 +821,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'CompareInsightsCard': {
       const items = asRecordArray(props.items)
       return (
-        <Card size="small" title="跨论文对比洞察" style={baseCardStyle()}>
+        <Card size="small" title="跨论文对比洞察" style={baseCardStyle(ctx)}>
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             {items.map((item, idx) => (
               <div key={`cmp-${idx}`}>
@@ -691,6 +849,31 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
           description={(
             <Space direction="vertical" size={6}>
               <Text>迭代：{report.iterations || 0} 轮；停止原因：{report.stop_reason || 'unknown'}</Text>
+              <Space size={8} wrap>
+                {typeof report.cross_column_merge_ratio === 'number' ? (
+                  <Tag color={report.cross_column_merge_ratio <= 0.08 ? 'green' : 'gold'}>
+                    跨栏拼接率 {(report.cross_column_merge_ratio * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof report.sidebar_recall === 'number' ? (
+                  <Tag color={report.sidebar_recall >= 0.75 ? 'green' : 'gold'}>
+                    侧栏保留率 {(report.sidebar_recall * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof report.toc_quality === 'number' ? (
+                  <Tag color={report.toc_quality >= 0.55 ? 'blue' : 'orange'}>
+                    目录质量 {(report.toc_quality * 100).toFixed(0)}%
+                  </Tag>
+                ) : null}
+                {report.mm_assist_used ? (
+                  <Tag color="purple">
+                    多模态辅助：{report.mm_model || '已启用'}
+                    {report.mm_fallback_used ? '（fallback）' : ''}
+                  </Tag>
+                ) : (
+                  <Tag>多模态辅助：未触发</Tag>
+                )}
+              </Space>
               {deductions.length > 0 ? (
                 <div>
                   <Text strong>扣分项：</Text>
@@ -722,7 +905,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const description = asString(props.description)
       const page = asNumber(props.page, 0)
       return (
-        <Card size="small" title={title} style={baseCardStyle()}>
+        <Card size="small" title={title} style={baseCardStyle(ctx)}>
           <Paragraph style={{ marginBottom: 8 }}>{description}</Paragraph>
           {page > 0 ? <Tag color="blue">第 {page} 页</Tag> : null}
         </Card>

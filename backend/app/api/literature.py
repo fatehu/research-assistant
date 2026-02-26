@@ -1705,7 +1705,7 @@ def _knowledge_not_ready_error(details: Dict[str, Any]) -> HTTPException:
 def _resolve_literature_agent_max_iterations() -> int:
     configured = _to_int(getattr(settings, "literature_agent_max_iterations", None))
     if configured is None or configured <= 0:
-        configured = _to_int(getattr(settings, "react_max_iterations", None)) or 8
+        configured = _to_int(getattr(settings, "react_max_iterations", None)) or 14
     return max(2, min(int(configured), 20))
 
 
@@ -2794,6 +2794,7 @@ async def _prefetch_reader_composed_pages_background(
     style_intent: Optional[str],
     latency_budget_ms: Optional[int],
     quality_target: Optional[float],
+    max_iterations: Optional[int],
     theme_mode: Optional[str],
     detail_level: Optional[str],
     compare_mode: Optional[bool],
@@ -2816,6 +2817,7 @@ async def _prefetch_reader_composed_pages_background(
             style_intent=style_intent,
             latency_budget_ms=latency_budget_ms,
             quality_target=quality_target,
+            max_iterations=max_iterations,
             theme_mode=theme_mode,
             detail_level=detail_level,
             compare_mode=compare_mode,
@@ -3001,6 +3003,8 @@ async def prefetch_reader_generative_pages(
     paper = await _get_owned_paper_or_404(db, current_user, paper_id)
     service = get_literature_reader_service()
     pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=409, detail="本地 PDF 不存在，请先下载后再执行预读。")
     max_page = await _get_pdf_page_count(pdf_path)
     queued, skipped = service.queue_prefetch(
         pages=list(payload.pages or []),
@@ -3049,6 +3053,7 @@ async def stream_reader_composed_page(
                 regenerate=bool(payload.regenerate),
                 latency_budget_ms=payload.latency_budget_ms,
                 quality_target=payload.quality_target,
+                max_iterations=getattr(payload, "max_iterations", None),
                 style_intent=payload.style_intent,
                 theme_mode=getattr(payload, "theme_mode", None),
                 detail_level=getattr(payload, "detail_level", None),
@@ -3109,6 +3114,10 @@ async def stream_reader_composed_page(
                         {
                             "iteration": int(row.get("iteration") or 0),
                             "quality_report": row.get("quality_report") or {},
+                            "mm_assist_used": bool((row.get("quality_report") or {}).get("mm_assist_used")),
+                            "mm_fallback_used": bool((row.get("quality_report") or {}).get("mm_fallback_used")),
+                            "cross_column_merge_ratio": float((row.get("quality_report") or {}).get("cross_column_merge_ratio") or 0.0),
+                            "sidebar_recall": float((row.get("quality_report") or {}).get("sidebar_recall") or 0.0),
                         },
                     )
             else:
@@ -3128,6 +3137,10 @@ async def stream_reader_composed_page(
                 {
                     "iteration": int(meta.iterations or 0),
                     "quality_report": composed_payload.get("quality_report") or {},
+                    "mm_assist_used": bool((composed_payload.get("quality_report") or {}).get("mm_assist_used")),
+                    "mm_fallback_used": bool((composed_payload.get("quality_report") or {}).get("mm_fallback_used")),
+                    "cross_column_merge_ratio": float((composed_payload.get("quality_report") or {}).get("cross_column_merge_ratio") or 0.0),
+                    "sidebar_recall": float((composed_payload.get("quality_report") or {}).get("sidebar_recall") or 0.0),
                 },
             )
             yield _sse_payload(
@@ -3181,6 +3194,8 @@ async def prefetch_reader_composed_pages(
     paper = await _get_owned_paper_or_404(db, current_user, paper_id)
     service = get_literature_reader_compose_service()
     pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=409, detail="本地 PDF 不存在，请先下载后再执行预读。")
     max_page = await _get_pdf_page_count(pdf_path)
     queued, skipped = service.queue_prefetch(
         pages=list(payload.pages or []),
@@ -3197,6 +3212,7 @@ async def prefetch_reader_composed_pages(
             style_intent=payload.style_intent,
             latency_budget_ms=payload.latency_budget_ms,
             quality_target=payload.quality_target,
+            max_iterations=getattr(payload, "max_iterations", None),
             theme_mode=getattr(payload, "theme_mode", None),
             detail_level=getattr(payload, "detail_level", None),
             compare_mode=getattr(payload, "compare_mode", None),
@@ -3262,8 +3278,10 @@ async def stream_reader_composed_inline_query(
                 scope=str(payload.scope),
                 selected_kb_id=payload.selected_kb_id,
                 style_intent=payload.style_intent,
+                theme_mode=getattr(payload, "theme_mode", None),
                 detail_level=getattr(payload, "detail_level", None),
                 compare_mode=getattr(payload, "compare_mode", None),
+                citation_tldr=getattr(payload, "citation_tldr", None),
             )
             if await request.is_disconnected():
                 return

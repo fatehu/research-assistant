@@ -1,4 +1,4 @@
-﻿"""
+"""
 Generative literature reader service.
 
 Strategy:
@@ -216,8 +216,13 @@ class LiteratureReaderService:
                     repaired.get("style_tuning") if isinstance(repaired, dict) else None,
                     fallback=parsed.get("style_tuning") if isinstance(parsed, dict) else None,
                 ),
+                "raw_text": str(repaired.get("raw_text") or raw_text),
+                "style_cues": dict(repaired.get("style_cues") or parsed.get("style_cues") or {}),
                 "sections": list(repaired.get("sections") or []),
                 "blocks": list(repaired.get("blocks") or []),
+                "side_context_blocks": list(repaired.get("side_context_blocks") or parsed.get("side_context_blocks") or []),
+                "figure_meta_blocks": list(repaired.get("figure_meta_blocks") or parsed.get("figure_meta_blocks") or []),
+                "toc_quality": float(repaired.get("toc_quality") or parsed.get("toc_quality") or 0.0),
                 "assets": assets,
                 "generated_at": datetime.utcnow().isoformat(),
             }
@@ -277,6 +282,12 @@ class LiteratureReaderService:
             if isinstance(item, dict)
         }
         sidebar_line_hints = self._build_sidebar_line_hints(style_cues)
+        side_context_blocks = self._build_side_context_blocks_from_style_cues(
+            style_cues=style_cues,
+            page=page,
+            raw_text=normalized_raw_text,
+            noise_hints=noise_line_hints,
+        )
 
         blocks: List[Dict[str, Any]] = []
         sections: List[Dict[str, Any]] = []
@@ -302,7 +313,16 @@ class LiteratureReaderService:
                 }
             )
 
-        def _append_block(kind: str, text: str, section_title: str) -> None:
+        def _append_block(
+            kind: str,
+            text: str,
+            section_title: str,
+            *,
+            zone_type: str = "main_body",
+            column_id: str = "main",
+            heading_prob: float = 0.0,
+            layout_confidence: float = 0.78,
+        ) -> None:
             nonlocal cursor, order, blocks
             content = self._normalize_spaces(text)
             if not content:
@@ -321,6 +341,10 @@ class LiteratureReaderService:
                     "start_char": int(start_char),
                     "end_char": int(end_char),
                 },
+                "zone_type": str(zone_type or "main_body"),
+                "column_id": str(column_id or "main"),
+                "heading_prob": float(max(0.0, min(1.0, heading_prob))),
+                "layout_confidence": float(max(0.0, min(1.0, layout_confidence))),
             }
             blocks.append(block)
             section_to_block_ids.setdefault(section_title or "Body", []).append(block_id)
@@ -359,19 +383,42 @@ class LiteratureReaderService:
                 start_char, end_char = self._locate_anchor(normalized_raw_text, line, cursor)
                 anchor = {"page": int(page), "start_char": int(start_char), "end_char": int(end_char)}
                 _ensure_section(current_section, anchor=anchor, level=heading_level)
-                _append_block("heading", line, current_section)
+                heading_prob = float(style_heading_hints.get(line.lower(), 0.78))
+                _append_block(
+                    "heading",
+                    line,
+                    current_section,
+                    zone_type="main_body",
+                    column_id="main",
+                    heading_prob=heading_prob,
+                    layout_confidence=max(0.7, heading_prob),
+                )
                 continue
 
             if self._is_caption_line(line):
                 _flush_paragraph()
                 _ensure_section(current_section)
-                _append_block("caption", line, current_section)
+                _append_block(
+                    "caption",
+                    line,
+                    current_section,
+                    zone_type="figure_meta",
+                    column_id="main",
+                    layout_confidence=0.84,
+                )
                 continue
 
             if self._is_list_item_line(line):
                 _flush_paragraph()
                 _ensure_section(current_section)
-                _append_block("list_item", line, current_section)
+                _append_block(
+                    "list_item",
+                    line,
+                    current_section,
+                    zone_type="main_body",
+                    column_id="main",
+                    layout_confidence=0.8,
+                )
                 continue
 
             paragraph_lines.append(line)
@@ -400,6 +447,10 @@ class LiteratureReaderService:
                         "start_char": 0,
                         "end_char": max(1, len(fallback_text)),
                     },
+                    "zone_type": "main_body",
+                    "column_id": "main",
+                    "heading_prob": 0.0,
+                    "layout_confidence": 0.55,
                 }
             ]
             sections = [
@@ -410,6 +461,16 @@ class LiteratureReaderService:
                     "source_anchor": None,
                 }
             ]
+
+        figure_meta_blocks = [item for item in blocks if str(item.get("zone_type") or "") == "figure_meta"]
+        heading_blocks = [item for item in blocks if str(item.get("kind") or "") == "heading"]
+        high_conf_headings = [
+            item
+            for item in heading_blocks
+            if float(item.get("heading_prob") or 0.0) >= 0.72
+            and str(item.get("text") or "").strip().lower() not in {"body"}
+        ]
+        toc_quality = len(high_conf_headings) / max(1, len(heading_blocks)) if heading_blocks else 0.0
 
         style_key = self._pick_style_key(
             raw_text=normalized_raw_text,
@@ -426,6 +487,9 @@ class LiteratureReaderService:
             "summary": summary,
             "sections": sections,
             "blocks": blocks,
+            "side_context_blocks": side_context_blocks,
+            "figure_meta_blocks": figure_meta_blocks,
+            "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
         }
 
     async def repair_structure_with_agent(
@@ -1066,6 +1130,57 @@ class LiteratureReaderService:
             if text_key:
                 key_hints.add(text_key)
         return {"texts": text_hints, "keys": key_hints}
+
+    @staticmethod
+    def _build_side_context_blocks_from_style_cues(
+        *,
+        style_cues: Optional[Dict[str, Any]],
+        page: int,
+        raw_text: str,
+        noise_hints: Optional[set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """从版面行数据中提取侧栏块，避免正文链路直接丢弃侧栏信息。"""
+        cues = style_cues if isinstance(style_cues, dict) else {}
+        line_layout = list(cues.get("line_layout") or [])
+        noise_set = noise_hints or set()
+        output: List[Dict[str, Any]] = []
+        order = 0
+        cursor = 0
+        for idx, row in enumerate(line_layout[:220]):
+            if not isinstance(row, dict):
+                continue
+            column_label = str(row.get("column_label") or "main")
+            if not column_label.startswith("sidebar"):
+                continue
+            text = LiteratureReaderService._normalize_spaces(str(row.get("text") or ""))
+            if not text or len(text) < 4:
+                continue
+            if text.lower() in noise_set:
+                continue
+            if LiteratureReaderService._is_probable_noise_line(text):
+                continue
+            start_char, end_char = LiteratureReaderService._locate_anchor(raw_text, text, cursor)
+            cursor = max(cursor, end_char)
+            output.append(
+                {
+                    "id": f"sb{idx + 1}",
+                    "kind": "paragraph",
+                    "text": text,
+                    "order": order,
+                    "section_title": "Side Context",
+                    "source_anchor": {
+                        "page": int(page),
+                        "start_char": int(start_char),
+                        "end_char": int(end_char),
+                    },
+                    "zone_type": "side_context",
+                    "column_id": column_label,
+                    "heading_prob": 0.0,
+                    "layout_confidence": 0.78,
+                }
+            )
+            order += 1
+        return output
 
     @staticmethod
     def _is_sidebar_line(text: str, *, sidebar_hints: Optional[Dict[str, set[str]]]) -> bool:
@@ -1728,6 +1843,14 @@ class LiteratureReaderService:
                         "start_char": start_char,
                         "end_char": end_char,
                     },
+                    "zone_type": (
+                        str(item.get("zone_type") or ("figure_meta" if kind == "caption" else "main_body"))
+                        if str(item.get("zone_type") or ("figure_meta" if kind == "caption" else "main_body")) in {"main_body", "side_context", "figure_meta"}
+                        else ("figure_meta" if kind == "caption" else "main_body")
+                    ),
+                    "column_id": str(item.get("column_id") or "main"),
+                    "heading_prob": float(item.get("heading_prob") or (0.78 if kind == "heading" else 0.0)),
+                    "layout_confidence": float(item.get("layout_confidence") or 0.8),
                 }
             )
 
@@ -1755,11 +1878,25 @@ class LiteratureReaderService:
                 section_map[title]["level"] = max(1, min(4, level))
 
         sections = list(section_map.values())
+        side_context_blocks = [
+            item for item in normalized_blocks if str(item.get("zone_type") or "") == "side_context"
+        ]
+        figure_meta_blocks = [
+            item for item in normalized_blocks if str(item.get("zone_type") or "") == "figure_meta"
+        ]
+        heading_blocks = [item for item in normalized_blocks if str(item.get("kind") or "") == "heading"]
+        high_conf_headings = [
+            item for item in heading_blocks if float(item.get("heading_prob") or 0.0) >= 0.72
+        ]
+
         return {
             "style_key": self._normalize_style_key(payload.get("style_key"), fallback=fallback_style),
             "style_tuning": self._normalize_style_tuning(payload.get("style_tuning"), fallback=None),
             "sections": sections,
             "blocks": normalized_blocks,
+            "side_context_blocks": side_context_blocks,
+            "figure_meta_blocks": figure_meta_blocks,
+            "toc_quality": round(len(high_conf_headings) / max(1, len(heading_blocks)), 4) if heading_blocks else 0.0,
         }
 
     @staticmethod

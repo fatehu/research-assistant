@@ -26,10 +26,11 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.knowledge import Document
+from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperReaderComponentOverlay, PaperReaderPageCache
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
+from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
 from app.services.status_event_bus import build_status_channel_for_user, publish_status_event
 
 try:
@@ -40,13 +41,14 @@ except Exception:  # pragma: no cover
 
 COMPOSE_ENGINE_VERSION = "reader_compose_v1"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v1"
-COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v1"
+COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
+COMPOSE_LAYOUT_SCHEMA_VERSION = "layout_schema_v2"
 
 DEFAULT_QUALITY_TARGET = 0.86
 DEFAULT_LATENCY_BUDGET_MS = 8500
-DEFAULT_MAX_ITERATIONS = 5
-LOW_CONFIDENCE_MAX_ITERATIONS = 7
+DEFAULT_MAX_ITERATIONS = max(6, int(getattr(settings, "literature_agent_max_iterations", 14) or 14))
+LOW_CONFIDENCE_MAX_ITERATIONS = min(24, max(DEFAULT_MAX_ITERATIONS + 4, 12))
 
 REDIS_TTL_SECONDS = 24 * 3600
 LOCK_TTL_SECONDS = 120
@@ -73,6 +75,7 @@ COMPONENT_WHITELIST = {
     "AnswerCard",
     "CompareInsightsCard",
     "PdfSnippetCard",
+    "ContextRail",
 }
 
 _SIDEBAR_TEXT_PATTERNS = (
@@ -84,6 +87,14 @@ _SIDEBAR_TEXT_PATTERNS = (
     "editor:",
     "copyright",
 )
+
+_GENERIC_HEADING_MARKERS = {
+    "research article",
+    "article",
+    "open access",
+    "author summary",
+    "plos digital health",
+}
 
 
 @dataclass
@@ -103,6 +114,7 @@ class LiteratureReaderComposeService:
     def __init__(self) -> None:
         self._redis_client: Any = None
         self._reader_service = get_literature_reader_service()
+        self._mm_layout_service = ReaderMultimodalLayoutService()
 
     async def build_or_get_composed_payload(
         self,
@@ -116,6 +128,7 @@ class LiteratureReaderComposeService:
         regenerate: bool = False,
         latency_budget_ms: Optional[int] = None,
         quality_target: Optional[float] = None,
+        max_iterations: Optional[int] = None,
         style_intent: Optional[str] = None,
         theme_mode: Optional[str] = None,
         detail_level: Optional[str] = None,
@@ -131,9 +144,11 @@ class LiteratureReaderComposeService:
         normalized_detail = self._normalize_detail_level(detail_level)
         use_compare_mode = bool(compare_mode)
         use_citation_tldr = bool(citation_tldr)
+        normalized_max_iterations = self._normalize_max_iterations(max_iterations)
 
         source_signature = await self._build_source_signature(
             db=db,
+            user_id=int(user_id),
             paper=paper,
             selected_kb_id=selected_kb_id,
             style_intent=style_intent,
@@ -141,6 +156,7 @@ class LiteratureReaderComposeService:
             detail_level=normalized_detail,
             compare_mode=use_compare_mode,
             citation_tldr=use_citation_tldr,
+            max_iterations=normalized_max_iterations,
         )
         sig_hash = self._signature_hash(source_signature)
         redis_key = self._cache_key(paper_id=int(paper.id), page=page_num, sig_hash=sig_hash)
@@ -240,6 +256,11 @@ class LiteratureReaderComposeService:
                 prefer_agent=bool(regenerate),
                 publish_ready_event_enabled=False,
             )
+            base_payload = await self._apply_multimodal_layout_assist(
+                paper=paper,
+                page=page_num,
+                base_payload=base_payload,
+            )
 
             loop_result = await self.run_react_compose_loop(
                 paper=paper,
@@ -251,6 +272,7 @@ class LiteratureReaderComposeService:
                 compare_mode=use_compare_mode,
                 quality_target=quality_goal,
                 latency_budget_ms=latency_budget,
+                max_iterations=normalized_max_iterations,
             )
             assets = await self.collect_assets_with_policy(
                 paper=paper,
@@ -279,10 +301,13 @@ class LiteratureReaderComposeService:
                 "iteration_trace": list(loop_result.get("iteration_trace") or []),
                 "asset_policy": {
                     "pdf_first": True,
-                    "web_fallback": True,
+                    "web_fallback": bool(getattr(settings, "reader_external_image_enabled", False)),
                     "max_external_images": 2,
                     "version": COMPOSE_ASSET_POLICY_VERSION,
                 },
+                "layout_channels": dict(base_payload.get("layout_channels") or {}),
+                "mm_assist_meta": dict(base_payload.get("mm_assist_meta") or {}),
+                "toc_quality": float(base_payload.get("toc_quality") or 0.0),
                 "overlay_applied": False,
                 "overlay_count": 0,
                 "generated_at": datetime.utcnow().isoformat(),
@@ -345,14 +370,20 @@ class LiteratureReaderComposeService:
         compare_mode: bool,
         quality_target: float,
         latency_budget_ms: int,
+        max_iterations: Optional[int] = None,
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
         confidence = float(base_payload.get("structure_confidence") or 0.0)
-        max_iterations = (
-            LOW_CONFIDENCE_MAX_ITERATIONS
-            if confidence < 0.68
-            else DEFAULT_MAX_ITERATIONS
+        resolved_max_iterations = (
+            int(max_iterations)
+            if isinstance(max_iterations, int) and max_iterations > 0
+            else (
+                LOW_CONFIDENCE_MAX_ITERATIONS
+                if confidence < 0.68
+                else DEFAULT_MAX_ITERATIONS
+            )
         )
+        resolved_max_iterations = max(1, min(int(resolved_max_iterations), 24))
 
         current_plan = self._build_initial_ui_plan(
             paper=paper,
@@ -369,8 +400,11 @@ class LiteratureReaderComposeService:
         iteration_trace: List[Dict[str, Any]] = []
         degraded = False
         stop_reason = "max_iterations_reached"
+        low_gain_streak = 0
+        previous_overall: Optional[float] = None
 
-        for iteration in range(1, max_iterations + 1):
+        for iteration in range(1, resolved_max_iterations + 1):
+            current_plan = self._sanitize_ui_plan_anchors(current_plan, page=page)
             validation = self.validate_ui_plan(current_plan, page=page)
             quality = self.score_ui_plan(
                 ui_plan=current_plan,
@@ -396,9 +430,22 @@ class LiteratureReaderComposeService:
                 best_plan = current_plan
                 best_quality = quality
 
+            # 中文注释：连续两轮增益小于 0.01 时提前停止，避免无效迭代占用延迟预算。
+            if previous_overall is not None:
+                delta = overall - previous_overall
+                if delta < 0.01:
+                    low_gain_streak += 1
+                else:
+                    low_gain_streak = 0
+            previous_overall = overall
+
             hard_pass = bool(quality.get("hard_constraints_passed"))
             if hard_pass and overall >= quality_target:
                 stop_reason = "quality_threshold_met"
+                break
+
+            if low_gain_streak >= 2:
+                stop_reason = "early_stop_low_gain"
                 break
 
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
@@ -407,7 +454,7 @@ class LiteratureReaderComposeService:
                 stop_reason = "latency_budget_exceeded"
                 break
 
-            if iteration >= max_iterations:
+            if iteration >= resolved_max_iterations:
                 stop_reason = "max_iterations_reached"
                 break
 
@@ -448,6 +495,101 @@ class LiteratureReaderComposeService:
             "stop_reason": stop_reason,
             "build_mode": "compose_agent",
         }
+
+    async def _apply_multimodal_layout_assist(
+        self,
+        *,
+        paper: Paper,
+        page: int,
+        base_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """在文本主链路后，按门控低频调用多模态进行布局裁决。"""
+        payload = json.loads(json.dumps(base_payload, ensure_ascii=False))
+        payload.setdefault("mm_assist_meta", {})
+
+        # 中文注释：只有拿到本地 PDF 才能做“页图+文本块”联合裁决，否则直接降级。
+        path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+            user_id=int(paper.user_id),
+            paper_id=int(paper.id),
+            paper_title=paper.title,
+            paper_pdf_path=paper.pdf_path,
+        )
+        if not path or not os.path.exists(path):
+            payload["mm_assist_meta"] = {
+                "used": False,
+                "degraded": True,
+                "reason": "pdf_missing",
+                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+                "fallback_used": False,
+            }
+            return self._ensure_layout_channels(payload)
+
+        # 中文注释：先走门控，避免高质量页面也触发视觉模型造成额外时延。
+        trigger, trigger_meta = self._mm_layout_service.should_trigger_mm(
+            paper_id=int(paper.id),
+            page=int(page),
+            base_payload=payload,
+            call_count=0,
+        )
+        if not trigger:
+            payload["mm_assist_meta"] = {
+                "used": False,
+                "degraded": False,
+                "reason": str(trigger_meta.get("reason") or "quality_gate_not_hit"),
+                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+                "fallback_used": False,
+            }
+            if "cross_column_merge_ratio" in trigger_meta:
+                payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
+            return self._ensure_layout_channels(payload)
+
+        prompt_payload = await self._mm_layout_service.build_mm_prompt_payload(
+            pdf_path=path,
+            page=int(page),
+            base_payload=payload,
+        )
+        if not isinstance(prompt_payload, dict):
+            payload["mm_assist_meta"] = {
+                "used": False,
+                "degraded": True,
+                "reason": "prompt_payload_build_failed",
+                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+                "fallback_used": False,
+            }
+            return self._ensure_layout_channels(payload)
+
+        # 中文注释：视觉调用策略固定为“主模型失败后单次回退”，保证链路可控。
+        mm_decision, call_meta = await self._mm_layout_service.call_primary_then_fallback(
+            prompt_payload=prompt_payload,
+        )
+        if not isinstance(mm_decision, dict):
+            payload["mm_assist_meta"] = {
+                "used": False,
+                "degraded": True,
+                "reason": str(call_meta.get("error") or "mm_failed"),
+                "model": str(call_meta.get("model") or getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+                "fallback_used": bool(call_meta.get("fallback_used")),
+            }
+            if "cross_column_merge_ratio" in trigger_meta:
+                payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
+            return self._ensure_layout_channels(payload)
+
+        # 中文注释：融合后统一输出三通道，确保正文/侧栏/图注在前端可分域渲染。
+        merged_payload = self._mm_layout_service.merge_mm_decision_into_blocks(
+            base_payload=payload,
+            mm_decision=mm_decision,
+        )
+        self._mm_layout_service.mark_mm_triggered(paper_id=int(paper.id), page=int(page))
+        merged_payload["mm_assist_meta"] = {
+            "used": True,
+            "degraded": False,
+            "reason": "applied",
+            "model": str(call_meta.get("model") or getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+            "fallback_used": bool(call_meta.get("fallback_used")),
+            "trigger_reason": list(trigger_meta.get("trigger_reasons") or []),
+            "prompt_version": str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1")),
+        }
+        return self._ensure_layout_channels(merged_payload)
 
     def validate_ui_plan(self, ui_plan: Dict[str, Any], *, page: int) -> Dict[str, Any]:
         errors: List[str] = []
@@ -568,7 +710,7 @@ class LiteratureReaderComposeService:
         has_header = any(node.get("type") == "PaperHeaderCard" for node in flat_nodes)
         has_body = bool(paragraph_nodes)
         has_toc_or_meta = any(
-            node.get("type") in {"SectionTOC", "MetadataSidebarCard"} for node in flat_nodes
+            node.get("type") in {"SectionTOC", "MetadataSidebarCard", "ContextRail"} for node in flat_nodes
         )
         layout_consistency = 0.0
         if has_header:
@@ -579,16 +721,52 @@ class LiteratureReaderComposeService:
             layout_consistency += 0.33
         layout_consistency = min(1.0, layout_consistency)
 
+        cross_column_merge_ratio = float(
+            base_payload.get("cross_column_merge_ratio")
+            if base_payload.get("cross_column_merge_ratio") is not None
+            else self._estimate_cross_column_merge_ratio(base_payload=base_payload)
+        )
+        expected_sidebar = max(0, len(list(base_payload.get("side_context_blocks") or [])))
+        rendered_sidebar = 0
+        for node in flat_nodes:
+            if str(node.get("type") or "") != "ContextRail":
+                continue
+            items = (node.get("props") or {}).get("items")
+            if isinstance(items, list):
+                rendered_sidebar += len(items)
+        sidebar_recall = 1.0
+        if expected_sidebar > 0:
+            sidebar_recall = rendered_sidebar / max(1, expected_sidebar)
+            sidebar_recall = max(0.0, min(1.0, sidebar_recall))
+
+        toc_quality = float(base_payload.get("toc_quality") or 0.0)
+        toc_hidden = bool(base_payload.get("toc_hidden"))
+        toc_nodes = [node for node in flat_nodes if str(node.get("type") or "") == "SectionTOC"]
+        if toc_nodes:
+            props = toc_nodes[0].get("props") or {}
+            if isinstance(props, dict):
+                try:
+                    toc_quality = float(props.get("toc_quality") or toc_quality)
+                except Exception:
+                    toc_quality = float(base_payload.get("toc_quality") or 0.0)
+                hidden_reason = self._normalize_spaces(str(props.get("hidden_reason") or ""))
+                if hidden_reason:
+                    toc_hidden = True
+
         sidebar_leak = self._detect_sidebar_leak(paragraph_nodes)
         title_integrity = self._check_title_integrity(flat_nodes, base_payload)
         anchors_valid = not any("anchor" in str(item).lower() for item in validation_errors)
-        hard_constraints_passed = bool(title_integrity and not sidebar_leak and anchors_valid)
+        toc_passed = bool(toc_hidden or toc_quality >= 0.55)
+        hard_constraints_passed = bool(title_integrity and not sidebar_leak and anchors_valid and toc_passed)
 
+        # 中文注释：总分在原四项基础上加入“跨栏拼接率/侧栏召回率”，避免只看文本流畅度。
         overall = (
-            0.45 * structure_fidelity
-            + 0.25 * readability
-            + 0.20 * evidence_alignment
-            + 0.10 * layout_consistency
+            0.42 * structure_fidelity
+            + 0.23 * readability
+            + 0.18 * evidence_alignment
+            + 0.09 * layout_consistency
+            + 0.04 * (1.0 - max(0.0, min(1.0, cross_column_merge_ratio)))
+            + 0.04 * sidebar_recall
         )
         deductions: List[Dict[str, Any]] = []
         if validation_errors:
@@ -619,6 +797,33 @@ class LiteratureReaderComposeService:
                 }
             )
             overall -= 0.2
+        if cross_column_merge_ratio > 0.08:
+            deductions.append(
+                {
+                    "item": "cross_column_merge",
+                    "penalty": 0.12,
+                    "reason": "疑似跨栏正文拼接",
+                }
+            )
+            overall -= 0.12
+        if sidebar_recall < 0.6:
+            deductions.append(
+                {
+                    "item": "sidebar_recall",
+                    "penalty": 0.1,
+                    "reason": "侧栏保留率过低",
+                }
+            )
+            overall -= 0.1
+        if not toc_passed:
+            deductions.append(
+                {
+                    "item": "toc_quality",
+                    "penalty": 0.08,
+                    "reason": "目录质量不足且未隐藏",
+                }
+            )
+            overall -= 0.08
         overall = max(0.0, min(1.0, overall))
 
         fix_suggestions: List[str] = []
@@ -632,6 +837,14 @@ class LiteratureReaderComposeService:
             fix_suggestions.append("执行断词修复与段落分句优化，降低长段落密度。")
         if evidence_alignment < 0.8:
             fix_suggestions.append("补充 DOI/URL 对应证据锚点，提升证据对齐度。")
+        if cross_column_merge_ratio > 0.08:
+            fix_suggestions.append("加强双栏行级分流，降低跨栏拼接比例。")
+        if sidebar_recall < 0.6:
+            fix_suggestions.append("保留并渲染侧栏信息至 ContextRail，而非删除。")
+        if not toc_passed:
+            fix_suggestions.append("仅保留高置信标题生成目录，低质目录直接隐藏。")
+
+        mm_meta = dict(base_payload.get("mm_assist_meta") or {})
 
         return {
             "overall": round(overall, 4),
@@ -639,10 +852,16 @@ class LiteratureReaderComposeService:
             "readability": round(readability, 4),
             "evidence_alignment": round(evidence_alignment, 4),
             "layout_consistency": round(layout_consistency, 4),
+            "cross_column_merge_ratio": round(max(0.0, min(1.0, cross_column_merge_ratio)), 4),
+            "sidebar_recall": round(max(0.0, min(1.0, sidebar_recall)), 4),
+            "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
             "hard_constraints_passed": hard_constraints_passed,
             "sidebar_leak_detected": sidebar_leak,
             "title_integrity_ok": title_integrity,
             "anchors_valid": anchors_valid,
+            "mm_assist_used": bool(mm_meta.get("used")),
+            "mm_model": str(mm_meta.get("model") or ""),
+            "mm_fallback_used": bool(mm_meta.get("fallback_used")),
             "validation_errors": list(validation_errors),
             "quality_target": quality_target,
             "deductions": deductions,
@@ -660,6 +879,8 @@ class LiteratureReaderComposeService:
     ) -> List[Dict[str, Any]]:
         base_assets = list(base_payload.get("assets") or [])
         dedup: Dict[str, Dict[str, Any]] = {}
+        # 中文注释：非多模态部署默认关闭外网补图，仅保留 PDF 与文本来源资产。
+        allow_external_images = bool(getattr(settings, "reader_external_image_enabled", False))
 
         def _asset_key(item: Dict[str, Any]) -> str:
             kind = str(item.get("kind") or "")
@@ -673,7 +894,7 @@ class LiteratureReaderComposeService:
             dedup[_asset_key(item)] = dict(item)
 
         has_pdf_image = any(str(item.get("kind") or "") == "image_hint" for item in dedup.values())
-        if not has_pdf_image:
+        if allow_external_images and not has_pdf_image:
             query = self._build_external_image_query(
                 paper=paper,
                 ui_plan=ui_plan,
@@ -758,6 +979,7 @@ class LiteratureReaderComposeService:
         style_intent: Optional[str] = None,
         latency_budget_ms: Optional[int] = None,
         quality_target: Optional[float] = None,
+        max_iterations: Optional[int] = None,
         theme_mode: Optional[str] = None,
         detail_level: Optional[str] = None,
         compare_mode: Optional[bool] = None,
@@ -775,6 +997,7 @@ class LiteratureReaderComposeService:
                     style_intent=style_intent,
                     latency_budget_ms=latency_budget_ms,
                     quality_target=quality_target,
+                    max_iterations=max_iterations,
                     theme_mode=theme_mode,
                     detail_level=detail_level,
                     compare_mode=compare_mode,
@@ -822,10 +1045,29 @@ class LiteratureReaderComposeService:
         compare_mode: bool,
     ) -> Dict[str, Any]:
         sections = list(base_payload.get("sections") or [])
-        blocks = list(base_payload.get("blocks") or [])
+        blocks = self._normalize_blocks_for_render(
+            blocks=list(base_payload.get("blocks") or []),
+            page=page,
+        )
+        side_context_blocks = self._normalize_blocks_for_render(
+            blocks=list(base_payload.get("side_context_blocks") or []),
+            page=page,
+        )
+        figure_meta_blocks = self._normalize_blocks_for_render(
+            blocks=list(base_payload.get("figure_meta_blocks") or []),
+            page=page,
+        )
+        if not figure_meta_blocks:
+            figure_meta_blocks = [
+                item for item in blocks if str(item.get("zone_type") or "") == "figure_meta"
+            ]
+        main_blocks = [
+            item for item in blocks if str(item.get("zone_type") or "main_body") == "main_body"
+        ]
         assets = list(base_payload.get("assets") or [])
         summary = str(base_payload.get("summary") or "").strip()
         style_cues = dict(base_payload.get("style_cues") or {})
+        toc_quality = float(base_payload.get("toc_quality") or 0.0)
 
         components: List[Dict[str, Any]] = []
         cid = 0
@@ -836,24 +1078,21 @@ class LiteratureReaderComposeService:
             return f"{prefix}_{cid}"
 
         def wrap_anchor(anchor: Any, quote_text: str = "") -> List[Dict[str, Any]]:
-            if not isinstance(anchor, dict):
+            normalized = self._normalize_anchor_ref(
+                anchor=anchor,
+                page=page,
+                quote_text=quote_text,
+            )
+            if not normalized:
                 return []
             try:
-                bbox_hint = self._build_bbox_hint(
+                normalized["bbox_hint"] = self._build_bbox_hint(
                     style_cues=style_cues,
                     quote_text=quote_text,
                 )
-                return [
-                    {
-                        "page": int(anchor.get("page") or page),
-                        "start_char": int(anchor.get("start_char") or 0),
-                        "end_char": int(anchor.get("end_char") or 1),
-                        "quote_text": quote_text[:280] if quote_text else None,
-                        "bbox_hint": bbox_hint,
-                    }
-                ]
             except Exception:
-                return []
+                normalized["bbox_hint"] = None
+            return [normalized]
 
         components.append(
             {
@@ -903,21 +1142,42 @@ class LiteratureReaderComposeService:
         )
 
         toc_items = []
-        for item in sections:
-            title = str(item.get("title") or "").strip()
-            if not title:
-                continue
-            toc_items.append(
-                {
-                    "title": title,
-                    "anchor": wrap_anchor(item.get("source_anchor"), quote_text=title),
-                }
-            )
+        toc_candidates = list(base_payload.get("toc_candidates") or [])
+        if toc_candidates:
+            for item in toc_candidates:
+                if not isinstance(item, dict):
+                    continue
+                title = self._normalize_spaces(str(item.get("title") or ""))
+                if not title:
+                    continue
+                toc_items.append(
+                    {
+                        "title": title,
+                        "anchor": wrap_anchor(item.get("source_anchor"), quote_text=title),
+                    }
+                )
+        else:
+            for item in sections:
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                toc_items.append(
+                    {
+                        "title": title,
+                        "anchor": wrap_anchor(item.get("source_anchor"), quote_text=title),
+                    }
+                )
+
+        toc_hidden = bool(base_payload.get("toc_hidden")) or toc_quality < 0.55
         components.append(
             {
                 "id": next_id("toc"),
                 "type": "SectionTOC",
-                "props": {"items": toc_items[:24]},
+                "props": {
+                    "items": toc_items[:24] if not toc_hidden else [],
+                    "hidden_reason": "本页目录质量不足，已隐藏。" if toc_hidden else "",
+                    "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
+                },
                 "children": [],
                 "source_anchor_refs": [],
                 "capabilities": ["jump_anchor"],
@@ -926,8 +1186,43 @@ class LiteratureReaderComposeService:
             }
         )
 
+        if side_context_blocks:
+            side_items = []
+            for row in side_context_blocks[:22]:
+                if not isinstance(row, dict):
+                    continue
+                text = self._normalize_spaces(str(row.get("text") or ""))
+                if not text:
+                    continue
+                side_items.append(
+                    {
+                        "text": text,
+                        "anchor": wrap_anchor(row.get("source_anchor"), quote_text=text),
+                        "column_id": str(row.get("column_id") or "sidebar"),
+                    }
+                )
+            if side_items:
+                components.append(
+                    {
+                        "id": next_id("context_rail"),
+                        "type": "ContextRail",
+                        "props": {
+                            "title": "侧栏信息",
+                            "items": side_items,
+                            "default_collapsed": True,
+                        },
+                        "children": [],
+                        "source_anchor_refs": [],
+                        "zone_type": "side_context",
+                        "column_id": "sidebar",
+                        "capabilities": ["jump_anchor", "copy", "drag_markdown"],
+                        "actions": [],
+                        "layout_slot": {"reserved_height": 180, "lock_height": True},
+                    }
+                )
+
         if summary:
-            summary_parts = [item.strip() for item in re.split(r"[。.!?；;]\s*", summary) if item.strip()]
+            summary_parts = [item.strip() for item in re.split(r"[。！？!?;；]\s*", summary) if item.strip()]
             if detail_level == "concise":
                 summary_parts = summary_parts[:3]
             elif detail_level == "deep":
@@ -1002,12 +1297,10 @@ class LiteratureReaderComposeService:
                 }
             )
 
-        for block in blocks:
+        for block in main_blocks:
             kind = str(block.get("kind") or "")
             text = self._normalize_spaces(str(block.get("text") or ""))
             if not text:
-                continue
-            if self._looks_like_sidebar_text(text):
                 continue
             anchor_refs = wrap_anchor(block.get("source_anchor"), quote_text=text)
             if kind == "heading":
@@ -1021,6 +1314,9 @@ class LiteratureReaderComposeService:
                         },
                         "children": [],
                         "source_anchor_refs": anchor_refs,
+                        "zone_type": "main_body",
+                        "column_id": str(block.get("column_id") or "main"),
+                        "heading_prob": float(block.get("heading_prob") or 0.0),
                         "capabilities": ["jump_anchor", "copy"],
                         "actions": [],
                         "layout_slot": {"reserved_height": 86, "lock_height": True},
@@ -1034,6 +1330,8 @@ class LiteratureReaderComposeService:
                         "props": {"items": [text]},
                         "children": [],
                         "source_anchor_refs": anchor_refs,
+                        "zone_type": "main_body",
+                        "column_id": str(block.get("column_id") or "main"),
                         "capabilities": ["copy", "drag_markdown"],
                         "actions": [],
                         "layout_slot": {"reserved_height": 130, "lock_height": False},
@@ -1066,6 +1364,8 @@ class LiteratureReaderComposeService:
                         "props": {"text": text},
                         "children": [],
                         "source_anchor_refs": anchor_refs,
+                        "zone_type": "main_body",
+                        "column_id": str(block.get("column_id") or "main"),
                         "capabilities": ["copy", "drag_markdown", "inline_query", "jump_anchor"],
                         "actions": [
                             {"key": "regenerate", "label": "修复", "kind": "default", "payload": {}},
@@ -1080,16 +1380,51 @@ class LiteratureReaderComposeService:
                         "id": next_id("inline_slot"),
                         "type": "InlineQuerySlot",
                         "props": {
-                            "placeholder": "在此提问（仅针对当前段落/章节）",
+                            "placeholder": "在这里提问（仅针对当前段落/章节）",
                             "target_node_ref": str(components[-1]["id"]),
                         },
                         "children": [],
                         "source_anchor_refs": anchor_refs,
+                        "zone_type": "main_body",
+                        "column_id": str(block.get("column_id") or "main"),
                         "capabilities": ["inline_query"],
                         "actions": [],
                         "layout_slot": {"reserved_height": 68, "lock_height": True},
                     }
                 )
+
+        seen_figure_keys: set[str] = set()
+        for block in figure_meta_blocks:
+            if not isinstance(block, dict):
+                continue
+            text = self._normalize_spaces(str(block.get("text") or ""))
+            if not text:
+                continue
+            text_key = re.sub(r"\s+", "", text.lower())[:120]
+            if text_key in seen_figure_keys:
+                continue
+            seen_figure_keys.add(text_key)
+            anchor_refs = wrap_anchor(block.get("source_anchor"), quote_text=text)
+            components.append(
+                {
+                    "id": next_id("figure"),
+                    "type": "FigurePanel",
+                    "props": {
+                        "caption": text,
+                        "image_url": None,
+                        "ai_insight": self._build_caption_insight(text),
+                    },
+                    "children": [],
+                    "source_anchor_refs": anchor_refs,
+                    "zone_type": "figure_meta",
+                    "column_id": str(block.get("column_id") or "main"),
+                    "capabilities": ["copy", "drag_markdown", "jump_anchor"],
+                    "actions": [
+                        {"key": "copy_markdown", "label": "复制Markdown", "kind": "default", "payload": {}},
+                    ],
+                    "layout_slot": {"reserved_height": 260, "lock_height": True},
+                }
+            )
 
         if compare_mode:
             components.append(
@@ -1139,8 +1474,11 @@ class LiteratureReaderComposeService:
                 "theme_mode": str(theme_mode or "light"),
                 "detail_level": str(detail_level),
                 "compare_mode": bool(compare_mode),
+                "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
+                "toc_hidden": bool(toc_hidden),
                 "generator": COMPOSE_ENGINE_VERSION,
                 "schema_version": COMPOSE_COMPONENT_SCHEMA_VERSION,
+                "layout_schema_version": COMPOSE_LAYOUT_SCHEMA_VERSION,
                 "tool_call_trace": [],
             },
         }
@@ -1175,7 +1513,7 @@ class LiteratureReaderComposeService:
                     node["props"] = props
             patched.append(node)
 
-        # 中文注释：当标题组件缺失时，从 sections 中补齐至少一个。
+        # 中文注释：当标题组件缺失时，从 sections 补齐至少一个。
         has_heading = any(str(item.get("type") or "") == "SectionHeading" for item in patched)
         if not has_heading:
             sections = list(base_payload.get("sections") or [])
@@ -1183,6 +1521,11 @@ class LiteratureReaderComposeService:
                 title = self._normalize_spaces(str(section.get("title") or ""))
                 if not title or title.lower() == "body":
                     continue
+                recovered_anchor = self._normalize_anchor_ref(
+                    anchor=section.get("source_anchor"),
+                    page=int(section.get("page") or 0) or int((section.get("source_anchor") or {}).get("page") or 0) or 1,
+                    quote_text=title,
+                )
                 patched.insert(
                     3,
                     {
@@ -1190,7 +1533,7 @@ class LiteratureReaderComposeService:
                         "type": "SectionHeading",
                         "props": {"text": title, "level": int(section.get("level") or 1)},
                         "children": [],
-                        "source_anchor_refs": [section.get("source_anchor")] if isinstance(section.get("source_anchor"), dict) else [],
+                        "source_anchor_refs": [recovered_anchor] if recovered_anchor else [],
                     },
                 )
                 break
@@ -1298,8 +1641,10 @@ class LiteratureReaderComposeService:
         scope: str = "section",
         selected_kb_id: Optional[int] = None,
         style_intent: Optional[str] = None,
+        theme_mode: Optional[str] = None,
         detail_level: Optional[str] = None,
         compare_mode: Optional[bool] = None,
+        citation_tldr: Optional[bool] = None,
     ) -> Dict[str, Any]:
         payload, _ = await self.build_or_get_composed_payload(
             db=db,
@@ -1310,8 +1655,10 @@ class LiteratureReaderComposeService:
             force_refresh=False,
             regenerate=False,
             style_intent=style_intent,
+            theme_mode=theme_mode,
             detail_level=detail_level,
             compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
             publish_ready_event_enabled=False,
         )
 
@@ -1320,8 +1667,22 @@ class LiteratureReaderComposeService:
         if node is None:
             raise ValueError(f"node not found: {node_id}")
 
-        anchor_refs = list(node.get("source_anchor_refs") or [])
-        context_text = self._extract_node_text(node)
+        target_node = self._resolve_inline_query_target_node(
+            query_node=node,
+            components=components,
+        )
+        anchor_refs = self._resolve_inline_query_anchors(
+            query_node=node,
+            target_node=target_node,
+            components=components,
+            page=int(page),
+        )
+        context_text = self._build_inline_query_context(
+            query_node=node,
+            target_node=target_node,
+            components=components,
+            page=int(page),
+        )
         answer = await self._generate_inline_answer(
             question=question,
             context_text=context_text,
@@ -1367,10 +1728,12 @@ class LiteratureReaderComposeService:
         compact_question = self._normalize_spaces(question)
         compact_context = self._normalize_spaces(context_text)
         if not compact_context:
-            compact_context = "当前节点缺少可提取正文，请切换 PDF 模式查看原文。"
+            compact_context = "当前节点缺少可提取正文，请先定位到证据后再提问。"
         prompt = (
             "你是论文阅读助手。请只基于给定上下文回答，不要编造。\n"
-            "输出中文，先给结论，再给一句证据说明。\n"
+            "当前模型为文本模式，不具备图像理解能力；不得基于图片内容做推断。\n"
+            "输出中文，格式固定为两句：第一句“结论：...”，第二句“证据：...”。\n"
+            "若上下文不足，明确写“结论：当前证据不足以回答”。\n"
             f"问题：{compact_question}\n"
             f"范围：{scope}\n"
             f"上下文：{compact_context[:2200]}"
@@ -1387,7 +1750,10 @@ class LiteratureReaderComposeService:
                 return content
         except Exception as exc:
             logger.debug(f"[ReaderComposeService] inline answer generation failed: {exc}")
-        return f"结论：基于当前段落信息，{compact_question} 的关键依据在该段原文中。证据说明：请点击“定位到证据”查看对应锚点。"
+        return (
+            f"结论：暂时无法从当前上下文完整回答“{compact_question}”。"
+            "证据：请先点击“定位到证据”核对原文后再追问。"
+        )
 
     async def _apply_overlay_for_user(
         self,
@@ -1569,7 +1935,7 @@ class LiteratureReaderComposeService:
         elif node_type in {"FigurePanel", "TablePanel"}:
             insight = self._normalize_spaces(str(props.get("ai_insight") or ""))
             if not insight:
-                props["ai_insight"] = "该图表用于支撑本页关键结论，建议结合原文锚点进行核对。"
+                props["ai_insight"] = "该图表用于支撑本页关键结论，建议结合原文锚点核对。"
         regenerated["props"] = props
         return regenerated
 
@@ -1592,10 +1958,135 @@ class LiteratureReaderComposeService:
                         text_parts.append(value)
         return " ".join(text_parts).strip()
 
+    def _resolve_inline_query_target_node(
+        self,
+        *,
+        query_node: Dict[str, Any],
+        components: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        node_type = str(query_node.get("type") or "")
+        if node_type != "InlineQuerySlot":
+            return query_node
+        target_ref = str(((query_node.get("props") or {}).get("target_node_ref") or "")).strip()
+        if target_ref:
+            target_node = self._find_component_node(components, target_ref)
+            if isinstance(target_node, dict):
+                return target_node
+        return query_node
+
+    def _resolve_inline_query_anchors(
+        self,
+        *,
+        query_node: Dict[str, Any],
+        target_node: Dict[str, Any],
+        components: Sequence[Dict[str, Any]],
+        page: int,
+    ) -> List[Dict[str, Any]]:
+        target_anchors = list(target_node.get("source_anchor_refs") or [])
+        query_anchors = list(query_node.get("source_anchor_refs") or [])
+        selected = target_anchors or query_anchors
+        if selected:
+            normalized: List[Dict[str, Any]] = []
+            for row in selected:
+                normalized_row = self._normalize_anchor_ref(
+                    anchor=row,
+                    page=page,
+                    quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                )
+                if normalized_row:
+                    normalized.append(normalized_row)
+            if normalized:
+                return normalized[:3]
+
+        # 中文注释：若当前节点没有锚点，则退化为邻近正文节点锚点，保证问答可追溯。
+        flat_nodes = self._flatten_components(components)
+        target_id = str(target_node.get("id") or "")
+        anchor_candidates: List[Dict[str, Any]] = []
+        index_map = {str(item.get("id") or ""): idx for idx, item in enumerate(flat_nodes)}
+        center = index_map.get(target_id, 0)
+        for offset in (0, -1, 1, -2, 2, -3, 3):
+            idx = center + offset
+            if idx < 0 or idx >= len(flat_nodes):
+                continue
+            candidate = flat_nodes[idx]
+            refs = list(candidate.get("source_anchor_refs") or [])
+            for row in refs:
+                normalized_row = self._normalize_anchor_ref(
+                    anchor=row,
+                    page=page,
+                    quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                )
+                if normalized_row:
+                    anchor_candidates.append(normalized_row)
+            if anchor_candidates:
+                break
+        return anchor_candidates[:3]
+
+    def _build_inline_query_context(
+        self,
+        *,
+        query_node: Dict[str, Any],
+        target_node: Dict[str, Any],
+        components: Sequence[Dict[str, Any]],
+        page: int,
+    ) -> str:
+        flat_nodes = self._flatten_components(components)
+        node_id = str(target_node.get("id") or query_node.get("id") or "")
+        index_map = {str(item.get("id") or ""): idx for idx, item in enumerate(flat_nodes)}
+        center = index_map.get(node_id, 0)
+
+        heading_text = ""
+        for idx in range(center, -1, -1):
+            node = flat_nodes[idx]
+            if str(node.get("type") or "") == "SectionHeading":
+                heading_text = self._extract_node_text(node)
+                if heading_text:
+                    break
+
+        context_parts: List[str] = []
+        if heading_text:
+            context_parts.append(f"当前章节：{heading_text}")
+
+        target_text = self._extract_node_text(target_node)
+        if target_text:
+            context_parts.append(f"当前节点：{target_text}")
+
+        nearby_snippets: List[str] = []
+        for idx in range(max(0, center - 2), min(len(flat_nodes), center + 3)):
+            if idx == center:
+                continue
+            node = flat_nodes[idx]
+            node_type = str(node.get("type") or "")
+            if node_type not in {"ParagraphProse", "ListBlock", "SectionHeading"}:
+                continue
+            snippet = self._extract_node_text(node)
+            if snippet:
+                nearby_snippets.append(snippet)
+        if nearby_snippets:
+            context_parts.append(f"相邻上下文：{' '.join(nearby_snippets[:3])}")
+
+        anchors = self._resolve_inline_query_anchors(
+            query_node=query_node,
+            target_node=target_node,
+            components=components,
+            page=page,
+        )
+        anchor_quotes = [
+            self._normalize_spaces(str(item.get("quote_text") or ""))
+            for item in anchors
+            if isinstance(item, dict)
+        ]
+        anchor_quotes = [item for item in anchor_quotes if item]
+        if anchor_quotes:
+            context_parts.append(f"证据片段：{' '.join(anchor_quotes[:2])}")
+
+        return self._normalize_spaces("\n".join(context_parts))
+
     async def _build_source_signature(
         self,
         *,
         db: AsyncSession,
+        user_id: int,
         paper: Paper,
         selected_kb_id: Optional[int],
         style_intent: Optional[str],
@@ -1603,40 +2094,98 @@ class LiteratureReaderComposeService:
         detail_level: str,
         compare_mode: bool,
         citation_tldr: bool,
+        max_iterations: Optional[int],
     ) -> str:
+        normalized_style_intent = self._normalize_style_intent(style_intent)
         path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
             user_id=int(paper.user_id),
             paper_id=int(paper.id),
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
-        stat_part = "pdf:none"
+        pdf_sig: Dict[str, Any] = {"path_hash": "none", "mtime": 0, "size": 0}
         if path and os.path.exists(path):
             st = os.stat(path)
-            stat_part = f"pdf:{path}|mtime:{int(st.st_mtime)}|size:{int(st.st_size)}"
+            pdf_sig = {
+                "path_hash": hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:16],
+                "mtime": int(st.st_mtime),
+                "size": int(st.st_size),
+            }
 
-        kb_part = "kb:none"
+        kb_sig: Dict[str, Any] = {"id": 0, "doc_updated": "none"}
         kb_id = int(selected_kb_id) if selected_kb_id else 0
         if kb_id > 0:
-            max_doc_updated = (
+            # 中文注释：签名中的知识库信息必须限制在当前用户可见范围，避免跨租户信息侧漏。
+            owned_kb_id = (
                 await db.execute(
-                    select(func.max(Document.updated_at)).where(
-                        Document.knowledge_base_id == kb_id
+                    select(KnowledgeBase.id).where(
+                        and_(
+                            KnowledgeBase.id == kb_id,
+                            KnowledgeBase.user_id == int(user_id),
+                        )
                     )
                 )
             ).scalar_one_or_none()
-            kb_part = f"kb:{kb_id}|doc_updated:{max_doc_updated.isoformat() if max_doc_updated else 'none'}"
+            if owned_kb_id:
+                max_doc_updated = (
+                    await db.execute(
+                        select(func.max(Document.updated_at))
+                        .select_from(Document)
+                        .where(Document.knowledge_base_id == int(owned_kb_id))
+                    )
+                ).scalar_one_or_none()
+                kb_sig = {
+                    "id": int(owned_kb_id),
+                    "doc_updated": max_doc_updated.isoformat() if max_doc_updated else "none",
+                }
 
-        style_part = self._normalize_spaces(str(style_intent or "auto"))
         theme_part = self._normalize_spaces(str(theme_mode or "light"))
         detail_part = self._normalize_spaces(str(detail_level or "standard"))
-        signature = (
-            f"{stat_part}|engine:{COMPOSE_ENGINE_VERSION}|component:{COMPOSE_COMPONENT_SCHEMA_VERSION}|"
-            f"prompt:{COMPOSE_AGENT_PROMPT_VERSION}|asset:{COMPOSE_ASSET_POLICY_VERSION}|"
-            f"{kb_part}|style:{style_part}|theme:{theme_part}|detail:{detail_part}|"
-            f"compare:{int(bool(compare_mode))}|cite_tldr:{int(bool(citation_tldr))}"
+        iteration_part = int(max_iterations) if isinstance(max_iterations, int) and max_iterations > 0 else DEFAULT_MAX_ITERATIONS
+        mm_enabled = bool(
+            getattr(settings, "reader_mm_assist_enabled", False)
+            or getattr(settings, "reader_multimodal_enabled", False)
         )
-        return signature[:240]
+        mm_primary = str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash") or "qwen3.5-flash")
+        mm_fallback = str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-flash") or "qwen3-vl-flash")
+        mm_prompt_version = str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1") or "mm_layout_v1")
+        layout_schema_version = str(
+            getattr(settings, "reader_mm_layout_schema_version", COMPOSE_LAYOUT_SCHEMA_VERSION)
+            or COMPOSE_LAYOUT_SCHEMA_VERSION
+        )
+
+        signature_payload = {
+            "engine": COMPOSE_ENGINE_VERSION,
+            "component": COMPOSE_COMPONENT_SCHEMA_VERSION,
+            "prompt": COMPOSE_AGENT_PROMPT_VERSION,
+            "asset": COMPOSE_ASSET_POLICY_VERSION,
+            "layout_schema": layout_schema_version,
+            "paper_id": int(paper.id),
+            "pdf": pdf_sig,
+            "kb": kb_sig,
+            "mode": {
+                "style": normalized_style_intent,
+                "theme": theme_part,
+                "detail": detail_part,
+                "compare": int(bool(compare_mode)),
+                "cite_tldr": int(bool(citation_tldr)),
+                "iter": int(iteration_part),
+                "mm": int(mm_enabled),
+                "mm_primary": mm_primary,
+                "mm_fallback": mm_fallback,
+                "mm_prompt": mm_prompt_version,
+                "extimg": int(bool(getattr(settings, "reader_external_image_enabled", False))),
+            },
+        }
+        packed = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(packed.encode("utf-8")).hexdigest()
+        signature = (
+            f"compose_v2|p:{int(paper.id)}|kb:{int(kb_sig.get('id') or 0)}|"
+            f"m:{int(pdf_sig.get('mtime') or 0)}|s:{int(pdf_sig.get('size') or 0)}|"
+            f"mode:{normalized_style_intent}/{theme_part}/{detail_part}/{int(bool(compare_mode))}/{int(bool(citation_tldr))}|"
+            f"h:{digest[:24]}"
+        )
+        return signature[:255]
 
     @staticmethod
     def _build_style_tokens(
@@ -1645,9 +2194,7 @@ class LiteratureReaderComposeService:
         theme_mode: Optional[str],
         detail_level: str,
     ) -> Dict[str, Any]:
-        style = str(style_intent or "journal").strip().lower()
-        if style not in {"journal", "clinical", "preprint", "auto"}:
-            style = "auto"
+        style = LiteratureReaderComposeService._normalize_style_intent(style_intent)
         theme = str(theme_mode or "light").strip().lower()
         if theme not in {"light", "dark"}:
             theme = "light"
@@ -1660,6 +2207,20 @@ class LiteratureReaderComposeService:
             "body_font_size": 18 if style in {"journal", "auto"} else 17,
             "panel_contrast": 0.9 if theme == "light" else 1.05,
         }
+
+    @staticmethod
+    def _normalize_style_intent(raw: Optional[str]) -> str:
+        value = str(raw or "auto").strip().lower()
+        alias_map = {
+            "journal_classic": "journal",
+            "clinical_brief": "clinical",
+            "preprint_modern": "preprint",
+            "journal": "journal",
+            "clinical": "clinical",
+            "preprint": "preprint",
+            "auto": "auto",
+        }
+        return alias_map.get(value, "auto")
 
     def _build_external_image_query(
         self,
@@ -1722,7 +2283,7 @@ class LiteratureReaderComposeService:
         text = str(caption or "").strip()
         if not text:
             return "该图表用于补充论文当前页面的关键论点。"
-        return f"AI解读：该图注强调“{text[:80]}”，建议结合对应证据锚点核对结论。"
+        return f"AI 解读：该图注强调“{text[:80]}”，建议结合对应证据锚点核对结论。"
 
     @staticmethod
     def _build_compare_insights_stub(summary: str) -> List[Dict[str, str]]:
@@ -1742,7 +2303,7 @@ class LiteratureReaderComposeService:
         normalized_href = str(href or "").strip().lower()
         normalized_label = str(label or "").strip()
         paper_doi = str(paper.doi or "").strip().lower()
-        # 仅在 DOI 非空时再做子串匹配，避免空字符串导致所有链接都被误判为 DOI。
+        # 中文注释：仅在 DOI 非空时再做子串匹配，避免空字符串导致全部链接被识别成 DOI。
         if "doi.org" in normalized_href or (paper_doi and paper_doi in normalized_href):
             return "TL;DR：该链接是论文正式标识入口，可用于快速核对题目、期刊与年份信息。"
         if "arxiv.org" in normalized_href:
@@ -1807,6 +2368,212 @@ class LiteratureReaderComposeService:
             return []
         return candidates
 
+    def _sanitize_ui_plan_anchors(self, ui_plan: Dict[str, Any], *, page: int) -> Dict[str, Any]:
+        """中文注释：统一修复组件树的字段与锚点，降低 schema 校验错误率。"""
+        cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
+        seen_ids: set[str] = set()
+        auto_seq = 0
+
+        def _next_id(node_type: str) -> str:
+            nonlocal auto_seq
+            auto_seq += 1
+            prefix = re.sub(r"[^a-z0-9]+", "_", str(node_type or "node").strip().lower()).strip("_") or "node"
+            return f"{prefix}_{auto_seq}"
+
+        def _walk(nodes: Any) -> None:
+            if not isinstance(nodes, list):
+                return
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+
+                node_type = str(node.get("type") or "").strip()
+                if node_type not in COMPONENT_WHITELIST:
+                    node_type = "ParagraphProse"
+                    node["type"] = node_type
+                    raw_props = node.get("props") if isinstance(node.get("props"), dict) else {}
+                    text = self._normalize_spaces(str(raw_props.get("text") or "")) if isinstance(raw_props, dict) else ""
+                    node["props"] = {"text": text or "内容待修复"}
+                    node["children"] = []
+
+                node_id = str(node.get("id") or "").strip()
+                if not node_id or node_id in seen_ids:
+                    node_id = _next_id(node_type)
+                node["id"] = node_id
+                seen_ids.add(node_id)
+
+                if not isinstance(node.get("props"), dict):
+                    node["props"] = {}
+                if not isinstance(node.get("children"), list):
+                    node["children"] = []
+
+                anchors = node.get("source_anchor_refs")
+                if isinstance(anchors, list):
+                    normalized_rows: List[Dict[str, Any]] = []
+                    for row in anchors:
+                        normalized = self._normalize_anchor_ref(
+                            anchor=row,
+                            page=page,
+                            quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                        )
+                        if normalized:
+                            bbox_hint = (row or {}).get("bbox_hint") if isinstance(row, dict) else None
+                            if isinstance(bbox_hint, dict):
+                                normalized["bbox_hint"] = bbox_hint
+                            normalized_rows.append(normalized)
+                    node["source_anchor_refs"] = normalized_rows
+                else:
+                    node["source_anchor_refs"] = []
+
+                _walk(node.get("children"))
+
+        _walk(cloned.get("components"))
+        return cloned
+
+    def _normalize_anchor_ref(
+        self,
+        *,
+        anchor: Any,
+        page: int,
+        quote_text: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(anchor, dict):
+            return None
+        # 中文注释：composed 按页构建，锚点页号强制与当前页一致，避免跨页锚点污染评分与定位。
+        page_no = int(page)
+        start_char = int(anchor.get("start_char") or 0)
+        if start_char < 0:
+            start_char = 0
+        end_char = int(anchor.get("end_char") or 0)
+        normalized_quote = self._normalize_spaces(str(quote_text or anchor.get("quote_text") or ""))
+        fallback_span = max(1, min(3200, len(normalized_quote) or 120))
+        if end_char <= start_char:
+            end_char = start_char + fallback_span
+        if end_char - start_char > 12000:
+            end_char = start_char + 12000
+        return {
+            "page": page_no,
+            "start_char": start_char,
+            "end_char": end_char,
+            "quote_text": normalized_quote[:280] if normalized_quote else None,
+        }
+
+    def _ensure_layout_channels(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """补齐三通道字段，保证后续渲染链路稳定。"""
+        cloned = dict(payload)
+        blocks = list(cloned.get("blocks") or [])
+        side_context_blocks = list(cloned.get("side_context_blocks") or [])
+        figure_meta_blocks = list(cloned.get("figure_meta_blocks") or [])
+
+        if not side_context_blocks:
+            side_context_blocks = [
+                item for item in blocks if str((item or {}).get("zone_type") or "") == "side_context"
+            ]
+        if not figure_meta_blocks:
+            figure_meta_blocks = [
+                item for item in blocks if str((item or {}).get("zone_type") or "") == "figure_meta"
+            ]
+
+        cloned["side_context_blocks"] = side_context_blocks
+        cloned["figure_meta_blocks"] = figure_meta_blocks
+        cloned["layout_channels"] = dict(
+            cloned.get("layout_channels")
+            or {
+                "main_body": [
+                    str(item.get("id") or "")
+                    for item in blocks
+                    if str(item.get("zone_type") or "main_body") == "main_body"
+                ],
+                "side_context": [str(item.get("id") or "") for item in side_context_blocks if item.get("id")],
+                "figure_meta": [str(item.get("id") or "") for item in figure_meta_blocks if item.get("id")],
+            }
+        )
+        if "toc_quality" not in cloned:
+            heading_blocks = [item for item in blocks if str(item.get("kind") or "") == "heading"]
+            high_conf = [
+                item for item in heading_blocks
+                if float(item.get("heading_prob") or 0.0) >= 0.72
+            ]
+            cloned["toc_quality"] = round(len(high_conf) / max(1, len(heading_blocks)), 4) if heading_blocks else 0.0
+        if "toc_hidden" not in cloned:
+            cloned["toc_hidden"] = bool(float(cloned.get("toc_quality") or 0.0) < 0.55)
+        return cloned
+
+    def _normalize_blocks_for_render(
+        self,
+        *,
+        blocks: Sequence[Dict[str, Any]],
+        page: int,
+    ) -> List[Dict[str, Any]]:
+        """中文注释：预处理提取块，先修复断词，再合并被拆开的连续标题行。"""
+        normalized: List[Dict[str, Any]] = []
+        for raw in blocks:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip()
+            if not kind:
+                continue
+            text = self._repair_text_artifacts(self._normalize_spaces(str(raw.get("text") or "")))
+            if kind == "heading":
+                text = self._repair_heading_text(text)
+            if not text:
+                continue
+            row = dict(raw)
+            row["kind"] = kind
+            row["text"] = text
+            source_anchor = self._normalize_anchor_ref(anchor=row.get("source_anchor"), page=page, quote_text=text)
+            row["source_anchor"] = source_anchor or row.get("source_anchor")
+            zone_type = str(row.get("zone_type") or ("figure_meta" if kind == "caption" else "main_body"))
+            if zone_type not in {"main_body", "side_context", "figure_meta"}:
+                zone_type = "main_body"
+            row["zone_type"] = zone_type
+            row["column_id"] = str(row.get("column_id") or "main")
+            row["heading_prob"] = float(row.get("heading_prob") or (0.75 if kind == "heading" else 0.0))
+            row["layout_confidence"] = float(row.get("layout_confidence") or 0.8)
+            normalized.append(row)
+
+        if not normalized:
+            return []
+
+        merged: List[Dict[str, Any]] = []
+        idx = 0
+        while idx < len(normalized):
+            current = dict(normalized[idx])
+            text = str(current.get("text") or "")
+            kind = str(current.get("kind") or "")
+            if kind == "heading":
+                while idx + 1 < len(normalized):
+                    nxt = normalized[idx + 1]
+                    if str(nxt.get("kind") or "") != "heading":
+                        break
+                    nxt_text = str(nxt.get("text") or "")
+                    if not self._should_merge_heading_lines(text, nxt_text):
+                        break
+                    text = self._normalize_spaces(f"{text} {nxt_text}")
+                    current["text"] = text
+                    idx += 1
+            merged.append(current)
+            idx += 1
+        return merged
+
+    @staticmethod
+    def _should_merge_heading_lines(current: str, nxt: str) -> bool:
+        left = str(current or "").strip()
+        right = str(nxt or "").strip()
+        if not left or not right:
+            return False
+        if len(left) > 220 or len(right) > 160:
+            return False
+        if re.search(r"[.!?;:。！？；：]$", left):
+            return False
+        if right.lower() in _GENERIC_HEADING_MARKERS:
+            return False
+        if right[:1].islower():
+            return True
+        if re.match(r"^(for|and|with|using|on|in|of|to|the)\b", right, flags=re.IGNORECASE):
+            return True
+        return False
+
     @staticmethod
     def _is_safe_http_url(raw: str) -> bool:
         value = str(raw or "").strip()
@@ -1850,6 +2617,8 @@ class LiteratureReaderComposeService:
         value = str(text or "")
         value = re.sub(r"([A-Za-z]{2,})-\s+([a-z]{2,})", r"\1\2", value)
         value = re.sub(r"\b(of|for|to|in|and|with)([A-Z][a-z]{3,})", r"\1 \2", value)
+        value = re.sub(r"\b([a-z]{2,})([A-Z]{2,})\b", r"\1 \2", value)
+        value = re.sub(r"\b([A-Za-z]{4,})(of|for|to|in|and|with)([A-Z][A-Za-z]{2,})\b", r"\1 \2 \3", value)
         value = re.sub(r"\s+", " ", value).strip()
         return value
 
@@ -1857,6 +2626,9 @@ class LiteratureReaderComposeService:
         value = self._normalize_spaces(text)
         value = value.replace("RESEA RCH", "RESEARCH")
         value = value.replace("AUTH OR", "AUTHOR")
+        value = value.replace("INTRO DUCTION", "INTRODUCTION")
+        value = value.replace("DISCUS SION", "DISCUSSION")
+        value = value.replace("CON CLUSION", "CONCLUSION")
         return value
 
     def _infer_heading_level(self, text: str) -> int:
@@ -1875,6 +2647,25 @@ class LiteratureReaderComposeService:
             return True
         return False
 
+    def _estimate_cross_column_merge_ratio(self, *, base_payload: Dict[str, Any]) -> float:
+        """估算跨栏误拼接比例（仅用于质量评估，不影响锚点真值）。"""
+        style_cues = dict(base_payload.get("style_cues") or {})
+        layout_mode = str(style_cues.get("layout_mode") or "")
+        if layout_mode != "two_column":
+            return 0.0
+        blocks = list(base_payload.get("blocks") or [])
+        paragraph_blocks = [
+            item for item in blocks if str(item.get("kind") or "") == "paragraph"
+        ]
+        if not paragraph_blocks:
+            return 0.0
+        long_count = 0
+        for item in paragraph_blocks:
+            text = self._normalize_spaces(str(item.get("text") or ""))
+            if len(text) >= 900:
+                long_count += 1
+        return max(0.0, min(1.0, long_count / max(1, len(paragraph_blocks))))
+
     def _detect_sidebar_leak(self, paragraph_nodes: Sequence[Dict[str, Any]]) -> bool:
         for node in paragraph_nodes:
             text = str((node.get("props") or {}).get("text") or "")
@@ -1889,11 +2680,19 @@ class LiteratureReaderComposeService:
         title = self._normalize_spaces(str((header_nodes[0].get("props") or {}).get("title") or ""))
         if len(title) < 12:
             return False
+        # 中文注释：头部标题足够长且词元充足时，直接视为标题完整，避免被噪声 heading 误伤。
+        title_words = [w for w in re.findall(r"[A-Za-z]{3,}", title.lower()) if w]
+        if len(title_words) >= 5 and all(marker not in title.lower() for marker in _GENERIC_HEADING_MARKERS):
+            return True
         blocks = list(base_payload.get("blocks") or [])
         expected = [
             self._normalize_spaces(str(item.get("text") or "")).lower()
             for item in blocks
             if str(item.get("kind") or "") == "heading"
+        ]
+        expected = [
+            item for item in expected
+            if item and item not in _GENERIC_HEADING_MARKERS
         ]
         if not expected:
             return True
@@ -1904,7 +2703,29 @@ class LiteratureReaderComposeService:
         if not words:
             return True
         hits = sum(1 for w in words[:6] if w.lower() in title.lower())
-        return hits >= 2
+        if hits >= 2:
+            return True
+
+        # 中文注释：若头部元数据标题质量不高，则允许正文标题节点作为完整性校验依据。
+        heading_nodes = [
+            self._normalize_spaces(str((item.get("props") or {}).get("text") or "")).lower()
+            for item in nodes
+            if str(item.get("type") or "") == "SectionHeading"
+        ]
+        heading_nodes = [
+            item for item in heading_nodes
+            if item and item not in _GENERIC_HEADING_MARKERS
+        ]
+        if not heading_nodes:
+            return False
+        for candidate in heading_nodes[:4]:
+            words = [w for w in re.findall(r"[A-Za-z]{4,}", candidate) if w]
+            if not words:
+                continue
+            hit_count = sum(1 for w in words[:8] if w.lower() in first_heading)
+            if hit_count >= 3:
+                return True
+        return False
 
     @staticmethod
     def _normalize_latency_budget(raw: Optional[int]) -> int:
@@ -1913,6 +2734,14 @@ class LiteratureReaderComposeService:
         except Exception:
             value = DEFAULT_LATENCY_BUDGET_MS
         return max(1200, min(value, 25000))
+
+    @staticmethod
+    def _normalize_max_iterations(raw: Optional[int]) -> int:
+        try:
+            value = int(raw) if raw is not None else DEFAULT_MAX_ITERATIONS
+        except Exception:
+            value = DEFAULT_MAX_ITERATIONS
+        return max(1, min(value, 24))
 
     @staticmethod
     def _normalize_quality_target(raw: Optional[float]) -> float:
@@ -2073,3 +2902,4 @@ _literature_reader_compose_service = LiteratureReaderComposeService()
 
 def get_literature_reader_compose_service() -> LiteratureReaderComposeService:
     return _literature_reader_compose_service
+

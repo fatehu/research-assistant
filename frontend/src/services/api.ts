@@ -977,6 +977,7 @@ export interface ReaderComposeRequest {
   regenerate?: boolean
   latency_budget_ms?: number
   quality_target?: number
+  max_iterations?: number
   style_intent?: string
   theme_mode?: 'light' | 'dark'
   detail_level?: 'concise' | 'standard' | 'deep'
@@ -1018,6 +1019,7 @@ export interface ReaderComponentNode {
   type:
     | 'PaperHeaderCard'
     | 'MetadataSidebarCard'
+    | 'ContextRail'
     | 'SectionTOC'
     | 'SectionHeading'
     | 'ParagraphProse'
@@ -1037,6 +1039,9 @@ export interface ReaderComponentNode {
   props: Record<string, unknown>
   children: ReaderComponentNode[]
   source_anchor_refs: ReaderComponentSourceAnchor[]
+  zone_type?: 'main_body' | 'side_context' | 'figure_meta'
+  column_id?: string
+  heading_prob?: number
   capabilities?: string[]
   actions?: ReaderComponentAction[]
   layout_slot?: ReaderComponentLayoutSlot | null
@@ -1048,10 +1053,16 @@ export interface ReaderComposeQualityReport {
   readability: number
   evidence_alignment: number
   layout_consistency: number
+  cross_column_merge_ratio?: number
+  sidebar_recall?: number
+  toc_quality?: number
   hard_constraints_passed: boolean
   sidebar_leak_detected: boolean
   title_integrity_ok: boolean
   anchors_valid: boolean
+  mm_assist_used?: boolean
+  mm_model?: string
+  mm_fallback_used?: boolean
   validation_errors: string[]
   quality_target: number
   iterations: number
@@ -1091,6 +1102,9 @@ export interface ReaderComposePayload {
   quality_report: ReaderComposeQualityReport
   iteration_trace: Array<Record<string, unknown>>
   asset_policy: Record<string, unknown>
+  layout_channels?: Record<string, string[]>
+  mm_assist_meta?: Record<string, unknown>
+  toc_quality?: number
   generated_at: string
   cache_hit?: boolean
   cache_layer?: 'redis' | 'db' | 'none' | string
@@ -1104,6 +1118,7 @@ export interface ReaderComposePrefetchRequest {
   style_intent?: string
   latency_budget_ms?: number
   quality_target?: number
+  max_iterations?: number
   theme_mode?: 'light' | 'dark'
   detail_level?: 'concise' | 'standard' | 'deep'
   compare_mode?: boolean
@@ -1145,6 +1160,10 @@ export interface ReaderComposeStreamEventMap {
   quality: {
     iteration: number
     quality_report: ReaderComposeQualityReport
+    mm_assist_used?: boolean
+    mm_fallback_used?: boolean
+    cross_column_merge_ratio?: number
+    sidebar_recall?: number
   }
   done: {
     payload: ReaderComposePayload
@@ -1188,8 +1207,10 @@ export interface ReaderInlineQueryRequest {
   scope?: 'page' | 'section'
   selected_kb_id?: number
   style_intent?: string
+  theme_mode?: 'light' | 'dark'
   detail_level?: 'concise' | 'standard' | 'deep'
   compare_mode?: boolean
+  citation_tldr?: boolean
 }
 
 export interface ReaderInlineQuerySource {

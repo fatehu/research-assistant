@@ -335,6 +335,7 @@ class ReaderComposeRequest(BaseModel):
     regenerate: bool = False
     latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
     quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
+    max_iterations: Optional[int] = Field(default=None, ge=1, le=16)
     style_intent: Optional[str] = None
     theme_mode: Optional[Literal["light", "dark"]] = None
     detail_level: Optional[Literal["concise", "standard", "deep"]] = None
@@ -377,6 +378,9 @@ class ReaderComponentNode(BaseModel):
     props: Dict[str, Any] = Field(default_factory=dict)
     children: List["ReaderComponentNode"] = Field(default_factory=list)
     source_anchor_refs: List[ReaderComponentSourceAnchor] = Field(default_factory=list)
+    zone_type: Optional[Literal["main_body", "side_context", "figure_meta"]] = None
+    column_id: Optional[str] = None
+    heading_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     capabilities: List[str] = Field(default_factory=list)
     actions: List[ReaderComponentAction] = Field(default_factory=list)
     layout_slot: Optional[ReaderComponentLayoutSlot] = None
@@ -388,10 +392,16 @@ class ReaderComposeQualityReport(BaseModel):
     readability: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_alignment: float = Field(default=0.0, ge=0.0, le=1.0)
     layout_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
+    cross_column_merge_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    sidebar_recall: float = Field(default=1.0, ge=0.0, le=1.0)
+    toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     hard_constraints_passed: bool = False
     sidebar_leak_detected: bool = False
     title_integrity_ok: bool = False
     anchors_valid: bool = False
+    mm_assist_used: bool = False
+    mm_model: str = ""
+    mm_fallback_used: bool = False
     validation_errors: List[str] = Field(default_factory=list)
     quality_target: float = Field(default=0.86, ge=0.6, le=0.97)
     iterations: int = Field(default=0, ge=0)
@@ -431,6 +441,9 @@ class ReaderComposePayload(BaseModel):
     quality_report: ReaderComposeQualityReport = Field(default_factory=ReaderComposeQualityReport)
     iteration_trace: List[Dict[str, Any]] = Field(default_factory=list)
     asset_policy: Dict[str, Any] = Field(default_factory=dict)
+    layout_channels: Dict[str, List[str]] = Field(default_factory=dict)
+    mm_assist_meta: Dict[str, Any] = Field(default_factory=dict)
+    toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     generated_at: datetime
     cache_hit: bool = False
     cache_layer: Optional[Literal["redis", "db", "none"]] = None
@@ -444,6 +457,7 @@ class ReaderComposePrefetchRequest(BaseModel):
     style_intent: Optional[str] = None
     latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
     quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
+    max_iterations: Optional[int] = Field(default=None, ge=1, le=16)
     theme_mode: Optional[Literal["light", "dark"]] = None
     detail_level: Optional[Literal["concise", "standard", "deep"]] = None
     compare_mode: Optional[bool] = None
@@ -484,8 +498,10 @@ class ReaderInlineQueryRequest(BaseModel):
     scope: Literal["page", "section"] = "section"
     selected_kb_id: Optional[int] = None
     style_intent: Optional[str] = None
+    theme_mode: Optional[Literal["light", "dark"]] = None
     detail_level: Optional[Literal["concise", "standard", "deep"]] = None
     compare_mode: Optional[bool] = None
+    citation_tldr: Optional[bool] = None
 
 
 class ReaderInlineQuerySource(BaseModel):
