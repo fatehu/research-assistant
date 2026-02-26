@@ -743,7 +743,7 @@ async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypa
     assert "side_context" in channels
 
 
-def test_reader_compose_toc_should_hide_when_low_quality():
+def test_reader_compose_should_not_render_page_toc_when_low_quality():
     service = LiteratureReaderComposeService()
     paper = SimpleNamespace(id=21, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)
     ui_plan = service._build_initial_ui_plan(
@@ -765,10 +765,10 @@ def test_reader_compose_toc_should_hide_when_low_quality():
     )
 
     toc_nodes = [node for node in ui_plan.get("components") or [] if node.get("type") == "SectionTOC"]
-    assert toc_nodes
-    toc_props = toc_nodes[0].get("props") or {}
-    assert toc_props.get("items") == []
-    assert "已隐藏" in str(toc_props.get("hidden_reason") or "")
+    assert toc_nodes == []
+    trace_meta = ui_plan.get("trace_meta") or {}
+    assert float(trace_meta.get("toc_quality") or 0.0) == pytest.approx(0.2, rel=0.0, abs=1e-6)
+    assert bool(trace_meta.get("toc_hidden")) is True
 
 
 def test_reader_compose_quality_should_include_layout_metrics():
