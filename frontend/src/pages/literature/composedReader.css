@@ -48,7 +48,7 @@
 .reader-composed-surface .ant-typography-secondary,
 .reader-composed-preview .ant-typography-secondary {
   color: var(--reader-text) !important;
-  opacity: 0.72;
+  opacity: 0.8;
 }
 
 .reader-composed-surface .ant-list-item,
@@ -84,4 +84,28 @@
 .reader-composed-popover .ant-popover-inner-content,
 .reader-composed-popover .ant-typography {
   color: var(--reader-text) !important;
+}
+
+.reader-composed-surface .ant-empty-description,
+.reader-composed-preview .ant-empty-description {
+  color: var(--reader-text) !important;
+  opacity: 0.78;
+}
+
+.reader-composed-surface .ant-alert-message,
+.reader-composed-surface .ant-alert-description,
+.reader-composed-preview .ant-alert-message,
+.reader-composed-preview .ant-alert-description {
+  color: var(--reader-text) !important;
+}
+
+.reader-composed-surface a,
+.reader-composed-preview a {
+  color: var(--reader-heading) !important;
+}
+
+.reader-composed-surface a:hover,
+.reader-composed-preview a:hover {
+  color: var(--reader-heading) !important;
+  text-decoration: underline;
 }

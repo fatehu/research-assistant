@@ -81,6 +81,7 @@ import {
 import { renderReaderComponentTree } from './readerComponents'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
+import './composedReader.css'
 
 const { Title, Text } = Typography
 const { TextArea } = Input
@@ -2947,13 +2948,19 @@ export default function PaperReaderPage() {
           }}
         >
           <div
+            className="reader-composed-surface"
             style={{
+              // 中文注释：显式注入阅读主题变量，覆盖全局暗色 Ant 样式，确保浅色模式可读。
+              '--reader-card-bg': activeGenerativeStyle.panelBackground,
+              '--reader-card-border': activeGenerativeStyle.borderColor,
+              '--reader-text': activeGenerativeStyle.bodyColor,
+              '--reader-heading': activeGenerativeStyle.headingColor,
               border: `1px solid ${activeGenerativeStyle.borderColor}`,
               borderRadius: 12,
               background: activeGenerativeStyle.pageBackground,
               boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
               color: activeGenerativeStyle.bodyColor,
-            }}
+            } as CSSProperties}
           >
             <div
               style={{
@@ -3065,6 +3072,7 @@ export default function PaperReaderPage() {
               {hasComposedPlan && activeComposedPlan ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                   {renderReaderComponentTree(activeComposedPlan.components, {
+                    themeStyle: activeGenerativeStyle,
                     qualityReport: composedQuality || composedPayload?.quality_report || null,
                     inlineQueryLoadingNodeId,
                     onNodeAction: (node, action) => {
