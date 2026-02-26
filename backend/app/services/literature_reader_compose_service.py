@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v2"
+COMPOSE_ENGINE_VERSION = "reader_compose_v3"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v1"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -261,6 +261,19 @@ class LiteratureReaderComposeService:
                 page=page_num,
                 base_payload=base_payload,
             )
+            # 关键要点改为由 LLM 基于“上一页+当前页+下一页”联合概括，避免仅靠截断文本。
+            takeaways = await self._build_takeaways_with_neighbor_context(
+                db=db,
+                user_id=int(user_id),
+                paper=paper,
+                page=page_num,
+                selected_kb_id=selected_kb_id,
+                current_payload=base_payload,
+                detail_level=normalized_detail,
+            )
+            if takeaways:
+                base_payload = dict(base_payload)
+                base_payload["takeaways"] = takeaways
 
             loop_result = await self.run_react_compose_loop(
                 paper=paper,
@@ -374,6 +387,8 @@ class LiteratureReaderComposeService:
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
         confidence = float(base_payload.get("structure_confidence") or 0.0)
+        # 迭代轮次优先使用调用方传入值；未传时根据结构置信度自动分档。
+        # 低置信页给更高上限，高置信页控制成本和延迟。
         resolved_max_iterations = (
             int(max_iterations)
             if isinstance(max_iterations, int) and max_iterations > 0
@@ -385,6 +400,7 @@ class LiteratureReaderComposeService:
         )
         resolved_max_iterations = max(1, min(int(resolved_max_iterations), 24))
 
+        # 先用规则和解析器产出可用初版，再进入 ReAct 迭代修订。
         current_plan = self._build_initial_ui_plan(
             paper=paper,
             page=page,
@@ -404,6 +420,7 @@ class LiteratureReaderComposeService:
         previous_overall: Optional[float] = None
 
         for iteration in range(1, resolved_max_iterations + 1):
+            # 每轮都先“自愈”一次锚点和字段，降低后续 schema 校验失败率。
             current_plan = self._sanitize_ui_plan_anchors(current_plan, page=page)
             validation = self.validate_ui_plan(current_plan, page=page)
             quality = self.score_ui_plan(
@@ -430,7 +447,7 @@ class LiteratureReaderComposeService:
                 best_plan = current_plan
                 best_quality = quality
 
-            # 中文注释：连续两轮增益小于 0.01 时提前停止，避免无效迭代占用延迟预算。
+            # 连续两轮增益小于 0.01 时提前停止，避免无效迭代占用延迟预算。
             if previous_overall is not None:
                 delta = overall - previous_overall
                 if delta < 0.01:
@@ -440,6 +457,7 @@ class LiteratureReaderComposeService:
             previous_overall = overall
 
             hard_pass = bool(quality.get("hard_constraints_passed"))
+            # 只有硬约束与目标分同时满足才允许提前“成功停止”。
             if hard_pass and overall >= quality_target:
                 stop_reason = "quality_threshold_met"
                 break
@@ -449,6 +467,7 @@ class LiteratureReaderComposeService:
                 break
 
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            # 延迟预算优先级高于轮次，超预算立即返回当前最优结果。
             if elapsed_ms >= latency_budget_ms:
                 degraded = True
                 stop_reason = "latency_budget_exceeded"
@@ -458,6 +477,7 @@ class LiteratureReaderComposeService:
                 stop_reason = "max_iterations_reached"
                 break
 
+            # 用质量报告驱动下一轮局部修订，避免每轮全量重排造成抖动。
             current_plan = self._revise_ui_plan(
                 ui_plan=current_plan,
                 base_payload=base_payload,
@@ -507,7 +527,7 @@ class LiteratureReaderComposeService:
         payload = json.loads(json.dumps(base_payload, ensure_ascii=False))
         payload.setdefault("mm_assist_meta", {})
 
-        # 中文注释：只有拿到本地 PDF 才能做“页图+文本块”联合裁决，否则直接降级。
+        # 只有拿到本地 PDF 才能做“页图+文本块”联合裁决，否则直接降级。
         path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
             user_id=int(paper.user_id),
             paper_id=int(paper.id),
@@ -524,7 +544,7 @@ class LiteratureReaderComposeService:
             }
             return self._ensure_layout_channels(payload)
 
-        # 中文注释：先走门控，避免高质量页面也触发视觉模型造成额外时延。
+        # 先走门控，避免高质量页面也触发视觉模型造成额外时延。
         trigger, trigger_meta = self._mm_layout_service.should_trigger_mm(
             paper_id=int(paper.id),
             page=int(page),
@@ -539,6 +559,7 @@ class LiteratureReaderComposeService:
                 "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
                 "fallback_used": False,
             }
+            # 未触发多模态时仍回填监控指标，便于前端质量面板解释“为何未触发”。
             if "cross_column_merge_ratio" in trigger_meta:
                 payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
             return self._ensure_layout_channels(payload)
@@ -558,7 +579,7 @@ class LiteratureReaderComposeService:
             }
             return self._ensure_layout_channels(payload)
 
-        # 中文注释：视觉调用策略固定为“主模型失败后单次回退”，保证链路可控。
+        # 视觉调用策略固定为“主模型失败后单次回退”，保证链路可控。
         mm_decision, call_meta = await self._mm_layout_service.call_primary_then_fallback(
             prompt_payload=prompt_payload,
         )
@@ -570,11 +591,12 @@ class LiteratureReaderComposeService:
                 "model": str(call_meta.get("model") or getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
                 "fallback_used": bool(call_meta.get("fallback_used")),
             }
+            # 多模态失败时保留文本链路结果并标记降级，不中断主流程。
             if "cross_column_merge_ratio" in trigger_meta:
                 payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
             return self._ensure_layout_channels(payload)
 
-        # 中文注释：融合后统一输出三通道，确保正文/侧栏/图注在前端可分域渲染。
+        # 融合后统一输出三通道，确保正文/侧栏/图注在前端可分域渲染。
         merged_payload = self._mm_layout_service.merge_mm_decision_into_blocks(
             base_payload=payload,
             mm_decision=mm_decision,
@@ -759,7 +781,7 @@ class LiteratureReaderComposeService:
         toc_passed = bool(toc_hidden or toc_quality >= 0.55)
         hard_constraints_passed = bool(title_integrity and not sidebar_leak and anchors_valid and toc_passed)
 
-        # 中文注释：总分在原四项基础上加入“跨栏拼接率/侧栏召回率”，避免只看文本流畅度。
+        # 总分在原四项基础上加入“跨栏拼接率/侧栏召回率”，避免只看文本流畅度。
         overall = (
             0.42 * structure_fidelity
             + 0.23 * readability
@@ -879,7 +901,7 @@ class LiteratureReaderComposeService:
     ) -> List[Dict[str, Any]]:
         base_assets = list(base_payload.get("assets") or [])
         dedup: Dict[str, Dict[str, Any]] = {}
-        # 中文注释：非多模态部署默认关闭外网补图，仅保留 PDF 与文本来源资产。
+        # 非多模态部署默认关闭外网补图，仅保留 PDF 与文本来源资产。
         allow_external_images = bool(getattr(settings, "reader_external_image_enabled", False))
 
         def _asset_key(item: Dict[str, Any]) -> str:
@@ -920,7 +942,7 @@ class LiteratureReaderComposeService:
                         "page": int(page),
                     },
                 }
-                # 中文注释：外网图片必须包含可追溯来源信息。
+                # 外网图片必须包含可追溯来源信息。
                 meta = asset.get("meta") or {}
                 if not (meta.get("source_url") and meta.get("source_domain") and meta.get("license")):
                     continue
@@ -1179,25 +1201,18 @@ class LiteratureReaderComposeService:
                     }
                 )
 
-        if summary:
-            summary_parts = [item.strip() for item in re.split(r"[。！？!?;；]\s*", summary) if item.strip()]
-            if detail_level == "concise":
-                summary_parts = summary_parts[:3]
-            elif detail_level == "deep":
-                summary_parts = summary_parts[:8]
+        takeaway_items = self._normalize_takeaway_items(
+            raw_items=base_payload.get("takeaways"),
+            page=page,
+            fallback_summary=summary,
+            detail_level=detail_level,
+        )
+        if takeaway_items:
             components.append(
                 {
                     "id": next_id("takeaways"),
                     "type": "KeyTakeaways",
-                    "props": {
-                        "items": [
-                            {
-                                "text": text,
-                                "evidence_anchors": [],
-                            }
-                            for text in summary_parts[:8]
-                        ],
-                    },
+                    "props": {"items": takeaway_items},
                     "children": [],
                     "source_anchor_refs": [],
                     "capabilities": ["jump_anchor", "copy", "drag_markdown"],
@@ -1471,7 +1486,7 @@ class LiteratureReaderComposeService:
                     node["props"] = props
             patched.append(node)
 
-        # 中文注释：当标题组件缺失时，从 sections 补齐至少一个。
+        # 当标题组件缺失时，从 sections 补齐至少一个。
         has_heading = any(str(item.get("type") or "") == "SectionHeading" for item in patched)
         if not has_heading:
             sections = list(base_payload.get("sections") or [])
@@ -1956,7 +1971,7 @@ class LiteratureReaderComposeService:
             if normalized:
                 return normalized[:3]
 
-        # 中文注释：若当前节点没有锚点，则退化为邻近正文节点锚点，保证问答可追溯。
+        # 若当前节点没有锚点，则退化为邻近正文节点锚点，保证问答可追溯。
         flat_nodes = self._flatten_components(components)
         target_id = str(target_node.get("id") or "")
         anchor_candidates: List[Dict[str, Any]] = []
@@ -2073,7 +2088,7 @@ class LiteratureReaderComposeService:
         kb_sig: Dict[str, Any] = {"id": 0, "doc_updated": "none"}
         kb_id = int(selected_kb_id) if selected_kb_id else 0
         if kb_id > 0:
-            # 中文注释：签名中的知识库信息必须限制在当前用户可见范围，避免跨租户信息侧漏。
+            # 签名中的知识库信息必须限制在当前用户可见范围，避免跨租户信息侧漏。
             owned_kb_id = (
                 await db.execute(
                     select(KnowledgeBase.id).where(
@@ -2138,7 +2153,7 @@ class LiteratureReaderComposeService:
         packed = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(packed.encode("utf-8")).hexdigest()
         signature = (
-            f"compose_v2|p:{int(paper.id)}|kb:{int(kb_sig.get('id') or 0)}|"
+            f"compose_v3|p:{int(paper.id)}|kb:{int(kb_sig.get('id') or 0)}|"
             f"m:{int(pdf_sig.get('mtime') or 0)}|s:{int(pdf_sig.get('size') or 0)}|"
             f"mode:{normalized_style_intent}/{theme_part}/{detail_part}/{int(bool(compare_mode))}/{int(bool(citation_tldr))}|"
             f"h:{digest[:24]}"
@@ -2197,6 +2212,236 @@ class LiteratureReaderComposeService:
         title = self._normalize_spaces(str(paper.title or "medical research"))
         query = " ".join(item for item in [title[:120], first_heading[:60], summary[:80], "diagram"] if item).strip()
         return query or "medical education diagram"
+
+    async def _build_takeaways_with_neighbor_context(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        current_payload: Dict[str, Any],
+        detail_level: str,
+    ) -> List[Dict[str, Any]]:
+        # 使用上一页/当前页/下一页构造要点上下文，降低单页截断造成的语义断裂。
+        # 注意：这里只是补充语境，最终提炼目标仍是当前页。
+        context_rows: List[Tuple[int, Dict[str, Any]]] = [(int(page), dict(current_payload))]
+        neighbor_pages = [int(page) - 1, int(page) + 1]
+        for neighbor in neighbor_pages:
+            if neighbor < 1:
+                continue
+            try:
+                payload, _ = await self._reader_service.build_or_get_page_payload(
+                    db=db,
+                    user_id=int(user_id),
+                    paper=paper,
+                    page=int(neighbor),
+                    selected_kb_id=selected_kb_id,
+                    force_refresh=False,
+                    style_hint=None,
+                    prefer_agent=False,
+                    publish_ready_event_enabled=False,
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"[ReaderComposeService] load neighbor page for takeaways failed page={neighbor}: {exc}"
+                )
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_text = self._normalize_spaces(str(payload.get("raw_text") or ""))
+            blocks = list(payload.get("blocks") or [])
+            if not raw_text and not blocks:
+                continue
+            # 只携带结构化结果，避免把邻页原始文本无上限地塞入提示词。
+            context_rows.append((int(neighbor), dict(payload)))
+
+        context_rows = sorted(context_rows, key=lambda item: item[0])
+        return await self._generate_takeaways_from_context_rows(
+            context_rows=context_rows,
+            current_page=int(page),
+            detail_level=detail_level,
+        )
+
+    async def _generate_takeaways_from_context_rows(
+        self,
+        *,
+        context_rows: Sequence[Tuple[int, Dict[str, Any]]],
+        current_page: int,
+        detail_level: str,
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        for row_page, payload in context_rows:
+            blocks = self._normalize_blocks_for_render(
+                blocks=list((payload or {}).get("blocks") or []),
+                page=int(row_page),
+            )
+            if not blocks:
+                continue
+            # 当前页放宽采样，邻页收紧采样，保证“当前页主导”的提示词结构。
+            per_page_limit = 18 if int(row_page) == int(current_page) else 8
+            collected = 0
+            for idx, block in enumerate(blocks):
+                if collected >= per_page_limit:
+                    break
+                if str(block.get("zone_type") or "main_body") != "main_body":
+                    continue
+                # 这里只抽“标题/段落/列表”三类正文块，避免把资源卡、元数据卡混进要点提示。
+                kind = str(block.get("kind") or "")
+                if kind not in {"heading", "paragraph", "list_item"}:
+                    continue
+                text = self._normalize_spaces(str(block.get("text") or ""))
+                if len(text) < 16:
+                    continue
+                anchor = block.get("source_anchor")
+                if not isinstance(anchor, dict):
+                    continue
+                raw_id = str(block.get("id") or f"b{idx + 1}")
+                block_id = f"p{int(row_page)}_{raw_id}"
+                candidates.append(
+                    {
+                        "block_id": block_id,
+                        "page": int(row_page),
+                        "scope": "current" if int(row_page) == int(current_page) else "neighbor_ref",
+                        "kind": kind,
+                        "text": text[:280],
+                    }
+                )
+                collected += 1
+
+        if len(candidates) < 3:
+            return []
+
+        level_hint = {
+            "concise": "建议偏少且聚焦，常见 2-4 条。",
+            "deep": "允许更细颗粒，常见 4-8 条。",
+        }.get(str(detail_level or "standard"), "通常 3-6 条即可。")
+
+        prompt = (
+            "你是科研论文阅读助手。\n"
+            "你正在处理论文“单页要点提炼”任务。\n"
+            "任务：根据上一页、当前页、下一页候选块，总结当前页关键要点。\n"
+            "规则：\n"
+            "1) 只提炼“当前页”核心信息；相邻页仅用于理解上下文，不作为核心结论来源。\n"
+            "2) 由你自主决定要点数量，不固定条数。"
+            f"{level_hint}\n"
+            "3) 每条都要简洁中文完整句，不要省略号，不要照抄长段原文。\n"
+            "4) 避免空泛句式（如“本文研究了…”、“论文介绍了…”），要保留具体事实。\n"
+            "5) 不输出定位信息，不输出证据 ID，不输出解释文本。\n"
+            "6) 只输出 JSON，不要解释。\n"
+            "输出格式：\n"
+            "{\"items\":[{\"text\":\"...\"}]}\n"
+            f"当前页: {int(current_page)}\n"
+            f"候选证据块: {json.dumps(candidates, ensure_ascii=False)}"
+        )
+
+        try:
+            llm = await get_llm_service()
+            result = await llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=960,
+            )
+            payload = self._extract_json_dict(str(result.get("content") or ""))
+            if not payload:
+                return []
+            rows = payload.get("items")
+            if not isinstance(rows, list):
+                return []
+            normalized_rows: List[Dict[str, Any]] = []
+            seen_texts: set[str] = set()
+            for raw in rows:
+                if isinstance(raw, dict):
+                    text = self._normalize_spaces(str(raw.get("text") or raw.get("title") or ""))
+                else:
+                    text = self._normalize_spaces(str(raw or ""))
+                text = re.sub(r"(?:\.\.\.|…)+$", "", text).strip()
+                if len(text) < 8:
+                    continue
+                text_key = text.lower()
+                if text_key in seen_texts:
+                    continue
+                seen_texts.add(text_key)
+                # KeyTakeaways 当前阶段不展示证据高亮，因此统一留空 evidence_anchors。
+                # 后续若恢复高亮功能，可在此处接回 block_id -> anchor 的映射。
+                normalized_rows.append(
+                    {
+                        "text": text[:220],
+                        "evidence_anchors": [],
+                    }
+                )
+                if len(normalized_rows) >= 8:
+                    break
+            return normalized_rows
+        except Exception as exc:
+            logger.debug(f"[ReaderComposeService] generate takeaways with context failed: {exc}")
+            return []
+
+    def _normalize_takeaway_items(
+        self,
+        *,
+        raw_items: Any,
+        page: int,
+        fallback_summary: str,
+        detail_level: str,
+    ) -> List[Dict[str, Any]]:
+        normalized_rows: List[Dict[str, Any]] = []
+        seen_texts: set[str] = set()
+        if isinstance(raw_items, list):
+            for raw in raw_items:
+                if isinstance(raw, dict):
+                    text = self._normalize_spaces(str(raw.get("text") or raw.get("title") or ""))
+                else:
+                    text = self._normalize_spaces(str(raw or ""))
+                text = re.sub(r"(?:\.\.\.|…)+$", "", text).strip()
+                if len(text) < 8:
+                    continue
+                text_key = text.lower()
+                if text_key in seen_texts:
+                    continue
+                seen_texts.add(text_key)
+                normalized_rows.append({"text": text[:220], "evidence_anchors": []})
+                if len(normalized_rows) >= 8:
+                    break
+
+        if normalized_rows:
+            return normalized_rows
+
+        # 回退路径：若 LLM 概括失败，仍基于摘要拆句给出可读要点，避免整块文本+省略号。
+        # 这里仅做兜底，不追求语义最优，优先保证页面可用。
+        summary = self._normalize_spaces(str(fallback_summary or ""))
+        summary = re.sub(r"(?:\.\.\.|…)+$", "", summary).strip()
+        if not summary:
+            return []
+        parts = [item.strip() for item in re.split(r"[。！？!?;；\.]+\s*", summary) if item.strip()]
+        if detail_level == "concise":
+            parts = parts[:3]
+        elif detail_level == "deep":
+            parts = parts[:8]
+        else:
+            parts = parts[:6]
+        return [{"text": item[:220], "evidence_anchors": []} for item in parts if len(item) >= 8][:8]
+
+    @staticmethod
+    def _extract_json_dict(content: str) -> Optional[Dict[str, Any]]:
+        text = str(content or "").strip()
+        if not text:
+            return None
+        fenced = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text, flags=re.IGNORECASE)
+        if fenced:
+            text = fenced.group(1).strip()
+        if not text.startswith("{"):
+            match = re.search(r"\{[\s\S]+\}", text)
+            if not match:
+                return None
+            text = match.group(0)
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
 
     def _build_bbox_hint(self, *, style_cues: Dict[str, Any], quote_text: str) -> Optional[Dict[str, Any]]:
         line_layout = list(style_cues.get("line_layout") or [])
@@ -2261,7 +2506,7 @@ class LiteratureReaderComposeService:
         normalized_href = str(href or "").strip().lower()
         normalized_label = str(label or "").strip()
         paper_doi = str(paper.doi or "").strip().lower()
-        # 中文注释：仅在 DOI 非空时再做子串匹配，避免空字符串导致全部链接被识别成 DOI。
+        # 仅在 DOI 非空时再做子串匹配，避免空字符串导致全部链接被识别成 DOI。
         if "doi.org" in normalized_href or (paper_doi and paper_doi in normalized_href):
             return "TL;DR：该链接是论文正式标识入口，可用于快速核对题目、期刊与年份信息。"
         if "arxiv.org" in normalized_href:
@@ -2327,7 +2572,7 @@ class LiteratureReaderComposeService:
         return candidates
 
     def _sanitize_ui_plan_anchors(self, ui_plan: Dict[str, Any], *, page: int) -> Dict[str, Any]:
-        """中文注释：统一修复组件树的字段与锚点，降低 schema 校验错误率。"""
+        """统一修复组件树的字段与锚点，降低 schema 校验错误率。"""
         cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
         seen_ids: set[str] = set()
         auto_seq = 0
@@ -2347,6 +2592,7 @@ class LiteratureReaderComposeService:
 
                 node_type = str(node.get("type") or "").strip()
                 if node_type not in COMPONENT_WHITELIST:
+                    # 非白名单组件统一降级为正文段落，防止前端渲染未知组件报错。
                     node_type = "ParagraphProse"
                     node["type"] = node_type
                     raw_props = node.get("props") if isinstance(node.get("props"), dict) else {}
@@ -2356,6 +2602,7 @@ class LiteratureReaderComposeService:
 
                 node_id = str(node.get("id") or "").strip()
                 if not node_id or node_id in seen_ids:
+                    # 缺失或重复 id 都会导致节点动作与 patch 不稳定，这里统一重建。
                     node_id = _next_id(node_type)
                 node["id"] = node_id
                 seen_ids.add(node_id)
@@ -2369,6 +2616,7 @@ class LiteratureReaderComposeService:
                 if isinstance(anchors, list):
                     normalized_rows: List[Dict[str, Any]] = []
                     for row in anchors:
+                        # 锚点规范化阶段只保留必要字段，其它扩展字段按白名单透传。
                         normalized = self._normalize_anchor_ref(
                             anchor=row,
                             page=page,
@@ -2397,16 +2645,18 @@ class LiteratureReaderComposeService:
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(anchor, dict):
             return None
-        # 中文注释：composed 按页构建，锚点页号强制与当前页一致，避免跨页锚点污染评分与定位。
+        # composed 按页构建，锚点页号强制与当前页一致，避免跨页锚点污染评分与定位。
         page_no = int(page)
         start_char = int(anchor.get("start_char") or 0)
         if start_char < 0:
             start_char = 0
         end_char = int(anchor.get("end_char") or 0)
         normalized_quote = self._normalize_spaces(str(quote_text or anchor.get("quote_text") or ""))
+        # 当 end_char 无效时，用 quote 长度推断一个保守跨度，尽量保证证据可定位。
         fallback_span = max(1, min(3200, len(normalized_quote) or 120))
         if end_char <= start_char:
             end_char = start_char + fallback_span
+        # 限制跨度上限，避免“整页高亮”影响证据可读性与信任感。
         if end_char - start_char > 12000:
             end_char = start_char + 12000
         return {
@@ -2424,10 +2674,12 @@ class LiteratureReaderComposeService:
         figure_meta_blocks = list(cloned.get("figure_meta_blocks") or [])
 
         if not side_context_blocks:
+            # 兼容旧 payload：若未提前拆分侧栏，这里按 zone_type 兜底回填。
             side_context_blocks = [
                 item for item in blocks if str((item or {}).get("zone_type") or "") == "side_context"
             ]
         if not figure_meta_blocks:
+            # 兼容旧 payload：图注/图表元信息未拆分时同步兜底。
             figure_meta_blocks = [
                 item for item in blocks if str((item or {}).get("zone_type") or "") == "figure_meta"
             ]
@@ -2463,7 +2715,7 @@ class LiteratureReaderComposeService:
         blocks: Sequence[Dict[str, Any]],
         page: int,
     ) -> List[Dict[str, Any]]:
-        """中文注释：预处理提取块，先修复断词，再合并被拆开的连续标题行。"""
+        """预处理提取块：先修复断词，再合并被拆开的连续标题行。"""
         normalized: List[Dict[str, Any]] = []
         for raw in blocks:
             if not isinstance(raw, dict):
@@ -2638,7 +2890,7 @@ class LiteratureReaderComposeService:
         title = self._normalize_spaces(str((header_nodes[0].get("props") or {}).get("title") or ""))
         if len(title) < 12:
             return False
-        # 中文注释：头部标题足够长且词元充足时，直接视为标题完整，避免被噪声 heading 误伤。
+        # 头部标题足够长且词元充足时，直接视为标题完整，避免被噪声 heading 误伤。
         title_words = [w for w in re.findall(r"[A-Za-z]{3,}", title.lower()) if w]
         if len(title_words) >= 5 and all(marker not in title.lower() for marker in _GENERIC_HEADING_MARKERS):
             return True
@@ -2664,7 +2916,7 @@ class LiteratureReaderComposeService:
         if hits >= 2:
             return True
 
-        # 中文注释：若头部元数据标题质量不高，则允许正文标题节点作为完整性校验依据。
+        # 若头部元数据标题质量不高，则允许正文标题节点作为完整性校验依据。
         heading_nodes = [
             self._normalize_spaces(str((item.get("props") or {}).get("text") or "")).lower()
             for item in nodes
