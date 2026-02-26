@@ -1044,7 +1044,6 @@ class LiteratureReaderComposeService:
         detail_level: str,
         compare_mode: bool,
     ) -> Dict[str, Any]:
-        sections = list(base_payload.get("sections") or [])
         blocks = self._normalize_blocks_for_render(
             blocks=list(base_payload.get("blocks") or []),
             page=page,
@@ -1068,6 +1067,7 @@ class LiteratureReaderComposeService:
         summary = str(base_payload.get("summary") or "").strip()
         style_cues = dict(base_payload.get("style_cues") or {})
         toc_quality = float(base_payload.get("toc_quality") or 0.0)
+        toc_hidden = bool(base_payload.get("toc_hidden")) or toc_quality < 0.55
 
         components: List[Dict[str, Any]] = []
         cid = 0
@@ -1141,50 +1141,8 @@ class LiteratureReaderComposeService:
             }
         )
 
-        toc_items = []
-        toc_candidates = list(base_payload.get("toc_candidates") or [])
-        if toc_candidates:
-            for item in toc_candidates:
-                if not isinstance(item, dict):
-                    continue
-                title = self._normalize_spaces(str(item.get("title") or ""))
-                if not title:
-                    continue
-                toc_items.append(
-                    {
-                        "title": title,
-                        "anchor": wrap_anchor(item.get("source_anchor"), quote_text=title),
-                    }
-                )
-        else:
-            for item in sections:
-                title = str(item.get("title") or "").strip()
-                if not title:
-                    continue
-                toc_items.append(
-                    {
-                        "title": title,
-                        "anchor": wrap_anchor(item.get("source_anchor"), quote_text=title),
-                    }
-                )
-
-        toc_hidden = bool(base_payload.get("toc_hidden")) or toc_quality < 0.55
-        components.append(
-            {
-                "id": next_id("toc"),
-                "type": "SectionTOC",
-                "props": {
-                    "items": toc_items[:24] if not toc_hidden else [],
-                    "hidden_reason": "本页目录质量不足，已隐藏。" if toc_hidden else "",
-                    "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
-                },
-                "children": [],
-                "source_anchor_refs": [],
-                "capabilities": ["jump_anchor"],
-                "actions": [],
-                "layout_slot": {"reserved_height": 220, "lock_height": True},
-            }
-        )
+        # 论文按页阅读默认不渲染目录卡，避免“空目录+占位”打断阅读流。
+        # 如需导航能力，后续应做跨页聚合的大纲侧栏，而不是每页 TOC。
 
         if side_context_blocks:
             side_items = []
