@@ -169,6 +169,7 @@ const DEFAULT_READER_STYLE_TUNING: ReaderGenerativeStyleTuning = {
   line_height: 1.9,
   heading_scale: 1,
 }
+const DEFAULT_COMPOSE_MAX_ITERATIONS = 16
 
 function normalizeReaderStyleTuning(
   raw: unknown,
@@ -605,6 +606,7 @@ type PendingSectionJump = {
 }
 
 type ReaderDetailLevel = 'concise' | 'standard' | 'deep'
+type AnchorMatchMethod = 'bbox_hint' | 'quote_exact' | 'quote_fuzzy' | 'char_range' | 'fallback'
 
 type AnchorPreviewState = {
   visible: boolean
@@ -614,6 +616,9 @@ type AnchorPreviewState = {
   text: string
   title: string
   anchors: ReaderComponentSourceAnchor[]
+  image_data_url?: string | null
+  match_method?: AnchorMatchMethod
+  match_confidence?: number
 }
 
 function splitAnswerByCitation(answer: string): AnswerSegment[] {
@@ -739,21 +744,442 @@ function insertNodeAfterInTree(
   return output
 }
 
-function pickPrimaryAnchor(anchors: ReaderComponentSourceAnchor[]): ReaderComponentSourceAnchor | null {
+function normalizeAnchorMatchText(value: string): string {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function findAllOccurrences(source: string, query: string, limit = 64): number[] {
+  if (!source || !query) return []
+  const output: number[] = []
+  let cursor = 0
+  while (cursor >= 0 && cursor < source.length && output.length < limit) {
+    const idx = source.indexOf(query, cursor)
+    if (idx < 0) break
+    output.push(idx)
+    cursor = idx + Math.max(1, query.length)
+  }
+  return output
+}
+
+function pickPrimaryAnchor(
+  anchors: ReaderComponentSourceAnchor[],
+  preferredPage?: number,
+): ReaderComponentSourceAnchor | null {
   if (!Array.isArray(anchors) || anchors.length === 0) return null
-  const anchor = anchors[0]
-  if (!anchor || !Number.isFinite(anchor.page) || anchor.page <= 0) return null
-  return anchor
+  const validAnchors = anchors.filter((item) => Number.isFinite(item.page) && Number(item.page) > 0)
+  if (validAnchors.length === 0) return null
+  const scored = validAnchors.map((item, idx) => {
+    const span = Math.max(0, Number(item.end_char || 0) - Number(item.start_char || 0))
+    const quoteLength = String(item.quote_text || '').trim().length
+    const hasBbox = Boolean(item.bbox_hint && Number(item.bbox_hint.x1) > Number(item.bbox_hint.x0))
+    let score = 0
+    if (Number(preferredPage || 0) > 0 && Number(item.page) === Number(preferredPage)) score += 1000
+    if (hasBbox) score += 220
+    if (quoteLength > 0) score += 80 + Math.min(220, quoteLength) * 0.3
+    if (span >= 24 && span <= 1800) score += 48
+    else if (span > 0) score += 16
+    score -= idx * 0.01
+    return { item, score }
+  })
+  scored.sort((a, b) => b.score - a.score)
+  return scored[0]?.item || null
+}
+
+function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
+  const bbox = anchor.bbox_hint
+  const bboxKey = bbox
+    ? [bbox.x0, bbox.x1, bbox.top, bbox.bottom, bbox.page_width, bbox.page_height].map((n) => Number(n || 0)).join(':')
+    : 'none'
+  return [
+    Number(anchor.page || 0),
+    Number(anchor.start_char || 0),
+    Number(anchor.end_char || 0),
+    normalizeAnchorMatchText(String(anchor.quote_text || '')).slice(0, 320),
+    bboxKey,
+  ].join('|')
+}
+
+function clampRect(
+  rect: { x: number; y: number; width: number; height: number },
+  canvasWidth: number,
+  canvasHeight: number,
+): { x: number; y: number; width: number; height: number } | null {
+  const x = Math.max(0, Math.min(canvasWidth - 1, rect.x))
+  const y = Math.max(0, Math.min(canvasHeight - 1, rect.y))
+  const maxWidth = Math.max(1, canvasWidth - x)
+  const maxHeight = Math.max(1, canvasHeight - y)
+  const width = Math.max(1, Math.min(maxWidth, rect.width))
+  const height = Math.max(1, Math.min(maxHeight, rect.height))
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null
+  return { x, y, width, height }
+}
+
+function resolveRectFromBboxHint(
+  anchor: ReaderComponentSourceAnchor,
+  viewportWidth: number,
+  viewportHeight: number,
+  renderScale: number,
+): { rect: { x: number; y: number; width: number; height: number }; confidence: number } | null {
+  const hint = anchor.bbox_hint
+  if (!hint) return null
+  const x0 = Number(hint.x0)
+  const x1 = Number(hint.x1)
+  const top = Number(hint.top)
+  const bottom = Number(hint.bottom)
+  if (![x0, x1, top, bottom].every((n) => Number.isFinite(n))) return null
+  if (x1 <= x0 || bottom <= top) return null
+  const sourceWidth = Number(hint.page_width || 0) > 0 ? Number(hint.page_width) : viewportWidth / renderScale
+  const sourceHeight = Number(hint.page_height || 0) > 0 ? Number(hint.page_height) : viewportHeight / renderScale
+  const scaleX = sourceWidth > 0 ? viewportWidth / sourceWidth : 1
+  const scaleY = sourceHeight > 0 ? viewportHeight / sourceHeight : 1
+  const rect = clampRect(
+    {
+      x: x0 * scaleX,
+      y: top * scaleY,
+      width: Math.max(2, (x1 - x0) * scaleX),
+      height: Math.max(2, (bottom - top) * scaleY),
+    },
+    viewportWidth,
+    viewportHeight,
+  )
+  if (!rect) return null
+  return { rect, confidence: 0.92 }
+}
+
+type AnchorMetricRow = {
+  text: string
+  lower: string
+  start: number
+  end: number
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+function buildTextMetricsForAnchor(
+  items: PdfTextItemLike[],
+  viewport: { width: number; height: number; transform?: number[] },
+  renderScale: number,
+): { merged: string; rows: AnchorMetricRow[] } {
+  const rows: AnchorMetricRow[] = []
+  const mergedParts: string[] = []
+  const util = (pdfjs as any)?.Util
+  let cursor = 0
+  for (const item of items) {
+    const text = String(item?.str || '').replace(/\s+/g, ' ').trim()
+    if (!text) continue
+    const transform = Array.isArray(item?.transform) ? item.transform as number[] : []
+    let tx = Number(transform[4] || 0) * renderScale
+    let topY = 0
+    const width = Math.max(4, Number(item?.width || Math.max(6, text.length * 5)) * renderScale)
+    let height = 10
+    if (util && Array.isArray(viewport.transform) && transform.length >= 6) {
+      try {
+        const transformed = util.transform(viewport.transform, transform)
+        tx = Number(transformed[4] || 0)
+        const ty = Number(transformed[5] || 0)
+        const fontHeight =
+          Math.hypot(Number(transformed[2] || 0), Number(transformed[3] || 0))
+          || Math.hypot(Number(transformed[0] || 0), Number(transformed[1] || 0))
+          || 10
+        height = Math.max(9, fontHeight)
+        topY = Math.max(0, ty - height)
+      } catch {
+        const ty = Number(transform[5] || 0) * renderScale
+        const rawHeight =
+          Math.abs(Number(transform[3] || 0))
+          || Math.abs(Number(transform[0] || 0))
+          || 10
+        height = Math.max(9, rawHeight * renderScale)
+        topY = Math.max(0, viewport.height - ty - height)
+      }
+    } else {
+      const ty = Number(transform[5] || 0) * renderScale
+      const rawHeight =
+        Math.abs(Number(transform[3] || 0))
+        || Math.abs(Number(transform[0] || 0))
+        || 10
+      height = Math.max(9, rawHeight * renderScale)
+      topY = Math.max(0, viewport.height - ty - height)
+    }
+    const start = cursor
+    const end = start + text.length
+    cursor = end + 1
+    mergedParts.push(text)
+    rows.push({
+      text,
+      lower: text.toLowerCase(),
+      start,
+      end,
+      x: tx,
+      y: topY,
+      width,
+      height,
+    })
+  }
+  return { merged: mergedParts.join(' '), rows }
+}
+
+function buildRectFromMetricRows(
+  rows: AnchorMetricRow[],
+  viewportWidth: number,
+  viewportHeight: number,
+): { x: number; y: number; width: number; height: number } | null {
+  if (!rows.length) return null
+  const x0 = Math.min(...rows.map((row) => row.x))
+  const x1 = Math.max(...rows.map((row) => row.x + row.width))
+  const y0 = Math.min(...rows.map((row) => row.y))
+  const y1 = Math.max(...rows.map((row) => row.y + row.height))
+  return clampRect(
+    {
+      x: x0,
+      y: y0,
+      width: Math.max(2, x1 - x0),
+      height: Math.max(2, y1 - y0),
+    },
+    viewportWidth,
+    viewportHeight,
+  )
+}
+
+function rectArea(rect: { x: number; y: number; width: number; height: number }): number {
+  return Math.max(0, rect.width) * Math.max(0, rect.height)
+}
+
+function rectIoU(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+): number {
+  const x1 = Math.max(a.x, b.x)
+  const y1 = Math.max(a.y, b.y)
+  const x2 = Math.min(a.x + a.width, b.x + b.width)
+  const y2 = Math.min(a.y + a.height, b.y + b.height)
+  const interW = Math.max(0, x2 - x1)
+  const interH = Math.max(0, y2 - y1)
+  const inter = interW * interH
+  if (inter <= 0) return 0
+  const union = rectArea(a) + rectArea(b) - inter
+  if (union <= 0) return 0
+  return inter / union
+}
+
+function resolveRectFromTextMetrics(
+  anchor: ReaderComponentSourceAnchor,
+  metrics: { merged: string; rows: AnchorMetricRow[] },
+  viewportWidth: number,
+  viewportHeight: number,
+): { rect: { x: number; y: number; width: number; height: number }; method: AnchorMatchMethod; confidence: number } | null {
+  if (!metrics.rows.length) return null
+  const mergedLower = normalizeAnchorMatchText(metrics.merged)
+  const quote = normalizeAnchorMatchText(String(anchor.quote_text || ''))
+  const hasQuote = quote.length > 0
+
+  if (hasQuote) {
+    const quoteHits = findAllOccurrences(mergedLower, quote, 48)
+    if (quoteHits.length > 0) {
+      const targetChar = Math.max(0, Number(anchor.start_char || 0))
+      const quoteIdx =
+        targetChar > 0
+          ? quoteHits.reduce((best, current) => (
+            Math.abs(current - targetChar) < Math.abs(best - targetChar) ? current : best
+          ), quoteHits[0])
+          : quoteHits[0]
+      const quoteEnd = quoteIdx + quote.length
+      const hitRows = metrics.rows.filter((row) => row.end > quoteIdx && row.start < quoteEnd)
+      const rect = buildRectFromMetricRows(hitRows, viewportWidth, viewportHeight)
+      if (rect) return { rect, method: 'quote_exact', confidence: 0.85 }
+    }
+
+    const quoteTokens = quote.split(' ').filter((item) => item.length >= 4)
+    if (quoteTokens.length >= 2) {
+      const scoredRows = metrics.rows
+        .map((row) => {
+          const tokenHits = quoteTokens.reduce((acc, token) => (row.lower.includes(token) ? acc + 1 : acc), 0)
+          return { row, tokenHits }
+        })
+        .filter((item) => item.tokenHits > 0)
+        .sort((a, b) => b.tokenHits - a.tokenHits)
+      const pivot = scoredRows[0]?.row
+      if (pivot) {
+        const sameBandRows = scoredRows
+          .map((item) => item.row)
+          .filter((row) => (
+            Math.abs(row.y - pivot.y) <= Math.max(56, pivot.height * 2.4)
+            && Math.abs(row.x - pivot.x) <= Math.max(260, pivot.width * 1.2)
+          ))
+          .slice(0, 8)
+        const rect = buildRectFromMetricRows(sameBandRows.length > 0 ? sameBandRows : [pivot], viewportWidth, viewportHeight)
+        if (rect) {
+          const ratio = rectArea(rect) / Math.max(1, viewportWidth * viewportHeight)
+          if (ratio <= 0.34) return { rect, method: 'quote_fuzzy', confidence: 0.66 }
+        }
+      }
+    }
+    return null
+  }
+
+  const start = Math.max(0, Number(anchor.start_char || 0))
+  const end = Math.max(start + 1, Number(anchor.end_char || start + 1))
+  const span = end - start
+  if (end > start && span <= 2200) {
+    const hitRows = metrics.rows.filter((row) => row.end > start && row.start < end)
+    const compactRows = hitRows.slice(0, 14)
+    const rect = buildRectFromMetricRows(compactRows, viewportWidth, viewportHeight)
+    if (rect) {
+      const ratio = rectArea(rect) / Math.max(1, viewportWidth * viewportHeight)
+      if (ratio <= 0.28) return { rect, method: 'char_range', confidence: 0.5 }
+    }
+  }
+
+  return null
 }
 
 function buildAnchorPreviewSnippet(rawText: string, anchor: ReaderComponentSourceAnchor): string {
   const text = String(rawText || '')
   if (!text) return ''
+  const quote = String(anchor.quote_text || '').replace(/\s+/g, ' ').trim()
+  if (quote) {
+    const lowerText = text.toLowerCase()
+    const lowerQuote = quote.toLowerCase()
+    const quoteStart = lowerText.indexOf(lowerQuote)
+    if (quoteStart >= 0) {
+      const quoteEnd = quoteStart + quote.length
+      const previewStart = Math.max(0, quoteStart - 120)
+      const previewEnd = Math.min(text.length, quoteEnd + 180)
+      return text.slice(previewStart, previewEnd).replace(/\s+/g, ' ').trim()
+    }
+  }
   const start = Math.max(0, Math.min(text.length, Number(anchor.start_char || 0)))
   const end = Math.max(start + 1, Math.min(text.length, Number(anchor.end_char || start + 1)))
   const previewStart = Math.max(0, start - 120)
   const previewEnd = Math.min(text.length, end + 180)
   return text.slice(previewStart, previewEnd).replace(/\s+/g, ' ').trim()
+}
+
+async function renderAnchorEvidenceImage(
+  pageProxy: any,
+  textItems: PdfTextItemLike[],
+  anchor: ReaderComponentSourceAnchor,
+): Promise<{ imageDataUrl: string | null; matchMethod: AnchorMatchMethod; confidence: number }> {
+  const renderScale = 2.4
+  const viewport = pageProxy.getViewport({ scale: renderScale })
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.floor(viewport.width))
+  canvas.height = Math.max(1, Math.floor(viewport.height))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    return { imageDataUrl: null, matchMethod: 'fallback', confidence: 0.3 }
+  }
+  await pageProxy.render({ canvasContext: ctx, viewport }).promise
+
+  const metrics = buildTextMetricsForAnchor(textItems, viewport, renderScale)
+  const fromText = resolveRectFromTextMetrics(anchor, metrics, viewport.width, viewport.height)
+  const fromBbox = resolveRectFromBboxHint(anchor, viewport.width, viewport.height, renderScale)
+  let rectCandidate = fromBbox
+  let matchMethod: AnchorMatchMethod = 'fallback'
+  let confidence = 0.3
+
+  if (fromBbox && fromText) {
+    const pageArea = Math.max(1, viewport.width * viewport.height)
+    const iou = rectIoU(fromBbox.rect, fromText.rect)
+    const bboxCoverRatio = rectArea(fromBbox.rect) / pageArea
+    const textCoverRatio = rectArea(fromText.rect) / pageArea
+    const preferText =
+      fromText.method === 'quote_exact'
+      && (
+        bboxCoverRatio >= 0.74
+        || (iou < 0.08 && bboxCoverRatio >= 0.58 && textCoverRatio <= 0.24)
+      )
+    if (preferText) {
+      rectCandidate = { rect: fromText.rect, confidence: fromText.confidence }
+      matchMethod = fromText.method
+      confidence = fromText.confidence
+    } else {
+      rectCandidate = fromBbox
+      matchMethod = 'bbox_hint'
+      confidence = fromBbox.confidence
+    }
+  } else if (fromBbox) {
+    rectCandidate = fromBbox
+    matchMethod = 'bbox_hint'
+    confidence = fromBbox.confidence
+  } else if (fromText) {
+    rectCandidate = { rect: fromText.rect, confidence: fromText.confidence }
+    matchMethod = fromText.method
+    confidence = fromText.confidence
+  }
+
+  const fullRect = { x: 0, y: 0, width: viewport.width, height: viewport.height }
+  const rect = rectCandidate?.rect || fullRect
+  const pageArea = Math.max(1, viewport.width * viewport.height)
+  const padX = Math.max(18, rect.width * 0.2)
+  const padY = Math.max(26, rect.height * 0.52)
+  const minCropWidth = Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
+  const minCropHeight = Math.min(viewport.height * 0.78, Math.max(rect.height + padY * 2, viewport.height * 0.28))
+  const targetWidth = Math.min(canvas.width, Math.max(1, minCropWidth))
+  const targetHeight = Math.min(canvas.height, Math.max(1, minCropHeight))
+  const centerX = rect.x + rect.width / 2
+  const centerY = rect.y + rect.height / 2 + Math.min(40, rect.height * 0.18)
+  const cropRect = clampRect(
+    {
+      x: Math.max(0, Math.min(canvas.width - targetWidth, centerX - targetWidth / 2)),
+      y: Math.max(0, Math.min(canvas.height - targetHeight, centerY - targetHeight / 2)),
+      width: targetWidth,
+      height: targetHeight,
+    },
+    canvas.width,
+    canvas.height,
+  ) || fullRect
+
+  const cropRatio = rectArea(cropRect) / pageArea
+  if (rectCandidate && cropRatio > 0.72 && confidence <= 0.72 && matchMethod !== 'bbox_hint') {
+    return { imageDataUrl: null, matchMethod, confidence: Math.max(0.45, confidence - 0.15) }
+  }
+
+  const maxOutputWidth = 1360
+  const outputScale = cropRect.width > maxOutputWidth ? maxOutputWidth / cropRect.width : 1
+  const outputCanvas = document.createElement('canvas')
+  outputCanvas.width = Math.max(1, Math.floor(cropRect.width * outputScale))
+  outputCanvas.height = Math.max(1, Math.floor(cropRect.height * outputScale))
+  const outputCtx = outputCanvas.getContext('2d')
+  if (!outputCtx) {
+    return { imageDataUrl: null, matchMethod, confidence }
+  }
+  outputCtx.drawImage(
+    canvas,
+    cropRect.x,
+    cropRect.y,
+    cropRect.width,
+    cropRect.height,
+    0,
+    0,
+    outputCanvas.width,
+    outputCanvas.height,
+  )
+
+  if (rectCandidate?.rect) {
+    const hx = (rect.x - cropRect.x) * outputScale
+    const hy = (rect.y - cropRect.y) * outputScale
+    const hw = rect.width * outputScale
+    const hh = rect.height * outputScale
+    outputCtx.fillStyle = 'rgba(245, 158, 11, 0.20)'
+    outputCtx.strokeStyle = 'rgba(245, 158, 11, 0.95)'
+    outputCtx.lineWidth = Math.max(2, Math.round(2 * outputScale))
+    outputCtx.fillRect(hx, hy, hw, hh)
+    outputCtx.strokeRect(hx, hy, hw, hh)
+  }
+
+  let imageDataUrl: string | null = null
+  try {
+    imageDataUrl = outputCanvas.toDataURL('image/webp', 0.82)
+  } catch {
+    imageDataUrl = outputCanvas.toDataURL('image/png')
+  }
+  return { imageDataUrl, matchMethod, confidence }
 }
 
 export default function PaperReaderPage() {
@@ -833,6 +1259,7 @@ export default function PaperReaderPage() {
   const [composedPayload, setComposedPayload] = useState<ReaderComposePayload | null>(null)
   const [composedQuality, setComposedQuality] = useState<ReaderComposeQualityReport | null>(null)
   const [composedCacheLabel, setComposedCacheLabel] = useState<string>('')
+  const [composeMaxIterations, setComposeMaxIterations] = useState<number>(DEFAULT_COMPOSE_MAX_ITERATIONS)
   const [composedRunSeed, setComposedRunSeed] = useState<number>(0)
   const [inlineQueryLoadingNodeId, setInlineQueryLoadingNodeId] = useState<string | null>(null)
   const [anchorPreview, setAnchorPreview] = useState<AnchorPreviewState>({
@@ -843,6 +1270,9 @@ export default function PaperReaderPage() {
     text: '',
     title: '',
     anchors: [],
+    image_data_url: null,
+    match_method: 'fallback',
+    match_confidence: 0,
   })
 
   const viewerRef = useRef<HTMLDivElement | null>(null)
@@ -857,6 +1287,12 @@ export default function PaperReaderPage() {
   })
   const inlineQueryStreamControllerRef = useRef<AbortController | null>(null)
   const annotationInputRef = useRef<any>(null)
+  const anchorPreviewCacheRef = useRef<Map<string, {
+    text: string
+    imageDataUrl: string | null
+    matchMethod: AnchorMatchMethod
+    confidence: number
+  }>>(new Map())
   const prefetchedPagesRef = useRef<Set<number>>(new Set())
   const [viewerWidth, setViewerWidth] = useState<number>(860)
   const pdfObjectUrlRef = useRef<string | null>(null)
@@ -1166,6 +1602,10 @@ export default function PaperReaderPage() {
       rawDetailLevel === 'concise' || rawDetailLevel === 'deep' ? rawDetailLevel : 'standard'
     const restoredCompareMode = Boolean(sessionAnchor.compare_mode)
     const restoredCitationTldr = Boolean(sessionAnchor.citation_tldr)
+    const restoredMaxIterations = Math.max(
+      4,
+      Math.min(24, Number(sessionAnchor.compose_max_iterations || DEFAULT_COMPOSE_MAX_ITERATIONS) || DEFAULT_COMPOSE_MAX_ITERATIONS),
+    )
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
@@ -1175,6 +1615,7 @@ export default function PaperReaderPage() {
     setDetailLevel(restoredDetailLevel)
     setCompareMode(restoredCompareMode)
     setCitationTldr(restoredCitationTldr)
+    setComposeMaxIterations(restoredMaxIterations)
     setGenerativeStyleTuning(
       normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[restoredStyleKey].bodyLineHeight),
     )
@@ -1205,6 +1646,7 @@ export default function PaperReaderPage() {
         compare_mode: restoredCompareMode,
         citation_tldr: restoredCitationTldr,
         compose_quality_target: 0.86,
+        compose_max_iterations: restoredMaxIterations,
       },
     })
     setReaderAutoSaveStatus('saved')
@@ -1423,6 +1865,7 @@ export default function PaperReaderPage() {
           detail_level: detailLevel,
           compare_mode: compareMode,
           citation_tldr: citationTldr,
+          max_iterations: composeMaxIterations,
         },
         (event, data) => {
           if (controller.signal.aborted) return
@@ -1508,6 +1951,7 @@ export default function PaperReaderPage() {
     detailLevel,
     compareMode,
     citationTldr,
+    composeMaxIterations,
     composedRunSeed,
   ])
 
@@ -1526,6 +1970,7 @@ export default function PaperReaderPage() {
         detail_level: detailLevel,
         compare_mode: compareMode,
         citation_tldr: citationTldr,
+        max_iterations: Math.max(4, composeMaxIterations - 2),
       })
       .then((result) => {
         if (Array.isArray(result.queued)) {
@@ -1546,6 +1991,7 @@ export default function PaperReaderPage() {
     detailLevel,
     compareMode,
     citationTldr,
+    composeMaxIterations,
   ])
 
   useEffect(() => {
@@ -1563,6 +2009,7 @@ export default function PaperReaderPage() {
         compare_mode: compareMode,
         citation_tldr: citationTldr,
         compose_quality_target: 0.86,
+        compose_max_iterations: composeMaxIterations,
       },
       updated_at: new Date().toISOString(),
     })
@@ -1578,6 +2025,7 @@ export default function PaperReaderPage() {
     detailLevel,
     compareMode,
     citationTldr,
+    composeMaxIterations,
   ])
 
   useEffect(() => {
@@ -1596,6 +2044,7 @@ export default function PaperReaderPage() {
         compare_mode: compareMode,
         citation_tldr: citationTldr,
         compose_quality_target: 0.86,
+        compose_max_iterations: composeMaxIterations,
       },
     }
     const signature = JSON.stringify(payload)
@@ -1634,6 +2083,7 @@ export default function PaperReaderPage() {
     detailLevel,
     compareMode,
     citationTldr,
+    composeMaxIterations,
   ])
 
   useEffect(() => {
@@ -2196,14 +2646,16 @@ export default function PaperReaderPage() {
     anchors: ReaderComponentSourceAnchor[],
     options?: { pinPreview?: boolean },
   ) => {
-    const anchor = pickPrimaryAnchor(anchors)
+    const anchor = pickPrimaryAnchor(anchors, readPage)
     if (!anchor) return
+    const previewKey = buildPreviewKey(anchor)
+    const cached = anchorPreviewCacheRef.current.get(previewKey)
     const nextPinned = Boolean(options?.pinPreview)
-    const previewText = buildPreviewTextFromAnchor(anchor)
+    const previewText = cached?.text || buildPreviewTextFromAnchor(anchor)
     setAnchorPreview({
       visible: true,
       pinned: nextPinned,
-      loading: !previewText,
+      loading: !cached && !previewText,
       page: Number(anchor.page || readPage),
       text: previewText || '正在加载该锚点原文片段...',
       title: `原文证据 · 第 ${Number(anchor.page || readPage)} 页`,
@@ -2213,12 +2665,26 @@ export default function PaperReaderPage() {
       setReadPage(Number(anchor.page))
     }
 
-    if (!previewText && pdfDoc && Number(anchor.page || 0) > 0) {
+    setAnchorPreview({
+      visible: true,
+      pinned: nextPinned,
+      loading: !cached && !previewText,
+      page: Number(anchor.page || readPage),
+      text: previewText || 'Loading evidence snippet...',
+      title: `Evidence · Page ${Number(anchor.page || readPage)}`,
+      anchors,
+      image_data_url: cached?.imageDataUrl ?? null,
+      match_method: cached?.matchMethod || 'fallback',
+      match_confidence: cached?.confidence || 0,
+    })
+
+    if (pdfDoc && Number(anchor.page || 0) > 0 && !cached) {
       const targetPage = Number(anchor.page)
       void (async () => {
         try {
-          const page = await pdfDoc.getPage(targetPage)
-          const textContent = await page.getTextContent()
+          const pageProxy = await pdfDoc.getPage(targetPage)
+          const textContent = await pageProxy.getTextContent()
+          const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
           const extracted = extractAcademicPageText(textContent)
           const fallback = Array.isArray(textContent?.items)
             ? textContent.items
@@ -2229,11 +2695,26 @@ export default function PaperReaderPage() {
             : ''
           const source = extracted || fallback
           const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
+          const rendered = await renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+          anchorPreviewCacheRef.current.set(previewKey, {
+            text: resolvedText,
+            imageDataUrl: rendered.imageDataUrl,
+            matchMethod: rendered.matchMethod,
+            confidence: rendered.confidence,
+          })
+          if (anchorPreviewCacheRef.current.size > 120) {
+            const oldestKey = anchorPreviewCacheRef.current.keys().next().value
+            if (oldestKey) anchorPreviewCacheRef.current.delete(oldestKey)
+          }
           setAnchorPreview((prev) => {
             if (!prev.visible) return prev
+            if (Number(prev.page || 0) !== targetPage) return prev
             return {
               ...prev,
               loading: false,
+              image_data_url: rendered.imageDataUrl,
+              match_method: rendered.matchMethod,
+              match_confidence: rendered.confidence,
               text: resolvedText || prev.text || '未检索到可展示的原文片段。',
             }
           })
@@ -2300,6 +2781,110 @@ export default function PaperReaderPage() {
     if (!markdown.trim()) return
     appendMarkdownToAnnotation(markdown)
     message.success('组件内容已放入批注草稿')
+  }
+
+  const renderAnchorEvidenceCard = () => {
+    const methodLabelMap: Record<AnchorMatchMethod, string> = {
+      bbox_hint: 'Layout bbox',
+      quote_exact: 'Quote exact',
+      quote_fuzzy: 'Quote fuzzy',
+      char_range: 'Char range',
+      fallback: 'Fallback',
+    }
+    const method = anchorPreview.match_method || 'fallback'
+    const confidence = Math.max(0, Math.min(1, Number(anchorPreview.match_confidence || 0)))
+    return (
+      <Card
+        className="reader-composed-preview"
+        size="small"
+        title={anchorPreview.title || `Evidence · Page ${readPage}`}
+        style={{
+          marginTop: 8,
+          borderRadius: 12,
+          border: `1px solid ${activeGenerativeStyle.borderColor}`,
+          background: activeGenerativeStyle.panelBackground,
+          color: activeGenerativeStyle.bodyColor,
+        }}
+        extra={(
+          <Space size={8}>
+            {anchorPreview.pinned ? <Tag color="blue">Pinned</Tag> : null}
+            <Button
+              size="small"
+              disabled={!anchorPreview.visible}
+              onClick={() => {
+                const targetPage = Number(anchorPreview.page || 0)
+                if (targetPage > 0) setReadPage(targetPage)
+              }}
+            >
+              跳转
+            </Button>
+            <Button
+              size="small"
+              onClick={() => {
+                setAnchorPreview((prev) => ({ ...prev, visible: false, pinned: false, loading: false }))
+              }}
+            >
+              关闭
+            </Button>
+          </Space>
+        )}
+      >
+        <div style={{ maxHeight: 'min(62vh, 640px)', overflowY: 'auto', paddingRight: 4 }}>
+          <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
+            悬停或点击左侧带锚点组件后，这里会显示 PDF 局部证据和命中区域。
+          </Text>
+          {!anchorPreview.visible ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前暂无证据预览" />
+          ) : anchorPreview.loading ? (
+            <div className="h-[120px] flex items-center justify-center">
+              <Spin size="small" />
+            </div>
+          ) : (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Space size={8} wrap>
+                <Tag color="blue">{methodLabelMap[method] || methodLabelMap.fallback}</Tag>
+                <Tag color={confidence >= 0.8 ? 'green' : confidence >= 0.6 ? 'gold' : 'red'}>
+                  置信度: {Math.round(confidence * 100)}%
+                </Tag>
+              </Space>
+              {anchorPreview.image_data_url ? (
+                <img
+                  src={anchorPreview.image_data_url}
+                  alt="anchor-evidence"
+                  style={{
+                    width: '100%',
+                    maxHeight: '52vh',
+                    display: 'block',
+                    margin: '0 auto',
+                    borderRadius: 10,
+                    border: `1px solid ${activeGenerativeStyle.borderColor}`,
+                    imageRendering: 'auto',
+                    objectFit: 'contain',
+                    background: '#fff',
+                  }}
+                />
+              ) : null}
+              <div
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  lineHeight: 1.75,
+                  maxHeight: 220,
+                  overflowY: 'auto',
+                  color: activeGenerativeStyle.bodyColor,
+                  fontSize: 14,
+                  borderRadius: 10,
+                  border: `1px solid ${activeGenerativeStyle.borderColor}`,
+                  padding: '10px 12px',
+                  background: activeGenerativeStyle.pageBackground,
+                }}
+              >
+                {anchorPreview.text || '暂无可展示的锚点原文。'}
+              </div>
+            </Space>
+          )}
+        </div>
+      </Card>
+    )
   }
 
   const renderAnswerWithCitations = () => {
@@ -2387,6 +2972,17 @@ export default function PaperReaderPage() {
                 {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
                 {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
                 {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
+                {composedQuality?.mm_assist_used ? (
+                  <Tag color="magenta">
+                    MM: {composedQuality.mm_model || 'enabled'}
+                    {composedQuality.mm_fallback_used ? ' (fallback)' : ''}
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.cross_column_merge_ratio === 'number' ? (
+                  <Tag color={composedQuality.cross_column_merge_ratio <= 0.08 ? 'green' : 'gold'}>
+                    跨栏 {(composedQuality.cross_column_merge_ratio * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
               </Space>
               <Space size={8} wrap>
                 <Select
@@ -2878,6 +3474,8 @@ export default function PaperReaderPage() {
   }
   const panelListStyle: CSSProperties = {
     padding: '12px 14px',
+    maxHeight: 'min(64vh, 660px)',
+    overflowY: 'auto',
   }
   const renderThreeTierPanel = (
     title: string,
@@ -3097,6 +3695,7 @@ export default function PaperReaderPage() {
                         新增批注
                       </Button>
                     </Space>,
+                    <Space direction="vertical" size={10} style={{ width: '100%' }}>
                     <List
                       size="small"
                       dataSource={annotations}
@@ -3116,7 +3715,9 @@ export default function PaperReaderPage() {
                           </Space>
                         </List.Item>
                       )}
-                    />,
+                    />
+                    {renderAnchorEvidenceCard()}
+                    </Space>,
                   )
                 ),
               },
@@ -3384,6 +3985,7 @@ export default function PaperReaderPage() {
 
       <div
         style={{
+          display: 'none',
           position: 'fixed',
           bottom: 32,
           right: 'calc(33.33vw + 24px)',

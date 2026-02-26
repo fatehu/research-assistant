@@ -138,7 +138,7 @@ class Settings(BaseSettings):
 
     # ReAct
     react_max_iterations: int = 10
-    literature_agent_max_iterations: int = 8
+    literature_agent_max_iterations: int = 14
     react_temperature: float = 0.7
     react_output_max_length: int = 500
     agent_function_calling_enabled: bool = True
@@ -207,6 +207,20 @@ class Settings(BaseSettings):
     # PDF layout parser
     pdf_layout_parser: Literal["auto", "markitdown", "docling", "none"] = "auto"
     pdf_layout_min_chars: int = 200
+    # Reader compose：多模态仅用于结构裁决（不做正文改写）。
+    reader_mm_assist_enabled: bool = True
+    reader_mm_primary_model: str = "qwen3.5-flash"
+    reader_mm_fallback_model: str = "qwen3-vl-flash"
+    reader_mm_timeout_ms: int = 6000
+    reader_mm_max_calls_per_page: int = 1
+    reader_mm_trigger_confidence: float = 0.62
+    reader_mm_max_doc_trigger_ratio: float = 0.08
+    reader_mm_prompt_version: str = "mm_layout_v1"
+    reader_mm_layout_schema_version: str = "mm_layout_schema_v1"
+    # 兼容旧配置键（后续可移除）。
+    reader_multimodal_enabled: bool = False
+    # Reader compose: 外网补图默认关闭，避免引入与文本模型能力不匹配的链路。
+    reader_external_image_enabled: bool = False
 
     def get_llm_config(self, provider: str = None):
         provider = provider or self.default_llm_provider

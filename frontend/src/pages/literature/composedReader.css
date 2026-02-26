@@ -1,0 +1,87 @@
+.reader-composed-surface,
+.reader-composed-preview {
+  --reader-card-bg: rgba(255, 255, 255, 0.9);
+  --reader-card-border: rgba(101, 154, 244, 0.22);
+  --reader-text: #14223b;
+  --reader-heading: #102a50;
+  --reader-link-bg: rgba(22, 119, 255, 0.08);
+  --reader-link-border: rgba(22, 119, 255, 0.2);
+}
+
+.reader-composed-surface .ant-card,
+.reader-composed-preview .ant-card,
+.reader-composed-preview.ant-card {
+  background: var(--reader-card-bg) !important;
+  border-color: var(--reader-card-border) !important;
+  color: var(--reader-text) !important;
+}
+
+.reader-composed-surface .ant-card:hover,
+.reader-composed-preview .ant-card:hover,
+.reader-composed-preview.ant-card:hover {
+  transform: none !important;
+  box-shadow: inherit !important;
+}
+
+.reader-composed-surface .ant-card .ant-card-head,
+.reader-composed-preview .ant-card .ant-card-head,
+.reader-composed-preview.ant-card .ant-card-head {
+  background: transparent !important;
+  border-bottom-color: var(--reader-card-border) !important;
+}
+
+.reader-composed-surface .ant-card .ant-card-head-title,
+.reader-composed-preview .ant-card .ant-card-head-title,
+.reader-composed-preview.ant-card .ant-card-head-title {
+  color: var(--reader-heading) !important;
+}
+
+.reader-composed-surface .ant-typography,
+.reader-composed-preview .ant-typography,
+.reader-composed-surface .ant-list-item,
+.reader-composed-preview .ant-list-item,
+.reader-composed-surface .ant-list-item-meta-title,
+.reader-composed-preview .ant-list-item-meta-title {
+  color: var(--reader-text) !important;
+}
+
+.reader-composed-surface .ant-typography-secondary,
+.reader-composed-preview .ant-typography-secondary {
+  color: var(--reader-text) !important;
+  opacity: 0.72;
+}
+
+.reader-composed-surface .ant-list-item,
+.reader-composed-preview .ant-list-item {
+  border-block-end-color: var(--reader-card-border) !important;
+}
+
+.reader-composed-surface .ant-btn-default,
+.reader-composed-surface .ant-btn-dashed,
+.reader-composed-surface .ant-btn-link,
+.reader-composed-preview .ant-btn-default,
+.reader-composed-preview .ant-btn-dashed,
+.reader-composed-preview .ant-btn-link {
+  color: var(--reader-text) !important;
+  border-color: var(--reader-card-border) !important;
+  background: var(--reader-card-bg) !important;
+}
+
+.reader-composed-surface .ant-btn-link,
+.reader-composed-preview .ant-btn-link {
+  background: transparent !important;
+}
+
+.reader-composed-surface .reader-action-bar {
+  opacity: 0.86;
+}
+
+.reader-composed-popover .ant-popover-inner {
+  background: var(--reader-card-bg) !important;
+  border: 1px solid var(--reader-card-border) !important;
+}
+
+.reader-composed-popover .ant-popover-inner-content,
+.reader-composed-popover .ant-typography {
+  color: var(--reader-text) !important;
+}
