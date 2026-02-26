@@ -444,52 +444,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     }
 
     case 'SectionTOC': {
-      const rawItems = Array.isArray(props.items) ? props.items : []
-      const hiddenReason = asString((props as Record<string, unknown>).hidden_reason)
-      const items = rawItems.map((row) => {
-        if (typeof row === 'string') {
-          return { title: row, anchor: [] as ReaderComponentSourceAnchor[] }
-        }
-        if (row && typeof row === 'object') {
-          const rec = row as Record<string, unknown>
-          return {
-            title: asString(rec.title || rec.text),
-            anchor: normalizeAnchorRows(rec.anchor),
-          }
-        }
-        return { title: '', anchor: [] as ReaderComponentSourceAnchor[] }
-      }).filter((item) => item.title)
-      return (
-        <Card size="small" title="章节目录" style={baseCardStyle(ctx)}>
-          {hiddenReason ? (
-            <Alert
-              showIcon
-              type="info"
-              message={hiddenReason}
-              style={{ marginBottom: 10 }}
-            />
-          ) : null}
-          <List
-            size="small"
-            dataSource={items}
-            renderItem={(item, idx) => (
-              <List.Item key={`toc-${idx}`}>
-                <Button
-                  type="link"
-                  size="small"
-                  onClick={() => {
-                    const anchors = item.anchor.length > 0 ? item.anchor : anchorRefs
-                    ctx.onJumpAnchor?.(anchors, { pinPreview: true })
-                  }}
-                >
-                  {item.title}
-                </Button>
-              </List.Item>
-            )}
-          />
-          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
-        </Card>
-      )
+      // 按页目录卡已下线。兼容旧缓存时直接跳过渲染，避免出现“空目录占位”。
+      return null
     }
 
     case 'SectionHeading': {
