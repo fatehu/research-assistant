@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v1"
+COMPOSE_ENGINE_VERSION = "reader_compose_v2"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v1"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
