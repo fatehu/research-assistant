@@ -743,6 +743,116 @@ async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypa
     assert "side_context" in channels
 
 
+@pytest.mark.asyncio
+async def test_generate_takeaways_should_use_neighbor_context(monkeypatch):
+    service = LiteratureReaderComposeService()
+
+    class _StubLLM:
+        async def chat(self, **_kwargs):
+            return {
+                "content": json.dumps(
+                    {
+                        "items": [
+                            {"text": "模型在当前页给出了可迁移的核心实验结论。"},
+                            {"text": "上一页背景用于解释当前页结论成立条件。"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            }
+
+    async def _fake_get_llm_service():
+        return _StubLLM()
+
+    monkeypatch.setattr(
+        "app.services.literature_reader_compose_service.get_llm_service",
+        _fake_get_llm_service,
+    )
+
+    rows = await service._generate_takeaways_from_context_rows(
+        context_rows=[
+            (
+                1,
+                {
+                    "blocks": [
+                        {
+                            "id": "b1",
+                            "kind": "paragraph",
+                            "text": "Page one context paragraph.",
+                            "source_anchor": {"page": 1, "start_char": 0, "end_char": 24},
+                        }
+                    ]
+                },
+            ),
+            (
+                2,
+                {
+                    "blocks": [
+                        {
+                            "id": "b1",
+                            "kind": "paragraph",
+                            "text": "Current page core finding paragraph.",
+                            "source_anchor": {"page": 2, "start_char": 10, "end_char": 48},
+                        }
+                    ]
+                },
+            ),
+            (
+                3,
+                {
+                    "blocks": [
+                        {
+                            "id": "b1",
+                            "kind": "paragraph",
+                            "text": "Next page supporting statement.",
+                            "source_anchor": {"page": 3, "start_char": 5, "end_char": 36},
+                        }
+                    ]
+                },
+            ),
+        ],
+        current_page=2,
+        detail_level="standard",
+    )
+
+    assert len(rows) == 2
+    assert "核心实验结论" in str(rows[0].get("text") or "")
+    assert all((row.get("evidence_anchors") or []) == [] for row in rows)
+
+
+def test_build_initial_ui_plan_should_prefer_takeaways_from_payload():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=31, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)
+    ui_plan = service._build_initial_ui_plan(
+        paper=paper,
+        page=1,
+        base_payload={
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "source_anchor": {"page": 1, "start_char": 0, "end_char": 14}}],
+            "assets": [],
+            "summary": "This summary should not be used...",
+            "style_cues": {},
+            "toc_quality": 0.8,
+            "toc_hidden": False,
+            "takeaways": [
+                {
+                    "text": "该页的关键结论已经由 AI 概括完成",
+                    "evidence_anchors": [{"page": 1, "start_char": 0, "end_char": 14}],
+                }
+            ],
+        },
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    takeaway_nodes = [node for node in ui_plan.get("components") or [] if node.get("type") == "KeyTakeaways"]
+    assert takeaway_nodes
+    items = (takeaway_nodes[0].get("props") or {}).get("items") or []
+    assert items
+    assert "由 AI 概括完成" in str(items[0].get("text") or "")
+
+
 def test_reader_compose_should_not_render_page_toc_when_low_quality():
     service = LiteratureReaderComposeService()
     paper = SimpleNamespace(id=21, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)

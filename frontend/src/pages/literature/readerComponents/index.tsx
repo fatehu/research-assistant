@@ -672,14 +672,12 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const itemRows = rows.length > 0
         ? rows.map((row) => ({
           text: asString(row.text || row.title || row.value),
-          evidenceAnchors: normalizeAnchorRows(row.evidence_anchors),
         }))
-        : asStringArray(props.items).map((text) => ({ text, evidenceAnchors: [] as ReaderComponentSourceAnchor[] }))
+        : asStringArray(props.items).map((text) => ({ text }))
       return (
         <Card size="small" title="关键要点" style={baseCardStyle(ctx)}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {itemRows.map((item, idx) => {
-              const hasAnchors = item.evidenceAnchors.length > 0 || anchorRefs.length > 0
               return (
                 <div
                   key={`take-${idx}`}
@@ -714,18 +712,6 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                   </div>
                   <div style={{ flex: 1, lineHeight: 1.8 }}>
                     <Text style={{ fontSize: 15, color: ctx?.themeStyle?.bodyColor }}>{item.text}</Text>
-                    {hasAnchors ? (
-                      <div style={{ marginTop: 8 }}>
-                        <Button
-                          size="small"
-                          type="dashed"
-                          icon={<LinkOutlined />}
-                          onClick={() => ctx.onJumpAnchor?.(item.evidenceAnchors.length > 0 ? item.evidenceAnchors : anchorRefs, { pinPreview: true })}
-                        >
-                          定位到证据
-                        </Button>
-                      </div>
-                    ) : null}
                   </div>
                 </div>
               )
