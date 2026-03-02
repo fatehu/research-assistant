@@ -3267,6 +3267,61 @@ async def test_simplified_pipeline_stage2_fail_should_use_deterministic_baseline
     assert len(list(ui_plan.get("components") or [])) > 0
 
 
+def test_single_agent_step_result_listblock_object_items_are_sanitized():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._step_result_to_ui_plan(  # pylint: disable=protected-access
+        page=3,
+        step_result={
+            "classification": {"items": [{"layout_id": "L1", "bucket": "main_content"}]},
+            "cleaning": {"items": [{"layout_id": "L1", "source_text": "alpha", "normalized_text": "alpha"}]},
+            "ui_plan_draft": {
+                "components": [
+                    {
+                        "component": "ListBlock",
+                        "source_block_ids": ["L1"],
+                        "props": {
+                            "items": [
+                                {"content": "first"},
+                                {"text": "second"},
+                                "third",
+                                4,
+                            ]
+                        },
+                    }
+                ],
+                "layout_tokens": {},
+            },
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "L1",
+                "source_text": "fallback text",
+                "type": "text",
+                "subType": "para",
+                "block_ids": ["p3_b1"],
+            }
+        ],
+        layout_to_block_ids={"L1": ["p3_b1"]},
+        base_payload={
+            "blocks": [
+                {
+                    "id": "p3_b1",
+                    "text": "fallback text",
+                    "source_anchor": {"page": 3, "start_char": 0, "end_char": 12},
+                }
+            ]
+        },
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+    components = list((ui_plan.get("components") or []))
+    assert len(components) == 1
+    assert str((components[0] or {}).get("type") or "") == "ListBlock"
+    assert list(((components[0] or {}).get("props") or {}).get("items") or []) == ["first", "second", "third", "4"]
+
+
 @pytest.mark.asyncio
 async def test_reader_composed_soft_disabled_endpoints(monkeypatch):
     monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")

@@ -774,6 +774,21 @@ function insertNodeAfterInTree(
   return output
 }
 
+function findNodeInTree(
+  nodes: ReaderComponentNode[],
+  nodeId: string,
+): ReaderComponentNode | null {
+  for (const node of nodes) {
+    if (String(node.id) === String(nodeId)) return node
+    const children = Array.isArray(node.children) ? node.children : []
+    if (children.length > 0) {
+      const found = findNodeInTree(children, nodeId)
+      if (found) return found
+    }
+  }
+  return null
+}
+
 function normalizeAnchorMatchText(value: string): string {
   return String(value || '')
     .replace(/\s+/g, ' ')
@@ -2951,13 +2966,19 @@ export default function PaperReaderPage() {
     let aggregatedAnswer = ''
     let sourceRows: ReaderInlineQuerySource[] = []
     let inserted = false
+    const targetRef = String(((node.props || {}) as Record<string, unknown>).target_node_ref || '').trim()
+    const requestNodeId = (
+      String(node.type || '') === 'InlineQuerySlot' && targetRef
+        ? targetRef
+        : String(node.id)
+    )
 
     try {
       await literatureApi.streamReaderComposedInlineQuery(
         parsedPaperId,
         {
           page: readPage,
-          node_id: String(node.id),
+          node_id: requestNodeId,
           question: compactQuestion,
           scope: 'section',
           selected_kb_id: selectedKbId,
@@ -3585,13 +3606,25 @@ export default function PaperReaderPage() {
                       appendMarkdownToAnnotation(markdown)
                     },
                     onManualInsertSlot: (nodeId) => {
+                      const targetNode = activeComposedPlan
+                        ? findNodeInTree(activeComposedPlan.components || [], String(nodeId))
+                        : null
+                      const inheritedBlockIds = Array.isArray(targetNode?.source_block_ids)
+                        ? targetNode.source_block_ids
+                        : []
+                      const inheritedAnchors = Array.isArray(targetNode?.source_anchor_refs)
+                        ? targetNode.source_anchor_refs
+                        : []
                       const slotNode: ReaderComponentNode = {
                         id: `manual-slot-${Date.now()}`,
                         type: 'InlineQuerySlot',
-                        props: { placeholder: '请输入您关于上述段落的疑问...' },
+                        props: {
+                          placeholder: '请输入您关于上述段落的疑问...',
+                          target_node_ref: String(nodeId),
+                        },
                         children: [],
-                        source_block_ids: [String(nodeId)],
-                        source_anchor_refs: [],
+                        source_block_ids: inheritedBlockIds,
+                        source_anchor_refs: inheritedAnchors,
                       }
                       applyNodeInsertToComposeState(nodeId, slotNode)
                     },

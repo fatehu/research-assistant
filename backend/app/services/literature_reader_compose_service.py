@@ -1153,12 +1153,12 @@ class LiteratureReaderComposeService:
             if not source_block_ids:
                 continue
 
+            first_layout_id = source_layout_ids[0]
+            fallback_text = self._normalize_spaces(
+                cleaned_text_map.get(first_layout_id) or str((docmind_map.get(first_layout_id) or {}).get("source_text") or "")
+            )
             props = dict(row.get("props") or {})
             if not props:
-                first_layout_id = source_layout_ids[0]
-                fallback_text = self._normalize_spaces(
-                    cleaned_text_map.get(first_layout_id) or str((docmind_map.get(first_layout_id) or {}).get("source_text") or "")
-                )
                 if component_name == "SectionHeading":
                     props = {"text": fallback_text or "Untitled", "level": 2}
                 elif component_name == "ListBlock":
@@ -1167,6 +1167,36 @@ class LiteratureReaderComposeService:
                     props = {"title": "Context", "items": [{"text": fallback_text}] if fallback_text else []}
                 else:
                     props = {"text": fallback_text}
+            elif component_name == "ListBlock":
+                # Frontend contract requires ListBlock.props.items to be string[].
+                # Model outputs may include object rows (for example {"content": "..."}).
+                raw_items = props.get("items")
+                normalized_items: List[str] = []
+                if isinstance(raw_items, list):
+                    for item in raw_items:
+                        text = ""
+                        if isinstance(item, dict):
+                            text = self._normalize_spaces(
+                                str(
+                                    item.get("text")
+                                    or item.get("content")
+                                    or item.get("label")
+                                    or item.get("value")
+                                    or item.get("title")
+                                    or ""
+                                )
+                            )
+                        else:
+                            text = self._normalize_spaces(str(item or ""))
+                        if text:
+                            normalized_items.append(text)
+                elif raw_items is not None:
+                    text = self._normalize_spaces(str(raw_items))
+                    if text:
+                        normalized_items.append(text)
+                if not normalized_items and fallback_text:
+                    normalized_items = [fallback_text]
+                props["items"] = normalized_items
 
             nodes.append(
                 {
@@ -3361,7 +3391,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "cross_column_merge",
                     "penalty": 0.12,
-                    "reason": "鐤戜技璺ㄦ爮姝ｆ枃鎷兼帴",
+                    "reason": "Detected possible cross-column body merge",
                 }
             )
             overall -= 0.12
@@ -3519,7 +3549,7 @@ class LiteratureReaderComposeService:
                 if str(item.get("kind") or "") != "link":
                     continue
                 href = str(item.get("href") or "")
-                label = str(item.get("label") or "閾炬帴")
+                label = str(item.get("label") or "链接")
                 item["tldr"] = self._build_link_tldr(
                     href=href,
                     label=label,
@@ -4689,7 +4719,7 @@ class LiteratureReaderComposeService:
             if snippet:
                 nearby_snippets.append(snippet)
         if nearby_snippets:
-            context_parts.append(f"鐩搁偦涓婁笅鏂囷細{' '.join(nearby_snippets[:3])}")
+            context_parts.append(f"相邻上下文：{' '.join(nearby_snippets[:3])}")
 
         anchors = self._resolve_inline_query_anchors(
             query_node=query_node,
@@ -6789,7 +6819,8 @@ class LiteratureReaderComposeService:
 
                 node_id = str(node.get("id") or "").strip()
                 if not node_id or node_id in seen_ids:
-                    # 缂哄け鎴栭噸澶?id 閮戒細瀵艰嚧鑺傜偣鍔ㄤ綔涓?patch 涓嶇ǔ瀹氾紝杩欓噷缁熶竴閲嶅缓銆?
+                    # Missing or duplicate node IDs make node-level patching unstable.
+                    # Rebuild a deterministic ID in one place.
                     node_id = _next_id(node_type)
                 node["id"] = node_id
                 seen_ids.add(node_id)
@@ -6883,7 +6914,8 @@ class LiteratureReaderComposeService:
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(anchor, dict):
             return None
-        # composed 鎸夐〉鏋勫缓锛岄敋鐐归〉鍙峰己鍒朵笌褰撳墠椤典竴鑷达紝閬垮厤璺ㄩ〉閿氱偣姹℃煋璇勫垎涓庡畾浣嶃€?
+        # Composed payload is page-scoped. Keep anchor page aligned to current page
+        # to avoid cross-page anchor contamination in scoring and jumps.
         page_no = self._safe_int(page, 1)
         start_char = self._safe_int(anchor.get("start_char"), 0)
         if start_char < 0:
