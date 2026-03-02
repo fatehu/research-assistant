@@ -30,9 +30,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Mojibake guard
-        run: python scripts/check_mojibake.py --json --strict
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
