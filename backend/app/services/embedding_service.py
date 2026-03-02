@@ -1,4 +1,4 @@
-﻿"""
+"""
 Embedding 服务 - 支持本地科研嵌入模型和云端 API
 
 支持的 Provider:

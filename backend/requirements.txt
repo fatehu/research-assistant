@@ -1,4 +1,4 @@
-# FastAPI 核心
+# FastAPI core
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.9
@@ -6,89 +6,60 @@ pydantic==2.9.0
 pydantic-settings==2.5.2
 email-validator==2.2.0
 
-# 数据库
+# Database
 sqlalchemy==2.0.35
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
 alembic==1.13.3
+pgvector==0.3.5
 
-# Redis
+# Cache
 redis==5.1.0
 
-# 认证
+# Auth
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 
-# LLM 集成
+# LLM and integrations
 openai==1.50.0
 httpx==0.27.0
 mcp==1.10.1
+alibabacloud-docmind-api20220711==1.4.13
 
-# 工具
+# Utilities
 python-dotenv==1.0.1
 tenacity==9.0.0
 jieba==0.42.1
 duckduckgo-search==8.1.1
 asteval==1.0.8
-
-# SSE 流式响应
+loguru==0.7.2
+aiofiles==23.2.1
 sse-starlette==2.1.0
 
-# 日志
-loguru==0.7.2
-
-# 其他
-aiofiles==23.2.1
-
-# 阶段2: 知识库相关
+# PDF parsing
 pypdf==4.0.0
 pdfplumber==0.10.3
-# Layout-aware PDF parsers (recommended for OCR-noise-heavy PDFs)
-# markitdown 需要 [pdf] extra 才支持 PDF 转换
 markitdown[pdf]>=0.1.4
-# docling>=2.73.0
 beautifulsoup4==4.12.3
 numpy==1.26.4
-pgvector==0.3.5
 
-# ========== 代码实验室 (CodeLab) 依赖 ==========
-# 数据科学核心
+# Data science
 pandas==2.2.0
 scipy==1.12.0
-
-# 可视化
 matplotlib==3.8.3
 seaborn==0.13.2
 plotly==5.19.0
-
-# 机器学习 (可选，根据需要取消注释)
-# scikit-learn==1.4.0
-# torch==2.2.0
-# transformers==4.37.0
-
-# ========== 本地嵌入模型依赖 ==========
-# sentence-transformers (自动安装 torch + transformers + huggingface_hub)
 sentence-transformers>=3.0.0
-# 如需指定 CPU 版 torch 以减小体积:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# 如需 CUDA 加速:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-# Jupyter 相关工具 (用于格式处理)
+# Notebook
 nbformat==5.9.2
 nbconvert==7.14.2
 
-# 代码格式化
+# Formatting
 black==24.2.0
 isort==5.13.2
 
-# 安全沙箱 (可选增强)
-# RestrictedPython==7.0
-
-# ========== 智能分块依赖 ==========
-# nest_asyncio 已移除 (Fix 3: 同步包装器安全化)
-
-# ========== 测试依赖 ==========
+# Tests
 pytest==8.0.0
 pytest-asyncio==0.23.0

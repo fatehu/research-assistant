@@ -1,4 +1,4 @@
-﻿# 论文阅读模块 Agentic 步数配置与跨语言 paper_read 检索增强测试记录
+# 论文阅读模块 Agentic 步数配置与跨语言 paper_read 检索增强测试记录
 
 - 时间：2026-02-16 07:10
 - 测试环境：Windows + PowerShell，本地代码工作区

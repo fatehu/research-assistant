@@ -1,4 +1,4 @@
-﻿"""Utilities for contextual retrieval and adjacent-window enrichment."""
+"""Utilities for contextual retrieval and adjacent-window enrichment."""
 
 from __future__ import annotations
 

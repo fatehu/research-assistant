@@ -54,6 +54,7 @@ import {
   PaperKnowledgeLinkStatusEventData,
   PaperRatingSummary,
   ReaderComposeAsset,
+  ReaderComponentPatchOp,
   ReaderComponentNode,
   ReaderComponentSourceAnchor,
   ReaderInlineQueryEvent,
@@ -75,6 +76,7 @@ import {
   GENERATIVE_STYLE_LABELS,
   GENERATIVE_STYLE_TOKENS,
   normalizeGenerativeStyleKey,
+  type GenerativeStyleTokens,
   type ReaderThemeMode,
   resolveGenerativeStyleTokens,
 } from './generativeStyles'
@@ -171,6 +173,30 @@ const DEFAULT_READER_STYLE_TUNING: ReaderGenerativeStyleTuning = {
   heading_scale: 1,
 }
 const DEFAULT_COMPOSE_MAX_ITERATIONS = 16
+
+function pickStyleTokenString(tokens: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = String(tokens[key] ?? '').trim()
+    if (value) return value
+  }
+  return ''
+}
+
+function pickStyleTokenNumber(tokens: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = Number(tokens[key])
+    if (Number.isFinite(value)) return value
+  }
+  return null
+}
+
+function mapComposeStyleIntentToKey(styleIntent: string, fallback: ReaderGenerativeStyleKey): ReaderGenerativeStyleKey {
+  const normalized = String(styleIntent || '').trim().toLowerCase()
+  if (normalized === 'clinical' || normalized === 'clinical_brief') return 'clinical_brief'
+  if (normalized === 'preprint' || normalized === 'preprint_modern') return 'preprint_modern'
+  if (normalized === 'journal' || normalized === 'journal_classic' || normalized === 'auto') return 'journal_classic'
+  return fallback
+}
 
 function normalizeReaderStyleTuning(
   raw: unknown,
@@ -607,7 +633,7 @@ type PendingSectionJump = {
 }
 
 type ReaderDetailLevel = 'concise' | 'standard' | 'deep'
-type AnchorMatchMethod = 'bbox_hint' | 'quote_exact' | 'quote_fuzzy' | 'char_range' | 'fallback'
+type AnchorMatchMethod = 'polygon' | 'bbox_hint' | 'quote_exact' | 'quote_fuzzy' | 'char_range' | 'fallback'
 
 type AnchorPreviewState = {
   visible: boolean
@@ -617,9 +643,12 @@ type AnchorPreviewState = {
   text: string
   title: string
   anchors: ReaderComponentSourceAnchor[]
+  anchor_index: number
+  anchor_count: number
   image_data_url?: string | null
   match_method?: AnchorMatchMethod
   match_confidence?: number
+  fallback_used?: boolean
 }
 
 function splitAnswerByCitation(answer: string): AnswerSegment[] {
@@ -765,12 +794,147 @@ function findAllOccurrences(source: string, query: string, limit = 64): number[]
   return output
 }
 
+function removeNodeInTree(
+  nodes: ReaderComponentNode[],
+  nodeId: string,
+): ReaderComponentNode[] {
+  const output: ReaderComponentNode[] = []
+  for (const node of nodes) {
+    if (node.id === nodeId) continue
+    const children = Array.isArray(node.children) ? node.children : []
+    output.push({
+      ...node,
+      children: children.length > 0 ? removeNodeInTree(children, nodeId) : children,
+    })
+  }
+  return output
+}
+
+function updateNodePropsInTree(
+  nodes: ReaderComponentNode[],
+  nodeId: string,
+  propsPatch: Record<string, unknown>,
+): ReaderComponentNode[] {
+  return nodes.map((node) => {
+    if (node.id === nodeId) {
+      return {
+        ...node,
+        props: {
+          ...(node.props || {}),
+          ...(propsPatch || {}),
+        },
+      }
+    }
+    const children = Array.isArray(node.children) ? node.children : []
+    if (children.length === 0) return node
+    return {
+      ...node,
+      children: updateNodePropsInTree(children, nodeId, propsPatch),
+    }
+  })
+}
+
+function reorderTopLevelNodes(
+  nodes: ReaderComponentNode[],
+  orderedNodeIds: string[],
+): ReaderComponentNode[] {
+  const idToNode = new Map(nodes.map((node) => [String(node.id), node]))
+  const ordered: ReaderComponentNode[] = []
+  const seen = new Set<string>()
+  for (const nodeId of orderedNodeIds) {
+    const key = String(nodeId || '').trim()
+    if (!key || seen.has(key)) continue
+    const node = idToNode.get(key)
+    if (!node) continue
+    ordered.push(node)
+    seen.add(key)
+  }
+  for (const node of nodes) {
+    const key = String(node.id || '')
+    if (seen.has(key)) continue
+    ordered.push(node)
+  }
+  return ordered
+}
+
+function applyComponentPatchOps(
+  nodes: ReaderComponentNode[],
+  ops: ReaderComponentPatchOp[],
+): ReaderComponentNode[] {
+  let next = [...nodes]
+  for (const op of Array.isArray(ops) ? ops : []) {
+    const kind = String(op?.op || '').trim()
+    if (kind === 'reorder_components') {
+      next = reorderTopLevelNodes(next, Array.isArray(op.ordered_component_ids) ? op.ordered_component_ids : [])
+      continue
+    }
+    if (kind === 'remove_component') {
+      const nodeId = String(op.component_id || '').trim()
+      if (!nodeId) continue
+      next = removeNodeInTree(next, nodeId)
+      continue
+    }
+    if (kind === 'update_component_props') {
+      const nodeId = String(op.component_id || '').trim()
+      if (!nodeId || !op.props_patch || typeof op.props_patch !== 'object') continue
+      next = updateNodePropsInTree(next, nodeId, op.props_patch)
+      continue
+    }
+    if (kind === 'insert_component') {
+      const node = op.component
+      if (!node || typeof node !== 'object') continue
+      const afterId = String(op.after_component_id || '').trim()
+      next = afterId ? insertNodeAfterInTree(next, afterId, node) : [...next, node]
+    }
+  }
+  return next
+}
+
+const ACTIONABLE_ANCHOR_MIN_CONFIDENCE = 0.78
+
+function isActionableAnchor(anchor: ReaderComponentSourceAnchor): boolean {
+  const start = Number(anchor.start_char || 0)
+  const end = Number(anchor.end_char || 0)
+  if (end <= start) return false
+  if (Number(anchor.segment_index || 0) > 0 || Number(anchor.segment_total || 0) > 0) return false
+  const canonicalBlockId = String(anchor.canonical_block_id || '').trim()
+  if (!canonicalBlockId) return false
+  const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
+  if (coordVersion !== 'anchor_v2') return false
+  const confidence = Number(anchor.anchor_confidence || 0)
+  if (confidence > 0 && confidence < ACTIONABLE_ANCHOR_MIN_CONFIDENCE) return false
+  return true
+}
+
+function sortAnchorsForPreview(
+  anchors: ReaderComponentSourceAnchor[],
+  preferredPage?: number,
+): ReaderComponentSourceAnchor[] {
+  const validAnchors = Array.isArray(anchors)
+    ? anchors.filter((item) => Number.isFinite(item.page) && Number(item.page) > 0 && isActionableAnchor(item))
+    : []
+  return [...validAnchors].sort((left, right) => {
+    const leftOnPage = Number(preferredPage || 0) > 0 && Number(left.page) === Number(preferredPage)
+    const rightOnPage = Number(preferredPage || 0) > 0 && Number(right.page) === Number(preferredPage)
+    if (leftOnPage !== rightOnPage) return leftOnPage ? -1 : 1
+    const leftSegment = Number(left.segment_index || 0)
+    const rightSegment = Number(right.segment_index || 0)
+    if (leftSegment > 0 && rightSegment > 0 && leftSegment !== rightSegment) {
+      return leftSegment - rightSegment
+    }
+    const leftStart = Number(left.start_char || 0)
+    const rightStart = Number(right.start_char || 0)
+    if (leftStart !== rightStart) return leftStart - rightStart
+    return Number(left.end_char || 0) - Number(right.end_char || 0)
+  })
+}
+
 function pickPrimaryAnchor(
   anchors: ReaderComponentSourceAnchor[],
   preferredPage?: number,
 ): ReaderComponentSourceAnchor | null {
   if (!Array.isArray(anchors) || anchors.length === 0) return null
-  const validAnchors = anchors.filter((item) => Number.isFinite(item.page) && Number(item.page) > 0)
+  const validAnchors = sortAnchorsForPreview(anchors, preferredPage)
   if (validAnchors.length === 0) return null
   const scored = validAnchors.map((item, idx) => {
     const span = Math.max(0, Number(item.end_char || 0) - Number(item.start_char || 0))
@@ -794,12 +958,26 @@ function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
   const bboxKey = bbox
     ? [bbox.x0, bbox.x1, bbox.top, bbox.bottom, bbox.page_width, bbox.page_height].map((n) => Number(n || 0)).join(':')
     : 'none'
+  const geometry = anchor.geometry
+  const polygonKey = geometry?.polygons
+    ? geometry.polygons
+      .map((poly) => (Array.isArray(poly?.points) ? poly.points : [])
+        .map((pt) => `${Number((pt as any)?.x || 0).toFixed(2)},${Number((pt as any)?.y || 0).toFixed(2)}`)
+        .join(';'))
+      .join('|')
+    : 'none'
   return [
     Number(anchor.page || 0),
     Number(anchor.start_char || 0),
     Number(anchor.end_char || 0),
+    String(anchor.canonical_block_id || anchor.anchor_v2?.canonical_block_id || ''),
+    String(anchor.coord_version || anchor.anchor_v2?.coord_version || ''),
+    String(anchor.anchor_id || ''),
+    Number(anchor.segment_index || 0),
+    Number(anchor.segment_total || 0),
     normalizeAnchorMatchText(String(anchor.quote_text || '')).slice(0, 320),
     bboxKey,
+    polygonKey.slice(0, 1024),
   ].join('|')
 }
 
@@ -816,6 +994,57 @@ function clampRect(
   const height = Math.max(1, Math.min(maxHeight, rect.height))
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null
   return { x, y, width, height }
+}
+
+type RenderPolygonPoint = { x: number; y: number }
+type RenderPolygon = { points: RenderPolygonPoint[] }
+
+function buildPolygonBounds(polygons: RenderPolygon[]): { x: number; y: number; width: number; height: number } | null {
+  const points = polygons.flatMap((poly) => poly.points)
+  if (points.length < 3) return null
+  const xs = points.map((p) => p.x)
+  const ys = points.map((p) => p.y)
+  const x0 = Math.min(...xs)
+  const x1 = Math.max(...xs)
+  const y0 = Math.min(...ys)
+  const y1 = Math.max(...ys)
+  if (!Number.isFinite(x0) || !Number.isFinite(x1) || !Number.isFinite(y0) || !Number.isFinite(y1)) return null
+  if (x1 <= x0 || y1 <= y0) return null
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+}
+
+function resolvePolygonsFromGeometry(
+  anchor: ReaderComponentSourceAnchor,
+  viewportWidth: number,
+  viewportHeight: number,
+  renderScale: number,
+): { polygons: RenderPolygon[]; rect: { x: number; y: number; width: number; height: number }; confidence: number } | null {
+  const geometry = anchor.geometry
+  if (!geometry || !Array.isArray(geometry.polygons) || geometry.polygons.length === 0) return null
+  const sourceWidth = Number(geometry.page_width || 0) > 0 ? Number(geometry.page_width) : viewportWidth / renderScale
+  const sourceHeight = Number(geometry.page_height || 0) > 0 ? Number(geometry.page_height) : viewportHeight / renderScale
+  const scaleX = sourceWidth > 0 ? viewportWidth / sourceWidth : 1
+  const scaleY = sourceHeight > 0 ? viewportHeight / sourceHeight : 1
+  const polygons: RenderPolygon[] = []
+
+  for (const poly of geometry.polygons) {
+    const rawPoints = Array.isArray(poly?.points) ? poly.points : []
+    const points: RenderPolygonPoint[] = rawPoints
+      .map((row) => ({ x: Number((row as any)?.x || 0) * scaleX, y: Number((row as any)?.y || 0) * scaleY }))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      .map((p) => ({
+        x: Math.max(0, Math.min(viewportWidth - 1, p.x)),
+        y: Math.max(0, Math.min(viewportHeight - 1, p.y)),
+      }))
+    if (points.length < 3) continue
+    polygons.push({ points })
+  }
+  if (polygons.length === 0) return null
+  const rect = buildPolygonBounds(polygons)
+  if (!rect) return null
+  const clampedRect = clampRect(rect, viewportWidth, viewportHeight)
+  if (!clampedRect) return null
+  return { polygons, rect: clampedRect, confidence: 0.94 }
 }
 
 function resolveRectFromBboxHint(
@@ -980,8 +1209,17 @@ function resolveRectFromTextMetrics(
   const hasQuote = quote.length > 0
 
   if (hasQuote) {
-    const quoteHits = findAllOccurrences(mergedLower, quote, 48)
-    if (quoteHits.length > 0) {
+    const probeList = [
+      quote,
+      quote.length > 220 ? quote.slice(0, 220).trim() : '',
+      quote.split(' ').slice(0, 20).join(' ').trim(),
+    ]
+      .map((item) => normalizeAnchorMatchText(item))
+      .filter((item, idx, arr) => item.length >= 18 && arr.indexOf(item) === idx)
+
+    for (const probe of probeList) {
+      const quoteHits = findAllOccurrences(mergedLower, probe, 48)
+      if (quoteHits.length === 0) continue
       const targetChar = Math.max(0, Number(anchor.start_char || 0))
       const quoteIdx =
         targetChar > 0
@@ -989,10 +1227,13 @@ function resolveRectFromTextMetrics(
             Math.abs(current - targetChar) < Math.abs(best - targetChar) ? current : best
           ), quoteHits[0])
           : quoteHits[0]
-      const quoteEnd = quoteIdx + quote.length
+      const quoteEnd = quoteIdx + probe.length
       const hitRows = metrics.rows.filter((row) => row.end > quoteIdx && row.start < quoteEnd)
       const rect = buildRectFromMetricRows(hitRows, viewportWidth, viewportHeight)
-      if (rect) return { rect, method: 'quote_exact', confidence: 0.85 }
+      if (rect) {
+        const confidence = probe === quote ? 0.85 : 0.8
+        return { rect, method: 'quote_exact', confidence }
+      }
     }
 
     const quoteTokens = quote.split(' ').filter((item) => item.length >= 4)
@@ -1020,19 +1261,28 @@ function resolveRectFromTextMetrics(
         }
       }
     }
+  }
+
+  // 当锚点包含可用 quote 但无法在当前页文本中对齐时，不再盲目退回 char_range，
+  // 以免出现“定位成功但位置错误”的假阳性证据框。
+  if (hasQuote && quote.length >= 24) {
     return null
   }
 
   const start = Math.max(0, Number(anchor.start_char || 0))
   const end = Math.max(start + 1, Number(anchor.end_char || start + 1))
   const span = end - start
-  if (end > start && span <= 2200) {
+  if (end > start) {
     const hitRows = metrics.rows.filter((row) => row.end > start && row.start < end)
-    const compactRows = hitRows.slice(0, 14)
+    const maxRows = span > 5200 ? 96 : span > 2800 ? 68 : span > 1400 ? 42 : 26
+    const compactRows = hitRows.slice(0, maxRows)
     const rect = buildRectFromMetricRows(compactRows, viewportWidth, viewportHeight)
     if (rect) {
       const ratio = rectArea(rect) / Math.max(1, viewportWidth * viewportHeight)
-      if (ratio <= 0.28) return { rect, method: 'char_range', confidence: 0.5 }
+      if (ratio <= 0.68) {
+        const confidence = span > 3200 ? 0.48 : 0.56
+        return { rect, method: 'char_range', confidence }
+      }
     }
   }
 
@@ -1046,13 +1296,22 @@ function buildAnchorPreviewSnippet(rawText: string, anchor: ReaderComponentSourc
   if (quote) {
     const lowerText = text.toLowerCase()
     const lowerQuote = quote.toLowerCase()
-    const quoteStart = lowerText.indexOf(lowerQuote)
-    if (quoteStart >= 0) {
+    const quoteHits = findAllOccurrences(lowerText, lowerQuote, 36)
+    if (quoteHits.length > 0) {
+      const targetChar = Math.max(0, Number(anchor.start_char || 0))
+      const quoteStart =
+        targetChar > 0
+          ? quoteHits.reduce((best, current) => (
+            Math.abs(current - targetChar) < Math.abs(best - targetChar) ? current : best
+          ), quoteHits[0])
+          : quoteHits[0]
       const quoteEnd = quoteStart + quote.length
       const previewStart = Math.max(0, quoteStart - 120)
       const previewEnd = Math.min(text.length, quoteEnd + 180)
       return text.slice(previewStart, previewEnd).replace(/\s+/g, ' ').trim()
     }
+    // quote 无法在当前抽取文本精确命中时，直接展示 quote，避免回退到错误 char_range。
+    return quote.length > 420 ? `${quote.slice(0, 420)}...` : quote
   }
   const start = Math.max(0, Math.min(text.length, Number(anchor.start_char || 0)))
   const end = Math.max(start + 1, Math.min(text.length, Number(anchor.end_char || start + 1)))
@@ -1065,7 +1324,7 @@ async function renderAnchorEvidenceImage(
   pageProxy: any,
   textItems: PdfTextItemLike[],
   anchor: ReaderComponentSourceAnchor,
-): Promise<{ imageDataUrl: string | null; matchMethod: AnchorMatchMethod; confidence: number }> {
+): Promise<{ imageDataUrl: string | null; matchMethod: AnchorMatchMethod; confidence: number; fallbackUsed: boolean }> {
   const renderScale = 2.4
   const viewport = pageProxy.getViewport({ scale: renderScale })
   const canvas = document.createElement('canvas')
@@ -1073,41 +1332,53 @@ async function renderAnchorEvidenceImage(
   canvas.height = Math.max(1, Math.floor(viewport.height))
   const ctx = canvas.getContext('2d')
   if (!ctx) {
-    return { imageDataUrl: null, matchMethod: 'fallback', confidence: 0.3 }
+    return { imageDataUrl: null, matchMethod: 'fallback', confidence: 0.3, fallbackUsed: true }
   }
   await pageProxy.render({ canvasContext: ctx, viewport }).promise
 
   const metrics = buildTextMetricsForAnchor(textItems, viewport, renderScale)
+  const fromPolygons = resolvePolygonsFromGeometry(anchor, viewport.width, viewport.height, renderScale)
   const fromText = resolveRectFromTextMetrics(anchor, metrics, viewport.width, viewport.height)
   const fromBbox = resolveRectFromBboxHint(anchor, viewport.width, viewport.height, renderScale)
-  let rectCandidate = fromBbox
+  const pageArea = Math.max(1, viewport.width * viewport.height)
+  const rawBboxCoverRatio = fromBbox ? (rectArea(fromBbox.rect) / pageArea) : 0
+  // Oversized bbox hints are usually wrong for paragraph-level evidence.
+  const effectiveBbox = rawBboxCoverRatio >= 0.56 ? null : fromBbox
+  let polygonCandidate: RenderPolygon[] | null = fromPolygons?.polygons || null
+  let rectCandidate = effectiveBbox
   let matchMethod: AnchorMatchMethod = 'fallback'
   let confidence = 0.3
 
-  if (fromBbox && fromText) {
-    const pageArea = Math.max(1, viewport.width * viewport.height)
-    const iou = rectIoU(fromBbox.rect, fromText.rect)
-    const bboxCoverRatio = rectArea(fromBbox.rect) / pageArea
+  if (fromPolygons) {
+    rectCandidate = { rect: fromPolygons.rect, confidence: fromPolygons.confidence }
+    matchMethod = 'polygon'
+    confidence = fromPolygons.confidence
+  } else if (effectiveBbox && fromText) {
+    const iou = rectIoU(effectiveBbox.rect, fromText.rect)
+    const bboxCoverRatio = rectArea(effectiveBbox.rect) / pageArea
     const textCoverRatio = rectArea(fromText.rect) / pageArea
-    const preferText =
+    const preferText = (
       fromText.method === 'quote_exact'
+      && textCoverRatio <= 0.46
       && (
-        bboxCoverRatio >= 0.74
-        || (iou < 0.08 && bboxCoverRatio >= 0.58 && textCoverRatio <= 0.24)
+        iou < 0.18
+        || bboxCoverRatio >= 0.44
+        || fromText.confidence >= 0.84
       )
+    )
     if (preferText) {
       rectCandidate = { rect: fromText.rect, confidence: fromText.confidence }
       matchMethod = fromText.method
       confidence = fromText.confidence
     } else {
-      rectCandidate = fromBbox
+      rectCandidate = effectiveBbox
       matchMethod = 'bbox_hint'
-      confidence = fromBbox.confidence
+      confidence = effectiveBbox.confidence
     }
-  } else if (fromBbox) {
-    rectCandidate = fromBbox
+  } else if (effectiveBbox) {
+    rectCandidate = effectiveBbox
     matchMethod = 'bbox_hint'
-    confidence = fromBbox.confidence
+    confidence = effectiveBbox.confidence
   } else if (fromText) {
     rectCandidate = { rect: fromText.rect, confidence: fromText.confidence }
     matchMethod = fromText.method
@@ -1116,7 +1387,6 @@ async function renderAnchorEvidenceImage(
 
   const fullRect = { x: 0, y: 0, width: viewport.width, height: viewport.height }
   const rect = rectCandidate?.rect || fullRect
-  const pageArea = Math.max(1, viewport.width * viewport.height)
   const padX = Math.max(18, rect.width * 0.2)
   const padY = Math.max(26, rect.height * 0.52)
   const minCropWidth = Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
@@ -1137,34 +1407,61 @@ async function renderAnchorEvidenceImage(
   ) || fullRect
 
   const cropRatio = rectArea(cropRect) / pageArea
+  let finalCropRect = cropRect
+  let fallbackUsed = false
   if (rectCandidate && cropRatio > 0.72 && confidence <= 0.72 && matchMethod !== 'bbox_hint') {
-    return { imageDataUrl: null, matchMethod, confidence: Math.max(0.45, confidence - 0.15) }
+    finalCropRect = fullRect
+    matchMethod = 'fallback'
+    confidence = Math.max(0.42, confidence - 0.2)
+    fallbackUsed = true
+    polygonCandidate = null
   }
 
   const maxOutputWidth = 1360
-  const outputScale = cropRect.width > maxOutputWidth ? maxOutputWidth / cropRect.width : 1
+  const outputScale = finalCropRect.width > maxOutputWidth ? maxOutputWidth / finalCropRect.width : 1
   const outputCanvas = document.createElement('canvas')
-  outputCanvas.width = Math.max(1, Math.floor(cropRect.width * outputScale))
-  outputCanvas.height = Math.max(1, Math.floor(cropRect.height * outputScale))
+  outputCanvas.width = Math.max(1, Math.floor(finalCropRect.width * outputScale))
+  outputCanvas.height = Math.max(1, Math.floor(finalCropRect.height * outputScale))
   const outputCtx = outputCanvas.getContext('2d')
   if (!outputCtx) {
-    return { imageDataUrl: null, matchMethod, confidence }
+    return { imageDataUrl: null, matchMethod: 'fallback', confidence: Math.min(confidence, 0.45), fallbackUsed: true }
   }
   outputCtx.drawImage(
     canvas,
-    cropRect.x,
-    cropRect.y,
-    cropRect.width,
-    cropRect.height,
+    finalCropRect.x,
+    finalCropRect.y,
+    finalCropRect.width,
+    finalCropRect.height,
     0,
     0,
     outputCanvas.width,
     outputCanvas.height,
   )
 
-  if (rectCandidate?.rect) {
-    const hx = (rect.x - cropRect.x) * outputScale
-    const hy = (rect.y - cropRect.y) * outputScale
+  if (polygonCandidate && polygonCandidate.length > 0 && matchMethod === 'polygon') {
+    outputCtx.fillStyle = 'rgba(245, 158, 11, 0.20)'
+    outputCtx.strokeStyle = 'rgba(245, 158, 11, 0.95)'
+    outputCtx.lineWidth = Math.max(2, Math.round(2 * outputScale))
+    for (const poly of polygonCandidate) {
+      const points = poly.points
+        .map((p) => ({
+          x: (p.x - finalCropRect.x) * outputScale,
+          y: (p.y - finalCropRect.y) * outputScale,
+        }))
+        .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      if (points.length < 3) continue
+      outputCtx.beginPath()
+      outputCtx.moveTo(points[0].x, points[0].y)
+      for (let i = 1; i < points.length; i += 1) {
+        outputCtx.lineTo(points[i].x, points[i].y)
+      }
+      outputCtx.closePath()
+      outputCtx.fill()
+      outputCtx.stroke()
+    }
+  } else if (rectCandidate?.rect) {
+    const hx = (rect.x - finalCropRect.x) * outputScale
+    const hy = (rect.y - finalCropRect.y) * outputScale
     const hw = rect.width * outputScale
     const hh = rect.height * outputScale
     outputCtx.fillStyle = 'rgba(245, 158, 11, 0.20)'
@@ -1180,7 +1477,7 @@ async function renderAnchorEvidenceImage(
   } catch {
     imageDataUrl = outputCanvas.toDataURL('image/png')
   }
-  return { imageDataUrl, matchMethod, confidence }
+  return { imageDataUrl, matchMethod, confidence, fallbackUsed }
 }
 
 export default function PaperReaderPage() {
@@ -1271,9 +1568,12 @@ export default function PaperReaderPage() {
     text: '',
     title: '',
     anchors: [],
+    anchor_index: 0,
+    anchor_count: 0,
     image_data_url: null,
     match_method: 'fallback',
     match_confidence: 0,
+    fallback_used: false,
   })
 
   const viewerRef = useRef<HTMLDivElement | null>(null)
@@ -1293,6 +1593,7 @@ export default function PaperReaderPage() {
     imageDataUrl: string | null
     matchMethod: AnchorMatchMethod
     confidence: number
+    fallbackUsed: boolean
   }>>(new Map())
   const prefetchedPagesRef = useRef<Set<number>>(new Set())
   const [viewerWidth, setViewerWidth] = useState<number>(860)
@@ -1357,6 +1658,44 @@ export default function PaperReaderPage() {
       bodyLineHeight: normalizedStyleTuning.line_height,
     }
   }, [baseGenerativeStyle, normalizedStyleTuning])
+  const composedStyleTokens = useMemo<Record<string, unknown>>(() => {
+    if (composedPlan?.style_tokens && typeof composedPlan.style_tokens === 'object') {
+      return composedPlan.style_tokens as Record<string, unknown>
+    }
+    if (composedPayload?.ui_plan?.style_tokens && typeof composedPayload.ui_plan.style_tokens === 'object') {
+      return composedPayload.ui_plan.style_tokens as Record<string, unknown>
+    }
+    return {}
+  }, [composedPlan, composedPayload])
+  const activeComposedStyle = useMemo<GenerativeStyleTokens>(() => {
+    const styleIntent = pickStyleTokenString(composedStyleTokens, ['style_intent', 'styleIntent'])
+    const themeToken = pickStyleTokenString(composedStyleTokens, ['theme_mode', 'themeMode']).toLowerCase()
+    const resolvedThemeMode: ReaderThemeMode = themeToken === 'dark' ? 'dark' : themeMode
+    const resolvedStyleKey = mapComposeStyleIntentToKey(styleIntent, generativeStyleKey)
+    const base = resolveGenerativeStyleTokens(resolvedStyleKey, resolvedThemeMode)
+
+    const tokenBodySize = pickStyleTokenNumber(composedStyleTokens, ['body_font_size', 'bodyFontSize'])
+    const tokenLineHeight = pickStyleTokenNumber(composedStyleTokens, ['body_line_height', 'bodyLineHeight'])
+
+    const tunedBodyFontSize = Math.round(
+      (tokenBodySize ?? base.bodyFontSize) * normalizedStyleTuning.body_scale * 10,
+    ) / 10
+    const nextStyle: GenerativeStyleTokens = {
+      ...base,
+      pageBackground: pickStyleTokenString(composedStyleTokens, ['page_background', 'pageBackground']) || base.pageBackground,
+      panelBackground: pickStyleTokenString(composedStyleTokens, ['panel_background', 'panelBackground']) || base.panelBackground,
+      borderColor: pickStyleTokenString(composedStyleTokens, ['border_color', 'borderColor']) || base.borderColor,
+      headingColor: pickStyleTokenString(composedStyleTokens, ['heading_color', 'headingColor']) || base.headingColor,
+      bodyColor: pickStyleTokenString(composedStyleTokens, ['body_color', 'bodyColor']) || base.bodyColor,
+      bodyFontFamily: pickStyleTokenString(composedStyleTokens, ['body_font_family', 'bodyFontFamily']) || base.bodyFontFamily,
+      headingFontFamily: pickStyleTokenString(composedStyleTokens, ['heading_font_family', 'headingFontFamily']) || base.headingFontFamily,
+      bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
+      bodyLineHeight: tokenLineHeight !== null
+        ? Math.max(1.55, Math.min(2.2, tokenLineHeight))
+        : normalizedStyleTuning.line_height,
+    }
+    return nextStyle
+  }, [composedStyleTokens, generativeStyleKey, themeMode, normalizedStyleTuning])
   const generativeLayoutMode = useMemo<'split' | 'stack'>(() => (
     viewerWidth >= 1080 ? 'split' : 'stack'
   ), [viewerWidth])
@@ -1821,7 +2160,7 @@ export default function PaperReaderPage() {
   }, [pdfDoc, readPage, pdfNumPages])
 
   const requestGenerativeRefresh = (options?: { forceRefresh?: boolean; preferAgent?: boolean }) => {
-    // 中文注释：把“本次刷新参数”写入 ref，仅供下一次请求消费。
+    // 把“本次刷新参数”写入 ref，仅供下一次请求消费。
     pendingComposedRunRef.current = {
       forceRefresh: Boolean(options?.forceRefresh),
       regenerate: Boolean(options?.preferAgent),
@@ -1891,6 +2230,56 @@ export default function PaperReaderPage() {
             if (planData.ui_plan) {
               setComposedPlan(planData.ui_plan)
             }
+            return
+          }
+
+          if (event === 'component_patch') {
+            const patchData = data as { ui_ops?: ReaderComponentPatchOp[] }
+            const uiOps = Array.isArray(patchData.ui_ops) ? patchData.ui_ops : []
+            if (uiOps.length > 0) {
+              setComposedPlan((prev) => {
+                if (!prev) return prev
+                return {
+                  ...prev,
+                  components: applyComponentPatchOps(prev.components || [], uiOps),
+                }
+              })
+              setComposedPayload((prev) => {
+                if (!prev?.ui_plan) return prev
+                return {
+                  ...prev,
+                  ui_plan: {
+                    ...prev.ui_plan,
+                    components: applyComponentPatchOps(prev.ui_plan.components || [], uiOps),
+                  },
+                }
+              })
+            }
+            return
+          }
+
+          if (event === 'agent_trace') {
+            const traceData = data as { trace?: Array<Record<string, unknown>>; tool_calls?: Array<Record<string, unknown>> }
+            setComposedPlan((prev) => {
+              if (!prev) return prev
+              return {
+                ...prev,
+                trace_meta: {
+                  ...(prev.trace_meta || {}),
+                  agent_trace: Array.isArray(traceData.trace) ? traceData.trace : [],
+                  agent_tool_calls: Array.isArray(traceData.tool_calls) ? traceData.tool_calls : [],
+                },
+              }
+            })
+            return
+          }
+
+          if (event === 'component_error') {
+            const errorData = data as { message?: string; errors?: string[] }
+            const details = Array.isArray(errorData.errors) && errorData.errors.length > 0
+              ? ` (${errorData.errors.slice(0, 3).join('; ')})`
+              : ''
+            setComposedError(String(errorData.message || 'Component patch failed') + details)
             return
           }
 
@@ -2543,6 +2932,9 @@ export default function PaperReaderPage() {
         start_char: Number(row.start_char || 0),
         end_char: Number(row.end_char || 0),
         quote_text: row.quote_text || undefined,
+        canonical_block_id: row.canonical_block_id || undefined,
+        coord_version: row.coord_version || undefined,
+        anchor_confidence: Number.isFinite(Number(row.anchor_confidence)) ? Number(row.anchor_confidence) : undefined,
       }))
       .filter((row) => row.page > 0 && row.end_char > row.start_char)
 
@@ -2570,8 +2962,10 @@ export default function PaperReaderPage() {
           scope: 'section',
           selected_kb_id: selectedKbId,
           style_intent: generativeStyleKey,
+          theme_mode: themeMode,
           detail_level: detailLevel,
           compare_mode: compareMode,
+          citation_tldr: citationTldr,
         },
         (event: ReaderInlineQueryEvent, data) => {
           if (event === 'token') {
@@ -2645,10 +3039,15 @@ export default function PaperReaderPage() {
 
   const showAnchorPreview = (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { pinPreview?: boolean },
+    options?: { pinPreview?: boolean; segmentIndex?: number },
   ) => {
-    const anchor = pickPrimaryAnchor(anchors, readPage)
+    const orderedAnchors = sortAnchorsForPreview(anchors, readPage)
+    if (orderedAnchors.length === 0) return
+    const anchor = pickPrimaryAnchor(orderedAnchors, readPage) || orderedAnchors[0]
     if (!anchor) return
+    const previewAnchors = [anchor]
+    const resolvedIndex = 0
+
     const previewKey = buildPreviewKey(anchor)
     const cached = anchorPreviewCacheRef.current.get(previewKey)
     const nextPinned = Boolean(options?.pinPreview)
@@ -2658,26 +3057,19 @@ export default function PaperReaderPage() {
       pinned: nextPinned,
       loading: !cached && !previewText,
       page: Number(anchor.page || readPage),
-      text: previewText || '正在加载该锚点原文片段...',
-      title: `原文证据 · 第 ${Number(anchor.page || readPage)} 页`,
-      anchors,
+      text: previewText || 'Loading evidence snippet...',
+      title: `Evidence · Page ${Number(anchor.page || readPage)}`,
+      anchors: previewAnchors,
+      anchor_index: resolvedIndex,
+      anchor_count: previewAnchors.length,
+      image_data_url: cached?.imageDataUrl ?? null,
+      match_method: cached?.matchMethod || 'fallback',
+      match_confidence: cached?.confidence || 0,
+      fallback_used: cached?.fallbackUsed || false,
     })
     if (nextPinned && Number(anchor.page || 0) > 0 && Number(anchor.page || 0) !== readPage) {
       setReadPage(Number(anchor.page))
     }
-
-    setAnchorPreview({
-      visible: true,
-      pinned: nextPinned,
-      loading: !cached && !previewText,
-      page: Number(anchor.page || readPage),
-      text: previewText || 'Loading evidence snippet...',
-      title: `Evidence · Page ${Number(anchor.page || readPage)}`,
-      anchors,
-      image_data_url: cached?.imageDataUrl ?? null,
-      match_method: cached?.matchMethod || 'fallback',
-      match_confidence: cached?.confidence || 0,
-    })
 
     if (pdfDoc && Number(anchor.page || 0) > 0 && !cached) {
       const targetPage = Number(anchor.page)
@@ -2702,6 +3094,7 @@ export default function PaperReaderPage() {
             imageDataUrl: rendered.imageDataUrl,
             matchMethod: rendered.matchMethod,
             confidence: rendered.confidence,
+            fallbackUsed: rendered.fallbackUsed,
           })
           if (anchorPreviewCacheRef.current.size > 120) {
             const oldestKey = anchorPreviewCacheRef.current.keys().next().value
@@ -2710,22 +3103,76 @@ export default function PaperReaderPage() {
           setAnchorPreview((prev) => {
             if (!prev.visible) return prev
             if (Number(prev.page || 0) !== targetPage) return prev
+            if (Number(prev.anchor_index || 0) !== resolvedIndex) return prev
             return {
               ...prev,
               loading: false,
               image_data_url: rendered.imageDataUrl,
               match_method: rendered.matchMethod,
               match_confidence: rendered.confidence,
+              fallback_used: rendered.fallbackUsed,
               text: resolvedText || prev.text || '未检索到可展示的原文片段。',
             }
           })
         } catch {
           setAnchorPreview((prev) => {
             if (!prev.visible) return prev
-            return { ...prev, loading: false, text: prev.text || '原文片段加载失败，请切换 PDF 模式核对。' }
+            return {
+              ...prev,
+              loading: false,
+              fallback_used: true,
+              text: prev.text || '原文片段加载失败，请切换 PDF 模式核对。',
+            }
           })
         }
       })()
+    }
+  }
+
+  const resolveAnchorPreviewImage = async (
+    anchors: ReaderComponentSourceAnchor[],
+    options?: { preferredPage?: number; segmentIndex?: number },
+  ): Promise<string | null> => {
+    const orderedAnchors = sortAnchorsForPreview(anchors, options?.preferredPage || readPage)
+    if (orderedAnchors.length === 0) return null
+    const anchor = pickPrimaryAnchor(orderedAnchors, options?.preferredPage || readPage) || orderedAnchors[0]
+    if (!anchor) return null
+
+    const previewKey = buildPreviewKey(anchor)
+    const cached = anchorPreviewCacheRef.current.get(previewKey)
+    if (cached?.imageDataUrl) return cached.imageDataUrl
+    if (!pdfDoc || Number(anchor.page || 0) <= 0) return null
+
+    try {
+      const targetPage = Number(anchor.page)
+      const pageProxy = await pdfDoc.getPage(targetPage)
+      const textContent = await pageProxy.getTextContent()
+      const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
+      const extracted = extractAcademicPageText(textContent)
+      const fallback = Array.isArray(textContent?.items)
+        ? textContent.items
+          .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+        : ''
+      const source = extracted || fallback
+      const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
+      const rendered = await renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+      anchorPreviewCacheRef.current.set(previewKey, {
+        text: resolvedText,
+        imageDataUrl: rendered.imageDataUrl,
+        matchMethod: rendered.matchMethod,
+        confidence: rendered.confidence,
+        fallbackUsed: rendered.fallbackUsed,
+      })
+      if (anchorPreviewCacheRef.current.size > 120) {
+        const oldestKey = anchorPreviewCacheRef.current.keys().next().value
+        if (oldestKey) anchorPreviewCacheRef.current.delete(oldestKey)
+      }
+      return rendered.imageDataUrl
+    } catch {
+      return null
     }
   }
 
@@ -2735,7 +3182,6 @@ export default function PaperReaderPage() {
       return { ...prev, visible: false, loading: false }
     })
   }
-
   const appendMarkdownToAnnotation = (markdown: string) => {
     const text = String(markdown || '').trim()
     if (!text) return
@@ -2786,6 +3232,7 @@ export default function PaperReaderPage() {
 
   const renderAnchorEvidenceCard = () => {
     const methodLabelMap: Record<AnchorMatchMethod, string> = {
+      polygon: 'Polygon',
       bbox_hint: 'Layout bbox',
       quote_exact: 'Quote exact',
       quote_fuzzy: 'Quote fuzzy',
@@ -2802,9 +3249,9 @@ export default function PaperReaderPage() {
         style={{
           marginTop: 8,
           borderRadius: 12,
-          border: `1px solid ${activeGenerativeStyle.borderColor}`,
-          background: activeGenerativeStyle.panelBackground,
-          color: activeGenerativeStyle.bodyColor,
+          border: `1px solid ${activeComposedStyle.borderColor}`,
+          background: activeComposedStyle.panelBackground,
+          color: activeComposedStyle.bodyColor,
         }}
         extra={(
           <Space size={8}>
@@ -2830,7 +3277,7 @@ export default function PaperReaderPage() {
           </Space>
         )}
       >
-        <div style={{ maxHeight: 'min(62vh, 640px)', overflowY: 'auto', paddingRight: 4 }}>
+        <div style={{ maxHeight: 'min(72vh, 760px)', overflowY: 'auto', paddingRight: 4 }}>
           <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
             悬停或点击左侧带锚点组件后，这里会显示 PDF 局部证据和命中区域。
           </Text>
@@ -2847,6 +3294,7 @@ export default function PaperReaderPage() {
                 <Tag color={confidence >= 0.8 ? 'green' : confidence >= 0.6 ? 'gold' : 'red'}>
                   置信度: {Math.round(confidence * 100)}%
                 </Tag>
+                {anchorPreview.fallback_used ? <Tag color="orange">图像已回退整页裁剪</Tag> : null}
               </Space>
               {anchorPreview.image_data_url ? (
                 <img
@@ -2854,11 +3302,11 @@ export default function PaperReaderPage() {
                   alt="anchor-evidence"
                   style={{
                     width: '100%',
-                    maxHeight: '52vh',
+                    maxHeight: '56vh',
                     display: 'block',
                     margin: '0 auto',
                     borderRadius: 10,
-                    border: `1px solid ${activeGenerativeStyle.borderColor}`,
+                    border: `1px solid ${activeComposedStyle.borderColor}`,
                     imageRendering: 'auto',
                     objectFit: 'contain',
                     background: '#fff',
@@ -2869,14 +3317,14 @@ export default function PaperReaderPage() {
                 style={{
                   whiteSpace: 'pre-wrap',
                   lineHeight: 1.75,
-                  maxHeight: 220,
+                  maxHeight: 280,
                   overflowY: 'auto',
-                  color: activeGenerativeStyle.bodyColor,
+                  color: activeComposedStyle.bodyColor,
                   fontSize: 14,
                   borderRadius: 10,
-                  border: `1px solid ${activeGenerativeStyle.borderColor}`,
+                  border: `1px solid ${activeComposedStyle.borderColor}`,
                   padding: '10px 12px',
-                  background: activeGenerativeStyle.pageBackground,
+                  background: activeComposedStyle.pageBackground,
                 }}
               >
                 {anchorPreview.text || '暂无可展示的锚点原文。'}
@@ -2922,6 +3370,12 @@ export default function PaperReaderPage() {
   const renderGenerativeTextPanel = () => {
     const activeComposedPlan = composedPlan || composedPayload?.ui_plan || null
     const hasComposedPlan = Boolean(activeComposedPlan?.components?.length)
+    const composedLayout = (activeComposedPlan?.layout || {}) as Record<string, unknown>
+    const composedContentMaxWidth = (() => {
+      const width = Number(composedLayout.content_max_width ?? composedLayout.contentMaxWidth ?? 920)
+      if (!Number.isFinite(width)) return 920
+      return clamp(width, 680, 1280)
+    })()
     const useComposedView =
       hasComposedPlan ||
       composedLoading ||
@@ -2935,14 +3389,14 @@ export default function PaperReaderPage() {
           theme={{
             algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
             token: {
-              colorText: activeGenerativeStyle.bodyColor,
-              colorTextHeading: activeGenerativeStyle.headingColor,
-              colorBorder: activeGenerativeStyle.borderColor,
+              colorText: activeComposedStyle.bodyColor,
+              colorTextHeading: activeComposedStyle.headingColor,
+              colorBorder: activeComposedStyle.borderColor,
             },
             components: {
               Typography: {
-                colorText: activeGenerativeStyle.bodyColor,
-                colorTextHeading: activeGenerativeStyle.headingColor,
+                colorText: activeComposedStyle.bodyColor,
+                colorTextHeading: activeComposedStyle.headingColor,
               }
             }
           }}
@@ -2950,16 +3404,16 @@ export default function PaperReaderPage() {
           <div
             className="reader-composed-surface"
             style={{
-              // 中文注释：显式注入阅读主题变量，覆盖全局暗色 Ant 样式，确保浅色模式可读。
-              '--reader-card-bg': activeGenerativeStyle.panelBackground,
-              '--reader-card-border': activeGenerativeStyle.borderColor,
-              '--reader-text': activeGenerativeStyle.bodyColor,
-              '--reader-heading': activeGenerativeStyle.headingColor,
-              border: `1px solid ${activeGenerativeStyle.borderColor}`,
+              // 显式注入阅读主题变量，覆盖全局暗色 Ant 样式，确保浅色模式可读。
+              '--reader-card-bg': activeComposedStyle.panelBackground,
+              '--reader-card-border': activeComposedStyle.borderColor,
+              '--reader-text': activeComposedStyle.bodyColor,
+              '--reader-heading': activeComposedStyle.headingColor,
+              border: `1px solid ${activeComposedStyle.borderColor}`,
               borderRadius: 12,
-              background: activeGenerativeStyle.pageBackground,
+              background: activeComposedStyle.pageBackground,
               boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
-              color: activeGenerativeStyle.bodyColor,
+              color: activeComposedStyle.bodyColor,
             } as CSSProperties}
           >
             <div
@@ -2975,7 +3429,7 @@ export default function PaperReaderPage() {
             >
               <Space size={8} wrap>
                 <Tag color="blue">AI Composed Reader</Tag>
-                <Text style={{ color: activeGenerativeStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
+                <Text style={{ color: activeComposedStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
                 {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
                 {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
                 {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
@@ -2988,6 +3442,31 @@ export default function PaperReaderPage() {
                 {typeof composedQuality?.cross_column_merge_ratio === 'number' ? (
                   <Tag color={composedQuality.cross_column_merge_ratio <= 0.08 ? 'green' : 'gold'}>
                     跨栏 {(composedQuality.cross_column_merge_ratio * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.duplicate_ratio === 'number' ? (
+                  <Tag color={composedQuality.duplicate_ratio <= 0.1 ? 'green' : 'orange'}>
+                    重复 {(composedQuality.duplicate_ratio * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.anchor_quote_hit_rate === 'number' ? (
+                  <Tag color={(composedQuality.anchor_quote_hit_rate || 0) >= 0.8 ? 'green' : 'orange'}>
+                    命中 {(Number(composedQuality.anchor_quote_hit_rate || 0) * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.anchor_bbox_iou === 'number' ? (
+                  <Tag color={(composedQuality.anchor_bbox_iou || 0) >= 0.25 ? 'green' : 'gold'}>
+                    IoU {(Number(composedQuality.anchor_bbox_iou || 0) * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.anchor_misjump_rate === 'number' ? (
+                  <Tag color={(composedQuality.anchor_misjump_rate || 1) <= 0.2 ? 'green' : 'red'}>
+                    误跳 {(Number(composedQuality.anchor_misjump_rate || 0) * 100).toFixed(1)}%
+                  </Tag>
+                ) : null}
+                {typeof composedQuality?.anchor_gate_passed === 'boolean' ? (
+                  <Tag color={composedQuality.anchor_gate_passed ? 'green' : 'red'}>
+                    定位门禁 {composedQuality.anchor_gate_passed ? '通过' : '关闭跳转'}
                   </Tag>
                 ) : null}
               </Space>
@@ -3070,11 +3549,21 @@ export default function PaperReaderPage() {
               ) : null}
 
               {hasComposedPlan && activeComposedPlan ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 12,
+                    maxWidth: composedContentMaxWidth,
+                    margin: '0 auto',
+                    width: '100%',
+                  }}
+                >
                   {renderReaderComponentTree(activeComposedPlan.components, {
-                    themeStyle: activeGenerativeStyle,
+                    themeStyle: activeComposedStyle,
                     qualityReport: composedQuality || composedPayload?.quality_report || null,
                     inlineQueryLoadingNodeId,
+                    isActionableAnchor,
                     onNodeAction: (node, action) => {
                       void handleComposedNodeAction(node, action)
                     },
@@ -3089,6 +3578,9 @@ export default function PaperReaderPage() {
                     },
                     onHidePreview: () => {
                       hideAnchorPreview()
+                    },
+                    resolveAnchorPreviewImage: async (anchors, options) => {
+                      return resolveAnchorPreviewImage(anchors, options)
                     },
                     onDropMarkdown: (markdown) => {
                       appendMarkdownToAnnotation(markdown)
@@ -3188,7 +3680,7 @@ export default function PaperReaderPage() {
               style={{ minWidth: 168 }}
               value={generativeStyleKey}
               onChange={(value) => {
-                // 中文注释：切换风格会触发 useEffect 重新拉取该风格对应内容。
+                // 切换风格会触发 useEffect 重新拉取该风格对应内容。
                 const nextStyle = value as ReaderGenerativeStyleKey
                 setGenerativeStyleKey(nextStyle)
                 setGenerativeStyleTuning(
@@ -4079,5 +4571,4 @@ export default function PaperReaderPage() {
     </div>
   )
 }
-
 

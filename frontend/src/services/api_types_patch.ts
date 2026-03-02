@@ -1,4 +1,4 @@
-﻿import type { ChunkingStrategy, ChunkLevel } from './api'
+import type { ChunkingStrategy, ChunkLevel } from './api'
 
 
 export interface ChunkingConfig {

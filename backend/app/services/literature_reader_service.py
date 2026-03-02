@@ -25,8 +25,9 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.knowledge import Document
+from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperAnnotation, PaperReaderPageCache
+from app.services.document_mind_parser_service import get_document_mind_parser_service
 from app.services.llm_service import get_llm_service
 from app.services.status_event_bus import build_status_channel_for_user, publish_status_event
 
@@ -37,7 +38,7 @@ except Exception:  # pragma: no cover - runtime optional
 
 
 STYLE_WHITELIST = ("journal_classic", "clinical_brief", "preprint_modern")
-PARSER_VERSION = "reader_parser_v5"
+PARSER_VERSION = "reader_parser_v7"
 CONFIDENCE_THRESHOLD = 0.68
 REDIS_TTL_SECONDS = 24 * 3600
 LOCK_TTL_SECONDS = 120
@@ -83,6 +84,7 @@ class ReaderBuildMeta:
 class LiteratureReaderService:
     def __init__(self) -> None:
         self._redis_client: Any = None
+        self._document_mind_parser = get_document_mind_parser_service()
 
     async def build_or_get_page_payload(
         self,
@@ -98,11 +100,12 @@ class LiteratureReaderService:
         publish_ready_event_enabled: bool = False,
     ) -> Tuple[Dict[str, Any], ReaderBuildMeta]:
         page_num = max(1, int(page))
-        # 中文注释：用户选择“优先 Agent”时，强制跳过缓存重建一次。
+        # Force one rebuild when user explicitly prefers agent-first parsing.
         prefer_agent = bool(prefer_agent)
         force_refresh = bool(force_refresh or prefer_agent)
         source_signature = await self._build_source_signature(
             db=db,
+            user_id=int(user_id),
             paper=paper,
             selected_kb_id=selected_kb_id,
             style_hint=style_hint,
@@ -171,6 +174,8 @@ class LiteratureReaderService:
                 pdf_path=local_pdf_path,
                 page=page_num,
                 style_hint=style_hint,
+                source_url=str(paper.pdf_url or paper.url or ""),
+                paper_id=int(paper.id),
             )
             raw_text = str(parsed.get("raw_text") or "")
             structure_confidence = float(parsed.get("structure_confidence") or 0.0)
@@ -218,11 +223,20 @@ class LiteratureReaderService:
                 ),
                 "raw_text": str(repaired.get("raw_text") or raw_text),
                 "style_cues": dict(repaired.get("style_cues") or parsed.get("style_cues") or {}),
+                "line_catalog": list(repaired.get("line_catalog") or parsed.get("line_catalog") or []),
                 "sections": list(repaired.get("sections") or []),
                 "blocks": list(repaired.get("blocks") or []),
                 "side_context_blocks": list(repaired.get("side_context_blocks") or parsed.get("side_context_blocks") or []),
                 "figure_meta_blocks": list(repaired.get("figure_meta_blocks") or parsed.get("figure_meta_blocks") or []),
                 "toc_quality": float(repaired.get("toc_quality") or parsed.get("toc_quality") or 0.0),
+                "parser_chain_meta": dict(repaired.get("parser_chain_meta") or parsed.get("parser_chain_meta") or {}),
+                "docmind_meta": dict(
+                    repaired.get("docmind_meta")
+                    or parsed.get("docmind_meta")
+                    or ((repaired.get("parser_chain_meta") or parsed.get("parser_chain_meta") or {}).get("document_mind") or {})
+                ),
+                "docmind_structure": dict(repaired.get("docmind_structure") or parsed.get("docmind_structure") or {}),
+                "page_structure_v3": dict(repaired.get("page_structure_v3") or parsed.get("page_structure_v3") or {}),
                 "assets": assets,
                 "generated_at": datetime.utcnow().isoformat(),
             }
@@ -265,12 +279,95 @@ class LiteratureReaderService:
         pdf_path: str,
         page: int,
         style_hint: Optional[str] = None,
+        source_url: Optional[str] = None,
+        paper_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        raw_text = await asyncio.to_thread(self._read_pdf_page_text, pdf_path, page)
+        parser_chain_meta: Dict[str, Any] = {
+            "document_mind": {"used": False, "reason": "not_attempted"},
+        }
+        docmind_structure: Dict[str, Any] = {}
+        raw_text = ""
+        parser_mode = str(getattr(settings, "pdf_layout_parser", "auto") or "auto").strip().lower()
+        docmind_only_mode = parser_mode == "document_mind"
+        if parser_mode in {"auto", "document_mind"}:
+            if hasattr(self._document_mind_parser, "parse_page_structure"):
+                docmind_rows, docmind_meta = await self._document_mind_parser.parse_page_structure(
+                    paper_id=int(paper_id) if isinstance(paper_id, int) else None,
+                    page=int(page),
+                    file_url=str(source_url or "").strip(),
+                    file_name=os.path.basename(str(pdf_path or "").strip()) or None,
+                    local_pdf_path=str(pdf_path or "").strip() or None,
+                )
+                parser_chain_meta["document_mind"] = dict(docmind_meta or {})
+                if isinstance(docmind_rows, dict) and list(docmind_rows.get("layouts") or []):
+                    docmind_structure = dict(docmind_rows)
+                else:
+                    docmind_text, docmind_meta_text = await self._document_mind_parser.parse_page_text(
+                        paper_id=int(paper_id) if isinstance(paper_id, int) else None,
+                        page=int(page),
+                        file_url=str(source_url or "").strip(),
+                        file_name=os.path.basename(str(pdf_path or "").strip()) or None,
+                        local_pdf_path=str(pdf_path or "").strip() or None,
+                    )
+                    parser_chain_meta["document_mind"] = dict(docmind_meta_text or parser_chain_meta.get("document_mind") or {})
+                    if isinstance(docmind_text, str) and docmind_text.strip():
+                        raw_text = docmind_text
+            else:
+                docmind_text, docmind_meta = await self._document_mind_parser.parse_page_text(
+                    paper_id=int(paper_id) if isinstance(paper_id, int) else None,
+                    page=int(page),
+                    file_url=str(source_url or "").strip(),
+                    file_name=os.path.basename(str(pdf_path or "").strip()) or None,
+                    local_pdf_path=str(pdf_path or "").strip() or None,
+                )
+                parser_chain_meta["document_mind"] = dict(docmind_meta or {})
+                if isinstance(docmind_text, str) and docmind_text.strip():
+                    raw_text = docmind_text
+
+        if docmind_structure:
+            style_cues = await asyncio.to_thread(self._extract_page_style_cues, pdf_path, page)
+            parsed_docmind = self._build_page_structure_v3_from_docmind(
+                page=int(page),
+                docmind_structure=docmind_structure,
+                parser_chain_meta=parser_chain_meta,
+                style_hint=style_hint,
+                style_cues=style_cues,
+            )
+            if isinstance(parsed_docmind, dict) and list(parsed_docmind.get("blocks") or []):
+                return parsed_docmind
+
+        if docmind_only_mode:
+            if raw_text.strip():
+                return self._build_docmind_text_only_payload(
+                    page=int(page),
+                    raw_text=raw_text,
+                    parser_chain_meta=parser_chain_meta,
+                    style_hint=style_hint,
+                    docmind_structure=docmind_structure,
+                )
+            return self._build_docmind_empty_payload(
+                page=int(page),
+                parser_chain_meta=parser_chain_meta,
+                style_hint=style_hint,
+                docmind_structure=docmind_structure,
+            )
+
+        if not raw_text.strip():
+            raw_text = await asyncio.to_thread(self._read_pdf_page_text, pdf_path, page)
+            if not parser_chain_meta["document_mind"].get("used"):
+                parser_chain_meta["document_mind"]["reason"] = str(
+                    parser_chain_meta["document_mind"].get("reason") or "fallback_to_local_parser"
+                )
+
         normalized_raw_text = self._normalize_pdf_text(raw_text)
         lines = [line.strip() for line in normalized_raw_text.splitlines()]
         lines = self._split_embedded_heading_lines(lines)
         style_cues = await asyncio.to_thread(self._extract_page_style_cues, pdf_path, page)
+        line_catalog = self._build_line_catalog(
+            page=int(page),
+            raw_text=normalized_raw_text,
+            style_cues=style_cues,
+        )
         style_heading_hints = {
             self._normalize_spaces(str(item.get("text") or "")).lower(): float(item.get("score") or 0.0)
             for item in list(style_cues.get("heading_hints") or [])
@@ -282,6 +379,10 @@ class LiteratureReaderService:
             if isinstance(item, dict)
         }
         sidebar_line_hints = self._build_sidebar_line_hints(style_cues)
+        paragraph_break_markers = self._build_paragraph_break_markers(
+            style_cues=style_cues,
+            noise_hints=noise_line_hints,
+        )
         side_context_blocks = self._build_side_context_blocks_from_style_cues(
             style_cues=style_cues,
             page=page,
@@ -296,6 +397,7 @@ class LiteratureReaderService:
         section_to_block_ids: Dict[str, List[str]] = {}
         current_section = "Body"
         paragraph_lines: List[str] = []
+        paragraph_line_seen: Dict[str, int] = {}
 
         def _ensure_section(title: str, anchor: Optional[Dict[str, Any]] = None, level: int = 1) -> None:
             nonlocal sections, section_to_block_ids
@@ -330,6 +432,7 @@ class LiteratureReaderService:
             start_char, end_char = self._locate_anchor(normalized_raw_text, content, cursor)
             cursor = max(cursor, end_char)
             block_id = f"b{order + 1}"
+            canonical_block_id = f"p{int(page)}_{block_id}"
             block = {
                 "id": block_id,
                 "kind": kind,
@@ -340,6 +443,15 @@ class LiteratureReaderService:
                     "page": int(page),
                     "start_char": int(start_char),
                     "end_char": int(end_char),
+                    "canonical_block_id": canonical_block_id,
+                    "coord_version": "anchor_v2",
+                    "anchor_v2": {
+                        "coord_version": "anchor_v2",
+                        "canonical_block_id": canonical_block_id,
+                        "page": int(page),
+                        "start_char": int(start_char),
+                        "end_char": int(end_char),
+                    },
                 },
                 "zone_type": str(zone_type or "main_body"),
                 "column_id": str(column_id or "main"),
@@ -360,23 +472,48 @@ class LiteratureReaderService:
                 _ensure_section(current_section)
                 _append_block("paragraph", merged, current_section)
 
+        def _append_paragraph_line(line_text: str) -> None:
+            paragraph_lines.append(line_text)
+            text_key = self._to_text_key(line_text)
+            if not text_key:
+                return
+            occ = int(paragraph_line_seen.get(text_key, 0) + 1)
+            paragraph_line_seen[text_key] = occ
+            marker_occ = paragraph_break_markers.get(text_key) or set()
+            if occ in marker_occ:
+                _flush_paragraph()
+
         _ensure_section("Body")
-        for raw_line in lines:
+        for idx, raw_line in enumerate(lines):
             line = self._normalize_spaces(raw_line)
             if not line:
                 _flush_paragraph()
                 continue
-            # 中文注释：先排除侧栏/边注，再进入正文结构判断。
+            # Exclude sidebar/callout rows before body structure decisions.
             if self._is_sidebar_line(line, sidebar_hints=sidebar_line_hints):
                 _flush_paragraph()
                 continue
 
-            # 中文注释：过滤图片重叠噪声与高概率乱码行，避免污染正文。
+            # Filter image-overlapped noise rows while keeping potential headings.
             if self._is_noise_line(line, noise_hints=noise_line_hints) and not self._is_heading_line(line):
                 _flush_paragraph()
                 continue
 
-            if self._is_heading_line(line) or self._is_style_heading_hint(line, heading_hints=style_heading_hints):
+            next_line = ""
+            if idx + 1 < len(lines):
+                next_line = self._normalize_spaces(lines[idx + 1])
+            is_heading_candidate = self._is_heading_line(line) or self._is_style_heading_hint(
+                line,
+                heading_hints=style_heading_hints,
+            )
+            if is_heading_candidate and self._should_demote_heading_line(
+                heading_text=line,
+                next_line=next_line,
+            ):
+                _append_paragraph_line(line)
+                continue
+
+            if is_heading_candidate:
                 _flush_paragraph()
                 heading_level = self._heading_level(line)
                 current_section = line
@@ -421,7 +558,7 @@ class LiteratureReaderService:
                 )
                 continue
 
-            paragraph_lines.append(line)
+            _append_paragraph_line(line)
         _flush_paragraph()
 
         paragraphs = [item["text"] for item in blocks if item.get("kind") == "paragraph"]
@@ -435,6 +572,7 @@ class LiteratureReaderService:
 
         if not blocks and normalized_raw_text:
             fallback_text = self._normalize_spaces(normalized_raw_text)
+            fallback_block_id = f"p{int(page)}_b1"
             blocks = [
                 {
                     "id": "b1",
@@ -446,6 +584,15 @@ class LiteratureReaderService:
                         "page": int(page),
                         "start_char": 0,
                         "end_char": max(1, len(fallback_text)),
+                        "canonical_block_id": fallback_block_id,
+                        "coord_version": "anchor_v2",
+                        "anchor_v2": {
+                            "coord_version": "anchor_v2",
+                            "canonical_block_id": fallback_block_id,
+                            "page": int(page),
+                            "start_char": 0,
+                            "end_char": max(1, len(fallback_text)),
+                        },
                     },
                     "zone_type": "main_body",
                     "column_id": "main",
@@ -483,6 +630,7 @@ class LiteratureReaderService:
             "style_key": style_key,
             "style_tuning": style_tuning,
             "style_cues": style_cues,
+            "line_catalog": line_catalog,
             "structure_confidence": structure_confidence,
             "summary": summary,
             "sections": sections,
@@ -490,6 +638,583 @@ class LiteratureReaderService:
             "side_context_blocks": side_context_blocks,
             "figure_meta_blocks": figure_meta_blocks,
             "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
+            "parser_chain_meta": parser_chain_meta,
+            "docmind_meta": dict(parser_chain_meta.get("document_mind") or {}),
+        }
+
+    def _build_docmind_text_only_payload(
+        self,
+        *,
+        page: int,
+        raw_text: str,
+        parser_chain_meta: Dict[str, Any],
+        style_hint: Optional[str],
+        docmind_structure: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_raw_text = self._normalize_pdf_text(raw_text)
+        chunks = [
+            self._normalize_spaces(item)
+            for item in re.split(r"\n\s*\n+", normalized_raw_text)
+        ]
+        paragraphs = [item for item in chunks if item]
+        if not paragraphs and normalized_raw_text:
+            fallback = self._normalize_spaces(normalized_raw_text)
+            if fallback:
+                paragraphs = [fallback]
+
+        blocks: List[Dict[str, Any]] = []
+        block_groups: List[Dict[str, Any]] = []
+        cursor = 0
+        for idx, text in enumerate(paragraphs, start=1):
+            if not text:
+                continue
+            start_char, end_char = self._locate_anchor(normalized_raw_text, text, cursor)
+            cursor = max(cursor, end_char)
+            block_id = f"b{idx}"
+            canonical_block_id = f"p{int(page)}_{block_id}"
+            block = {
+                "id": block_id,
+                "kind": "paragraph",
+                "text": text,
+                "order": idx - 1,
+                "section_title": "Body",
+                "source_anchor": {
+                    "page": int(page),
+                    "start_char": int(start_char),
+                    "end_char": int(end_char),
+                    "canonical_block_id": canonical_block_id,
+                    "coord_version": "anchor_v2",
+                    "anchor_v2": {
+                        "coord_version": "anchor_v2",
+                        "canonical_block_id": canonical_block_id,
+                        "page": int(page),
+                        "start_char": int(start_char),
+                        "end_char": int(end_char),
+                    },
+                },
+                "zone_type": "main_body",
+                "column_id": "main",
+                "heading_prob": 0.0,
+                "layout_confidence": 0.78,
+            }
+            blocks.append(block)
+            block_groups.append(
+                {
+                    "block_id": canonical_block_id,
+                    "kind": "paragraph",
+                    "title": "",
+                    "text": text,
+                    "parent_node_id": "",
+                    "line_ids": [],
+                    "word_ids": [],
+                    "char_ranges": [],
+                    "zone_type": "main_body",
+                    "column_id": "main",
+                    "reading_order": int(idx),
+                    "confidence": 0.78,
+                    "image_refs": [],
+                    "source_spans": [{"start": int(start_char), "end": int(max(start_char + 1, end_char))}],
+                    "layout_bbox_or_polygon": {},
+                    "style_summary": {},
+                }
+            )
+
+        sections = [{"title": "Body", "level": 1, "block_ids": [str(row.get("id") or "") for row in blocks], "source_anchor": None}]
+        style_key = self._pick_style_key(
+            raw_text=normalized_raw_text,
+            sections=sections,
+            style_hint=style_hint,
+        )
+        style_tuning = self._derive_style_tuning(style_key=style_key, style_cues={})
+        summary = self._build_summary([str(item.get("text") or "") for item in blocks[:8]])
+        page_structure_v3 = {
+            "source": "document_mind",
+            "doc_nav_tree": [],
+            "heading_groups": [],
+            "paragraph_groups": [],
+            "figure_groups": [],
+            "block_groups": block_groups,
+            "relations": [],
+            "counts": {
+                "heading_count": 0,
+                "paragraph_count": int(len(block_groups)),
+                "figure_count": 0,
+                "table_count": 0,
+                "block_count": int(len(block_groups)),
+                "relation_count": 0,
+            },
+            "notes": [
+                "normalized_by=document_mind_text_only",
+                f"paragraph_count={len(block_groups)}",
+            ],
+        }
+        return {
+            "raw_text": normalized_raw_text,
+            "style_key": style_key,
+            "style_tuning": style_tuning,
+            "style_cues": {},
+            "line_catalog": [],
+            "structure_confidence": 0.72 if block_groups else 0.0,
+            "summary": summary,
+            "sections": sections,
+            "blocks": blocks,
+            "side_context_blocks": [],
+            "figure_meta_blocks": [],
+            "toc_quality": 0.0,
+            "parser_chain_meta": parser_chain_meta,
+            "docmind_meta": dict(parser_chain_meta.get("document_mind") or {}),
+            "docmind_structure": dict(docmind_structure or {}),
+            "page_structure_v3": page_structure_v3,
+        }
+
+    def _build_docmind_empty_payload(
+        self,
+        *,
+        page: int,
+        parser_chain_meta: Dict[str, Any],
+        style_hint: Optional[str],
+        docmind_structure: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        style_key = self._pick_style_key(
+            raw_text="",
+            sections=[],
+            style_hint=style_hint,
+        )
+        style_tuning = self._derive_style_tuning(style_key=style_key, style_cues={})
+        reason = str((parser_chain_meta.get("document_mind") or {}).get("reason") or "docmind_empty")
+        return {
+            "raw_text": "",
+            "style_key": style_key,
+            "style_tuning": style_tuning,
+            "style_cues": {},
+            "line_catalog": [],
+            "structure_confidence": 0.0,
+            "summary": "",
+            "sections": [],
+            "blocks": [],
+            "side_context_blocks": [],
+            "figure_meta_blocks": [],
+            "toc_quality": 0.0,
+            "parser_chain_meta": parser_chain_meta,
+            "docmind_meta": dict(parser_chain_meta.get("document_mind") or {}),
+            "docmind_structure": dict(docmind_structure or {}),
+            "page_structure_v3": {
+                "source": "document_mind",
+                "doc_nav_tree": [],
+                "heading_groups": [],
+                "paragraph_groups": [],
+                "figure_groups": [],
+                "block_groups": [],
+                "relations": [],
+                "counts": {
+                    "heading_count": 0,
+                    "paragraph_count": 0,
+                    "figure_count": 0,
+                    "table_count": 0,
+                    "block_count": 0,
+                    "relation_count": 0,
+                },
+                "notes": [
+                    "normalized_by=document_mind_only",
+                    f"reason={reason}",
+                    f"page={int(page)}",
+                ],
+            },
+        }
+
+    def _build_page_structure_v3_from_docmind(
+        self,
+        *,
+        page: int,
+        docmind_structure: Dict[str, Any],
+        parser_chain_meta: Dict[str, Any],
+        style_hint: Optional[str],
+        style_cues: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        layouts = [row for row in list((docmind_structure or {}).get("layouts") or []) if isinstance(row, dict)]
+        styles = [row for row in list((docmind_structure or {}).get("styles") or []) if isinstance(row, dict)]
+        doc_tree = [row for row in list((docmind_structure or {}).get("doc_tree") or []) if isinstance(row, dict)]
+        doc_info = dict((docmind_structure or {}).get("doc_info") or {})
+
+        style_map: Dict[int, Dict[str, Any]] = {}
+        for row in styles:
+            try:
+                style_id = int(row.get("styleId"))
+            except Exception:
+                continue
+            style_map[style_id] = row
+
+        page_width = 0.0
+        page_height = 0.0
+        page_rows = [row for row in list(doc_info.get("pages") or []) if isinstance(row, dict)]
+        if page_rows:
+            page_idx = max(0, int(page) - 1)
+            page_row = page_rows[page_idx] if page_idx < len(page_rows) else page_rows[0]
+            page_width = float(page_row.get("imageWidth") or page_row.get("pageWidth") or 0.0)
+            page_height = float(page_row.get("imageHeight") or page_row.get("pageHeight") or 0.0)
+        if page_width <= 0:
+            page_width = float((style_cues or {}).get("page_width") or 0.0)
+        if page_height <= 0:
+            page_height = float((style_cues or {}).get("page_height") or 0.0)
+
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        def _points_from_pos(value: Any) -> List[Dict[str, float]]:
+            points: List[Dict[str, float]] = []
+            for row in list(value or []):
+                if not isinstance(row, dict):
+                    continue
+                x = _safe_float(row.get("x"), 0.0)
+                y = _safe_float(row.get("y"), 0.0)
+                points.append({"x": round(float(x), 2), "y": round(float(y), 2)})
+            return points
+
+        def _bbox_from_points(points: Sequence[Dict[str, float]]) -> Optional[Dict[str, float]]:
+            if not points:
+                return None
+            xs = [float(item.get("x") or 0.0) for item in points]
+            ys = [float(item.get("y") or 0.0) for item in points]
+            if not xs or not ys:
+                return None
+            return {
+                "x0": round(min(xs), 2),
+                "x1": round(max(xs), 2),
+                "top": round(min(ys), 2),
+                "bottom": round(max(ys), 2),
+            }
+
+        def _kind_for_layout(*, layout_type: str, sub_type: str) -> str:
+            token_type = str(layout_type or "").strip().lower()
+            token_sub = str(sub_type or "").strip().lower()
+            if token_type == "figure":
+                return "figure_meta"
+            if "title" in token_sub or token_type == "title":
+                return "heading"
+            if "caption" in token_sub:
+                return "caption"
+            return "paragraph"
+
+        def _zone_for_layout(*, layout_type: str, kind: str) -> str:
+            token_type = str(layout_type or "").strip().lower()
+            if token_type in {"figure"} or kind in {"figure_meta", "caption", "table_caption"}:
+                return "figure_meta"
+            if token_type in {"side", "foot", "header_line", "footer_line", "foot_pagenum"}:
+                return "side_context"
+            if token_type in {"head", "title", "text"}:
+                return "main_body"
+            return "main_body"
+
+        def _column_id_for(*, zone_type: str, alignment: str, bbox: Optional[Dict[str, float]]) -> str:
+            align = str(alignment or "").strip().lower()
+            if zone_type == "side_context":
+                if align == "right":
+                    return "sidebar_right"
+                return "sidebar_left"
+            if zone_type == "figure_meta":
+                return "main"
+            if not isinstance(bbox, dict) or page_width <= 0:
+                return "main_right" if align == "right" else "main_left"
+            center = (float(bbox.get("x0") or 0.0) + float(bbox.get("x1") or 0.0)) / 2.0
+            if center <= page_width * 0.46:
+                return "main_left"
+            if center >= page_width * 0.54:
+                return "main_right"
+            return "main"
+
+        ordered_layouts = sorted(
+            layouts,
+            key=lambda row: (
+                int(row.get("index") or 0),
+                str(row.get("uniqueId") or ""),
+            ),
+        )
+
+        raw_parts: List[str] = []
+        blocks: List[Dict[str, Any]] = []
+        block_groups: List[Dict[str, Any]] = []
+        relation_rows: List[Dict[str, Any]] = []
+        cursor = 0
+        order = 0
+        layout_block_ids: Dict[str, List[str]] = {}
+
+        for l_idx, layout in enumerate(ordered_layouts, start=1):
+            layout_type = str(layout.get("type") or "").strip()
+            sub_type = str(layout.get("subType") or "").strip()
+            alignment = str(layout.get("alignment") or "").strip()
+            layout_uid = str(layout.get("uniqueId") or f"layout_{l_idx}").strip()
+            layout_points = _points_from_pos(layout.get("pos"))
+            layout_bbox = _bbox_from_points(layout_points)
+            layout_blocks = [row for row in list(layout.get("blocks") or []) if isinstance(row, dict)]
+            if not layout_blocks:
+                text = self._normalize_spaces(str(layout.get("text") or ""))
+                if text:
+                    layout_blocks = [{"text": text, "pos": list(layout.get("pos") or []), "styleId": None}]
+            if not layout_blocks:
+                continue
+
+            created_ids: List[str] = []
+            for b_idx, row in enumerate(layout_blocks, start=1):
+                text = self._normalize_spaces(str(row.get("text") or ""))
+                if not text:
+                    continue
+                kind = _kind_for_layout(layout_type=layout_type, sub_type=sub_type)
+                zone_type = _zone_for_layout(layout_type=layout_type, kind=kind)
+
+                points = _points_from_pos(row.get("pos")) or list(layout_points)
+                bbox = _bbox_from_points(points) or layout_bbox
+                column_id = _column_id_for(zone_type=zone_type, alignment=alignment, bbox=bbox)
+
+                block_id = f"dm_p{int(page)}_l{int(l_idx):03d}_b{int(b_idx):03d}"
+                canonical_block_id = f"p{int(page)}_{block_id}"
+                start_char = int(cursor)
+                raw_parts.append(text)
+                cursor += len(text)
+                end_char = int(cursor)
+                raw_parts.append("\n")
+                cursor += 1
+
+                style_id_raw = row.get("styleId")
+                style_summary: Dict[str, Any] = {}
+                try:
+                    style_id = int(style_id_raw)
+                except Exception:
+                    style_id = None
+                if isinstance(style_id, int) and style_id in style_map:
+                    style_row = dict(style_map.get(style_id) or {})
+                    style_summary = {
+                        "style_id": style_id,
+                        "font_name": str(style_row.get("fontName") or "")[:120],
+                        "font_size": _safe_float(style_row.get("fontSize"), 0.0),
+                        "bold": bool(style_row.get("bold")),
+                        "italic": bool(style_row.get("italic")),
+                        "color": str(style_row.get("color") or "")[:40],
+                    }
+
+                anchor: Dict[str, Any] = {
+                    "page": int(page),
+                    "start_char": int(start_char),
+                    "end_char": int(max(start_char + 1, end_char)),
+                    "canonical_block_id": canonical_block_id,
+                    "coord_version": "anchor_v2",
+                    "anchor_v2": {
+                        "coord_version": "anchor_v2",
+                        "canonical_block_id": canonical_block_id,
+                        "page": int(page),
+                        "start_char": int(start_char),
+                        "end_char": int(max(start_char + 1, end_char)),
+                    },
+                }
+                if isinstance(bbox, dict):
+                    anchor["bbox_hint"] = {
+                        "x0": float(bbox.get("x0") or 0.0),
+                        "x1": float(bbox.get("x1") or 0.0),
+                        "top": float(bbox.get("top") or 0.0),
+                        "bottom": float(bbox.get("bottom") or 0.0),
+                        "page_width": float(page_width) if page_width > 0 else None,
+                        "page_height": float(page_height) if page_height > 0 else None,
+                    }
+                if points:
+                    anchor["geometry_version"] = "poly_v1"
+                    anchor["geometry"] = {
+                        "polygons": [
+                            {
+                                "points": points,
+                                "source": "docmind_layout",
+                                "component_id": block_id,
+                            }
+                        ],
+                        "page_width": float(page_width) if page_width > 0 else None,
+                        "page_height": float(page_height) if page_height > 0 else None,
+                    }
+                anchor["anchor_confidence"] = 0.92
+
+                block_row = {
+                    "id": block_id,
+                    "kind": kind,
+                    "text": text,
+                    "order": int(order),
+                    "section_title": "Body",
+                    "source_anchor": anchor,
+                    "zone_type": zone_type,
+                    "column_id": column_id,
+                    "heading_prob": 0.9 if kind == "heading" else 0.0,
+                    "layout_confidence": 0.9,
+                }
+                blocks.append(block_row)
+
+                group_row = {
+                    "block_id": block_id,
+                    "kind": kind,
+                    "title": text[:220] if kind == "heading" else "",
+                    "text": text[:2000],
+                    "parent_node_id": "",
+                    "line_ids": [],
+                    "word_ids": [],
+                    "char_ranges": [],
+                    "zone_type": zone_type,
+                    "column_id": column_id,
+                    "reading_order": int(order + 1),
+                    "confidence": 0.92,
+                    "image_refs": [],
+                    "source_spans": [{"start": int(start_char), "end": int(max(start_char + 1, end_char))}],
+                    "layout_bbox_or_polygon": {
+                        "bbox": dict(bbox or {}),
+                        "polygon": points,
+                    },
+                    "style_summary": style_summary,
+                    "layout_unique_id": layout_uid,
+                    "layout_type": layout_type,
+                    "layout_sub_type": sub_type,
+                }
+                block_groups.append(group_row)
+                created_ids.append(block_id)
+                order += 1
+
+            if created_ids:
+                layout_block_ids[layout_uid] = list(created_ids)
+
+        normalized_raw_text = self._normalize_pdf_text("".join(raw_parts))
+        if not blocks:
+            return {}
+
+        heading_blocks = [row for row in blocks if str(row.get("kind") or "") == "heading" and str(row.get("zone_type") or "") == "main_body"]
+        paragraph_blocks = [row for row in blocks if str(row.get("kind") or "") == "paragraph" and str(row.get("zone_type") or "") == "main_body"]
+        sections: List[Dict[str, Any]] = []
+        section_to_block_ids: Dict[str, List[str]] = {}
+        current_section = "Body"
+        if heading_blocks:
+            for row in heading_blocks:
+                title = self._normalize_spaces(str(row.get("text") or "")) or "Body"
+                section_to_block_ids.setdefault(title, [])
+                sections.append(
+                    {
+                        "title": title,
+                        "level": 1,
+                        "block_ids": section_to_block_ids[title],
+                        "source_anchor": dict(row.get("source_anchor") or {}),
+                    }
+                )
+            current_section = sections[0]["title"] if sections else "Body"
+            heading_idx = 0
+            ordered_main = [row for row in blocks if str(row.get("zone_type") or "") == "main_body"]
+            for row in ordered_main:
+                if str(row.get("kind") or "") == "heading":
+                    current_section = self._normalize_spaces(str(row.get("text") or "")) or current_section
+                    heading_idx += 1
+                    continue
+                section_to_block_ids.setdefault(current_section, []).append(str(row.get("id") or ""))
+                row["section_title"] = current_section
+        else:
+            sections = [{"title": "Body", "level": 1, "block_ids": [], "source_anchor": None}]
+            for row in blocks:
+                if str(row.get("zone_type") or "") != "main_body":
+                    continue
+                sections[0]["block_ids"].append(str(row.get("id") or ""))
+                row["section_title"] = "Body"
+
+        main_heading_ids = [str(row.get("id") or "") for row in heading_blocks]
+        if main_heading_ids:
+            heading_cursor = 0
+            current_heading_id = main_heading_ids[0]
+            for row in blocks:
+                row_id = str(row.get("id") or "")
+                if row_id in main_heading_ids:
+                    current_heading_id = row_id
+                    continue
+                if str(row.get("zone_type") or "") != "main_body":
+                    continue
+                relation_rows.append({"type": "belongs_to_heading", "from": row_id, "to": current_heading_id, "confidence": 0.86})
+
+        doc_nav_tree: List[Dict[str, Any]] = []
+        for idx, row in enumerate(heading_blocks, start=1):
+            doc_nav_tree.append(
+                {
+                    "node_id": f"dm_node_{idx:03d}",
+                    "type": "section",
+                    "title": self._normalize_spaces(str(row.get("text") or ""))[:220],
+                    "level": 1,
+                    "line_ids": [],
+                    "zone_type": "main_body",
+                    "column_id": str(row.get("column_id") or "main"),
+                    "confidence": float(max(0.8, float(row.get("heading_prob") or 0.8))),
+                    "children": [],
+                }
+            )
+
+        if doc_tree:
+            # Keep raw tree availability in notes/meta for debugging and future hierarchy upgrades.
+            relation_rows.append(
+                {
+                    "type": "references_figure",
+                    "from": str(blocks[0].get("id") or ""),
+                    "to": str(blocks[0].get("id") or ""),
+                    "confidence": 0.0,
+                    "meta": {"doc_tree_nodes": len(doc_tree)},
+                }
+            )
+            relation_rows = [row for row in relation_rows if float(row.get("confidence") or 0.0) > 0.0]
+
+        figure_meta_blocks = [row for row in blocks if str(row.get("zone_type") or "") == "figure_meta"]
+        side_context_blocks = [row for row in blocks if str(row.get("zone_type") or "") == "side_context"]
+        toc_quality = len(heading_blocks) / max(1, len([row for row in blocks if str(row.get("zone_type") or "") == "main_body"]))
+        structure_confidence = self._estimate_structure_confidence(
+            raw_text=normalized_raw_text,
+            heading_count=len(heading_blocks),
+            paragraph_count=len(paragraph_blocks),
+        )
+        summary = self._build_summary([str(item.get("text") or "") for item in paragraph_blocks])
+
+        counts = {
+            "heading_count": int(len([row for row in block_groups if str(row.get("kind") or "") == "heading"])),
+            "paragraph_count": int(len([row for row in block_groups if str(row.get("kind") or "") in {"paragraph", "list_item"}])),
+            "figure_count": int(len([row for row in block_groups if str(row.get("zone_type") or "") == "figure_meta"])),
+            "table_count": int(len([row for row in block_groups if str(row.get("kind") or "") == "table_caption"])),
+            "block_count": int(len(block_groups)),
+            "relation_count": int(len(relation_rows)),
+        }
+        page_structure_v3 = {
+            "source": "document_mind",
+            "doc_nav_tree": doc_nav_tree,
+            "heading_groups": [],
+            "paragraph_groups": [],
+            "figure_groups": [],
+            "block_groups": block_groups,
+            "relations": relation_rows,
+            "counts": counts,
+            "notes": [
+                "normalized_by=document_mind",
+                f"layout_count={len(layouts)}",
+                f"doc_tree_count={len(doc_tree)}",
+            ],
+        }
+
+        style_key = self._pick_style_key(
+            raw_text=normalized_raw_text,
+            sections=sections,
+            style_hint=style_hint,
+        )
+        style_tuning = self._derive_style_tuning(style_key=style_key, style_cues=style_cues or {})
+        return {
+            "raw_text": normalized_raw_text,
+            "style_key": style_key,
+            "style_tuning": style_tuning,
+            "style_cues": dict(style_cues or {}),
+            "line_catalog": [],
+            "structure_confidence": float(max(0.0, min(1.0, structure_confidence))),
+            "summary": summary,
+            "sections": sections,
+            "blocks": blocks,
+            "side_context_blocks": side_context_blocks,
+            "figure_meta_blocks": figure_meta_blocks,
+            "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
+            "parser_chain_meta": parser_chain_meta,
+            "docmind_structure": docmind_structure,
+            "docmind_meta": dict(parser_chain_meta.get("document_mind") or {}),
+            "page_structure_v3": page_structure_v3,
         }
 
     async def repair_structure_with_agent(
@@ -747,6 +1472,7 @@ class LiteratureReaderService:
         self,
         *,
         db: AsyncSession,
+        user_id: int,
         paper: Paper,
         selected_kb_id: Optional[int],
         style_hint: Optional[str],
@@ -765,17 +1491,38 @@ class LiteratureReaderService:
         kb_part = "kb:none"
         kb_id = int(selected_kb_id) if selected_kb_id else 0
         if kb_id > 0:
-            max_doc_updated = (
+            # Only include knowledge bases owned by the current user.
+            owned_kb_id = (
                 await db.execute(
-                    select(func.max(Document.updated_at)).where(
-                        Document.knowledge_base_id == kb_id
+                    select(KnowledgeBase.id).where(
+                        and_(
+                            KnowledgeBase.id == kb_id,
+                            KnowledgeBase.user_id == int(user_id),
+                        )
                     )
                 )
             ).scalar_one_or_none()
-            kb_part = f"kb:{kb_id}|doc_updated:{max_doc_updated.isoformat() if max_doc_updated else 'none'}"
+            if owned_kb_id:
+                max_doc_updated = (
+                    await db.execute(
+                        select(func.max(Document.updated_at)).where(
+                            Document.knowledge_base_id == int(owned_kb_id)
+                        )
+                    )
+                ).scalar_one_or_none()
+                kb_part = f"kb:{int(owned_kb_id)}|doc_updated:{max_doc_updated.isoformat() if max_doc_updated else 'none'}"
 
         style_part = self._normalize_style_key(style_hint, fallback=None)
-        signature = f"{stat_part}|parser:{PARSER_VERSION}|{kb_part}|style:{style_part or 'auto'}"
+        parser_mode = str(getattr(settings, "pdf_layout_parser", "auto") or "auto").strip().lower() or "auto"
+        docmind_enabled = bool(getattr(settings, "reader_document_mind_enabled", False))
+        docmind_allowlist = str(getattr(settings, "reader_document_mind_allowlist", "") or "").strip()
+        source_url = str(getattr(paper, "pdf_url", None) or getattr(paper, "url", None) or "").strip()
+        signature = (
+            f"{stat_part}|parser:{PARSER_VERSION}|parser_mode:{parser_mode}|"
+            f"{kb_part}|style:{style_part or 'auto'}|"
+            f"docmind:{int(docmind_enabled)}|docmind_allow:{docmind_allowlist}|"
+            f"source_url:{source_url[:180]}"
+        )
         return signature[:240]
 
     @staticmethod
@@ -933,7 +1680,7 @@ class LiteratureReaderService:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         repaired_lines: List[str] = []
         for line in text.splitlines():
-            # 中文注释：先修复词边界，再修复标题碎片词，避免标题被拆散。
+            # Repair word boundaries first, then repair fragmented heading tokens.
             normalized_line = LiteratureReaderService._repair_word_boundaries(line.rstrip())
             normalized_line = LiteratureReaderService._repair_fragmented_heading_words(normalized_line)
             repaired_lines.append(normalized_line)
@@ -985,7 +1732,7 @@ class LiteratureReaderService:
         if len(words) < 2:
             return text
 
-        # 中文注释：只处理高置信的常见章节词拼接，避免误合并普通正文词汇。
+        # Only merge a safe, explicit list of fragmented heading words.
         merged_map = {
             "PLOSDIGITALHEALTH": "PLOS DIGITAL HEALTH",
             "DIGITALHEALTH": "DIGITAL HEALTH",
@@ -1050,8 +1797,17 @@ class LiteratureReaderService:
                 prefix = line[:match.start()].strip()
                 heading = line[match.start():match.end()].strip()
                 suffix = line[match.end():].strip()
-                # 中文注释：仅在“行内标题 + 足够长正文”场景拆分，降低误拆风险。
-                if match.start() < 10 or len(suffix) < 24:
+                # KISS safety rule:
+                # Only split when a section keyword appears near line start.
+                # This prevents false positives like "learning method Anecdotal ..."
+                # from being promoted to a heading.
+                if match.start() > 8 or len(suffix) < 24:
+                    continue
+                if suffix and re.match(r"^[\.,;!?]", suffix):
+                    continue
+                if suffix and suffix[:1].islower():
+                    continue
+                if prefix and re.search(r"[A-Za-z\u4e00-\u9fff]", prefix):
                     continue
                 if prefix:
                     output.append(prefix)
@@ -1139,7 +1895,7 @@ class LiteratureReaderService:
         raw_text: str,
         noise_hints: Optional[set[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """从版面行数据中提取侧栏块，避免正文链路直接丢弃侧栏信息。"""
+        """Build side-context blocks from visual line rows to preserve sidebar content."""
         cues = style_cues if isinstance(style_cues, dict) else {}
         line_layout = list(cues.get("line_layout") or [])
         noise_set = noise_hints or set()
@@ -1161,9 +1917,11 @@ class LiteratureReaderService:
                 continue
             start_char, end_char = LiteratureReaderService._locate_anchor(raw_text, text, cursor)
             cursor = max(cursor, end_char)
+            block_id = f"sb{idx + 1}"
+            canonical_block_id = f"p{int(page)}_{block_id}"
             output.append(
                 {
-                    "id": f"sb{idx + 1}",
+                    "id": block_id,
                     "kind": "paragraph",
                     "text": text,
                     "order": order,
@@ -1172,6 +1930,15 @@ class LiteratureReaderService:
                         "page": int(page),
                         "start_char": int(start_char),
                         "end_char": int(end_char),
+                        "canonical_block_id": canonical_block_id,
+                        "coord_version": "anchor_v2",
+                        "anchor_v2": {
+                            "coord_version": "anchor_v2",
+                            "canonical_block_id": canonical_block_id,
+                            "page": int(page),
+                            "start_char": int(start_char),
+                            "end_char": int(end_char),
+                        },
                     },
                     "zone_type": "side_context",
                     "column_id": column_label,
@@ -1181,6 +1948,196 @@ class LiteratureReaderService:
             )
             order += 1
         return output
+
+    @staticmethod
+    def _line_column_slot(
+        *,
+        column_label: str,
+        x0: float,
+        x1: float,
+        page_width: float,
+    ) -> str:
+        label = str(column_label or "main").strip().lower()
+        if label.startswith("sidebar_left"):
+            return "sidebar_left"
+        if label.startswith("sidebar_right"):
+            return "sidebar_right"
+        if label.startswith("sidebar"):
+            return "sidebar"
+        if label.startswith("main"):
+            if page_width > 1.0:
+                center = (float(x0) + float(x1)) / 2.0
+                if center <= page_width * 0.46:
+                    return "main_left"
+                if center >= page_width * 0.54:
+                    return "main_right"
+            return "main"
+        return "main"
+
+    def _build_line_catalog(
+        self,
+        *,
+        page: int,
+        raw_text: str,
+        style_cues: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        cues = style_cues if isinstance(style_cues, dict) else {}
+        line_layout = list(cues.get("line_layout") or [])
+        if not line_layout:
+            return []
+
+        page_width = float(cues.get("page_width") or 0.0)
+        page_height = float(cues.get("page_height") or 0.0)
+        cursor = 0
+        output: List[Dict[str, Any]] = []
+        for idx, row in enumerate(line_layout[:220], start=1):
+            if not isinstance(row, dict):
+                continue
+            text = self._normalize_spaces(str(row.get("text") or ""))
+            if not text:
+                continue
+            x0 = float(row.get("x0") or 0.0)
+            x1 = float(row.get("x1") or x0)
+            top = float(row.get("top") or 0.0)
+            bottom = float(row.get("bottom") or top)
+            start_char, end_char = self._locate_anchor(raw_text, text, cursor)
+            cursor = max(cursor, end_char)
+            column_label = str(row.get("column_label") or "main")
+            column_slot = self._line_column_slot(
+                column_label=column_label,
+                x0=x0,
+                x1=x1,
+                page_width=page_width,
+            )
+            existing_line_id = str(row.get("line_id") or "").strip()
+            if not re.match(r"^p\d+_l\d+_[a-z0-9_]+$", existing_line_id, flags=re.IGNORECASE):
+                existing_line_id = ""
+            line_id = existing_line_id or f"p{int(page)}_l{idx:03d}_{column_slot}"
+            words = []
+            for word in list(row.get("words") or [])[:120]:
+                if not isinstance(word, dict):
+                    continue
+                word_text = self._normalize_spaces(str(word.get("text") or ""))
+                if not word_text:
+                    continue
+                word_x0 = float(word.get("x0") or 0.0)
+                word_x1 = float(word.get("x1") or word_x0)
+                word_top = float(word.get("top") or 0.0)
+                word_bottom = float(word.get("bottom") or word_top)
+                words.append(
+                    {
+                        "text": word_text[:80],
+                        "x0": round(word_x0, 2),
+                        "x1": round(word_x1, 2),
+                        "top": round(word_top, 2),
+                        "bottom": round(word_bottom, 2),
+                        "width": round(float(word.get("width") or max(0.0, word_x1 - word_x0)), 2),
+                        "height": round(float(word.get("height") or max(0.0, word_bottom - word_top)), 2),
+                        "font_name": str(word.get("font_name") or "")[:120],
+                        "font_size": round(float(word.get("font_size") or 0.0), 2),
+                    }
+                )
+            output.append(
+                {
+                    "line_id": line_id,
+                    "page": int(page),
+                    "order": int(idx - 1),
+                    "text": text[:220],
+                    "text_key": str(row.get("text_key") or ""),
+                    "column_label": column_label,
+                    "column_slot": column_slot,
+                    "x0": round(x0, 2),
+                    "x1": round(x1, 2),
+                    "top": round(top, 2),
+                    "bottom": round(bottom, 2),
+                    "width": round(float(row.get("width") or max(0.0, x1 - x0)), 2),
+                    "height": round(float(row.get("height") or max(0.0, bottom - top)), 2),
+                    "avg_size": round(float(row.get("avg_size") or 0.0), 2),
+                    "bold_ratio": round(float(row.get("bold_ratio") or 0.0), 3),
+                    "image_overlap_ratio": round(float(row.get("image_overlap_ratio") or 0.0), 3),
+                    "start_char": int(start_char),
+                    "end_char": int(end_char),
+                    "page_width": round(page_width, 2),
+                    "page_height": round(page_height, 2),
+                    "words": words,
+                }
+            )
+        return output
+
+    def _build_paragraph_break_markers(
+        self,
+        *,
+        style_cues: Optional[Dict[str, Any]],
+        noise_hints: Optional[set[str]] = None,
+    ) -> Dict[str, set[int]]:
+        """Build deterministic paragraph break markers from visual line layout."""
+        cues = style_cues if isinstance(style_cues, dict) else {}
+        rows: List[Dict[str, Any]] = []
+        for raw in list(cues.get("line_layout") or [])[:220]:
+            if not isinstance(raw, dict):
+                continue
+            text = self._normalize_spaces(str(raw.get("text") or ""))
+            if not text:
+                continue
+            if self._is_noise_line(text, noise_hints=noise_hints):
+                continue
+            column_label = str(raw.get("column_label") or "main")
+            if column_label.startswith("sidebar"):
+                continue
+            text_key = self._to_text_key(text)
+            if not text_key:
+                continue
+            top = float(raw.get("top") or 0.0)
+            bottom = float(raw.get("bottom") or top)
+            height = max(1.0, float(raw.get("height") or max(0.0, bottom - top)))
+            rows.append(
+                {
+                    "text": text,
+                    "text_key": text_key,
+                    "column_label": column_label,
+                    "top": top,
+                    "bottom": bottom,
+                    "height": height,
+                }
+            )
+        if len(rows) < 2:
+            return {}
+
+        seen_counts: Dict[str, int] = {}
+        for row in rows:
+            key = str(row.get("text_key") or "")
+            occ = int(seen_counts.get(key, 0) + 1)
+            seen_counts[key] = occ
+            row["occ"] = occ
+
+        markers: Dict[str, set[int]] = {}
+        for idx in range(len(rows) - 1):
+            current = rows[idx]
+            nxt = rows[idx + 1]
+            should_break = False
+
+            current_col = str(current.get("column_label") or "main")
+            next_col = str(nxt.get("column_label") or "main")
+            if current_col != next_col:
+                should_break = True
+
+            gap = float(nxt.get("top") or 0.0) - float(current.get("bottom") or 0.0)
+            prev_height = max(1.0, float(current.get("height") or 1.0))
+            if gap > max(12.0, prev_height * 1.45):
+                should_break = True
+
+            sentence_end = bool(re.search(r"[.!?;:。！？；]$", str(current.get("text") or "")))
+            if sentence_end and gap > max(8.0, prev_height * 1.15):
+                should_break = True
+            if sentence_end and str((nxt.get("text") or ""))[:1].isupper() and gap > max(4.0, prev_height * 0.45):
+                should_break = True
+
+            if should_break:
+                key = str(current.get("text_key") or "")
+                occ = int(current.get("occ") or 0)
+                if key and occ > 0:
+                    markers.setdefault(key, set()).add(occ)
+        return markers
 
     @staticmethod
     def _is_sidebar_line(text: str, *, sidebar_hints: Optional[Dict[str, set[str]]]) -> bool:
@@ -1251,6 +2208,20 @@ class LiteratureReaderService:
                 line_rows: List[Dict[str, Any]] = []
                 current: List[Dict[str, Any]] = []
                 current_top: Optional[float] = None
+                def _flush_current_words() -> None:
+                    nonlocal current
+                    if not current:
+                        return
+                    segments = LiteratureReaderService._split_words_by_spacing(
+                        current,
+                        page_width=page_width,
+                    )
+                    for seg in segments:
+                        row = LiteratureReaderService._build_style_line_row(seg, image_boxes)
+                        if row.get("text"):
+                            line_rows.append(row)
+                    current = []
+
                 for item in words:
                     text = str(item.get("text") or "").strip()
                     if not text:
@@ -1264,12 +2235,10 @@ class LiteratureReaderService:
                         current.append(item)
                         current_top = (current_top + top_val) / 2.0
                     else:
-                        if current:
-                            line_rows.append(LiteratureReaderService._build_style_line_row(current, image_boxes))
+                        _flush_current_words()
                         current = [item]
                         current_top = top_val
-                if current:
-                    line_rows.append(LiteratureReaderService._build_style_line_row(current, image_boxes))
+                _flush_current_words()
 
                 line_rows = [row for row in line_rows if row.get("text")]
                 line_rows, layout_meta = LiteratureReaderService._classify_line_layout(
@@ -1322,23 +2291,45 @@ class LiteratureReaderService:
                             }
                         )
 
-                line_layout = [
-                    {
-                        "text": str(row.get("text") or "")[:180],
-                        "text_key": str(row.get("text_key") or ""),
-                        "column_label": str(row.get("column_label") or "main"),
-                        "x0": round(float(row.get("x0") or 0.0), 2),
-                        "x1": round(float(row.get("x1") or 0.0), 2),
-                        "top": round(float(row.get("top") or 0.0), 2),
-                        "bottom": round(float(row.get("bottom") or 0.0), 2),
-                        "width": round(float(row.get("width") or 0.0), 2),
-                        "height": round(float(row.get("height") or 0.0), 2),
-                        "avg_size": round(float(row.get("avg_size") or 0.0), 2),
-                        "bold_ratio": round(float(row.get("bold_ratio") or 0.0), 3),
-                        "image_overlap_ratio": round(float(row.get("image_overlap_ratio") or 0.0), 3),
-                    }
-                    for row in line_rows[:160]
-                ]
+                line_layout = []
+                char_cursor = 0
+                for row in line_rows[:160]:
+                    row_text = str(row.get("text") or "")[:180]
+                    row_span = max(1, len(row_text))
+                    start_char = int(char_cursor)
+                    end_char = int(start_char + row_span)
+                    char_cursor = end_char + 1
+                    column_label = str(row.get("column_label") or "main")
+                    x0 = float(row.get("x0") or 0.0)
+                    x1 = float(row.get("x1") or x0)
+                    column_slot = LiteratureReaderService._line_column_slot(
+                        column_label=column_label,
+                        x0=x0,
+                        x1=x1,
+                        page_width=page_width,
+                    )
+                    line_id = f"p{int(page)}_l{len(line_layout) + 1:03d}_{column_slot}"
+                    line_layout.append(
+                        {
+                            "line_id": line_id,
+                            "text": row_text,
+                            "text_key": str(row.get("text_key") or ""),
+                            "column_label": column_label,
+                            "column_slot": column_slot,
+                            "x0": round(x0, 2),
+                            "x1": round(x1, 2),
+                            "top": round(float(row.get("top") or 0.0), 2),
+                            "bottom": round(float(row.get("bottom") or 0.0), 2),
+                            "width": round(float(row.get("width") or 0.0), 2),
+                            "height": round(float(row.get("height") or 0.0), 2),
+                            "avg_size": round(float(row.get("avg_size") or 0.0), 2),
+                            "bold_ratio": round(float(row.get("bold_ratio") or 0.0), 3),
+                            "image_overlap_ratio": round(float(row.get("image_overlap_ratio") or 0.0), 3),
+                            "start_char": start_char,
+                            "end_char": end_char,
+                            "words": list(row.get("words") or [])[:120],
+                        }
+                    )
 
                 result.update(
                     {
@@ -1392,6 +2383,28 @@ class LiteratureReaderService:
         text = LiteratureReaderService._normalize_spaces(" ".join(texts))
         width = max(0.0, x1 - x0)
         height = max(0.0, bottom - top)
+        word_rows = []
+        for item in ordered:
+            word_text = LiteratureReaderService._normalize_spaces(str(item.get("text") or ""))
+            if not word_text:
+                continue
+            word_x0 = float(item.get("x0") or 0.0)
+            word_x1 = float(item.get("x1") or word_x0)
+            word_top = float(item.get("top") or item.get("doctop") or 0.0)
+            word_bottom = float(item.get("bottom") or word_top)
+            word_rows.append(
+                {
+                    "text": word_text[:80],
+                    "x0": round(word_x0, 2),
+                    "x1": round(word_x1, 2),
+                    "top": round(word_top, 2),
+                    "bottom": round(word_bottom, 2),
+                    "width": round(max(0.0, word_x1 - word_x0), 2),
+                    "height": round(max(0.0, word_bottom - word_top), 2),
+                    "font_name": str(item.get("fontname") or "")[:120],
+                    "font_size": round(float(item.get("size") or 0.0), 2),
+                }
+            )
         return {
             "text": text,
             "text_key": LiteratureReaderService._to_text_key(text),
@@ -1407,7 +2420,65 @@ class LiteratureReaderService:
             "height": height,
             "x_center": x0 + (width / 2.0),
             "char_count": len(text),
+            "words": word_rows,
         }
+
+    @staticmethod
+    def _split_words_by_spacing(
+        words: Sequence[Dict[str, Any]],
+        *,
+        page_width: float,
+    ) -> List[List[Dict[str, Any]]]:
+        ordered = sorted(
+            [item for item in words if isinstance(item, dict)],
+            key=lambda item: (float(item.get("x0") or 0.0), str(item.get("text") or "")),
+        )
+        if len(ordered) <= 1:
+            return [ordered] if ordered else []
+
+        widths: List[float] = []
+        gaps: List[float] = []
+        for item in ordered:
+            x0 = float(item.get("x0") or 0.0)
+            x1 = float(item.get("x1") or x0)
+            widths.append(max(0.0, x1 - x0))
+        for idx in range(1, len(ordered)):
+            prev = ordered[idx - 1]
+            cur = ordered[idx]
+            prev_x1 = float(prev.get("x1") or prev.get("x0") or 0.0)
+            cur_x0 = float(cur.get("x0") or 0.0)
+            gaps.append(max(0.0, cur_x0 - prev_x1))
+
+        width_base = float(statistics.median(widths)) if widths else 0.0
+        positive_gaps = [gap for gap in gaps if gap > 0.0]
+        gap_base = float(statistics.median(positive_gaps)) if positive_gaps else 0.0
+
+        dynamic_gap_threshold = max(10.0, gap_base * 3.2, width_base * 1.6)
+        hard_gap_threshold = max(56.0, float(page_width) * 0.09) if page_width > 0 else 56.0
+
+        segments: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = [ordered[0]]
+        for idx in range(1, len(ordered)):
+            prev = ordered[idx - 1]
+            cur = ordered[idx]
+            prev_x1 = float(prev.get("x1") or prev.get("x0") or 0.0)
+            cur_x0 = float(cur.get("x0") or 0.0)
+            gap = max(0.0, cur_x0 - prev_x1)
+
+            should_split = False
+            if gap >= hard_gap_threshold:
+                should_split = True
+            elif gap_base > 0.0 and gap >= dynamic_gap_threshold:
+                should_split = True
+
+            if should_split and current:
+                segments.append(current)
+                current = [cur]
+            else:
+                current.append(cur)
+        if current:
+            segments.append(current)
+        return segments
 
     @staticmethod
     def _rect_overlap_ratio(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
@@ -1452,7 +2523,7 @@ class LiteratureReaderService:
             and int(row.get("char_count") or 0) >= 6
         ]
 
-        # 中文注释：当左右两栏都足够密集且宽度接近时，认定为标准双栏正文，而不是“正文+侧栏”。
+        # When both left/right columns are dense and similarly wide, treat as two-column body.
         left_candidates = [
             row
             for row in valid_rows
@@ -1627,6 +2698,20 @@ class LiteratureReaderService:
         if re.match(r"^(?:\d+(?:\.\d+){0,2}|[IVXLC]{1,5})\s+[A-Z][A-Za-z0-9 ,:;()\-]{2,90}$", value):
             return True
         if value.upper() == value and re.search(r"[A-Z]{4,}", value) and len(value.split()) <= 10:
+            return True
+        return False
+
+    @staticmethod
+    def _should_demote_heading_line(*, heading_text: str, next_line: str) -> bool:
+        heading = LiteratureReaderService._normalize_spaces(heading_text).lower()
+        if heading not in SECTION_KEYWORDS:
+            return False
+        nxt = LiteratureReaderService._normalize_spaces(next_line)
+        if not nxt:
+            return False
+        if nxt[:1].islower() and len(nxt) >= 20:
+            return True
+        if re.match(r"^[\.,;!?]", nxt):
             return True
         return False
 
@@ -1831,9 +2916,11 @@ class LiteratureReaderService:
             if raw_len > 0 and (start_char > raw_len or end_char > raw_len):
                 return None
 
+            block_id = f"b{idx + 1}"
+            canonical_block_id = f"p{int(page)}_{block_id}"
             normalized_blocks.append(
                 {
-                    "id": f"b{idx + 1}",
+                    "id": block_id,
                     "kind": kind,
                     "text": text,
                     "order": idx,
@@ -1842,6 +2929,15 @@ class LiteratureReaderService:
                         "page": int(page),
                         "start_char": start_char,
                         "end_char": end_char,
+                        "canonical_block_id": canonical_block_id,
+                        "coord_version": "anchor_v2",
+                        "anchor_v2": {
+                            "coord_version": "anchor_v2",
+                            "canonical_block_id": canonical_block_id,
+                            "page": int(page),
+                            "start_char": start_char,
+                            "end_char": end_char,
+                        },
                     },
                     "zone_type": (
                         str(item.get("zone_type") or ("figure_meta" if kind == "caption" else "main_body"))
@@ -1942,15 +3038,7 @@ class LiteratureReaderService:
 
     @staticmethod
     def _read_pdf_page_text(path: str, page: int) -> str:
-        pypdf_text = LiteratureReaderService._read_pdf_page_text_with_pypdf(path, page)
-        pdfplumber_text = LiteratureReaderService._read_pdf_page_text_with_pdfplumber(path, page)
-        pdfplumber_words_text = LiteratureReaderService._read_pdf_page_text_with_pdfplumber_words(path, page)
-        candidates = [pypdf_text, pdfplumber_text, pdfplumber_words_text]
-        candidates = [item for item in candidates if str(item or "").strip()]
-        if not candidates:
-            return ""
-        # 中文注释：同页多候选提取结果按质量分打分，优先选择词边界更自然的文本。
-        return max(candidates, key=LiteratureReaderService._score_extraction_quality)
+        return LiteratureReaderService._read_pdf_page_text_with_pdfplumber_words(path, page)
 
     @staticmethod
     def _read_pdf_page_text_with_pypdf(path: str, page: int) -> str:
@@ -1992,6 +3080,7 @@ class LiteratureReaderService:
                 if page_index >= len(pdf.pages):
                     return ""
                 page_obj = pdf.pages[page_index]
+                page_width = float(getattr(page_obj, "width", 0.0) or 0.0)
                 words = page_obj.extract_words(
                     x_tolerance=1.5,
                     y_tolerance=3,
@@ -2002,8 +3091,26 @@ class LiteratureReaderService:
                     return ""
 
                 lines: List[List[str]] = []
-                current_words: List[str] = []
+                current_words: List[Dict[str, Any]] = []
                 current_top: Optional[float] = None
+                def _flush_current_words() -> None:
+                    nonlocal current_words
+                    if not current_words:
+                        return
+                    segments = LiteratureReaderService._split_words_by_spacing(
+                        current_words,
+                        page_width=page_width,
+                    )
+                    for seg in segments:
+                        parts = [
+                            str(item.get("text") or "").strip()
+                            for item in seg
+                            if str(item.get("text") or "").strip()
+                        ]
+                        if parts:
+                            lines.append(parts)
+                    current_words = []
+
                 for item in words:
                     text = str(item.get("text") or "").strip()
                     if not text:
@@ -2011,19 +3118,17 @@ class LiteratureReaderService:
                     top_value = float(item.get("top") or item.get("doctop") or 0.0)
                     if current_top is None:
                         current_top = top_value
-                        current_words = [text]
+                        current_words = [item]
                         continue
                     if abs(top_value - current_top) <= 2.8:
-                        current_words.append(text)
+                        current_words.append(item)
                         current_top = (current_top + top_value) / 2.0
                     else:
-                        if current_words:
-                            lines.append(current_words)
-                        current_words = [text]
+                        _flush_current_words()
+                        current_words = [item]
                         current_top = top_value
 
-                if current_words:
-                    lines.append(current_words)
+                _flush_current_words()
 
                 return "\n".join(" ".join(parts) for parts in lines if parts)
         except Exception as exc:
@@ -2054,7 +3159,7 @@ class LiteratureReaderService:
             short_upper = sum(1 for item in parts if item.isupper() and len(item) <= 5)
             if short_upper >= 4:
                 fragmented_upper_lines += 1
-        # 中文注释：惩罚黏连词、短碎词和大写碎片行，提升后续结构提取质量。
+        # Penalize glued words and fragmented uppercase lines to improve extraction quality.
         score = (
             len(tokens) * 0.02
             + len(lines) * 0.05
@@ -2073,5 +3178,6 @@ _literature_reader_service = LiteratureReaderService()
 
 def get_literature_reader_service() -> LiteratureReaderService:
     return _literature_reader_service
+
 
 

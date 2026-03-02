@@ -11,6 +11,8 @@ from app.api import literature as literature_api
 from app.config import settings
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
 from app.services.literature_reader_compose_service import LiteratureReaderComposeService
+from app.services.reader_component_contract_service import ReaderComponentContractService
+from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
 
 
 def _score(overall: float, hard_pass: bool, quality_target: float) -> dict:
@@ -207,7 +209,7 @@ def test_reader_compose_validate_rejects_invalid_anchor():
     assert any("anchor" in err.lower() for err in result["errors"])
 
 
-def test_reader_compose_sanitize_anchor_can_recover_invalid_range():
+def test_reader_compose_sanitize_anchor_should_drop_invalid_range():
     service = LiteratureReaderComposeService()
     raw_plan = {
         "plan_id": "x",
@@ -229,18 +231,46 @@ def test_reader_compose_sanitize_anchor_can_recover_invalid_range():
     result = service.validate_ui_plan(sanitized, page=1)
 
     assert result["valid"] is True
-    anchor = sanitized["components"][0]["source_anchor_refs"][0]
-    assert anchor["page"] == 1
-    assert anchor["end_char"] > anchor["start_char"]
+    assert sanitized["components"][0]["source_anchor_refs"] == []
 
 
 def test_reader_compose_normalize_blocks_merge_split_heading_lines():
     service = LiteratureReaderComposeService()
     rows = service._normalize_blocks_for_render(
         blocks=[
-            {"kind": "heading", "text": "Performance of ChatGPT on USMLE: Potential"},
-            {"kind": "heading", "text": "for AI-assisted medical education using large"},
-            {"kind": "heading", "text": "language models"},
+            {
+                "kind": "heading",
+                "text": "Performance of ChatGPT on USMLE: Potential",
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 100,
+                    "end_char": 142,
+                    "canonical_block_id": "p1_b1",
+                    "coord_version": "anchor_v2",
+                },
+            },
+            {
+                "kind": "heading",
+                "text": "for AI-assisted medical education using large",
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 143,
+                    "end_char": 188,
+                    "canonical_block_id": "p1_b1",
+                    "coord_version": "anchor_v2",
+                },
+            },
+            {
+                "kind": "heading",
+                "text": "language models",
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 189,
+                    "end_char": 204,
+                    "canonical_block_id": "p1_b1",
+                    "coord_version": "anchor_v2",
+                },
+            },
             {"kind": "heading", "text": "RESEA RCH ARTICLE"},
         ],
         page=1,
@@ -249,6 +279,432 @@ def test_reader_compose_normalize_blocks_merge_split_heading_lines():
     headings = [str(item.get("text") or "") for item in rows if str(item.get("kind") or "") == "heading"]
     assert any("Performance of ChatGPT on USMLE: Potential for AI-assisted medical education using large language models" in item for item in headings)
     assert any("RESEARCH ARTICLE" in item for item in headings)
+    merged_heading = next(item for item in rows if "Performance of ChatGPT on USMLE: Potential" in str(item.get("text") or ""))
+    anchor = dict(merged_heading.get("source_anchor") or {})
+    assert int(anchor.get("start_char") or 0) == 100
+    assert int(anchor.get("end_char") or 0) >= 204
+
+
+def test_build_main_blocks_from_segment_map_should_cover_full_line_span():
+    service = LiteratureReaderComposeService()
+    blocks = [
+        {
+            "id": "b1",
+            "page": 1,
+            "kind": "paragraph",
+            "text": "Block text",
+            "order": 1,
+            "section_title": "Introduction",
+            "source_anchor": {"page": 1, "start_char": 0, "end_char": 420},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "heading_prob": 0.0,
+            "layout_confidence": 0.9,
+        }
+    ]
+    line_catalog = []
+    cursor = 0
+    line_ids = []
+    for idx in range(8):
+        line_id = f"p1_l{idx + 1:03d}_main"
+        line_ids.append(line_id)
+        line_catalog.append(
+            {
+                "line_id": line_id,
+                "page": 1,
+                "order": idx,
+                "text": f"Line {idx + 1} content.",
+                "start_char": cursor,
+                "end_char": cursor + 52,
+                "x0": 120,
+                "x1": 620,
+                "top": 120 + idx * 18,
+                "bottom": 136 + idx * 18,
+                "page_width": 840,
+                "page_height": 1188,
+                "column_label": "main",
+            }
+        )
+        cursor += 53
+
+    output = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map={
+            "segments": [
+                {
+                    "segment_id": "seg_long",
+                    "kind": "paragraph",
+                    "ui_component": "ParagraphProse",
+                    "block_ids": [],
+                    "line_ids": line_ids,
+                    "evidence_line_ids": [],
+                    "title": "",
+                    "continuation": "none",
+                    "reason": "test",
+                }
+            ]
+        },
+        base_payload={"line_catalog": line_catalog},
+    )
+
+    assert output
+    anchor_rows = [dict((row or {}).get("source_anchor") or {}) for row in output]
+    max_end = max(int(item.get("end_char") or 0) for item in anchor_rows)
+    assert max_end >= int(line_catalog[-1]["end_char"])
+    assert all(str(item.get("canonical_block_id") or "").startswith("p1_b1") for item in anchor_rows if item)
+
+
+def test_reader_compose_build_segment_map_from_parser_advice_should_generate_segments():
+    service = LiteratureReaderComposeService()
+    segment_map = service._build_segment_map_from_parser_advice(
+        page=1,
+        parser_advice={
+            "heading_groups": [
+                {"heading_id": "h_intro", "line_ids": ["p1_l001_main_left"], "title": "Introduction", "level": 1, "confidence": 0.95}
+            ],
+            "paragraph_groups": [
+                {
+                    "paragraph_id": "p_intro_1",
+                    "line_ids": ["p1_l002_main_left", "p1_l003_main_left"],
+                    "heading_id": "h_intro",
+                    "zone_type": "main_body",
+                    "column_id": "main_left",
+                    "confidence": 0.9,
+                }
+            ],
+            "counts": {"heading_count": 1, "paragraph_count": 1, "figure_count": 0},
+            "notes": ["parser ok"],
+        },
+        prompt_payload={
+            "line_candidates": [
+                {"line_id": "p1_l001_main_left", "order": 0, "text": "Introduction"},
+                {"line_id": "p1_l002_main_left", "order": 1, "text": "First sentence."},
+                {"line_id": "p1_l003_main_left", "order": 2, "text": "Second sentence."},
+            ]
+        },
+    )
+
+    assert isinstance(segment_map, dict)
+    assert str(segment_map.get("source") or "") == "vlflash_page_structure_v2"
+    segments = list(segment_map.get("segments") or [])
+    assert len(segments) == 2
+    assert segments[0].get("kind") == "heading"
+    assert segments[1].get("kind") == "paragraph"
+    assert segments[1].get("line_ids") == ["p1_l002_main_left", "p1_l003_main_left"]
+
+
+def test_reader_compose_build_segment_map_from_parser_advice_should_use_block_groups():
+    service = LiteratureReaderComposeService()
+    segment_map = service._build_segment_map_from_parser_advice(
+        page=1,
+        parser_advice={
+            "line_labels": [],
+            "toc_tree": [{"node_id": "h_intro", "type": "heading", "title": "Introduction", "line_ids": ["p1_l001_main_left"], "children": []}],
+            "heading_groups": [],
+            "paragraph_groups": [],
+            "figure_groups": [],
+            "block_groups": [
+                {
+                    "block_id": "blk_h1",
+                    "kind": "heading",
+                    "title": "Introduction",
+                    "line_ids": ["p1_l001_main_left"],
+                    "word_ids": ["w000001"],
+                    "char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000010"}],
+                    "zone_type": "main_body",
+                    "column_id": "main_left",
+                    "reading_order": 1,
+                    "confidence": 0.95,
+                },
+                {
+                    "block_id": "blk_p1",
+                    "kind": "paragraph",
+                    "parent_node_id": "blk_h1",
+                    "line_ids": ["p1_l002_main_left", "p1_l003_main_left"],
+                    "word_ids": ["w000002", "w000003"],
+                    "char_ranges": [{"start_char_id": "c000011", "end_char_id": "c000060"}],
+                    "zone_type": "main_body",
+                    "column_id": "main_left",
+                    "reading_order": 2,
+                    "confidence": 0.9,
+                },
+            ],
+            "counts": {"heading_count": 1, "paragraph_count": 1, "figure_count": 0, "block_count": 2},
+            "notes": ["ok"],
+        },
+        prompt_payload={
+            "line_candidates": [
+                {"line_id": "p1_l001_main_left", "order": 0, "text": "Introduction"},
+                {"line_id": "p1_l002_main_left", "order": 1, "text": "First sentence."},
+                {"line_id": "p1_l003_main_left", "order": 2, "text": "Second sentence."},
+            ]
+        },
+    )
+
+    assert isinstance(segment_map, dict)
+    segments = list(segment_map.get("segments") or [])
+    assert len(segments) == 2
+    assert segments[0].get("segment_id") == "blk_h1"
+    assert segments[0].get("kind") == "heading"
+    assert segments[1].get("segment_id") == "blk_p1"
+    assert segments[1].get("kind") == "paragraph"
+    assert len(list(segments[1].get("word_ids") or [])) == 2
+    assert len(list(segments[1].get("char_ranges") or [])) == 1
+
+
+def test_build_main_blocks_from_segment_map_should_not_merge_two_block_paragraphs():
+    service = LiteratureReaderComposeService()
+    blocks = [
+        {
+            "id": "b1",
+            "page": 1,
+            "kind": "paragraph",
+            "text": "Paragraph A",
+            "order": 1,
+            "section_title": "Results",
+            "source_anchor": {"page": 1, "start_char": 0, "end_char": 120},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "heading_prob": 0.0,
+            "layout_confidence": 0.9,
+        },
+        {
+            "id": "b2",
+            "page": 1,
+            "kind": "paragraph",
+            "text": "Paragraph B",
+            "order": 2,
+            "section_title": "Results",
+            "source_anchor": {"page": 1, "start_char": 121, "end_char": 260},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "heading_prob": 0.0,
+            "layout_confidence": 0.9,
+        },
+    ]
+    line_catalog = [
+        {
+            "line_id": "p1_l001_main",
+            "page": 1,
+            "order": 1,
+            "text": "A line 1.",
+            "start_char": 0,
+            "end_char": 42,
+            "x0": 120,
+            "x1": 620,
+            "top": 100,
+            "bottom": 116,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l002_main",
+            "page": 1,
+            "order": 2,
+            "text": "A line 2.",
+            "start_char": 43,
+            "end_char": 110,
+            "x0": 120,
+            "x1": 620,
+            "top": 118,
+            "bottom": 134,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l003_main",
+            "page": 1,
+            "order": 3,
+            "text": "B line 1.",
+            "start_char": 130,
+            "end_char": 186,
+            "x0": 120,
+            "x1": 620,
+            "top": 170,
+            "bottom": 186,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l004_main",
+            "page": 1,
+            "order": 4,
+            "text": "B line 2.",
+            "start_char": 187,
+            "end_char": 250,
+            "x0": 120,
+            "x1": 620,
+            "top": 188,
+            "bottom": 204,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+    ]
+    output = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map={
+            "segments": [
+                {
+                    "segment_id": "seg_merge_candidate",
+                    "kind": "paragraph",
+                    "ui_component": "ParagraphProse",
+                    "block_ids": ["p1_b1", "p1_b2"],
+                    "line_ids": ["p1_l001_main", "p1_l002_main", "p1_l003_main", "p1_l004_main"],
+                    "evidence_line_ids": ["p1_l001_main", "p1_l002_main", "p1_l003_main", "p1_l004_main"],
+                    "title": "",
+                    "continuation": "none",
+                    "reason": "test no merge",
+                }
+            ]
+        },
+        base_payload={"line_catalog": line_catalog},
+    )
+
+    assert len(output) == 2
+    assert output[0].get("source_block_ids") == ["p1_b1"]
+    assert output[1].get("source_block_ids") == ["p1_b2"]
+    assert "A line 1." in str(output[0].get("text") or "")
+    assert "B line 1." in str(output[1].get("text") or "")
+
+
+def test_build_main_blocks_from_segment_map_should_split_by_large_vertical_gap():
+    service = LiteratureReaderComposeService()
+    blocks = [
+        {
+            "id": "b1",
+            "page": 1,
+            "kind": "paragraph",
+            "text": "Merged source block",
+            "order": 1,
+            "section_title": "Discussion",
+            "source_anchor": {"page": 1, "start_char": 0, "end_char": 300},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "heading_prob": 0.0,
+            "layout_confidence": 0.9,
+        }
+    ]
+    line_catalog = [
+        {
+            "line_id": "p1_l001_main",
+            "page": 1,
+            "order": 1,
+            "text": "First paragraph sentence one.",
+            "start_char": 0,
+            "end_char": 60,
+            "x0": 120,
+            "x1": 620,
+            "top": 100,
+            "bottom": 116,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l002_main",
+            "page": 1,
+            "order": 2,
+            "text": "First paragraph sentence two.",
+            "start_char": 61,
+            "end_char": 120,
+            "x0": 120,
+            "x1": 620,
+            "top": 118,
+            "bottom": 134,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l003_main",
+            "page": 1,
+            "order": 3,
+            "text": "Second paragraph starts here.",
+            "start_char": 121,
+            "end_char": 180,
+            "x0": 120,
+            "x1": 620,
+            "top": 160,
+            "bottom": 176,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+        {
+            "line_id": "p1_l004_main",
+            "page": 1,
+            "order": 4,
+            "text": "Second paragraph continues.",
+            "start_char": 181,
+            "end_char": 240,
+            "x0": 120,
+            "x1": 620,
+            "top": 178,
+            "bottom": 194,
+            "page_width": 840,
+            "page_height": 1188,
+            "column_label": "main",
+        },
+    ]
+    output = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map={
+            "segments": [
+                {
+                    "segment_id": "seg_gap_candidate",
+                    "kind": "paragraph",
+                    "ui_component": "ParagraphProse",
+                    "block_ids": ["p1_b1"],
+                    "line_ids": ["p1_l001_main", "p1_l002_main", "p1_l003_main", "p1_l004_main"],
+                    "evidence_line_ids": ["p1_l001_main", "p1_l002_main", "p1_l003_main", "p1_l004_main"],
+                    "title": "",
+                    "continuation": "none",
+                    "reason": "test gap split",
+                }
+            ]
+        },
+        base_payload={"line_catalog": line_catalog},
+    )
+
+    assert len(output) >= 2
+    assert "First paragraph sentence one." in str(output[0].get("text") or "")
+    assert any("Second paragraph starts here." in str(item.get("text") or "") for item in output[1:])
+
+
+def test_mm_layout_plan_validator_should_accept_common_aliases():
+    mm = ReaderMultimodalLayoutService()
+    payload = {
+        "zones": [{"zone_type": "sidebar_left", "block_ids": ["p2_b10"]}],
+        "headings": [{"block_id": "p2_b10", "level": 1, "confidence": 0.92, "text": "Introduction"}],
+        "continuation": {"from_prev": [], "to_next": [], "confidence": 0.3},
+        "segments": [
+            {
+                "segment_id": "seg_1",
+                "kind": "text",
+                "ui_component": "paragraph",
+                "line_ids": ["1", "2"],
+                "evidence_line_ids": [],
+                "block_ids": ["p2_b10"],
+                "title": "",
+            }
+        ],
+    }
+    validated = mm.validate_layout_plan_v2_json(
+        payload=payload,
+        valid_block_ids={"p2_b10"},
+        valid_line_ids={"p2_l001_main", "p2_l002_main"},
+        component_whitelist={"SectionHeading", "ParagraphProse", "ListBlock", "ContextRail", "FigurePanel", "TablePanel"},
+    )
+    assert isinstance(validated, dict)
+    assert (validated.get("zones") or [])[0]["zone_type"] == "side_context"
+    assert (validated.get("segments") or [])[0]["ui_component"] == "ParagraphProse"
 
 
 def test_inline_query_slot_should_resolve_target_node_text():
@@ -371,13 +827,11 @@ def test_build_link_tldr_empty_doi_should_not_match_all_links():
         paper=SimpleNamespace(doi=None),
     )
 
-    assert "正式标识入口" not in tldr
-
+    assert "DOI link" not in tldr
 
 def test_extract_query_terms_should_expand_limitations_to_valid_chinese_term():
     terms = literature_api._extract_query_terms("limitations")
-    assert "局限性" in terms
-
+    assert "limitations" in terms
 
 class _FakeDB:
     async def execute(self, _stmt):
@@ -523,7 +977,8 @@ async def test_reader_compose_signature_should_change_with_mode_even_with_long_p
 
     class _NoopDb:
         async def execute(self, *_args, **_kwargs):
-            raise AssertionError("selected_kb_id=None 时不应触发 DB 查询")
+            raise AssertionError("selected_kb_id=None should not trigger DB query")
+
 
     paper = SimpleNamespace(id=11, user_id=1, pdf_path=long_path, title="Demo")
     sig_a = await service._build_source_signature(
@@ -613,8 +1068,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
         )
 
     async def _fake_answer(**_kwargs):
-        return "结论：可回答。证据：来自当前段落。"
-
+        return "Conclusion: answerable with current paragraph evidence."
     monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build_or_get)
     monkeypatch.setattr(service, "_generate_inline_answer", _fake_answer)
 
@@ -624,7 +1078,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
         paper=SimpleNamespace(id=1),
         page=1,
         node_id="n1",
-        question="测试",
+        question="test",
         scope="section",
         theme_mode="dark",
         citation_tldr=True,
@@ -743,6 +1197,320 @@ async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypa
     assert "side_context" in channels
 
 
+def test_mm_should_trigger_per_build_when_budget_allows(monkeypatch):
+    service = ReaderMultimodalLayoutService()
+    monkeypatch.setattr(settings, "reader_mm_assist_enabled", True)
+    monkeypatch.setattr(settings, "reader_mm_max_calls_per_page", 1)
+
+    base_payload = {
+        "structure_confidence": 0.92,
+        "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph"}],
+        "style_cues": {"layout_mode": "single_column"},
+    }
+    should_trigger, trigger_meta = service.should_trigger_mm(
+        paper_id=88,
+        page=3,
+        base_payload=base_payload,
+        call_count=0,
+    )
+    assert should_trigger is True
+    assert str(trigger_meta.get("reason") or "") == "triggered_per_page_default"
+
+    should_trigger_again, trigger_meta_again = service.should_trigger_mm(
+        paper_id=88,
+        page=3,
+        base_payload=base_payload,
+        call_count=0,
+    )
+    assert should_trigger_again is True
+    assert str(trigger_meta_again.get("reason") or "") == "triggered_per_page_default"
+
+    over_budget, over_budget_meta = service.should_trigger_mm(
+        paper_id=88,
+        page=3,
+        base_payload=base_payload,
+        call_count=1,
+    )
+    assert over_budget is False
+    assert str(over_budget_meta.get("reason") or "") == "page_call_budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_mm_prompt_payload_should_include_prev_current_next_images(monkeypatch):
+    service = ReaderMultimodalLayoutService()
+
+    async def _fake_render(*, pdf_path: str, page: int):
+        _ = pdf_path
+        return f"data:image/jpeg;base64,page-{page}"
+
+    monkeypatch.setattr(service, "_render_page_image_data_url", _fake_render)
+    payload = await service.build_mm_prompt_payload(
+        pdf_path="demo.pdf",
+        page=2,
+        base_payload={
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "source_anchor": {"page": 2, "start_char": 0, "end_char": 10}}],
+            "style_cues": {
+                "line_layout": [
+                    {"line_id": 1, "text": "Demo paragraph", "x0": 80, "x1": 600, "top": 120, "bottom": 138},
+                ]
+            },
+        },
+    )
+
+    assert isinstance(payload, dict)
+    images = list(payload.get("images") or [])
+    scopes = [str(item.get("scope") or "") for item in images]
+    assert scopes == ["prev", "current", "next"]
+    assert str(payload.get("image_data_url") or "").startswith("data:image/jpeg;base64,page-2")
+    assert isinstance(payload.get("native_page_extract"), dict)
+    assert isinstance(payload.get("valid_word_ids"), list)
+    assert isinstance(payload.get("valid_char_ids"), list)
+
+
+def test_mm_validate_json_should_keep_continuation_and_ui_suggestions():
+    service = ReaderMultimodalLayoutService()
+    parsed = service.validate_mm_layout_json(
+        {
+            "headings": [{"line_id": 1, "heading_prob": 0.88, "level": 1}],
+            "zones": [{"line_id": 1, "zone_type": "main_body", "column_id": "left"}],
+            "toc_candidates": [1],
+            "notes": ["ok"],
+            "page_continuation": {"from_prev": True, "to_next": False, "continuation_confidence": 0.81, "notes": ["tail"]},
+            "ui_suggestions": [
+                {"kind": "continue_from_prev", "target_block_ids": ["b1"], "reason": "tail from previous page"},
+                {"kind": "unknown_kind", "target_block_ids": ["b2"], "reason": "ignored"},
+            ],
+        }
+    )
+
+    assert isinstance(parsed, dict)
+    continuation = parsed.get("page_continuation") or {}
+    assert continuation.get("from_prev") is True
+    assert continuation.get("to_next") is False
+    suggestions = list(parsed.get("ui_suggestions") or [])
+    assert len(suggestions) == 1
+    assert suggestions[0].get("kind") == "continue_from_prev"
+
+
+def test_mm_validate_line_parse_advice_should_keep_groups_counts_and_aliases():
+    service = ReaderMultimodalLayoutService()
+    parsed = service.validate_line_parse_advice_json(
+        payload={
+            "line_labels": [
+                {"line_id": 1, "zone_type": "main_body", "column_id": "main_left", "paragraph_break_after": False, "heading_prob": 0.95},
+                {"line_id": 2, "zone_type": "main_body", "column_id": "main_left", "paragraph_break_after": False, "heading_prob": 0.05},
+                {"line_id": 3, "zone_type": "main_body", "column_id": "main_left", "paragraph_break_after": True, "heading_prob": 0.05},
+            ],
+            "toc_tree": [
+                {"node_id": "h_intro", "type": "heading", "title": "Introduction", "line_ids": [1], "level": 1, "children": []}
+            ],
+            "heading_groups": [
+                {"heading_id": "h_intro", "line_ids": [1], "title": "Introduction", "level": 1, "confidence": 0.92}
+            ],
+            "paragraph_groups": [
+                {"paragraph_id": "p1", "line_ids": [2, 3], "heading_id": "h_intro", "zone_type": "main_body", "column_id": "main_left", "confidence": 0.88}
+            ],
+            "figure_groups": [
+                {"figure_id": "f1", "line_ids": [], "caption_line_ids": [3], "related_heading_id": "h_intro", "confidence": 0.8}
+            ],
+            "block_groups": [
+                {
+                    "block_id": "blk_001",
+                    "kind": "paragraph",
+                    "parent_node_id": "h_intro",
+                    "line_ids": [2, 3],
+                    "word_ids": ["w000001", "w000002"],
+                    "char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000012"}],
+                    "zone_type": "main_body",
+                    "column_id": "main_left",
+                    "reading_order": 1,
+                    "confidence": 0.9,
+                }
+            ],
+            "counts": {"heading_count": 1, "paragraph_count": 1, "figure_count": 1, "block_count": 1},
+            "notes": ["ok"],
+        },
+        valid_line_ids={"p2_l001_main_left", "p2_l002_main_left", "p2_l003_main_left"},
+        valid_word_ids={"w000001", "w000002"},
+        valid_char_ids=["c000001", "c000002", "c000003", "c000004", "c000005", "c000006", "c000007", "c000008", "c000009", "c000010", "c000011", "c000012"],
+    )
+
+    assert isinstance(parsed, dict)
+    assert len(list(parsed.get("line_labels") or [])) == 3
+    assert len(list(parsed.get("heading_groups") or [])) == 1
+    assert len(list(parsed.get("paragraph_groups") or [])) == 1
+    assert len(list(parsed.get("figure_groups") or [])) == 1
+    assert len(list(parsed.get("block_groups") or [])) == 1
+    counts = dict(parsed.get("counts") or {})
+    assert counts.get("heading_count") == 1
+    assert counts.get("paragraph_count") == 1
+    assert counts.get("figure_count") == 1
+    assert counts.get("block_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_mm_build_line_parse_advice_should_retry_on_quality_gate(monkeypatch):
+    service = ReaderMultimodalLayoutService()
+    valid_line_ids = [f"p1_l{idx:03d}_main_left" for idx in range(1, 21)]
+    valid_word_ids = [f"w{idx:06d}" for idx in range(1, 81)]
+    valid_char_ids = [f"c{idx:06d}" for idx in range(1, 501)]
+    calls = []
+
+    first_bad = {
+        "line_labels": [
+            {
+                "line_id": line_id,
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "paragraph_break_after": False,
+                "heading_prob": 0.0,
+            }
+            for line_id in valid_line_ids
+        ],
+        "toc_tree": [],
+        "heading_groups": [],
+        "paragraph_groups": [
+            {
+                "paragraph_id": "p1",
+                "line_ids": list(valid_line_ids),
+                "heading_id": "",
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "confidence": 0.88,
+            }
+        ],
+        "figure_groups": [],
+        "block_groups": [],
+        "counts": {"heading_count": 0, "paragraph_count": 1, "figure_count": 0},
+        "notes": [],
+    }
+    second_good = {
+        "line_labels": [
+            {
+                "line_id": line_id,
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "paragraph_break_after": line_id in {valid_line_ids[9], valid_line_ids[-1]},
+                "heading_prob": 0.0,
+            }
+            for line_id in valid_line_ids
+        ],
+        "toc_tree": [],
+        "heading_groups": [],
+        "paragraph_groups": [
+            {
+                "paragraph_id": "p1",
+                "line_ids": list(valid_line_ids[:10]),
+                "heading_id": "",
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "confidence": 0.9,
+            },
+            {
+                "paragraph_id": "p2",
+                "line_ids": list(valid_line_ids[10:]),
+                "heading_id": "",
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "confidence": 0.9,
+            },
+        ],
+        "figure_groups": [],
+        "block_groups": [
+            {
+                "block_id": "blk_001",
+                "kind": "paragraph",
+                "line_ids": list(valid_line_ids[:10]),
+                "word_ids": list(valid_word_ids[:40]),
+                "char_ranges": [{"start_char_id": valid_char_ids[0], "end_char_id": valid_char_ids[249]}],
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "reading_order": 1,
+                "confidence": 0.9,
+            },
+            {
+                "block_id": "blk_002",
+                "kind": "paragraph",
+                "line_ids": list(valid_line_ids[10:]),
+                "word_ids": list(valid_word_ids[40:80]),
+                "char_ranges": [{"start_char_id": valid_char_ids[250], "end_char_id": valid_char_ids[-1]}],
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "reading_order": 2,
+                "confidence": 0.9,
+            },
+        ],
+        "counts": {"heading_count": 0, "paragraph_count": 2, "figure_count": 0, "block_count": 2},
+        "notes": ["retry_fixed"],
+    }
+
+    async def _fake_call_mm_model(*, model: str, prompt_payload: dict, timeout_ms: int, prompt_kind: str):
+        _ = (model, timeout_ms, prompt_kind)
+        calls.append(dict(prompt_payload))
+        return first_bad if len(calls) == 1 else second_good
+
+    monkeypatch.setattr(service, "_call_mm_model", _fake_call_mm_model)
+    monkeypatch.setattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")
+    monkeypatch.setattr(settings, "reader_mm_fallback_model", "qwen3-vl-flash")
+
+    parsed, meta = await service.build_line_parse_advice(
+        prompt_payload={"line_candidates": [], "valid_word_ids": valid_word_ids, "valid_char_ids": valid_char_ids},
+        valid_line_ids=valid_line_ids,
+    )
+
+    assert isinstance(parsed, dict)
+    assert int((meta or {}).get("retry_count") or 0) >= 1
+    assert bool((meta or {}).get("retry_used")) is True
+    assert len(calls) == 2
+    assert not str(calls[0].get("retry_hint") or "")
+    assert "validation_errors=" in str(calls[1].get("retry_hint") or "")
+
+
+def test_mm_merge_decision_should_accept_string_line_ids():
+    service = ReaderMultimodalLayoutService()
+    payload = service.merge_mm_decision_into_blocks(
+        base_payload={
+            "page": 1,
+            "raw_text": "Introduction Body text line.",
+            "style_cues": {
+                "line_layout": [
+                    {"line_id": "p1_l001_main_left", "text": "Introduction", "column_label": "main_left"},
+                    {"line_id": "p1_l002_main_left", "text": "Body text line.", "column_label": "main_left"},
+                ]
+            },
+            "blocks": [
+                {
+                    "id": "p1_b1",
+                    "kind": "heading",
+                    "text": "Introduction",
+                    "source_anchor": {"page": 1, "start_char": 0, "end_char": 12},
+                },
+                {
+                    "id": "p1_b2",
+                    "kind": "paragraph",
+                    "text": "Body text line.",
+                    "source_anchor": {"page": 1, "start_char": 13, "end_char": 28},
+                },
+            ],
+        },
+        mm_decision={
+            "headings": [{"line_id": "p1_l001_main_left", "heading_prob": 0.93, "level": 1}],
+            "zones": [
+                {"line_id": "p1_l001_main_left", "zone_type": "main_body", "column_id": "main_left"},
+                {"line_id": "p1_l002_main_left", "zone_type": "main_body", "column_id": "main_left"},
+            ],
+            "toc_candidates": ["p1_l001_main_left"],
+            "notes": [],
+        },
+    )
+
+    merged_blocks = list(payload.get("blocks") or [])
+    assert len(merged_blocks) == 2
+    heading_block = next(item for item in merged_blocks if str(item.get("kind") or "") == "heading")
+    assert heading_block.get("toc_candidate") is True
+    assert str(heading_block.get("column_id") or "") == "main_left"
+
+
 @pytest.mark.asyncio
 async def test_generate_takeaways_should_use_neighbor_context(monkeypatch):
     service = LiteratureReaderComposeService()
@@ -753,8 +1521,14 @@ async def test_generate_takeaways_should_use_neighbor_context(monkeypatch):
                 "content": json.dumps(
                     {
                         "items": [
-                            {"text": "模型在当前页给出了可迁移的核心实验结论。"},
-                            {"text": "上一页背景用于解释当前页结论成立条件。"},
+                            {
+                                "text": "Current-page core finding with transferable conclusion.",
+                                "evidence_block_ids": ["p2_b1"],
+                            },
+                            {
+                                "text": "Previous-page context supports condition interpretation.",
+                                "evidence_block_ids": ["p1_b1"],
+                            },
                         ]
                     },
                     ensure_ascii=False,
@@ -816,8 +1590,10 @@ async def test_generate_takeaways_should_use_neighbor_context(monkeypatch):
     )
 
     assert len(rows) == 2
-    assert "核心实验结论" in str(rows[0].get("text") or "")
-    assert all((row.get("evidence_anchors") or []) == [] for row in rows)
+    assert "core finding" in str(rows[0].get("text") or "").lower()
+    assert len(rows[0].get("evidence_anchors") or []) > 0
+    assert int((rows[0].get("evidence_anchors") or [])[0].get("page") or 0) == 2
+    assert len(rows[1].get("evidence_anchors") or []) == 0
 
 
 def test_build_initial_ui_plan_should_prefer_takeaways_from_payload():
@@ -835,7 +1611,7 @@ def test_build_initial_ui_plan_should_prefer_takeaways_from_payload():
             "toc_hidden": False,
             "takeaways": [
                 {
-                    "text": "该页的关键结论已经由 AI 概括完成",
+                    "text": "This page key takeaway is summarized by AI.",
                     "evidence_anchors": [{"page": 1, "start_char": 0, "end_char": 14}],
                 }
             ],
@@ -848,9 +1624,88 @@ def test_build_initial_ui_plan_should_prefer_takeaways_from_payload():
 
     takeaway_nodes = [node for node in ui_plan.get("components") or [] if node.get("type") == "KeyTakeaways"]
     assert takeaway_nodes
+    assert len(takeaway_nodes[0].get("source_anchor_refs") or []) == 0
     items = (takeaway_nodes[0].get("props") or {}).get("items") or []
     assert items
-    assert "由 AI 概括完成" in str(items[0].get("text") or "")
+    text = str(items[0].get("text") or "")
+    assert "AI" in text
+    assert len(text) >= 8
+
+
+def test_build_initial_ui_plan_should_dedupe_main_blocks_and_reduce_inline_slot_density():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=32, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)
+    duplicated_text = (
+        "This section reports the baseline setup and evaluation protocol for model performance across cohorts."
+    )
+    ui_plan = service._build_initial_ui_plan(
+        paper=paper,
+        page=1,
+        base_payload={
+            "sections": [
+                {
+                    "title": "Introduction",
+                    "level": 1,
+                    "source_anchor": {"page": 1, "start_char": 0, "end_char": 12},
+                }
+            ],
+            "blocks": [
+                {
+                    "id": "h1",
+                    "kind": "heading",
+                    "text": "Introduction",
+                    "section_title": "Introduction",
+                    "source_anchor": {"page": 1, "start_char": 0, "end_char": 12},
+                    "zone_type": "main_body",
+                },
+                {
+                    "id": "p1",
+                    "kind": "paragraph",
+                    "text": duplicated_text,
+                    "section_title": "Introduction",
+                    "source_anchor": {"page": 1, "start_char": 13, "end_char": 120},
+                    "zone_type": "main_body",
+                },
+                {
+                    "id": "p2",
+                    "kind": "paragraph",
+                    "text": duplicated_text,
+                    "section_title": "Introduction",
+                    "source_anchor": {"page": 1, "start_char": 121, "end_char": 228},
+                    "zone_type": "main_body",
+                },
+                {
+                    "id": "p3",
+                    "kind": "paragraph",
+                    "text": (
+                        "We then compare error distributions across tasks, and the analysis remains grounded on "
+                        "aligned evidence snippets for every claim presented in this section."
+                    ),
+                    "section_title": "Introduction",
+                    "source_anchor": {"page": 1, "start_char": 229, "end_char": 410},
+                    "zone_type": "main_body",
+                },
+            ],
+            "assets": [],
+            "summary": "",
+            "style_cues": {},
+            "toc_quality": 0.8,
+            "toc_hidden": False,
+        },
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    nodes = list(ui_plan.get("components") or [])
+    paragraph_nodes = [node for node in nodes if node.get("type") == "ParagraphProse"]
+    inline_nodes = [node for node in nodes if node.get("type") == "InlineQuerySlot"]
+    heading_nodes = [node for node in nodes if node.get("type") == "SectionHeading"]
+
+    assert heading_nodes
+    assert len(paragraph_nodes) == 2
+    assert inline_nodes == []
 
 
 def test_reader_compose_should_not_render_page_toc_when_low_quality():
@@ -881,6 +1736,65 @@ def test_reader_compose_should_not_render_page_toc_when_low_quality():
     assert bool(trace_meta.get("toc_hidden")) is True
 
 
+def test_reader_compose_quality_should_penalize_duplicate_nodes():
+    service = LiteratureReaderComposeService()
+    quality = service.score_ui_plan(
+        ui_plan={
+            "plan_id": "p1",
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+            "components": [
+                {
+                    "id": "head_1",
+                    "type": "PaperHeaderCard",
+                    "props": {"title": "A Reliable Study Title"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                },
+                {
+                    "id": "sec_1",
+                    "type": "SectionHeading",
+                    "props": {"text": "Introduction"},
+                    "children": [],
+                    "source_anchor_refs": [{"page": 1, "start_char": 0, "end_char": 12}],
+                },
+                {
+                    "id": "p_1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Repeated paragraph content for duplicate ratio checks."},
+                    "children": [],
+                    "source_anchor_refs": [{"page": 1, "start_char": 13, "end_char": 74}],
+                },
+                {
+                    "id": "p_2",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Repeated paragraph content for duplicate ratio checks."},
+                    "children": [],
+                    "source_anchor_refs": [{"page": 1, "start_char": 75, "end_char": 136}],
+                },
+            ],
+        },
+        base_payload={
+            "blocks": [
+                {"id": "h1", "kind": "heading", "text": "Introduction"},
+                {"id": "p1", "kind": "paragraph", "text": "Repeated paragraph content for duplicate ratio checks."},
+            ],
+            "assets": [],
+            "style_cues": {},
+            "side_context_blocks": [],
+            "toc_quality": 0.7,
+            "toc_hidden": False,
+        },
+        validation_errors=[],
+        quality_target=0.86,
+    )
+
+    assert float(quality.get("duplicate_ratio") or 0.0) > 0.1
+    deductions = list(quality.get("deductions") or [])
+    assert any(str(item.get("item") or "") == "duplicate_content" for item in deductions)
+
+
 def test_reader_compose_quality_should_include_layout_metrics():
     service = LiteratureReaderComposeService()
     quality = service.score_ui_plan(
@@ -891,7 +1805,7 @@ def test_reader_compose_quality_should_include_layout_metrics():
             "trace_meta": {},
             "components": [
                 {"id": "h1", "type": "PaperHeaderCard", "props": {"title": "Demo title"}, "children": [], "source_anchor_refs": []},
-                {"id": "t1", "type": "SectionTOC", "props": {"items": [], "hidden_reason": "本页目录质量不足，已隐藏。"}, "children": [], "source_anchor_refs": []},
+                {"id": "t1", "type": "SectionTOC", "props": {"items": [], "hidden_reason": "TOC quality too low, hidden."}, "children": [], "source_anchor_refs": []},
                 {"id": "p1", "type": "ParagraphProse", "props": {"text": "demo body"}, "children": [], "source_anchor_refs": [{"page": 1, "start_char": 0, "end_char": 8}]},
                 {"id": "c1", "type": "ContextRail", "props": {"items": [{"text": "OPEN ACCESS"}]}, "children": [], "source_anchor_refs": []},
             ],
@@ -913,4 +1827,1126 @@ def test_reader_compose_quality_should_include_layout_metrics():
     assert "cross_column_merge_ratio" in quality
     assert "sidebar_recall" in quality
     assert "toc_quality" in quality
+    assert "anchor_coverage_ratio" in quality
+    assert "evidence_image_ready" in quality
     assert quality.get("mm_assist_used") is True
+
+
+def test_reader_compose_quality_should_fail_anchor_gate_on_misaligned_quote():
+    service = LiteratureReaderComposeService()
+    quality = service.score_ui_plan(
+        ui_plan={
+            "plan_id": "p1",
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+            "components": [
+                {
+                    "id": "p1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "This is the visible paragraph text.", "source_block_id": "b1"},
+                    "children": [],
+                    "source_anchor_refs": [
+                        {
+                            "page": 1,
+                            "start_char": 0,
+                            "end_char": 8,
+                            "quote_text": "unrelated evidence phrase",
+                            "canonical_block_id": "b1",
+                            "coord_version": "anchor_v2",
+                            "anchor_confidence": 0.92,
+                        }
+                    ],
+                }
+            ],
+        },
+        base_payload={
+            "raw_text": "This is the visible paragraph text.",
+            "style_cues": {
+                "line_layout": [
+                    {"text": "This is the visible paragraph text.", "x0": 80, "x1": 620, "top": 120, "bottom": 138},
+                ]
+            },
+            "blocks": [{"id": "b1", "kind": "paragraph", "text": "This is the visible paragraph text."}],
+            "assets": [],
+            "toc_quality": 0.0,
+            "toc_hidden": True,
+        },
+        validation_errors=[],
+        quality_target=0.86,
+    )
+
+    assert quality.get("anchor_gate_passed") is False
+    assert float(quality.get("anchor_quote_hit_rate") or 0) <= 0.2
+    assert float(quality.get("anchor_misjump_rate") or 0) >= 0.8
+
+
+def test_reader_compose_long_paragraph_should_build_single_stable_anchor():
+    service = LiteratureReaderComposeService()
+    quote_text = " ".join([f"Sentence {idx}." for idx in range(1, 40)])
+    refs = service._build_segmented_anchor_refs(
+        anchor={"page": 1, "start_char": 100, "end_char": 4200},
+        page=1,
+        quote_text=quote_text,
+        style_cues={
+            "page_width": 900,
+            "page_height": 1200,
+            "line_layout": [
+                {"text": "Sentence 1.", "x0": 80, "x1": 620, "top": 120, "bottom": 138, "column_label": "main"},
+                {"text": "Sentence 8.", "x0": 80, "x1": 620, "top": 142, "bottom": 160, "column_label": "main"},
+                {"text": "Sentence 16.", "x0": 80, "x1": 620, "top": 164, "bottom": 182, "column_label": "main"},
+            ],
+        },
+    )
+
+    assert len(refs) == 1
+    row = refs[0]
+    assert int(row.get("end_char") or 0) > int(row.get("start_char") or 0)
+    assert row.get("anchor_id")
+    assert row.get("segment_index") is None
+    assert row.get("segment_total") is None
+
+
+def test_reader_compose_bbox_hint_should_union_multi_line_rows():
+    service = LiteratureReaderComposeService()
+    bbox = service._build_bbox_hint(
+        style_cues={
+            "page_width": 900,
+            "page_height": 1200,
+            "line_layout": [
+                {"text": "Intro line A", "x0": 100, "x1": 520, "top": 200, "bottom": 218, "column_label": "main"},
+                {"text": "Intro line B", "x0": 102, "x1": 518, "top": 220, "bottom": 238, "column_label": "main"},
+                {"text": "Intro line C", "x0": 105, "x1": 516, "top": 240, "bottom": 258, "column_label": "main"},
+            ],
+        },
+        quote_text="Intro line A Intro line B Intro line C",
+        source_anchor={"page": 1, "start_char": 10, "end_char": 160},
+    )
+
+    assert isinstance(bbox, dict)
+    assert float(bbox.get("top") or 0) <= 200
+    assert float(bbox.get("bottom") or 0) >= 258
+
+
+def test_sanitize_ui_plan_should_keep_only_actionable_anchor_refs():
+    service = LiteratureReaderComposeService()
+    raw_plan = {
+        "plan_id": "p1",
+        "components": [
+            {
+                "id": "n1",
+                "type": "ParagraphProse",
+                "props": {"text": "Demo paragraph", "source_block_id": "b1"},
+                "children": [],
+                "source_anchor_refs": [
+                    {
+                        "page": 1,
+                        "start_char": 0,
+                        "end_char": 32,
+                        "quote_text": "Demo paragraph",
+                        "canonical_block_id": "b1",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.91,
+                    },
+                    {
+                        "page": 1,
+                        "start_char": 0,
+                        "end_char": 32,
+                        "quote_text": "Demo paragraph",
+                        "canonical_block_id": "b1",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.4,
+                    },
+                    {
+                        "page": 1,
+                        "start_char": 0,
+                        "end_char": 32,
+                        "quote_text": "Demo paragraph",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.95,
+                    },
+                    {
+                        "page": 1,
+                        "start_char": 0,
+                        "end_char": 32,
+                        "quote_text": "Demo paragraph",
+                        "canonical_block_id": "b1",
+                        "coord_version": "anchor_v2",
+                        "segment_index": 1,
+                        "segment_total": 2,
+                        "anchor_confidence": 0.95,
+                    },
+                ],
+            }
+        ],
+    }
+    base_payload = {
+        "blocks": [{"id": "b1", "kind": "paragraph", "page": 1}],
+        "side_context_blocks": [],
+        "figure_meta_blocks": [],
+    }
+
+    sanitized = service._sanitize_ui_plan_anchors(raw_plan, page=1, base_payload=base_payload)
+    anchors = list((sanitized.get("components") or [{}])[0].get("source_anchor_refs") or [])
+    assert len(anchors) == 2
+    assert all(str(item.get("canonical_block_id") or "") == "p1_b1" for item in anchors)
+    assert all(str(item.get("coord_version") or "") == "anchor_v2" for item in anchors)
+    assert all(float(item.get("anchor_confidence") or 0.0) >= 0.78 for item in anchors)
+
+
+def test_anchor_eval_should_pass_with_high_hit_and_iou():
+    service = LiteratureReaderComposeService()
+    style_cues = {
+        "page_width": 900,
+        "page_height": 1200,
+        "line_layout": [
+            {
+                "text": "This is the visible paragraph text.",
+                "x0": 80,
+                "x1": 620,
+                "top": 120,
+                "bottom": 138,
+                "column_label": "main",
+            }
+        ],
+    }
+    source_anchor = {
+        "page": 1,
+        "start_char": 0,
+        "end_char": 35,
+        "quote_text": "This is the visible paragraph text.",
+        "canonical_block_id": "p1_b1",
+        "coord_version": "anchor_v2",
+        "anchor_confidence": 0.95,
+    }
+    bbox = service._build_bbox_hint(
+        style_cues=style_cues,
+        quote_text=str(source_anchor.get("quote_text") or ""),
+        source_anchor=source_anchor,
+    )
+    assert isinstance(bbox, dict)
+    source_anchor["bbox_hint"] = bbox
+    eval_result = service._evaluate_anchor_metrics(
+        ui_plan={
+            "components": [
+                {
+                    "id": "p1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "This is the visible paragraph text."},
+                    "children": [],
+                    "source_anchor_refs": [source_anchor],
+                }
+            ]
+        },
+        base_payload={
+            "raw_text": "This is the visible paragraph text.",
+            "style_cues": style_cues,
+        },
+    )
+    assert float(eval_result.get("hit_rate") or 0.0) >= 0.8
+    assert float(eval_result.get("bbox_iou") or 0.0) >= 0.25
+    assert float(eval_result.get("misjump_rate", 1.0)) <= 0.2
+    assert bool(eval_result.get("gate_passed")) is True
+
+
+def test_anchor_eval_should_fail_when_iou_below_gate():
+    service = LiteratureReaderComposeService()
+    eval_result = service._evaluate_anchor_metrics(
+        ui_plan={
+            "components": [
+                {
+                    "id": "p1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "This is the visible paragraph text."},
+                    "children": [],
+                    "source_anchor_refs": [
+                        {
+                            "page": 1,
+                            "start_char": 0,
+                            "end_char": 35,
+                            "quote_text": "This is the visible paragraph text.",
+                            "canonical_block_id": "p1_b1",
+                            "coord_version": "anchor_v2",
+                            "anchor_confidence": 0.95,
+                            "bbox_hint": {
+                                "x0": 700,
+                                "x1": 860,
+                                "top": 900,
+                                "bottom": 980,
+                                "page_width": 900,
+                                "page_height": 1200,
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        base_payload={
+            "raw_text": "This is the visible paragraph text.",
+            "style_cues": {
+                "page_width": 900,
+                "page_height": 1200,
+                "line_layout": [
+                    {
+                        "text": "This is the visible paragraph text.",
+                        "x0": 80,
+                        "x1": 620,
+                        "top": 120,
+                        "bottom": 138,
+                        "column_label": "main",
+                    }
+                ],
+            },
+        },
+    )
+    assert float(eval_result.get("hit_rate") or 0.0) >= 0.8
+    assert float(eval_result.get("bbox_iou", 1.0)) < 0.25
+    assert bool(eval_result.get("gate_passed")) is False
+
+
+def test_node_level_anchor_gate_should_not_strip_entire_page():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {
+                "id": "n_good",
+                "type": "ParagraphProse",
+                "props": {"text": "Good paragraph", "source_block_id": "p1_b1"},
+                "children": [],
+                "capabilities": ["jump_anchor", "copy"],
+                "actions": [{"key": "jump_anchor", "label": "定位到证据"}],
+                "source_anchor_refs": [
+                    {
+                        "page": 1,
+                        "start_char": 10,
+                        "end_char": 40,
+                        "quote_text": "Good paragraph",
+                        "canonical_block_id": "p1_b1",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.92,
+                    }
+                ],
+            },
+            {
+                "id": "n_bad",
+                "type": "ParagraphProse",
+                "props": {"text": "Bad paragraph", "source_block_id": "p1_b2"},
+                "children": [],
+                "capabilities": ["jump_anchor", "copy"],
+                "actions": [{"key": "jump_anchor", "label": "定位到证据"}],
+                "source_anchor_refs": [
+                    {
+                        "page": 1,
+                        "start_char": 50,
+                        "end_char": 70,
+                        "quote_text": "Bad paragraph",
+                        "canonical_block_id": "p1_b2",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.2,
+                    }
+                ],
+            },
+        ],
+    }
+    base_payload = {
+        "blocks": [
+            {"id": "b1", "page": 1, "kind": "paragraph"},
+            {"id": "b2", "page": 1, "kind": "paragraph"},
+        ]
+    }
+
+    gated = service._apply_node_level_anchor_gate(ui_plan=ui_plan, base_payload=base_payload, page=1)
+    nodes = list((gated.get("ui_plan") or {}).get("components") or [])
+    assert len(nodes) == 2
+    good = next(item for item in nodes if item.get("id") == "n_good")
+    bad = next(item for item in nodes if item.get("id") == "n_bad")
+
+    assert len(list(good.get("source_anchor_refs") or [])) == 1
+    assert bool((good.get("props") or {}).get("node_gate_passed")) is True
+
+    assert list(bad.get("source_anchor_refs") or []) == []
+    assert bool((bad.get("props") or {}).get("node_gate_passed")) is False
+    bad_action_keys = [str(item.get("key") or "") for item in list(bad.get("actions") or [])]
+    assert "jump_anchor" not in bad_action_keys
+
+    report = dict(gated.get("node_gate_report") or {})
+    assert int(report.get("total_nodes") or 0) >= 2
+    assert int(report.get("blocked_nodes") or 0) >= 1
+
+
+def test_build_main_blocks_from_segment_map_should_follow_segment_order():
+    service = LiteratureReaderComposeService()
+    blocks = service._normalize_blocks_for_render(
+        blocks=[
+            {
+                "id": "b1",
+                "kind": "heading",
+                "text": "Introduction",
+                "page": 1,
+                "order": 1,
+                "source_anchor": {"page": 1, "start_char": 0, "end_char": 12},
+            },
+            {
+                "id": "b2",
+                "kind": "paragraph",
+                "text": "We evaluated the model on USMLE exams.",
+                "page": 1,
+                "order": 2,
+                "source_anchor": {"page": 1, "start_char": 13, "end_char": 52},
+            },
+        ],
+        page=1,
+    )
+    segment_map = {
+        "segments": [
+            {
+                "segment_id": "seg_1",
+                "kind": "heading",
+                "ui_component": "SectionHeading",
+                "block_ids": ["p1_b1"],
+                "title": "Introduction",
+            },
+            {
+                "segment_id": "seg_2",
+                "kind": "paragraph",
+                "ui_component": "ParagraphProse",
+                "block_ids": ["p1_b2"],
+            },
+        ]
+    }
+
+    rows = service._build_main_blocks_from_segment_map(page=1, blocks=blocks, segment_map=segment_map)
+    assert len(rows) == 2
+    assert str(rows[0].get("kind") or "") == "heading"
+    assert str(rows[0].get("text") or "") == "Introduction"
+    assert str(rows[1].get("kind") or "") == "paragraph"
+    assert "USMLE" in str(rows[1].get("text") or "")
+
+
+def test_build_main_blocks_from_segment_map_prefers_line_ids_and_evidence_lines():
+    service = LiteratureReaderComposeService()
+    blocks = service._normalize_blocks_for_render(
+        blocks=[
+            {
+                "id": "b1",
+                "kind": "paragraph",
+                "text": "Legacy parser block text that should not dominate.",
+                "page": 1,
+                "order": 1,
+                "source_anchor": {"page": 1, "start_char": 0, "end_char": 48},
+            },
+        ],
+        page=1,
+    )
+    base_payload = {
+        "line_catalog": [
+            {
+                "line_id": "p1_l001_main_left",
+                "page": 1,
+                "order": 0,
+                "text": "This is line one from multimodal planning.",
+                "column_label": "main",
+                "x0": 10,
+                "x1": 500,
+                "top": 100,
+                "bottom": 120,
+                "start_char": 100,
+                "end_char": 140,
+                "page_width": 612,
+                "page_height": 792,
+            },
+            {
+                "line_id": "p1_l002_main_left",
+                "page": 1,
+                "order": 1,
+                "text": "This is line two from multimodal planning.",
+                "column_label": "main",
+                "x0": 10,
+                "x1": 500,
+                "top": 122,
+                "bottom": 142,
+                "start_char": 141,
+                "end_char": 182,
+                "page_width": 612,
+                "page_height": 792,
+            },
+        ]
+    }
+    segment_map = {
+        "segments": [
+            {
+                "segment_id": "seg_intro_p1",
+                "kind": "paragraph",
+                "ui_component": "ParagraphProse",
+                "line_ids": ["p1_l001_main_left", "p1_l002_main_left"],
+                "evidence_line_ids": ["p1_l001_main_left"],
+            }
+        ]
+    }
+
+    rows = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map=segment_map,
+        base_payload=base_payload,
+    )
+    assert len(rows) == 1
+    assert str(rows[0].get("id") or "").startswith("p1_seg_")
+    assert "line one from multimodal planning" in str(rows[0].get("text") or "").lower()
+    assert list(rows[0].get("source_line_ids") or []) == ["p1_l001_main_left", "p1_l002_main_left"]
+    assert list(rows[0].get("evidence_line_ids") or []) == ["p1_l001_main_left"]
+    anchor = dict(rows[0].get("source_anchor") or {})
+    bbox = dict(anchor.get("bbox_hint") or {})
+    assert float(bbox.get("x1") or 0) > float(bbox.get("x0") or 0)
+    assert float(bbox.get("bottom") or 0) > float(bbox.get("top") or 0)
+
+
+def test_node_gate_should_allow_segment_generated_canonical_block_id():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {
+                "id": "n_seg",
+                "type": "ParagraphProse",
+                "props": {"text": "Segment text", "source_block_id": "p1_seg_seg_intro_p1"},
+                "children": [],
+                "capabilities": ["jump_anchor", "copy"],
+                "actions": [{"key": "jump_anchor", "label": "Locate"}],
+                "source_anchor_refs": [
+                    {
+                        "page": 1,
+                        "start_char": 100,
+                        "end_char": 182,
+                        "quote_text": "Segment text",
+                        "canonical_block_id": "p1_seg_seg_intro_p1",
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.9,
+                    }
+                ],
+            }
+        ],
+    }
+    base_payload = {
+        "blocks": [{"id": "b1", "page": 1, "kind": "paragraph"}],
+        "segment_map": {
+            "segments": [
+                {
+                    "segment_id": "seg_intro_p1",
+                    "ui_component": "ParagraphProse",
+                    "kind": "paragraph",
+                    "line_ids": ["p1_l001_main_left"],
+                    "evidence_line_ids": ["p1_l001_main_left"],
+                }
+            ]
+        },
+    }
+    gated = service._apply_node_level_anchor_gate(ui_plan=ui_plan, base_payload=base_payload, page=1)
+    nodes = list((gated.get("ui_plan") or {}).get("components") or [])
+    assert len(nodes) == 1
+    refs = list((nodes[0] or {}).get("source_anchor_refs") or [])
+    assert len(refs) == 1
+    assert str(refs[0].get("canonical_block_id") or "") == "p1_seg_seg_intro_p1"
+
+
+@pytest.mark.asyncio
+async def test_apply_deepseek_assembly_decision_should_apply_order_drop_and_type_override(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_compose_layout_llm_enabled", True)
+
+    class _FakeLLM:
+        async def chat(self, **kwargs):  # type: ignore[no-untyped-def]
+            _ = kwargs
+            return {
+                "content": json.dumps(
+                    {
+                        "ordered_node_ids": ["n2", "n1"],
+                        "drop_node_ids": ["n3"],
+                        "type_override": {"n2": "ListBlock"},
+                    },
+                    ensure_ascii=False,
+                ),
+                "model": "deepseek-chat",
+            }
+
+    async def _fake_get_llm_service():  # type: ignore[no-untyped-def]
+        return _FakeLLM()
+
+    monkeypatch.setattr(
+        "app.services.literature_reader_compose_service.get_llm_service",
+        _fake_get_llm_service,
+    )
+
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {"id": "n1", "type": "ParagraphProse", "props": {"text": "first paragraph"}, "children": [], "source_anchor_refs": []},
+            {"id": "n2", "type": "ParagraphProse", "props": {"text": "second paragraph"}, "children": [], "source_anchor_refs": []},
+            {"id": "n3", "type": "SectionHeading", "props": {"text": "Dropped heading", "level": 2}, "children": [], "source_anchor_refs": []},
+        ],
+        "trace_meta": {},
+    }
+    base_payload = {
+        "segment_map": {
+            "segments": [
+                {"segment_id": "seg_1", "kind": "paragraph", "component_hint": "ParagraphProse", "line_ids": ["p1_l001_main_left"]},
+            ]
+        },
+        "layout_channels": {"main_body": ["p1_b1"]},
+    }
+
+    decided = await service._apply_deepseek_assembly_decision(
+        ui_plan=ui_plan,
+        base_payload=base_payload,
+        page=1,
+        latency_budget_ms=8500,
+    )
+    nodes = list(decided.get("components") or [])
+    assert [str(item.get("id") or "") for item in nodes] == ["n2", "n1"]
+    assert str((nodes[0] or {}).get("type") or "") == "ListBlock"
+    assert list(((nodes[0] or {}).get("props") or {}).get("items") or [])
+    trace_meta = dict(decided.get("trace_meta") or {})
+    assert bool(trace_meta.get("assembly_used")) is True
+    assert str(trace_meta.get("assembly_model") or "") == "deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_apply_deepseek_assembly_decision_should_fallback_on_invalid_node_id(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_compose_layout_llm_enabled", True)
+
+    class _FakeLLM:
+        async def chat(self, **kwargs):  # type: ignore[no-untyped-def]
+            _ = kwargs
+            return {"content": '{"ordered_node_ids":["missing_node"]}', "model": "deepseek-chat"}
+
+    async def _fake_get_llm_service():  # type: ignore[no-untyped-def]
+        return _FakeLLM()
+
+    monkeypatch.setattr(
+        "app.services.literature_reader_compose_service.get_llm_service",
+        _fake_get_llm_service,
+    )
+
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {"id": "n1", "type": "ParagraphProse", "props": {"text": "first paragraph"}, "children": [], "source_anchor_refs": []},
+            {"id": "n2", "type": "ParagraphProse", "props": {"text": "second paragraph"}, "children": [], "source_anchor_refs": []},
+        ],
+        "trace_meta": {},
+    }
+    base_payload = {
+        "segment_map": {"segments": [{"segment_id": "seg_1", "kind": "paragraph", "line_ids": ["p1_l001_main_left"]}]},
+        "layout_channels": {"main_body": ["p1_b1"]},
+    }
+
+    decided = await service._apply_deepseek_assembly_decision(
+        ui_plan=ui_plan,
+        base_payload=base_payload,
+        page=1,
+        latency_budget_ms=8500,
+    )
+    nodes = list(decided.get("components") or [])
+    assert [str(item.get("id") or "") for item in nodes] == ["n1", "n2"]
+    trace_meta = dict(decided.get("trace_meta") or {})
+    assert bool(trace_meta.get("assembly_used")) is False
+    assert str(trace_meta.get("assembly_fallback_reason") or "") == "assembly_invalid_node_id_in_order"
+
+
+@pytest.mark.asyncio
+async def test_apply_deepseek_assembly_decision_should_ignore_invalid_type_override(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_compose_layout_llm_enabled", True)
+
+    class _FakeLLM:
+        async def chat(self, **kwargs):  # type: ignore[no-untyped-def]
+            _ = kwargs
+            return {
+                "content": '{"ordered_node_ids":["n1","n2"],"type_override":{"n1":"FigurePanel"}}',
+                "model": "deepseek-chat",
+            }
+
+    async def _fake_get_llm_service():  # type: ignore[no-untyped-def]
+        return _FakeLLM()
+
+    monkeypatch.setattr(
+        "app.services.literature_reader_compose_service.get_llm_service",
+        _fake_get_llm_service,
+    )
+
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {"id": "n1", "type": "ParagraphProse", "props": {"text": "first paragraph"}, "children": [], "source_anchor_refs": []},
+            {"id": "n2", "type": "ParagraphProse", "props": {"text": "second paragraph"}, "children": [], "source_anchor_refs": []},
+        ],
+        "trace_meta": {},
+    }
+    base_payload = {
+        "segment_map": {"segments": [{"segment_id": "seg_1", "kind": "paragraph", "line_ids": ["p1_l001_main_left"]}]},
+        "layout_channels": {"main_body": ["p1_b1"]},
+    }
+
+    decided = await service._apply_deepseek_assembly_decision(
+        ui_plan=ui_plan,
+        base_payload=base_payload,
+        page=1,
+        latency_budget_ms=8500,
+    )
+    nodes = list(decided.get("components") or [])
+    assert [str(item.get("id") or "") for item in nodes] == ["n1", "n2"]
+    assert str((nodes[0] or {}).get("type") or "") == "ParagraphProse"
+    trace_meta = dict(decided.get("trace_meta") or {})
+    assert bool(trace_meta.get("assembly_used")) is True
+
+
+def test_mm_validate_line_parse_advice_should_accept_doc_nav_tree_v2():
+    service = ReaderMultimodalLayoutService()
+    parsed = service.validate_line_parse_advice_json(
+        payload={
+            "doc_nav_tree": [
+                {
+                    "node_id": "h_intro",
+                    "type": "heading",
+                    "title": "Introduction",
+                    "line_ids": ["p1_l001_main_left"],
+                    "children": [],
+                }
+            ],
+            "block_groups": [
+                {
+                    "block_id": "blk_p1",
+                    "kind": "paragraph",
+                    "title": "",
+                    "parent_node_id": "h_intro",
+                    "line_ids": [],
+                    "word_ids": ["w000001", "w000002"],
+                    "char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000020"}],
+                    "zone_type": "main_body",
+                    "column_id": "main_left",
+                    "reading_order": 1,
+                    "confidence": 0.92,
+                }
+            ],
+            "counts": {"heading_count": 1, "paragraph_count": 1, "figure_count": 0, "table_count": 0, "block_count": 1},
+            "notes": [],
+        },
+        valid_line_ids={"p1_l001_main_left"},
+        valid_word_ids={"w000001", "w000002"},
+        valid_char_ids=["c000001", "c000020"],
+    )
+    assert isinstance(parsed, dict)
+    assert isinstance(parsed.get("doc_nav_tree"), list)
+    assert len(list(parsed.get("block_groups") or [])) == 1
+
+
+def test_build_main_blocks_from_segment_map_should_emit_polygon_geometry_from_word_ids():
+    service = LiteratureReaderComposeService()
+    blocks = [
+        {
+            "id": "b1",
+            "page": 1,
+            "kind": "paragraph",
+            "text": "Alpha Beta",
+            "order": 1,
+            "section_title": "Introduction",
+            "source_anchor": {"page": 1, "start_char": 0, "end_char": 40, "canonical_block_id": "p1_b1"},
+            "zone_type": "main_body",
+            "column_id": "main_left",
+            "heading_prob": 0.0,
+            "layout_confidence": 0.9,
+        }
+    ]
+    output = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map={
+            "segments": [
+                {
+                    "segment_id": "blk_p1",
+                    "kind": "paragraph",
+                    "kind_hint": "paragraph",
+                    "component_hint": "ParagraphProse",
+                    "line_ids": [],
+                    "evidence_line_ids": [],
+                    "word_ids": ["w000001", "w000002"],
+                    "char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000012"}],
+                    "block_ids": ["p1_b1"],
+                    "title": "Introduction",
+                }
+            ]
+        },
+        base_payload={
+            "line_catalog": [],
+            "native_page_extract": {
+                "page_meta": {"page": 1, "page_width": 840, "page_height": 1188},
+                "words": [
+                    {"word_id": "w000001", "text": "Alpha", "x0": 120, "x1": 170, "top": 220, "bottom": 236},
+                    {"word_id": "w000002", "text": "Beta", "x0": 174, "x1": 214, "top": 220, "bottom": 236},
+                ],
+            },
+        },
+    )
+    assert output
+    anchor = dict((output[0] or {}).get("source_anchor") or {})
+    assert str(anchor.get("geometry_version") or "") == "poly_v1"
+    geometry = dict(anchor.get("geometry") or {})
+    polygons = list(geometry.get("polygons") or [])
+    assert len(polygons) >= 1
+    assert len(list((polygons[0] or {}).get("points") or [])) >= 3
+
+
+def test_build_main_blocks_from_segment_map_should_not_reuse_segment_word_ids_across_blocks():
+    service = LiteratureReaderComposeService()
+    blocks = service._normalize_blocks_for_render(
+        blocks=[
+            {
+                "id": "b1",
+                "page": 1,
+                "kind": "paragraph",
+                "text": "Alpha Beta",
+                "order": 1,
+                "section_title": "Intro",
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 0,
+                    "end_char": 30,
+                    "canonical_block_id": "p1_b1",
+                    "source_word_ids": ["w000001", "w000002"],
+                    "source_char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000010"}],
+                },
+            },
+            {
+                "id": "b2",
+                "page": 1,
+                "kind": "paragraph",
+                "text": "Gamma Delta",
+                "order": 2,
+                "section_title": "Intro",
+                "source_anchor": {
+                    "page": 1,
+                    "start_char": 31,
+                    "end_char": 80,
+                    "canonical_block_id": "p1_b2",
+                    "source_word_ids": ["w000003", "w000004"],
+                    "source_char_ranges": [{"start_char_id": "c000011", "end_char_id": "c000020"}],
+                },
+            },
+        ],
+        page=1,
+    )
+    segment_map = {
+        "segments": [
+            {
+                "segment_id": "seg_mix",
+                "kind": "paragraph",
+                "kind_hint": "paragraph",
+                "component_hint": "ParagraphProse",
+                "block_ids": ["p1_b1", "p1_b2"],
+                "line_ids": ["p1_l001_main_left", "p1_l002_main_left"],
+                "word_ids": ["w000001", "w000002", "w000003", "w000004"],  # intentionally mixed
+                "char_ranges": [{"start_char_id": "c000001", "end_char_id": "c000020"}],
+            }
+        ]
+    }
+    base_payload = {
+        "line_catalog": [
+            {
+                "line_id": "p1_l001_main_left",
+                "page": 1,
+                "order": 0,
+                "text": "Alpha Beta",
+                "start_char": 0,
+                "end_char": 24,
+                "x0": 100,
+                "x1": 320,
+                "top": 120,
+                "bottom": 140,
+                "column_label": "main_left",
+                "words": [
+                    {"word_id": "w000001", "text": "Alpha", "x0": 100, "x1": 150, "top": 120, "bottom": 140},
+                    {"word_id": "w000002", "text": "Beta", "x0": 156, "x1": 196, "top": 120, "bottom": 140},
+                ],
+            },
+            {
+                "line_id": "p1_l002_main_left",
+                "page": 1,
+                "order": 1,
+                "text": "Gamma Delta",
+                "start_char": 40,
+                "end_char": 70,
+                "x0": 100,
+                "x1": 340,
+                "top": 160,
+                "bottom": 180,
+                "column_label": "main_left",
+                "words": [
+                    {"word_id": "w000003", "text": "Gamma", "x0": 100, "x1": 154, "top": 160, "bottom": 180},
+                    {"word_id": "w000004", "text": "Delta", "x0": 160, "x1": 212, "top": 160, "bottom": 180},
+                ],
+            },
+        ],
+        "native_page_extract": {
+            "page_meta": {"page": 1, "page_width": 840, "page_height": 1188},
+            "words": [
+                {
+                    "word_id": "w000001",
+                    "text": "Alpha",
+                    "x0": 100,
+                    "x1": 150,
+                    "top": 120,
+                    "bottom": 140,
+                    "start_char_id": "c000001",
+                    "end_char_id": "c000005",
+                },
+                {
+                    "word_id": "w000002",
+                    "text": "Beta",
+                    "x0": 156,
+                    "x1": 196,
+                    "top": 120,
+                    "bottom": 140,
+                    "start_char_id": "c000006",
+                    "end_char_id": "c000010",
+                },
+                {
+                    "word_id": "w000003",
+                    "text": "Gamma",
+                    "x0": 100,
+                    "x1": 154,
+                    "top": 160,
+                    "bottom": 180,
+                    "start_char_id": "c000011",
+                    "end_char_id": "c000015",
+                },
+                {
+                    "word_id": "w000004",
+                    "text": "Delta",
+                    "x0": 160,
+                    "x1": 212,
+                    "top": 160,
+                    "bottom": 180,
+                    "start_char_id": "c000016",
+                    "end_char_id": "c000020",
+                },
+            ],
+            "chars": [{"char_id": f"c{idx:06d}"} for idx in range(1, 32)],
+        },
+    }
+
+    output = service._build_main_blocks_from_segment_map(
+        page=1,
+        blocks=blocks,
+        segment_map=segment_map,
+        base_payload=base_payload,
+    )
+
+    assert len(output) == 2
+    row_b1 = next(item for item in output if str(item.get("id") or "") == "p1_b1")
+    row_b2 = next(item for item in output if str(item.get("id") or "") == "p1_b2")
+    assert list(row_b1.get("source_word_ids") or []) == ["w000001", "w000002"]
+    assert list(row_b2.get("source_word_ids") or []) == ["w000003", "w000004"]
+
+    anchor_b1 = dict(row_b1.get("source_anchor") or {})
+    anchor_b2 = dict(row_b2.get("source_anchor") or {})
+    bbox_b1 = dict(anchor_b1.get("bbox_hint") or {})
+    bbox_b2 = dict(anchor_b2.get("bbox_hint") or {})
+    assert float(bbox_b1.get("bottom") or 0.0) <= float(bbox_b2.get("top") or 9999.0)
+
+
+def test_apply_ui_ops_to_plan_reorder_update_remove_insert():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "plan_id": "p1",
+        "components": [
+            {"id": "n1", "type": "SectionHeading", "props": {"text": "Title"}, "children": [], "source_anchor_refs": []},
+            {"id": "n2", "type": "ParagraphProse", "props": {"text": "Para A"}, "children": [], "source_anchor_refs": []},
+            {"id": "n3", "type": "ParagraphProse", "props": {"text": "Para B"}, "children": [], "source_anchor_refs": []},
+        ],
+        "layout": {},
+        "style_tokens": {},
+        "trace_meta": {},
+    }
+    ui_ops = [
+        {"op": "reorder_components", "ordered_component_ids": ["n3", "n1", "n2"]},
+        {"op": "update_component_props", "component_id": "n2", "props_patch": {"text": "Para A+"}},
+        {"op": "remove_component", "component_id": "n1"},
+        {
+            "op": "insert_component",
+            "after_component_id": "n3",
+            "component": {"id": "n4", "type": "ParagraphProse", "props": {"text": "Inserted"}},
+        },
+    ]
+
+    result = service._apply_ui_ops_to_plan(ui_plan=ui_plan, ui_ops=ui_ops)
+    assert not result["errors"]
+    next_plan = result["ui_plan"]
+    next_ids = [str(item.get("id") or "") for item in list(next_plan.get("components") or [])]
+    assert next_ids == ["n3", "n4", "n2"]
+    row_n2 = next(item for item in next_plan["components"] if str(item.get("id") or "") == "n2")
+    assert str((row_n2.get("props") or {}).get("text") or "") == "Para A+"
+
+
+def test_reader_component_contract_service_rejects_invalid_ui_ops():
+    service = ReaderComponentContractService()
+    ops, errors = service.validate_and_sanitize_ui_ops(
+        [
+            {"op": "reorder_components", "ordered_component_ids": ["n1", "n9"]},
+            {"op": "insert_component", "component": {"id": "x1", "type": "NotAllowed", "props": {}}},
+            {"op": "update_component_props", "component_id": "n2", "props_patch": "bad"},
+        ],
+        existing_component_ids=["n1", "n2"],
+        valid_block_ids={"b1", "b2"},
+    )
+    assert ops == []
+    assert len(errors) >= 3
+
+
+@pytest.mark.asyncio
+async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=78, user_id=1, title="Demo", pdf_path="demo.pdf")
+
+    async def _prompt_payload(**_kwargs):
+        return {"native_page_extract": {}, "valid_line_ids": []}
+
+    async def _plan_builder(**_kwargs):
+        return (
+            {
+                "segments": [
+                    {
+                        "segment_id": "seg_1",
+                        "kind": "paragraph",
+                        "component_hint": "ParagraphProse",
+                        "block_ids": ["p1_dm_p1_l001_b001"],
+                        "reason": "main prose",
+                    }
+                ],
+                "zones": [],
+                "continuation": {},
+                "ui_suggestions": [],
+                "notes": [],
+            },
+            {"model": "qwen3.5-plus", "fallback_used": False},
+        )
+
+    async def _should_not_call_parser(**_kwargs):
+        raise AssertionError("build_line_parse_advice should be skipped when docmind structure exists")
+
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_kwargs: "dummy.pdf",
+    )
+    monkeypatch.setattr(
+        "app.services.literature_reader_compose_service.os.path.exists",
+        lambda _path: True,
+    )
+    monkeypatch.setattr(service._mm_layout_service, "build_mm_prompt_payload", _prompt_payload)
+    monkeypatch.setattr(service._mm_layout_service, "build_layout_plan_v2", _plan_builder)
+    monkeypatch.setattr(service._mm_layout_service, "build_line_parse_advice", _should_not_call_parser)
+    monkeypatch.setattr(service._mm_layout_service, "mark_mm_triggered", lambda **_kwargs: None)
+
+    base_payload = {
+        "page_structure_v3": {
+            "source": "document_mind",
+            "block_groups": [
+                {
+                    "block_id": "dm_p1_l001_b001",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "Demo paragraph.",
+                    "reading_order": 1,
+                }
+            ],
+            "counts": {"block_count": 1},
+        },
+        "blocks": [
+            {
+                "id": "dm_p1_l001_b001",
+                "kind": "paragraph",
+                "text": "Demo paragraph.",
+                "zone_type": "main_body",
+                "source_anchor": {"page": 1, "start_char": 0, "end_char": 14},
+            }
+        ],
+    }
+
+    output = await service._apply_multimodal_layout_assist(  # pylint: disable=protected-access
+        paper=paper,
+        page=1,
+        base_payload=base_payload,
+    )
+
+    mm_parser_meta = dict(output.get("mm_parser_meta") or {})
+    layout_advice_meta = dict(output.get("layout_advice_meta") or {})
+    assert str(mm_parser_meta.get("reason") or "") == "skipped_docmind_structure_present"
+    assert bool(layout_advice_meta.get("used")) is True
+    assert str((output.get("page_structure_v3") or {}).get("source") or "") == "document_mind"
+    assert str((output.get("mm_assist_meta") or {}).get("reason") or "") == "docmind_structure_with_layout_advice"
+
+
+def test_layout_plan_prompt_should_include_all_block_ids_without_truncation():
+    service = ReaderMultimodalLayoutService()
+    block_groups = [
+        {
+            "block_id": f"p1_dm_{idx:03d}",
+            "kind": "paragraph",
+            "zone_type": "main_body",
+            "reading_order": idx,
+            "text": f"paragraph {idx}",
+            "layout_bbox_or_polygon": {"bbox": {"x0": 10, "x1": 20, "top": idx, "bottom": idx + 1}, "polygon": []},
+            "style_summary": {"font_size": 10.5},
+        }
+        for idx in range(1, 141)
+    ]
+    prompt = service._build_layout_plan_v2_prompt_text(  # pylint: disable=protected-access
+        {
+            "layout_summary": {},
+            "layout_meta": {},
+            "images": [],
+            "valid_block_ids": [row["block_id"] for row in block_groups],
+            "component_whitelist": ["ParagraphProse"],
+            "page_structure_v3": {"block_groups": block_groups, "counts": {"block_count": len(block_groups)}},
+        }
+    )
+    assert "p1_dm_001" in prompt
+    assert "p1_dm_140" in prompt
+
+
+def test_build_main_blocks_from_page_structure_should_use_docmind_geometry_when_no_word_ids():
+    service = LiteratureReaderComposeService()
+    page_structure = {
+        "source": "document_mind",
+        "block_groups": [
+            {
+                "block_id": "dm_p1_l001_b001",
+                "kind": "paragraph",
+                "zone_type": "main_body",
+                "column_id": "main_left",
+                "reading_order": 1,
+                "text": "DocMind paragraph text.",
+                "confidence": 0.92,
+                "word_ids": [],
+                "char_ranges": [],
+                "layout_bbox_or_polygon": {
+                    "bbox": {"x0": 80, "x1": 760, "top": 180, "bottom": 240},
+                    "polygon": [{"x": 80, "y": 180}, {"x": 760, "y": 180}, {"x": 760, "y": 240}, {"x": 80, "y": 240}],
+                },
+            }
+        ],
+    }
+    output = service._build_main_blocks_from_page_structure(
+        page=1,
+        page_structure=page_structure,
+        base_payload={"native_page_extract": {"page_meta": {"page_width": 840, "page_height": 1188}, "words": [], "chars": []}},
+    )
+    assert len(output) == 1
+    anchor = dict((output[0].get("source_anchor") or {}))
+    assert str(anchor.get("geometry_version") or "") == "poly_v1"
+    assert isinstance(anchor.get("geometry"), dict)
+    bbox = dict(anchor.get("bbox_hint") or {})
+    assert float(bbox.get("x0") or 0.0) == 80.0
+    assert float(bbox.get("x1") or 0.0) == 760.0

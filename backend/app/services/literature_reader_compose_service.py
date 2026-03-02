@@ -30,6 +30,8 @@ from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperReaderComponentOverlay, PaperReaderPageCache
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
+from app.services.reader_component_contract_service import get_reader_component_contract_service
+from app.services.reader_compose_agent_runtime import get_reader_compose_agent_runtime
 from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
 from app.services.status_event_bus import build_status_channel_for_user, publish_status_event
 
@@ -46,7 +48,10 @@ COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
 COMPOSE_LAYOUT_SCHEMA_VERSION = "layout_schema_v2"
 
 DEFAULT_QUALITY_TARGET = 0.86
-DEFAULT_LATENCY_BUDGET_MS = 8500
+DEFAULT_LATENCY_BUDGET_MS = max(
+    1200,
+    min(int(getattr(settings, "reader_compose_latency_budget_ms", 20000) or 20000), 25000),
+)
 DEFAULT_MAX_ITERATIONS = max(6, int(getattr(settings, "literature_agent_max_iterations", 14) or 14))
 LOW_CONFIDENCE_MAX_ITERATIONS = min(24, max(DEFAULT_MAX_ITERATIONS + 4, 12))
 
@@ -115,6 +120,22 @@ class LiteratureReaderComposeService:
         self._redis_client: Any = None
         self._reader_service = get_literature_reader_service()
         self._mm_layout_service = ReaderMultimodalLayoutService()
+        self._component_contract_service = get_reader_component_contract_service()
+        self._compose_agent_runtime = get_reader_compose_agent_runtime()
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
 
     async def build_or_get_composed_payload(
         self,
@@ -320,6 +341,28 @@ class LiteratureReaderComposeService:
                 },
                 "layout_channels": dict(base_payload.get("layout_channels") or {}),
                 "mm_assist_meta": dict(base_payload.get("mm_assist_meta") or {}),
+                "parser_chain_meta": dict(base_payload.get("parser_chain_meta") or {}),
+                "docmind_meta": dict(base_payload.get("docmind_meta") or {}),
+                "docmind_structure": dict(base_payload.get("docmind_structure") or {}),
+                "page_structure_v3": dict(base_payload.get("page_structure_v3") or {}),
+                "qwen_layout_plan_v2": dict(base_payload.get("qwen_layout_plan_v2") or {}),
+                "qwen_plan_meta": dict(base_payload.get("qwen_plan_meta") or {}),
+                "layout_advice_v2": dict(base_payload.get("layout_advice_v2") or {}),
+                "layout_advice_v3": dict(base_payload.get("layout_advice_v3") or {}),
+                "layout_advice_meta": dict(base_payload.get("layout_advice_meta") or {}),
+                "mm_parser_meta": dict(base_payload.get("mm_parser_meta") or {}),
+                "assembly_meta": {
+                    "used": bool(((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_used")),
+                    "model": str((((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_model") or "")),
+                    "fallback_reason": str((((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_fallback_reason") or "")),
+                    "ui_ops_count": int((((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_ui_ops_count") or 0)),
+                    "agent_tool_call_count": int((((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_agent_tool_call_count") or 0)),
+                    "agent_trace_count": int((((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("assembly_agent_trace_count") or 0)),
+                },
+                "component_registry_version": "reader_components_v2",
+                "segment_map": dict(base_payload.get("segment_map") or {}),
+                "segment_map_meta": dict(base_payload.get("segment_map_meta") or {}),
+                "node_gate_report": dict(loop_result.get("node_gate_report") or {}),
                 "toc_quality": float(base_payload.get("toc_quality") or 0.0),
                 "overlay_applied": False,
                 "overlay_count": 0,
@@ -410,6 +453,14 @@ class LiteratureReaderComposeService:
             detail_level=detail_level,
             compare_mode=compare_mode,
         )
+        current_plan = await self._apply_deepseek_assembly_decision(
+            ui_plan=current_plan,
+            base_payload=base_payload,
+            page=page,
+            latency_budget_ms=latency_budget_ms,
+            user_id=int(getattr(paper, "user_id", 0) or 0),
+            user_intent=str(style_intent or detail_level or "standard"),
+        )
         best_plan = current_plan
         best_quality: Dict[str, Any] = {}
         best_score = -1.0
@@ -421,7 +472,18 @@ class LiteratureReaderComposeService:
 
         for iteration in range(1, resolved_max_iterations + 1):
             # 每轮都先“自愈”一次锚点和字段，降低后续 schema 校验失败率。
-            current_plan = self._sanitize_ui_plan_anchors(current_plan, page=page)
+            current_plan = self._sanitize_ui_plan_anchors(
+                current_plan,
+                page=page,
+                base_payload=base_payload,
+            )
+            gate_result = self._apply_node_level_anchor_gate(
+                ui_plan=current_plan,
+                base_payload=base_payload,
+                page=page,
+            )
+            current_plan = dict(gate_result.get("ui_plan") or current_plan)
+            node_gate_report = dict(gate_result.get("node_gate_report") or {})
             validation = self.validate_ui_plan(current_plan, page=page)
             quality = self.score_ui_plan(
                 ui_plan=current_plan,
@@ -429,6 +491,7 @@ class LiteratureReaderComposeService:
                 validation_errors=validation.get("errors") or [],
                 quality_target=quality_target,
             )
+            quality["node_gate_report"] = node_gate_report
             quality["iteration"] = iteration
             quality["elapsed_ms"] = int((time.perf_counter() - started_at) * 1000)
             quality.setdefault("tool_call_trace", [])
@@ -438,6 +501,9 @@ class LiteratureReaderComposeService:
                     "iteration": iteration,
                     "ui_plan": current_plan,
                     "quality_report": quality,
+                    "ui_ops": list((current_plan or {}).get("ui_ops") or []),
+                    "agent_trace": list((current_plan or {}).get("agent_trace") or []),
+                    "agent_tool_calls": list((current_plan or {}).get("agent_tool_calls") or []),
                 }
             )
 
@@ -509,12 +575,484 @@ class LiteratureReaderComposeService:
         return {
             "ui_plan": best_plan,
             "quality_report": best_quality,
+            "node_gate_report": dict(best_quality.get("node_gate_report") or {}),
             "iteration_trace": iteration_trace,
             "iterations": len(iteration_trace),
             "degraded": degraded,
             "stop_reason": stop_reason,
             "build_mode": "compose_agent",
         }
+
+    async def _apply_deepseek_assembly_decision(
+        self,
+        *,
+        ui_plan: Dict[str, Any],
+        base_payload: Dict[str, Any],
+        page: int,
+        latency_budget_ms: int,
+        user_id: int = 0,
+        user_intent: str = "standard",
+    ) -> Dict[str, Any]:
+        """Let DeepSeek make a lightweight final assembly decision with strict local validation."""
+        cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
+        trace_meta = dict(cloned.get("trace_meta") or {})
+        components = list(cloned.get("components") or [])
+        candidate_types = {"SectionHeading", "ParagraphProse", "ListBlock"}
+        allowed_override_types = {"SectionHeading", "ParagraphProse", "ListBlock"}
+
+        def _mark_skip(reason: str) -> Dict[str, Any]:
+            trace_meta["assembly_used"] = False
+            trace_meta["assembly_fallback_reason"] = str(reason)
+            cloned["trace_meta"] = trace_meta
+            return cloned
+
+        if not bool(getattr(settings, "reader_compose_layout_llm_enabled", True)):
+            return _mark_skip("assembly_disabled")
+        if not components:
+            return _mark_skip("no_components")
+        if (
+            bool(getattr(settings, "reader_agent_component_stream_enabled", True))
+            and isinstance((base_payload.get("page_structure_v3") or {}).get("block_groups"), list)
+            and len(list((base_payload.get("page_structure_v3") or {}).get("block_groups") or [])) > 0
+        ):
+            try:
+                runtime_result = await self._compose_agent_runtime.run_component_assembly(
+                    user_id=int(user_id or 0),
+                    page=int(page),
+                    user_intent=str(user_intent or "standard"),
+                    ui_plan=cloned,
+                    page_structure_v3=dict(base_payload.get("page_structure_v3") or {}),
+                    layout_advice_v3=dict(base_payload.get("layout_advice_v3") or {}),
+                    latency_budget_ms=int(latency_budget_ms),
+                )
+                if bool(runtime_result.get("used")):
+                    ui_ops = [row for row in list(runtime_result.get("ui_ops") or []) if isinstance(row, dict)]
+                    apply_result = self._apply_ui_ops_to_plan(ui_plan=cloned, ui_ops=ui_ops)
+                    apply_errors = [str(item).strip() for item in list(apply_result.get("errors") or []) if str(item).strip()]
+                    if not apply_errors:
+                        cloned = dict(apply_result.get("ui_plan") or cloned)
+                        trace_meta["assembly_used"] = True
+                        trace_meta["assembly_model"] = str(
+                            runtime_result.get("model") or getattr(settings, "deepseek_model", "deepseek-chat")
+                        )
+                        trace_meta["assembly_patch_protocol"] = "ui_ops_v1"
+                        trace_meta["assembly_ui_ops_count"] = len(ui_ops)
+                        trace_meta["assembly_agent_trace_count"] = len(list(runtime_result.get("agent_trace") or []))
+                        trace_meta["assembly_agent_tool_call_count"] = len(list(runtime_result.get("agent_tool_calls") or []))
+                        trace_meta["assembly_agent_summary"] = str(runtime_result.get("agent_summary") or "")
+                        trace_meta.pop("assembly_fallback_reason", None)
+                        cloned["trace_meta"] = trace_meta
+                        cloned["ui_ops"] = ui_ops
+                        cloned["agent_trace"] = list(runtime_result.get("agent_trace") or [])
+                        cloned["agent_tool_calls"] = list(runtime_result.get("agent_tool_calls") or [])
+                        return cloned
+                    trace_meta["assembly_agent_validation_errors"] = apply_errors
+                    cloned["trace_meta"] = trace_meta
+                else:
+                    runtime_fallback_reason = str(runtime_result.get("fallback_reason") or "").strip()
+                    if runtime_fallback_reason:
+                        trace_meta["assembly_agent_fallback_reason"] = runtime_fallback_reason
+                        cloned["trace_meta"] = trace_meta
+            except Exception as exc:
+                logger.debug(f"[ReaderComposeService] compose-agent ui_ops path failed page={page}: {exc}")
+
+        candidate_nodes = [
+            node for node in components if isinstance(node, dict) and str(node.get("type") or "") in candidate_types
+        ]
+        if len(candidate_nodes) < 2:
+            return _mark_skip("insufficient_candidates")
+
+        segment_rows = [
+            row
+            for row in list((base_payload.get("segment_map") or {}).get("segments") or [])
+            if isinstance(row, dict)
+        ]
+        if not segment_rows:
+            page_structure = dict(base_payload.get("page_structure_v3") or {})
+            for row in list(page_structure.get("block_groups") or []):
+                if not isinstance(row, dict):
+                    continue
+                block_id = str(row.get("block_id") or "").strip()
+                text = self._normalize_spaces(str(row.get("text") or ""))
+                if not block_id or not text:
+                    continue
+                segment_rows.append(
+                    {
+                        "segment_id": block_id,
+                        "kind_hint": str(row.get("kind") or ""),
+                        "component_hint": str(row.get("component_hint") or ""),
+                        "block_ids": [block_id],
+                        "line_ids": [],
+                        "word_ids": [str(item).strip() for item in list(row.get("word_ids") or []) if str(item).strip()],
+                        "resolved_text": text,
+                        "reason": "from_page_structure_v3",
+                        "confidence": self._safe_float(row.get("confidence"), 0.86),
+                    }
+                )
+        if not segment_rows:
+            return _mark_skip("no_ai_blocks")
+
+        max_blocks = max(12, int(getattr(settings, "reader_compose_layout_llm_max_blocks", 80) or 80))
+        compact_nodes: List[Dict[str, Any]] = []
+        node_id_set: set[str] = set()
+        for idx, node in enumerate(components[: max_blocks * 2]):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            node_type = str(node.get("type") or "").strip()
+            if not node_id or node_id in node_id_set:
+                continue
+            node_id_set.add(node_id)
+            text = self._normalize_spaces(self._extract_node_text(node))[:220]
+            compact_nodes.append(
+                {
+                    "id": node_id,
+                    "type": node_type,
+                    "zone_type": str(node.get("zone_type") or ""),
+                    "text": text,
+                    "anchor_count": len(list(node.get("source_anchor_refs") or [])),
+                    "index": idx,
+                }
+            )
+            if len(compact_nodes) >= max_blocks:
+                break
+
+        if len(compact_nodes) < 2:
+            return _mark_skip("insufficient_candidates")
+
+        compact_segments: List[Dict[str, Any]] = []
+        for row in segment_rows[: max_blocks]:
+            if not isinstance(row, dict):
+                continue
+            line_ids = [str(item).strip() for item in list(row.get("line_ids") or [])[:12] if str(item).strip()]
+            word_ids = [str(item).strip() for item in list(row.get("word_ids") or [])[:120] if str(item).strip()]
+            block_ids = [str(item).strip() for item in list(row.get("block_ids") or [])[:8] if str(item).strip()]
+            compact_segments.append(
+                {
+                    "segment_id": str(row.get("segment_id") or ""),
+                    "kind_hint": str(row.get("kind_hint") or row.get("kind") or ""),
+                    "component_hint": str(row.get("component_hint") or row.get("ui_component") or ""),
+                    "block_ids": block_ids,
+                    "line_id_count": len(line_ids),
+                    "word_id_count": len(word_ids),
+                    "text": self._normalize_spaces(str(row.get("resolved_text") or row.get("text") or ""))[:200],
+                    "reason": self._normalize_spaces(str(row.get("reason") or ""))[:160],
+                    "confidence": float(row.get("confidence") or 0.0),
+                }
+            )
+
+        compact_channels = dict(base_payload.get("layout_channels") or {})
+        layout_advice_v3 = dict(base_payload.get("layout_advice_v3") or {})
+        compact_advice = {
+            "ordered_block_ids": [
+                str(item).strip()
+                for item in list(layout_advice_v3.get("ordered_block_ids") or [])[:max_blocks]
+                if str(item).strip()
+            ],
+            "suggested_components": [
+                row
+                for row in list(layout_advice_v3.get("suggested_components") or [])[:max_blocks]
+                if isinstance(row, dict)
+            ],
+            "grouping_hints": [
+                row
+                for row in list(layout_advice_v3.get("grouping_hints") or [])[:max_blocks]
+                if isinstance(row, dict)
+            ],
+            "visual_hints": [
+                row
+                for row in list(layout_advice_v3.get("visual_hints") or [])[:max_blocks]
+                if isinstance(row, dict)
+            ],
+        }
+        prompt = (
+            "You are a strict UI assembly planner for a literature reader.\n"
+            "Task: adjust component order and minor component-type override for better readability.\n"
+            "Hard rules:\n"
+            "1) Return JSON only.\n"
+            "2) Output schema: "
+            '{"ordered_node_ids":[],"drop_node_ids":[],"type_override":{"node_id":"SectionHeading|ParagraphProse|ListBlock"}}\n'
+            "3) ordered_node_ids and drop_node_ids must come from provided node IDs only.\n"
+            "4) type_override keys must be existing node IDs only.\n"
+            "5) type_override values must be one of: SectionHeading, ParagraphProse, ListBlock.\n"
+            "6) Do NOT create/edit evidence anchors, coords, block IDs, or facts.\n"
+            "7) Prefer one semantic paragraph per ParagraphProse; avoid merging adjacent paragraphs.\n"
+            "8) Avoid false headings from inline words.\n"
+            f"page: {int(page)}\n"
+            f"allowed_component_types: {json.dumps(sorted(list(allowed_override_types)), ensure_ascii=False)}\n"
+            f"nodes: {json.dumps(compact_nodes, ensure_ascii=False)}\n"
+            f"segment_hints: {json.dumps(compact_segments, ensure_ascii=False)}\n"
+            f"layout_advice_v3: {json.dumps(compact_advice, ensure_ascii=False)}\n"
+            f"layout_channels: {json.dumps(compact_channels, ensure_ascii=False)}"
+        )
+
+        try:
+            llm = await get_llm_service()
+            configured_timeout = float(getattr(settings, "reader_compose_layout_llm_timeout_seconds", 120) or 120)
+            if configured_timeout <= 0:
+                result = await llm.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=720,
+                )
+            else:
+                timeout_seconds = max(6.0, configured_timeout)
+                result = await asyncio.wait_for(
+                    llm.chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1,
+                        max_tokens=720,
+                    ),
+                    timeout=timeout_seconds,
+                )
+            decision = self._extract_json_dict(str((result or {}).get("content") or ""))
+            if not isinstance(decision, dict):
+                return _mark_skip("assembly_invalid_json")
+
+            existing_ids = [str(item.get("id") or "") for item in compact_nodes]
+            existing_set = set(existing_ids)
+
+            raw_ordered = list(decision.get("ordered_node_ids") or [])
+            ordered_ids: List[str] = []
+            seen_ids: set[str] = set()
+            for item in raw_ordered:
+                node_id = str(item or "").strip()
+                if not node_id:
+                    continue
+                if node_id not in existing_set:
+                    return _mark_skip("assembly_invalid_node_id_in_order")
+                if node_id in seen_ids:
+                    continue
+                seen_ids.add(node_id)
+                ordered_ids.append(node_id)
+
+            raw_drop = list(decision.get("drop_node_ids") or [])
+            drop_ids: set[str] = set()
+            for item in raw_drop:
+                node_id = str(item or "").strip()
+                if not node_id:
+                    continue
+                if node_id not in existing_set:
+                    return _mark_skip("assembly_invalid_node_id_in_drop")
+                drop_ids.add(node_id)
+
+            raw_override = decision.get("type_override") or {}
+            type_override: Dict[str, str] = {}
+            if isinstance(raw_override, dict):
+                for raw_id, raw_type in raw_override.items():
+                    node_id = str(raw_id or "").strip()
+                    target_type = str(raw_type or "").strip()
+                    if not node_id:
+                        continue
+                    if node_id not in existing_set:
+                        return _mark_skip("assembly_invalid_node_id_in_override")
+                    if target_type not in allowed_override_types:
+                        continue
+                    type_override[node_id] = target_type
+
+            top_components = [node for node in components if isinstance(node, dict)]
+            id_to_node = {str(node.get("id") or ""): node for node in top_components if str(node.get("id") or "")}
+
+            reordered: List[Dict[str, Any]] = []
+            consumed: set[str] = set()
+            for node_id in ordered_ids:
+                if node_id in consumed or node_id in drop_ids:
+                    continue
+                node = id_to_node.get(node_id)
+                if not isinstance(node, dict):
+                    continue
+                reordered.append(node)
+                consumed.add(node_id)
+            for node in top_components:
+                node_id = str(node.get("id") or "")
+                if not node_id or node_id in consumed or node_id in drop_ids:
+                    continue
+                reordered.append(node)
+                consumed.add(node_id)
+
+            def _coerce_type(node: Dict[str, Any], target_type: str) -> Dict[str, Any]:
+                source_type = str(node.get("type") or "")
+                if source_type not in allowed_override_types or target_type not in allowed_override_types:
+                    return node
+                if source_type == target_type:
+                    return node
+
+                patched = json.loads(json.dumps(node, ensure_ascii=False))
+                props = dict(patched.get("props") or {})
+                text = self._normalize_spaces(str(props.get("text") or ""))
+                if not text and source_type == "ListBlock":
+                    items = props.get("items")
+                    if isinstance(items, list):
+                        text = self._normalize_spaces(" ".join(str(item) for item in items if str(item).strip()))
+                if not text:
+                    text = self._normalize_spaces(self._extract_node_text(patched))
+
+                if target_type == "SectionHeading":
+                    if not text:
+                        return node
+                    props["text"] = text[:220]
+                    try:
+                        props["level"] = int(props.get("level") or 2)
+                    except Exception:
+                        props["level"] = 2
+                    patched["type"] = "SectionHeading"
+                    patched["props"] = props
+                    return patched
+
+                if target_type == "ParagraphProse":
+                    if not text:
+                        return node
+                    props["text"] = text
+                    patched["type"] = "ParagraphProse"
+                    patched["props"] = props
+                    return patched
+
+                # target ListBlock
+                items = props.get("items")
+                normalized_items: List[str] = []
+                if isinstance(items, list):
+                    normalized_items = [
+                        self._normalize_spaces(str(item))
+                        for item in items
+                        if self._normalize_spaces(str(item))
+                    ]
+                if not normalized_items:
+                    source_text = text or self._normalize_spaces(self._extract_node_text(patched))
+                    source_text = self._normalize_spaces(source_text)
+                    if not source_text:
+                        return node
+                    split_items = [
+                        self._normalize_spaces(item)
+                        for item in re.split(r"[；;。]\s*", source_text)
+                        if self._normalize_spaces(item)
+                    ]
+                    normalized_items = split_items[:8] if split_items else [source_text]
+                props["items"] = normalized_items
+                patched["type"] = "ListBlock"
+                patched["props"] = props
+                return patched
+
+            patched_components: List[Dict[str, Any]] = []
+            for node in reordered:
+                node_id = str(node.get("id") or "")
+                target_type = str(type_override.get(node_id) or "")
+                if target_type:
+                    patched_components.append(_coerce_type(node, target_type))
+                else:
+                    patched_components.append(node)
+
+            cloned["components"] = patched_components
+            trace_meta["assembly_used"] = True
+            trace_meta["assembly_model"] = str((result or {}).get("model") or getattr(settings, "deepseek_model", "deepseek-chat"))
+            trace_meta["assembly_ordered_count"] = len(ordered_ids)
+            trace_meta["assembly_drop_count"] = len(drop_ids)
+            trace_meta["assembly_override_count"] = len(type_override)
+            trace_meta.pop("assembly_fallback_reason", None)
+            cloned["trace_meta"] = trace_meta
+            return cloned
+        except asyncio.TimeoutError:
+            return _mark_skip("assembly_timeout")
+        except Exception as exc:
+            logger.debug(f"[ReaderComposeService] deepseek assembly decision failed page={page}: {exc}")
+            return _mark_skip("assembly_exception")
+
+    @staticmethod
+    def _apply_ui_ops_to_plan(
+        *,
+        ui_plan: Dict[str, Any],
+        ui_ops: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
+        components = [row for row in list(cloned.get("components") or []) if isinstance(row, dict)]
+        errors: List[str] = []
+
+        def _index_by_id(component_id: str) -> int:
+            for idx, node in enumerate(components):
+                if str(node.get("id") or "").strip() == component_id:
+                    return idx
+            return -1
+
+        for row in list(ui_ops or []):
+            if not isinstance(row, dict):
+                continue
+            op = str(row.get("op") or "").strip()
+            if op == "reorder_components":
+                ordered_ids = [
+                    str(item).strip()
+                    for item in list(row.get("ordered_component_ids") or [])
+                    if str(item).strip()
+                ]
+                id_to_node = {
+                    str(node.get("id") or "").strip(): node
+                    for node in components
+                    if str(node.get("id") or "").strip()
+                }
+                ordered_set = set(ordered_ids)
+                reordered: List[Dict[str, Any]] = []
+                for cid in ordered_ids:
+                    node = id_to_node.get(cid)
+                    if isinstance(node, dict):
+                        reordered.append(node)
+                for node in components:
+                    cid = str(node.get("id") or "").strip()
+                    if not cid or cid in ordered_set:
+                        continue
+                    reordered.append(node)
+                components = reordered
+                continue
+
+            if op == "remove_component":
+                component_id = str(row.get("component_id") or "").strip()
+                if not component_id:
+                    errors.append("remove_component_missing_id")
+                    continue
+                before = len(components)
+                components = [
+                    node for node in components if str(node.get("id") or "").strip() != component_id
+                ]
+                if len(components) == before:
+                    errors.append("remove_component_not_found")
+                continue
+
+            if op == "update_component_props":
+                component_id = str(row.get("component_id") or "").strip()
+                props_patch = dict(row.get("props_patch") or {})
+                idx = _index_by_id(component_id)
+                if idx < 0:
+                    errors.append("update_component_not_found")
+                    continue
+                node = json.loads(json.dumps(components[idx], ensure_ascii=False))
+                props = dict(node.get("props") or {})
+                props.update(props_patch)
+                node["props"] = props
+                components[idx] = node
+                continue
+
+            if op == "insert_component":
+                component = row.get("component")
+                if not isinstance(component, dict):
+                    errors.append("insert_component_missing_component")
+                    continue
+                new_node = json.loads(json.dumps(component, ensure_ascii=False))
+                if not isinstance(new_node.get("children"), list):
+                    new_node["children"] = []
+                if not isinstance(new_node.get("source_anchor_refs"), list):
+                    new_node["source_anchor_refs"] = []
+                after_component_id = str(row.get("after_component_id") or "").strip()
+                if after_component_id:
+                    idx = _index_by_id(after_component_id)
+                    if idx < 0:
+                        errors.append("insert_after_not_found")
+                        continue
+                    components.insert(idx + 1, new_node)
+                else:
+                    components.append(new_node)
+                continue
+
+            errors.append(f"unsupported_ui_op:{op}")
+
+        cloned["components"] = components
+        return {"ui_plan": cloned, "errors": errors}
 
     async def _apply_multimodal_layout_assist(
         self,
@@ -523,11 +1061,22 @@ class LiteratureReaderComposeService:
         page: int,
         base_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """在文本主链路后，按门控低频调用多模态进行布局裁决。"""
+        """Apply multimodal assistance to compose payload.
+
+        If page_structure_v3 already comes from Document Mind (DocStructure),
+        skip VL parser stage and run only layout-advice stage.
+        """
         payload = json.loads(json.dumps(base_payload, ensure_ascii=False))
         payload.setdefault("mm_assist_meta", {})
 
-        # 只有拿到本地 PDF 才能做“页图+文本块”联合裁决，否则直接降级。
+        page_structure_v3 = dict(payload.get("page_structure_v3") or {})
+        page_structure_source = str(page_structure_v3.get("source") or "").strip().lower()
+        has_docmind_structure = (
+            page_structure_source == "document_mind"
+            and isinstance(page_structure_v3.get("block_groups"), list)
+            and len(list(page_structure_v3.get("block_groups") or [])) > 0
+        )
+
         path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
             user_id=int(paper.user_id),
             paper_id=int(paper.id),
@@ -544,25 +1093,31 @@ class LiteratureReaderComposeService:
             }
             return self._ensure_layout_channels(payload)
 
-        # 先走门控，避免高质量页面也触发视觉模型造成额外时延。
-        trigger, trigger_meta = self._mm_layout_service.should_trigger_mm(
-            paper_id=int(paper.id),
-            page=int(page),
-            base_payload=payload,
-            call_count=0,
-        )
-        if not trigger:
-            payload["mm_assist_meta"] = {
-                "used": False,
-                "degraded": False,
-                "reason": str(trigger_meta.get("reason") or "quality_gate_not_hit"),
-                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-                "fallback_used": False,
+        trigger_meta: Dict[str, Any] = {}
+        if has_docmind_structure:
+            trigger = True
+            trigger_meta = {
+                "reason": "docmind_structure_present",
+                "trigger_reasons": ["docmind_structure_present"],
             }
-            # 未触发多模态时仍回填监控指标，便于前端质量面板解释“为何未触发”。
-            if "cross_column_merge_ratio" in trigger_meta:
-                payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
-            return self._ensure_layout_channels(payload)
+        else:
+            trigger, trigger_meta = self._mm_layout_service.should_trigger_mm(
+                paper_id=int(paper.id),
+                page=int(page),
+                base_payload=payload,
+                call_count=0,
+            )
+            if not trigger:
+                payload["mm_assist_meta"] = {
+                    "used": False,
+                    "degraded": False,
+                    "reason": str(trigger_meta.get("reason") or "quality_gate_not_hit"),
+                    "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
+                    "fallback_used": False,
+                }
+                if "cross_column_merge_ratio" in trigger_meta:
+                    payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
+                return self._ensure_layout_channels(payload)
 
         prompt_payload = await self._mm_layout_service.build_mm_prompt_payload(
             pdf_path=path,
@@ -579,39 +1134,646 @@ class LiteratureReaderComposeService:
             }
             return self._ensure_layout_channels(payload)
 
-        # 视觉调用策略固定为“主模型失败后单次回退”，保证链路可控。
-        mm_decision, call_meta = await self._mm_layout_service.call_primary_then_fallback(
-            prompt_payload=prompt_payload,
-        )
-        if not isinstance(mm_decision, dict):
+        parser_advice: Dict[str, Any] = {}
+        parser_meta: Dict[str, Any] = {}
+        parser_segment_map: Dict[str, Any] = {}
+        if has_docmind_structure:
+            parser_advice = dict(page_structure_v3)
+            parser_meta = {
+                "used": False,
+                "reason": "skipped_docmind_structure_present",
+                "model": str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+                "fallback_used": False,
+                "error": None,
+            }
+        elif hasattr(self._mm_layout_service, "build_line_parse_advice"):
+            try:
+                parser_rows, parser_meta = await self._mm_layout_service.build_line_parse_advice(
+                    prompt_payload=prompt_payload,
+                    valid_line_ids=list(prompt_payload.get("valid_line_ids") or []),
+                )
+                if isinstance(parser_rows, dict):
+                    parser_advice = parser_rows
+                    prompt_payload = dict(prompt_payload)
+                    prompt_payload["parser_advice"] = parser_rows
+                    parser_segment_map = self._build_segment_map_from_parser_advice(
+                        page=int(page),
+                        parser_advice=parser_rows,
+                        prompt_payload=prompt_payload,
+                    )
+                else:
+                    parser_meta = dict(parser_meta or {})
+                    parser_meta.setdefault("used", False)
+                    parser_meta.setdefault("reason", "parser_no_valid_output")
+            except Exception as exc:
+                parser_meta = {
+                    "used": False,
+                    "reason": "parser_exception",
+                    "model": str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+                    "error": str(exc),
+                }
+                logger.warning(f"[ReaderComposeService] parser advice pass failed page={page}: {exc}")
+
+        if not parser_advice:
             payload["mm_assist_meta"] = {
                 "used": False,
                 "degraded": True,
-                "reason": str(call_meta.get("error") or "mm_failed"),
-                "model": str(call_meta.get("model") or getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-                "fallback_used": bool(call_meta.get("fallback_used")),
+                "reason": str((parser_meta or {}).get("error") or "parser_failed"),
+                "model": str((parser_meta or {}).get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+                "fallback_used": bool((parser_meta or {}).get("fallback_used")),
             }
-            # 多模态失败时保留文本链路结果并标记降级，不中断主流程。
+            if parser_meta:
+                payload["mm_parser_meta"] = parser_meta
             if "cross_column_merge_ratio" in trigger_meta:
                 payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
             return self._ensure_layout_channels(payload)
 
-        # 融合后统一输出三通道，确保正文/侧栏/图注在前端可分域渲染。
-        merged_payload = self._mm_layout_service.merge_mm_decision_into_blocks(
-            base_payload=payload,
-            mm_decision=mm_decision,
-        )
+        merged_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+        merged_payload["native_page_extract"] = dict(prompt_payload.get("native_page_extract") or {})
+        merged_payload["page_structure_v3"] = dict(parser_advice)
+
+        if parser_segment_map:
+            merged_payload["segment_map"] = dict(parser_segment_map)
+
+        if parser_segment_map:
+            segment_map_meta: Dict[str, Any] = {
+                "used": True,
+                "reason": "parser_structure_applied",
+                "source": "vlflash_page_structure_v2",
+                "model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+                "fallback_used": bool(parser_meta.get("fallback_used")),
+                "error": None,
+            }
+        elif has_docmind_structure:
+            segment_map_meta = {
+                "used": False,
+                "reason": "docmind_structure_only",
+                "source": "document_mind",
+                "model": str(getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
+                "fallback_used": False,
+                "error": None,
+            }
+        else:
+            segment_map_meta = {
+                "used": False,
+                "reason": "parser_structure_unavailable",
+                "source": "none",
+                "model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+                "fallback_used": bool(parser_meta.get("fallback_used")),
+            }
+
+        layout_plan_v2: Dict[str, Any] = {}
+        layout_advice_meta: Dict[str, Any] = {"used": False, "reason": "layout_plan_v2_disabled"}
+        if self._layout_plan_v2_enabled_for_paper(int(paper.id)) and hasattr(self._mm_layout_service, "build_layout_plan_v2"):
+            parser_block_ids = [
+                self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
+                for row in list((parser_advice or {}).get("block_groups") or [])
+                if isinstance(row, dict) and str(row.get("block_id") or "").strip()
+            ]
+            parser_block_ids = [item for item in parser_block_ids if item]
+            valid_block_ids = parser_block_ids or self._collect_valid_block_ids(
+                page=int(page),
+                blocks=list(merged_payload.get("blocks") or []),
+            )
+            try:
+                plan_prompt_payload = dict(prompt_payload)
+                plan_prompt_payload["page_structure_v3"] = dict(parser_advice)
+                plan_rows, plan_meta = await self._mm_layout_service.build_layout_plan_v2(
+                    prompt_payload=plan_prompt_payload,
+                    valid_block_ids=valid_block_ids,
+                    valid_line_ids=[],
+                    component_whitelist=[
+                        "SectionHeading",
+                        "ParagraphProse",
+                        "ListBlock",
+                        "ContextRail",
+                        "FigurePanel",
+                        "TablePanel",
+                    ],
+                )
+                if isinstance(plan_rows, dict):
+                    layout_plan_v2 = dict(plan_rows)
+                    merged_payload["qwen_layout_plan_v2"] = layout_plan_v2
+                    ordered_block_ids: List[str] = []
+                    suggested_components: List[Dict[str, Any]] = []
+                    for seg in list(layout_plan_v2.get("segments") or []):
+                        if not isinstance(seg, dict):
+                            continue
+                        seg_block_ids = [
+                            self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                            for item in list(seg.get("block_ids") or [])[:8]
+                            if str(item).strip()
+                        ]
+                        seg_block_ids = [item for item in seg_block_ids if item]
+                        for block_id in seg_block_ids:
+                            if block_id not in ordered_block_ids:
+                                ordered_block_ids.append(block_id)
+                        component_hint = str(seg.get("component_hint") or seg.get("ui_component") or "").strip()
+                        if component_hint and seg_block_ids:
+                            suggested_components.append(
+                                {
+                                    "block_ids": seg_block_ids,
+                                    "component": component_hint,
+                                    "kind_hint": str(seg.get("kind_hint") or seg.get("kind") or "").strip(),
+                                    "reason": self._normalize_spaces(str(seg.get("reason") or ""))[:180],
+                                }
+                            )
+                    merged_payload["layout_advice_v2"] = {
+                        "source": "qwen_layout_advice_v3",
+                        "advice_only": True,
+                        "segments": list(layout_plan_v2.get("segments") or []),
+                        "zones": list(layout_plan_v2.get("zones") or []),
+                        "continuation": dict(layout_plan_v2.get("continuation") or {}),
+                        "ui_suggestions": list(layout_plan_v2.get("ui_suggestions") or []),
+                        "notes": list(layout_plan_v2.get("notes") or []),
+                    }
+                    merged_payload["layout_advice_v3"] = {
+                        "source": "qwen_layout_advice_v3",
+                        "advice_only": True,
+                        "ordered_block_ids": ordered_block_ids,
+                        "suggested_components": suggested_components[:240],
+                        "grouping_hints": [
+                            {
+                                "zone_type": str(row.get("zone_type") or ""),
+                                "block_ids": [
+                                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                                    for item in list(row.get("block_ids") or [])[:24]
+                                    if str(item).strip()
+                                ],
+                            }
+                            for row in list(layout_plan_v2.get("zones") or [])[:120]
+                            if isinstance(row, dict)
+                        ],
+                        "visual_hints": [
+                            {
+                                "kind": str(row.get("kind") or ""),
+                                "target_block_ids": [
+                                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                                    for item in list(row.get("target_block_ids") or [])[:24]
+                                    if str(item).strip()
+                                ],
+                                "reason": self._normalize_spaces(str(row.get("reason") or ""))[:180],
+                            }
+                            for row in list(layout_plan_v2.get("ui_suggestions") or [])[:120]
+                            if isinstance(row, dict)
+                        ],
+                        "segments": list(layout_plan_v2.get("segments") or []),
+                        "zones": list(layout_plan_v2.get("zones") or []),
+                        "continuation": dict(layout_plan_v2.get("continuation") or {}),
+                        "ui_suggestions": list(layout_plan_v2.get("ui_suggestions") or []),
+                        "notes": list(layout_plan_v2.get("notes") or []),
+                    }
+                    layout_advice_meta = {
+                        "used": True,
+                        "reason": "applied",
+                        "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
+                        "fallback_used": bool(plan_meta.get("fallback_used")),
+                        "error": None,
+                    }
+                    if not parser_segment_map:
+                        merged_payload["segment_map"] = dict(merged_payload["layout_advice_v2"])
+                        segment_map_meta = {
+                            "used": True,
+                            "reason": "layout_advice_fallback",
+                            "source": "qwen_layout_advice_v3",
+                            "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
+                            "fallback_used": bool(plan_meta.get("fallback_used")),
+                            "error": None,
+                        }
+                else:
+                    layout_advice_meta = {
+                        "used": False,
+                        "reason": str(plan_meta.get("error") or "layout_plan_v2_failed"),
+                        "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
+                        "fallback_used": bool(plan_meta.get("fallback_used")),
+                    }
+            except Exception as exc:
+                layout_advice_meta = {
+                    "used": False,
+                    "reason": "layout_plan_v2_exception",
+                    "error": str(exc),
+                }
+
+        merged_payload["segment_map_meta"] = segment_map_meta
+        merged_payload["layout_advice_meta"] = layout_advice_meta
+        if parser_advice:
+            merged_payload["mm_parser_advice"] = parser_advice
+            merged_payload["mm_parser_summary"] = {
+                "heading_groups": len(list(parser_advice.get("heading_groups") or [])),
+                "paragraph_groups": len(list(parser_advice.get("paragraph_groups") or [])),
+                "figure_groups": len(list(parser_advice.get("figure_groups") or [])),
+                "counts": dict(parser_advice.get("counts") or {}),
+                "segment_fallback_used": bool(parser_segment_map),
+            }
+        if parser_meta:
+            merged_payload["mm_parser_meta"] = parser_meta
+
         self._mm_layout_service.mark_mm_triggered(paper_id=int(paper.id), page=int(page))
+        merged_payload["qwen_plan_meta"] = {
+            "used": bool(layout_advice_meta.get("used")),
+            "layout_model": str(layout_advice_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
+            "layout_fallback_used": bool(layout_advice_meta.get("fallback_used")),
+            "parser_model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
+            "parser_fallback_used": bool(parser_meta.get("fallback_used")),
+            "source": "document_mind" if has_docmind_structure else "vl_parser",
+        }
         merged_payload["mm_assist_meta"] = {
             "used": True,
             "degraded": False,
-            "reason": "applied",
-            "model": str(call_meta.get("model") or getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-            "fallback_used": bool(call_meta.get("fallback_used")),
+            "reason": "docmind_structure_with_layout_advice" if has_docmind_structure else "parser_applied",
+            "model": str(
+                (layout_advice_meta.get("model") if layout_advice_meta.get("used") else parser_meta.get("model"))
+                or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")
+            ),
+            "fallback_used": bool(layout_advice_meta.get("fallback_used") or parser_meta.get("fallback_used")),
             "trigger_reason": list(trigger_meta.get("trigger_reasons") or []),
             "prompt_version": str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1")),
         }
         return self._ensure_layout_channels(merged_payload)
+
+    def _build_segment_map_from_parser_advice(
+        self,
+        *,
+        page: int,
+        parser_advice: Dict[str, Any],
+        prompt_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(parser_advice, dict):
+            return {}
+
+        line_candidates = list((prompt_payload or {}).get("line_candidates") or [])
+        line_order_map: Dict[str, int] = {}
+        line_text_map: Dict[str, str] = {}
+        for idx, row in enumerate(line_candidates):
+            if not isinstance(row, dict):
+                continue
+            line_id = str(row.get("line_id") or "").strip()
+            if not line_id:
+                continue
+            try:
+                line_order = int(row.get("order") or idx)
+            except Exception:
+                line_order = idx
+            line_order_map[line_id] = line_order
+            line_text_map[line_id] = self._normalize_spaces(str(row.get("text") or ""))
+
+        native_extract = dict((prompt_payload or {}).get("native_page_extract") or {})
+        native_words = [row for row in list(native_extract.get("words") or []) if isinstance(row, dict)]
+        word_order_map: Dict[str, int] = {}
+        word_text_map: Dict[str, str] = {}
+        for idx, row in enumerate(native_words):
+            word_id = str(row.get("word_id") or "").strip()
+            if not word_id:
+                continue
+            word_order_map[word_id] = idx
+            word_text_map[word_id] = self._normalize_spaces(str(row.get("text") or ""))
+        native_chars = [row for row in list(native_extract.get("chars") or []) if isinstance(row, dict)]
+        char_order_map: Dict[str, int] = {}
+        for idx, row in enumerate(native_chars):
+            char_id = str(row.get("char_id") or "").strip()
+            if char_id:
+                char_order_map[char_id] = idx
+
+        heading_groups = [row for row in list(parser_advice.get("heading_groups") or []) if isinstance(row, dict)]
+        paragraph_groups = [row for row in list(parser_advice.get("paragraph_groups") or []) if isinstance(row, dict)]
+        line_labels = [row for row in list(parser_advice.get("line_labels") or []) if isinstance(row, dict)]
+        figure_groups = [row for row in list(parser_advice.get("figure_groups") or []) if isinstance(row, dict)]
+        block_groups = [row for row in list(parser_advice.get("block_groups") or []) if isinstance(row, dict)]
+
+        heading_title_by_id: Dict[str, str] = {}
+        heading_line_ids: set[str] = set()
+        segments: List[Dict[str, Any]] = []
+        segment_seq = 0
+
+        def _ordered_line_ids(values: Any, *, limit: int) -> List[str]:
+            rows = [str(item).strip() for item in list(values or [])[:limit] if str(item).strip()]
+            rows = list(dict.fromkeys(rows))
+            return sorted(rows, key=lambda line_id: (line_order_map.get(line_id, 10_000_000), line_id))
+
+        def _next_segment_id(prefix: str) -> str:
+            nonlocal segment_seq
+            segment_seq += 1
+            return f"{prefix}_{segment_seq}"
+
+        if block_groups:
+            ordered_block_groups = sorted(
+                block_groups,
+                key=lambda row: (
+                    self._safe_int(row.get("reading_order"), 10_000_000),
+                    min(
+                        [
+                            line_order_map.get(str(item).strip(), 10_000_000)
+                            for item in list(row.get("line_ids") or [])
+                            if str(item).strip()
+                        ]
+                        or [10_000_000]
+                    ),
+                    str(row.get("block_id") or ""),
+                ),
+            )
+            for row in ordered_block_groups:
+                kind_raw = str(row.get("kind") or "").strip().lower()
+                canonical_block_id = self._normalize_canonical_block_id(
+                    page=page,
+                    raw_id=str(row.get("block_id") or ""),
+                )
+                line_ids = _ordered_line_ids(row.get("line_ids"), limit=120)
+                word_ids = [
+                    str(item).strip()
+                    for item in list(row.get("word_ids") or [])[:320]
+                    if str(item).strip()
+                ]
+                char_ranges = [
+                    {
+                        "start_char_id": str(item.get("start_char_id") or "").strip(),
+                        "end_char_id": str(item.get("end_char_id") or "").strip(),
+                    }
+                    for item in list(row.get("char_ranges") or [])[:200]
+                    if isinstance(item, dict)
+                    and str(item.get("start_char_id") or "").strip()
+                    and str(item.get("end_char_id") or "").strip()
+                ]
+                if not line_ids and not word_ids and not char_ranges:
+                    continue
+                title = self._normalize_spaces(str(row.get("title") or ""))
+                parent_node_id = self._normalize_spaces(str(row.get("parent_node_id") or "")).lower()[:40]
+                try:
+                    confidence = float(row.get("confidence") or 0.0)
+                except Exception:
+                    confidence = 0.0
+
+                resolved_text = self._normalize_spaces(" ".join(line_text_map.get(line_id, "") for line_id in line_ids))
+                if not resolved_text and word_ids:
+                    resolved_text = self._normalize_spaces(" ".join(word_text_map.get(word_id, "") for word_id in word_ids))
+                if not resolved_text:
+                    resolved_text = title
+
+                if kind_raw == "heading":
+                    heading_id = self._normalize_spaces(str(row.get("block_id") or parent_node_id or "")).lower()[:40]
+                    if heading_id:
+                        heading_title_by_id[heading_id] = title
+                    heading_line_ids.update(set(line_ids))
+                    segments.append(
+                        {
+                            "segment_id": str(row.get("block_id") or _next_segment_id("h")).strip() or _next_segment_id("h"),
+                            "kind": "heading",
+                            "kind_hint": "heading",
+                            "component_hint": "SectionHeading",
+                            "line_ids": line_ids,
+                            "evidence_line_ids": list(line_ids),
+                            "word_ids": word_ids,
+                            "char_ranges": char_ranges,
+                            "block_ids": [canonical_block_id] if canonical_block_id else [],
+                            "title": title,
+                            "resolved_text": resolved_text,
+                            "sort_order": min(
+                                [line_order_map.get(line_id, 10_000_000) for line_id in list(line_ids)] or
+                                [word_order_map.get(word_id, 10_000_000) for word_id in list(word_ids)] or
+                                [10_000_000]
+                            ),
+                            "continuation": "none",
+                            "reason": "parser_block_group_heading",
+                            "confidence": max(0.0, min(1.0, confidence)),
+                        }
+                    )
+                    continue
+
+                zone_type = str(row.get("zone_type") or "main_body").strip().lower()
+                if zone_type != "main_body":
+                    continue
+                cleaned_line_ids = [line_id for line_id in line_ids if line_id not in heading_line_ids] or list(line_ids)
+                section_title = title
+                if not section_title and parent_node_id:
+                    section_title = heading_title_by_id.get(parent_node_id, "")
+                component_hint = "ParagraphProse"
+                kind = "paragraph"
+                if kind_raw == "list_item":
+                    component_hint = "ListBlock"
+                    kind = "list_item"
+                elif kind_raw in {"caption", "table_caption"}:
+                    component_hint = "ParagraphProse"
+                    kind = "caption"
+                segments.append(
+                    {
+                        "segment_id": str(row.get("block_id") or _next_segment_id("p")).strip() or _next_segment_id("p"),
+                        "kind": kind,
+                        "kind_hint": kind,
+                        "component_hint": component_hint,
+                        "line_ids": cleaned_line_ids,
+                        "evidence_line_ids": list(cleaned_line_ids),
+                        "word_ids": word_ids,
+                        "char_ranges": char_ranges,
+                        "block_ids": [canonical_block_id] if canonical_block_id else [],
+                        "title": section_title,
+                        "resolved_text": resolved_text,
+                        "sort_order": min(
+                            [line_order_map.get(line_id, 10_000_000) for line_id in list(cleaned_line_ids)] or
+                            [word_order_map.get(word_id, 10_000_000) for word_id in list(word_ids)] or
+                            [
+                                min(
+                                    char_order_map.get(str(rng.get("start_char_id") or "").strip(), 10_000_000),
+                                    char_order_map.get(str(rng.get("end_char_id") or "").strip(), 10_000_000),
+                                )
+                                for rng in list(char_ranges)
+                                if isinstance(rng, dict)
+                            ] or
+                            [10_000_000]
+                        ),
+                        "continuation": "none",
+                        "reason": "parser_block_group_body",
+                        "confidence": max(0.0, min(1.0, confidence)),
+                    }
+                )
+
+        if not segments:
+            for row in heading_groups:
+                line_ids = _ordered_line_ids(row.get("line_ids"), limit=8)
+                if not line_ids:
+                    continue
+                heading_id = self._normalize_spaces(str(row.get("heading_id") or "")).lower()[:40]
+                title = self._normalize_spaces(str(row.get("title") or ""))
+                if not title:
+                    title = self._normalize_spaces(" ".join(line_text_map.get(line_id, "") for line_id in line_ids))
+                if heading_id:
+                    heading_title_by_id[heading_id] = title
+                heading_line_ids.update(set(line_ids))
+                try:
+                    confidence = float(row.get("confidence") or 0.0)
+                except Exception:
+                    confidence = 0.0
+                segments.append(
+                    {
+                        "segment_id": _next_segment_id("h"),
+                        "kind": "heading",
+                        "kind_hint": "heading",
+                        "component_hint": "SectionHeading",
+                        "line_ids": line_ids,
+                        "evidence_line_ids": list(line_ids),
+                        "block_ids": [],
+                        "title": title,
+                        "continuation": "none",
+                        "reason": "parser_heading_group",
+                        "confidence": max(0.0, min(1.0, confidence)),
+                    }
+                )
+
+            for row in paragraph_groups:
+                line_ids = _ordered_line_ids(row.get("line_ids"), limit=80)
+                if not line_ids:
+                    continue
+                zone_type = str(row.get("zone_type") or "main_body").strip().lower()
+                if zone_type != "main_body":
+                    continue
+                cleaned_line_ids = [line_id for line_id in line_ids if line_id not in heading_line_ids] or list(line_ids)
+                heading_id = self._normalize_spaces(str(row.get("heading_id") or "")).lower()[:40]
+                title = heading_title_by_id.get(heading_id, "")
+                try:
+                    confidence = float(row.get("confidence") or 0.0)
+                except Exception:
+                    confidence = 0.0
+                segments.append(
+                    {
+                        "segment_id": str(row.get("paragraph_id") or _next_segment_id("p")).strip() or _next_segment_id("p"),
+                        "kind": "paragraph",
+                        "kind_hint": "paragraph",
+                        "component_hint": "ParagraphProse",
+                        "line_ids": cleaned_line_ids,
+                        "evidence_line_ids": list(cleaned_line_ids),
+                        "block_ids": [],
+                        "title": title,
+                        "continuation": "none",
+                        "reason": "parser_paragraph_group",
+                        "confidence": max(0.0, min(1.0, confidence)),
+                    }
+                )
+
+        # Compatibility fallback: if parser model only returned line_labels, split conservatively.
+        if not segments and line_labels:
+            ordered_labels = sorted(
+                line_labels,
+                key=lambda row: (
+                    line_order_map.get(str(row.get("line_id") or "").strip(), 10_000_000),
+                    str(row.get("line_id") or ""),
+                ),
+            )
+            paragraph_buffer: List[str] = []
+            for row in ordered_labels:
+                line_id = str(row.get("line_id") or "").strip()
+                if not line_id:
+                    continue
+                zone_type = str(row.get("zone_type") or "main_body").strip().lower()
+                if zone_type != "main_body":
+                    continue
+                try:
+                    heading_prob = float(row.get("heading_prob") or 0.0)
+                except Exception:
+                    heading_prob = 0.0
+                if heading_prob >= 0.9:
+                    if paragraph_buffer:
+                        segments.append(
+                            {
+                                "segment_id": _next_segment_id("p"),
+                                "kind": "paragraph",
+                                "kind_hint": "paragraph",
+                                "component_hint": "ParagraphProse",
+                                "line_ids": list(paragraph_buffer),
+                                "evidence_line_ids": list(paragraph_buffer),
+                                "block_ids": [],
+                                "title": "",
+                                "continuation": "none",
+                                "reason": "parser_line_label_buffer",
+                            }
+                        )
+                        paragraph_buffer = []
+                    title = line_text_map.get(line_id, "")
+                    segments.append(
+                        {
+                            "segment_id": _next_segment_id("h"),
+                            "kind": "heading",
+                            "kind_hint": "heading",
+                            "component_hint": "SectionHeading",
+                            "line_ids": [line_id],
+                            "evidence_line_ids": [line_id],
+                            "block_ids": [],
+                            "title": title,
+                            "continuation": "none",
+                            "reason": "parser_line_label_heading",
+                            "confidence": max(0.9, heading_prob),
+                        }
+                    )
+                    continue
+                paragraph_buffer.append(line_id)
+                if bool(row.get("paragraph_break_after")):
+                    segments.append(
+                        {
+                            "segment_id": _next_segment_id("p"),
+                            "kind": "paragraph",
+                            "kind_hint": "paragraph",
+                            "component_hint": "ParagraphProse",
+                            "line_ids": list(paragraph_buffer),
+                            "evidence_line_ids": list(paragraph_buffer),
+                            "block_ids": [],
+                            "title": "",
+                            "continuation": "none",
+                            "reason": "parser_line_label_break",
+                        }
+                    )
+                    paragraph_buffer = []
+            if paragraph_buffer:
+                segments.append(
+                    {
+                        "segment_id": _next_segment_id("p"),
+                        "kind": "paragraph",
+                        "kind_hint": "paragraph",
+                        "component_hint": "ParagraphProse",
+                        "line_ids": list(paragraph_buffer),
+                        "evidence_line_ids": list(paragraph_buffer),
+                        "block_ids": [],
+                        "title": "",
+                        "continuation": "none",
+                        "reason": "parser_line_label_tail",
+                    }
+                )
+
+        if not segments:
+            return {}
+
+        segments = sorted(
+            segments,
+            key=lambda row: (
+                self._safe_int(
+                    row.get("sort_order"),
+                    min(
+                        [line_order_map.get(line_id, 10_000_000) for line_id in list(row.get("line_ids") or [])] or
+                        [word_order_map.get(str(word_id).strip(), 10_000_000) for word_id in list(row.get("word_ids") or [])] or
+                        [10_000_000]
+                    ),
+                ),
+                str(row.get("segment_id") or ""),
+            ),
+        )
+
+        counts = dict(parser_advice.get("counts") or {})
+        return {
+            "source": "vlflash_page_structure_v2",
+            "page_structure_version": "v3",
+            "advice_only": True,
+            "segments": segments,
+            "zones": [],
+            "continuation": {"from_prev": [], "to_next": [], "confidence": 0.0, "reason": ""},
+            "ui_suggestions": [],
+            "notes": list(parser_advice.get("notes") or []),
+            "doc_nav_tree": [row for row in list(parser_advice.get("doc_nav_tree") or []) if isinstance(row, dict)][:120],
+            "relations": [row for row in list(parser_advice.get("relations") or []) if isinstance(row, dict)][:320],
+            "parser_counts": {
+                "heading_count": self._safe_int(counts.get("heading_count"), len(heading_groups)),
+                "paragraph_count": self._safe_int(counts.get("paragraph_count"), len(paragraph_groups)),
+                "figure_count": self._safe_int(counts.get("figure_count"), len(figure_groups)),
+                "block_count": self._safe_int(counts.get("block_count"), len(block_groups)),
+            },
+            "figure_groups": figure_groups[:80],
+            "block_groups": block_groups[:240],
+        }
 
     def validate_ui_plan(self, ui_plan: Dict[str, Any], *, page: int) -> Dict[str, Any]:
         errors: List[str] = []
@@ -657,9 +1819,9 @@ class LiteratureReaderComposeService:
                         if not isinstance(anchor, dict):
                             errors.append(f"invalid anchor in {node_id or node_type}")
                             continue
-                        page_no = int(anchor.get("page") or 0)
-                        start_char = int(anchor.get("start_char") or -1)
-                        end_char = int(anchor.get("end_char") or -1)
+                        page_no = self._safe_int(anchor.get("page"), 0)
+                        start_char = self._safe_int(anchor.get("start_char"), -1)
+                        end_char = self._safe_int(anchor.get("end_char"), -1)
                         if page_no != int(page):
                             errors.append(f"anchor page mismatch in {node_id or node_type}")
                         if start_char < 0 or end_char <= start_char:
@@ -699,6 +1861,38 @@ class LiteratureReaderComposeService:
         heading_nodes = [node for node in flat_nodes if node.get("type") == "SectionHeading"]
         paragraph_nodes = [node for node in flat_nodes if node.get("type") == "ParagraphProse"]
         link_nodes = [node for node in flat_nodes if node.get("type") == "CitationLinks"]
+        paragraph_texts = [
+            self._normalize_spaces(str((node.get("props") or {}).get("text") or ""))
+            for node in paragraph_nodes
+            if self._normalize_spaces(str((node.get("props") or {}).get("text") or ""))
+        ]
+        paragraph_unique = len({item.lower() for item in paragraph_texts})
+        duplicate_ratio = 0.0
+        if paragraph_texts:
+            duplicate_ratio = 1.0 - (paragraph_unique / max(1, len(paragraph_texts)))
+
+        anchor_eval = self._evaluate_anchor_metrics(
+            ui_plan=ui_plan,
+            base_payload=base_payload,
+        )
+        anchor_quote_hit_rate = float(anchor_eval.get("hit_rate") or 0.0)
+        anchor_bbox_iou = float(anchor_eval.get("bbox_iou") or 0.0)
+        anchor_misjump_rate = float(anchor_eval.get("misjump_rate") or 0.0)
+        anchor_gate_passed = bool(anchor_eval.get("gate_passed"))
+        if not bool(getattr(settings, "reader_anchor_eval_gate_enabled", True)):
+            anchor_gate_passed = True
+
+        anchor_ref_count = 0
+        anchor_node_count = 0
+        evidence_image_ready = False
+        for node in flat_nodes:
+            refs = list((node or {}).get("source_anchor_refs") or [])
+            if refs:
+                anchor_node_count += 1
+                anchor_ref_count += len(refs)
+                if any(isinstance((row or {}).get("bbox_hint"), dict) for row in refs if isinstance(row, dict)):
+                    evidence_image_ready = True
+        anchor_coverage_ratio = (anchor_node_count / max(1, len(paragraph_nodes))) if paragraph_nodes else 1.0
 
         expected_heading_count = max(1, len(base_headings))
         rendered_heading_count = len(heading_nodes)
@@ -779,7 +1973,13 @@ class LiteratureReaderComposeService:
         title_integrity = self._check_title_integrity(flat_nodes, base_payload)
         anchors_valid = not any("anchor" in str(item).lower() for item in validation_errors)
         toc_passed = bool(toc_hidden or toc_quality >= 0.55)
-        hard_constraints_passed = bool(title_integrity and not sidebar_leak and anchors_valid and toc_passed)
+        hard_constraints_passed = bool(
+            title_integrity
+            and not sidebar_leak
+            and anchors_valid
+            and toc_passed
+            and anchor_gate_passed
+        )
 
         # 总分在原四项基础上加入“跨栏拼接率/侧栏召回率”，避免只看文本流畅度。
         overall = (
@@ -846,6 +2046,24 @@ class LiteratureReaderComposeService:
                 }
             )
             overall -= 0.08
+        if duplicate_ratio > 0.1:
+            deductions.append(
+                {
+                    "item": "duplicate_content",
+                    "penalty": 0.1,
+                    "reason": "正文组件存在较高重复率",
+                }
+            )
+            overall -= 0.1
+        if not anchor_gate_passed:
+            deductions.append(
+                {
+                    "item": "anchor_gate",
+                    "penalty": 0.12,
+                    "reason": "证据锚点命中率或IoU不达标",
+                }
+            )
+            overall -= 0.12
         overall = max(0.0, min(1.0, overall))
 
         fix_suggestions: List[str] = []
@@ -865,6 +2083,10 @@ class LiteratureReaderComposeService:
             fix_suggestions.append("保留并渲染侧栏信息至 ContextRail，而非删除。")
         if not toc_passed:
             fix_suggestions.append("仅保留高置信标题生成目录，低质目录直接隐藏。")
+        if duplicate_ratio > 0.1:
+            fix_suggestions.append("对重复正文块去重，保持一个语义段只渲染一次。")
+        if not anchor_gate_passed:
+            fix_suggestions.append("未通过证据门禁时仅显示文本，隐藏定位按钮并触发重排。")
 
         mm_meta = dict(base_payload.get("mm_assist_meta") or {})
 
@@ -877,6 +2099,14 @@ class LiteratureReaderComposeService:
             "cross_column_merge_ratio": round(max(0.0, min(1.0, cross_column_merge_ratio)), 4),
             "sidebar_recall": round(max(0.0, min(1.0, sidebar_recall)), 4),
             "toc_quality": round(max(0.0, min(1.0, toc_quality)), 4),
+            "duplicate_ratio": round(max(0.0, min(1.0, duplicate_ratio)), 4),
+            "anchor_coverage_ratio": round(max(0.0, min(1.0, anchor_coverage_ratio)), 4),
+            "anchor_quote_hit_rate": round(max(0.0, min(1.0, anchor_quote_hit_rate)), 4),
+            "anchor_bbox_iou": round(max(0.0, min(1.0, anchor_bbox_iou)), 4),
+            "anchor_misjump_rate": round(max(0.0, min(1.0, anchor_misjump_rate)), 4),
+            "anchor_gate_passed": bool(anchor_gate_passed),
+            "evidence_image_ready": bool(evidence_image_ready),
+            "anchor_ref_count": int(anchor_ref_count),
             "hard_constraints_passed": hard_constraints_passed,
             "sidebar_leak_detected": sidebar_leak,
             "title_integrity_ok": title_integrity,
@@ -1066,10 +2296,23 @@ class LiteratureReaderComposeService:
         detail_level: str,
         compare_mode: bool,
     ) -> Dict[str, Any]:
-        blocks = self._normalize_blocks_for_render(
+        raw_blocks = self._normalize_blocks_for_render(
             blocks=list(base_payload.get("blocks") or []),
             page=page,
         )
+        page_structure_v3 = dict(base_payload.get("page_structure_v3") or {})
+        ai_main_blocks = self._build_main_blocks_from_page_structure(
+            page=page,
+            page_structure=page_structure_v3,
+            base_payload=base_payload,
+        )
+        main_block_source = "page_structure_v3_only"
+
+        blocks = list(raw_blocks)
+        if ai_main_blocks:
+            non_main = [item for item in blocks if str(item.get("zone_type") or "") != "main_body"]
+            blocks = ai_main_blocks + non_main
+
         side_context_blocks = self._normalize_blocks_for_render(
             blocks=list(base_payload.get("side_context_blocks") or []),
             page=page,
@@ -1085,6 +2328,7 @@ class LiteratureReaderComposeService:
         main_blocks = [
             item for item in blocks if str(item.get("zone_type") or "main_body") == "main_body"
         ]
+        main_blocks = self._dedupe_main_blocks(main_blocks)
         assets = list(base_payload.get("assets") or [])
         summary = str(base_payload.get("summary") or "").strip()
         style_cues = dict(base_payload.get("style_cues") or {})
@@ -1108,12 +2352,14 @@ class LiteratureReaderComposeService:
             if not normalized:
                 return []
             try:
-                normalized["bbox_hint"] = self._build_bbox_hint(
-                    style_cues=style_cues,
-                    quote_text=quote_text,
-                )
+                if not isinstance(normalized.get("bbox_hint"), dict):
+                    normalized["bbox_hint"] = self._build_bbox_hint(
+                        style_cues=style_cues,
+                        quote_text=quote_text,
+                    )
             except Exception:
-                normalized["bbox_hint"] = None
+                if "bbox_hint" not in normalized:
+                    normalized["bbox_hint"] = None
             return [normalized]
 
         components.append(
@@ -1292,7 +2538,8 @@ class LiteratureReaderComposeService:
                         "heading_prob": float(block.get("heading_prob") or 0.0),
                         "capabilities": ["jump_anchor", "copy"],
                         "actions": [],
-                        "layout_slot": {"reserved_height": 86, "lock_height": True},
+                        # Do not hard-lock heading height; long/multi-line titles would be clipped.
+                        "layout_slot": {"reserved_height": 86, "lock_height": False},
                     }
                 )
             elif kind == "list_item":
@@ -1346,23 +2593,6 @@ class LiteratureReaderComposeService:
                             {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
                         ],
                         "layout_slot": {"reserved_height": 210, "lock_height": False},
-                    }
-                )
-                components.append(
-                    {
-                        "id": next_id("inline_slot"),
-                        "type": "InlineQuerySlot",
-                        "props": {
-                            "placeholder": "在这里提问（仅针对当前段落/章节）",
-                            "target_node_ref": str(components[-1]["id"]),
-                        },
-                        "children": [],
-                        "source_anchor_refs": anchor_refs,
-                        "zone_type": "main_body",
-                        "column_id": str(block.get("column_id") or "main"),
-                        "capabilities": ["inline_query"],
-                        "actions": [],
-                        "layout_slot": {"reserved_height": 68, "lock_height": True},
                     }
                 )
 
@@ -1452,6 +2682,7 @@ class LiteratureReaderComposeService:
                 "generator": COMPOSE_ENGINE_VERSION,
                 "schema_version": COMPOSE_COMPONENT_SCHEMA_VERSION,
                 "layout_schema_version": COMPOSE_LAYOUT_SCHEMA_VERSION,
+                "main_block_source": str(main_block_source),
                 "tool_call_trace": [],
             },
         }
@@ -1683,9 +2914,9 @@ class LiteratureReaderComposeService:
                 continue
             sources.append(
                 {
-                    "page": int(anchor.get("page") or int(page)),
-                    "start_char": int(anchor.get("start_char") or 0),
-                    "end_char": int(anchor.get("end_char") or 0),
+                    "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
+                    "start_char": self._safe_int(anchor.get("start_char"), 0),
+                    "end_char": self._safe_int(anchor.get("end_char"), 0),
                     "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
                 }
             )
@@ -2121,11 +3352,19 @@ class LiteratureReaderComposeService:
         )
         mm_primary = str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash") or "qwen3.5-flash")
         mm_fallback = str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-flash") or "qwen3-vl-flash")
+        mm_parser = str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash") or "qwen3-vl-flash")
+        mm_layout = str(getattr(settings, "reader_mm_layout_model", "qwen3.5-flash") or "qwen3.5-flash")
         mm_prompt_version = str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1") or "mm_layout_v1")
         layout_schema_version = str(
             getattr(settings, "reader_mm_layout_schema_version", COMPOSE_LAYOUT_SCHEMA_VERSION)
             or COMPOSE_LAYOUT_SCHEMA_VERSION
         )
+        assembly_enabled = bool(getattr(settings, "reader_compose_layout_llm_enabled", True))
+        assembly_prompt_version = str(
+            getattr(settings, "reader_compose_layout_llm_prompt_version", "compose_layout_llm_v1")
+            or "compose_layout_llm_v1"
+        )
+        assembly_max_blocks = int(getattr(settings, "reader_compose_layout_llm_max_blocks", 80) or 80)
 
         signature_payload = {
             "engine": COMPOSE_ENGINE_VERSION,
@@ -2146,7 +3385,12 @@ class LiteratureReaderComposeService:
                 "mm": int(mm_enabled),
                 "mm_primary": mm_primary,
                 "mm_fallback": mm_fallback,
+                "mm_parser": mm_parser,
+                "mm_layout": mm_layout,
                 "mm_prompt": mm_prompt_version,
+                "assembly": int(assembly_enabled),
+                "assembly_prompt": assembly_prompt_version,
+                "assembly_max_blocks": int(assembly_max_blocks),
                 "extimg": int(bool(getattr(settings, "reader_external_image_enabled", False))),
             },
         }
@@ -2272,6 +3516,7 @@ class LiteratureReaderComposeService:
         detail_level: str,
     ) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
+        block_anchor_map: Dict[str, Dict[str, Any]] = {}
 
         for row_page, payload in context_rows:
             blocks = self._normalize_blocks_for_render(
@@ -2300,6 +3545,13 @@ class LiteratureReaderComposeService:
                     continue
                 raw_id = str(block.get("id") or f"b{idx + 1}")
                 block_id = f"p{int(row_page)}_{raw_id}"
+                normalized_anchor = self._normalize_anchor_ref(
+                    anchor=anchor,
+                    page=int(row_page),
+                    quote_text=text,
+                )
+                if isinstance(normalized_anchor, dict):
+                    block_anchor_map[block_id] = normalized_anchor
                 candidates.append(
                     {
                         "block_id": block_id,
@@ -2355,8 +3607,14 @@ class LiteratureReaderComposeService:
             for raw in rows:
                 if isinstance(raw, dict):
                     text = self._normalize_spaces(str(raw.get("text") or raw.get("title") or ""))
+                    evidence_block_ids = [
+                        str(item).strip()
+                        for item in list(raw.get("evidence_block_ids") or raw.get("block_ids") or [])[:4]
+                        if str(item).strip()
+                    ]
                 else:
                     text = self._normalize_spaces(str(raw or ""))
+                    evidence_block_ids = []
                 text = re.sub(r"(?:\.\.\.|…)+$", "", text).strip()
                 if len(text) < 8:
                     continue
@@ -2364,12 +3622,20 @@ class LiteratureReaderComposeService:
                 if text_key in seen_texts:
                     continue
                 seen_texts.add(text_key)
-                # KeyTakeaways 当前阶段不展示证据高亮，因此统一留空 evidence_anchors。
-                # 后续若恢复高亮功能，可在此处接回 block_id -> anchor 的映射。
+                evidence_anchors: List[Dict[str, Any]] = []
+                for block_id in evidence_block_ids:
+                    anchor = dict(block_anchor_map.get(block_id) or {})
+                    if not anchor:
+                        continue
+                    if self._safe_int(anchor.get("page"), 0) != self._safe_int(current_page, 0):
+                        continue
+                    evidence_anchors.append(anchor)
+                    if len(evidence_anchors) >= 2:
+                        break
                 normalized_rows.append(
                     {
                         "text": text[:220],
-                        "evidence_anchors": [],
+                        "evidence_anchors": evidence_anchors,
                     }
                 )
                 if len(normalized_rows) >= 8:
@@ -2443,15 +3709,21 @@ class LiteratureReaderComposeService:
         except Exception:
             return None
 
-    def _build_bbox_hint(self, *, style_cues: Dict[str, Any], quote_text: str) -> Optional[Dict[str, Any]]:
-        line_layout = list(style_cues.get("line_layout") or [])
+    def _build_bbox_hint(
+        self,
+        *,
+        style_cues: Dict[str, Any],
+        quote_text: str,
+        source_anchor: Optional[Dict[str, Any]] = None,
+        line_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        line_layout = list(line_rows or style_cues.get("line_layout") or [])
         target = self._normalize_spaces(str(quote_text or "")).lower()
         if not target:
             return None
 
-        best_row: Optional[Dict[str, Any]] = None
-        best_score = 0.0
-        for row in line_layout[:180]:
+        scored_rows: List[Tuple[float, Dict[str, Any]]] = []
+        for row in line_layout[:260]:
             if not isinstance(row, dict):
                 continue
             row_text = self._normalize_spaces(str(row.get("text") or "")).lower()
@@ -2463,23 +3735,1508 @@ class LiteratureReaderComposeService:
             if target in row_text or row_text in target:
                 score = 1.0
             else:
-                overlap = len(set(target.split()) & set(row_text.split()))
-                if overlap > 0:
-                    score = min(0.95, 0.18 * overlap)
-            if score > best_score:
-                best_score = score
-                best_row = row
+                target_tokens = [item for item in target.split(" ") if item]
+                row_tokens = [item for item in row_text.split(" ") if item]
+                if target_tokens and row_tokens:
+                    overlap = len(set(target_tokens) & set(row_tokens))
+                    if overlap > 0:
+                        score = min(0.95, overlap / max(1, min(len(target_tokens), len(row_tokens))))
+            if score > 0:
+                scored_rows.append((score, row))
 
-        if best_row is None or best_score < 0.2:
+        if not scored_rows:
+            return None
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        best_score = float(scored_rows[0][0])
+        keep_threshold = max(0.35, best_score * 0.6)
+        kept_rows = [row for score, row in scored_rows if score >= keep_threshold][:8]
+        if not kept_rows:
+            kept_rows = [scored_rows[0][1]]
+
+        x0 = min(float(row.get("x0") or 0.0) for row in kept_rows)
+        x1 = max(float(row.get("x1") or 0.0) for row in kept_rows)
+        top = min(float(row.get("top") or 0.0) for row in kept_rows)
+        bottom = max(float(row.get("bottom") or 0.0) for row in kept_rows)
+        if source_anchor and isinstance(source_anchor, dict):
+            # Keep bbox stable for long spans by respecting anchor page defaults.
+            _ = self._safe_int(source_anchor.get("page"), 0)
+        if x1 <= x0 or bottom <= top:
             return None
         return {
-            "x0": float(best_row.get("x0") or 0.0),
-            "x1": float(best_row.get("x1") or 0.0),
-            "top": float(best_row.get("top") or 0.0),
-            "bottom": float(best_row.get("bottom") or 0.0),
+            "x0": x0,
+            "x1": x1,
+            "top": top,
+            "bottom": bottom,
             "page_width": float(style_cues.get("page_width") or 0.0) or None,
             "page_height": float(style_cues.get("page_height") or 0.0) or None,
         }
+
+    @staticmethod
+    def _build_rect_polygon(*, x0: float, x1: float, top: float, bottom: float) -> List[Dict[str, float]]:
+        return [
+            {"x": float(x0), "y": float(top)},
+            {"x": float(x1), "y": float(top)},
+            {"x": float(x1), "y": float(bottom)},
+            {"x": float(x0), "y": float(bottom)},
+        ]
+
+    @staticmethod
+    def _dedupe_polygon_points(points: Sequence[Dict[str, float]]) -> List[Dict[str, float]]:
+        output: List[Dict[str, float]] = []
+        last_key = ""
+        for row in points:
+            x = float(row.get("x") or 0.0)
+            y = float(row.get("y") or 0.0)
+            key = f"{x:.3f}:{y:.3f}"
+            if key == last_key:
+                continue
+            output.append({"x": x, "y": y})
+            last_key = key
+        if len(output) >= 2:
+            first = output[0]
+            last = output[-1]
+            if abs(float(first.get("x") or 0.0) - float(last.get("x") or 0.0)) < 1e-3 and abs(
+                float(first.get("y") or 0.0) - float(last.get("y") or 0.0)
+            ) < 1e-3:
+                output.pop()
+        return output
+
+    def _build_anchor_geometry(
+        self,
+        *,
+        boxes: Sequence[Dict[str, Any]],
+        page_width: float,
+        page_height: float,
+        source: str = "word_union",
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(settings, "reader_polygon_highlight_enabled", True)):
+            return None
+        normalized_boxes: List[Dict[str, float]] = []
+        for row in list(boxes or [])[:4000]:
+            if not isinstance(row, dict):
+                continue
+            x0 = self._safe_float(row.get("x0"), 0.0)
+            x1 = self._safe_float(row.get("x1"), 0.0)
+            top = self._safe_float(row.get("top"), 0.0)
+            bottom = self._safe_float(row.get("bottom"), 0.0)
+            if x1 <= x0 or bottom <= top:
+                continue
+            normalized_boxes.append({"x0": x0, "x1": x1, "top": top, "bottom": bottom})
+        if not normalized_boxes:
+            return None
+
+        # Split into connected components to avoid bridging left/right columns.
+        components: List[Dict[str, Any]] = []
+        x_gap = 14.0
+        y_gap = 9.0
+        for box in sorted(normalized_boxes, key=lambda item: (item["top"], item["x0"])):
+            matched = None
+            for comp in components:
+                if (
+                    box["x0"] <= float(comp["x1"]) + x_gap
+                    and box["x1"] >= float(comp["x0"]) - x_gap
+                    and box["top"] <= float(comp["bottom"]) + y_gap
+                    and box["bottom"] >= float(comp["top"]) - y_gap
+                ):
+                    matched = comp
+                    break
+            if not matched:
+                components.append(
+                    {
+                        "boxes": [box],
+                        "x0": box["x0"],
+                        "x1": box["x1"],
+                        "top": box["top"],
+                        "bottom": box["bottom"],
+                    }
+                )
+                continue
+            matched["boxes"].append(box)
+            matched["x0"] = min(float(matched["x0"]), box["x0"])
+            matched["x1"] = max(float(matched["x1"]), box["x1"])
+            matched["top"] = min(float(matched["top"]), box["top"])
+            matched["bottom"] = max(float(matched["bottom"]), box["bottom"])
+
+        polygons: List[Dict[str, Any]] = []
+        for idx, comp in enumerate(components, start=1):
+            comp_boxes = list(comp.get("boxes") or [])
+            if not comp_boxes:
+                continue
+            rows: List[Dict[str, float]] = []
+            for box in sorted(comp_boxes, key=lambda item: (item["top"], item["x0"])):
+                cy = (float(box["top"]) + float(box["bottom"])) / 2.0
+                target_row: Optional[Dict[str, float]] = None
+                for row in rows:
+                    if abs(cy - float(row["cy"])) <= max(6.0, float(row["height"]) * 0.65):
+                        target_row = row
+                        break
+                if target_row is None:
+                    rows.append(
+                        {
+                            "x0": float(box["x0"]),
+                            "x1": float(box["x1"]),
+                            "top": float(box["top"]),
+                            "bottom": float(box["bottom"]),
+                            "cy": cy,
+                            "height": max(1.0, float(box["bottom"]) - float(box["top"])),
+                        }
+                    )
+                    continue
+                target_row["x0"] = min(float(target_row["x0"]), float(box["x0"]))
+                target_row["x1"] = max(float(target_row["x1"]), float(box["x1"]))
+                target_row["top"] = min(float(target_row["top"]), float(box["top"]))
+                target_row["bottom"] = max(float(target_row["bottom"]), float(box["bottom"]))
+                target_row["cy"] = (float(target_row["top"]) + float(target_row["bottom"])) / 2.0
+                target_row["height"] = max(1.0, float(target_row["bottom"]) - float(target_row["top"]))
+            rows = sorted(rows, key=lambda item: (item["top"], item["x0"]))
+            if not rows:
+                continue
+
+            if len(rows) == 1:
+                only = rows[0]
+                points = self._build_rect_polygon(
+                    x0=float(only["x0"]),
+                    x1=float(only["x1"]),
+                    top=float(only["top"]),
+                    bottom=float(only["bottom"]),
+                )
+            else:
+                upper: List[Dict[str, float]] = []
+                lower: List[Dict[str, float]] = []
+                for row in rows:
+                    upper.append({"x": float(row["x0"]), "y": float(row["top"])})
+                    upper.append({"x": float(row["x1"]), "y": float(row["top"])})
+                for row in reversed(rows):
+                    lower.append({"x": float(row["x1"]), "y": float(row["bottom"])})
+                    lower.append({"x": float(row["x0"]), "y": float(row["bottom"])})
+                points = upper + lower
+
+            points = self._dedupe_polygon_points(points)
+            if len(points) < 3:
+                fallback = self._build_rect_polygon(
+                    x0=float(comp["x0"]),
+                    x1=float(comp["x1"]),
+                    top=float(comp["top"]),
+                    bottom=float(comp["bottom"]),
+                )
+                points = self._dedupe_polygon_points(fallback)
+            if len(points) < 3:
+                continue
+            polygons.append(
+                {
+                    "points": points,
+                    "source": source,
+                    "component_id": f"comp_{idx}",
+                }
+            )
+
+        if not polygons:
+            return None
+        return {
+            "polygons": polygons,
+            "page_width": float(page_width) if page_width > 0 else None,
+            "page_height": float(page_height) if page_height > 0 else None,
+        }
+
+    def _build_main_blocks_from_segment_map(
+        self,
+        *,
+        page: int,
+        blocks: Sequence[Dict[str, Any]],
+        segment_map: Optional[Dict[str, Any]],
+        base_payload: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        seg_rows = list((segment_map or {}).get("segments") or [])
+        if not seg_rows:
+            return []
+
+        line_catalog = list(((base_payload or {}).get("line_catalog") or []))
+        line_map: Dict[str, Dict[str, Any]] = {}
+        for row in line_catalog:
+            if not isinstance(row, dict):
+                continue
+            line_id = str(row.get("line_id") or "").strip()
+            if line_id:
+                line_map[line_id] = row
+
+        native_extract = dict(((base_payload or {}).get("native_page_extract") or {}))
+        native_words = [row for row in list(native_extract.get("words") or []) if isinstance(row, dict)]
+        word_map: Dict[str, Dict[str, Any]] = {}
+        for row in native_words:
+            word_id = str(row.get("word_id") or "").strip()
+            if word_id:
+                word_map[word_id] = row
+        native_chars = [row for row in list(native_extract.get("chars") or []) if isinstance(row, dict)]
+        char_order_map: Dict[str, int] = {}
+        for idx, row in enumerate(native_chars):
+            char_id = str(row.get("char_id") or "").strip()
+            if char_id:
+                char_order_map[char_id] = idx
+        word_char_span_map: Dict[str, Tuple[int, int]] = {}
+        for idx, row in enumerate(native_words):
+            word_id = str(row.get("word_id") or "").strip()
+            if not word_id:
+                continue
+            start_id = str(row.get("start_char_id") or "").strip()
+            end_id = str(row.get("end_char_id") or "").strip()
+            start_ord = char_order_map.get(start_id, idx * 2)
+            end_ord = char_order_map.get(end_id, start_ord + 1)
+            if end_ord < start_ord:
+                end_ord = start_ord
+            word_char_span_map[word_id] = (start_ord, end_ord)
+        page_meta = dict(native_extract.get("page_meta") or {})
+        page_width_native = self._safe_float(page_meta.get("page_width"), self._safe_float((base_payload or {}).get("style_cues", {}).get("page_width"), 0.0))
+        page_height_native = self._safe_float(page_meta.get("page_height"), self._safe_float((base_payload or {}).get("style_cues", {}).get("page_height"), 0.0))
+
+        block_map: Dict[str, Dict[str, Any]] = {}
+        fallback_block: Optional[Dict[str, Any]] = None
+        for raw in list(blocks or []):
+            if not isinstance(raw, dict):
+                continue
+            block_id = str(raw.get("id") or "").strip()
+            canonical = self._normalize_canonical_block_id(
+                page=page,
+                raw_id=str(((raw.get("source_anchor") or {}).get("canonical_block_id") or block_id)),
+            )
+            if canonical:
+                block_map[canonical] = raw
+            if fallback_block is None and str(raw.get("kind") or "") in {"paragraph", "heading", "list_item"}:
+                fallback_block = raw
+        if fallback_block is None and blocks:
+            fallback_block = dict(blocks[0])
+
+        output: List[Dict[str, Any]] = []
+
+        def _normalize_kind(raw_kind: str) -> str:
+            token = str(raw_kind or "").strip().lower()
+            if token in {"list", "list_item"}:
+                return "list_item"
+            if token in {"heading", "paragraph"}:
+                return token
+            return ""
+
+        def _consensus_kind_from_source(source_block_ids: Sequence[str]) -> str:
+            kinds = [
+                _normalize_kind(str((block_map.get(block_id) or {}).get("kind") or ""))
+                for block_id in list(source_block_ids or [])
+                if str(block_id or "").strip()
+            ]
+            kinds = [item for item in kinds if item]
+            if not kinds:
+                return ""
+            unique = set(kinds)
+            if len(unique) == 1:
+                return kinds[0]
+            if "paragraph" in unique:
+                return "paragraph"
+            if "heading" in unique and "list_item" not in unique:
+                return "heading"
+            return "paragraph"
+
+        def _looks_like_list_lines(rows: Sequence[Dict[str, Any]]) -> bool:
+            bullet_like = 0
+            total = 0
+            for row in list(rows or [])[:8]:
+                if not isinstance(row, dict):
+                    continue
+                total += 1
+                line_text = self._normalize_spaces(str(row.get("text") or ""))
+                if re.match(r"^(\d+[\.\)]|[-*•])\s+", line_text):
+                    bullet_like += 1
+            if total <= 0:
+                return False
+            return (bullet_like / float(total)) >= 0.5
+
+        def _resolve_group_kind(
+            *,
+            seg: Dict[str, Any],
+            source_block_ids: Sequence[str],
+            row_lines: Sequence[Dict[str, Any]],
+        ) -> str:
+            # Parser blocks are authoritative for final render kind.
+            source_kind = _consensus_kind_from_source(source_block_ids)
+            if source_kind:
+                return source_kind
+
+            # Multimodal kind/component is advisory only.
+            hint_kind = _normalize_kind(str(seg.get("kind_hint") or seg.get("kind") or ""))
+            if hint_kind == "list_item":
+                return "list_item" if _looks_like_list_lines(row_lines) else "paragraph"
+            if hint_kind == "heading":
+                try:
+                    hint_conf = float(seg.get("confidence") or seg.get("heading_confidence") or seg.get("heading_prob") or 0.0)
+                except Exception:
+                    hint_conf = 0.0
+                if hint_conf >= 0.9 and len(list(row_lines or [])) <= 2:
+                    return "heading"
+                return "paragraph"
+            return "paragraph"
+
+        def _word_ids_from_char_ranges(
+            ranges: Sequence[Dict[str, str]],
+            *,
+            limit: int = 480,
+        ) -> List[str]:
+            spans: List[Tuple[int, int]] = []
+            for row in list(ranges or []):
+                if not isinstance(row, dict):
+                    continue
+                start_id = str(row.get("start_char_id") or "").strip()
+                end_id = str(row.get("end_char_id") or "").strip()
+                if not start_id or not end_id:
+                    continue
+                start_ord = char_order_map.get(start_id)
+                end_ord = char_order_map.get(end_id)
+                if start_ord is None and end_ord is None:
+                    continue
+                if start_ord is None:
+                    start_ord = end_ord
+                if end_ord is None:
+                    end_ord = start_ord
+                if start_ord is None or end_ord is None:
+                    continue
+                if end_ord < start_ord:
+                    start_ord, end_ord = end_ord, start_ord
+                spans.append((start_ord, end_ord))
+            if not spans:
+                return []
+            rows: List[Tuple[int, str]] = []
+            for word_id, (word_start, word_end) in word_char_span_map.items():
+                for span_start, span_end in spans:
+                    if word_end < span_start or word_start > span_end:
+                        continue
+                    rows.append((word_start, word_id))
+                    break
+            rows = sorted(rows, key=lambda item: (item[0], item[1]))
+            return list(dict.fromkeys(word_id for _, word_id in rows))[:limit]
+
+        def _char_span_from_sources(
+            *,
+            word_ids: Sequence[str],
+            char_ranges: Sequence[Dict[str, str]],
+        ) -> Tuple[int, int]:
+            starts: List[int] = []
+            ends: List[int] = []
+            for word_id in list(word_ids or []):
+                start_end = word_char_span_map.get(str(word_id).strip())
+                if not start_end:
+                    continue
+                starts.append(int(start_end[0]))
+                # Keep end exclusive for anchor range.
+                ends.append(int(start_end[1]) + 1)
+            if not starts or not ends:
+                for row in list(char_ranges or []):
+                    if not isinstance(row, dict):
+                        continue
+                    start_id = str(row.get("start_char_id") or "").strip()
+                    end_id = str(row.get("end_char_id") or "").strip()
+                    start_ord = char_order_map.get(start_id)
+                    end_ord = char_order_map.get(end_id)
+                    if start_ord is None and end_ord is None:
+                        continue
+                    if start_ord is None:
+                        start_ord = end_ord
+                    if end_ord is None:
+                        end_ord = start_ord
+                    if start_ord is None or end_ord is None:
+                        continue
+                    starts.append(int(min(start_ord, end_ord)))
+                    ends.append(int(max(start_ord, end_ord)) + 1)
+            if not starts or not ends:
+                return 0, 1
+            start_char = min(starts)
+            end_char = max(ends)
+            return start_char, max(start_char + 1, end_char)
+
+        def _build_word_bbox_hint(word_ids: Sequence[str]) -> Optional[Dict[str, Any]]:
+            boxes = []
+            for word_id in list(word_ids or []):
+                row = word_map.get(str(word_id).strip())
+                if not isinstance(row, dict):
+                    continue
+                x0 = self._safe_float(row.get("x0"), 0.0)
+                x1 = self._safe_float(row.get("x1"), 0.0)
+                top = self._safe_float(row.get("top"), 0.0)
+                bottom = self._safe_float(row.get("bottom"), 0.0)
+                if x1 <= x0 or bottom <= top:
+                    continue
+                boxes.append({"x0": x0, "x1": x1, "top": top, "bottom": bottom})
+            if not boxes:
+                return None
+            return {
+                "x0": min(float(item["x0"]) for item in boxes),
+                "x1": max(float(item["x1"]) for item in boxes),
+                "top": min(float(item["top"]) for item in boxes),
+                "bottom": max(float(item["bottom"]) for item in boxes),
+                "page_width": page_width_native if page_width_native > 0 else None,
+                "page_height": page_height_native if page_height_native > 0 else None,
+            }
+
+        def _char_ranges_from_word_ids(
+            word_ids: Sequence[str],
+            *,
+            limit: int = 240,
+        ) -> List[Dict[str, str]]:
+            rows: List[Dict[str, str]] = []
+            seen: set[str] = set()
+            for word_id in list(word_ids or []):
+                row = word_map.get(str(word_id).strip())
+                if not isinstance(row, dict):
+                    continue
+                start_id = str(row.get("start_char_id") or "").strip()
+                end_id = str(row.get("end_char_id") or "").strip()
+                if not start_id or not end_id:
+                    continue
+                key = f"{start_id}:{end_id}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"start_char_id": start_id, "end_char_id": end_id})
+                if len(rows) >= limit:
+                    break
+            return rows
+
+        def _word_ids_from_line_rows(
+            rows: Sequence[Dict[str, Any]],
+            *,
+            limit: int = 480,
+        ) -> List[str]:
+            ordered_word_ids: List[str] = []
+            for row in list(rows or []):
+                if not isinstance(row, dict):
+                    continue
+                words = [item for item in list(row.get("words") or []) if isinstance(item, dict)]
+                if words:
+                    words = sorted(
+                        words,
+                        key=lambda item: (
+                            self._safe_float(item.get("x0"), 0.0),
+                            self._safe_float(item.get("top"), 0.0),
+                            str(item.get("word_id") or item.get("id") or ""),
+                        ),
+                    )
+                    for word in words:
+                        word_id = str(word.get("word_id") or word.get("id") or "").strip()
+                        if not word_id:
+                            continue
+                        ordered_word_ids.append(word_id)
+                for item in list(row.get("word_ids") or [])[:180]:
+                    token = str(item).strip()
+                    if token:
+                        ordered_word_ids.append(token)
+            return list(dict.fromkeys(ordered_word_ids))[:limit]
+
+        def _collect_anchor_sources_from_block_ids(
+            source_block_ids: Sequence[str],
+            *,
+            word_limit: int = 480,
+            char_limit: int = 240,
+        ) -> Tuple[List[str], List[Dict[str, str]]]:
+            word_ids: List[str] = []
+            char_ranges: List[Dict[str, str]] = []
+            seen_char_pairs: set[str] = set()
+            for block_id in list(source_block_ids or []):
+                src_anchor = dict((block_map.get(str(block_id).strip()) or {}).get("source_anchor") or {})
+                for item in list(src_anchor.get("source_word_ids") or [])[:600]:
+                    token = str(item).strip()
+                    if token:
+                        word_ids.append(token)
+                for rng in list(src_anchor.get("source_char_ranges") or [])[:400]:
+                    if not isinstance(rng, dict):
+                        continue
+                    start_id = str(rng.get("start_char_id") or "").strip()
+                    end_id = str(rng.get("end_char_id") or "").strip()
+                    if not start_id or not end_id:
+                        continue
+                    key = f"{start_id}:{end_id}"
+                    if key in seen_char_pairs:
+                        continue
+                    seen_char_pairs.add(key)
+                    char_ranges.append({"start_char_id": start_id, "end_char_id": end_id})
+            word_ids = list(dict.fromkeys(word_ids))[:word_limit]
+            char_ranges = char_ranges[:char_limit]
+            return word_ids, char_ranges
+
+        def _resolve_group_anchor_sources(
+            *,
+            seg_word_ids: Sequence[str],
+            seg_char_ranges: Sequence[Dict[str, str]],
+            source_block_ids: Sequence[str],
+            row_lines: Sequence[Dict[str, Any]],
+        ) -> Tuple[List[str], List[Dict[str, str]]]:
+            row_word_ids = _word_ids_from_line_rows(row_lines)
+            block_word_ids, block_char_ranges = _collect_anchor_sources_from_block_ids(source_block_ids)
+
+            chosen_word_ids: List[str] = []
+            if row_word_ids:
+                chosen_word_ids = list(row_word_ids)
+            elif block_word_ids:
+                chosen_word_ids = list(block_word_ids)
+            elif seg_word_ids:
+                chosen_word_ids = [str(item).strip() for item in list(seg_word_ids or []) if str(item).strip()]
+
+            chosen_word_ids = list(dict.fromkeys(chosen_word_ids))[:480]
+
+            chosen_char_ranges: List[Dict[str, str]] = []
+            if chosen_word_ids:
+                chosen_char_ranges = _char_ranges_from_word_ids(chosen_word_ids)
+            if not chosen_char_ranges and block_char_ranges:
+                chosen_char_ranges = list(block_char_ranges)
+            if not chosen_char_ranges:
+                chosen_char_ranges = [
+                    {
+                        "start_char_id": str(item.get("start_char_id") or "").strip(),
+                        "end_char_id": str(item.get("end_char_id") or "").strip(),
+                    }
+                    for item in list(seg_char_ranges or [])[:240]
+                    if isinstance(item, dict)
+                    and str(item.get("start_char_id") or "").strip()
+                    and str(item.get("end_char_id") or "").strip()
+                ]
+            if not chosen_word_ids and chosen_char_ranges:
+                chosen_word_ids = _word_ids_from_char_ranges(chosen_char_ranges)
+
+            return chosen_word_ids[:480], chosen_char_ranges[:240]
+
+        for idx, seg in enumerate(seg_rows, start=1):
+            if not isinstance(seg, dict):
+                continue
+            seg_id = str(seg.get("segment_id") or f"seg_{idx}").strip() or f"seg_{idx}"
+            block_ids = [
+                self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                for item in list(seg.get("block_ids") or [])[:8]
+                if self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            ]
+            line_ids = [
+                str(item).strip()
+                for item in list(seg.get("line_ids") or [])[:80]
+                if str(item).strip()
+            ]
+            explicit_evidence_line_ids = [
+                str(item).strip()
+                for item in list(seg.get("evidence_line_ids") or [])[:40]
+                if str(item).strip()
+            ]
+            source_word_ids = [
+                str(item).strip()
+                for item in list(seg.get("word_ids") or [])[:400]
+                if str(item).strip()
+            ]
+            source_char_ranges = [
+                {
+                    "start_char_id": str(item.get("start_char_id") or "").strip(),
+                    "end_char_id": str(item.get("end_char_id") or "").strip(),
+                }
+                for item in list(seg.get("char_ranges") or [])[:240]
+                if isinstance(item, dict)
+                and str(item.get("start_char_id") or "").strip()
+                and str(item.get("end_char_id") or "").strip()
+            ]
+            if not source_word_ids and source_char_ranges:
+                source_word_ids = _word_ids_from_char_ranges(source_char_ranges)
+            segment_text_hint = self._normalize_spaces(
+                str(seg.get("resolved_text") or seg.get("text") or "")
+            )
+            evidence_line_ids = list(explicit_evidence_line_ids)
+            if not evidence_line_ids:
+                evidence_line_ids = list(line_ids)
+
+            seg_lines = [line_map[line_id] for line_id in line_ids if line_id in line_map]
+
+            groups: List[Dict[str, Any]] = []
+            if len(block_ids) > 1:
+                # Respect parser block boundaries to avoid merging two source paragraphs.
+                for canonical in block_ids:
+                    src_block = block_map.get(canonical)
+                    src_anchor = dict((src_block or {}).get("source_anchor") or {})
+                    start_raw = src_anchor.get("start_char")
+                    end_raw = src_anchor.get("end_char")
+                    start = self._safe_int(start_raw, -1) if start_raw is not None else -1
+                    end = self._safe_int(end_raw, -1) if end_raw is not None else -1
+                    owned_lines: List[Dict[str, Any]] = []
+                    if start >= 0 and end > start and seg_lines:
+                        for line in seg_lines:
+                            line_start_raw = line.get("start_char")
+                            line_end_raw = line.get("end_char")
+                            line_start = self._safe_int(line_start_raw, -1) if line_start_raw is not None else -1
+                            line_end = self._safe_int(line_end_raw, -1) if line_end_raw is not None else -1
+                            if line_start < 0 or line_end <= line_start:
+                                continue
+                            mid = line_start + ((line_end - line_start) / 2.0)
+                            if float(start) <= mid <= float(end):
+                                owned_lines.append(line)
+                    if owned_lines:
+                        groups.extend(
+                            {
+                                "canonical": canonical,
+                                "source_block_ids": [canonical],
+                                "lines": split_rows,
+                            }
+                            for split_rows in self._split_lines_by_large_vertical_gap(owned_lines)
+                            if split_rows
+                        )
+                    elif src_block:
+                        groups.append(
+                            {
+                                "canonical": canonical,
+                                "source_block_ids": [canonical],
+                                "lines": [],
+                                "fallback_text": self._normalize_spaces(str(src_block.get("text") or "")),
+                                "source_anchor": dict(src_anchor),
+                            }
+                        )
+            else:
+                if seg_lines:
+                    canonical = ""
+                    if block_ids:
+                        canonical = block_ids[0]
+                    elif explicit_evidence_line_ids or source_word_ids or source_char_ranges:
+                        canonical = f"p{int(page)}_seg_{seg_id}"
+                    else:
+                        fb_id = str((fallback_block or {}).get("id") or "b1")
+                        canonical = self._normalize_canonical_block_id(page=page, raw_id=fb_id) or f"p{int(page)}_b1"
+                    groups.extend(
+                        {
+                            "canonical": canonical,
+                            "source_block_ids": list(block_ids),
+                            "lines": split_rows,
+                        }
+                        for split_rows in self._split_lines_by_large_vertical_gap(seg_lines)
+                        if split_rows
+                    )
+                else:
+                    canonical = ""
+                    if block_ids:
+                        canonical = block_ids[0]
+                    elif explicit_evidence_line_ids or source_word_ids or source_char_ranges:
+                        canonical = f"p{int(page)}_seg_{seg_id}"
+                    else:
+                        fb_id = str((fallback_block or {}).get("id") or "b1")
+                        canonical = self._normalize_canonical_block_id(page=page, raw_id=fb_id) or f"p{int(page)}_b1"
+                    fallback_text = ""
+                    if block_ids and block_map.get(block_ids[0]):
+                        fallback_text = self._normalize_spaces(str((block_map.get(block_ids[0]) or {}).get("text") or ""))
+                    elif segment_text_hint:
+                        fallback_text = segment_text_hint
+                    elif fallback_block:
+                        fallback_text = self._normalize_spaces(str((fallback_block or {}).get("text") or ""))
+                    if fallback_text:
+                        groups.append(
+                            {
+                                "canonical": canonical,
+                                "source_block_ids": list(block_ids),
+                                "lines": [],
+                                "fallback_text": fallback_text,
+                                "source_anchor": dict(((fallback_block or {}).get("source_anchor") or {})),
+                            }
+                        )
+
+            for part_idx, group in enumerate(groups, start=1):
+                canonical = str(group.get("canonical") or "").strip() or f"p{int(page)}_seg_{seg_id}_{part_idx}"
+                source_block_ids = [
+                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                    for item in list(group.get("source_block_ids") or [])[:8]
+                    if self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                ]
+                row_lines = list(group.get("lines") or [])
+                kind = _resolve_group_kind(
+                    seg=seg,
+                    source_block_ids=source_block_ids,
+                    row_lines=row_lines,
+                )
+                group_source_word_ids, group_source_char_ranges = _resolve_group_anchor_sources(
+                    seg_word_ids=source_word_ids,
+                    seg_char_ranges=source_char_ranges,
+                    source_block_ids=source_block_ids,
+                    row_lines=row_lines,
+                )
+                line_id_set: List[str] = []
+                evidence_set: List[str] = []
+                if row_lines:
+                    row_lines = sorted(
+                        row_lines,
+                        key=lambda item: (
+                            self._safe_int(item.get("order"), 0),
+                            float(item.get("top") or 0.0),
+                            str(item.get("line_id") or ""),
+                        ),
+                    )
+                    text = self._normalize_spaces(" ".join(str(item.get("text") or "") for item in row_lines))
+                    if not text and segment_text_hint:
+                        text = segment_text_hint
+                    if not text and group_source_word_ids:
+                        text = self._normalize_spaces(
+                            " ".join(
+                                self._normalize_spaces(str((word_map.get(word_id) or {}).get("text") or ""))
+                                for word_id in group_source_word_ids
+                            )
+                        )
+                    start_char = min(self._safe_int(item.get("start_char"), 0) for item in row_lines)
+                    end_char = max(self._safe_int(item.get("end_char"), 0) for item in row_lines)
+                    line_id_set = [str(item.get("line_id") or "").strip() for item in row_lines if str(item.get("line_id") or "").strip()]
+                    evidence_set = [line_id for line_id in evidence_line_ids if line_id in set(line_id_set)] or list(line_id_set)
+                    bbox = self._build_bbox_hint(
+                        style_cues=dict(base_payload.get("style_cues") or {}) if isinstance(base_payload, dict) else {},
+                        quote_text=text,
+                        line_rows=row_lines,
+                    )
+                    source_anchor = {
+                        "page": int(page),
+                        "start_char": int(start_char),
+                        "end_char": int(max(start_char + 1, end_char)),
+                        "quote_text": text[:280] if text else None,
+                        "canonical_block_id": canonical,
+                        "coord_version": "anchor_v2",
+                        "anchor_confidence": 0.9,
+                        "anchor_id": f"{canonical}:{start_char}:{end_char}",
+                        "anchor_v2": {
+                            "coord_version": "anchor_v2",
+                            "canonical_block_id": canonical,
+                            "page": int(page),
+                            "start_char": int(start_char),
+                            "end_char": int(max(start_char + 1, end_char)),
+                        },
+                    }
+                    if isinstance(bbox, dict):
+                        source_anchor["bbox_hint"] = bbox
+                    source_anchor["source_word_ids"] = list(group_source_word_ids)
+                    source_anchor["source_char_ranges"] = list(group_source_char_ranges)
+                    if group_source_word_ids:
+                        word_boxes = []
+                        for word_id in group_source_word_ids:
+                            row = word_map.get(word_id)
+                            if not isinstance(row, dict):
+                                continue
+                            word_boxes.append(
+                                {
+                                    "x0": self._safe_float(row.get("x0"), 0.0),
+                                    "x1": self._safe_float(row.get("x1"), 0.0),
+                                    "top": self._safe_float(row.get("top"), 0.0),
+                                    "bottom": self._safe_float(row.get("bottom"), 0.0),
+                                }
+                            )
+                        geometry = self._build_anchor_geometry(
+                            boxes=word_boxes,
+                            page_width=page_width_native,
+                            page_height=page_height_native,
+                            source="word_union",
+                        )
+                        if isinstance(geometry, dict):
+                            source_anchor["geometry_version"] = "poly_v1"
+                            source_anchor["geometry"] = geometry
+                    elif row_lines:
+                        geometry = self._build_anchor_geometry(
+                            boxes=[
+                                {
+                                    "x0": self._safe_float(item.get("x0"), 0.0),
+                                    "x1": self._safe_float(item.get("x1"), 0.0),
+                                    "top": self._safe_float(item.get("top"), 0.0),
+                                    "bottom": self._safe_float(item.get("bottom"), 0.0),
+                                }
+                                for item in row_lines
+                                if isinstance(item, dict)
+                            ],
+                            page_width=page_width_native,
+                            page_height=page_height_native,
+                            source="line_union",
+                        )
+                        if isinstance(geometry, dict):
+                            source_anchor["geometry_version"] = "poly_v1"
+                            source_anchor["geometry"] = geometry
+                else:
+                    text = self._normalize_spaces(str(group.get("fallback_text") or ""))
+                    if not text and segment_text_hint:
+                        text = segment_text_hint
+                    if not text and group_source_word_ids:
+                        text = self._normalize_spaces(
+                            " ".join(
+                                self._normalize_spaces(str((word_map.get(word_id) or {}).get("text") or ""))
+                                for word_id in group_source_word_ids
+                            )
+                        )
+                    source_anchor = dict(group.get("source_anchor") or {})
+                    span_start, span_end = _char_span_from_sources(
+                        word_ids=group_source_word_ids,
+                        char_ranges=group_source_char_ranges,
+                    )
+                    source_anchor["page"] = int(page)
+                    source_anchor["start_char"] = int(span_start)
+                    source_anchor["end_char"] = int(span_end)
+                    source_anchor["canonical_block_id"] = canonical
+                    source_anchor["coord_version"] = "anchor_v2"
+                    source_anchor["anchor_confidence"] = float(source_anchor.get("anchor_confidence") or 0.86)
+                    source_anchor["anchor_id"] = str(
+                        source_anchor.get("anchor_id")
+                        or f"{canonical}:{source_anchor.get('start_char') or 0}:{source_anchor.get('end_char') or 1}"
+                    )
+                    source_anchor["anchor_v2"] = {
+                        "coord_version": "anchor_v2",
+                        "canonical_block_id": canonical,
+                        "page": int(page),
+                        "start_char": int(span_start),
+                        "end_char": int(span_end),
+                    }
+                    source_anchor["source_word_ids"] = list(group_source_word_ids)
+                    source_anchor["source_char_ranges"] = list(group_source_char_ranges)
+                    line_id_set = list(line_ids)
+                    evidence_set = [line_id for line_id in evidence_line_ids if line_id in set(line_id_set)] or list(line_id_set)
+                    bbox_hint = _build_word_bbox_hint(group_source_word_ids)
+                    if isinstance(bbox_hint, dict):
+                        source_anchor["bbox_hint"] = bbox_hint
+                    if group_source_word_ids:
+                        word_boxes = []
+                        for word_id in group_source_word_ids:
+                            row = word_map.get(word_id)
+                            if not isinstance(row, dict):
+                                continue
+                            word_boxes.append(
+                                {
+                                    "x0": self._safe_float(row.get("x0"), 0.0),
+                                    "x1": self._safe_float(row.get("x1"), 0.0),
+                                    "top": self._safe_float(row.get("top"), 0.0),
+                                    "bottom": self._safe_float(row.get("bottom"), 0.0),
+                                }
+                            )
+                        geometry = self._build_anchor_geometry(
+                            boxes=word_boxes,
+                            page_width=page_width_native,
+                            page_height=page_height_native,
+                            source="word_union",
+                        )
+                        if isinstance(geometry, dict):
+                            source_anchor["geometry_version"] = "poly_v1"
+                            source_anchor["geometry"] = geometry
+
+                if not text:
+                    continue
+                if kind == "heading":
+                    text = self._repair_heading_text(text)
+
+                output.append(
+                    {
+                        "id": canonical,
+                        "kind": kind,
+                        "kind_hint": str(seg.get("kind_hint") or seg.get("kind") or "paragraph"),
+                        "component_hint": str(seg.get("component_hint") or seg.get("ui_component") or ""),
+                        "text": text,
+                        "order": len(output),
+                        "section_title": self._normalize_spaces(str(seg.get("title") or "")) or str((fallback_block or {}).get("section_title") or "Body"),
+                        "source_anchor": source_anchor,
+                        "source_block_ids": source_block_ids,
+                        "source_line_ids": line_id_set,
+                        "evidence_line_ids": evidence_set,
+                        "source_word_ids": group_source_word_ids,
+                        "source_char_ranges": group_source_char_ranges,
+                        "zone_type": "main_body",
+                        "column_id": str((row_lines[0] if row_lines else {}).get("column_label") or "main"),
+                        "heading_prob": 0.92 if kind == "heading" else 0.0,
+                        "layout_confidence": 0.9,
+                    }
+                )
+        return output
+
+    def _build_main_blocks_from_page_structure(
+        self,
+        *,
+        page: int,
+        page_structure: Optional[Dict[str, Any]],
+        base_payload: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Build renderable main blocks directly from AI-structured page blocks.
+        Content source-of-truth is page_structure_v3.block_groups.
+        Parser/line heuristics are not used for text composition here.
+        """
+        structure = dict(page_structure or {})
+        block_groups = [row for row in list(structure.get("block_groups") or []) if isinstance(row, dict)]
+        if not block_groups:
+            return []
+
+        native_extract = dict(((base_payload or {}).get("native_page_extract") or {}))
+        native_words = [row for row in list(native_extract.get("words") or []) if isinstance(row, dict)]
+        word_map: Dict[str, Dict[str, Any]] = {}
+        for row in native_words:
+            word_id = str(row.get("word_id") or "").strip()
+            if word_id:
+                word_map[word_id] = row
+
+        native_chars = [row for row in list(native_extract.get("chars") or []) if isinstance(row, dict)]
+        char_order_map: Dict[str, int] = {}
+        for idx, row in enumerate(native_chars):
+            char_id = str(row.get("char_id") or "").strip()
+            if char_id:
+                char_order_map[char_id] = idx
+
+        word_char_span_map: Dict[str, Tuple[int, int]] = {}
+        for idx, row in enumerate(native_words):
+            word_id = str(row.get("word_id") or "").strip()
+            if not word_id:
+                continue
+            start_id = str(row.get("start_char_id") or "").strip()
+            end_id = str(row.get("end_char_id") or "").strip()
+            start_ord = char_order_map.get(start_id, idx * 2)
+            end_ord = char_order_map.get(end_id, start_ord + 1)
+            if end_ord < start_ord:
+                end_ord = start_ord
+            word_char_span_map[word_id] = (start_ord, end_ord)
+
+        page_meta = dict(native_extract.get("page_meta") or {})
+        style_cues = dict(((base_payload or {}).get("style_cues") or {}))
+        page_width_native = self._safe_float(
+            page_meta.get("page_width"),
+            self._safe_float(style_cues.get("page_width"), 0.0),
+        )
+        page_height_native = self._safe_float(
+            page_meta.get("page_height"),
+            self._safe_float(style_cues.get("page_height"), 0.0),
+        )
+
+        def _kind(token: str) -> str:
+            raw = str(token or "").strip().lower()
+            if raw in {"heading"}:
+                return "heading"
+            if raw in {"list_item", "list"}:
+                return "list_item"
+            if raw in {"caption", "figure_meta", "table_caption"}:
+                return "caption"
+            return "paragraph"
+
+        def _word_ids_from_char_ranges(
+            char_ranges: Sequence[Dict[str, str]],
+            *,
+            limit: int = 600,
+        ) -> List[str]:
+            spans: List[Tuple[int, int]] = []
+            for row in list(char_ranges or []):
+                if not isinstance(row, dict):
+                    continue
+                start_id = str(row.get("start_char_id") or "").strip()
+                end_id = str(row.get("end_char_id") or "").strip()
+                if not start_id or not end_id:
+                    continue
+                start_ord = char_order_map.get(start_id)
+                end_ord = char_order_map.get(end_id)
+                if start_ord is None and end_ord is None:
+                    continue
+                if start_ord is None:
+                    start_ord = end_ord
+                if end_ord is None:
+                    end_ord = start_ord
+                if start_ord is None or end_ord is None:
+                    continue
+                if end_ord < start_ord:
+                    start_ord, end_ord = end_ord, start_ord
+                spans.append((start_ord, end_ord))
+            if not spans:
+                return []
+            rows: List[Tuple[int, str]] = []
+            for word_id, (word_start, word_end) in word_char_span_map.items():
+                for span_start, span_end in spans:
+                    if word_end < span_start or word_start > span_end:
+                        continue
+                    rows.append((word_start, word_id))
+                    break
+            rows = sorted(rows, key=lambda item: (item[0], item[1]))
+            return list(dict.fromkeys(word_id for _, word_id in rows))[:limit]
+
+        def _char_ranges_from_word_ids(
+            word_ids: Sequence[str],
+            *,
+            limit: int = 320,
+        ) -> List[Dict[str, str]]:
+            rows: List[Dict[str, str]] = []
+            seen: set[str] = set()
+            for word_id in list(word_ids or []):
+                row = word_map.get(str(word_id).strip())
+                if not isinstance(row, dict):
+                    continue
+                start_id = str(row.get("start_char_id") or "").strip()
+                end_id = str(row.get("end_char_id") or "").strip()
+                if not start_id or not end_id:
+                    continue
+                key = f"{start_id}:{end_id}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"start_char_id": start_id, "end_char_id": end_id})
+                if len(rows) >= limit:
+                    break
+            return rows
+
+        ordered_groups = sorted(
+            block_groups,
+            key=lambda row: (
+                self._safe_int(row.get("reading_order"), 10**9),
+                str(row.get("block_id") or ""),
+            ),
+        )
+
+        output: List[Dict[str, Any]] = []
+        for idx, group in enumerate(ordered_groups, start=1):
+            zone_type = str(group.get("zone_type") or "").strip().lower()
+            if zone_type in {"side_context", "figure_meta"}:
+                continue
+
+            text = self._normalize_spaces(str(group.get("text") or ""))
+            if not text:
+                continue
+
+            block_id_raw = str(group.get("block_id") or "").strip() or f"v3_{idx}"
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=block_id_raw) or f"p{int(page)}_{block_id_raw}"
+
+            word_ids = [
+                str(item).strip()
+                for item in list(group.get("word_ids") or [])[:800]
+                if str(item).strip() and str(item).strip() in word_map
+            ]
+            word_ids = list(dict.fromkeys(word_ids))
+
+            char_ranges = [
+                {
+                    "start_char_id": str(item.get("start_char_id") or "").strip(),
+                    "end_char_id": str(item.get("end_char_id") or "").strip(),
+                }
+                for item in list(group.get("char_ranges") or [])[:500]
+                if isinstance(item, dict)
+                and str(item.get("start_char_id") or "").strip()
+                and str(item.get("end_char_id") or "").strip()
+            ]
+            if not word_ids and char_ranges:
+                word_ids = _word_ids_from_char_ranges(char_ranges)
+            if word_ids and not char_ranges:
+                char_ranges = _char_ranges_from_word_ids(word_ids)
+
+            start_chars: List[int] = []
+            end_chars: List[int] = []
+            for word_id in word_ids:
+                span = word_char_span_map.get(word_id)
+                if not span:
+                    continue
+                start_chars.append(int(span[0]))
+                end_chars.append(int(span[1]) + 1)
+            if not start_chars or not end_chars:
+                for row in char_ranges:
+                    start_ord = char_order_map.get(str(row.get("start_char_id") or "").strip())
+                    end_ord = char_order_map.get(str(row.get("end_char_id") or "").strip())
+                    if start_ord is None and end_ord is None:
+                        continue
+                    if start_ord is None:
+                        start_ord = end_ord
+                    if end_ord is None:
+                        end_ord = start_ord
+                    if start_ord is None or end_ord is None:
+                        continue
+                    lo, hi = min(int(start_ord), int(end_ord)), max(int(start_ord), int(end_ord)) + 1
+                    start_chars.append(lo)
+                    end_chars.append(hi)
+            start_char = min(start_chars) if start_chars else 0
+            end_char = max(end_chars) if end_chars else max(1, len(text))
+            if end_char <= start_char:
+                end_char = start_char + max(1, len(text))
+
+            bbox_hint = None
+            word_boxes: List[Dict[str, float]] = []
+            for word_id in word_ids:
+                row = word_map.get(word_id)
+                if not isinstance(row, dict):
+                    continue
+                x0 = self._safe_float(row.get("x0"), 0.0)
+                x1 = self._safe_float(row.get("x1"), 0.0)
+                top = self._safe_float(row.get("top"), 0.0)
+                bottom = self._safe_float(row.get("bottom"), 0.0)
+                if x1 <= x0 or bottom <= top:
+                    continue
+                word_boxes.append({"x0": x0, "x1": x1, "top": top, "bottom": bottom})
+            if word_boxes:
+                bbox_hint = {
+                    "x0": min(float(item["x0"]) for item in word_boxes),
+                    "x1": max(float(item["x1"]) for item in word_boxes),
+                    "top": min(float(item["top"]) for item in word_boxes),
+                    "bottom": max(float(item["bottom"]) for item in word_boxes),
+                    "page_width": page_width_native if page_width_native > 0 else None,
+                    "page_height": page_height_native if page_height_native > 0 else None,
+                }
+
+            layout_geo = dict(group.get("layout_bbox_or_polygon") or {})
+            layout_bbox = dict(layout_geo.get("bbox") or {}) if isinstance(layout_geo.get("bbox"), dict) else {}
+            layout_polygon_raw = list(layout_geo.get("polygon") or []) if isinstance(layout_geo.get("polygon"), list) else []
+            layout_polygon = [
+                {
+                    "x": self._safe_float(item.get("x"), 0.0),
+                    "y": self._safe_float(item.get("y"), 0.0),
+                }
+                for item in layout_polygon_raw
+                if isinstance(item, dict)
+            ]
+            if not bbox_hint and layout_bbox:
+                x0 = self._safe_float(layout_bbox.get("x0"), 0.0)
+                x1 = self._safe_float(layout_bbox.get("x1"), 0.0)
+                top = self._safe_float(layout_bbox.get("top"), 0.0)
+                bottom = self._safe_float(layout_bbox.get("bottom"), 0.0)
+                if x1 > x0 and bottom > top:
+                    bbox_hint = {
+                        "x0": x0,
+                        "x1": x1,
+                        "top": top,
+                        "bottom": bottom,
+                        "page_width": page_width_native if page_width_native > 0 else None,
+                        "page_height": page_height_native if page_height_native > 0 else None,
+                    }
+            if not bbox_hint and len(layout_polygon) >= 3:
+                bbox_hint = {
+                    "x0": min(float(item["x"]) for item in layout_polygon),
+                    "x1": max(float(item["x"]) for item in layout_polygon),
+                    "top": min(float(item["y"]) for item in layout_polygon),
+                    "bottom": max(float(item["y"]) for item in layout_polygon),
+                    "page_width": page_width_native if page_width_native > 0 else None,
+                    "page_height": page_height_native if page_height_native > 0 else None,
+                }
+
+            source_anchor: Dict[str, Any] = {
+                "page": int(page),
+                "start_char": int(start_char),
+                "end_char": int(end_char),
+                "quote_text": text[:280] if text else None,
+                "canonical_block_id": canonical,
+                "coord_version": "anchor_v2",
+                "anchor_confidence": max(0.7, min(1.0, self._safe_float(group.get("confidence"), 0.86))),
+                "anchor_id": f"{canonical}:{int(start_char)}:{int(end_char)}",
+                "anchor_v2": {
+                    "coord_version": "anchor_v2",
+                    "canonical_block_id": canonical,
+                    "page": int(page),
+                    "start_char": int(start_char),
+                    "end_char": int(end_char),
+                },
+                "source_word_ids": list(word_ids)[:600],
+                "source_char_ranges": list(char_ranges)[:320],
+            }
+            if isinstance(bbox_hint, dict):
+                source_anchor["bbox_hint"] = bbox_hint
+            if word_boxes:
+                geometry = self._build_anchor_geometry(
+                    boxes=word_boxes,
+                    page_width=page_width_native,
+                    page_height=page_height_native,
+                    source="word_union",
+                )
+                if isinstance(geometry, dict):
+                    source_anchor["geometry_version"] = "poly_v1"
+                    source_anchor["geometry"] = geometry
+            elif len(layout_polygon) >= 3:
+                source_anchor["geometry_version"] = "poly_v1"
+                source_anchor["geometry"] = {
+                    "polygons": [
+                        {
+                            "points": layout_polygon,
+                            "source": "docmind_layout",
+                            "component_id": canonical,
+                        }
+                    ],
+                    "page_width": page_width_native if page_width_native > 0 else None,
+                    "page_height": page_height_native if page_height_native > 0 else None,
+                }
+
+            output.append(
+                {
+                    "id": canonical,
+                    "kind": _kind(str(group.get("kind") or "")),
+                    "kind_hint": str(group.get("kind") or ""),
+                    "component_hint": str(group.get("component_hint") or group.get("ui_component") or ""),
+                    "text": text,
+                    "order": len(output),
+                    "section_title": self._normalize_spaces(str(group.get("title") or "")),
+                    "source_anchor": source_anchor,
+                    "source_block_ids": [canonical],
+                    "source_line_ids": [],
+                    "evidence_line_ids": [],
+                    "source_word_ids": list(word_ids)[:600],
+                    "source_char_ranges": list(char_ranges)[:320],
+                    "zone_type": "main_body",
+                    "column_id": str(group.get("column_id") or "main"),
+                    "heading_prob": 0.92 if _kind(str(group.get("kind") or "")) == "heading" else 0.0,
+                    "layout_confidence": max(0.0, min(1.0, self._safe_float(group.get("confidence"), 0.86))),
+                }
+            )
+        return output
+
+    @staticmethod
+    def _split_lines_by_large_vertical_gap(lines: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        ordered = sorted(
+            [item for item in lines if isinstance(item, dict)],
+            key=lambda item: (
+                LiteratureReaderComposeService._safe_int(item.get("order"), 0),
+                float(item.get("top") or 0.0),
+                str(item.get("line_id") or ""),
+            ),
+        )
+        if not ordered:
+            return []
+        groups: List[List[Dict[str, Any]]] = [[ordered[0]]]
+        for row in ordered[1:]:
+            prev = groups[-1][-1]
+            prev_bottom = float(prev.get("bottom") or 0.0)
+            prev_top = float(prev.get("top") or prev_bottom)
+            prev_height = max(1.0, float(prev.get("height") or max(0.0, prev_bottom - prev_top)))
+            top = float(row.get("top") or 0.0)
+            gap = max(0.0, top - prev_bottom)
+            if gap > max(18.0, prev_height * 1.45):
+                groups.append([row])
+            else:
+                groups[-1].append(row)
+        return groups
+
+    def _build_segmented_anchor_refs(
+        self,
+        *,
+        anchor: Dict[str, Any],
+        page: int,
+        quote_text: str,
+        style_cues: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized = self._normalize_anchor_ref(
+            anchor=anchor,
+            page=page,
+            quote_text=quote_text,
+            source_block_id=str(anchor.get("canonical_block_id") or ""),
+        )
+        if not normalized:
+            return []
+        normalized["anchor_id"] = str(
+            normalized.get("anchor_id")
+            or f"{normalized.get('canonical_block_id') or 'anchor'}:{normalized.get('start_char') or 0}:{normalized.get('end_char') or 1}"
+        )
+        bbox_hint = self._build_bbox_hint(
+            style_cues=dict(style_cues or {}),
+            quote_text=str(normalized.get("quote_text") or quote_text or ""),
+            source_anchor=normalized,
+        )
+        if isinstance(bbox_hint, dict):
+            normalized["bbox_hint"] = bbox_hint
+        geometry = anchor.get("geometry")
+        if isinstance(geometry, dict):
+            normalized["geometry_version"] = str(anchor.get("geometry_version") or "poly_v1")
+            normalized["geometry"] = geometry
+        source_word_ids = [
+            str(item).strip()
+            for item in list(anchor.get("source_word_ids") or [])[:600]
+            if str(item).strip()
+        ]
+        if source_word_ids:
+            normalized["source_word_ids"] = source_word_ids
+        source_char_ranges = [
+            {
+                "start_char_id": str(item.get("start_char_id") or "").strip(),
+                "end_char_id": str(item.get("end_char_id") or "").strip(),
+            }
+            for item in list(anchor.get("source_char_ranges") or [])[:400]
+            if isinstance(item, dict)
+            and str(item.get("start_char_id") or "").strip()
+            and str(item.get("end_char_id") or "").strip()
+        ]
+        if source_char_ranges:
+            normalized["source_char_ranges"] = source_char_ranges
+        normalized["segment_index"] = None
+        normalized["segment_total"] = None
+        return [normalized]
+
+    def _evaluate_anchor_metrics(
+        self,
+        *,
+        ui_plan: Dict[str, Any],
+        base_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        components = self._flatten_components(list(ui_plan.get("components") or []))
+        raw_text = self._normalize_spaces(str(base_payload.get("raw_text") or ""))
+        style_cues = dict(base_payload.get("style_cues") or {})
+        anchors: List[Tuple[Dict[str, Any], str]] = []
+        for node in components:
+            if not isinstance(node, dict):
+                continue
+            node_text = self._normalize_spaces(self._extract_node_text(node))
+            for row in list(node.get("source_anchor_refs") or []):
+                if isinstance(row, dict):
+                    anchors.append((row, node_text))
+        if not anchors:
+            return {"hit_rate": 1.0, "bbox_iou": 1.0, "misjump_rate": 0.0, "gate_passed": True, "total": 0}
+
+        hit_count = 0
+        iou_scores: List[float] = []
+        misjump = 0
+        for anchor, node_text in anchors:
+            quote_text = self._normalize_spaces(str(anchor.get("quote_text") or ""))
+            if not quote_text:
+                quote_text = node_text[:260]
+            hit = False
+            if node_text and quote_text:
+                if quote_text.lower() in node_text.lower() or node_text.lower() in quote_text.lower():
+                    hit = True
+                else:
+                    hit = self._token_overlap_ratio(quote_text, node_text) >= 0.45
+            if not hit and raw_text and quote_text:
+                hit = quote_text.lower() in raw_text.lower()
+            if hit:
+                hit_count += 1
+            else:
+                misjump += 1
+
+            predicted_bbox = self._build_bbox_hint(
+                style_cues=style_cues,
+                quote_text=quote_text or node_text,
+                source_anchor=anchor,
+            )
+            given_bbox = dict(anchor.get("bbox_hint") or {})
+            if isinstance(predicted_bbox, dict) and isinstance(given_bbox, dict) and given_bbox:
+                iou_scores.append(self._bbox_iou(predicted_bbox, given_bbox))
+
+        total = len(anchors)
+        hit_rate = hit_count / max(1, total)
+        misjump_rate = misjump / max(1, total)
+        bbox_iou = sum(iou_scores) / len(iou_scores) if iou_scores else 1.0
+        gate_passed = bool(
+            hit_rate >= float(getattr(settings, "reader_anchor_eval_min_hit_rate", 0.8) or 0.8)
+            and bbox_iou >= float(getattr(settings, "reader_anchor_eval_min_iou", 0.25) or 0.25)
+            and misjump_rate <= float(getattr(settings, "reader_anchor_eval_max_misjump", 0.2) or 0.2)
+        )
+        return {
+            "hit_rate": round(max(0.0, min(1.0, hit_rate)), 4),
+            "bbox_iou": round(max(0.0, min(1.0, bbox_iou)), 4),
+            "misjump_rate": round(max(0.0, min(1.0, misjump_rate)), 4),
+            "gate_passed": gate_passed,
+            "total": int(total),
+        }
+
+    def _apply_node_level_anchor_gate(
+        self,
+        *,
+        ui_plan: Dict[str, Any],
+        base_payload: Dict[str, Any],
+        page: int,
+    ) -> Dict[str, Any]:
+        cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
+        components = list(cloned.get("components") or [])
+        allowed_canonical = self._build_allowed_canonical_block_ids(base_payload=base_payload, page=page)
+        min_conf = float(getattr(settings, "reader_anchor_min_confidence", 0.78) or 0.78)
+
+        total_nodes = 0
+        blocked_nodes = 0
+
+        for node in self._flatten_components(components):
+            if not isinstance(node, dict):
+                continue
+            refs = list(node.get("source_anchor_refs") or [])
+            if not refs:
+                continue
+            total_nodes += 1
+            normalized_rows: List[Dict[str, Any]] = []
+            source_block_id = str((node.get("props") or {}).get("source_block_id") or "")
+            for row in refs:
+                if not isinstance(row, dict):
+                    continue
+                if self._safe_int(row.get("end_char"), 0) <= self._safe_int(row.get("start_char"), 0):
+                    continue
+                normalized = self._normalize_anchor_ref(
+                    anchor=row,
+                    page=page,
+                    quote_text=str(row.get("quote_text") or ""),
+                    source_block_id=source_block_id,
+                )
+                if not normalized:
+                    continue
+                canonical = str(normalized.get("canonical_block_id") or "")
+                if allowed_canonical and canonical and canonical not in allowed_canonical:
+                    continue
+                if float(normalized.get("anchor_confidence") or 0.0) < min_conf:
+                    continue
+                if normalized.get("segment_index") is not None or normalized.get("segment_total") is not None:
+                    continue
+                normalized_rows.append(normalized)
+
+            props = node.get("props") if isinstance(node.get("props"), dict) else {}
+            if normalized_rows:
+                node["source_anchor_refs"] = normalized_rows
+                props["node_gate_passed"] = True
+            else:
+                node["source_anchor_refs"] = []
+                props["node_gate_passed"] = False
+                blocked_nodes += 1
+                actions = [
+                    item for item in list(node.get("actions") or [])
+                    if str((item or {}).get("key") or "").strip().lower() != "jump_anchor"
+                ]
+                node["actions"] = actions
+                caps = [
+                    item for item in list(node.get("capabilities") or [])
+                    if str(item).strip().lower() != "jump_anchor"
+                ]
+                node["capabilities"] = caps
+            node["props"] = props
+
+        cloned["components"] = components
+        report = {
+            "total_nodes": int(total_nodes),
+            "blocked_nodes": int(blocked_nodes),
+            "passed_nodes": int(max(0, total_nodes - blocked_nodes)),
+            "pass_rate": round((max(0, total_nodes - blocked_nodes) / max(1, total_nodes)), 4) if total_nodes else 1.0,
+        }
+        return {"ui_plan": cloned, "node_gate_report": report}
+
+    @staticmethod
+    def _bbox_iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        ax0, ax1 = float(a.get("x0") or 0.0), float(a.get("x1") or 0.0)
+        ay0, ay1 = float(a.get("top") or 0.0), float(a.get("bottom") or 0.0)
+        bx0, bx1 = float(b.get("x0") or 0.0), float(b.get("x1") or 0.0)
+        by0, by1 = float(b.get("top") or 0.0), float(b.get("bottom") or 0.0)
+        inter_w = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+        inter_h = max(0.0, min(ay1, by1) - max(ay0, by0))
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+        area_a = max(1e-6, (ax1 - ax0) * (ay1 - ay0))
+        area_b = max(1e-6, (bx1 - bx0) * (by1 - by0))
+        union = area_a + area_b - inter_area
+        if union <= 1e-6:
+            return 0.0
+        return max(0.0, min(1.0, inter_area / union))
+
+    @staticmethod
+    def _token_overlap_ratio(a: str, b: str) -> float:
+        a_tokens = [item for item in str(a or "").lower().split(" ") if item]
+        b_tokens = [item for item in str(b or "").lower().split(" ") if item]
+        if not a_tokens or not b_tokens:
+            return 0.0
+        inter = len(set(a_tokens) & set(b_tokens))
+        return inter / max(1, min(len(a_tokens), len(b_tokens)))
+
+    def _build_allowed_canonical_block_ids(self, *, base_payload: Dict[str, Any], page: int) -> set[str]:
+        allowed: set[str] = set()
+        for row in list(base_payload.get("blocks") or []):
+            if not isinstance(row, dict):
+                continue
+            block_id = str(row.get("id") or "").strip()
+            canonical = str(((row.get("source_anchor") or {}).get("canonical_block_id") or "")).strip()
+            normalized = self._normalize_canonical_block_id(page=page, raw_id=canonical or block_id)
+            if normalized:
+                allowed.add(normalized)
+        segment_map = dict(base_payload.get("segment_map") or {})
+        for row in list(segment_map.get("segments") or []):
+            if not isinstance(row, dict):
+                continue
+            segment_id = str(row.get("segment_id") or "").strip()
+            if segment_id:
+                allowed.add(f"p{int(page)}_seg_{segment_id}")
+        return allowed
+
+    @staticmethod
+    def _normalize_canonical_block_id(*, page: int, raw_id: str) -> str:
+        token = str(raw_id or "").strip()
+        if not token:
+            return ""
+        if token.startswith(f"p{int(page)}_"):
+            return token
+        if re.match(r"^p\d+_", token):
+            return token
+        return f"p{int(page)}_{token}"
 
     @staticmethod
     def _build_caption_insight(caption: str) -> str:
@@ -2571,11 +5328,23 @@ class LiteratureReaderComposeService:
             return []
         return candidates
 
-    def _sanitize_ui_plan_anchors(self, ui_plan: Dict[str, Any], *, page: int) -> Dict[str, Any]:
-        """统一修复组件树的字段与锚点，降低 schema 校验错误率。"""
+    def _sanitize_ui_plan_anchors(
+        self,
+        ui_plan: Dict[str, Any],
+        *,
+        page: int,
+        base_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Normalize component tree anchors and keep actionable refs only."""
         cloned = json.loads(json.dumps(ui_plan, ensure_ascii=False))
         seen_ids: set[str] = set()
         auto_seq = 0
+        allowed_canonical = (
+            self._build_allowed_canonical_block_ids(base_payload=base_payload or {}, page=page)
+            if isinstance(base_payload, dict)
+            else set()
+        )
+        min_conf = float(getattr(settings, "reader_anchor_min_confidence", 0.78) or 0.78)
 
         def _next_id(node_type: str) -> str:
             nonlocal auto_seq
@@ -2615,17 +5384,52 @@ class LiteratureReaderComposeService:
                 anchors = node.get("source_anchor_refs")
                 if isinstance(anchors, list):
                     normalized_rows: List[Dict[str, Any]] = []
+                    source_block_id = str((node.get("props") or {}).get("source_block_id") or "")
                     for row in anchors:
-                        # 锚点规范化阶段只保留必要字段，其它扩展字段按白名单透传。
+                        if not isinstance(row, dict):
+                            continue
+                        if self._safe_int(row.get("end_char"), 0) <= self._safe_int(row.get("start_char"), 0):
+                            continue
                         normalized = self._normalize_anchor_ref(
                             anchor=row,
                             page=page,
-                            quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                            quote_text=str(row.get("quote_text") or ""),
+                            source_block_id=source_block_id,
                         )
                         if normalized:
-                            bbox_hint = (row or {}).get("bbox_hint") if isinstance(row, dict) else None
+                            canonical = str(normalized.get("canonical_block_id") or "")
+                            if allowed_canonical and canonical and canonical not in allowed_canonical:
+                                continue
+                            if float(normalized.get("anchor_confidence") or 0.0) < min_conf:
+                                continue
+                            if normalized.get("segment_index") is not None or normalized.get("segment_total") is not None:
+                                continue
+                            bbox_hint = row.get("bbox_hint")
                             if isinstance(bbox_hint, dict):
                                 normalized["bbox_hint"] = bbox_hint
+                            geometry = row.get("geometry")
+                            if isinstance(geometry, dict):
+                                normalized["geometry_version"] = str(row.get("geometry_version") or "poly_v1")
+                                normalized["geometry"] = geometry
+                            source_word_ids = [
+                                str(item).strip()
+                                for item in list(row.get("source_word_ids") or [])[:600]
+                                if str(item).strip()
+                            ]
+                            if source_word_ids:
+                                normalized["source_word_ids"] = source_word_ids
+                            source_char_ranges = [
+                                {
+                                    "start_char_id": str(item.get("start_char_id") or "").strip(),
+                                    "end_char_id": str(item.get("end_char_id") or "").strip(),
+                                }
+                                for item in list(row.get("source_char_ranges") or [])[:400]
+                                if isinstance(item, dict)
+                                and str(item.get("start_char_id") or "").strip()
+                                and str(item.get("end_char_id") or "").strip()
+                            ]
+                            if source_char_ranges:
+                                normalized["source_char_ranges"] = source_char_ranges
                             normalized_rows.append(normalized)
                     node["source_anchor_refs"] = normalized_rows
                 else:
@@ -2634,6 +5438,21 @@ class LiteratureReaderComposeService:
                 _walk(node.get("children"))
 
         _walk(cloned.get("components"))
+        polygon_anchor_count = 0
+        for node in self._flatten_components(list(cloned.get("components") or [])):
+            if not isinstance(node, dict):
+                continue
+            for row in list(node.get("source_anchor_refs") or []):
+                if not isinstance(row, dict):
+                    continue
+                geometry = row.get("geometry")
+                polygons = list((geometry or {}).get("polygons") or []) if isinstance(geometry, dict) else []
+                if polygons:
+                    polygon_anchor_count += 1
+        trace_meta = dict(cloned.get("trace_meta") or {})
+        trace_meta["evidence_geometry_mode"] = "polygon" if polygon_anchor_count > 0 else "bbox_fallback"
+        trace_meta["polygon_component_count"] = int(polygon_anchor_count)
+        cloned["trace_meta"] = trace_meta
         return cloned
 
     def _normalize_anchor_ref(
@@ -2642,15 +5461,16 @@ class LiteratureReaderComposeService:
         anchor: Any,
         page: int,
         quote_text: str = "",
+        source_block_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(anchor, dict):
             return None
         # composed 按页构建，锚点页号强制与当前页一致，避免跨页锚点污染评分与定位。
-        page_no = int(page)
-        start_char = int(anchor.get("start_char") or 0)
+        page_no = self._safe_int(page, 1)
+        start_char = self._safe_int(anchor.get("start_char"), 0)
         if start_char < 0:
             start_char = 0
-        end_char = int(anchor.get("end_char") or 0)
+        end_char = self._safe_int(anchor.get("end_char"), 0)
         normalized_quote = self._normalize_spaces(str(quote_text or anchor.get("quote_text") or ""))
         # 当 end_char 无效时，用 quote 长度推断一个保守跨度，尽量保证证据可定位。
         fallback_span = max(1, min(3200, len(normalized_quote) or 120))
@@ -2659,12 +5479,87 @@ class LiteratureReaderComposeService:
         # 限制跨度上限，避免“整页高亮”影响证据可读性与信任感。
         if end_char - start_char > 12000:
             end_char = start_char + 12000
+        canonical_raw = str(
+            anchor.get("canonical_block_id")
+            or ((anchor.get("anchor_v2") or {}).get("canonical_block_id")
+            or source_block_id)
+        ).strip()
+        canonical_block_id = self._normalize_canonical_block_id(page=page_no, raw_id=canonical_raw)
+        coord_version = str(anchor.get("coord_version") or ((anchor.get("anchor_v2") or {}).get("coord_version") or "anchor_v2"))
+        if coord_version != "anchor_v2":
+            coord_version = "anchor_v2"
+        try:
+            confidence = float(anchor.get("anchor_confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        if confidence <= 0:
+            confidence = 0.86 if canonical_block_id else 0.72
+        anchor_id = str(anchor.get("anchor_id") or f"{canonical_block_id or 'anchor'}:{start_char}:{end_char}")
+        bbox_hint = anchor.get("bbox_hint") if isinstance(anchor.get("bbox_hint"), dict) else None
+        geometry = anchor.get("geometry") if isinstance(anchor.get("geometry"), dict) else None
+        source_word_ids = [
+            str(item).strip()
+            for item in list(anchor.get("source_word_ids") or [])[:600]
+            if str(item).strip()
+        ]
+        source_char_ranges = [
+            {
+                "start_char_id": str(item.get("start_char_id") or "").strip(),
+                "end_char_id": str(item.get("end_char_id") or "").strip(),
+            }
+            for item in list(anchor.get("source_char_ranges") or [])[:400]
+            if isinstance(item, dict)
+            and str(item.get("start_char_id") or "").strip()
+            and str(item.get("end_char_id") or "").strip()
+        ]
         return {
             "page": page_no,
             "start_char": start_char,
             "end_char": end_char,
             "quote_text": normalized_quote[:280] if normalized_quote else None,
+            "canonical_block_id": canonical_block_id or None,
+            "coord_version": coord_version,
+            "anchor_confidence": max(0.0, min(1.0, confidence)),
+            "anchor_id": anchor_id,
+            "segment_index": anchor.get("segment_index"),
+            "segment_total": anchor.get("segment_total"),
+            "bbox_hint": bbox_hint,
+            "geometry_version": str(anchor.get("geometry_version") or "poly_v1") if isinstance(geometry, dict) else None,
+            "geometry": geometry,
+            "source_word_ids": source_word_ids,
+            "source_char_ranges": source_char_ranges,
+            "anchor_v2": {
+                "coord_version": "anchor_v2",
+                "canonical_block_id": canonical_block_id or None,
+                "page": page_no,
+                "start_char": start_char,
+                "end_char": end_char,
+            },
         }
+
+    @staticmethod
+    def _layout_plan_v2_enabled_for_paper(paper_id: int) -> bool:
+        _ = int(paper_id)  # keep signature stable for callers and logs
+        return bool(getattr(settings, "reader_layout_plan_v2_enabled", False))
+
+    @staticmethod
+    def _collect_valid_block_ids(*, page: int, blocks: Sequence[Dict[str, Any]]) -> List[str]:
+        output: List[str] = []
+        seen: set[str] = set()
+        for row in blocks:
+            if not isinstance(row, dict):
+                continue
+            block_id = str(row.get("id") or "").strip()
+            if not block_id:
+                continue
+            canonical = str(((row.get("source_anchor") or {}).get("canonical_block_id") or "")).strip()
+            if not canonical:
+                canonical = block_id if block_id.startswith(f"p{int(page)}_") else f"p{int(page)}_{block_id}"
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            output.append(canonical)
+        return output
 
     def _ensure_layout_channels(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """补齐三通道字段，保证后续渲染链路稳定。"""
@@ -2708,6 +5603,24 @@ class LiteratureReaderComposeService:
         if "toc_hidden" not in cloned:
             cloned["toc_hidden"] = bool(float(cloned.get("toc_quality") or 0.0) < 0.55)
         return cloned
+
+    def _dedupe_main_blocks(self, blocks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        seen_paragraph_keys: set[str] = set()
+        for row in blocks:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            kind = str(item.get("kind") or "")
+            if kind == "paragraph":
+                text = self._normalize_spaces(str(item.get("text") or ""))
+                text_key = re.sub(r"\s+", " ", text.lower()).strip()
+                if text_key and text_key in seen_paragraph_keys:
+                    continue
+                if text_key:
+                    seen_paragraph_keys.add(text_key)
+            output.append(item)
+        return output
 
     def _normalize_blocks_for_render(
         self,
@@ -2761,6 +5674,157 @@ class LiteratureReaderComposeService:
                         break
                     text = self._normalize_spaces(f"{text} {nxt_text}")
                     current["text"] = text
+                    current_anchor = dict(current.get("source_anchor") or {})
+                    next_anchor = dict(nxt.get("source_anchor") or {})
+                    if current_anchor or next_anchor:
+                        anchor_page = self._safe_int(
+                            current_anchor.get("page")
+                            or next_anchor.get("page")
+                            or page,
+                            self._safe_int(page, 1),
+                        )
+                        start_values: List[int] = []
+                        end_values: List[int] = []
+                        for raw in (current_anchor.get("start_char"), next_anchor.get("start_char")):
+                            try:
+                                start_values.append(int(raw))
+                            except Exception:
+                                continue
+                        for raw in (current_anchor.get("end_char"), next_anchor.get("end_char")):
+                            try:
+                                end_values.append(int(raw))
+                            except Exception:
+                                continue
+                        anchor_start = min(start_values) if start_values else 0
+                        anchor_end = max(end_values) if end_values else max(anchor_start + 1, len(text))
+                        if anchor_end <= anchor_start:
+                            anchor_end = anchor_start + max(1, len(text))
+
+                        canonical_raw = str(
+                            current_anchor.get("canonical_block_id")
+                            or ((current_anchor.get("anchor_v2") or {}).get("canonical_block_id") or "")
+                            or next_anchor.get("canonical_block_id")
+                            or ((next_anchor.get("anchor_v2") or {}).get("canonical_block_id") or "")
+                        )
+                        canonical_block_id = self._normalize_canonical_block_id(page=anchor_page, raw_id=canonical_raw)
+                        if not canonical_block_id:
+                            fallback_id = str(current.get("id") or "")
+                            canonical_block_id = (
+                                self._normalize_canonical_block_id(page=anchor_page, raw_id=fallback_id)
+                                or f"p{int(anchor_page)}_b1"
+                            )
+
+                        try:
+                            confidence = max(
+                                float(current_anchor.get("anchor_confidence") or 0.0),
+                                float(next_anchor.get("anchor_confidence") or 0.0),
+                            )
+                        except Exception:
+                            confidence = 0.0
+                        confidence = max(0.86, min(1.0, confidence or 0.86))
+
+                        merged_bbox: Optional[Dict[str, Any]] = None
+                        left_bbox = current_anchor.get("bbox_hint")
+                        right_bbox = next_anchor.get("bbox_hint")
+                        if isinstance(left_bbox, dict) and isinstance(right_bbox, dict):
+                            try:
+                                lx0 = float(left_bbox.get("x0") or 0.0)
+                                lx1 = float(left_bbox.get("x1") or 0.0)
+                                ltop = float(left_bbox.get("top") or 0.0)
+                                lbottom = float(left_bbox.get("bottom") or 0.0)
+                                rx0 = float(right_bbox.get("x0") or 0.0)
+                                rx1 = float(right_bbox.get("x1") or 0.0)
+                                rtop = float(right_bbox.get("top") or 0.0)
+                                rbottom = float(right_bbox.get("bottom") or 0.0)
+                                merged_bbox = {
+                                    "x0": min(lx0, rx0),
+                                    "x1": max(lx1, rx1),
+                                    "top": min(ltop, rtop),
+                                    "bottom": max(lbottom, rbottom),
+                                    "page_width": left_bbox.get("page_width") or right_bbox.get("page_width"),
+                                    "page_height": left_bbox.get("page_height") or right_bbox.get("page_height"),
+                                }
+                            except Exception:
+                                merged_bbox = None
+                        elif isinstance(left_bbox, dict):
+                            merged_bbox = dict(left_bbox)
+                        elif isinstance(right_bbox, dict):
+                            merged_bbox = dict(right_bbox)
+
+                        merged_anchor: Dict[str, Any] = dict(current_anchor or next_anchor)
+                        merged_anchor["page"] = anchor_page
+                        merged_anchor["start_char"] = int(anchor_start)
+                        merged_anchor["end_char"] = int(anchor_end)
+                        merged_anchor["quote_text"] = text[:280]
+                        merged_anchor["canonical_block_id"] = canonical_block_id
+                        merged_anchor["coord_version"] = "anchor_v2"
+                        merged_anchor["anchor_confidence"] = confidence
+                        merged_anchor["anchor_id"] = f"{canonical_block_id}:{anchor_start}:{anchor_end}"
+                        merged_anchor["anchor_v2"] = {
+                            "coord_version": "anchor_v2",
+                            "canonical_block_id": canonical_block_id,
+                            "page": int(anchor_page),
+                            "start_char": int(anchor_start),
+                            "end_char": int(anchor_end),
+                        }
+
+                        merged_source_word_ids = [
+                            str(item).strip()
+                            for item in (
+                                list(current_anchor.get("source_word_ids") or [])
+                                + list(next_anchor.get("source_word_ids") or [])
+                            )
+                            if str(item).strip()
+                        ]
+                        merged_source_word_ids = list(dict.fromkeys(merged_source_word_ids))[:600]
+                        if merged_source_word_ids:
+                            merged_anchor["source_word_ids"] = merged_source_word_ids
+
+                        merged_source_char_ranges = [
+                            {
+                                "start_char_id": str(item.get("start_char_id") or "").strip(),
+                                "end_char_id": str(item.get("end_char_id") or "").strip(),
+                            }
+                            for item in (
+                                list(current_anchor.get("source_char_ranges") or [])
+                                + list(next_anchor.get("source_char_ranges") or [])
+                            )
+                            if isinstance(item, dict)
+                            and str(item.get("start_char_id") or "").strip()
+                            and str(item.get("end_char_id") or "").strip()
+                        ]
+                        if merged_source_char_ranges:
+                            dedup_ranges: List[Dict[str, str]] = []
+                            seen_ranges: set[str] = set()
+                            for item in merged_source_char_ranges:
+                                key = f"{item['start_char_id']}:{item['end_char_id']}"
+                                if key in seen_ranges:
+                                    continue
+                                seen_ranges.add(key)
+                                dedup_ranges.append(item)
+                            merged_anchor["source_char_ranges"] = dedup_ranges[:400]
+
+                        left_geometry = current_anchor.get("geometry")
+                        right_geometry = next_anchor.get("geometry")
+                        left_polygons = list((left_geometry or {}).get("polygons") or []) if isinstance(left_geometry, dict) else []
+                        right_polygons = list((right_geometry or {}).get("polygons") or []) if isinstance(right_geometry, dict) else []
+                        merged_polygons = [item for item in left_polygons + right_polygons if isinstance(item, dict)]
+                        if merged_polygons:
+                            merged_anchor["geometry_version"] = "poly_v1"
+                            merged_anchor["geometry"] = {
+                                "polygons": merged_polygons,
+                                "page_width": (
+                                    ((left_geometry or {}).get("page_width") if isinstance(left_geometry, dict) else None)
+                                    or ((right_geometry or {}).get("page_width") if isinstance(right_geometry, dict) else None)
+                                ),
+                                "page_height": (
+                                    ((left_geometry or {}).get("page_height") if isinstance(left_geometry, dict) else None)
+                                    or ((right_geometry or {}).get("page_height") if isinstance(right_geometry, dict) else None)
+                                ),
+                            }
+                        if isinstance(merged_bbox, dict):
+                            merged_anchor["bbox_hint"] = merged_bbox
+                        current["source_anchor"] = merged_anchor
                     idx += 1
             merged.append(current)
             idx += 1

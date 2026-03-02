@@ -994,12 +994,48 @@ export interface ReaderComponentBBoxHint {
   page_height?: number | null
 }
 
+export interface ReaderAnchorPolygonPoint {
+  x: number
+  y: number
+}
+
+export interface ReaderAnchorPolygon {
+  points: ReaderAnchorPolygonPoint[]
+  source?: string | null
+  component_id?: string | null
+}
+
+export interface ReaderAnchorGeometry {
+  polygons: ReaderAnchorPolygon[]
+  page_width?: number | null
+  page_height?: number | null
+}
+
+export interface ReaderComponentAnchorV2 {
+  coord_version: 'anchor_v2' | string
+  canonical_block_id: string
+  page: number
+  start_char: number
+  end_char: number
+}
+
 export interface ReaderComponentSourceAnchor {
   page: number
   start_char: number
   end_char: number
   quote_text?: string | null
+  anchor_id?: string | null
+  segment_index?: number | null
+  segment_total?: number | null
   bbox_hint?: ReaderComponentBBoxHint | null
+  canonical_block_id?: string | null
+  coord_version?: 'anchor_v2' | string | null
+  anchor_confidence?: number | null
+  anchor_v2?: ReaderComponentAnchorV2 | null
+  geometry_version?: 'poly_v1' | string | null
+  geometry?: ReaderAnchorGeometry | null
+  source_word_ids?: string[]
+  source_char_ranges?: Array<{ start_char_id: string; end_char_id: string }>
 }
 
 export interface ReaderComponentAction {
@@ -1054,6 +1090,7 @@ export interface ReaderComposeQualityReport {
   evidence_alignment: number
   layout_consistency: number
   cross_column_merge_ratio?: number
+  duplicate_ratio?: number
   sidebar_recall?: number
   toc_quality?: number
   hard_constraints_passed: boolean
@@ -1063,6 +1100,12 @@ export interface ReaderComposeQualityReport {
   mm_assist_used?: boolean
   mm_model?: string
   mm_fallback_used?: boolean
+  anchor_coverage_ratio?: number
+  evidence_image_ready?: number
+  anchor_quote_hit_rate?: number
+  anchor_bbox_iou?: number
+  anchor_misjump_rate?: number
+  anchor_gate_passed?: boolean
   validation_errors: string[]
   quality_target: number
   iterations: number
@@ -1080,6 +1123,50 @@ export interface ReaderUIPlan {
   layout: Record<string, unknown>
   style_tokens: Record<string, unknown>
   trace_meta: Record<string, unknown>
+  ui_ops?: ReaderComponentPatchOp[]
+  agent_trace?: Array<Record<string, unknown>>
+  agent_tool_calls?: Array<Record<string, unknown>>
+}
+
+export interface ReaderComponentPatchOp {
+  op: 'insert_component' | 'update_component_props' | 'remove_component' | 'reorder_components' | string
+  reason?: string
+  ordered_component_ids?: string[]
+  component_id?: string
+  props_patch?: Record<string, unknown>
+  after_component_id?: string | null
+  component?: ReaderComponentNode
+}
+
+export interface SegmentPlan {
+  segment_id: string
+  kind: string
+  ui_component: string
+  component_hint?: string | null
+  kind_hint?: string | null
+  confidence?: number | null
+  block_ids: string[]
+  line_ids?: string[]
+  evidence_line_ids?: string[]
+  title?: string | null
+  continuation?: string | null
+  reason?: string | null
+}
+
+export interface LayoutPlanV2 {
+  zones?: Array<Record<string, unknown>>
+  headings?: Array<Record<string, unknown>>
+  continuation?: Record<string, unknown>
+  segments?: SegmentPlan[]
+  ui_suggestions?: Array<Record<string, unknown>>
+  notes?: string[]
+}
+
+export interface NodeGateReport {
+  total_nodes?: number
+  blocked_nodes?: number
+  passed_nodes?: number
+  rows?: Array<Record<string, unknown>>
 }
 
 export interface ReaderComposeAsset {
@@ -1104,6 +1191,16 @@ export interface ReaderComposePayload {
   asset_policy: Record<string, unknown>
   layout_channels?: Record<string, string[]>
   mm_assist_meta?: Record<string, unknown>
+  parser_chain_meta?: Record<string, unknown>
+  page_structure_v3?: Record<string, unknown>
+  qwen_layout_plan_v2?: LayoutPlanV2 | null
+  layout_advice_v3?: Record<string, unknown>
+  qwen_plan_meta?: Record<string, unknown>
+  assembly_meta?: Record<string, unknown>
+  component_registry_version?: string
+  segment_map?: Record<string, unknown>
+  segment_map_meta?: Record<string, unknown>
+  node_gate_report?: NodeGateReport | null
   toc_quality?: number
   generated_at: string
   cache_hit?: boolean
@@ -1154,6 +1251,21 @@ export interface ReaderComposeStreamEventMap {
     phase?: 'skeleton' | 'semantic' | 'enhance' | string
     patch_type?: 'node_replace' | 'node_insert' | 'node_update' | string
   }
+  component_patch: {
+    iteration: number
+    seq?: number
+    source?: 'agent' | string
+    ui_ops: ReaderComponentPatchOp[]
+  }
+  agent_trace: {
+    iteration: number
+    trace: Array<Record<string, unknown>>
+    tool_calls?: Array<Record<string, unknown>>
+  }
+  component_error: {
+    message: string
+    errors?: string[]
+  }
   assets: {
     assets: ReaderComposeAsset[]
   }
@@ -1170,6 +1282,10 @@ export interface ReaderComposeStreamEventMap {
     cache_meta?: Record<string, unknown>
     iteration_stats?: Record<string, unknown>
     overlay_meta?: Record<string, unknown>
+    qwen_plan_meta?: Record<string, unknown>
+    parser_chain_meta?: Record<string, unknown>
+    segment_stats?: Record<string, unknown>
+    node_gate_stats?: Record<string, unknown>
   }
   error: {
     message: string
@@ -1218,6 +1334,9 @@ export interface ReaderInlineQuerySource {
   start_char: number
   end_char: number
   quote_text?: string | null
+  canonical_block_id?: string | null
+  coord_version?: 'anchor_v2' | string | null
+  anchor_confidence?: number | null
 }
 
 export interface ReaderInlineQueryEventMap {

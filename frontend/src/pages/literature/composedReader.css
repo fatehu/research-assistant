@@ -67,6 +67,11 @@
   background: var(--reader-card-bg) !important;
 }
 
+.reader-composed-surface .ant-btn-primary,
+.reader-composed-preview .ant-btn-primary {
+  color: #ffffff !important;
+}
+
 .reader-composed-surface .ant-btn-link,
 .reader-composed-preview .ant-btn-link {
   background: transparent !important;
@@ -84,6 +89,28 @@
 .reader-composed-popover .ant-popover-inner-content,
 .reader-composed-popover .ant-typography {
   color: var(--reader-text) !important;
+}
+
+.reader-composed-surface .ant-select .ant-select-selector,
+.reader-composed-preview .ant-select .ant-select-selector,
+.reader-composed-surface .ant-input,
+.reader-composed-surface .ant-input-affix-wrapper,
+.reader-composed-preview .ant-input,
+.reader-composed-preview .ant-input-affix-wrapper {
+  color: var(--reader-text) !important;
+  border-color: var(--reader-card-border) !important;
+  background: var(--reader-card-bg) !important;
+}
+
+.reader-composed-surface .ant-select-arrow,
+.reader-composed-preview .ant-select-arrow {
+  color: var(--reader-text) !important;
+}
+
+.reader-composed-surface .ant-tag,
+.reader-composed-preview .ant-tag {
+  color: var(--reader-text) !important;
+  border-color: var(--reader-card-border) !important;
 }
 
 .reader-composed-surface .ant-empty-description,
