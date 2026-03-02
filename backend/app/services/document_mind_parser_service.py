@@ -10,6 +10,7 @@ This adapter is optional and must fail-open:
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 import time
@@ -293,8 +294,6 @@ class DocumentMindParserService:
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         if not self._enabled_for_paper(paper_id=paper_id):
             return None, {"used": False, "reason": "disabled_or_not_allowlisted"}
-        if not self._is_http_url(file_url):
-            return None, {"used": False, "reason": "invalid_or_missing_file_url"}
         client = self._build_client()
         if client is None:
             return None, {"used": False, "reason": "client_unavailable"}
@@ -333,6 +332,8 @@ class DocumentMindParserService:
             merged["fallback_reason"] = str((meta or {}).get("reason") or "")
             return None, merged
 
+        if not self._is_http_url(file_url):
+            return None, {"used": False, "reason": "invalid_or_missing_file_url"}
         return await self._run_doc_parser_job(
             client=client,
             page=page,
@@ -340,6 +341,26 @@ class DocumentMindParserService:
             file_name=file_name,
             option=option,
         )
+
+    @staticmethod
+    def _build_single_page_pdf_bytes(*, pdf_path: Path, page: int) -> Optional[bytes]:
+        """Extract one page into an in-memory PDF stream for page-scoped DocStructure parsing."""
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except Exception:
+            return None
+        try:
+            reader = PdfReader(str(pdf_path))
+            page_index = max(0, int(page) - 1)
+            if page_index >= len(reader.pages):
+                return None
+            writer = PdfWriter()
+            writer.add_page(reader.pages[page_index])
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+        except Exception:
+            return None
 
     async def _run_doc_parser_job(
         self,
@@ -467,10 +488,24 @@ class DocumentMindParserService:
             submit_req.file_name_extension = suffix
 
         runtime = util_models.RuntimeOptions()
+        page_pdf_bytes = await asyncio.to_thread(
+            self._build_single_page_pdf_bytes,
+            pdf_path=local_path,
+            page=int(page),
+        )
+        if not isinstance(page_pdf_bytes, (bytes, bytearray)) or len(page_pdf_bytes) <= 0:
+            return None, {
+                "used": False,
+                "reason": "single_page_pdf_extract_failed",
+                "page": int(page),
+            }
+        file_stream = io.BytesIO(bytes(page_pdf_bytes))
+        submit_req.file_name = f"{Path(submit_req.file_name).stem}_p{int(page)}.pdf"[:200]
+        submit_req.file_name_extension = "pdf"
+        upload_scope = "single_page_pdf_stream"
         try:
-            with local_path.open("rb") as f:
-                submit_req.file_url_object = f
-                submit_resp = await asyncio.to_thread(client.submit_doc_structure_job_advance, submit_req, runtime)
+            submit_req.file_url_object = file_stream
+            submit_resp = await asyncio.to_thread(client.submit_doc_structure_job_advance, submit_req, runtime)
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[DocMind] submit doc structure job failed: {exc}")
             return None, {"used": False, "reason": "submit_doc_structure_failed"}
@@ -522,6 +557,7 @@ class DocumentMindParserService:
                     "status": "success",
                     "option": "docStructure",
                     "api": "doc_structure",
+                    "upload_scope": upload_scope,
                 }
 
             if code and code not in processing_codes:
