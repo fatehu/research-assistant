@@ -244,6 +244,30 @@ class Settings(BaseSettings):
     reader_layout_plan_v2_enabled: bool = True
     # Deprecated: layout plan v2 now applies globally when enabled.
     reader_layout_plan_v2_allowlist: str = ""
+    # Unified reader pipeline mode switch.
+    reader_pipeline_mode: Literal["legacy", "single_agent_v2"] = "legacy"
+    # Optional allowlist for gradual rollout. Empty means all papers/pages for current mode.
+    reader_pipeline_allowlist_papers: str = ""
+    reader_pipeline_allowlist_pages: str = ""
+    # Reader simplified 4-step pipeline switch (DocMind truth -> Stage1 semantic -> Stage2 design -> DeepSeek assembly).
+    # Deprecated. Kept for one release as compatibility fallback to reader_pipeline_mode.
+    reader_simplified_pipeline_enabled: bool = False
+    # Optional allowlist for gradual rollout. Empty means all papers/pages when enabled.
+    # Deprecated. Use reader_pipeline_allowlist_*.
+    reader_simplified_allowlist_papers: str = ""
+    reader_simplified_allowlist_pages: str = ""
+    # Cache/payload version isolation token for simplified pipeline.
+    reader_pipeline_version: str = "simplified_v2"
+    # Single-agent V2 runtime contract
+    reader_agent_model: str = "qwen-3.5-plus"
+    reader_agent_timeout_ms: int = 90000
+    reader_agent_max_tokens: int = 7000
+    reader_agent_max_steps: int = 12
+    reader_agent_max_repair_rounds: int = 2
+    # Optional startup cleanup for legacy compose cache keys.
+    reader_cache_cleanup_on_startup: bool = False
+    reader_cache_cleanup_timeout_seconds: int = 120
+    reader_cache_cleanup_scan_count: int = 200
     # Enable parser-v2 contract (doc_nav_tree + block_groups + word/char anchoring).
     reader_page_structure_v2_enabled: bool = True
     # Enable polygon-first evidence geometry; fallback to bbox when unavailable.
@@ -252,7 +276,9 @@ class Settings(BaseSettings):
     reader_compose_layout_llm_prompt_version: str = "compose_layout_llm_v1"
     reader_compose_layout_llm_max_blocks: int = 80
     # Compose end-to-end latency budget in milliseconds.
-    reader_compose_latency_budget_ms: int = 20000
+    reader_compose_latency_budget_ms: int = 600000
+    # Hard ceiling for compose latency budget to avoid unbounded runs.
+    reader_compose_latency_budget_max_ms: int = 600000
     # Reader compose agent runtime (component stream / tool-calling)
     reader_agent_component_stream_enabled: bool = True
     reader_agent_tools_enabled: bool = True

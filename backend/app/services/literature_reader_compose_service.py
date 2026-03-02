@@ -1,10 +1,8 @@
 """
 Composed literature reader service.
 
-目标：
-- 在现有结构化抽取基础上，生成受控组件树（UI-DSL）
-- 引入质量评分与迭代修订（ReAct 风格）
-- 复用共享缓存（Redis + DB）
+This service builds and validates composed reader UI payloads.
+It orchestrates layout planning, quality checks, and fallback strategies.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from loguru import logger
+from openai import AsyncOpenAI
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +32,21 @@ from app.services.llm_service import get_llm_service
 from app.services.reader_component_contract_service import get_reader_component_contract_service
 from app.services.reader_compose_agent_runtime import get_reader_compose_agent_runtime
 from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
+from app.services.reader_single_agent_controller import (
+    ReaderSingleAgentController,
+    parse_json_dict_from_model_text,
+)
+from app.services.reader_single_agent_validator import ReaderSingleAgentValidator
+from app.services.render_pipeline_contract import (
+    CanonicalAtomBundle,
+    LayoutDigestBundle,
+    RenderPipelineContractError,
+    build_canonical_atom_bundle,
+    build_deterministic_baseline_slots,
+    build_docmind_layout_digest,
+    enforce_minimal_gates,
+    materialize_stage2_plan,
+)
 from app.services.status_event_bus import build_status_channel_for_user, publish_status_event
 
 try:
@@ -46,11 +60,18 @@ COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v1"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
 COMPOSE_LAYOUT_SCHEMA_VERSION = "layout_schema_v2"
+SIMPLIFIED_PIPELINE_VERSION_DEFAULT = "simplified_v2"
+PIPELINE_MODE_LEGACY = "legacy"
+PIPELINE_MODE_SINGLE_AGENT_V2 = "single_agent_v2"
 
 DEFAULT_QUALITY_TARGET = 0.86
+MAX_LATENCY_BUDGET_MS = max(
+    1200,
+    int(getattr(settings, "reader_compose_latency_budget_max_ms", 600000) or 600000),
+)
 DEFAULT_LATENCY_BUDGET_MS = max(
     1200,
-    min(int(getattr(settings, "reader_compose_latency_budget_ms", 20000) or 20000), 25000),
+    min(int(getattr(settings, "reader_compose_latency_budget_ms", 20000) or 20000), MAX_LATENCY_BUDGET_MS),
 )
 DEFAULT_MAX_ITERATIONS = max(6, int(getattr(settings, "literature_agent_max_iterations", 14) or 14))
 LOW_CONFIDENCE_MAX_ITERATIONS = min(24, max(DEFAULT_MAX_ITERATIONS + 4, 12))
@@ -61,6 +82,8 @@ LOCK_WAIT_SECONDS = 6.0
 LOCK_POLL_INTERVAL_SECONDS = 0.22
 REDIS_KEY_PREFIX = "lit:reader:compose:v1"
 REDIS_LOCK_PREFIX = "lit:reader:compose:lock:v1"
+CLEANUP_LOCK_KEY = "lit:reader:compose:cleanup:lock"
+LEGACY_CACHE_SCAN_MATCH = "lit:reader:compose*:*"
 
 COMPONENT_WHITELIST = {
     "PaperHeaderCard",
@@ -101,6 +124,29 @@ _GENERIC_HEADING_MARKERS = {
     "plos digital health",
 }
 
+SIMPLIFIED_ALLOWED_COMPONENTS: List[str] = [
+    "SectionHeading",
+    "ParagraphProse",
+    "ListBlock",
+    "ContextRail",
+    "FigurePanel",
+    "TablePanel",
+    "KeyTakeaways",
+    "AnswerCard",
+    "CitationLinks",
+    "InlineQuerySlot",
+]
+
+INLINE_QUERY_SUPPORTED_NODE_TYPES = {
+    "ParagraphProse",
+    "SectionHeading",
+    "ListBlock",
+    "FigurePanel",
+    "TablePanel",
+    "KeyTakeaways",
+    "InlineQuerySlot",
+}
+
 
 @dataclass
 class ReaderComposeBuildMeta:
@@ -122,6 +168,12 @@ class LiteratureReaderComposeService:
         self._mm_layout_service = ReaderMultimodalLayoutService()
         self._component_contract_service = get_reader_component_contract_service()
         self._compose_agent_runtime = get_reader_compose_agent_runtime()
+        self._single_agent_validator = ReaderSingleAgentValidator()
+        self._single_agent_controller = ReaderSingleAgentController(
+            validator=self._single_agent_validator,
+            max_steps=max(1, int(getattr(settings, "reader_agent_max_steps", 12) or 12)),
+            max_repair_rounds=max(0, int(getattr(settings, "reader_agent_max_repair_rounds", 2) or 2)),
+        )
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -136,6 +188,70 @@ class LiteratureReaderComposeService:
             return float(value)
         except Exception:
             return float(default)
+
+    def _pipeline_version(self) -> str:
+        token = str(getattr(settings, "reader_pipeline_version", SIMPLIFIED_PIPELINE_VERSION_DEFAULT) or "").strip()
+        return token or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
+
+    def _pipeline_mode(self) -> str:
+        explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_LEGACY) or "").strip().lower()
+        raw_mode_env = str(os.getenv("READER_PIPELINE_MODE", "") or "").strip().lower()
+        valid_modes = {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}
+
+        # If explicit mode is configured, honor it first.
+        if raw_mode_env:
+            if explicit in valid_modes:
+                return explicit
+            logger.warning(
+                f"[ReaderComposeService] invalid READER_PIPELINE_MODE='{raw_mode_env}', "
+                f"fallback to compatibility switch."
+            )
+
+        # Support tests/runtime overrides that set settings directly.
+        if explicit == PIPELINE_MODE_SINGLE_AGENT_V2:
+            return PIPELINE_MODE_SINGLE_AGENT_V2
+
+        # Backward compatibility for one release: map old boolean switch.
+        legacy_flag = bool(getattr(settings, "reader_simplified_pipeline_enabled", False))
+        if legacy_flag:
+            logger.warning(
+                "[ReaderComposeService] reader_simplified_pipeline_enabled is deprecated; "
+                "use reader_pipeline_mode=single_agent_v2"
+            )
+            return PIPELINE_MODE_SINGLE_AGENT_V2
+        return PIPELINE_MODE_LEGACY
+
+    @staticmethod
+    def _parse_int_allowlist(raw: str) -> set[int]:
+        values: set[int] = set()
+        text = str(raw or "").strip()
+        if not text:
+            return values
+        for part in text.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if token.isdigit():
+                values.add(int(token))
+        return values
+
+    def _is_single_agent_v2_enabled(self, *, paper_id: int, page: int) -> bool:
+        if self._pipeline_mode() != PIPELINE_MODE_SINGLE_AGENT_V2:
+            return False
+        paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_papers", "") or ""))
+        page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_pages", "") or ""))
+
+        # Backward compatibility with deprecated allowlists.
+        if not paper_allow:
+            paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_papers", "") or ""))
+        if not page_allow:
+            page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_pages", "") or ""))
+
+        if paper_allow and int(paper_id) not in paper_allow:
+            return False
+        if page_allow and int(page) not in page_allow:
+            return False
+        return True
 
     async def build_or_get_composed_payload(
         self,
@@ -159,6 +275,8 @@ class LiteratureReaderComposeService:
     ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
         page_num = max(1, int(page))
         force_refresh = bool(force_refresh or regenerate)
+        pipeline_mode = self._pipeline_mode()
+        pipeline_version = self._pipeline_version()
         latency_budget = self._normalize_latency_budget(latency_budget_ms)
         quality_goal = self._normalize_quality_target(quality_target)
         normalized_theme = self._normalize_theme_mode(theme_mode)
@@ -180,8 +298,21 @@ class LiteratureReaderComposeService:
             max_iterations=normalized_max_iterations,
         )
         sig_hash = self._signature_hash(source_signature)
-        redis_key = self._cache_key(paper_id=int(paper.id), page=page_num, sig_hash=sig_hash)
-        lock_key = self._lock_key(paper_id=int(paper.id), page=page_num)
+        redis_key = self._cache_key(
+            user_id=int(user_id),
+            paper_id=int(paper.id),
+            page=page_num,
+            sig_hash=sig_hash,
+            pipeline_mode=pipeline_mode,
+            pipeline_version=pipeline_version,
+        )
+        lock_key = self._lock_key(
+            user_id=int(user_id),
+            paper_id=int(paper.id),
+            page=page_num,
+            pipeline_mode=pipeline_mode,
+            pipeline_version=pipeline_version,
+        )
 
         if not force_refresh:
             cached_payload = await self._read_payload_from_redis(redis_key)
@@ -195,6 +326,7 @@ class LiteratureReaderComposeService:
                     source_signature=source_signature,
                     payload=payload,
                 )
+                payload = self._ensure_payload_contract(page=page_num, payload=payload)
                 quality_report = payload.get("quality_report") or {}
                 return payload, ReaderComposeBuildMeta(
                     cache_hit=True,
@@ -224,6 +356,7 @@ class LiteratureReaderComposeService:
                     source_signature=source_signature,
                     payload=payload,
                 )
+                payload = self._ensure_payload_contract(page=page_num, payload=payload)
                 quality_report = payload.get("quality_report") or {}
                 return payload, ReaderComposeBuildMeta(
                     cache_hit=True,
@@ -239,9 +372,14 @@ class LiteratureReaderComposeService:
         lock_token = await self._acquire_lock(lock_key)
         if lock_token is None:
             waited = 0.0
-            while waited < LOCK_WAIT_SECONDS:
+            while waited < LOCK_WAIT_SECONDS and lock_token is None:
                 await asyncio.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 waited += LOCK_POLL_INTERVAL_SECONDS
+                lock_token = await self._acquire_lock(lock_key)
+                if lock_token is not None:
+                    break
+                if force_refresh:
+                    continue
                 cached_payload = await self._read_payload_from_redis(redis_key)
                 if isinstance(cached_payload, dict):
                     payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
@@ -253,6 +391,7 @@ class LiteratureReaderComposeService:
                         source_signature=source_signature,
                         payload=payload,
                     )
+                    payload = self._ensure_payload_contract(page=page_num, payload=payload)
                     quality_report = payload.get("quality_report") or {}
                     return payload, ReaderComposeBuildMeta(
                         cache_hit=True,
@@ -264,6 +403,42 @@ class LiteratureReaderComposeService:
                         degraded=bool(quality_report.get("degraded")),
                         stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
                     )
+
+            if lock_token is None and force_refresh:
+                fallback_payload = await self._build_force_refresh_timeout_fallback_payload(
+                    db=db,
+                    user_id=int(user_id),
+                    paper=paper,
+                    page=page_num,
+                    selected_kb_id=selected_kb_id,
+                    style_intent=style_intent,
+                    theme_mode=normalized_theme,
+                    detail_level=normalized_detail,
+                    compare_mode=use_compare_mode,
+                    source_signature=source_signature,
+                    pipeline_version=pipeline_version,
+                )
+                fallback_payload = self._with_cache_meta(fallback_payload, cache_hit=False, cache_layer="none")
+                fallback_payload = await self._apply_overlay_for_user(
+                    db=db,
+                    user_id=int(user_id),
+                    paper_id=int(paper.id),
+                    page=page_num,
+                    source_signature=source_signature,
+                    payload=fallback_payload,
+                )
+                fallback_payload = self._ensure_payload_contract(page=page_num, payload=fallback_payload)
+                quality_report = fallback_payload.get("quality_report") or {}
+                return fallback_payload, ReaderComposeBuildMeta(
+                    cache_hit=False,
+                    cache_layer="none",
+                    build_mode=str(fallback_payload.get("build_mode") or "compose_agent_simplified"),
+                    source_signature=source_signature,
+                    source_sig_hash=sig_hash,
+                    iterations=int(quality_report.get("iterations") or 0),
+                    degraded=True,
+                    stop_reason="force_refresh_lock_timeout",
+                )
 
         try:
             base_payload, _ = await self._reader_service.build_or_get_page_payload(
@@ -277,44 +452,85 @@ class LiteratureReaderComposeService:
                 prefer_agent=bool(regenerate),
                 publish_ready_event_enabled=False,
             )
-            base_payload = await self._apply_multimodal_layout_assist(
-                paper=paper,
+            simplified_enabled = self._is_single_agent_v2_enabled(
+                paper_id=int(paper.id),
                 page=page_num,
-                base_payload=base_payload,
             )
-            # 关键要点改为由 LLM 基于“上一页+当前页+下一页”联合概括，避免仅靠截断文本。
-            takeaways = await self._build_takeaways_with_neighbor_context(
-                db=db,
-                user_id=int(user_id),
-                paper=paper,
-                page=page_num,
-                selected_kb_id=selected_kb_id,
-                current_payload=base_payload,
-                detail_level=normalized_detail,
-            )
-            if takeaways:
-                base_payload = dict(base_payload)
-                base_payload["takeaways"] = takeaways
+            if simplified_enabled:
+                try:
+                    simplified_result = await self._build_single_agent_v2_result(
+                        db=db,
+                        user_id=int(user_id),
+                        paper=paper,
+                        page=page_num,
+                        base_payload=base_payload,
+                        style_intent=style_intent,
+                        theme_mode=normalized_theme,
+                        detail_level=normalized_detail,
+                        compare_mode=use_compare_mode,
+                        latency_budget_ms=latency_budget,
+                        selected_kb_id=selected_kb_id,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "[ReaderComposeService] single_agent_v2 controller failed; "
+                        "fallback to deterministic simplified baseline "
+                        f"paper={paper.id} page={page_num}: {exc}"
+                    )
+                    simplified_result = await self._build_simplified_pipeline_result_legacy(
+                        db=db,
+                        user_id=int(user_id),
+                        paper=paper,
+                        page=page_num,
+                        base_payload=base_payload,
+                        style_intent=style_intent,
+                        theme_mode=normalized_theme,
+                        detail_level=normalized_detail,
+                        compare_mode=use_compare_mode,
+                        latency_budget_ms=latency_budget,
+                        selected_kb_id=selected_kb_id,
+                    )
+                base_payload = dict(simplified_result.get("base_payload") or base_payload)
+                loop_result = dict(simplified_result.get("loop_result") or {})
+                assets = list(simplified_result.get("assets") or [])
+            else:
+                base_payload = await self._apply_multimodal_layout_assist(
+                    paper=paper,
+                    page=page_num,
+                    base_payload=base_payload,
+                )
+                takeaways = await self._build_takeaways_with_neighbor_context(
+                    db=db,
+                    user_id=int(user_id),
+                    paper=paper,
+                    page=page_num,
+                    selected_kb_id=selected_kb_id,
+                    current_payload=base_payload,
+                    detail_level=normalized_detail,
+                )
+                if takeaways:
+                    base_payload = dict(base_payload)
+                    base_payload["takeaways"] = takeaways
 
-            loop_result = await self.run_react_compose_loop(
-                paper=paper,
-                page=page_num,
-                base_payload=base_payload,
-                style_intent=style_intent,
-                theme_mode=normalized_theme,
-                detail_level=normalized_detail,
-                compare_mode=use_compare_mode,
-                quality_target=quality_goal,
-                latency_budget_ms=latency_budget,
-                max_iterations=normalized_max_iterations,
-            )
-            assets = await self.collect_assets_with_policy(
-                paper=paper,
-                page=page_num,
-                base_payload=base_payload,
-                ui_plan=loop_result.get("ui_plan") or {},
-                citation_tldr=use_citation_tldr,
-            )
+                loop_result = await self.run_react_compose_loop(
+                    paper=paper,
+                    page=page_num,
+                    base_payload=base_payload,
+                    style_intent=style_intent,
+                    theme_mode=normalized_theme,
+                    detail_level=normalized_detail,
+                    compare_mode=use_compare_mode,
+                    quality_target=quality_goal,
+                    latency_budget_ms=latency_budget,
+                    max_iterations=normalized_max_iterations,
+                )
+                assets = await self.collect_assets_with_policy(
+                    paper=paper,
+                    page=page_num,
+                    base_payload=base_payload,
+                    ui_plan=loop_result.get("ui_plan") or {},
+                    citation_tldr=use_citation_tldr,
+                )
 
             quality_report = dict(loop_result.get("quality_report") or {})
             quality_report["iterations"] = int(loop_result.get("iterations") or 0)
@@ -322,10 +538,28 @@ class LiteratureReaderComposeService:
             quality_report["stop_reason"] = str(loop_result.get("stop_reason") or "unknown")
             quality_report["quality_target"] = quality_goal
             quality_report["latency_budget_ms"] = latency_budget
+            validation_report = self._build_validation_report(
+                quality_report=quality_report,
+                minimal_gate_report=dict(base_payload.get("minimal_gate_report") or {}),
+            )
+            main_block_ids, aux_block_ids = self._partition_main_aux_block_ids(
+                page=page_num,
+                base_payload=base_payload,
+                ui_plan=dict(loop_result.get("ui_plan") or {}),
+            )
+            status_value = "done" if bool(validation_report.get("passed")) else "fallback"
+            degraded_reason = ""
+            if status_value != "done":
+                degraded_reason = str(quality_report.get("stop_reason") or "validator_non_converged").strip()
+                if not degraded_reason or degraded_reason == "unknown":
+                    degraded_reason = "validator_non_converged"
 
             payload: Dict[str, Any] = {
                 "paper_id": int(paper.id),
                 "page": page_num,
+                "status": status_value,
+                "degraded_reason": degraded_reason,
+                "pipeline_version": pipeline_version,
                 "engine_version": COMPOSE_ENGINE_VERSION,
                 "source_signature": source_signature,
                 "build_mode": str(loop_result.get("build_mode") or "compose_agent"),
@@ -333,6 +567,9 @@ class LiteratureReaderComposeService:
                 "assets": assets,
                 "quality_report": quality_report,
                 "iteration_trace": list(loop_result.get("iteration_trace") or []),
+                "main_block_ids": main_block_ids,
+                "aux_block_ids": aux_block_ids,
+                "validation_report": validation_report,
                 "asset_policy": {
                     "pdf_first": True,
                     "web_fallback": bool(getattr(settings, "reader_external_image_enabled", False)),
@@ -345,6 +582,17 @@ class LiteratureReaderComposeService:
                 "docmind_meta": dict(base_payload.get("docmind_meta") or {}),
                 "docmind_structure": dict(base_payload.get("docmind_structure") or {}),
                 "page_structure_v3": dict(base_payload.get("page_structure_v3") or {}),
+                "canonical_atoms": dict(base_payload.get("canonical_atoms") or {}),
+                "atom_semantics": dict(base_payload.get("atom_semantics") or {}),
+                "deterministic_page_skeleton": dict(base_payload.get("deterministic_page_skeleton") or {}),
+                "stage2_style_plan": dict(base_payload.get("stage2_style_plan") or {}),
+                "minimal_gate_report": dict(base_payload.get("minimal_gate_report") or {}),
+                "candidate_ranking": dict(base_payload.get("candidate_ranking") or {}),
+                "repair_report": dict(base_payload.get("repair_report") or {}),
+                "segment_id_map": dict(base_payload.get("segment_id_map") or {}),
+                "stage1_structural_annotations": dict(base_payload.get("stage1_structural_annotations") or {}),
+                "stage2_design_layout": dict(base_payload.get("stage2_design_layout") or {}),
+                "pipeline_contract_meta": dict(base_payload.get("pipeline_contract_meta") or {}),
                 "qwen_layout_plan_v2": dict(base_payload.get("qwen_layout_plan_v2") or {}),
                 "qwen_plan_meta": dict(base_payload.get("qwen_plan_meta") or {}),
                 "layout_advice_v2": dict(base_payload.get("layout_advice_v2") or {}),
@@ -369,6 +617,7 @@ class LiteratureReaderComposeService:
                 "generated_at": datetime.utcnow().isoformat(),
             }
 
+            payload = self._ensure_payload_contract(page=page_num, payload=payload)
             await self._upsert_payload_to_db(
                 db=db,
                 paper_id=int(paper.id),
@@ -400,6 +649,7 @@ class LiteratureReaderComposeService:
                 source_signature=source_signature,
                 payload=payload,
             )
+            payload = self._ensure_payload_contract(page=page_num, payload=payload)
             return payload, ReaderComposeBuildMeta(
                 cache_hit=False,
                 cache_layer="none",
@@ -413,6 +663,1104 @@ class LiteratureReaderComposeService:
         finally:
             if lock_token is not None:
                 await self._release_lock(lock_key, lock_token)
+
+    async def _build_simplified_pipeline_result(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        latency_budget_ms: int,
+        selected_kb_id: Optional[int],
+    ) -> Dict[str, Any]:
+        return await self._build_single_agent_v2_result(
+            db=db,
+            user_id=user_id,
+            paper=paper,
+            page=page,
+            base_payload=base_payload,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            latency_budget_ms=latency_budget_ms,
+            selected_kb_id=selected_kb_id,
+        )
+
+    async def _build_single_agent_v2_result(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        latency_budget_ms: int,
+        selected_kb_id: Optional[int],
+    ) -> Dict[str, Any]:
+        started_at = time.perf_counter()
+        payload = dict(base_payload or {})
+        docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
+            page=page,
+            base_payload=payload,
+        )
+        if not docmind_blocks:
+            raise RenderPipelineContractError(
+                code="DOCMIND_LAYOUT_DIGEST_EMPTY",
+                stage="docmind",
+                message="single_agent_v2 requires docmind layout blocks",
+                details={"paper_id": int(paper.id), "page": int(page)},
+            )
+
+        rendered_page_image = ""
+        pdf_path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+            user_id=int(paper.user_id),
+            paper_id=int(paper.id),
+            paper_title=paper.title,
+            paper_pdf_path=paper.pdf_path,
+        )
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                mm_payload = await self._mm_layout_service.build_mm_prompt_payload(
+                    pdf_path=pdf_path,
+                    page=int(page),
+                    base_payload=payload,
+                ) or {}
+                rendered_page_image = str(mm_payload.get("image_data_url") or "")
+            except Exception as exc:
+                logger.warning(
+                    f"[ReaderComposeService] build_mm_prompt_payload failed for single_agent_v2 "
+                    f"paper={paper.id} page={page}: {exc}"
+                )
+
+        page_meta = {
+            "paper_id": int(paper.id),
+            "page": int(page),
+            "pipeline_version": self._pipeline_version(),
+            "style_intent": str(style_intent or ""),
+            "theme_mode": str(theme_mode or ""),
+            "detail_level": str(detail_level or ""),
+            "compare_mode": bool(compare_mode),
+            "selected_kb_id": int(selected_kb_id) if selected_kb_id is not None else None,
+        }
+
+        async def _model_infer(system_prompt: str, user_prompt: Dict[str, Any], step: int, phase: str) -> Dict[str, Any]:
+            return await self._invoke_single_agent_model(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                rendered_page_image=rendered_page_image,
+                step=step,
+                phase=phase,
+            )
+
+        controller_result = await self._single_agent_controller.run(
+            page_meta=page_meta,
+            docmind_blocks=docmind_blocks,
+            rendered_page_image=rendered_page_image,
+            component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
+            model_infer=_model_infer,
+        )
+        step_result = dict(controller_result.get("step_result") or {})
+        validation_report = dict(controller_result.get("validation_report") or {})
+        repair_report = dict(controller_result.get("repair_report") or {})
+        status_value = str(controller_result.get("status") or "fallback").strip().lower()
+        degraded_reason = str(controller_result.get("degraded_reason") or "").strip()
+
+        ui_plan = self._step_result_to_ui_plan(
+            page=page,
+            step_result=step_result,
+            docmind_blocks=docmind_blocks,
+            layout_to_block_ids=layout_to_block_ids,
+            base_payload=payload,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+        )
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        failed_gates = [
+            gate_name
+            for gate_name, gate in dict(validation_report.get("gates") or {}).items()
+            if not bool((gate or {}).get("passed"))
+        ]
+        step_metrics = [
+            row
+            for row in list(repair_report.get("step_metrics") or [])
+            if isinstance(row, dict)
+        ]
+        total_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in step_metrics)
+        total_completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in step_metrics)
+        total_tokens = sum(int(row.get("total_tokens") or 0) for row in step_metrics)
+
+        payload["repair_report"] = {
+            **repair_report,
+            "failed_gates": failed_gates,
+        }
+        payload["qwen_plan_meta"] = {
+            "used": True,
+            "reason": "single_agent_v2",
+            "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+            "steps_executed": int(repair_report.get("steps_executed") or len(step_metrics)),
+            "prompt_tokens": int(total_prompt_tokens),
+            "completion_tokens": int(total_completion_tokens),
+            "total_tokens": int(total_tokens),
+            "pipeline_version": self._pipeline_version(),
+        }
+        payload["layout_advice_v3"] = {
+            "source": "single_agent_v2",
+            "ordered_block_ids": [
+                str(item.get("layout_id") or "")
+                for item in list((step_result.get("classification") or {}).get("items") or [])
+                if isinstance(item, dict) and str(item.get("layout_id") or "")
+            ],
+            "suggested_components": [
+                {
+                    "block_ids": [
+                        str(item).strip()
+                        for item in list((row or {}).get("source_block_ids") or [])
+                        if str(item).strip()
+                    ],
+                    "component": str((row or {}).get("component") or ""),
+                    "reason": "single_agent_v2",
+                }
+                for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
+                if isinstance(row, dict)
+            ],
+            "grouping_hints": [],
+            "visual_hints": [],
+            "notes": [
+                f"status={status_value}",
+                f"degraded_reason={degraded_reason}" if degraded_reason else "",
+            ],
+        }
+        payload["minimal_gate_report"] = {
+            "passed": bool(validation_report.get("passed")),
+            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
+            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
+            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
+            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
+            "non_empty_plan_for_non_empty_input": bool(
+                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
+            ),
+            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
+            "used_atom_count": len(
+                [
+                    item
+                    for item in list((step_result.get("classification") or {}).get("items") or [])
+                    if isinstance(item, dict) and str(item.get("layout_id") or "").strip()
+                ]
+            ),
+            "usable_atom_count": len(docmind_blocks),
+        }
+        payload["pipeline_contract_meta"] = {
+            **dict(payload.get("pipeline_contract_meta") or {}),
+            "used": True,
+            "pipeline": "single_agent_v2",
+            "elapsed_ms": elapsed_ms,
+            "validation_report": validation_report,
+        }
+
+        quality_report = {
+            "overall": 0.94 if status_value == "done" else 0.66,
+            "hard_constraints_passed": bool(validation_report.get("passed")),
+            "validation_errors": list(validation_report.get("errors") or []),
+            "quality_target": 0.0,
+            "elapsed_ms": elapsed_ms,
+            "iterations": int(repair_report.get("steps_executed") or len(step_metrics) or 1),
+            "degraded": status_value != "done",
+            "stop_reason": degraded_reason or ("single_agent_v2_done" if status_value == "done" else "validator_non_converged"),
+            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
+            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
+            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
+            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
+            "non_empty_plan_for_non_empty_input": bool(
+                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
+            ),
+            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
+            "pipeline_latency_ms": elapsed_ms,
+            "prompt_tokens": int(total_prompt_tokens),
+            "completion_tokens": int(total_completion_tokens),
+            "total_tokens": int(total_tokens),
+        }
+
+        loop_result = {
+            "ui_plan": ui_plan,
+            "quality_report": quality_report,
+            "node_gate_report": {},
+            "iteration_trace": [
+                {
+                    "iteration": int(row.get("step_index") or idx + 1),
+                    "ui_plan": ui_plan,
+                    "quality_report": quality_report,
+                    "phase": str(row.get("phase") or ""),
+                    "latency_ms": int(row.get("latency_ms") or 0),
+                    "failed_gates": list(row.get("failed_gates") or []),
+                }
+                for idx, row in enumerate(step_metrics)
+            ],
+            "iterations": int(repair_report.get("steps_executed") or len(step_metrics) or 1),
+            "degraded": status_value != "done",
+            "stop_reason": degraded_reason or ("single_agent_v2_done" if status_value == "done" else "validator_non_converged"),
+            "build_mode": "compose_agent_single_agent_v2",
+        }
+        assets = [
+            row
+            for row in list(payload.get("assets") or [])
+            if isinstance(row, dict) and str(row.get("kind") or "") in {"link", "annotation", "image_hint"}
+        ]
+        return {
+            "base_payload": payload,
+            "loop_result": loop_result,
+            "assets": assets,
+        }
+
+    async def _invoke_single_agent_model(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: Dict[str, Any],
+        rendered_page_image: str,
+        step: int,
+        phase: str,
+    ) -> Dict[str, Any]:
+        api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
+        base_url = str(getattr(settings, "aliyun_base_url", "") or "").strip()
+        model_name = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip()
+        if not api_key or not base_url or not model_name:
+            return {}
+
+        request_timeout = max(2.0, float(int(getattr(settings, "reader_agent_timeout_ms", 90000) or 90000)) / 1000.0)
+        max_tokens = max(512, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000))
+        content_parts: List[Dict[str, Any]] = [
+            {"type": "text", "text": json.dumps(user_prompt, ensure_ascii=False)}
+        ]
+        image_token = str(rendered_page_image or "").strip()
+        if step == 1 and image_token and (image_token.startswith("data:image") or image_token.startswith("http")):
+            content_parts.append({"type": "image_url", "image_url": {"url": image_token}})
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": str(system_prompt or "")},
+                        {"role": "user", "content": content_parts},
+                    ],
+                    temperature=0,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    timeout=request_timeout,
+                ),
+                timeout=request_timeout + 1.0,
+            )
+        except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+            logger.warning(
+                f"[ReaderComposeService] single_agent_v2 model call failed "
+                f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
+            )
+            return {}
+
+        content = ""
+        try:
+            content = str((response.choices[0].message.content or "")).strip()
+        except Exception:
+            return {}
+        parsed = await parse_json_dict_from_model_text(content)
+        if not parsed:
+            return {}
+        usage_obj = getattr(response, "usage", None)
+        usage = {
+            "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+        }
+        return {
+            "status": str(parsed.get("status") or ""),
+            "step_result": dict(parsed.get("step_result") or {}),
+            "usage": usage,
+            "self_check": dict(parsed.get("self_check") or {}),
+            "fixes_applied": list(parsed.get("fixes_applied") or []),
+        }
+
+    def _collect_docmind_blocks_for_single_agent(
+        self,
+        *,
+        page: int,
+        base_payload: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+        docmind_structure = dict(base_payload.get("docmind_structure") or {})
+        page_structure_v3 = dict(base_payload.get("page_structure_v3") or {})
+        layouts = [row for row in list(docmind_structure.get("layouts") or []) if isinstance(row, dict)]
+        block_groups = [row for row in list(page_structure_v3.get("block_groups") or []) if isinstance(row, dict)]
+
+        layout_to_block_ids: Dict[str, List[str]] = {}
+        for row in block_groups:
+            layout_uid = str(row.get("layout_unique_id") or "").strip()
+            raw_block_id = str(row.get("block_id") or "").strip()
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=raw_block_id)
+            if not layout_uid or not canonical:
+                continue
+            layout_to_block_ids.setdefault(layout_uid, [])
+            if canonical not in layout_to_block_ids[layout_uid]:
+                layout_to_block_ids[layout_uid].append(canonical)
+
+        page_zero = max(0, int(page) - 1)
+        page_one = max(1, int(page))
+        output_rows: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for idx, row in enumerate(layouts, start=1):
+            raw_page_num = row.get("pageNum")
+            if isinstance(raw_page_num, list) and raw_page_num:
+                page_values = []
+                for item in raw_page_num:
+                    token = str(item or "").strip()
+                    if token.isdigit():
+                        page_values.append(int(token))
+                if page_values and page_zero not in page_values and page_one not in page_values:
+                    continue
+            elif isinstance(raw_page_num, (int, float, str)):
+                token = str(raw_page_num).strip()
+                if token.isdigit() and int(token) not in {page_zero, page_one}:
+                    continue
+
+            layout_id = str(row.get("uniqueId") or row.get("layoutId") or row.get("id") or f"layout_{idx:04d}").strip()
+            if not layout_id:
+                layout_id = f"layout_{idx:04d}"
+            if layout_id in seen_ids:
+                continue
+            seen_ids.add(layout_id)
+
+            text_rows = [item for item in list(row.get("blocks") or []) if isinstance(item, dict)]
+            source_text = " ".join(
+                self._normalize_spaces(str(item.get("text") or ""))
+                for item in text_rows
+                if self._normalize_spaces(str(item.get("text") or ""))
+            ).strip()
+            if not source_text:
+                source_text = self._normalize_spaces(str(row.get("text") or ""))
+
+            output_rows.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "type": str(row.get("type") or "").strip().lower(),
+                    "subType": str(row.get("subType") or "").strip().lower(),
+                    "block_ids": list(layout_to_block_ids.get(layout_id) or []),
+                    "reading_order": int(row.get("index") or idx),
+                }
+            )
+
+        output_rows = sorted(
+            output_rows,
+            key=lambda item: (
+                int(item.get("reading_order") or 10**9),
+                str(item.get("layout_id") or ""),
+            ),
+        )
+        return output_rows, layout_to_block_ids
+
+    def _step_result_to_ui_plan(
+        self,
+        *,
+        page: int,
+        step_result: Dict[str, Any],
+        docmind_blocks: Sequence[Dict[str, Any]],
+        layout_to_block_ids: Dict[str, List[str]],
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+    ) -> Dict[str, Any]:
+        classification_rows = [
+            row
+            for row in list((step_result.get("classification") or {}).get("items") or [])
+            if isinstance(row, dict)
+        ]
+        cleaning_rows = [
+            row
+            for row in list((step_result.get("cleaning") or {}).get("items") or [])
+            if isinstance(row, dict)
+        ]
+        component_rows = [
+            row
+            for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
+            if isinstance(row, dict)
+        ]
+
+        docmind_map = {
+            str(row.get("layout_id") or ""): dict(row)
+            for row in list(docmind_blocks or [])
+            if isinstance(row, dict) and str(row.get("layout_id") or "")
+        }
+        cleaned_text_map = {
+            str(row.get("layout_id") or ""): str(row.get("normalized_text") or row.get("source_text") or "")
+            for row in cleaning_rows
+            if str(row.get("layout_id") or "")
+        }
+
+        block_anchor_map: Dict[str, Dict[str, Any]] = {}
+        for block in list(base_payload.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block.get("id") or ""))
+            if not canonical:
+                canonical = str(((block.get("source_anchor") or {}).get("canonical_block_id") or "")).strip()
+            if not canonical or canonical in block_anchor_map:
+                continue
+            anchor = self._normalize_anchor_ref(
+                anchor=block.get("source_anchor"),
+                page=page,
+                quote_text=str(block.get("text") or ""),
+            )
+            if anchor:
+                block_anchor_map[canonical] = anchor
+
+        nodes: List[Dict[str, Any]] = []
+        for idx, row in enumerate(component_rows, start=1):
+            component_name = str(row.get("component") or "").strip()
+            if not component_name:
+                continue
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(row.get("source_block_ids") or [])
+                if str(item).strip()
+            ]
+            if not source_layout_ids:
+                continue
+            source_block_ids: List[str] = []
+            source_anchor_refs: List[Dict[str, Any]] = []
+            for layout_id in source_layout_ids:
+                mapped_block_ids = list(layout_to_block_ids.get(layout_id) or [layout_id])
+                for block_id in mapped_block_ids:
+                    if block_id and block_id not in source_block_ids:
+                        source_block_ids.append(block_id)
+                    anchor = dict(block_anchor_map.get(block_id) or {})
+                    if anchor and anchor not in source_anchor_refs:
+                        source_anchor_refs.append(anchor)
+            if not source_block_ids:
+                continue
+
+            props = dict(row.get("props") or {})
+            if not props:
+                first_layout_id = source_layout_ids[0]
+                fallback_text = self._normalize_spaces(
+                    cleaned_text_map.get(first_layout_id) or str((docmind_map.get(first_layout_id) or {}).get("source_text") or "")
+                )
+                if component_name == "SectionHeading":
+                    props = {"text": fallback_text or "Untitled", "level": 2}
+                elif component_name == "ListBlock":
+                    props = {"items": [fallback_text] if fallback_text else []}
+                elif component_name == "ContextRail":
+                    props = {"title": "Context", "items": [{"text": fallback_text}] if fallback_text else []}
+                else:
+                    props = {"text": fallback_text}
+
+            nodes.append(
+                {
+                    "id": f"sgv2_{idx:03d}",
+                    "type": component_name,
+                    "props": props,
+                    "children": [],
+                    "source_anchor_refs": source_anchor_refs,
+                    "source_block_ids": source_block_ids,
+                    "capabilities": ["copy", "jump_anchor", "inline_query"],
+                    "actions": [],
+                    "layout_slot": {"reserved_height": 160, "lock_height": False},
+                }
+            )
+
+        if not nodes and classification_rows:
+            first_main = next(
+                (
+                    row
+                    for row in classification_rows
+                    if str(row.get("bucket") or "").strip() == "main_content"
+                    and str(row.get("layout_id") or "").strip()
+                ),
+                None,
+            )
+            if first_main:
+                layout_id = str(first_main.get("layout_id") or "").strip()
+                text = self._normalize_spaces(
+                    cleaned_text_map.get(layout_id) or str((docmind_map.get(layout_id) or {}).get("source_text") or "")
+                )
+                block_ids = list(layout_to_block_ids.get(layout_id) or [layout_id])
+                anchors = [
+                    dict(block_anchor_map[item])
+                    for item in block_ids
+                    if item in block_anchor_map
+                ]
+                nodes.append(
+                    {
+                        "id": "sgv2_fallback_001",
+                        "type": "ParagraphProse",
+                        "props": {"text": text or layout_id},
+                        "children": [],
+                        "source_anchor_refs": anchors,
+                        "source_block_ids": block_ids,
+                        "capabilities": ["copy", "jump_anchor", "inline_query"],
+                        "actions": [],
+                        "layout_slot": {"reserved_height": 160, "lock_height": False},
+                    }
+                )
+
+        return {
+            "plan_id": f"single_agent_v2_p{int(page)}",
+            "components": nodes,
+            "layout": {
+                "content_max_width": 980,
+                "column_count": 1,
+                "layout_mode": "single_column",
+            },
+            "style_tokens": {
+                "intent": str(style_intent or detail_level or "standard"),
+                "theme_mode": str(theme_mode or "light"),
+                "compare_mode": bool(compare_mode),
+            },
+            "trace_meta": {
+                "pipeline": "single_agent_v2",
+                "component_count": len(nodes),
+            },
+            "ui_ops": [],
+            "agent_trace": [],
+            "agent_tool_calls": [],
+        }
+
+    async def _build_simplified_pipeline_result_legacy(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        latency_budget_ms: int,
+        selected_kb_id: Optional[int],
+    ) -> Dict[str, Any]:
+        started_at = time.perf_counter()
+        payload = dict(base_payload or {})
+        page_structure_v3 = dict(payload.get("page_structure_v3") or {})
+        docmind_structure = dict(payload.get("docmind_structure") or {})
+        atom_bundle = build_canonical_atom_bundle(
+            docmind_structure=docmind_structure,
+            page=int(page),
+            paper_id=int(paper.id),
+        )
+
+        path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+            user_id=int(paper.user_id),
+            paper_id=int(paper.id),
+            paper_title=paper.title,
+            paper_pdf_path=paper.pdf_path,
+        )
+        mm_prompt_payload: Dict[str, Any] = {}
+        if path and os.path.exists(path):
+            try:
+                mm_prompt_payload = await self._mm_layout_service.build_mm_prompt_payload(
+                    pdf_path=path,
+                    page=int(page),
+                    base_payload=payload,
+                ) or {}
+            except Exception as exc:
+                logger.warning(f"[ReaderComposeService] simplified build_mm_prompt_payload failed page={page}: {exc}")
+                mm_prompt_payload = {}
+
+        image_rows = [
+            row
+            for row in list(mm_prompt_payload.get("images") or [])[:1]
+            if isinstance(row, dict)
+        ]
+        atoms_digest = [
+            {
+                "atom_id": str(row.get("atom_id") or ""),
+                "reading_order": int(row.get("reading_order") or 0),
+                "type": str(row.get("type") or ""),
+                "sub_type": str(row.get("sub_type") or ""),
+                "default_role": str(row.get("default_role") or "unknown"),
+                "default_component": str(row.get("default_component") or "ParagraphProse"),
+                "bbox": list(row.get("bbox") or [0.0, 0.0, 0.0, 0.0])[:4],
+                "text_preview": self._normalize_spaces(str(row.get("text") or ""))[:220],
+            }
+            for row in list(atom_bundle.usable_atoms or [])
+            if str(row.get("atom_id") or "")
+        ]
+        layout_meta = {
+            "paper_id": int(paper.id),
+            "page": int(page),
+            "pipeline_version": self._pipeline_version(),
+            "visual_reference_only": True,
+        }
+
+        stage1_payload = {
+            "layout_meta": layout_meta,
+            "images": image_rows,
+            "atoms_digest": atoms_digest,
+        }
+        stage1_semantic, stage1_meta = await self._mm_layout_service.build_stage1_semantic_annotations(
+            prompt_payload=stage1_payload,
+            atom_bundle=atom_bundle,
+        )
+        stage1_failed = not isinstance(stage1_semantic, dict)
+        if stage1_failed:
+            stage1_semantic = {
+                "annotations": [
+                    {
+                        "atom_id": str(row.get("atom_id") or ""),
+                        "role": str(row.get("default_role") or "unknown"),
+                        "importance": "normal",
+                        "grouping_hint": "",
+                        "component_hint": str(row.get("default_component") or "ParagraphProse"),
+                        "confidence": 0.7,
+                    }
+                    for row in list(atom_bundle.usable_atoms or [])
+                    if str(row.get("atom_id") or "")
+                ]
+            }
+            stage1_meta = dict(stage1_meta or {})
+            stage1_meta["used"] = False
+            stage1_meta["fallback_reason"] = "stage1_failed"
+            stage1_meta["degraded"] = True
+            stage2_slots = build_deterministic_baseline_slots(
+                atom_bundle=atom_bundle,
+                allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+            )
+            stage2_meta = {
+                "used": False,
+                "model": "",
+                "fallback_used": True,
+                "fallback_reason": "stage1_failed",
+                "degraded": True,
+            }
+        else:
+            stage2_payload = {
+                "layout_meta": layout_meta,
+                "images": image_rows,
+                "semantic_annotations": dict(stage1_semantic or {}),
+                "atoms_digest": atoms_digest,
+                "allowed_components": list(SIMPLIFIED_ALLOWED_COMPONENTS),
+            }
+            stage2_slots, stage2_meta = await self._mm_layout_service.build_stage2_design_slots(
+                prompt_payload=stage2_payload,
+                atom_bundle=atom_bundle,
+                allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+            )
+        if not isinstance(stage2_slots, dict):
+            stage2_slots = build_deterministic_baseline_slots(
+                atom_bundle=atom_bundle,
+                allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+            )
+            stage2_meta = dict(stage2_meta or {})
+            stage2_meta["used"] = False
+            stage2_meta["fallback_reason"] = "stage2_failed"
+            stage2_meta["degraded"] = True
+
+        block_groups = [
+            row for row in list(page_structure_v3.get("block_groups") or []) if isinstance(row, dict)
+        ]
+        layout_block_index: Dict[Tuple[str, int], str] = {}
+        for row in block_groups:
+            layout_uid = str(row.get("layout_unique_id") or "").strip()
+            block_id_raw = str(row.get("block_id") or "").strip()
+            if not layout_uid or not block_id_raw:
+                continue
+            block_match = re.search(r"_b(\d+)$", block_id_raw)
+            block_index = int(block_match.group(1)) if block_match else 1
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=block_id_raw) or f"p{int(page)}_{block_id_raw}"
+            layout_block_index[(layout_uid, block_index)] = canonical
+
+        atom_to_block: Dict[str, str] = {}
+        for row in list(atom_bundle.usable_atoms or []):
+            atom_id = str(row.get("atom_id") or "").strip()
+            layout_uid = str(row.get("source_layout_id") or "").strip()
+            block_index = int(row.get("block_index") or 1)
+            canonical = layout_block_index.get((layout_uid, block_index))
+            if not canonical:
+                # fallback to first block in the same layout
+                candidates = [
+                    value
+                    for (uid, _idx), value in layout_block_index.items()
+                    if uid == layout_uid
+                ]
+                canonical = candidates[0] if candidates else ""
+            if atom_id and canonical:
+                atom_to_block[atom_id] = canonical
+
+        ordered_block_ids: List[str] = []
+        suggested_components: List[Dict[str, Any]] = []
+        stage2_segments: List[Dict[str, Any]] = []
+        for idx, slot in enumerate(list(stage2_slots.get("page_layout_slots") or []), start=1):
+            if not isinstance(slot, dict):
+                continue
+            atom_ids = [
+                str(item).strip()
+                for item in list(slot.get("atom_ids") or [])
+                if str(item).strip()
+            ]
+            block_ids: List[str] = []
+            for atom_id in atom_ids:
+                canonical = str(atom_to_block.get(atom_id) or "").strip()
+                if canonical and canonical not in block_ids:
+                    block_ids.append(canonical)
+                    if canonical not in ordered_block_ids:
+                        ordered_block_ids.append(canonical)
+            if not block_ids:
+                continue
+            component = str(slot.get("component") or "ParagraphProse")
+            suggested_components.append(
+                {
+                    "block_ids": block_ids,
+                    "component": component,
+                    "reason": "stage2_design_slots",
+                }
+            )
+            stage2_segments.append(
+                {
+                    "segment_id": str(slot.get("slot_id") or f"slot_{idx:03d}"),
+                    "kind": "paragraph",
+                    "kind_hint": "paragraph",
+                    "component_hint": component,
+                    "block_ids": block_ids,
+                    "line_ids": [],
+                    "evidence_line_ids": [],
+                    "word_ids": [],
+                    "char_ranges": [],
+                    "title": "",
+                    "resolved_text": "",
+                    "sort_order": idx,
+                    "continuation": "none",
+                    "reason": "stage2_design_slots",
+                    "confidence": 0.88,
+                }
+            )
+
+        segment_id_map: Dict[str, Dict[str, Any]] = {}
+        for slot in list(stage2_slots.get("page_layout_slots") or []):
+            if not isinstance(slot, dict):
+                continue
+            slot_id = str(slot.get("slot_id") or "").strip()
+            if not slot_id:
+                continue
+            atom_ids = [
+                str(item).strip()
+                for item in list(slot.get("atom_ids") or [])
+                if str(item).strip()
+            ]
+            mapped_block_ids: List[str] = []
+            for atom_id in atom_ids:
+                block_id = str(atom_to_block.get(atom_id) or "").strip()
+                if block_id and block_id not in mapped_block_ids:
+                    mapped_block_ids.append(block_id)
+            segment_id_map[slot_id] = {
+                "atom_ids": atom_ids,
+                "block_ids": mapped_block_ids,
+            }
+
+        payload["stage1_structural_annotations"] = dict(stage1_semantic or {})
+        payload["stage2_design_layout"] = dict(stage2_slots or {})
+        payload["atom_semantics"] = dict(stage1_semantic or {})
+        payload["deterministic_page_skeleton"] = {
+            "source": "deterministic_atom_skeleton",
+            "slots": list(stage2_slots.get("page_layout_slots") or []),
+            "unused_atom_ids": list(stage2_slots.get("unused_atom_ids") or []),
+        }
+        payload["stage2_style_plan"] = {
+            "source": "stage2_design_v2" if bool(stage2_meta.get("used")) else "deterministic_baseline",
+            "slots": list(stage2_slots.get("page_layout_slots") or []),
+            "unused_atom_ids": list(stage2_slots.get("unused_atom_ids") or []),
+            "notes": list((stage2_slots or {}).get("notes") or []),
+        }
+        payload["layout_advice_v3"] = {
+            "source": "stage2_design_v2" if bool(stage2_meta.get("used")) else "deterministic_baseline",
+            "ordered_block_ids": ordered_block_ids,
+            "suggested_components": suggested_components,
+            "grouping_hints": [],
+            "visual_hints": [],
+            "notes": [
+                f"unused_atom_count={len(list(stage2_slots.get('unused_atom_ids') or []))}",
+                "visual_reference_only=true",
+            ],
+            "unused_atom_ids": [
+                str(item).strip()
+                for item in list(stage2_slots.get("unused_atom_ids") or [])
+                if str(item).strip()
+            ],
+        }
+        payload["segment_map"] = {
+            "source": "stage2_design_v2",
+            "segments": stage2_segments,
+            "counts": {
+                "segment_count": len(stage2_segments),
+                "unused_atom_count": len(list(stage2_slots.get("unused_atom_ids") or [])),
+            },
+        }
+        payload["segment_map_meta"] = {
+            "used": True,
+            "source": "stage2_design_v2",
+            "reason": "simplified_pipeline",
+        }
+        payload["segment_id_map"] = segment_id_map
+        payload["pipeline_contract_meta"] = {
+            "used": True,
+            "pipeline": "reader_simplified_v2",
+            "stage1": dict(stage1_meta or {}),
+            "stage2": dict(stage2_meta or {}),
+            "visual_reference_only": True,
+        }
+        payload["canonical_atoms"] = {
+            "count": len(list(atom_bundle.atoms or [])),
+            "usable_count": len(list(atom_bundle.usable_atom_ids or [])),
+            "excluded_count": len(list(atom_bundle.excluded_atoms or [])),
+            "excluded_atoms": list(atom_bundle.excluded_atoms or [])[:200],
+            "items": list(atom_bundle.atoms or [])[:1600],
+            "source": "docmind",
+        }
+        payload["candidate_ranking"] = {
+            "strategy": "single_candidate_simplified",
+            "selected_candidate_id": "candidate_1",
+            "candidates": [
+                {
+                    "candidate_id": "candidate_1",
+                    "source": "stage2_design_v2",
+                    "score": 1.0,
+                }
+            ],
+        }
+        payload["repair_report"] = {
+            "rounds": 0,
+            "used": False,
+            "reason": "",
+        }
+
+        ui_plan = self._build_initial_ui_plan(
+            paper=paper,
+            page=page,
+            base_payload=payload,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+        )
+        block_to_atoms: Dict[str, List[str]] = {}
+        for atom_id, block_id in atom_to_block.items():
+            block_to_atoms.setdefault(block_id, []).append(atom_id)
+
+        components = []
+        used_atoms: set[str] = set()
+        for node in list(ui_plan.get("components") or []):
+            if not isinstance(node, dict):
+                continue
+            cloned = dict(node)
+            source_block_ids = [
+                str(item).strip()
+                for item in list(cloned.get("source_block_ids") or [])
+                if str(item).strip()
+            ]
+            if not source_block_ids:
+                source_block_ids = [
+                    str((row or {}).get("canonical_block_id") or "").strip()
+                    for row in list(cloned.get("source_anchor_refs") or [])
+                    if isinstance(row, dict) and str((row or {}).get("canonical_block_id") or "").strip()
+                ]
+            source_atom_ids: List[str] = []
+            for block_id in source_block_ids:
+                for atom_id in list(block_to_atoms.get(block_id) or []):
+                    if atom_id not in source_atom_ids:
+                        source_atom_ids.append(atom_id)
+                        used_atoms.add(atom_id)
+            if source_block_ids:
+                cloned["source_block_ids"] = source_block_ids
+            if source_atom_ids:
+                cloned["source_atom_ids"] = source_atom_ids
+            components.append(cloned)
+        ui_plan["components"] = components
+
+        missing_atoms = [
+            atom
+            for atom in list(atom_bundle.usable_atoms or [])
+            if str(atom.get("atom_id") or "").strip() and str(atom.get("atom_id") or "").strip() not in used_atoms
+        ]
+        for atom in missing_atoms:
+            atom_id = str(atom.get("atom_id") or "").strip()
+            if not atom_id:
+                continue
+            component_type = str(atom.get("default_component") or "ParagraphProse")
+            text = self._normalize_spaces(str(atom.get("text") or ""))
+            if not text:
+                continue
+            source_block_id = str(atom_to_block.get(atom_id) or "").strip()
+            anchor_rows: List[Dict[str, Any]] = []
+            if source_block_id:
+                for row in list(payload.get("blocks") or []):
+                    block_id = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("id") or ""))
+                    if block_id and block_id == source_block_id:
+                        anchor = self._normalize_anchor_ref(anchor=row.get("source_anchor"), page=page, quote_text=text)
+                        if anchor:
+                            anchor_rows.append(anchor)
+                        break
+            node_props: Dict[str, Any] = {"text": text}
+            if component_type == "SectionHeading":
+                node_props = {"text": text, "level": 2}
+            elif component_type == "ListBlock":
+                node_props = {"items": [text]}
+            elif component_type == "ContextRail":
+                node_props = {"title": "Context", "items": [{"text": text, "anchor": anchor_rows}]}
+            elif component_type in {"FigurePanel", "TablePanel"}:
+                node_props = {"caption": text, "ai_insight": ""}
+            ui_plan.setdefault("components", []).append(
+                {
+                    "id": f"fallback_atom_{uuid.uuid4().hex[:8]}",
+                    "type": component_type,
+                    "props": node_props,
+                    "children": [],
+                    "source_anchor_refs": anchor_rows,
+                    "source_block_ids": [source_block_id] if source_block_id else [],
+                    "source_atom_ids": [atom_id],
+                    "capabilities": ["copy"],
+                    "actions": [],
+                    "layout_slot": {"reserved_height": 160, "lock_height": False},
+                }
+            )
+            used_atoms.add(atom_id)
+
+        ui_plan = await self._apply_deepseek_assembly_decision(
+            ui_plan=ui_plan,
+            base_payload=payload,
+            page=page,
+            latency_budget_ms=latency_budget_ms,
+            user_id=int(user_id),
+            user_intent=str(style_intent or detail_level or "standard"),
+        )
+        gate_report = enforce_minimal_gates(
+            ui_plan=ui_plan,
+            usable_atom_ids=list(atom_bundle.usable_atom_ids or []),
+            allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+            non_empty_input=bool(atom_bundle.usable_atom_ids),
+        )
+        if not bool(gate_report.get("passed")):
+            baseline_slots = build_deterministic_baseline_slots(
+                atom_bundle=atom_bundle,
+                allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+            )
+            payload["stage2_design_layout"] = baseline_slots
+            payload["layout_advice_v3"] = {
+                "source": "deterministic_baseline",
+                "ordered_block_ids": [],
+                "suggested_components": [],
+                "grouping_hints": [],
+                "visual_hints": [],
+                "notes": ["baseline_due_to_gate_failure"],
+                "unused_atom_ids": [],
+            }
+            payload["segment_map"] = {"source": "deterministic_baseline", "segments": [], "counts": {}}
+            ui_plan = self._build_initial_ui_plan(
+                paper=paper,
+                page=page,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            gate_report = enforce_minimal_gates(
+                ui_plan=ui_plan,
+                usable_atom_ids=list(atom_bundle.usable_atom_ids or []),
+                allowed_components=SIMPLIFIED_ALLOWED_COMPONENTS,
+                non_empty_input=bool(atom_bundle.usable_atom_ids),
+            )
+            payload["repair_report"] = {
+                "rounds": 1,
+                "used": True,
+                "reason": "minimal_gate_failed_baseline_rebuild",
+            }
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        quality_report = {
+            "overall": 0.92 if bool(gate_report.get("passed")) else 0.68,
+            "hard_constraints_passed": bool(gate_report.get("passed")),
+            "validation_errors": [],
+            "quality_target": 0.0,
+            "elapsed_ms": elapsed_ms,
+            "iterations": 1,
+            "degraded": bool(not stage1_meta.get("used") or not stage2_meta.get("used")),
+            "stop_reason": "simplified_pipeline",
+            "schema_valid": bool(gate_report.get("schema_valid")),
+            "whitelist_valid": bool(gate_report.get("whitelist_valid")),
+            "ownership_unchanged": bool(gate_report.get("ownership_unchanged")),
+            "full_coverage": bool(gate_report.get("full_coverage")),
+            "non_empty_plan_for_non_empty_input": bool(gate_report.get("non_empty_plan_for_non_empty_input")),
+            "coverage_rate": (
+                float(gate_report.get("used_atom_count") or 0) / float(max(1, gate_report.get("usable_atom_count") or 1))
+            ),
+            "pipeline_latency_ms": elapsed_ms,
+            "p50_done_latency_ms_target": 8000,
+            "p95_done_latency_ms_target": 18000,
+            "minimal_gate_report": gate_report,
+        }
+        assets = [
+            row
+            for row in list(payload.get("assets") or [])
+            if isinstance(row, dict) and str(row.get("kind") or "") in {"link", "annotation", "image_hint"}
+        ]
+        payload["pipeline_contract_meta"] = dict(payload.get("pipeline_contract_meta") or {})
+        payload["pipeline_contract_meta"]["minimal_gate_report"] = gate_report
+        payload["pipeline_contract_meta"]["elapsed_ms"] = elapsed_ms
+        payload["minimal_gate_report"] = dict(gate_report or {})
+        payload["qwen_plan_meta"] = {
+            "used": True,
+            "reason": "simplified_4step_pipeline",
+            "stage1_model": str((stage1_meta or {}).get("model") or ""),
+            "stage2_model": str((stage2_meta or {}).get("model") or ""),
+            "stage1_fallback_used": bool((stage1_meta or {}).get("fallback_used")),
+            "stage2_fallback_used": bool((stage2_meta or {}).get("fallback_used")),
+            "pipeline_version": self._pipeline_version(),
+        }
+        payload["mm_assist_meta"] = {
+            "used": True,
+            "reason": "simplified_4step_pipeline",
+            "visual_reference_only": True,
+            "degraded": bool(not stage1_meta.get("used") or not stage2_meta.get("used")),
+        }
+        loop_result = {
+            "ui_plan": ui_plan,
+            "quality_report": quality_report,
+            "node_gate_report": {},
+            "iteration_trace": [
+                {
+                    "iteration": 1,
+                    "ui_plan": ui_plan,
+                    "quality_report": quality_report,
+                    "ui_ops": list((ui_plan or {}).get("ui_ops") or []),
+                    "agent_trace": list((ui_plan or {}).get("agent_trace") or []),
+                    "agent_tool_calls": list((ui_plan or {}).get("agent_tool_calls") or []),
+                }
+            ],
+            "iterations": 1,
+            "degraded": bool(quality_report.get("degraded")),
+            "stop_reason": "simplified_pipeline",
+            "build_mode": "compose_agent_simplified",
+        }
+        return {
+            "base_payload": payload,
+            "loop_result": loop_result,
+            "assets": assets,
+        }
 
     async def run_react_compose_loop(
         self,
@@ -430,8 +1778,6 @@ class LiteratureReaderComposeService:
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
         confidence = float(base_payload.get("structure_confidence") or 0.0)
-        # 迭代轮次优先使用调用方传入值；未传时根据结构置信度自动分档。
-        # 低置信页给更高上限，高置信页控制成本和延迟。
         resolved_max_iterations = (
             int(max_iterations)
             if isinstance(max_iterations, int) and max_iterations > 0
@@ -443,7 +1789,6 @@ class LiteratureReaderComposeService:
         )
         resolved_max_iterations = max(1, min(int(resolved_max_iterations), 24))
 
-        # 先用规则和解析器产出可用初版，再进入 ReAct 迭代修订。
         current_plan = self._build_initial_ui_plan(
             paper=paper,
             page=page,
@@ -471,7 +1816,6 @@ class LiteratureReaderComposeService:
         previous_overall: Optional[float] = None
 
         for iteration in range(1, resolved_max_iterations + 1):
-            # 每轮都先“自愈”一次锚点和字段，降低后续 schema 校验失败率。
             current_plan = self._sanitize_ui_plan_anchors(
                 current_plan,
                 page=page,
@@ -513,7 +1857,6 @@ class LiteratureReaderComposeService:
                 best_plan = current_plan
                 best_quality = quality
 
-            # 连续两轮增益小于 0.01 时提前停止，避免无效迭代占用延迟预算。
             if previous_overall is not None:
                 delta = overall - previous_overall
                 if delta < 0.01:
@@ -523,7 +1866,6 @@ class LiteratureReaderComposeService:
             previous_overall = overall
 
             hard_pass = bool(quality.get("hard_constraints_passed"))
-            # 只有硬约束与目标分同时满足才允许提前“成功停止”。
             if hard_pass and overall >= quality_target:
                 stop_reason = "quality_threshold_met"
                 break
@@ -533,7 +1875,6 @@ class LiteratureReaderComposeService:
                 break
 
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-            # 延迟预算优先级高于轮次，超预算立即返回当前最优结果。
             if elapsed_ms >= latency_budget_ms:
                 degraded = True
                 stop_reason = "latency_budget_exceeded"
@@ -543,7 +1884,6 @@ class LiteratureReaderComposeService:
                 stop_reason = "max_iterations_reached"
                 break
 
-            # 用质量报告驱动下一轮局部修订，避免每轮全量重排造成抖动。
             current_plan = self._revise_ui_plan(
                 ui_plan=current_plan,
                 base_payload=base_payload,
@@ -923,7 +2263,7 @@ class LiteratureReaderComposeService:
                         return node
                     split_items = [
                         self._normalize_spaces(item)
-                        for item in re.split(r"[；;。]\s*", source_text)
+                        for item in re.split(r"[；;。.!?！？]\s*", source_text)
                         if self._normalize_spaces(item)
                     ]
                     normalized_items = split_items[:8] if split_items else [source_text]
@@ -1061,335 +2401,333 @@ class LiteratureReaderComposeService:
         page: int,
         base_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Apply multimodal assistance to compose payload.
-
-        If page_structure_v3 already comes from Document Mind (DocStructure),
-        skip VL parser stage and run only layout-advice stage.
-        """
+        """Strict 4-layer contract path: DocMind -> Stage1 -> Stage2 -> assembly."""
+        started_at = time.perf_counter()
         payload = json.loads(json.dumps(base_payload, ensure_ascii=False))
         payload.setdefault("mm_assist_meta", {})
 
         page_structure_v3 = dict(payload.get("page_structure_v3") or {})
-        page_structure_source = str(page_structure_v3.get("source") or "").strip().lower()
-        has_docmind_structure = (
-            page_structure_source == "document_mind"
-            and isinstance(page_structure_v3.get("block_groups"), list)
-            and len(list(page_structure_v3.get("block_groups") or [])) > 0
-        )
+        if str(page_structure_v3.get("source") or "").strip().lower() != "document_mind":
+            raise RenderPipelineContractError(
+                code="DOCMIND_LAYOUT_DIGEST_EMPTY",
+                stage="docmind",
+                message="Strict pipeline requires page_structure_v3.source=document_mind",
+                details={
+                    "paper_id": int(paper.id),
+                    "page": int(page),
+                    "source": str(page_structure_v3.get("source") or ""),
+                },
+            )
 
+        docmind_structure = dict(payload.get("docmind_structure") or {})
+        digest_bundle = build_docmind_layout_digest(docmind_structure, int(page))
+
+        # Keep Stage1 scope page-local: only annotate layouts that are already mapped to current-page block_groups.
+        page_block_groups = [
+            row
+            for row in list(page_structure_v3.get("block_groups") or [])
+            if isinstance(row, dict)
+        ]
+        page_layout_ids = {
+            str(row.get("layout_unique_id") or "").strip()
+            for row in page_block_groups
+            if str(row.get("layout_unique_id") or "").strip()
+        }
+        if page_layout_ids:
+            scoped_rows = [
+                row
+                for row in list(digest_bundle.layout_digest or [])
+                if str(row.get("layout_id") or "").strip() in page_layout_ids
+            ]
+            if scoped_rows:
+                known_layout_ids = [
+                    str(row.get("layout_id") or "").strip()
+                    for row in scoped_rows
+                    if str(row.get("layout_id") or "").strip()
+                ]
+                digest_bundle = LayoutDigestBundle(
+                    page=int(page),
+                    layout_digest=scoped_rows,
+                    known_layout_ids=known_layout_ids,
+                    layout_index={layout_id: idx for idx, layout_id in enumerate(known_layout_ids)},
+                )
+
+        prompt_payload: Dict[str, Any] = {}
         path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
             user_id=int(paper.user_id),
             paper_id=int(paper.id),
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
-        if not path or not os.path.exists(path):
-            payload["mm_assist_meta"] = {
-                "used": False,
-                "degraded": True,
-                "reason": "pdf_missing",
-                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-                "fallback_used": False,
-            }
-            return self._ensure_layout_channels(payload)
-
-        trigger_meta: Dict[str, Any] = {}
-        if has_docmind_structure:
-            trigger = True
-            trigger_meta = {
-                "reason": "docmind_structure_present",
-                "trigger_reasons": ["docmind_structure_present"],
-            }
-        else:
-            trigger, trigger_meta = self._mm_layout_service.should_trigger_mm(
-                paper_id=int(paper.id),
-                page=int(page),
-                base_payload=payload,
-                call_count=0,
-            )
-            if not trigger:
-                payload["mm_assist_meta"] = {
-                    "used": False,
-                    "degraded": False,
-                    "reason": str(trigger_meta.get("reason") or "quality_gate_not_hit"),
-                    "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-                    "fallback_used": False,
-                }
-                if "cross_column_merge_ratio" in trigger_meta:
-                    payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
-                return self._ensure_layout_channels(payload)
-
-        prompt_payload = await self._mm_layout_service.build_mm_prompt_payload(
-            pdf_path=path,
-            page=int(page),
-            base_payload=payload,
-        )
-        if not isinstance(prompt_payload, dict):
-            payload["mm_assist_meta"] = {
-                "used": False,
-                "degraded": True,
-                "reason": "prompt_payload_build_failed",
-                "model": str(getattr(settings, "reader_mm_primary_model", "qwen3.5-flash")),
-                "fallback_used": False,
-            }
-            return self._ensure_layout_channels(payload)
-
-        parser_advice: Dict[str, Any] = {}
-        parser_meta: Dict[str, Any] = {}
-        parser_segment_map: Dict[str, Any] = {}
-        if has_docmind_structure:
-            parser_advice = dict(page_structure_v3)
-            parser_meta = {
-                "used": False,
-                "reason": "skipped_docmind_structure_present",
-                "model": str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-                "fallback_used": False,
-                "error": None,
-            }
-        elif hasattr(self._mm_layout_service, "build_line_parse_advice"):
+        if path and os.path.exists(path):
             try:
-                parser_rows, parser_meta = await self._mm_layout_service.build_line_parse_advice(
-                    prompt_payload=prompt_payload,
-                    valid_line_ids=list(prompt_payload.get("valid_line_ids") or []),
+                prompt_payload = await self._mm_layout_service.build_mm_prompt_payload(
+                    pdf_path=path,
+                    page=int(page),
+                    base_payload=payload,
                 )
-                if isinstance(parser_rows, dict):
-                    parser_advice = parser_rows
-                    prompt_payload = dict(prompt_payload)
-                    prompt_payload["parser_advice"] = parser_rows
-                    parser_segment_map = self._build_segment_map_from_parser_advice(
-                        page=int(page),
-                        parser_advice=parser_rows,
-                        prompt_payload=prompt_payload,
-                    )
-                else:
-                    parser_meta = dict(parser_meta or {})
-                    parser_meta.setdefault("used", False)
-                    parser_meta.setdefault("reason", "parser_no_valid_output")
             except Exception as exc:
-                parser_meta = {
-                    "used": False,
-                    "reason": "parser_exception",
-                    "model": str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-                    "error": str(exc),
-                }
-                logger.warning(f"[ReaderComposeService] parser advice pass failed page={page}: {exc}")
-
-        if not parser_advice:
-            payload["mm_assist_meta"] = {
-                "used": False,
-                "degraded": True,
-                "reason": str((parser_meta or {}).get("error") or "parser_failed"),
-                "model": str((parser_meta or {}).get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-                "fallback_used": bool((parser_meta or {}).get("fallback_used")),
-            }
-            if parser_meta:
-                payload["mm_parser_meta"] = parser_meta
-            if "cross_column_merge_ratio" in trigger_meta:
-                payload["cross_column_merge_ratio"] = float(trigger_meta.get("cross_column_merge_ratio") or 0.0)
-            return self._ensure_layout_channels(payload)
-
-        merged_payload = json.loads(json.dumps(payload, ensure_ascii=False))
-        merged_payload["native_page_extract"] = dict(prompt_payload.get("native_page_extract") or {})
-        merged_payload["page_structure_v3"] = dict(parser_advice)
-
-        if parser_segment_map:
-            merged_payload["segment_map"] = dict(parser_segment_map)
-
-        if parser_segment_map:
-            segment_map_meta: Dict[str, Any] = {
-                "used": True,
-                "reason": "parser_structure_applied",
-                "source": "vlflash_page_structure_v2",
-                "model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-                "fallback_used": bool(parser_meta.get("fallback_used")),
-                "error": None,
-            }
-        elif has_docmind_structure:
-            segment_map_meta = {
-                "used": False,
-                "reason": "docmind_structure_only",
-                "source": "document_mind",
-                "model": str(getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
-                "fallback_used": False,
-                "error": None,
-            }
-        else:
-            segment_map_meta = {
-                "used": False,
-                "reason": "parser_structure_unavailable",
-                "source": "none",
-                "model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-                "fallback_used": bool(parser_meta.get("fallback_used")),
-            }
-
-        layout_plan_v2: Dict[str, Any] = {}
-        layout_advice_meta: Dict[str, Any] = {"used": False, "reason": "layout_plan_v2_disabled"}
-        if self._layout_plan_v2_enabled_for_paper(int(paper.id)) and hasattr(self._mm_layout_service, "build_layout_plan_v2"):
-            parser_block_ids = [
-                self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
-                for row in list((parser_advice or {}).get("block_groups") or [])
-                if isinstance(row, dict) and str(row.get("block_id") or "").strip()
-            ]
-            parser_block_ids = [item for item in parser_block_ids if item]
-            valid_block_ids = parser_block_ids or self._collect_valid_block_ids(
-                page=int(page),
-                blocks=list(merged_payload.get("blocks") or []),
-            )
-            try:
-                plan_prompt_payload = dict(prompt_payload)
-                plan_prompt_payload["page_structure_v3"] = dict(parser_advice)
-                plan_rows, plan_meta = await self._mm_layout_service.build_layout_plan_v2(
-                    prompt_payload=plan_prompt_payload,
-                    valid_block_ids=valid_block_ids,
-                    valid_line_ids=[],
-                    component_whitelist=[
-                        "SectionHeading",
-                        "ParagraphProse",
-                        "ListBlock",
-                        "ContextRail",
-                        "FigurePanel",
-                        "TablePanel",
-                    ],
+                logger.warning(
+                    f"[ReaderComposeService] build_mm_prompt_payload failed in strict path page={page}: {exc}"
                 )
-                if isinstance(plan_rows, dict):
-                    layout_plan_v2 = dict(plan_rows)
-                    merged_payload["qwen_layout_plan_v2"] = layout_plan_v2
-                    ordered_block_ids: List[str] = []
-                    suggested_components: List[Dict[str, Any]] = []
-                    for seg in list(layout_plan_v2.get("segments") or []):
-                        if not isinstance(seg, dict):
-                            continue
-                        seg_block_ids = [
-                            self._normalize_canonical_block_id(page=page, raw_id=str(item))
-                            for item in list(seg.get("block_ids") or [])[:8]
-                            if str(item).strip()
-                        ]
-                        seg_block_ids = [item for item in seg_block_ids if item]
-                        for block_id in seg_block_ids:
-                            if block_id not in ordered_block_ids:
-                                ordered_block_ids.append(block_id)
-                        component_hint = str(seg.get("component_hint") or seg.get("ui_component") or "").strip()
-                        if component_hint and seg_block_ids:
-                            suggested_components.append(
-                                {
-                                    "block_ids": seg_block_ids,
-                                    "component": component_hint,
-                                    "kind_hint": str(seg.get("kind_hint") or seg.get("kind") or "").strip(),
-                                    "reason": self._normalize_spaces(str(seg.get("reason") or ""))[:180],
-                                }
-                            )
-                    merged_payload["layout_advice_v2"] = {
-                        "source": "qwen_layout_advice_v3",
-                        "advice_only": True,
-                        "segments": list(layout_plan_v2.get("segments") or []),
-                        "zones": list(layout_plan_v2.get("zones") or []),
-                        "continuation": dict(layout_plan_v2.get("continuation") or {}),
-                        "ui_suggestions": list(layout_plan_v2.get("ui_suggestions") or []),
-                        "notes": list(layout_plan_v2.get("notes") or []),
-                    }
-                    merged_payload["layout_advice_v3"] = {
-                        "source": "qwen_layout_advice_v3",
-                        "advice_only": True,
-                        "ordered_block_ids": ordered_block_ids,
-                        "suggested_components": suggested_components[:240],
-                        "grouping_hints": [
-                            {
-                                "zone_type": str(row.get("zone_type") or ""),
-                                "block_ids": [
-                                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
-                                    for item in list(row.get("block_ids") or [])[:24]
-                                    if str(item).strip()
-                                ],
-                            }
-                            for row in list(layout_plan_v2.get("zones") or [])[:120]
-                            if isinstance(row, dict)
-                        ],
-                        "visual_hints": [
-                            {
-                                "kind": str(row.get("kind") or ""),
-                                "target_block_ids": [
-                                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
-                                    for item in list(row.get("target_block_ids") or [])[:24]
-                                    if str(item).strip()
-                                ],
-                                "reason": self._normalize_spaces(str(row.get("reason") or ""))[:180],
-                            }
-                            for row in list(layout_plan_v2.get("ui_suggestions") or [])[:120]
-                            if isinstance(row, dict)
-                        ],
-                        "segments": list(layout_plan_v2.get("segments") or []),
-                        "zones": list(layout_plan_v2.get("zones") or []),
-                        "continuation": dict(layout_plan_v2.get("continuation") or {}),
-                        "ui_suggestions": list(layout_plan_v2.get("ui_suggestions") or []),
-                        "notes": list(layout_plan_v2.get("notes") or []),
-                    }
-                    layout_advice_meta = {
-                        "used": True,
-                        "reason": "applied",
-                        "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
-                        "fallback_used": bool(plan_meta.get("fallback_used")),
-                        "error": None,
-                    }
-                    if not parser_segment_map:
-                        merged_payload["segment_map"] = dict(merged_payload["layout_advice_v2"])
-                        segment_map_meta = {
-                            "used": True,
-                            "reason": "layout_advice_fallback",
-                            "source": "qwen_layout_advice_v3",
-                            "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
-                            "fallback_used": bool(plan_meta.get("fallback_used")),
-                            "error": None,
-                        }
-                else:
-                    layout_advice_meta = {
-                        "used": False,
-                        "reason": str(plan_meta.get("error") or "layout_plan_v2_failed"),
-                        "model": str(plan_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
-                        "fallback_used": bool(plan_meta.get("fallback_used")),
-                    }
-            except Exception as exc:
-                layout_advice_meta = {
-                    "used": False,
-                    "reason": "layout_plan_v2_exception",
-                    "error": str(exc),
-                }
+                prompt_payload = {}
 
-        merged_payload["segment_map_meta"] = segment_map_meta
-        merged_payload["layout_advice_meta"] = layout_advice_meta
-        if parser_advice:
-            merged_payload["mm_parser_advice"] = parser_advice
-            merged_payload["mm_parser_summary"] = {
-                "heading_groups": len(list(parser_advice.get("heading_groups") or [])),
-                "paragraph_groups": len(list(parser_advice.get("paragraph_groups") or [])),
-                "figure_groups": len(list(parser_advice.get("figure_groups") or [])),
-                "counts": dict(parser_advice.get("counts") or {}),
-                "segment_fallback_used": bool(parser_segment_map),
-            }
-        if parser_meta:
-            merged_payload["mm_parser_meta"] = parser_meta
-
-        self._mm_layout_service.mark_mm_triggered(paper_id=int(paper.id), page=int(page))
-        merged_payload["qwen_plan_meta"] = {
-            "used": bool(layout_advice_meta.get("used")),
-            "layout_model": str(layout_advice_meta.get("model") or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")),
-            "layout_fallback_used": bool(layout_advice_meta.get("fallback_used")),
-            "parser_model": str(parser_meta.get("model") or getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash")),
-            "parser_fallback_used": bool(parser_meta.get("fallback_used")),
-            "source": "document_mind" if has_docmind_structure else "vl_parser",
+        layout_meta = {
+            "paper_id": int(paper.id),
+            "page": int(page),
+            "pipeline": "reader_workbench_v2_strict_4layer",
+            "visual_reference_only": True,
         }
-        merged_payload["mm_assist_meta"] = {
+        if isinstance(prompt_payload.get("layout_meta"), dict):
+            layout_meta.update(dict(prompt_payload.get("layout_meta") or {}))
+            layout_meta["visual_reference_only"] = True
+
+        image_rows = [
+            row
+            for row in list(prompt_payload.get("images") or [])[:1]
+            if isinstance(row, dict)
+        ]
+
+        stage1_payload = {
+            "layout_meta": layout_meta,
+            "images": image_rows,
+            "docmind_layout_digest": list(digest_bundle.layout_digest),
+        }
+        stage1_structural_annotations, stage1_meta = (
+            await self._mm_layout_service.build_stage1_structural_annotations(
+                prompt_payload=stage1_payload,
+                known_layout_ids=list(digest_bundle.known_layout_ids),
+            )
+        )
+
+        stage1_block_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(stage1_structural_annotations.get("blocks") or [])
+            if isinstance(row, dict) and str(row.get("layout_id") or "").strip()
+        }
+        stage2_layout_digest: List[Dict[str, Any]] = []
+        for row in list(digest_bundle.layout_digest):
+            layout_id = str(row.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            anno = dict(stage1_block_map.get(layout_id) or {})
+            stage2_layout_digest.append(
+                {
+                    "layout_id": layout_id,
+                    "bbox": list(row.get("bbox") or [0.0, 0.0, 0.0, 0.0])[:4],
+                    "role": str(anno.get("role") or "unknown"),
+                    "text_preview": self._normalize_spaces(str(row.get("text_preview") or ""))[:200],
+                }
+            )
+
+        allowed_components = [
+            "SectionHeading",
+            "ParagraphProse",
+            "ListBlock",
+            "ContextRail",
+            "FigurePanel",
+            "TablePanel",
+            "KeyTakeaways",
+            "AnswerCard",
+            "CitationLinks",
+            "InlineQuerySlot",
+        ]
+        stage2_payload = {
+            "layout_meta": layout_meta,
+            "images": image_rows,
+            "structural_annotations": dict(stage1_structural_annotations),
+            "layout_digest": stage2_layout_digest,
+            "allowed_components": list(allowed_components),
+        }
+        stage2_design_layout, stage2_meta = await self._mm_layout_service.build_stage2_design_layout(
+            prompt_payload=stage2_payload,
+            known_layout_ids=list(digest_bundle.known_layout_ids),
+            allowed_components=list(allowed_components),
+        )
+        stage2_design_layout = materialize_stage2_plan(stage2_design_layout, digest_bundle)
+
+        block_groups = [
+            row
+            for row in list(page_structure_v3.get("block_groups") or [])
+            if isinstance(row, dict)
+        ]
+        layout_to_block_ids: Dict[str, List[str]] = {}
+        for row in block_groups:
+            layout_id = str(row.get("layout_unique_id") or "").strip()
+            block_id = str(row.get("block_id") or "").strip()
+            canonical_block_id = self._normalize_canonical_block_id(page=page, raw_id=block_id)
+            if not layout_id or not canonical_block_id:
+                continue
+            bucket = layout_to_block_ids.setdefault(layout_id, [])
+            if canonical_block_id not in bucket:
+                bucket.append(canonical_block_id)
+
+        component_to_kind = {
+            "SectionHeading": "heading",
+            "ParagraphProse": "paragraph",
+            "ListBlock": "list_item",
+            "ContextRail": "paragraph",
+            "FigurePanel": "caption",
+            "TablePanel": "caption",
+            "KeyTakeaways": "paragraph",
+            "AnswerCard": "paragraph",
+            "CitationLinks": "paragraph",
+            "InlineQuerySlot": "paragraph",
+        }
+
+        ordered_block_ids: List[str] = []
+        suggested_components: List[Dict[str, Any]] = []
+        stage2_segments: List[Dict[str, Any]] = []
+        for seg_idx, row in enumerate(list(stage2_design_layout.get("page_layout") or []), start=1):
+            if not isinstance(row, dict):
+                continue
+            component = str(row.get("component") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(row.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            source_block_ids: List[str] = []
+            missing_layout_ids: List[str] = []
+            for layout_id in source_layout_ids:
+                mapped = list(layout_to_block_ids.get(layout_id) or [])
+                if not mapped:
+                    missing_layout_ids.append(layout_id)
+                    continue
+                for block_id in mapped:
+                    if block_id not in source_block_ids:
+                        source_block_ids.append(block_id)
+            if missing_layout_ids:
+                raise RenderPipelineContractError(
+                    code="STAGE2_LAYOUT_ID_COVERAGE_MISMATCH",
+                    stage="stage2",
+                    message="Stage2 source_layout_ids cannot be mapped to block_groups",
+                    details={
+                        "missing_layout_ids": missing_layout_ids[:80],
+                        "component": component,
+                    },
+                )
+            if not source_block_ids:
+                continue
+            for block_id in source_block_ids:
+                if block_id not in ordered_block_ids:
+                    ordered_block_ids.append(block_id)
+            suggested_components.append(
+                {
+                    "block_ids": list(source_block_ids),
+                    "component": component,
+                    "source_layout_ids": list(source_layout_ids),
+                    "reason": "stage2_design_layout",
+                    "props": dict(row.get("props") or {}) if isinstance(row.get("props"), dict) else {},
+                }
+            )
+            kind_hint = str(component_to_kind.get(component) or "paragraph")
+            stage2_segments.append(
+                {
+                    "segment_id": f"stage2_seg_{seg_idx:03d}",
+                    "kind": kind_hint,
+                    "kind_hint": kind_hint,
+                    "component_hint": component,
+                    "line_ids": [],
+                    "evidence_line_ids": [],
+                    "word_ids": [],
+                    "char_ranges": [],
+                    "block_ids": list(source_block_ids),
+                    "title": "",
+                    "resolved_text": "",
+                    "sort_order": seg_idx,
+                    "continuation": "none",
+                    "reason": "stage2_design_layout",
+                    "confidence": 0.9,
+                }
+            )
+
+        pipeline_elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        payload["stage1_structural_annotations"] = dict(stage1_structural_annotations)
+        payload["stage2_design_layout"] = dict(stage2_design_layout)
+        payload["pipeline_contract_meta"] = {
+            "used": True,
+            "pipeline": "reader_workbench_v2_strict_4layer",
+            "docmind_truth": True,
+            "visual_reference_only": True,
+            "stage1": dict(stage1_meta or {}),
+            "stage2": dict(stage2_meta or {}),
+            "elapsed_ms": pipeline_elapsed_ms,
+        }
+        payload["layout_advice_v3"] = {
+            "source": "stage2_design_v1",
+            "ordered_block_ids": list(ordered_block_ids),
+            "suggested_components": suggested_components[:240],
+            "grouping_hints": [],
+            "visual_hints": [],
+            "notes": [
+                f"unused_layout_count={len(list(stage2_design_layout.get('unused_layout_ids') or []))}",
+                "visual_reference_only=true",
+            ],
+            "unused_layout_ids": [
+                str(item).strip()
+                for item in list(stage2_design_layout.get("unused_layout_ids") or [])
+                if str(item).strip()
+            ],
+        }
+        payload["segment_map"] = {
+            "source": "stage2_design_v1",
+            "segments": stage2_segments,
+            "counts": {
+                "segment_count": int(len(stage2_segments)),
+                "used_layout_count": int(
+                    len(
+                        {
+                            layout_id
+                            for row in list(stage2_design_layout.get("page_layout") or [])
+                            if isinstance(row, dict)
+                            for layout_id in list(row.get("source_layout_ids") or [])
+                            if str(layout_id).strip()
+                        }
+                    )
+                ),
+                "unused_layout_count": int(len(list(stage2_design_layout.get("unused_layout_ids") or []))),
+            },
+        }
+        payload["segment_map_meta"] = {
+            "used": True,
+            "reason": "stage2_design_layout_applied",
+            "source": "stage2_design_v1",
+            "model": str(stage2_meta.get("model") or ""),
+            "fallback_used": bool(stage2_meta.get("fallback_used")),
+            "error": None,
+        }
+        payload["mm_parser_meta"] = dict(stage1_meta or {})
+        payload["layout_advice_meta"] = {
+            "used": True,
+            "reason": "stage2_design_layout_applied",
+            "source": "stage2_design_v1",
+            "model": str(stage2_meta.get("model") or ""),
+            "fallback_used": bool(stage2_meta.get("fallback_used")),
+            "error": None,
+        }
+        payload["qwen_plan_meta"] = {
+            "used": True,
+            "reason": "strict_stage1_stage2_contract_path",
+            "stage1_model": str(stage1_meta.get("model") or ""),
+            "stage2_model": str(stage2_meta.get("model") or ""),
+            "stage1_fallback_used": bool(stage1_meta.get("fallback_used")),
+            "stage2_fallback_used": bool(stage2_meta.get("fallback_used")),
+            "prompt_version": str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1")),
+            "pipeline_contract": True,
+        }
+        payload["mm_assist_meta"] = {
             "used": True,
             "degraded": False,
-            "reason": "docmind_structure_with_layout_advice" if has_docmind_structure else "parser_applied",
-            "model": str(
-                (layout_advice_meta.get("model") if layout_advice_meta.get("used") else parser_meta.get("model"))
-                or getattr(settings, "reader_mm_layout_model", "qwen3.5-flash")
-            ),
-            "fallback_used": bool(layout_advice_meta.get("fallback_used") or parser_meta.get("fallback_used")),
-            "trigger_reason": list(trigger_meta.get("trigger_reasons") or []),
+            "reason": "strict_stage1_stage2_contract_applied",
+            "model": str(stage2_meta.get("model") or stage1_meta.get("model") or ""),
+            "fallback_used": bool(stage1_meta.get("fallback_used") or stage2_meta.get("fallback_used")),
             "prompt_version": str(getattr(settings, "reader_mm_prompt_version", "mm_layout_v1")),
+            "visual_reference_only": True,
         }
-        return self._ensure_layout_channels(merged_payload)
+        payload["qwen_layout_plan_v2"] = {}
+
+        return self._ensure_layout_channels(payload)
 
     def _build_segment_map_from_parser_advice(
         self,
@@ -1981,7 +3319,6 @@ class LiteratureReaderComposeService:
             and anchor_gate_passed
         )
 
-        # 总分在原四项基础上加入“跨栏拼接率/侧栏召回率”，避免只看文本流畅度。
         overall = (
             0.42 * structure_fidelity
             + 0.23 * readability
@@ -1997,7 +3334,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "schema_validation",
                     "penalty": round(penalty, 4),
-                    "reason": f"发现 {len(validation_errors)} 个结构校验错误",
+                    "reason": f"Found {len(validation_errors)} schema validation issues",
                 }
             )
             overall -= min(0.25, 0.03 * len(validation_errors))
@@ -2006,7 +3343,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "sidebar_leak",
                     "penalty": 0.3,
-                    "reason": "检测到侧栏文本泄漏到正文",
+                    "reason": "Detected sidebar text leakage into main body",
                 }
             )
             overall -= 0.3
@@ -2015,7 +3352,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "title_integrity",
                     "penalty": 0.2,
-                    "reason": "标题完整性不足",
+                    "reason": "Title integrity check failed",
                 }
             )
             overall -= 0.2
@@ -2024,7 +3361,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "cross_column_merge",
                     "penalty": 0.12,
-                    "reason": "疑似跨栏正文拼接",
+                    "reason": "鐤戜技璺ㄦ爮姝ｆ枃鎷兼帴",
                 }
             )
             overall -= 0.12
@@ -2033,7 +3370,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "sidebar_recall",
                     "penalty": 0.1,
-                    "reason": "侧栏保留率过低",
+                    "reason": "Sidebar recall is below threshold",
                 }
             )
             overall -= 0.1
@@ -2042,7 +3379,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "toc_quality",
                     "penalty": 0.08,
-                    "reason": "目录质量不足且未隐藏",
+                    "reason": "TOC quality is below threshold and not hidden",
                 }
             )
             overall -= 0.08
@@ -2051,7 +3388,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "duplicate_content",
                     "penalty": 0.1,
-                    "reason": "正文组件存在较高重复率",
+                    "reason": "Detected high duplicate-content ratio",
                 }
             )
             overall -= 0.1
@@ -2060,7 +3397,7 @@ class LiteratureReaderComposeService:
                 {
                     "item": "anchor_gate",
                     "penalty": 0.12,
-                    "reason": "证据锚点命中率或IoU不达标",
+                    "reason": "Anchor quality gate did not pass",
                 }
             )
             overall -= 0.12
@@ -2068,25 +3405,25 @@ class LiteratureReaderComposeService:
 
         fix_suggestions: List[str] = []
         if sidebar_leak:
-            fix_suggestions.append("优先执行侧栏隔离修复，避免 OPEN ACCESS/Citation 混入正文。")
+            fix_suggestions.append("Prioritize sidebar isolation to prevent OPEN ACCESS/Citation bleed.")
         if not title_integrity:
-            fix_suggestions.append("补齐并校验首个章节标题，确保标题不被并入正文段落。")
+            fix_suggestions.append("Repair heading boundaries and prevent title/body merges.")
         if validation_errors:
-            fix_suggestions.append("执行节点级修复，重新校验 anchor 与组件字段。")
+            fix_suggestions.append("Run node-level repair and re-validate anchors/fields.")
         if readability < 0.72:
-            fix_suggestions.append("执行断词修复与段落分句优化，降低长段落密度。")
+            fix_suggestions.append("Improve paragraph segmentation and line-break cleanup.")
         if evidence_alignment < 0.8:
-            fix_suggestions.append("补充 DOI/URL 对应证据锚点，提升证据对齐度。")
+            fix_suggestions.append("Strengthen evidence alignment for DOI/URL and source anchors.")
         if cross_column_merge_ratio > 0.08:
-            fix_suggestions.append("加强双栏行级分流，降低跨栏拼接比例。")
+            fix_suggestions.append("Improve dual-column separation to reduce cross-column merges.")
         if sidebar_recall < 0.6:
-            fix_suggestions.append("保留并渲染侧栏信息至 ContextRail，而非删除。")
+            fix_suggestions.append("Preserve sidebar content into ContextRail instead of dropping it.")
         if not toc_passed:
-            fix_suggestions.append("仅保留高置信标题生成目录，低质目录直接隐藏。")
+            fix_suggestions.append("Generate TOC only from high-confidence headings; hide low-quality TOC.")
         if duplicate_ratio > 0.1:
-            fix_suggestions.append("对重复正文块去重，保持一个语义段只渲染一次。")
+            fix_suggestions.append("Deduplicate repeated prose blocks to keep one semantic paragraph per render.")
         if not anchor_gate_passed:
-            fix_suggestions.append("未通过证据门禁时仅显示文本，隐藏定位按钮并触发重排。")
+            fix_suggestions.append("Hide jump actions when anchor gate fails and trigger re-layout.")
 
         mm_meta = dict(base_payload.get("mm_assist_meta") or {})
 
@@ -2131,7 +3468,6 @@ class LiteratureReaderComposeService:
     ) -> List[Dict[str, Any]]:
         base_assets = list(base_payload.get("assets") or [])
         dedup: Dict[str, Dict[str, Any]] = {}
-        # 非多模态部署默认关闭外网补图，仅保留 PDF 与文本来源资产。
         allow_external_images = bool(getattr(settings, "reader_external_image_enabled", False))
 
         def _asset_key(item: Dict[str, Any]) -> str:
@@ -2172,7 +3508,6 @@ class LiteratureReaderComposeService:
                         "page": int(page),
                     },
                 }
-                # 外网图片必须包含可追溯来源信息。
                 meta = asset.get("meta") or {}
                 if not (meta.get("source_url") and meta.get("source_domain") and meta.get("license")):
                     continue
@@ -2184,7 +3519,7 @@ class LiteratureReaderComposeService:
                 if str(item.get("kind") or "") != "link":
                     continue
                 href = str(item.get("href") or "")
-                label = str(item.get("label") or "链接")
+                label = str(item.get("label") or "閾炬帴")
                 item["tldr"] = self._build_link_tldr(
                     href=href,
                     label=label,
@@ -2376,7 +3711,7 @@ class LiteratureReaderComposeService:
                 "source_anchor_refs": [],
                 "capabilities": ["copy"],
                 "actions": [
-                    {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
+                    {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
                 ],
                 "layout_slot": {"reserved_height": 200, "lock_height": True},
             }
@@ -2403,14 +3738,12 @@ class LiteratureReaderComposeService:
                 "source_anchor_refs": [],
                 "capabilities": ["copy"],
                 "actions": [
-                    {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
+                    {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
                 ],
                 "layout_slot": {"reserved_height": 220, "lock_height": True},
             }
         )
 
-        # 论文按页阅读默认不渲染目录卡，避免“空目录+占位”打断阅读流。
-        # 如需导航能力，后续应做跨页聚合的大纲侧栏，而不是每页 TOC。
 
         if side_context_blocks:
             side_items = []
@@ -2433,7 +3766,7 @@ class LiteratureReaderComposeService:
                         "id": next_id("context_rail"),
                         "type": "ContextRail",
                         "props": {
-                            "title": "侧栏信息",
+                            "title": "Side Information",
                             "items": side_items,
                             "default_collapsed": True,
                         },
@@ -2463,7 +3796,7 @@ class LiteratureReaderComposeService:
                     "source_anchor_refs": [],
                     "capabilities": ["jump_anchor", "copy", "drag_markdown"],
                     "actions": [
-                        {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
+                        {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
                     ],
                     "layout_slot": {"reserved_height": 180, "lock_height": True},
                 }
@@ -2571,7 +3904,7 @@ class LiteratureReaderComposeService:
                         "source_anchor_refs": anchor_refs,
                         "capabilities": ["copy", "drag_markdown", "jump_anchor"],
                         "actions": [
-                            {"key": "copy_markdown", "label": "复制Markdown", "kind": "default", "payload": {}},
+                            {"key": "copy_markdown", "label": "Copy Markdown", "kind": "default", "payload": {}},
                         ],
                         "layout_slot": {"reserved_height": 260, "lock_height": True},
                     }
@@ -2588,9 +3921,9 @@ class LiteratureReaderComposeService:
                         "column_id": str(block.get("column_id") or "main"),
                         "capabilities": ["copy", "drag_markdown", "inline_query", "jump_anchor"],
                         "actions": [
-                            {"key": "regenerate", "label": "修复", "kind": "default", "payload": {}},
-                            {"key": "degrade", "label": "降级", "kind": "default", "payload": {}},
-                            {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
+                            {"key": "regenerate", "label": "Repair", "kind": "default", "payload": {}},
+                            {"key": "degrade", "label": "Degrade", "kind": "default", "payload": {}},
+                            {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
                         ],
                         "layout_slot": {"reserved_height": 210, "lock_height": False},
                     }
@@ -2623,7 +3956,7 @@ class LiteratureReaderComposeService:
                     "column_id": str(block.get("column_id") or "main"),
                     "capabilities": ["copy", "drag_markdown", "jump_anchor"],
                     "actions": [
-                        {"key": "copy_markdown", "label": "复制Markdown", "kind": "default", "payload": {}},
+                        {"key": "copy_markdown", "label": "Copy Markdown", "kind": "default", "payload": {}},
                     ],
                     "layout_slot": {"reserved_height": 260, "lock_height": True},
                 }
@@ -2717,7 +4050,6 @@ class LiteratureReaderComposeService:
                     node["props"] = props
             patched.append(node)
 
-        # 当标题组件缺失时，从 sections 补齐至少一个。
         has_heading = any(str(item.get("type") or "") == "SectionHeading" for item in patched)
         if not has_heading:
             sections = list(base_payload.get("sections") or [])
@@ -2795,12 +4127,12 @@ class LiteratureReaderComposeService:
         if normalized_action == "degrade":
             node_after = self._build_degraded_node(node_before=node_before, page=int(page))
             quality_delta = -0.02
-            action_message = "已降级为更稳定的展示组件。"
+            action_message = "Node degraded to a safer fallback component."
             patch_type = "node_replace"
         else:
             node_after = self._build_regenerated_node(node_before=node_before)
             quality_delta = 0.04
-            action_message = "已完成节点修复。"
+            action_message = "Node regenerated successfully."
             patch_type = "node_replace"
 
         holder[idx] = node_after
@@ -2875,12 +4207,40 @@ class LiteratureReaderComposeService:
             query_node=node,
             components=components,
         )
+        contract_failure = self._validate_inline_query_contract(
+            page=int(page),
+            query_node=node,
+            target_node=target_node,
+        )
+        if contract_failure:
+            return {
+                "disabled": True,
+                "disabled_reason": contract_failure,
+                "message": "Inline query contract validation failed.",
+            }
         anchor_refs = self._resolve_inline_query_anchors(
             query_node=node,
             target_node=target_node,
             components=components,
             page=int(page),
         )
+        if not anchor_refs:
+            return {
+                "disabled": True,
+                "disabled_reason": "inline_query_missing_source_anchor_refs",
+                "message": "Inline query source anchors are required.",
+            }
+        source_block_ids = self._extract_inline_query_source_block_ids(
+            page=int(page),
+            query_node=node,
+            target_node=target_node,
+        )
+        if not source_block_ids:
+            return {
+                "disabled": True,
+                "disabled_reason": "inline_query_missing_source_block_ids",
+                "message": "Inline query source block IDs are required.",
+            }
         context_text = self._build_inline_query_context(
             query_node=node,
             target_node=target_node,
@@ -2902,9 +4262,10 @@ class LiteratureReaderComposeService:
             },
             "children": [],
             "source_anchor_refs": anchor_refs[:3],
+            "source_block_ids": source_block_ids[:12],
             "capabilities": ["copy", "jump_anchor", "drag_markdown"],
             "actions": [
-                {"key": "copy", "label": "复制", "kind": "default", "payload": {}},
+                {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
             ],
             "layout_slot": {"reserved_height": 220, "lock_height": False},
         }
@@ -2917,6 +4278,7 @@ class LiteratureReaderComposeService:
                     "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
                     "start_char": self._safe_int(anchor.get("start_char"), 0),
                     "end_char": self._safe_int(anchor.get("end_char"), 0),
+                    "quote": str(anchor.get("quote") or anchor.get("quote_text") or "")[:240] or None,
                     "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
                 }
             )
@@ -2932,12 +4294,14 @@ class LiteratureReaderComposeService:
         compact_question = self._normalize_spaces(question)
         compact_context = self._normalize_spaces(context_text)
         if not compact_context:
-            compact_context = "当前节点缺少可提取正文，请先定位到证据后再提问。"
+            compact_context = "Current node has limited textual evidence."
         prompt = (
-            "你是论文阅读助手。请只基于给定上下文回答，不要编造。\n"
-            "当前模型为文本模式，不具备图像理解能力；不得基于图片内容做推断。\n"
-            "输出中文，格式固定为两句：第一句“结论：...”，第二句“证据：...”。\n"
-            "若上下文不足，明确写“结论：当前证据不足以回答”。\n"
+            "You are a literature reading assistant.\n"
+            "Answer strictly from the provided context. Do not fabricate.\n"
+            "Output in exactly two Chinese sentences:\n"
+            "1) 结论：...\n"
+            "2) 证据：...\n"
+            "If evidence is insufficient, explicitly answer: 结论：当前证据不足以回答。\n"
             f"问题：{compact_question}\n"
             f"范围：{scope}\n"
             f"上下文：{compact_context[:2200]}"
@@ -2955,8 +4319,8 @@ class LiteratureReaderComposeService:
         except Exception as exc:
             logger.debug(f"[ReaderComposeService] inline answer generation failed: {exc}")
         return (
-            f"结论：暂时无法从当前上下文完整回答“{compact_question}”。"
-            "证据：请先点击“定位到证据”核对原文后再追问。"
+            f"结论：当前无法基于现有上下文完整回答“{compact_question}”。"
+            "证据：请先定位到原文证据后再追问。"
         )
 
     async def _apply_overlay_for_user(
@@ -3109,7 +4473,7 @@ class LiteratureReaderComposeService:
                 "source_anchor_refs": anchor_refs,
                 "capabilities": ["copy", "jump_anchor", "drag_markdown"],
                 "actions": [
-                    {"key": "regenerate", "label": "修复", "kind": "default", "payload": {}},
+                    {"key": "regenerate", "label": "Repair", "kind": "default", "payload": {}},
                 ],
                 "layout_slot": {"reserved_height": 200, "lock_height": False},
             }
@@ -3117,8 +4481,8 @@ class LiteratureReaderComposeService:
             "id": str(node_before.get("id") or f"degrade_{uuid.uuid4().hex[:8]}"),
             "type": "PdfSnippetCard",
             "props": {
-                "title": "已降级为原文片段",
-                "description": "当前节点无法稳定解析，建议切换 PDF 模式核对原文。",
+                "title": "Degraded to Original Snippet",
+                "description": "当前节点无法稳定解析，建议切换到 PDF 模式核对原文。",
                 "page": int(page),
             },
             "children": [],
@@ -3162,6 +4526,63 @@ class LiteratureReaderComposeService:
                         text_parts.append(value)
         return " ".join(text_parts).strip()
 
+    def _extract_inline_query_source_block_ids(
+        self,
+        *,
+        page: int,
+        query_node: Dict[str, Any],
+        target_node: Dict[str, Any],
+    ) -> List[str]:
+        output: List[str] = []
+        for node in (target_node, query_node):
+            for raw in list((node or {}).get("source_block_ids") or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(raw))
+                if canonical and canonical not in output:
+                    output.append(canonical)
+            for anchor in list((node or {}).get("source_anchor_refs") or []):
+                if not isinstance(anchor, dict):
+                    continue
+                canonical = self._normalize_canonical_block_id(
+                    page=page,
+                    raw_id=str(anchor.get("canonical_block_id") or ""),
+                )
+                if canonical and canonical not in output:
+                    output.append(canonical)
+        return output
+
+    def _validate_inline_query_contract(
+        self,
+        *,
+        page: int,
+        query_node: Dict[str, Any],
+        target_node: Dict[str, Any],
+    ) -> str:
+        target_type = str((target_node or {}).get("type") or "").strip()
+        if target_type not in INLINE_QUERY_SUPPORTED_NODE_TYPES:
+            return "inline_query_unsupported_node_type"
+        source_block_ids = self._extract_inline_query_source_block_ids(
+            page=page,
+            query_node=query_node,
+            target_node=target_node,
+        )
+        if not source_block_ids:
+            return "inline_query_missing_source_block_ids"
+        source_anchors = list((target_node or {}).get("source_anchor_refs") or []) or list(
+            (query_node or {}).get("source_anchor_refs") or []
+        )
+        if not source_anchors:
+            return "inline_query_missing_source_anchor_refs"
+        for anchor in source_anchors:
+            if not isinstance(anchor, dict):
+                continue
+            page_num = self._safe_int(anchor.get("page"), 0)
+            start_char = self._safe_int(anchor.get("start_char"), -1)
+            end_char = self._safe_int(anchor.get("end_char"), -1)
+            quote = self._normalize_spaces(str(anchor.get("quote") or anchor.get("quote_text") or ""))
+            if page_num >= 1 and start_char >= 0 and end_char > start_char and quote:
+                return ""
+        return "inline_query_invalid_source_anchor_shape"
+
     def _resolve_inline_query_target_node(
         self,
         *,
@@ -3195,14 +4616,14 @@ class LiteratureReaderComposeService:
                 normalized_row = self._normalize_anchor_ref(
                     anchor=row,
                     page=page,
-                    quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                    quote_text=str((row or {}).get("quote") or (row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
                 )
                 if normalized_row:
+                    normalized_row["quote"] = str(normalized_row.get("quote") or normalized_row.get("quote_text") or "").strip() or None
                     normalized.append(normalized_row)
             if normalized:
                 return normalized[:3]
 
-        # 若当前节点没有锚点，则退化为邻近正文节点锚点，保证问答可追溯。
         flat_nodes = self._flatten_components(components)
         target_id = str(target_node.get("id") or "")
         anchor_candidates: List[Dict[str, Any]] = []
@@ -3218,9 +4639,10 @@ class LiteratureReaderComposeService:
                 normalized_row = self._normalize_anchor_ref(
                     anchor=row,
                     page=page,
-                    quote_text=str((row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
+                    quote_text=str((row or {}).get("quote") or (row or {}).get("quote_text") or "") if isinstance(row, dict) else "",
                 )
                 if normalized_row:
+                    normalized_row["quote"] = str(normalized_row.get("quote") or normalized_row.get("quote_text") or "").strip() or None
                     anchor_candidates.append(normalized_row)
             if anchor_candidates:
                 break
@@ -3267,7 +4689,7 @@ class LiteratureReaderComposeService:
             if snippet:
                 nearby_snippets.append(snippet)
         if nearby_snippets:
-            context_parts.append(f"相邻上下文：{' '.join(nearby_snippets[:3])}")
+            context_parts.append(f"鐩搁偦涓婁笅鏂囷細{' '.join(nearby_snippets[:3])}")
 
         anchors = self._resolve_inline_query_anchors(
             query_node=query_node,
@@ -3276,7 +4698,7 @@ class LiteratureReaderComposeService:
             page=page,
         )
         anchor_quotes = [
-            self._normalize_spaces(str(item.get("quote_text") or ""))
+            self._normalize_spaces(str(item.get("quote") or item.get("quote_text") or ""))
             for item in anchors
             if isinstance(item, dict)
         ]
@@ -3319,7 +4741,6 @@ class LiteratureReaderComposeService:
         kb_sig: Dict[str, Any] = {"id": 0, "doc_updated": "none"}
         kb_id = int(selected_kb_id) if selected_kb_id else 0
         if kb_id > 0:
-            # 签名中的知识库信息必须限制在当前用户可见范围，避免跨租户信息侧漏。
             owned_kb_id = (
                 await db.execute(
                     select(KnowledgeBase.id).where(
@@ -3365,6 +4786,8 @@ class LiteratureReaderComposeService:
             or "compose_layout_llm_v1"
         )
         assembly_max_blocks = int(getattr(settings, "reader_compose_layout_llm_max_blocks", 80) or 80)
+        pipeline_mode = self._pipeline_mode()
+        pipeline_version = self._pipeline_version()
 
         signature_payload = {
             "engine": COMPOSE_ENGINE_VERSION,
@@ -3372,6 +4795,8 @@ class LiteratureReaderComposeService:
             "prompt": COMPOSE_AGENT_PROMPT_VERSION,
             "asset": COMPOSE_ASSET_POLICY_VERSION,
             "layout_schema": layout_schema_version,
+            "pipeline_mode": pipeline_mode,
+            "pipeline_version": pipeline_version,
             "paper_id": int(paper.id),
             "pdf": pdf_sig,
             "kb": kb_sig,
@@ -3399,6 +4824,8 @@ class LiteratureReaderComposeService:
         signature = (
             f"compose_v3|p:{int(paper.id)}|kb:{int(kb_sig.get('id') or 0)}|"
             f"m:{int(pdf_sig.get('mtime') or 0)}|s:{int(pdf_sig.get('size') or 0)}|"
+            f"pm:{pipeline_mode}|"
+            f"pv:{pipeline_version}|"
             f"mode:{normalized_style_intent}/{theme_part}/{detail_part}/{int(bool(compare_mode))}/{int(bool(citation_tldr))}|"
             f"h:{digest[:24]}"
         )
@@ -3468,8 +4895,6 @@ class LiteratureReaderComposeService:
         current_payload: Dict[str, Any],
         detail_level: str,
     ) -> List[Dict[str, Any]]:
-        # 使用上一页/当前页/下一页构造要点上下文，降低单页截断造成的语义断裂。
-        # 注意：这里只是补充语境，最终提炼目标仍是当前页。
         context_rows: List[Tuple[int, Dict[str, Any]]] = [(int(page), dict(current_payload))]
         neighbor_pages = [int(page) - 1, int(page) + 1]
         for neighbor in neighbor_pages:
@@ -3498,7 +4923,6 @@ class LiteratureReaderComposeService:
             blocks = list(payload.get("blocks") or [])
             if not raw_text and not blocks:
                 continue
-            # 只携带结构化结果，避免把邻页原始文本无上限地塞入提示词。
             context_rows.append((int(neighbor), dict(payload)))
 
         context_rows = sorted(context_rows, key=lambda item: item[0])
@@ -3525,7 +4949,6 @@ class LiteratureReaderComposeService:
             )
             if not blocks:
                 continue
-            # 当前页放宽采样，邻页收紧采样，保证“当前页主导”的提示词结构。
             per_page_limit = 18 if int(row_page) == int(current_page) else 8
             collected = 0
             for idx, block in enumerate(blocks):
@@ -3533,7 +4956,6 @@ class LiteratureReaderComposeService:
                     break
                 if str(block.get("zone_type") or "main_body") != "main_body":
                     continue
-                # 这里只抽“标题/段落/列表”三类正文块，避免把资源卡、元数据卡混进要点提示。
                 kind = str(block.get("kind") or "")
                 if kind not in {"heading", "paragraph", "list_item"}:
                     continue
@@ -3568,21 +4990,20 @@ class LiteratureReaderComposeService:
 
         level_hint = {
             "concise": "建议偏少且聚焦，常见 2-4 条。",
-            "deep": "允许更细颗粒，常见 4-8 条。",
+            "deep": "允许更细粒度，常见 4-8 条。",
         }.get(str(detail_level or "standard"), "通常 3-6 条即可。")
 
         prompt = (
             "你是科研论文阅读助手。\n"
-            "你正在处理论文“单页要点提炼”任务。\n"
-            "任务：根据上一页、当前页、下一页候选块，总结当前页关键要点。\n"
+            "任务：基于上一页、当前页、下一页候选块，总结当前页关键要点。\n"
             "规则：\n"
-            "1) 只提炼“当前页”核心信息；相邻页仅用于理解上下文，不作为核心结论来源。\n"
-            "2) 由你自主决定要点数量，不固定条数。"
+            "1) 仅输出“当前页”核心信息；相邻页只用于上下文理解。\n"
+            "2) 你可以自主决定要点条数，不固定。\n"
             f"{level_hint}\n"
-            "3) 每条都要简洁中文完整句，不要省略号，不要照抄长段原文。\n"
-            "4) 避免空泛句式（如“本文研究了…”、“论文介绍了…”），要保留具体事实。\n"
-            "5) 不输出定位信息，不输出证据 ID，不输出解释文本。\n"
-            "6) 只输出 JSON，不要解释。\n"
+            "3) 每条为简洁完整中文句子，不要省略号，不要抄长段原文。\n"
+            "4) 保留具体事实，避免空泛句式。\n"
+            "5) 不输出定位信息，不输出证据 ID，不输出解释性废话。\n"
+            "6) 仅输出 JSON。\n"
             "输出格式：\n"
             "{\"items\":[{\"text\":\"...\"}]}\n"
             f"当前页: {int(current_page)}\n"
@@ -3675,13 +5096,11 @@ class LiteratureReaderComposeService:
         if normalized_rows:
             return normalized_rows
 
-        # 回退路径：若 LLM 概括失败，仍基于摘要拆句给出可读要点，避免整块文本+省略号。
-        # 这里仅做兜底，不追求语义最优，优先保证页面可用。
         summary = self._normalize_spaces(str(fallback_summary or ""))
         summary = re.sub(r"(?:\.\.\.|…)+$", "", summary).strip()
         if not summary:
             return []
-        parts = [item.strip() for item in re.split(r"[。！？!?;；\.]+\s*", summary) if item.strip()]
+        parts = [item.strip() for item in re.split(r"[。！？!?;；.]+\s*", summary) if item.strip()]
         if detail_level == "concise":
             parts = parts[:3]
         elif detail_level == "deep":
@@ -5239,10 +6658,11 @@ class LiteratureReaderComposeService:
         return f"p{int(page)}_{token}"
 
     @staticmethod
+    @staticmethod
     def _build_caption_insight(caption: str) -> str:
         text = str(caption or "").strip()
         if not text:
-            return "该图表用于补充论文当前页面的关键论点。"
+            return "该图表用于补充当前页面的关键论点。"
         return f"AI 解读：该图注强调“{text[:80]}”，建议结合对应证据锚点核对结论。"
 
     @staticmethod
@@ -5250,7 +6670,7 @@ class LiteratureReaderComposeService:
         seed = str(summary or "").strip()
         if not seed:
             return [
-                {"title": "共识点", "content": "当前页与知识库文献在核心任务定义上具备可比性。"},
+                {"title": "共识点", "content": "当前页与知识库文献在核心任务定义上具有可比性。"},
                 {"title": "差异点", "content": "实验设置和样本边界可能不同，建议查看方法章节细节。"},
             ]
         return [
@@ -5263,13 +6683,12 @@ class LiteratureReaderComposeService:
         normalized_href = str(href or "").strip().lower()
         normalized_label = str(label or "").strip()
         paper_doi = str(paper.doi or "").strip().lower()
-        # 仅在 DOI 非空时再做子串匹配，避免空字符串导致全部链接被识别成 DOI。
+        # Only perform DOI substring match when DOI is non-empty.
         if "doi.org" in normalized_href or (paper_doi and paper_doi in normalized_href):
-            return "TL;DR：该链接是论文正式标识入口，可用于快速核对题目、期刊与年份信息。"
+            return "TL;DR：该链接是论文正式标识入口，可用于快速核对题目、期刊与年份。"
         if "arxiv.org" in normalized_href:
             return "TL;DR：该链接可查看预印本版本，适合核查方法细节和补充材料。"
         return f"TL;DR：{normalized_label or '该资源'}用于补充当前页上下文，建议结合证据锚点阅读。"
-
     @staticmethod
     def _normalize_theme_mode(raw: Optional[str]) -> str:
         value = str(raw or "light").strip().lower()
@@ -5361,7 +6780,6 @@ class LiteratureReaderComposeService:
 
                 node_type = str(node.get("type") or "").strip()
                 if node_type not in COMPONENT_WHITELIST:
-                    # 非白名单组件统一降级为正文段落，防止前端渲染未知组件报错。
                     node_type = "ParagraphProse"
                     node["type"] = node_type
                     raw_props = node.get("props") if isinstance(node.get("props"), dict) else {}
@@ -5371,7 +6789,7 @@ class LiteratureReaderComposeService:
 
                 node_id = str(node.get("id") or "").strip()
                 if not node_id or node_id in seen_ids:
-                    # 缺失或重复 id 都会导致节点动作与 patch 不稳定，这里统一重建。
+                    # 缂哄け鎴栭噸澶?id 閮戒細瀵艰嚧鑺傜偣鍔ㄤ綔涓?patch 涓嶇ǔ瀹氾紝杩欓噷缁熶竴閲嶅缓銆?
                     node_id = _next_id(node_type)
                 node["id"] = node_id
                 seen_ids.add(node_id)
@@ -5465,18 +6883,16 @@ class LiteratureReaderComposeService:
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(anchor, dict):
             return None
-        # composed 按页构建，锚点页号强制与当前页一致，避免跨页锚点污染评分与定位。
+        # composed 鎸夐〉鏋勫缓锛岄敋鐐归〉鍙峰己鍒朵笌褰撳墠椤典竴鑷达紝閬垮厤璺ㄩ〉閿氱偣姹℃煋璇勫垎涓庡畾浣嶃€?
         page_no = self._safe_int(page, 1)
         start_char = self._safe_int(anchor.get("start_char"), 0)
         if start_char < 0:
             start_char = 0
         end_char = self._safe_int(anchor.get("end_char"), 0)
-        normalized_quote = self._normalize_spaces(str(quote_text or anchor.get("quote_text") or ""))
-        # 当 end_char 无效时，用 quote 长度推断一个保守跨度，尽量保证证据可定位。
+        normalized_quote = self._normalize_spaces(str(quote_text or anchor.get("quote") or anchor.get("quote_text") or ""))
         fallback_span = max(1, min(3200, len(normalized_quote) or 120))
         if end_char <= start_char:
             end_char = start_char + fallback_span
-        # 限制跨度上限，避免“整页高亮”影响证据可读性与信任感。
         if end_char - start_char > 12000:
             end_char = start_char + 12000
         canonical_raw = str(
@@ -5516,6 +6932,7 @@ class LiteratureReaderComposeService:
             "page": page_no,
             "start_char": start_char,
             "end_char": end_char,
+            "quote": normalized_quote[:280] if normalized_quote else None,
             "quote_text": normalized_quote[:280] if normalized_quote else None,
             "canonical_block_id": canonical_block_id or None,
             "coord_version": coord_version,
@@ -5562,19 +6979,17 @@ class LiteratureReaderComposeService:
         return output
 
     def _ensure_layout_channels(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """补齐三通道字段，保证后续渲染链路稳定。"""
+        """Ensure all three layout channels exist for downstream rendering."""
         cloned = dict(payload)
         blocks = list(cloned.get("blocks") or [])
         side_context_blocks = list(cloned.get("side_context_blocks") or [])
         figure_meta_blocks = list(cloned.get("figure_meta_blocks") or [])
 
         if not side_context_blocks:
-            # 兼容旧 payload：若未提前拆分侧栏，这里按 zone_type 兜底回填。
             side_context_blocks = [
                 item for item in blocks if str((item or {}).get("zone_type") or "") == "side_context"
             ]
         if not figure_meta_blocks:
-            # 兼容旧 payload：图注/图表元信息未拆分时同步兜底。
             figure_meta_blocks = [
                 item for item in blocks if str((item or {}).get("zone_type") or "") == "figure_meta"
             ]
@@ -5628,7 +7043,7 @@ class LiteratureReaderComposeService:
         blocks: Sequence[Dict[str, Any]],
         page: int,
     ) -> List[Dict[str, Any]]:
-        """预处理提取块：先修复断词，再合并被拆开的连续标题行。"""
+        """Preprocess extracted blocks for rendering."""
         normalized: List[Dict[str, Any]] = []
         for raw in blocks:
             if not isinstance(raw, dict):
@@ -5922,7 +7337,7 @@ class LiteratureReaderComposeService:
         return False
 
     def _estimate_cross_column_merge_ratio(self, *, base_payload: Dict[str, Any]) -> float:
-        """估算跨栏误拼接比例（仅用于质量评估，不影响锚点真值）。"""
+        """Estimate cross-column merge ratio for quality scoring."""
         style_cues = dict(base_payload.get("style_cues") or {})
         layout_mode = str(style_cues.get("layout_mode") or "")
         if layout_mode != "two_column":
@@ -5954,7 +7369,6 @@ class LiteratureReaderComposeService:
         title = self._normalize_spaces(str((header_nodes[0].get("props") or {}).get("title") or ""))
         if len(title) < 12:
             return False
-        # 头部标题足够长且词元充足时，直接视为标题完整，避免被噪声 heading 误伤。
         title_words = [w for w in re.findall(r"[A-Za-z]{3,}", title.lower()) if w]
         if len(title_words) >= 5 and all(marker not in title.lower() for marker in _GENERIC_HEADING_MARKERS):
             return True
@@ -5980,7 +7394,6 @@ class LiteratureReaderComposeService:
         if hits >= 2:
             return True
 
-        # 若头部元数据标题质量不高，则允许正文标题节点作为完整性校验依据。
         heading_nodes = [
             self._normalize_spaces(str((item.get("props") or {}).get("text") or "")).lower()
             for item in nodes
@@ -6007,7 +7420,7 @@ class LiteratureReaderComposeService:
             value = int(raw) if raw is not None else DEFAULT_LATENCY_BUDGET_MS
         except Exception:
             value = DEFAULT_LATENCY_BUDGET_MS
-        return max(1200, min(value, 25000))
+        return max(1200, min(value, MAX_LATENCY_BUDGET_MS))
 
     @staticmethod
     def _normalize_max_iterations(raw: Optional[int]) -> int:
@@ -6024,6 +7437,273 @@ class LiteratureReaderComposeService:
         except Exception:
             value = DEFAULT_QUALITY_TARGET
         return max(0.6, min(value, 0.97))
+
+    def _build_validation_report(
+        self,
+        *,
+        quality_report: Dict[str, Any],
+        minimal_gate_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        def _gate(passed: bool, code: str) -> Dict[str, Any]:
+            return {"passed": bool(passed), "errors": [] if bool(passed) else [str(code)]}
+
+        gates = {
+            "id_integrity": _gate(bool(minimal_gate_report.get("schema_valid")), "id_integrity_failed"),
+            "full_coverage": _gate(bool(minimal_gate_report.get("full_coverage")), "full_coverage_failed"),
+            "whitelist_only": _gate(bool(minimal_gate_report.get("whitelist_valid")), "whitelist_only_failed"),
+            "ownership_unchanged": _gate(bool(minimal_gate_report.get("ownership_unchanged")), "ownership_unchanged_failed"),
+            "non_empty_plan_for_non_empty_input": _gate(
+                bool(minimal_gate_report.get("non_empty_plan_for_non_empty_input")),
+                "non_empty_plan_for_non_empty_input_failed",
+            ),
+            "source_text_immutable": _gate(
+                bool(minimal_gate_report.get("source_text_immutable", True)),
+                "source_text_immutable_failed",
+            ),
+        }
+        passed = all(bool((row or {}).get("passed")) for row in gates.values())
+        errors = [
+            str(item)
+            for item in list(quality_report.get("validation_errors") or [])
+            if str(item).strip()
+        ]
+        if not passed:
+            errors.extend([name for name, row in gates.items() if not bool((row or {}).get("passed"))])
+        return {"passed": bool(passed), "gates": gates, "errors": list(dict.fromkeys(errors))}
+
+    def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cloned = dict(payload or {})
+        ui_plan = dict(cloned.get("ui_plan") or {})
+        ui_plan["components"] = self._ensure_source_block_ids_on_nodes(
+            page=page,
+            nodes=[row for row in list(ui_plan.get("components") or []) if isinstance(row, dict)],
+        )
+        cloned["ui_plan"] = ui_plan
+
+        quality_report = dict(cloned.get("quality_report") or {})
+        validation_report = dict(cloned.get("validation_report") or {})
+        if not isinstance(validation_report.get("gates"), dict):
+            validation_report = self._build_validation_report(
+                quality_report=quality_report,
+                minimal_gate_report=dict(cloned.get("minimal_gate_report") or {}),
+            )
+        cloned["validation_report"] = validation_report
+
+        main_block_ids, aux_block_ids = self._partition_main_aux_block_ids(
+            page=page,
+            base_payload=cloned,
+            ui_plan=ui_plan,
+        )
+        cloned["main_block_ids"] = list(cloned.get("main_block_ids") or main_block_ids)
+        cloned["aux_block_ids"] = list(cloned.get("aux_block_ids") or aux_block_ids)
+
+        status_value = str(cloned.get("status") or "").strip().lower()
+        if status_value not in {"done", "fallback"}:
+            status_value = "done" if bool(validation_report.get("passed")) else "fallback"
+        cloned["status"] = status_value
+        degraded_reason = str(cloned.get("degraded_reason") or "").strip()
+        if status_value == "done":
+            degraded_reason = ""
+        elif not degraded_reason:
+            degraded_reason = str(quality_report.get("stop_reason") or "validator_non_converged").strip() or "validator_non_converged"
+        cloned["degraded_reason"] = degraded_reason
+        return cloned
+
+    def _ensure_source_block_ids_on_nodes(
+        self,
+        *,
+        page: int,
+        nodes: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        for raw in list(nodes or []):
+            if not isinstance(raw, dict):
+                continue
+            node = dict(raw)
+            existing = [
+                self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                for item in list(node.get("source_block_ids") or [])
+                if self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            ]
+            if not existing:
+                from_anchor = []
+                for anchor in list(node.get("source_anchor_refs") or []):
+                    if not isinstance(anchor, dict):
+                        continue
+                    canonical = self._normalize_canonical_block_id(
+                        page=page,
+                        raw_id=str(anchor.get("canonical_block_id") or ""),
+                    )
+                    if canonical and canonical not in from_anchor:
+                        from_anchor.append(canonical)
+                existing = from_anchor
+            node["source_block_ids"] = existing
+            node["children"] = self._ensure_source_block_ids_on_nodes(
+                page=page,
+                nodes=[row for row in list(node.get("children") or []) if isinstance(row, dict)],
+            )
+            output.append(node)
+        return output
+
+    def _collect_known_block_ids(self, *, page: int, base_payload: Dict[str, Any]) -> List[str]:
+        ordered: List[str] = []
+        seen: set[str] = set()
+        page_structure_v3 = dict((base_payload or {}).get("page_structure_v3") or {})
+        for row in list(page_structure_v3.get("block_groups") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
+            if canonical and canonical not in seen:
+                seen.add(canonical)
+                ordered.append(canonical)
+        for row in list((base_payload or {}).get("blocks") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("id") or ""))
+            if canonical and canonical not in seen:
+                seen.add(canonical)
+                ordered.append(canonical)
+        return ordered
+
+    def _partition_main_aux_block_ids(
+        self,
+        *,
+        page: int,
+        base_payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Tuple[List[str], List[str]]:
+        known = self._collect_known_block_ids(page=page, base_payload=base_payload)
+        known_set = set(known)
+        main_candidates: List[str] = []
+        components = [row for row in list((ui_plan or {}).get("components") or []) if isinstance(row, dict)]
+        for node in self._flatten_components(components):
+            for raw in list(node.get("source_block_ids") or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(raw))
+                if canonical and canonical not in main_candidates:
+                    main_candidates.append(canonical)
+            for anchor in list(node.get("source_anchor_refs") or []):
+                if not isinstance(anchor, dict):
+                    continue
+                canonical = self._normalize_canonical_block_id(
+                    page=page,
+                    raw_id=str(anchor.get("canonical_block_id") or ""),
+                )
+                if canonical and canonical not in main_candidates:
+                    main_candidates.append(canonical)
+
+        if known:
+            main_block_ids = [item for item in main_candidates if item in known_set]
+            aux_block_ids = [item for item in known if item not in set(main_block_ids)]
+            return main_block_ids, aux_block_ids
+
+        deduped_main: List[str] = []
+        seen_main: set[str] = set()
+        for item in main_candidates:
+            if item in seen_main:
+                continue
+            seen_main.add(item)
+            deduped_main.append(item)
+        return deduped_main, []
+
+    async def _build_force_refresh_timeout_fallback_payload(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        source_signature: str,
+        pipeline_version: str,
+    ) -> Dict[str, Any]:
+        base_payload, _ = await self._reader_service.build_or_get_page_payload(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            selected_kb_id=selected_kb_id,
+            force_refresh=False,
+            style_hint=None,
+            prefer_agent=False,
+            publish_ready_event_enabled=False,
+        )
+        ui_plan = self._build_initial_ui_plan(
+            paper=paper,
+            page=int(page),
+            base_payload=base_payload,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+        )
+        main_block_ids, aux_block_ids = self._partition_main_aux_block_ids(
+            page=int(page),
+            base_payload=base_payload,
+            ui_plan=ui_plan,
+        )
+        validation_report = {
+            "passed": False,
+            "gates": {
+                "id_integrity": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+                "full_coverage": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+                "whitelist_only": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+                "ownership_unchanged": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+                "non_empty_plan_for_non_empty_input": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+                "source_text_immutable": {"passed": False, "errors": ["force_refresh_lock_timeout"]},
+            },
+            "errors": ["force_refresh_lock_timeout"],
+        }
+        return {
+            "paper_id": int(paper.id),
+            "page": int(page),
+            "status": "fallback",
+            "degraded_reason": "force_refresh_lock_timeout",
+            "pipeline_version": str(pipeline_version or SIMPLIFIED_PIPELINE_VERSION_DEFAULT),
+            "engine_version": COMPOSE_ENGINE_VERSION,
+            "source_signature": str(source_signature),
+            "build_mode": "compose_agent_simplified",
+            "ui_plan": ui_plan,
+            "assets": [],
+            "quality_report": {
+                "overall": 0.0,
+                "hard_constraints_passed": False,
+                "validation_errors": ["force_refresh_lock_timeout"],
+                "iterations": 0,
+                "degraded": True,
+                "stop_reason": "force_refresh_lock_timeout",
+                "quality_target": DEFAULT_QUALITY_TARGET,
+                "latency_budget_ms": DEFAULT_LATENCY_BUDGET_MS,
+            },
+            "iteration_trace": [],
+            "main_block_ids": main_block_ids,
+            "aux_block_ids": aux_block_ids,
+            "validation_report": validation_report,
+            "repair_report": {
+                "rounds": 0,
+                "used": False,
+                "reason": "force_refresh_lock_timeout",
+                "step_metrics": [],
+            },
+            "asset_policy": {
+                "pdf_first": True,
+                "web_fallback": False,
+                "max_external_images": 0,
+                "version": COMPOSE_ASSET_POLICY_VERSION,
+            },
+            "layout_channels": dict((base_payload or {}).get("layout_channels") or {}),
+            "mm_assist_meta": dict((base_payload or {}).get("mm_assist_meta") or {}),
+            "parser_chain_meta": dict((base_payload or {}).get("parser_chain_meta") or {}),
+            "docmind_meta": dict((base_payload or {}).get("docmind_meta") or {}),
+            "docmind_structure": dict((base_payload or {}).get("docmind_structure") or {}),
+            "page_structure_v3": dict((base_payload or {}).get("page_structure_v3") or {}),
+            "generated_at": datetime.utcnow().isoformat(),
+            "overlay_applied": False,
+            "overlay_count": 0,
+        }
 
     async def _read_payload_from_db(
         self,
@@ -6147,16 +7827,131 @@ class LiteratureReaderComposeService:
             pass
 
     @staticmethod
+    def _is_legacy_compose_cache_key(key: str) -> bool:
+        token = str(key or "")
+        if token.startswith(f"{REDIS_KEY_PREFIX}:v2:"):
+            return False
+        if token.startswith(f"{REDIS_LOCK_PREFIX}:v2:"):
+            return False
+        return token.startswith(REDIS_KEY_PREFIX) or token.startswith(REDIS_LOCK_PREFIX)
+
+    async def _scan_legacy_compose_cache_keys(self, *, client: Any, scan_count: int) -> List[str]:
+        cursor = 0
+        output: List[str] = []
+        batch_size = max(10, int(scan_count))
+        while True:
+            cursor, keys = await client.scan(cursor=cursor, match=LEGACY_CACHE_SCAN_MATCH, count=batch_size)
+            for raw in list(keys or []):
+                key = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                if self._is_legacy_compose_cache_key(key):
+                    output.append(key)
+            if cursor == 0:
+                break
+        return output
+
+    async def cleanup_legacy_cache_keys(
+        self,
+        *,
+        dry_run: bool = False,
+        timeout_seconds: int = 120,
+        scan_count: int = 200,
+    ) -> Dict[str, Any]:
+        started = time.perf_counter()
+        report: Dict[str, Any] = {
+            "scanned_keys": 0,
+            "deleted_keys": 0,
+            "error_count": 0,
+            "duration_ms": 0,
+            "remaining_old_keys": 0,
+            "dry_run": bool(dry_run),
+        }
+        client = await self._get_redis_client()
+        if client is None:
+            report["error_count"] = 1
+            report["remaining_old_keys"] = -1
+            report["message"] = "redis_unavailable"
+            report["duration_ms"] = int((time.perf_counter() - started) * 1000)
+            return report
+
+        lock_token = f"cleanup:{uuid.uuid4().hex}"
+        timeout = max(30, int(timeout_seconds))
+        acquired = False
+        try:
+            acquired = bool(await client.set(CLEANUP_LOCK_KEY, lock_token, nx=True, ex=timeout))
+            if not acquired:
+                report["error_count"] = 1
+                report["remaining_old_keys"] = -1
+                report["message"] = "cleanup_lock_not_acquired"
+                return report
+
+            old_keys = await asyncio.wait_for(
+                self._scan_legacy_compose_cache_keys(client=client, scan_count=scan_count),
+                timeout=max(5, timeout),
+            )
+            report["scanned_keys"] = int(len(old_keys))
+            if not dry_run and old_keys:
+                for key in old_keys:
+                    try:
+                        deleted = await client.delete(key)
+                        if int(deleted or 0) > 0:
+                            report["deleted_keys"] = int(report["deleted_keys"]) + 1
+                    except Exception:
+                        report["error_count"] = int(report["error_count"]) + 1
+
+            remaining = await self._scan_legacy_compose_cache_keys(client=client, scan_count=scan_count)
+            report["remaining_old_keys"] = int(len(remaining))
+            return report
+        except asyncio.TimeoutError:
+            report["error_count"] = int(report["error_count"]) + 1
+            report["remaining_old_keys"] = -1
+            report["message"] = "cleanup_timeout"
+            return report
+        finally:
+            report["duration_ms"] = int((time.perf_counter() - started) * 1000)
+            try:
+                if acquired:
+                    current = await client.get(CLEANUP_LOCK_KEY)
+                    if current == lock_token:
+                        await client.delete(CLEANUP_LOCK_KEY)
+            except Exception:
+                pass
+
+    @staticmethod
     def _signature_hash(signature: str) -> str:
         return hashlib.sha256((signature or "").encode("utf-8")).hexdigest()[:20]
 
     @staticmethod
-    def _cache_key(*, paper_id: int, page: int, sig_hash: str) -> str:
-        return f"{REDIS_KEY_PREFIX}:{int(paper_id)}:{int(page)}:{sig_hash}"
+    def _cache_key(
+        *,
+        user_id: int,
+        paper_id: int,
+        page: int,
+        sig_hash: str,
+        pipeline_mode: str,
+        pipeline_version: str,
+    ) -> str:
+        mode = str(pipeline_mode or PIPELINE_MODE_LEGACY).strip().lower() or PIPELINE_MODE_LEGACY
+        version = str(pipeline_version or SIMPLIFIED_PIPELINE_VERSION_DEFAULT).strip() or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
+        return (
+            f"{REDIS_KEY_PREFIX}:v2:{mode}:{version}:"
+            f"u{int(user_id)}:p{int(paper_id)}:pg{int(page)}:{sig_hash}"
+        )
 
     @staticmethod
-    def _lock_key(*, paper_id: int, page: int) -> str:
-        return f"{REDIS_LOCK_PREFIX}:{int(paper_id)}:{int(page)}"
+    def _lock_key(
+        *,
+        user_id: int,
+        paper_id: int,
+        page: int,
+        pipeline_mode: str,
+        pipeline_version: str,
+    ) -> str:
+        mode = str(pipeline_mode or PIPELINE_MODE_LEGACY).strip().lower() or PIPELINE_MODE_LEGACY
+        version = str(pipeline_version or SIMPLIFIED_PIPELINE_VERSION_DEFAULT).strip() or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
+        return (
+            f"{REDIS_LOCK_PREFIX}:v2:{mode}:{version}:"
+            f"u{int(user_id)}:p{int(paper_id)}:pg{int(page)}"
+        )
 
     @staticmethod
     def _with_cache_meta(
@@ -6176,4 +7971,5 @@ _literature_reader_compose_service = LiteratureReaderComposeService()
 
 def get_literature_reader_compose_service() -> LiteratureReaderComposeService:
     return _literature_reader_compose_service
+
 

@@ -37,6 +37,11 @@ class _FakeDB:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _set_default_parser_mode(monkeypatch):
+    monkeypatch.setattr(settings, "pdf_layout_parser", "auto", raising=False)
+
+
 @pytest.mark.asyncio
 async def test_parse_page_structure_detects_introduction_heading(monkeypatch):
     service = LiteratureReaderService()

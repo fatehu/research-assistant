@@ -16,12 +16,20 @@ import io
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.render_pipeline_contract import (
+    CanonicalAtomBundle,
+    RenderPipelineContractError,
+    validate_stage1_semantic_output,
+    validate_stage2_design_output,
+    validate_stage1_output,
+    validate_stage2_output,
+)
 
 
 _GENERIC_HEADINGS = {
@@ -466,6 +474,494 @@ class ReaderMultimodalLayoutService:
             primary_model=str(getattr(settings, "reader_mm_layout_model", "qwen3.5-flash") or "qwen3.5-flash"),
             fallback_model=str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-flash") or "qwen3-vl-flash"),
         )
+
+    async def build_stage1_structural_annotations(
+        self,
+        *,
+        prompt_payload: Dict[str, Any],
+        known_layout_ids: Sequence[str],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        payload = dict(prompt_payload)
+        known_ids = [str(item).strip() for item in list(known_layout_ids or []) if str(item).strip()]
+        real_to_alias: Dict[str, str] = {}
+        alias_to_real: Dict[str, str] = {}
+        for idx, layout_id in enumerate(known_ids, start=1):
+            alias = f"L{idx:04d}"
+            real_to_alias[layout_id] = alias
+            alias_to_real[alias] = layout_id
+        payload["known_layout_ids"] = [real_to_alias.get(item, item) for item in known_ids]
+        digest_rows = [row for row in list(payload.get("docmind_layout_digest") or []) if isinstance(row, dict)]
+        if digest_rows and real_to_alias:
+            aliased_digest_rows: List[Dict[str, Any]] = []
+            for row in digest_rows:
+                cloned = dict(row)
+                original_layout_id = str(cloned.get("layout_id") or "").strip()
+                if original_layout_id and original_layout_id in real_to_alias:
+                    cloned["layout_id"] = real_to_alias[original_layout_id]
+                aliased_digest_rows.append(cloned)
+            payload["docmind_layout_digest"] = aliased_digest_rows
+        parser_model = str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash") or "qwen3-vl-flash")
+        parser_fallback_model = str(getattr(settings, "reader_mm_parser_fallback_model", "") or "").strip()
+        layout_model = str(getattr(settings, "reader_mm_layout_model", "qwen3.5-plus") or "qwen3.5-plus").strip()
+        mm_fallback_model = str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-plus") or "qwen3-vl-plus").strip()
+        # Stage1 is strict JSON annotation; prefer stable text-JSON model over OCR-style fallback.
+        if parser_fallback_model and "ocr" not in parser_fallback_model.lower():
+            fallback_model = parser_fallback_model
+        else:
+            fallback_model = layout_model or mm_fallback_model or "qwen3.5-plus"
+        timeout_ms = int(getattr(settings, "reader_mm_parser_timeout_ms", 120000) or 120000)
+        attempt_count = 0
+        last_error: Optional[RenderPipelineContractError] = None
+
+        async def _attempt(model: str, retry_hint: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[RenderPipelineContractError]]:
+            nonlocal attempt_count
+            attempt_count += 1
+            current_payload = dict(payload)
+            if retry_hint:
+                current_payload["retry_hint"] = retry_hint
+            advice = await self._call_mm_model(
+                model=model,
+                prompt_payload=current_payload,
+                timeout_ms=timeout_ms,
+                prompt_kind="stage1_structural_v1",
+            )
+            if not isinstance(advice, dict):
+                return None, RenderPipelineContractError(
+                    code="STAGE1_INVALID_JSON",
+                    stage="stage1",
+                    message="Stage1 model response is not a JSON object",
+                    details={"model": model},
+                )
+            advice = self._remap_stage1_layout_ids_from_aliases(
+                payload=advice,
+                alias_to_real=alias_to_real,
+            )
+            try:
+                validated = validate_stage1_output(advice, known_ids)
+            except RenderPipelineContractError as exc:
+                block_preview: Dict[str, Any] = {}
+                if isinstance(advice.get("blocks"), list) and advice.get("blocks"):
+                    first_block = advice["blocks"][0]
+                    if isinstance(first_block, dict):
+                        block_preview = {
+                            "keys": sorted(list(first_block.keys()))[:30],
+                            "layout_id": str(first_block.get("layout_id") or first_block.get("layoutId") or ""),
+                            "role": str(first_block.get("role") or first_block.get("block_role") or ""),
+                        }
+                logger.warning(
+                    f"[ReaderMM][stage1] validation failed model={model} "
+                    f"code={getattr(exc, 'code', '')} "
+                    f"details={json.dumps(dict(getattr(exc, 'details', {}) or {}), ensure_ascii=False)[:1200]} "
+                    f"block_preview={json.dumps(block_preview, ensure_ascii=False)[:600]}"
+                )
+                return None, exc
+            return validated, None
+
+        validated, err = await _attempt(parser_model, "")
+        if isinstance(validated, dict):
+            return validated, {
+                "used": True,
+                "model": parser_model,
+                "fallback_used": False,
+                "retry_used": False,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err
+        retry_hint = ""
+        if isinstance(last_error, RenderPipelineContractError):
+            retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
+            if str(last_error.code) == "STAGE1_REQUIRED_FIELD_MISSING":
+                retry_hint += (
+                    " Roles must be exact enum tokens only: "
+                    "doc_title,section_title,paragraph,list_item,caption,figure,table,"
+                    "sidebar,metadata,header,footer,noise,unknown. "
+                    "If uncertain, always use unknown."
+                )
+        validated_retry, err_retry = await _attempt(parser_model, retry_hint)
+        if isinstance(validated_retry, dict):
+            return validated_retry, {
+                "used": True,
+                "model": parser_model,
+                "fallback_used": False,
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err_retry
+
+        if fallback_model and fallback_model != parser_model:
+            validated_fb, err_fb = await _attempt(fallback_model, retry_hint)
+            if isinstance(validated_fb, dict):
+                return validated_fb, {
+                    "used": True,
+                    "model": fallback_model,
+                    "fallback_used": True,
+                    "retry_used": True,
+                    "retry_count": max(0, attempt_count - 1),
+                    "error": None,
+                }
+            last_error = err_fb
+
+        if isinstance(last_error, RenderPipelineContractError):
+            raise last_error
+        raise RenderPipelineContractError(
+            code="STAGE1_INVALID_JSON",
+            stage="stage1",
+            message="Stage1 failed with unknown error",
+        )
+
+    @staticmethod
+    def _remap_stage1_layout_ids_from_aliases(
+        *,
+        payload: Dict[str, Any],
+        alias_to_real: Mapping[str, str],
+    ) -> Dict[str, Any]:
+        alias_map = {str(key).strip(): str(value).strip() for key, value in dict(alias_to_real or {}).items() if str(key).strip() and str(value).strip()}
+        if not alias_map:
+            return payload
+
+        def _map_id(value: Any) -> str:
+            token = str(value or "").strip()
+            if not token:
+                return ""
+            return alias_map.get(token, token)
+
+        cloned = dict(payload or {})
+        blocks = []
+        for row in list(cloned.get("blocks") or []):
+            if not isinstance(row, dict):
+                blocks.append(row)
+                continue
+            mapped = dict(row)
+            mapped["layout_id"] = _map_id(row.get("layout_id") or row.get("layoutId") or row.get("id"))
+            blocks.append(mapped)
+        cloned["blocks"] = blocks
+
+        sections = []
+        for row in list(cloned.get("sections") or []):
+            if not isinstance(row, dict):
+                sections.append(row)
+                continue
+            mapped = dict(row)
+            mapped["title_layout_id"] = _map_id(
+                row.get("title_layout_id") or row.get("titleLayoutId") or row.get("title_id")
+            )
+            children = []
+            for item in list(
+                row.get("children")
+                or row.get("child_layout_ids")
+                or row.get("content_layout_ids")
+                or []
+            ):
+                mapped_id = _map_id(item)
+                if mapped_id:
+                    children.append(mapped_id)
+            mapped["children"] = children
+            sections.append(mapped)
+        cloned["sections"] = sections
+        return cloned
+
+    async def build_stage2_design_layout(
+        self,
+        *,
+        prompt_payload: Dict[str, Any],
+        known_layout_ids: Sequence[str],
+        allowed_components: Sequence[str],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        payload = dict(prompt_payload)
+        known_ids = [str(item).strip() for item in list(known_layout_ids or []) if str(item).strip()]
+        allowed = [str(item).strip() for item in list(allowed_components or []) if str(item).strip()]
+        payload["known_layout_ids"] = list(known_ids)
+        payload["allowed_components"] = list(allowed)
+        primary_model = str(getattr(settings, "reader_mm_layout_model", "qwen3.5-plus") or "qwen3.5-plus")
+        fallback_model = str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-plus") or "qwen3-vl-plus")
+        timeout_ms = int(getattr(settings, "reader_mm_timeout_ms", 90000) or 90000)
+        attempt_count = 0
+        last_error: Optional[RenderPipelineContractError] = None
+
+        async def _attempt(model: str, retry_hint: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[RenderPipelineContractError]]:
+            nonlocal attempt_count
+            attempt_count += 1
+            current_payload = dict(payload)
+            if retry_hint:
+                current_payload["retry_hint"] = retry_hint
+            advice = await self._call_mm_model(
+                model=model,
+                prompt_payload=current_payload,
+                timeout_ms=timeout_ms,
+                prompt_kind="stage2_design_v1",
+            )
+            if not isinstance(advice, dict):
+                return None, RenderPipelineContractError(
+                    code="STAGE2_INVALID_JSON",
+                    stage="stage2",
+                    message="Stage2 model response is not a JSON object",
+                    details={"model": model},
+                )
+            try:
+                validated = validate_stage2_output(advice, known_ids, allowed)
+            except RenderPipelineContractError as exc:
+                return None, exc
+            return validated, None
+
+        validated, err = await _attempt(primary_model, "")
+        if isinstance(validated, dict):
+            return validated, {
+                "used": True,
+                "model": primary_model,
+                "fallback_used": False,
+                "retry_used": False,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err
+        retry_hint = ""
+        if isinstance(last_error, RenderPipelineContractError):
+            retry_hint = f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. Return strict JSON only."
+        validated_retry, err_retry = await _attempt(primary_model, retry_hint)
+        if isinstance(validated_retry, dict):
+            return validated_retry, {
+                "used": True,
+                "model": primary_model,
+                "fallback_used": False,
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err_retry
+
+        if fallback_model and fallback_model != primary_model:
+            validated_fb, err_fb = await _attempt(fallback_model, retry_hint)
+            if isinstance(validated_fb, dict):
+                return validated_fb, {
+                    "used": True,
+                    "model": fallback_model,
+                    "fallback_used": True,
+                    "retry_used": True,
+                    "retry_count": max(0, attempt_count - 1),
+                    "error": None,
+                }
+            last_error = err_fb
+
+        if isinstance(last_error, RenderPipelineContractError):
+            raise last_error
+        raise RenderPipelineContractError(
+            code="STAGE2_INVALID_JSON",
+            stage="stage2",
+            message="Stage2 failed with unknown error",
+        )
+
+    async def build_stage1_semantic_annotations(
+        self,
+        *,
+        prompt_payload: Dict[str, Any],
+        atom_bundle: CanonicalAtomBundle,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Stage1 semantic-only annotations over deterministic atom IDs."""
+        payload = dict(prompt_payload)
+        payload["known_atom_ids"] = list(atom_bundle.usable_atom_ids or [])
+        parser_model = str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash") or "qwen3-vl-flash")
+        fallback_model = str(getattr(settings, "reader_mm_layout_model", "qwen3.5-plus") or "qwen3.5-plus")
+        timeout_ms = int(getattr(settings, "reader_mm_parser_timeout_ms", 120000) or 120000)
+        attempt_count = 0
+        last_error: Optional[RenderPipelineContractError] = None
+
+        async def _attempt(model: str, retry_hint: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[RenderPipelineContractError]]:
+            nonlocal attempt_count
+            attempt_count += 1
+            current_payload = dict(payload)
+            if retry_hint:
+                current_payload["retry_hint"] = retry_hint
+            advice = await self._call_mm_model(
+                model=model,
+                prompt_payload=current_payload,
+                timeout_ms=timeout_ms,
+                prompt_kind="stage1_semantic_v2",
+            )
+            if not isinstance(advice, dict):
+                return None, RenderPipelineContractError(
+                    code="STAGE1_INVALID_JSON",
+                    stage="stage1",
+                    message="Stage1 semantic response is not a JSON object",
+                    details={"model": model},
+                )
+            try:
+                validated = validate_stage1_semantic_output(
+                    advice,
+                    known_atom_ids=list(atom_bundle.usable_atom_ids or []),
+                )
+                return validated, None
+            except RenderPipelineContractError as exc:
+                return None, exc
+
+        validated, err = await _attempt(parser_model, "")
+        if isinstance(validated, dict):
+            return validated, {
+                "used": True,
+                "model": parser_model,
+                "fallback_used": False,
+                "retry_used": False,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err
+        retry_hint = ""
+        if isinstance(last_error, RenderPipelineContractError):
+            retry_hint = (
+                f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. "
+                "Return strict JSON with one annotation per atom_id."
+            )
+        validated_retry, err_retry = await _attempt(parser_model, retry_hint)
+        if isinstance(validated_retry, dict):
+            return validated_retry, {
+                "used": True,
+                "model": parser_model,
+                "fallback_used": False,
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err_retry
+
+        if fallback_model and fallback_model != parser_model:
+            validated_fb, err_fb = await _attempt(fallback_model, retry_hint)
+            if isinstance(validated_fb, dict):
+                return validated_fb, {
+                    "used": True,
+                    "model": fallback_model,
+                    "fallback_used": True,
+                    "retry_used": True,
+                    "retry_count": max(0, attempt_count - 1),
+                    "error": None,
+                }
+            last_error = err_fb
+
+        if isinstance(last_error, RenderPipelineContractError):
+            return None, {
+                "used": False,
+                "model": parser_model,
+                "fallback_used": bool(fallback_model and fallback_model != parser_model),
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": last_error.to_dict(),
+            }
+        return None, {
+            "used": False,
+            "model": parser_model,
+            "fallback_used": bool(fallback_model and fallback_model != parser_model),
+            "retry_used": True,
+            "retry_count": max(0, attempt_count - 1),
+            "error": {"code": "STAGE1_INVALID_JSON", "message": "unknown stage1 semantic error"},
+        }
+
+    async def build_stage2_design_slots(
+        self,
+        *,
+        prompt_payload: Dict[str, Any],
+        atom_bundle: CanonicalAtomBundle,
+        allowed_components: Sequence[str],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """Stage2 design-only plan over Stage1 annotations + deterministic atoms."""
+        payload = dict(prompt_payload)
+        payload["known_atom_ids"] = list(atom_bundle.usable_atom_ids or [])
+        payload["allowed_components"] = [
+            str(item).strip() for item in list(allowed_components or []) if str(item).strip()
+        ]
+        primary_model = str(getattr(settings, "reader_mm_layout_model", "qwen3.5-plus") or "qwen3.5-plus")
+        fallback_model = str(getattr(settings, "reader_mm_fallback_model", "qwen3-vl-plus") or "qwen3-vl-plus")
+        timeout_ms = int(getattr(settings, "reader_mm_timeout_ms", 90000) or 90000)
+        attempt_count = 0
+        last_error: Optional[RenderPipelineContractError] = None
+
+        async def _attempt(model: str, retry_hint: str = "") -> Tuple[Optional[Dict[str, Any]], Optional[RenderPipelineContractError]]:
+            nonlocal attempt_count
+            attempt_count += 1
+            current_payload = dict(payload)
+            if retry_hint:
+                current_payload["retry_hint"] = retry_hint
+            advice = await self._call_mm_model(
+                model=model,
+                prompt_payload=current_payload,
+                timeout_ms=timeout_ms,
+                prompt_kind="stage2_design_v2",
+            )
+            if not isinstance(advice, dict):
+                return None, RenderPipelineContractError(
+                    code="STAGE2_INVALID_JSON",
+                    stage="stage2",
+                    message="Stage2 design response is not a JSON object",
+                    details={"model": model},
+                )
+            try:
+                validated = validate_stage2_design_output(
+                    advice,
+                    known_atom_ids=list(atom_bundle.usable_atom_ids or []),
+                    allowed_components=list(payload.get("allowed_components") or []),
+                )
+                return validated, None
+            except RenderPipelineContractError as exc:
+                return None, exc
+
+        validated, err = await _attempt(primary_model, "")
+        if isinstance(validated, dict):
+            return validated, {
+                "used": True,
+                "model": primary_model,
+                "fallback_used": False,
+                "retry_used": False,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err
+        retry_hint = ""
+        if isinstance(last_error, RenderPipelineContractError):
+            retry_hint = (
+                f"Previous output failed validation: code={last_error.code}, stage={last_error.stage}. "
+                "Return strict JSON and ensure full atom coverage partition."
+            )
+        validated_retry, err_retry = await _attempt(primary_model, retry_hint)
+        if isinstance(validated_retry, dict):
+            return validated_retry, {
+                "used": True,
+                "model": primary_model,
+                "fallback_used": False,
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": None,
+            }
+        last_error = err_retry
+
+        if fallback_model and fallback_model != primary_model:
+            validated_fb, err_fb = await _attempt(fallback_model, retry_hint)
+            if isinstance(validated_fb, dict):
+                return validated_fb, {
+                    "used": True,
+                    "model": fallback_model,
+                    "fallback_used": True,
+                    "retry_used": True,
+                    "retry_count": max(0, attempt_count - 1),
+                    "error": None,
+                }
+            last_error = err_fb
+
+        if isinstance(last_error, RenderPipelineContractError):
+            return None, {
+                "used": False,
+                "model": primary_model,
+                "fallback_used": bool(fallback_model and fallback_model != primary_model),
+                "retry_used": True,
+                "retry_count": max(0, attempt_count - 1),
+                "error": last_error.to_dict(),
+            }
+        return None, {
+            "used": False,
+            "model": primary_model,
+            "fallback_used": bool(fallback_model and fallback_model != primary_model),
+            "retry_used": True,
+            "retry_count": max(0, attempt_count - 1),
+            "error": {"code": "STAGE2_INVALID_JSON", "message": "unknown stage2 design error"},
+        }
 
     async def build_line_parse_advice(
         self,
@@ -2897,6 +3393,14 @@ class ReaderMultimodalLayoutService:
 
         if str(prompt_kind) == "layout_plan_v2":
             user_prompt = self._build_layout_plan_v2_prompt_text(prompt_payload)
+        elif str(prompt_kind) == "stage1_semantic_v2":
+            user_prompt = self._build_stage1_semantic_prompt_text(prompt_payload)
+        elif str(prompt_kind) == "stage2_design_v2":
+            user_prompt = self._build_stage2_design_slots_prompt_text(prompt_payload)
+        elif str(prompt_kind) == "stage1_structural_v1":
+            user_prompt = self._build_stage1_structural_prompt_text(prompt_payload)
+        elif str(prompt_kind) == "stage2_design_v1":
+            user_prompt = self._build_stage2_design_prompt_text(prompt_payload)
         elif str(prompt_kind) == "line_parse_advice_v1":
             user_prompt = self._build_line_parse_advice_prompt_text(prompt_payload)
         else:
@@ -2906,7 +3410,10 @@ class ReaderMultimodalLayoutService:
         content_parts: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         model_name = str(model or "").strip().lower()
         use_images_for_prompt = True
-        if str(prompt_kind) == "line_parse_advice_v1" and "vl" not in model_name:
+        if str(prompt_kind) in {"stage1_structural_v1", "stage1_semantic_v2"}:
+            # Stage1 is DocMind-truth annotation only; keep image as metadata reference only.
+            use_images_for_prompt = False
+        elif str(prompt_kind) == "line_parse_advice_v1" and "vl" not in model_name:
             # Fallback text model: use text-only parse prompt to improve robustness and latency.
             use_images_for_prompt = False
         if use_images_for_prompt and image_rows:
@@ -2925,11 +3432,11 @@ class ReaderMultimodalLayoutService:
                 content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
         elif use_images_for_prompt and image_data_url:
             content_parts.append({"type": "image_url", "image_url": {"url": image_data_url}})
-        if len(content_parts) <= 1 and str(prompt_kind) != "line_parse_advice_v1":
+        if len(content_parts) <= 1 and str(prompt_kind) == "layout_judge_v1":
             return None
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        if str(prompt_kind) == "line_parse_advice_v1":
+        if str(prompt_kind) in {"line_parse_advice_v1", "stage1_structural_v1", "stage1_semantic_v2"}:
             max_tokens = max(1200, int(getattr(settings, "reader_mm_parser_max_tokens", 4200) or 4200))
         else:
             max_tokens = max(900, int(getattr(settings, "reader_mm_max_tokens", 2200) or 2200))
@@ -3126,6 +3633,237 @@ class ReaderMultimodalLayoutService:
             f"valid_block_ids: {json.dumps(valid_block_ids, ensure_ascii=False)}\n"
             f"component_whitelist: {json.dumps(component_whitelist, ensure_ascii=False)}\n"
             f"output_schema_example: {schema_text}"
+        )
+
+    def _build_stage1_semantic_prompt_text(self, prompt_payload: Dict[str, Any]) -> str:
+        meta = dict(prompt_payload.get("layout_meta") or {})
+        retry_hint = self._normalize_spaces(str(prompt_payload.get("retry_hint") or ""))[:600]
+        known_atom_ids = [
+            str(item).strip()
+            for item in list(prompt_payload.get("known_atom_ids") or [])[:2400]
+            if str(item).strip()
+        ]
+        atoms_digest = [
+            row for row in list(prompt_payload.get("atoms_digest") or [])[:2400]
+            if isinstance(row, dict)
+        ]
+        image_meta = [
+            {"scope": str(item.get("scope") or ""), "page": int(item.get("page") or 0)}
+            for item in list(prompt_payload.get("images") or [])[:1]
+            if isinstance(item, dict)
+        ]
+        schema_text = {
+            "annotations": [
+                {
+                    "atom_id": "p1:lA:b1",
+                    "role": "paragraph",
+                    "importance": "normal",
+                    "grouping_hint": "belongs_to_intro",
+                    "component_hint": "ParagraphProse",
+                    "confidence": 0.92,
+                }
+            ]
+        }
+        return (
+            "You are Stage1 semantic annotator for deterministic document atoms.\n"
+            "Return JSON only.\n"
+            "Hard constraints:\n"
+            "1) Annotate existing atom IDs only.\n"
+            "2) Do not merge/split atoms, do not rewrite text, do not invent IDs.\n"
+            "3) Every known atom_id must appear exactly once.\n"
+            "4) role must be one of: doc_title,section_title,paragraph,list_item,caption,figure,table,sidebar,metadata,header,footer,noise,unknown.\n"
+            "5) confidence in [0,1].\n"
+            "6) visual_reference_only=true: image is optional reference only.\n"
+            f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
+            f"visual_reference_only: true\n"
+            f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
+            f"known_atom_ids: {json.dumps(known_atom_ids, ensure_ascii=False)}\n"
+            f"atoms_digest: {json.dumps(atoms_digest, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"retry_hint: {json.dumps(retry_hint, ensure_ascii=False)}\n"
+            f"output_schema_example: {json.dumps(schema_text, ensure_ascii=False)}\n"
+            "Return JSON now."
+        )
+
+    def _build_stage2_design_slots_prompt_text(self, prompt_payload: Dict[str, Any]) -> str:
+        meta = dict(prompt_payload.get("layout_meta") or {})
+        retry_hint = self._normalize_spaces(str(prompt_payload.get("retry_hint") or ""))[:600]
+        annotations = dict(prompt_payload.get("semantic_annotations") or {})
+        atoms_digest = [
+            row for row in list(prompt_payload.get("atoms_digest") or [])[:2400]
+            if isinstance(row, dict)
+        ]
+        known_atom_ids = [
+            str(item).strip()
+            for item in list(prompt_payload.get("known_atom_ids") or [])[:2400]
+            if str(item).strip()
+        ]
+        allowed_components = [
+            str(item).strip()
+            for item in list(prompt_payload.get("allowed_components") or [])[:96]
+            if str(item).strip()
+        ]
+        image_meta = [
+            {"scope": str(item.get("scope") or ""), "page": int(item.get("page") or 0)}
+            for item in list(prompt_payload.get("images") or [])[:1]
+            if isinstance(item, dict)
+        ]
+        schema_text = {
+            "page_layout_slots": [
+                {
+                    "slot_id": "slot_001",
+                    "component": "ParagraphProse",
+                    "atom_ids": ["p1:lA:b2"],
+                    "style_tokens": {"tone": "clean"},
+                    "layout_tokens": {"region": "main"},
+                }
+            ],
+            "unused_atom_ids": ["p1:lA:b9"],
+        }
+        return (
+            "You are Stage2 design planner for a generative reader page.\n"
+            "Return JSON only.\n"
+            "Hard constraints:\n"
+            "1) Use only semantic_annotations + atoms_digest as source truth.\n"
+            "2) Do not invent atom IDs.\n"
+            "3) Do not use one atom_id more than once across page_layout_slots.\n"
+            "4) Every known atom_id must be accounted for via page_layout_slots.atom_ids or unused_atom_ids.\n"
+            "5) component must come from allowed_components.\n"
+            "6) Do not output ownership/topology override fields in any nested object.\n"
+            "7) visual_reference_only=true: image is optional reference only.\n"
+            f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
+            f"visual_reference_only: true\n"
+            f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
+            f"semantic_annotations: {json.dumps(annotations, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"atoms_digest: {json.dumps(atoms_digest, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"known_atom_ids: {json.dumps(known_atom_ids, ensure_ascii=False)}\n"
+            f"allowed_components: {json.dumps(allowed_components, ensure_ascii=False)}\n"
+            f"retry_hint: {json.dumps(retry_hint, ensure_ascii=False)}\n"
+            f"output_schema_example: {json.dumps(schema_text, ensure_ascii=False)}\n"
+            "Return JSON now."
+        )
+
+    def _build_stage1_structural_prompt_text(self, prompt_payload: Dict[str, Any]) -> str:
+        meta = dict(prompt_payload.get("layout_meta") or {})
+        retry_hint = self._normalize_spaces(str(prompt_payload.get("retry_hint") or ""))[:600]
+        known_layout_ids = [
+            str(item).strip()
+            for item in list(prompt_payload.get("known_layout_ids") or [])[:1200]
+            if str(item).strip()
+        ]
+        digest_rows = [
+            row for row in list(prompt_payload.get("docmind_layout_digest") or [])[:1200]
+            if isinstance(row, dict)
+        ]
+        digest_compact = [
+            {
+                "layout_id": str(row.get("layout_id") or "").strip(),
+                "reading_order": self._safe_int(row.get("reading_order"), 0),
+                "bbox": list(row.get("bbox") or [0.0, 0.0, 0.0, 0.0])[:4],
+                "text_preview": self._normalize_spaces(str(row.get("text_preview") or ""))[:120],
+            }
+            for row in digest_rows
+        ]
+        image_meta = [
+            {"scope": str(item.get("scope") or ""), "page": int(item.get("page") or 0)}
+            for item in list(prompt_payload.get("images") or [])[:1]
+            if isinstance(item, dict)
+        ]
+        schema_text = {
+            "blocks": [
+                {
+                    "layout_id": "layout_001",
+                    "role": "paragraph",
+                    "section_id": "sec_intro",
+                    "column": 0,
+                    "confidence": 0.92,
+                }
+            ],
+            "sections": [
+                {
+                    "section_id": "sec_intro",
+                    "title_layout_id": "layout_000",
+                    "children": ["layout_001"],
+                }
+            ],
+        }
+        return (
+            "You are Stage1 structural annotator for PDF layouts.\n"
+            "Return JSON only.\n"
+            "Hard constraints:\n"
+            "1) Annotate existing layout IDs only.\n"
+            "2) Do not merge/split blocks.\n"
+            "3) Do not rewrite or generate text.\n"
+            "4) Do not invent layout_id.\n"
+            "5) Every provided layout_id must appear exactly once in blocks.\n"
+            "6) role must be one of: doc_title,section_title,paragraph,list_item,caption,figure,table,sidebar,metadata,header,footer,noise,unknown.\n"
+            "6.1) role must be lowercase snake_case exact token; never output Chinese labels or camelCase.\n"
+            "7) confidence in [0,1], column must be integer >=0.\n"
+            "8) sections must reference valid layout_id only.\n"
+            "9) visual_reference_only=true: image is optional reference only, never authoritative for structure truth.\n"
+            f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
+            f"visual_reference_only: true\n"
+            f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
+            f"known_layout_ids: {json.dumps(known_layout_ids, ensure_ascii=False)}\n"
+            f"docmind_layout_digest: {json.dumps(digest_compact, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"retry_hint: {json.dumps(retry_hint, ensure_ascii=False)}\n"
+            f"output_schema_example: {json.dumps(schema_text, ensure_ascii=False)}\n"
+            "Return JSON now."
+        )
+
+    def _build_stage2_design_prompt_text(self, prompt_payload: Dict[str, Any]) -> str:
+        meta = dict(prompt_payload.get("layout_meta") or {})
+        retry_hint = self._normalize_spaces(str(prompt_payload.get("retry_hint") or ""))[:600]
+        annotations = dict(prompt_payload.get("structural_annotations") or {})
+        layout_digest = [
+            row for row in list(prompt_payload.get("layout_digest") or [])[:1200]
+            if isinstance(row, dict)
+        ]
+        known_layout_ids = [
+            str(item).strip()
+            for item in list(prompt_payload.get("known_layout_ids") or [])[:1200]
+            if str(item).strip()
+        ]
+        allowed_components = [
+            str(item).strip()
+            for item in list(prompt_payload.get("allowed_components") or [])[:64]
+            if str(item).strip()
+        ]
+        image_meta = [
+            {"scope": str(item.get("scope") or ""), "page": int(item.get("page") or 0)}
+            for item in list(prompt_payload.get("images") or [])[:1]
+            if isinstance(item, dict)
+        ]
+        schema_text = {
+            "page_layout": [
+                {
+                    "component": "ParagraphProse",
+                    "source_layout_ids": ["layout_001"],
+                    "props": {},
+                }
+            ],
+            "unused_layout_ids": ["layout_099"],
+        }
+        return (
+            "You are Stage2 design layout planner.\n"
+            "Return JSON only.\n"
+            "Hard constraints:\n"
+            "1) Use only structural_annotations + layout_digest as input truth.\n"
+            "2) Do not invent layout IDs.\n"
+            "3) Do not use one layout_id more than once across page_layout.\n"
+            "4) Every known layout_id must be accounted for in exactly one of: used or unused.\n"
+            "5) component must be in allowed_components.\n"
+            "6) Do not rewrite scientific facts.\n"
+            "7) visual_reference_only=true: image is optional reference only.\n"
+            f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
+            f"visual_reference_only: true\n"
+            f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
+            f"structural_annotations: {json.dumps(annotations, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"layout_digest: {json.dumps(layout_digest, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"known_layout_ids: {json.dumps(known_layout_ids, ensure_ascii=False)}\n"
+            f"allowed_components: {json.dumps(allowed_components, ensure_ascii=False)}\n"
+            f"retry_hint: {json.dumps(retry_hint, ensure_ascii=False)}\n"
+            f"output_schema_example: {json.dumps(schema_text, ensure_ascii=False)}\n"
+            "Return JSON now."
         )
 
     def _build_line_parse_advice_prompt_text(self, prompt_payload: Dict[str, Any]) -> str:

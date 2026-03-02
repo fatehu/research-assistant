@@ -11,6 +11,7 @@ from app.config import settings
 from app.core.database import create_tables
 from app.core.error_handlers import register_error_handlers
 from app.core.rate_limit import build_rate_limit_dependency
+from app.services.literature_reader_compose_service import get_literature_reader_compose_service
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab,
     admin, mentor, student, invitations, share, announcements, mcp
@@ -62,6 +63,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("AUTO_CREATE_TABLES=false，跳过启动建表（推荐生产使用 Alembic）")
     
+    if bool(getattr(settings, "reader_cache_cleanup_on_startup", False)):
+        compose_service = get_literature_reader_compose_service()
+        cleanup_report = await compose_service.cleanup_legacy_cache_keys(
+            dry_run=False,
+            timeout_seconds=int(getattr(settings, "reader_cache_cleanup_timeout_seconds", 120) or 120),
+            scan_count=int(getattr(settings, "reader_cache_cleanup_scan_count", 200) or 200),
+        )
+        logger.info(
+            "[ReaderComposeCleanup] scanned_keys={} deleted_keys={} error_count={} duration_ms={} remaining_old_keys={}",
+            int(cleanup_report.get("scanned_keys") or 0),
+            int(cleanup_report.get("deleted_keys") or 0),
+            int(cleanup_report.get("error_count") or 0),
+            int(cleanup_report.get("duration_ms") or 0),
+            int(cleanup_report.get("remaining_old_keys") or 0),
+        )
+
     yield
     
     logger.info("👋 应用关闭")

@@ -79,3 +79,9 @@ backend/docs/
 docs/**/tmp/
 docs/**/*.tmp
 tmp/
+
+# Reader eval artifacts
+# Keep manifests/versioned config, ignore runtime outputs
+backend/eval/results/**
+!backend/eval/results/
+!backend/eval/results/README.md
