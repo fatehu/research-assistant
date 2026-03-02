@@ -10,6 +10,7 @@ from sqlalchemy import select, func, desc
 from sqlalchemy.orm import selectinload
 from loguru import logger
 
+from app.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
@@ -423,7 +424,7 @@ async def send_message(
                     agent = create_react_agent(
                         llm_service,
                         tool_registry,
-                        max_iterations=5,
+                        max_iterations=settings.react_max_iterations,
                         runtime_context=AgentRuntimeContext(
                             user_id=current_user.id,
                             channel="chat",
