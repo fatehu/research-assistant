@@ -111,8 +111,34 @@ class ReaderSingleAgentController:
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
             total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+            model_status = str(model_output.get("status") or "").strip().lower() if isinstance(model_output, dict) else ""
 
             step_result = dict(model_output.get("step_result") or {}) if isinstance(model_output, dict) else {}
+            model_failed = not bool(step_result)
+            if model_failed:
+                reason = model_error or "model_unavailable"
+                step_metrics.append(
+                    {
+                        "step_index": int(step),
+                        "phase": phase,
+                        "latency_ms": int(latency_ms),
+                        "prompt_tokens": int(prompt_tokens),
+                        "completion_tokens": int(completion_tokens),
+                        "total_tokens": int(total_tokens),
+                        "failed_gates": ["model_unavailable"],
+                        "model_status": model_status,
+                        "model_error": reason,
+                    }
+                )
+                return self._finalize_fallback(
+                    reason=reason,
+                    docmind_blocks=docmind_blocks,
+                    component_whitelist=component_whitelist,
+                    ownership_baseline=ownership_baseline,
+                    repair_rounds_used=repair_rounds_used,
+                    step_metrics=step_metrics,
+                    all_fixes=all_fixes,
+                )
             validation = self.validator.validate(
                 step_result=step_result,
                 docmind_blocks=docmind_blocks,
@@ -159,15 +185,17 @@ class ReaderSingleAgentController:
                     "completion_tokens": int(completion_tokens),
                     "total_tokens": int(total_tokens),
                     "failed_gates": failed_gates,
+                    "model_status": model_status,
                     "model_error": model_error,
                 }
             )
 
             logger.info(
-                "[ReaderSingleAgentV2] step={} phase={} latency_ms={} prompt_tokens={} "
+                "[ReaderSingleAgentV2] step={} phase={} status={} latency_ms={} prompt_tokens={} "
                 "completion_tokens={} total_tokens={} failed_gates={} model_error={}",
                 int(step),
                 phase,
+                model_status,
                 int(latency_ms),
                 int(prompt_tokens),
                 int(completion_tokens),
@@ -176,7 +204,8 @@ class ReaderSingleAgentController:
                 model_error,
             )
 
-            if bool(revalidation.get("passed")):
+            ai_declares_done = model_status == "done"
+            if bool(revalidation.get("passed")) and ai_declares_done:
                 return {
                     "status": "done",
                     "degraded_reason": "",
@@ -197,8 +226,9 @@ class ReaderSingleAgentController:
             previous_validation = revalidation
 
             if step >= self.max_steps:
+                reason = "ai_not_done" if bool(revalidation.get("passed")) and not ai_declares_done else "max_steps_exhausted"
                 return self._finalize_fallback(
-                    reason="max_steps_exhausted",
+                    reason=reason,
                     docmind_blocks=docmind_blocks,
                     component_whitelist=component_whitelist,
                     ownership_baseline=ownership_baseline,
@@ -208,8 +238,9 @@ class ReaderSingleAgentController:
                 )
 
             if remaining_repairs <= 0:
+                reason = "ai_not_done" if bool(revalidation.get("passed")) and not ai_declares_done else "repair_rounds_exhausted"
                 return self._finalize_fallback(
-                    reason="repair_rounds_exhausted",
+                    reason=reason,
                     docmind_blocks=docmind_blocks,
                     component_whitelist=component_whitelist,
                     ownership_baseline=ownership_baseline,

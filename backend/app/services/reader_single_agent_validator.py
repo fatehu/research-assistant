@@ -120,6 +120,37 @@ class ReaderSingleAgentValidator:
             "errors": [str(item) for item in list(errors or []) if str(item)],
         }
 
+    @staticmethod
+    def _component_props_errors(component: str, props: Any) -> List[str]:
+        errs: List[str] = []
+        if not isinstance(props, Mapping):
+            return [f"component_props_not_object:{component}"]
+
+        if component == "ListBlock":
+            items = props.get("items")
+            if not isinstance(items, list):
+                errs.append("component_props_invalid:ListBlock:items:not_array")
+                return errs
+            for idx, item in enumerate(items):
+                if not isinstance(item, str) or not str(item).strip():
+                    errs.append(f"component_props_invalid:ListBlock:items.{idx}:string_required")
+                    break
+            return errs
+
+        if component == "ParagraphProse":
+            text = props.get("text")
+            if not isinstance(text, str) or not str(text).strip():
+                errs.append("component_props_invalid:ParagraphProse:text:string_required")
+            return errs
+
+        if component == "SectionHeading":
+            text = props.get("text")
+            if not isinstance(text, str) or not str(text).strip():
+                errs.append("component_props_invalid:SectionHeading:text:string_required")
+            return errs
+
+        return errs
+
     def validate(
         self,
         *,
@@ -206,6 +237,9 @@ class ReaderSingleAgentValidator:
             ]
             if not source_block_ids:
                 whitelist_errors.append(f"missing_source_block_ids:{component}")
+            props_errors = self._component_props_errors(component, row.get("props"))
+            if props_errors:
+                whitelist_errors.extend(props_errors)
 
         id_integrity_errors = sorted(
             set(
@@ -426,11 +460,15 @@ class ReaderSingleAgentValidator:
             if not source_block_ids:
                 dropped_components.append(component_name)
                 continue
+            props = copy.deepcopy(dict(row.get("props") or {}))
+            if self._component_props_errors(component_name, props):
+                dropped_components.append(component_name)
+                continue
             repaired_components.append(
                 {
                     "component": component_name,
                     "source_block_ids": list(dict.fromkeys(source_block_ids)),
-                    "props": copy.deepcopy(dict(row.get("props") or {})),
+                    "props": props,
                 }
             )
 

@@ -133,6 +133,29 @@ def test_validator_hard_gates_fail_for_invalid_step_result():
     assert result["gates"]["source_text_immutable"]["passed"] is False
 
 
+def test_validator_rejects_listblock_items_object_shape():
+    validator = ReaderSingleAgentValidator()
+    invalid = _valid_step_result()
+    invalid["ui_plan_draft"]["components"] = [
+        {
+            "component": "ListBlock",
+            "source_block_ids": ["l_para"],
+            "props": {"items": [{"content": "x"}]},
+        }
+    ]
+
+    result = validator.validate(
+        step_result=invalid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "ListBlock"],
+    )
+
+    assert result["passed"] is False
+    assert result["gates"]["whitelist_only"]["passed"] is False
+    errors = list(result["gates"]["whitelist_only"]["errors"] or [])
+    assert any("component_props_invalid:ListBlock:items.0:string_required" in str(item) for item in errors)
+
+
 def test_deterministic_repair_converges_to_valid_result():
     validator = ReaderSingleAgentValidator()
     broken = {
@@ -156,6 +179,32 @@ def test_deterministic_repair_converges_to_valid_result():
     assert validation["passed"] is True
     assert len(repaired_step_result["classification"]["items"]) == 2
     assert len(repaired_step_result["ui_plan_draft"]["components"]) >= 1
+
+
+def test_deterministic_repair_drops_invalid_component_props_and_converges():
+    validator = ReaderSingleAgentValidator()
+    broken = _valid_step_result()
+    broken["ui_plan_draft"]["components"] = [
+        {
+            "component": "ListBlock",
+            "source_block_ids": ["l_para"],
+            "props": {"items": [{"content": "x"}]},
+        }
+    ]
+
+    repaired = validator.deterministic_repair(
+        step_result=broken,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "ListBlock"],
+    )
+    repaired_step_result = repaired["step_result"]
+    validation = validator.validate(
+        step_result=repaired_step_result,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "ListBlock"],
+    )
+
+    assert validation["passed"] is True
 
 
 def test_text_hygiene_detection_flags_replacement_and_pua_and_mojibake():

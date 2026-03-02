@@ -270,6 +270,13 @@ function ActionBar(props: {
     color: ctx?.themeStyle?.bodyColor,
     borderColor: ctx?.themeStyle?.borderColor,
   }
+  const onDragMarkdown = (event: React.DragEvent<HTMLElement>): void => {
+    event.stopPropagation()
+    const payload = JSON.stringify({ node, markdown })
+    event.dataTransfer.setData('application/x-reader-component+json', payload)
+    event.dataTransfer.setData('text/markdown', markdown)
+    event.dataTransfer.setData('text/plain', markdown)
+  }
   if (actionRows.length === 0 && !extraActions) return null
   return (
     <div
@@ -347,6 +354,15 @@ function ActionBar(props: {
             </Button>
           )
         })}
+        <span draggable onDragStart={onDragMarkdown} style={{ display: 'inline-flex', cursor: 'grab' }}>
+          <Button
+            size="small"
+            icon={<DragOutlined />}
+            style={actionBtnStyle}
+          >
+            拖拽Markdown
+          </Button>
+        </span>
         {extraActions}
       </Space>
     </div>
@@ -356,23 +372,10 @@ function DraggableContainer(props: {
   node: ReaderComponentNode
   children: ReactNode
 }): ReactNode {
-  const { node, children } = props
-  const markdown = componentToMarkdown(node)
+  const { children } = props
   return (
-    <div
-      draggable
-      onDragStart={(event) => {
-        const payload = JSON.stringify({ node, markdown })
-        event.dataTransfer.setData('application/x-reader-component+json', payload)
-        event.dataTransfer.setData('text/markdown', markdown)
-        event.dataTransfer.setData('text/plain', markdown)
-      }}
-      style={{ cursor: 'grab' }}
-    >
+    <div style={{ userSelect: 'text' }}>
       {children}
-      <div style={{ marginTop: 6 }}>
-        <Tag icon={<DragOutlined />} color="default">可拖拽到右侧工作区</Tag>
-      </div>
     </div>
   )
 }
