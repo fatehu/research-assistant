@@ -1,37 +1,32 @@
 """
-Reader Compose Agent Core.
+Reader compose agent core.
 
-用于阶段二接管 composed 生成循环：
-- 限制工具白名单
-- 输出可追溯 tool_call_trace
-- 为质量阈值停机提供统一入口
+Specialized AgentCore for component assembly:
+- strict tool whitelist
+- strict system prompt for JSON ui_ops output
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from app.services.react_agent import AgentCore
 
 
 class ReaderComposeAgentCore(AgentCore):
-    """受控 Reader Agent Core（阶段二扩展点）"""
+    """Constrained AgentCore for reader compose assembly."""
 
-    ALLOWED_TOOLS = {
-        "reader_layout_extract",
-        "reader_structure_repair",
-        "reader_sidebar_filter",
-        "reader_asset_collect_pdf",
-        "reader_asset_search_web",
-        "reader_ui_plan_build",
-        "reader_ui_plan_score",
-        "reader_ui_plan_revise",
+    DEFAULT_ALLOWED_TOOLS = {
+        "paper_read",
+        "knowledge_search",
     }
 
     SYSTEM_PROMPT = (
-        "你是论文阅读 UI 编排代理。"
-        "只能调用白名单工具，不可输出任意代码。"
-        "每一步都要保留 source_anchor 对齐。"
+        "You are a React component assembly agent for a literature reader.\n"
+        "You can call tools only from the allowlist.\n"
+        "Your final answer must be JSON only and should follow the requested ui_ops schema.\n"
+        "Never fabricate evidence coordinates.\n"
+        "Never rewrite scientific facts.\n"
     )
 
     def __init__(
@@ -49,9 +44,20 @@ class ReaderComposeAgentCore(AgentCore):
             max_iterations=max_iterations,
             runtime_context=runtime_context,
         )
-        self.allowed_tool_names = set(allowed_tool_names or self.ALLOWED_TOOLS)
+        resolved = [str(item).strip() for item in list(allowed_tool_names or []) if str(item).strip()]
+        self.allowed_tool_names: Set[str] = set(resolved or list(self.DEFAULT_ALLOWED_TOOLS))
 
-    @classmethod
-    def build_default_trace(cls) -> List[Dict[str, Any]]:
-        """返回默认 trace 结构，便于前端统一展示。"""
-        return []
+    def _build_system_prompt(self, messages: Optional[List[Dict[str, Any]]] = None) -> str:
+        tools_desc = self.tools.get_tools_description(include_tool_names=self.allowed_tool_names)
+        self._last_tool_selection = {
+            "intent": "reader_compose",
+            "selected_tools": sorted(list(self.allowed_tool_names)),
+            "prompt_desc_tokens": 0,
+            "schema_scope": "selected",
+            "tool_selection_enabled": True,
+        }
+        return f"{self.SYSTEM_PROMPT}\n\nTools:\n{tools_desc}"
+
+    def _collect_llm_tool_schemas(self, user_text: str) -> List[Dict[str, Any]]:
+        return self.tools.list_tools(include_tool_names=self.allowed_tool_names, user_text=user_text)
+

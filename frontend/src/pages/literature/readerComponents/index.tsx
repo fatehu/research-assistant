@@ -3,11 +3,13 @@ import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Popover, Typogra
 import { DownOutlined, DragOutlined, LinkOutlined, ReloadOutlined, ShrinkOutlined, PlusOutlined } from '@ant-design/icons'
 
 import type {
+  ReaderComponentAction,
   ReaderComponentNode,
   ReaderComponentSourceAnchor,
   ReaderComposeQualityReport,
 } from '@/services/api'
 import type { GenerativeStyleTokens } from '../generativeStyles'
+import { isRegisteredReaderComponent, validateReaderComponentProps } from './registry'
 
 const { Text, Title, Paragraph } = Typography
 
@@ -15,6 +17,7 @@ export type ReaderComponentRenderContext = {
   themeStyle?: GenerativeStyleTokens
   qualityReport?: ReaderComposeQualityReport | null
   inlineQueryLoadingNodeId?: string | null
+  isActionableAnchor?: (anchor: ReaderComponentSourceAnchor) => boolean
   onJumpAnchor?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
   onPreviewAnchors?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
   onHidePreview?: () => void
@@ -22,6 +25,10 @@ export type ReaderComponentRenderContext = {
   onInlineQuery?: (node: ReaderComponentNode, question: string) => Promise<void> | void
   onDropMarkdown?: (markdown: string, node?: ReaderComponentNode) => void
   onManualInsertSlot?: (nodeId: string) => void
+  resolveAnchorPreviewImage?: (
+    anchors: ReaderComponentSourceAnchor[],
+    options?: { preferredPage?: number; segmentIndex?: number },
+  ) => Promise<string | null>
 }
 
 function asString(value: unknown): string {
@@ -59,10 +66,58 @@ function normalizeAnchorRows(value: unknown): ReaderComponentSourceAnchor[] {
       start_char: startChar,
       end_char: endChar,
       quote_text: typeof row.quote_text === 'string' ? row.quote_text : undefined,
+      anchor_id: typeof row.anchor_id === 'string' ? row.anchor_id : undefined,
+      segment_index: Number.isFinite(Number(row.segment_index)) ? Number(row.segment_index) : undefined,
+      segment_total: Number.isFinite(Number(row.segment_total)) ? Number(row.segment_total) : undefined,
       bbox_hint: row.bbox_hint as ReaderComponentSourceAnchor['bbox_hint'],
+      canonical_block_id: typeof row.canonical_block_id === 'string' ? row.canonical_block_id : undefined,
+      coord_version: typeof row.coord_version === 'string' ? row.coord_version : undefined,
+      anchor_confidence: Number.isFinite(Number(row.anchor_confidence)) ? Number(row.anchor_confidence) : undefined,
+      anchor_v2: row.anchor_v2 as ReaderComponentSourceAnchor['anchor_v2'],
+      geometry_version: typeof row.geometry_version === 'string' ? row.geometry_version : undefined,
+      geometry: row.geometry as ReaderComponentSourceAnchor['geometry'],
+      source_word_ids: Array.isArray(row.source_word_ids) ? row.source_word_ids.map((item) => String(item || '')).filter(Boolean) : undefined,
+      source_char_ranges: Array.isArray(row.source_char_ranges)
+        ? row.source_char_ranges
+          .filter((item): item is { start_char_id: string; end_char_id: string } => (
+            Boolean(item)
+            && typeof item === 'object'
+            && typeof (item as any).start_char_id === 'string'
+            && typeof (item as any).end_char_id === 'string'
+          ))
+        : undefined,
     })
   }
   return rows
+}
+
+const ACTIONABLE_ANCHOR_MIN_CONFIDENCE = 0.78
+
+function isNodeGatePassed(node: ReaderComponentNode): boolean {
+  const props = (node?.props && typeof node.props === 'object')
+    ? node.props as Record<string, unknown>
+    : {}
+  return props.node_gate_passed !== false
+}
+
+function isJumpableAnchor(
+  anchor: ReaderComponentSourceAnchor,
+  customPredicate?: (anchor: ReaderComponentSourceAnchor) => boolean,
+): boolean {
+  if (typeof customPredicate === 'function') {
+    return customPredicate(anchor)
+  }
+  const start = Number(anchor.start_char || 0)
+  const end = Number(anchor.end_char || 0)
+  if (end <= start) return false
+  if (Number(anchor.segment_index || 0) > 0 || Number(anchor.segment_total || 0) > 0) return false
+  const canonicalBlockId = String(anchor.canonical_block_id || '').trim()
+  if (!canonicalBlockId) return false
+  const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
+  if (coordVersion !== 'anchor_v2') return false
+  const confidence = Number(anchor.anchor_confidence || 0)
+  if (confidence > 0 && confidence < ACTIONABLE_ANCHOR_MIN_CONFIDENCE) return false
+  return true
 }
 
 function baseCardStyle(ctx?: ReaderComponentRenderContext): CSSProperties {
@@ -132,6 +187,68 @@ function renderChildren(children: ReaderComponentNode[], ctx: ReaderComponentRen
   )
 }
 
+function buildFallbackActions(node: ReaderComponentNode, ctx?: ReaderComponentRenderContext): ReaderComponentAction[] {
+  const capabilities = new Set(
+    asStringArray(node.capabilities)
+      .map((item) => item.toLowerCase())
+      .filter(Boolean),
+  )
+  const hasCapabilityFilter = capabilities.size > 0
+  const nodeGatePassed = isNodeGatePassed(node)
+  const anchors = normalizeAnchorRows(node.source_anchor_refs)
+    .filter((row) => nodeGatePassed && isJumpableAnchor(row, ctx?.isActionableAnchor))
+  const allowByCapability = (keys: string[], defaultAllow = true): boolean => {
+    if (!hasCapabilityFilter) return defaultAllow
+    return keys.some((key) => capabilities.has(key))
+  }
+
+  const fallback: ReaderComponentAction[] = []
+  if (allowByCapability(['regenerate'])) fallback.push({ key: 'regenerate', label: '修复', kind: 'default' })
+  if (allowByCapability(['degrade'])) fallback.push({ key: 'degrade', label: '降级', kind: 'default' })
+  if (
+    node.type !== 'KeyTakeaways'
+    && anchors.length > 0
+    && allowByCapability(['jump_anchor', 'jump_to_anchor', 'locate_evidence'])
+  ) {
+    fallback.push({ key: 'jump_anchor', label: '定位到证据', kind: 'default' })
+  }
+  if (allowByCapability(['copy', 'copy_markdown', 'drag_markdown'])) {
+    fallback.push({ key: 'copy_markdown', label: '复制Markdown', kind: 'default' })
+  }
+  return fallback
+}
+
+function canonicalActionKey(rawKey: string): string {
+  const key = asString(rawKey).toLowerCase()
+  if (key === 'jump_to_anchor' || key === 'locate_evidence') return 'jump_anchor'
+  if (key === 'copy_markdown') return 'copy'
+  return key
+}
+
+function mergeActionRows(
+  rawActions: ReaderComponentAction[],
+  fallbackActions: ReaderComponentAction[],
+): ReaderComponentAction[] {
+  const merged: ReaderComponentAction[] = []
+  const seen = new Set<string>()
+  for (const row of [...rawActions, ...fallbackActions]) {
+    const key = canonicalActionKey(asString(row?.key))
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    merged.push(row)
+  }
+  return merged
+}
+
+async function copyNodeMarkdown(markdown: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(markdown)
+    message.success('已复制为 Markdown')
+  } catch {
+    message.warning('复制失败，请检查浏览器权限')
+  }
+}
+
 function ActionBar(props: {
   node: ReaderComponentNode
   ctx: ReaderComponentRenderContext
@@ -140,13 +257,22 @@ function ActionBar(props: {
   const { node, ctx, extraActions } = props
   const [hovered, setHovered] = useState(false)
   const markdown = componentToMarkdown(node)
-  const canJump = Array.isArray(node.source_anchor_refs) && node.source_anchor_refs.length > 0
+  const nodeGatePassed = isNodeGatePassed(node)
+  const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
+    .filter((row) => nodeGatePassed && isJumpableAnchor(row, ctx?.isActionableAnchor))
+  const rawActions = Array.isArray(node.actions) ? node.actions : []
+  const actionRows = mergeActionRows(rawActions, buildFallbackActions(node, ctx))
+    .filter((row) => !(node.type === 'KeyTakeaways' && canonicalActionKey(asString(row.key)) === 'jump_anchor'))
+    .filter((row) => !(canonicalActionKey(asString(row.key)) === 'jump_anchor' && anchorRefs.length === 0))
+    .filter((row) => !(asString(row.key).toLowerCase() === 'preview_anchor' && anchorRefs.length === 0))
+  const canJump = anchorRefs.length > 0
   const darkTheme = isDarkTheme(ctx)
   const idleOpacity = darkTheme ? 0.62 : 0.9
   const actionBtnStyle: CSSProperties = {
     color: ctx?.themeStyle?.bodyColor,
     borderColor: ctx?.themeStyle?.borderColor,
   }
+  if (actionRows.length === 0 && !extraActions) return null
   return (
     <div
       className="reader-action-bar"
@@ -161,45 +287,94 @@ function ActionBar(props: {
       }}
     >
       <Space size={6} wrap>
-        <Button
-          size="small"
-          icon={<ReloadOutlined />}
-          style={actionBtnStyle}
-          onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
-        >
-          修复
-        </Button>
-        <Button
-          size="small"
-          icon={<ShrinkOutlined />}
-          style={actionBtnStyle}
-          onClick={() => ctx.onNodeAction?.(node, 'degrade')}
-        >
-          降级
-        </Button>
-        <Button
-          size="small"
-          icon={<LinkOutlined />}
-          style={actionBtnStyle}
-          disabled={!canJump}
-          onClick={() => ctx.onJumpAnchor?.(node.source_anchor_refs || [], { pinPreview: true })}
-        >
-          定位到证据
-        </Button>
-        <Button
-          size="small"
-          style={actionBtnStyle}
-          onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(markdown)
-              message.success('已复制为 Markdown')
-            } catch {
-              message.warning('复制失败，请检查浏览器权限')
-            }
-          }}
-        >
-          复制Markdown
-        </Button>
+        {actionRows.map((row, idx) => {
+          const key = canonicalActionKey(asString(row.key))
+          const label = asString(row.label) || key || `action-${idx + 1}`
+          const payload = (row.payload && typeof row.payload === 'object')
+            ? row.payload as Record<string, unknown>
+            : {}
+          if (!key) return null
+          if (key === 'regenerate') {
+            return (
+              <Button
+                key={`${node.id}:regenerate:${idx}`}
+                size="small"
+                icon={<ReloadOutlined />}
+                style={actionBtnStyle}
+                onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
+              >
+                {label}
+              </Button>
+            )
+          }
+          if (key === 'degrade') {
+            return (
+              <Button
+                key={`${node.id}:degrade:${idx}`}
+                size="small"
+                icon={<ShrinkOutlined />}
+                style={actionBtnStyle}
+                onClick={() => ctx.onNodeAction?.(node, 'degrade')}
+              >
+                {label}
+              </Button>
+            )
+          }
+          if (key === 'jump_anchor') {
+            return (
+              <Button
+                key={`${node.id}:jump:${idx}`}
+                size="small"
+                icon={<LinkOutlined />}
+                style={actionBtnStyle}
+                disabled={!canJump}
+                onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true })}
+              >
+                {label}
+              </Button>
+            )
+          }
+          if (key === 'copy') {
+            return (
+              <Button
+                key={`${node.id}:copy:${idx}`}
+                size="small"
+                style={actionBtnStyle}
+                onClick={() => copyNodeMarkdown(markdown)}
+              >
+                {label}
+              </Button>
+            )
+          }
+          if (key === 'preview_anchor') {
+            return (
+              <Button
+                key={`${node.id}:preview:${idx}`}
+                size="small"
+                style={actionBtnStyle}
+                disabled={!canJump}
+                onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true })}
+              >
+                {label}
+              </Button>
+            )
+          }
+          const href = asString(payload.href)
+          return (
+            <Button
+              key={`${node.id}:${key}:${idx}`}
+              size="small"
+              style={actionBtnStyle}
+              disabled={!href}
+              onClick={() => {
+                if (!href) return
+                window.open(href, '_blank', 'noopener,noreferrer')
+              }}
+            >
+              {label}
+            </Button>
+          )
+        })}
         {extraActions}
       </Space>
     </div>
@@ -337,8 +512,31 @@ function ParagraphProseNode(props: {
 }
 
 export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponentRenderContext): ReactNode {
-  const props = node.props || {}
+  if (!isRegisteredReaderComponent(String(node.type || ''))) {
+    return (
+      <Alert
+        showIcon
+        type="warning"
+        message={`Unknown component: ${node.type}`}
+        description="Component is not registered in reader registry."
+      />
+    )
+  }
+  const propsValidation = validateReaderComponentProps(String(node.type || ''), node.props || {})
+  if (!propsValidation.ok) {
+    return (
+      <Alert
+        showIcon
+        type="warning"
+        message={`Invalid props for ${node.type}`}
+        description={propsValidation.error}
+      />
+    )
+  }
+  const props = propsValidation.props || {}
+  const nodeGatePassed = isNodeGatePassed(node)
   const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
+    .filter((row) => nodeGatePassed && isJumpableAnchor(row, ctx?.isActionableAnchor))
 
   const layoutStyle: React.CSSProperties = {}
   if (node.layout_slot?.reserved_height) {
@@ -355,6 +553,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       onMouseEnter={() => {
         if (anchorRefs.length > 0) {
           ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: false })
+        } else {
+          ctx.onHidePreview?.()
         }
       }}
       onMouseLeave={() => {
@@ -407,7 +607,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const items = rows
         .map((row) => ({
           text: asString(row.text || row.label || row.value),
-          anchor: normalizeAnchorRows(row.anchor),
+          anchor: normalizeAnchorRows(row.anchor)
+            .filter((item) => isJumpableAnchor(item, ctx?.isActionableAnchor)),
         }))
         .filter((item) => item.text)
       const defaultCollapsed = props.default_collapsed !== false
@@ -676,6 +877,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
         : asStringArray(props.items).map((text) => ({ text }))
       return (
         <Card size="small" title="关键要点" style={baseCardStyle(ctx)}>
+          <ActionBar node={node} ctx={ctx} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {itemRows.map((item, idx) => {
               return (

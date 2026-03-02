@@ -1282,7 +1282,7 @@ class LiteratureDirectPaperReadTool(ToolBase):
                 if term.lower() in lower:
                     hit_count += 1
             ratio = (hit_count / max(len(terms), 1)) if terms else 0.0
-            # 中文注释：对首屏摘要页给予轻微偏置，避免零命中时完全随机。
+            # 对首屏摘要页给予轻微偏置，避免零命中时完全随机。
             page_bias = 0.04 if page_idx <= 2 else 0.0
             score = ratio + page_bias
             ranked.append((score, page_idx, content))
@@ -3043,6 +3043,23 @@ async def stream_reader_composed_page(
 
     async def event_generator():
         try:
+            yield _sse_payload(
+                "start",
+                {
+                    "cache_hit": False,
+                    "cache_layer": "none",
+                    "build_mode": "compose_pending",
+                    "page": int(page_num),
+                    "engine_version": "",
+                    "budget": {
+                        "latency_budget_ms": int(
+                            payload.latency_budget_ms
+                            or int(getattr(settings, "reader_compose_latency_budget_ms", 20000) or 20000)
+                        ),
+                        "quality_target": float(payload.quality_target or 0.86),
+                    },
+                },
+            )
             composed_payload, meta = await service.build_or_get_composed_payload(
                 db=db,
                 user_id=int(current_user.id),
@@ -3064,27 +3081,6 @@ async def stream_reader_composed_page(
             if await request.is_disconnected():
                 return
 
-            yield _sse_payload(
-                "start",
-                {
-                    "cache_hit": bool(meta.cache_hit),
-                    "cache_layer": meta.cache_layer,
-                    "build_mode": str(meta.build_mode),
-                    "page": int(page_num),
-                    "engine_version": meta.engine_version,
-                    "budget": {
-                        "latency_budget_ms": int(
-                            (composed_payload.get("quality_report") or {}).get("latency_budget_ms")
-                            or (payload.latency_budget_ms or 8500)
-                        ),
-                        "quality_target": float(
-                            (composed_payload.get("quality_report") or {}).get("quality_target")
-                            or (payload.quality_target or 0.86)
-                        ),
-                    },
-                },
-            )
-
             trace_rows = list(composed_payload.get("iteration_trace") or [])
             if trace_rows:
                 first = trace_rows[0]
@@ -3097,6 +3093,27 @@ async def stream_reader_composed_page(
                         "layout_lock": True,
                     },
                 )
+                first_ops = [row for row in list(first.get("ui_ops") or []) if isinstance(row, dict)]
+                if first_ops:
+                    yield _sse_payload(
+                        "component_patch",
+                        {
+                            "iteration": int(first.get("iteration") or 1),
+                            "seq": 1,
+                            "ui_ops": first_ops,
+                            "source": "agent",
+                        },
+                    )
+                first_agent_trace = [row for row in list(first.get("agent_trace") or []) if isinstance(row, dict)]
+                if first_agent_trace:
+                    yield _sse_payload(
+                        "agent_trace",
+                        {
+                            "iteration": int(first.get("iteration") or 1),
+                            "trace": first_agent_trace,
+                            "tool_calls": [row for row in list(first.get("agent_tool_calls") or []) if isinstance(row, dict)],
+                        },
+                    )
                 for row in trace_rows[1:]:
                     if await request.is_disconnected():
                         return
@@ -3109,6 +3126,27 @@ async def stream_reader_composed_page(
                             "patch_type": "node_replace",
                         },
                     )
+                    row_ops = [item for item in list(row.get("ui_ops") or []) if isinstance(item, dict)]
+                    if row_ops:
+                        yield _sse_payload(
+                            "component_patch",
+                            {
+                                "iteration": int(row.get("iteration") or 0),
+                                "seq": int(row.get("iteration") or 0),
+                                "ui_ops": row_ops,
+                                "source": "agent",
+                            },
+                        )
+                    row_agent_trace = [item for item in list(row.get("agent_trace") or []) if isinstance(item, dict)]
+                    if row_agent_trace:
+                        yield _sse_payload(
+                            "agent_trace",
+                            {
+                                "iteration": int(row.get("iteration") or 0),
+                                "trace": row_agent_trace,
+                                "tool_calls": [item for item in list(row.get("agent_tool_calls") or []) if isinstance(item, dict)],
+                            },
+                        )
                     yield _sse_payload(
                         "quality",
                         {
@@ -3130,6 +3168,21 @@ async def stream_reader_composed_page(
                         "layout_lock": True,
                     },
                 )
+                final_ops = [
+                    row
+                    for row in list(((composed_payload.get("ui_plan") or {}).get("ui_ops") or []))
+                    if isinstance(row, dict)
+                ]
+                if final_ops:
+                    yield _sse_payload(
+                        "component_patch",
+                        {
+                            "iteration": 1,
+                            "seq": 1,
+                            "ui_ops": final_ops,
+                            "source": "agent",
+                        },
+                    )
 
             yield _sse_payload("assets", {"assets": list(composed_payload.get("assets") or [])})
             yield _sse_payload(
@@ -3143,6 +3196,24 @@ async def stream_reader_composed_page(
                     "sidebar_recall": float((composed_payload.get("quality_report") or {}).get("sidebar_recall") or 0.0),
                 },
             )
+            trace_meta = dict(((composed_payload.get("ui_plan") or {}).get("trace_meta") or {}))
+            assembly_errors = [
+                str(item).strip()
+                for item in list(trace_meta.get("assembly_validation_errors") or [])
+                if str(item).strip()
+            ] + [
+                str(item).strip()
+                for item in list(trace_meta.get("assembly_apply_errors") or [])
+                if str(item).strip()
+            ]
+            if assembly_errors:
+                yield _sse_payload(
+                    "component_error",
+                    {
+                        "message": "component_patch_validation_failed",
+                        "errors": assembly_errors[:20],
+                    },
+                )
             yield _sse_payload(
                 "done",
                 {
@@ -3163,6 +3234,18 @@ async def stream_reader_composed_page(
                         "overlay_applied": bool(composed_payload.get("overlay_applied")),
                         "overlay_count": int(composed_payload.get("overlay_count") or 0),
                     },
+                    "qwen_plan_meta": dict(composed_payload.get("qwen_plan_meta") or {}),
+                    "parser_chain_meta": dict(composed_payload.get("parser_chain_meta") or {}),
+                    "docmind_meta": dict(composed_payload.get("docmind_meta") or {}),
+                    "page_structure_source": str((composed_payload.get("page_structure_v3") or {}).get("source") or ""),
+                    "layout_advice_meta": dict(composed_payload.get("layout_advice_meta") or {}),
+                    "segment_stats": {
+                        "used": bool((composed_payload.get("segment_map_meta") or {}).get("used")),
+                        "reason": str((composed_payload.get("segment_map_meta") or {}).get("reason") or ""),
+                        "source": str((composed_payload.get("segment_map") or {}).get("source") or ""),
+                        "segment_count": len(list((composed_payload.get("segment_map") or {}).get("segments") or [])),
+                    },
+                    "node_gate_stats": dict(composed_payload.get("node_gate_report") or {}),
                 },
             )
         except Exception as exc:

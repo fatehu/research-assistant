@@ -1,4 +1,4 @@
-﻿# 论文阅读模块_paper_read 语言切换策略改为 Agent 自主决策测试记录
+# 论文阅读模块_paper_read 语言切换策略改为 Agent 自主决策测试记录
 
 - 时间：2026-02-16 07:27
 - 环境：本地 Windows + Python

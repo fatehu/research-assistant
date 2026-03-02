@@ -352,12 +352,48 @@ class ReaderComponentBBoxHint(BaseModel):
     page_height: Optional[float] = None
 
 
+class ReaderAnchorPolygonPoint(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+
+
+class ReaderAnchorPolygon(BaseModel):
+    points: List[ReaderAnchorPolygonPoint] = Field(default_factory=list)
+    source: Optional[str] = None
+    component_id: Optional[str] = None
+
+
+class ReaderAnchorGeometry(BaseModel):
+    polygons: List[ReaderAnchorPolygon] = Field(default_factory=list)
+    page_width: Optional[float] = None
+    page_height: Optional[float] = None
+
+
+class ReaderComponentAnchorV2(BaseModel):
+    coord_version: str = "anchor_v2"
+    canonical_block_id: str
+    page: int = Field(..., ge=1)
+    start_char: int = Field(..., ge=0)
+    end_char: int = Field(..., ge=0)
+
+
 class ReaderComponentSourceAnchor(BaseModel):
     page: int = Field(..., ge=1)
     start_char: int = Field(..., ge=0)
     end_char: int = Field(..., ge=0)
     quote_text: Optional[str] = None
+    anchor_id: Optional[str] = None
+    segment_index: Optional[int] = Field(default=None, ge=1)
+    segment_total: Optional[int] = Field(default=None, ge=1)
     bbox_hint: Optional[ReaderComponentBBoxHint] = None
+    canonical_block_id: Optional[str] = None
+    coord_version: Optional[str] = None
+    anchor_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    anchor_v2: Optional[ReaderComponentAnchorV2] = None
+    geometry_version: Optional[str] = None
+    geometry: Optional[ReaderAnchorGeometry] = None
+    source_word_ids: List[str] = Field(default_factory=list)
+    source_char_ranges: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class ReaderComponentAction(BaseModel):
@@ -402,6 +438,12 @@ class ReaderComposeQualityReport(BaseModel):
     mm_assist_used: bool = False
     mm_model: str = ""
     mm_fallback_used: bool = False
+    anchor_coverage_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_image_ready: float = Field(default=0.0, ge=0.0, le=1.0)
+    anchor_quote_hit_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    anchor_bbox_iou: float = Field(default=0.0, ge=0.0, le=1.0)
+    anchor_misjump_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    anchor_gate_passed: bool = True
     validation_errors: List[str] = Field(default_factory=list)
     quality_target: float = Field(default=0.86, ge=0.6, le=0.97)
     iterations: int = Field(default=0, ge=0)
@@ -419,6 +461,40 @@ class ReaderUIPlan(BaseModel):
     layout: Dict[str, Any] = Field(default_factory=dict)
     style_tokens: Dict[str, Any] = Field(default_factory=dict)
     trace_meta: Dict[str, Any] = Field(default_factory=dict)
+    ui_ops: List[Dict[str, Any]] = Field(default_factory=list)
+    agent_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    agent_tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SegmentPlan(BaseModel):
+    segment_id: str
+    kind: str
+    ui_component: str
+    component_hint: Optional[str] = None
+    kind_hint: Optional[str] = None
+    confidence: Optional[float] = None
+    block_ids: List[str] = Field(default_factory=list)
+    line_ids: List[str] = Field(default_factory=list)
+    evidence_line_ids: List[str] = Field(default_factory=list)
+    title: Optional[str] = None
+    continuation: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class LayoutPlanV2(BaseModel):
+    zones: List[Dict[str, Any]] = Field(default_factory=list)
+    headings: List[Dict[str, Any]] = Field(default_factory=list)
+    continuation: Dict[str, Any] = Field(default_factory=dict)
+    segments: List[SegmentPlan] = Field(default_factory=list)
+    ui_suggestions: List[Dict[str, Any]] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class NodeGateReport(BaseModel):
+    total_nodes: int = 0
+    blocked_nodes: int = 0
+    passed_nodes: int = 0
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ReaderComposeAsset(BaseModel):
@@ -443,6 +519,16 @@ class ReaderComposePayload(BaseModel):
     asset_policy: Dict[str, Any] = Field(default_factory=dict)
     layout_channels: Dict[str, List[str]] = Field(default_factory=dict)
     mm_assist_meta: Dict[str, Any] = Field(default_factory=dict)
+    parser_chain_meta: Dict[str, Any] = Field(default_factory=dict)
+    page_structure_v3: Dict[str, Any] = Field(default_factory=dict)
+    qwen_layout_plan_v2: Optional[LayoutPlanV2] = None
+    layout_advice_v3: Dict[str, Any] = Field(default_factory=dict)
+    qwen_plan_meta: Dict[str, Any] = Field(default_factory=dict)
+    assembly_meta: Dict[str, Any] = Field(default_factory=dict)
+    component_registry_version: Optional[str] = None
+    segment_map: Dict[str, Any] = Field(default_factory=dict)
+    segment_map_meta: Dict[str, Any] = Field(default_factory=dict)
+    node_gate_report: Optional[NodeGateReport] = None
     toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     generated_at: datetime
     cache_hit: bool = False

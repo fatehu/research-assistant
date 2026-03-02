@@ -1,4 +1,4 @@
-﻿"""Backfill/rebuild contextual retrieval fields and embeddings.
+"""Backfill/rebuild contextual retrieval fields and embeddings.
 
 Usage examples:
   python -m app.maintenance.backfill_context_summary_and_embeddings --mode rebuild --truncate-first --dry-run

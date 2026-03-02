@@ -5,7 +5,7 @@ Application settings loaded from environment variables.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -205,22 +205,86 @@ class Settings(BaseSettings):
     notebook_context_output_cells: int = 5
 
     # PDF layout parser
-    pdf_layout_parser: Literal["auto", "markitdown", "docling", "none"] = "auto"
+    pdf_layout_parser: Literal["auto", "markitdown", "docling", "document_mind", "none"] = "document_mind"
     pdf_layout_min_chars: int = 200
-    # Reader compose：多模态仅用于结构裁决（不做正文改写）。
+    # Alibaba Cloud Document Mind parser (optional, parser-chain fallback)
+    reader_document_mind_enabled: bool = True
+    reader_document_mind_allowlist: str = ""
+    document_mind_access_key_id: str = ""
+    document_mind_access_key_secret: str = ""
+    document_mind_region_id: str = "cn-hangzhou"
+    document_mind_endpoint: str = "docmind-api.aliyuncs.com"
+    document_mind_option: str = "docStructure"
+    document_mind_poll_interval_seconds: float = 1.5
+    document_mind_timeout_seconds: int = 90
+    # Reader compose multimodal assist (layout only, no rewriting)
     reader_mm_assist_enabled: bool = True
-    reader_mm_primary_model: str = "qwen3.5-flash"
-    reader_mm_fallback_model: str = "qwen3-vl-flash"
-    reader_mm_timeout_ms: int = 6000
+    # Cheap multimodal advisor for parser/line-level hints
+    reader_mm_parser_model: str = "qwen3-vl-flash"
+    # Fallback for parser schema repair (can be a stronger text model)
+    reader_mm_parser_fallback_model: str = "qwen-vl-ocr-latest"
+    # Main planner for layout segments/components
+    reader_mm_layout_model: str = "qwen3.5-plus"
+    reader_mm_primary_model: str = "qwen3-vl-flash"
+    reader_mm_fallback_model: str = "qwen3-vl-plus"
+    reader_mm_timeout_ms: int = 90000
+    reader_mm_parser_timeout_ms: int = 120000
+    reader_mm_max_tokens: int = 7000
+    reader_mm_parser_max_tokens: int = 7000
     reader_mm_max_calls_per_page: int = 1
     reader_mm_trigger_confidence: float = 0.62
     reader_mm_max_doc_trigger_ratio: float = 0.08
+    reader_mm_image_resolution: int = 96
+    reader_mm_image_max_side: int = 1024
+    reader_mm_line_candidate_limit: int = 100
+    reader_mm_block_candidate_limit: int = 72
     reader_mm_prompt_version: str = "mm_layout_v1"
     reader_mm_layout_schema_version: str = "mm_layout_schema_v1"
-    # 兼容旧配置键（后续可移除）。
+    # Reader compose layout plan v2 (Qwen planner + DeepSeek assembler)
+    reader_layout_plan_v2_enabled: bool = True
+    # Deprecated: layout plan v2 now applies globally when enabled.
+    reader_layout_plan_v2_allowlist: str = ""
+    # Enable parser-v2 contract (doc_nav_tree + block_groups + word/char anchoring).
+    reader_page_structure_v2_enabled: bool = True
+    # Enable polygon-first evidence geometry; fallback to bbox when unavailable.
+    reader_polygon_highlight_enabled: bool = True
+    reader_compose_layout_llm_enabled: bool = True
+    reader_compose_layout_llm_prompt_version: str = "compose_layout_llm_v1"
+    reader_compose_layout_llm_max_blocks: int = 80
+    # Compose end-to-end latency budget in milliseconds.
+    reader_compose_latency_budget_ms: int = 20000
+    # Reader compose agent runtime (component stream / tool-calling)
+    reader_agent_component_stream_enabled: bool = True
+    reader_agent_tools_enabled: bool = True
+    reader_agent_tool_whitelist: str = "paper_read,knowledge_search"
+    # Agent assembly timeout in seconds. <=0 means no timeout.
+    reader_agent_assembly_timeout_seconds: int = 180
+    # Legacy DeepSeek assembly timeout in seconds. <=0 means no timeout.
+    reader_compose_layout_llm_timeout_seconds: int = 120
+    # Reader anchor quality gate / jump control
+    reader_anchor_min_confidence: float = 0.78
+    reader_anchor_eval_gate_enabled: bool = True
+    reader_anchor_eval_min_hit_rate: float = 0.8
+    reader_anchor_eval_min_iou: float = 0.25
+    reader_anchor_eval_max_misjump: float = 0.2
+    # Legacy compatibility flag
     reader_multimodal_enabled: bool = False
-    # Reader compose: 外网补图默认关闭，避免引入与文本模型能力不匹配的链路。
+    # Reader compose external image fallback (disabled by default)
     reader_external_image_enabled: bool = False
+
+    @field_validator("debug", "sqlalchemy_echo", mode="before")
+    @classmethod
+    def _parse_bool_like_flags(cls, value):  # type: ignore[no-untyped-def]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "debug", "dev", "development"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "release", "prod", "production", "staging"}:
+            return False
+        return value
 
     def get_llm_config(self, provider: str = None):
         provider = provider or self.default_llm_provider
@@ -290,3 +354,4 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
