@@ -1,6 +1,6 @@
 import { Fragment, type CSSProperties, type ReactNode, useState } from 'react'
 import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Popover, Typography, message } from 'antd'
-import { DownOutlined, DragOutlined, LinkOutlined, ReloadOutlined, ShrinkOutlined, PlusOutlined } from '@ant-design/icons'
+import { DownOutlined, DragOutlined, LinkOutlined, PlusOutlined } from '@ant-design/icons'
 
 import type {
   ReaderComponentAction,
@@ -21,7 +21,6 @@ export type ReaderComponentRenderContext = {
   onJumpAnchor?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
   onPreviewAnchors?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
   onHidePreview?: () => void
-  onNodeAction?: (node: ReaderComponentNode, action: 'regenerate' | 'degrade') => void
   onInlineQuery?: (node: ReaderComponentNode, question: string) => Promise<void> | void
   onDropMarkdown?: (markdown: string, node?: ReaderComponentNode) => void
   onManualInsertSlot?: (nodeId: string) => void
@@ -65,6 +64,7 @@ function normalizeAnchorRows(value: unknown): ReaderComponentSourceAnchor[] {
       page,
       start_char: startChar,
       end_char: endChar,
+      quote: typeof row.quote === 'string' ? row.quote : (typeof row.quote_text === 'string' ? row.quote_text : undefined),
       quote_text: typeof row.quote_text === 'string' ? row.quote_text : undefined,
       anchor_id: typeof row.anchor_id === 'string' ? row.anchor_id : undefined,
       segment_index: Number.isFinite(Number(row.segment_index)) ? Number(row.segment_index) : undefined,
@@ -203,8 +203,6 @@ function buildFallbackActions(node: ReaderComponentNode, ctx?: ReaderComponentRe
   }
 
   const fallback: ReaderComponentAction[] = []
-  if (allowByCapability(['regenerate'])) fallback.push({ key: 'regenerate', label: '修复', kind: 'default' })
-  if (allowByCapability(['degrade'])) fallback.push({ key: 'degrade', label: '降级', kind: 'default' })
   if (
     node.type !== 'KeyTakeaways'
     && anchors.length > 0
@@ -294,32 +292,6 @@ function ActionBar(props: {
             ? row.payload as Record<string, unknown>
             : {}
           if (!key) return null
-          if (key === 'regenerate') {
-            return (
-              <Button
-                key={`${node.id}:regenerate:${idx}`}
-                size="small"
-                icon={<ReloadOutlined />}
-                style={actionBtnStyle}
-                onClick={() => ctx.onNodeAction?.(node, 'regenerate')}
-              >
-                {label}
-              </Button>
-            )
-          }
-          if (key === 'degrade') {
-            return (
-              <Button
-                key={`${node.id}:degrade:${idx}`}
-                size="small"
-                icon={<ShrinkOutlined />}
-                style={actionBtnStyle}
-                onClick={() => ctx.onNodeAction?.(node, 'degrade')}
-              >
-                {label}
-              </Button>
-            )
-          }
           if (key === 'jump_anchor') {
             return (
               <Button
@@ -410,6 +382,7 @@ function InlineQuerySlotNode(props: {
   ctx: ReaderComponentRenderContext
 }): ReactNode {
   const { node, ctx } = props
+  if (!ctx.onInlineQuery) return null
   const [expanded, setExpanded] = useState(false)
   const [value, setValue] = useState('')
   const loading = ctx.inlineQueryLoadingNodeId === node.id

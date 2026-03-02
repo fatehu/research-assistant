@@ -1023,6 +1023,7 @@ export interface ReaderComponentSourceAnchor {
   page: number
   start_char: number
   end_char: number
+  quote?: string | null
   quote_text?: string | null
   anchor_id?: string | null
   segment_index?: number | null
@@ -1075,6 +1076,8 @@ export interface ReaderComponentNode {
   props: Record<string, unknown>
   children: ReaderComponentNode[]
   source_anchor_refs: ReaderComponentSourceAnchor[]
+  source_block_ids: string[]
+  source_atom_ids?: string[]
   zone_type?: 'main_body' | 'side_context' | 'figure_meta'
   column_id?: string
   heading_prob?: number
@@ -1169,6 +1172,26 @@ export interface NodeGateReport {
   rows?: Array<Record<string, unknown>>
 }
 
+export interface ReaderValidationGateResult {
+  passed: boolean
+  errors: string[]
+}
+
+export interface ReaderValidationGates {
+  id_integrity: ReaderValidationGateResult
+  full_coverage: ReaderValidationGateResult
+  whitelist_only: ReaderValidationGateResult
+  ownership_unchanged: ReaderValidationGateResult
+  non_empty_plan_for_non_empty_input: ReaderValidationGateResult
+  source_text_immutable: ReaderValidationGateResult
+}
+
+export interface ReaderValidationReport {
+  passed: boolean
+  gates: ReaderValidationGates
+  errors?: string[]
+}
+
 export interface ReaderComposeAsset {
   kind: 'link' | 'annotation' | 'image_hint' | 'external_image'
   label: string
@@ -1181,6 +1204,9 @@ export interface ReaderComposeAsset {
 export interface ReaderComposePayload {
   paper_id: number
   page: number
+  status: 'done' | 'fallback'
+  degraded_reason: string
+  pipeline_version?: string
   engine_version: string
   source_signature: string
   build_mode: string
@@ -1188,11 +1214,25 @@ export interface ReaderComposePayload {
   assets: ReaderComposeAsset[]
   quality_report: ReaderComposeQualityReport
   iteration_trace: Array<Record<string, unknown>>
+  main_block_ids: string[]
+  aux_block_ids: string[]
+  validation_report: ReaderValidationReport
   asset_policy: Record<string, unknown>
   layout_channels?: Record<string, string[]>
   mm_assist_meta?: Record<string, unknown>
   parser_chain_meta?: Record<string, unknown>
   page_structure_v3?: Record<string, unknown>
+  canonical_atoms?: Record<string, unknown>
+  atom_semantics?: Record<string, unknown>
+  deterministic_page_skeleton?: Record<string, unknown>
+  stage2_style_plan?: Record<string, unknown>
+  minimal_gate_report?: Record<string, unknown>
+  candidate_ranking?: Record<string, unknown>
+  repair_report?: Record<string, unknown>
+  segment_id_map?: Record<string, unknown>
+  stage1_structural_annotations?: Record<string, unknown>
+  stage2_design_layout?: Record<string, unknown>
+  pipeline_contract_meta?: Record<string, unknown>
   qwen_layout_plan_v2?: LayoutPlanV2 | null
   layout_advice_v3?: Record<string, unknown>
   qwen_plan_meta?: Record<string, unknown>
@@ -1265,6 +1305,9 @@ export interface ReaderComposeStreamEventMap {
   component_error: {
     message: string
     errors?: string[]
+    stage?: string
+    code?: string
+    details?: Record<string, unknown>
   }
   assets: {
     assets: ReaderComposeAsset[]
@@ -1278,17 +1321,33 @@ export interface ReaderComposeStreamEventMap {
     sidebar_recall?: number
   }
   done: {
+    status?: 'done' | 'fallback'
+    degraded_reason?: string
+    validation_report?: ReaderValidationReport
     payload: ReaderComposePayload
     cache_meta?: Record<string, unknown>
     iteration_stats?: Record<string, unknown>
     overlay_meta?: Record<string, unknown>
     qwen_plan_meta?: Record<string, unknown>
     parser_chain_meta?: Record<string, unknown>
+    pipeline_contract_meta?: Record<string, unknown>
+    stage1_structural_annotations?: Record<string, unknown>
+    stage2_design_layout?: Record<string, unknown>
+    canonical_atoms?: Record<string, unknown>
+    atom_semantics?: Record<string, unknown>
+    deterministic_page_skeleton?: Record<string, unknown>
+    stage2_style_plan?: Record<string, unknown>
+    minimal_gate_report?: Record<string, unknown>
+    candidate_ranking?: Record<string, unknown>
+    repair_report?: Record<string, unknown>
+    segment_id_map?: Record<string, unknown>
     segment_stats?: Record<string, unknown>
     node_gate_stats?: Record<string, unknown>
   }
   error: {
     message: string
+    stage?: string
+    code?: string
   }
 }
 
@@ -1314,6 +1373,8 @@ export interface ReaderNodeActionResponse {
   quality_delta: number
   overlay_saved: boolean
   message: string
+  disabled?: boolean
+  disabled_reason?: string | null
 }
 
 export interface ReaderInlineQueryRequest {
@@ -1333,6 +1394,7 @@ export interface ReaderInlineQuerySource {
   page: number
   start_char: number
   end_char: number
+  quote?: string | null
   quote_text?: string | null
   canonical_block_id?: string | null
   coord_version?: 'anchor_v2' | string | null
@@ -1348,9 +1410,16 @@ export interface ReaderInlineQueryEventMap {
     text: string
   }
   sources: ReaderInlineQuerySource[]
+  disabled: {
+    disabled: boolean
+    disabled_reason?: string
+    message?: string
+  }
   done: {
-    node: ReaderComponentNode
-    sources: ReaderInlineQuerySource[]
+    node?: ReaderComponentNode
+    sources?: ReaderInlineQuerySource[]
+    disabled?: boolean
+    disabled_reason?: string
   }
   error: {
     message: string

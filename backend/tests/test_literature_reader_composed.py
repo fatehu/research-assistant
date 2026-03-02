@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import sys
 from types import SimpleNamespace
@@ -9,10 +9,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.api import literature as literature_api
 from app.config import settings
+from app.services import literature_reader_compose_service as compose_module
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
 from app.services.literature_reader_compose_service import LiteratureReaderComposeService
 from app.services.reader_component_contract_service import ReaderComponentContractService
 from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
+from app.services.render_pipeline_contract import RenderPipelineContractError
 
 
 def _score(overall: float, hard_pass: bool, quality_target: float) -> dict:
@@ -29,6 +31,99 @@ def _score(overall: float, hard_pass: bool, quality_target: float) -> dict:
         "validation_errors": [],
         "quality_target": quality_target,
     }
+
+
+def _validation_report_stub(passed: bool = False) -> dict:
+    gates = {
+        "id_integrity": {"passed": bool(passed), "errors": [] if passed else ["id_integrity_failed"]},
+        "full_coverage": {"passed": bool(passed), "errors": [] if passed else ["full_coverage_failed"]},
+        "whitelist_only": {"passed": bool(passed), "errors": [] if passed else ["whitelist_only_failed"]},
+        "ownership_unchanged": {"passed": bool(passed), "errors": [] if passed else ["ownership_unchanged_failed"]},
+        "non_empty_plan_for_non_empty_input": {"passed": bool(passed), "errors": [] if passed else ["non_empty_plan_failed"]},
+        "source_text_immutable": {"passed": bool(passed), "errors": [] if passed else ["source_text_immutable_failed"]},
+    }
+    return {"passed": bool(passed), "gates": gates, "errors": [] if passed else ["fallback"]}
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_lock_contention_should_not_read_stale_cache(monkeypatch):
+    service = LiteratureReaderComposeService()
+    reads = {"redis": 0}
+
+    monkeypatch.setattr(compose_module, "LOCK_WAIT_SECONDS", 0.02, raising=False)
+    monkeypatch.setattr(compose_module, "LOCK_POLL_INTERVAL_SECONDS", 0.01, raising=False)
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-demo"
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_payload_from_redis(_key):
+        reads["redis"] += 1
+        return {"status": "done"}
+
+    async def _always_no_lock(_lock_key):
+        return None
+
+    async def _no_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _force_fallback(**kwargs):
+        page = int(kwargs.get("page") or 1)
+        return {
+            "paper_id": 1,
+            "page": page,
+            "status": "fallback",
+            "degraded_reason": "force_refresh_lock_timeout",
+            "pipeline_version": "single_agent_v2",
+            "engine_version": "reader_compose_v3",
+            "source_signature": str(kwargs.get("source_signature") or "sig-demo"),
+            "build_mode": "compose_agent_single_agent_v2",
+            "ui_plan": {
+                "plan_id": "fallback_plan",
+                "components": [
+                    {
+                        "id": "fallback_node_1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "fallback"},
+                        "children": [],
+                        "source_anchor_refs": [],
+                        "source_block_ids": ["p1_b1"],
+                    }
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+            "assets": [],
+            "quality_report": {"overall": 0.0, "validation_errors": []},
+            "iteration_trace": [],
+            "main_block_ids": ["p1_b1"],
+            "aux_block_ids": [],
+            "validation_report": _validation_report_stub(False),
+            "repair_report": {"used": True, "reason": "force_refresh_lock_timeout"},
+            "generated_at": "2026-03-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _always_no_lock)
+    monkeypatch.setattr(service, "_build_force_refresh_timeout_fallback_payload", _force_fallback)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _no_overlay)
+
+    payload, _ = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=1, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=True,
+    )
+
+    assert str(payload.get("status") or "") == "fallback"
+    assert str(payload.get("degraded_reason") or "") == "force_refresh_lock_timeout"
+    assert reads["redis"] == 0
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1146,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
                             "type": "ParagraphProse",
                             "props": {"text": "Demo paragraph for inline query."},
                             "children": [],
+                            "source_block_ids": ["p1_b1"],
                             "source_anchor_refs": [
                                 {"page": 1, "start_char": 0, "end_char": 20, "quote_text": "Demo paragraph"}
                             ],
@@ -1090,7 +1186,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
 
 
 @pytest.mark.asyncio
-async def test_reader_compose_mm_gate_not_hit_should_skip_mm_call(monkeypatch):
+async def test_reader_compose_mm_gate_not_hit_should_fail_loud_without_docmind_source(monkeypatch):
     service = LiteratureReaderComposeService()
 
     class _StubMMService:
@@ -1109,25 +1205,22 @@ async def test_reader_compose_mm_gate_not_hit_should_skip_mm_call(monkeypatch):
     )
     monkeypatch.setattr(os.path, "exists", lambda _path: True)
 
-    payload = await service._apply_multimodal_layout_assist(
-        paper=SimpleNamespace(id=19, user_id=1, title="Demo", pdf_path="demo.pdf"),
-        page=1,
-        base_payload={
-            "page": 1,
-            "structure_confidence": 0.9,
-            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph"}],
-            "sections": [],
-        },
-    )
-
-    meta = payload.get("mm_assist_meta") or {}
-    assert meta.get("used") is False
-    assert meta.get("reason") == "quality_gate_not_hit"
-    assert "layout_channels" in payload
+    with pytest.raises(RenderPipelineContractError) as exc_info:
+        await service._apply_multimodal_layout_assist(
+            paper=SimpleNamespace(id=19, user_id=1, title="Demo", pdf_path="demo.pdf"),
+            page=1,
+            base_payload={
+                "page": 1,
+                "structure_confidence": 0.9,
+                "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph"}],
+                "sections": [],
+            },
+        )
+    assert exc_info.value.code == "DOCMIND_LAYOUT_DIGEST_EMPTY"
 
 
 @pytest.mark.asyncio
-async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypatch):
+async def test_reader_compose_mm_should_fail_loud_when_stage_contract_prereq_missing(monkeypatch):
     service = LiteratureReaderComposeService()
 
     class _StubMMService:
@@ -1178,23 +1271,18 @@ async def test_reader_compose_mm_should_use_fallback_and_merge_channels(monkeypa
     )
     monkeypatch.setattr(os.path, "exists", lambda _path: True)
 
-    payload = await service._apply_multimodal_layout_assist(
-        paper=SimpleNamespace(id=20, user_id=1, title="Demo", pdf_path="demo.pdf"),
-        page=1,
-        base_payload={
-            "page": 1,
-            "structure_confidence": 0.5,
-            "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "zone_type": "main_body"}],
-            "sections": [],
-        },
-    )
-
-    mm_meta = payload.get("mm_assist_meta") or {}
-    assert mm_meta.get("used") is True
-    assert mm_meta.get("fallback_used") is True
-    channels = payload.get("layout_channels") or {}
-    assert "main_body" in channels
-    assert "side_context" in channels
+    with pytest.raises(RenderPipelineContractError) as exc_info:
+        await service._apply_multimodal_layout_assist(
+            paper=SimpleNamespace(id=20, user_id=1, title="Demo", pdf_path="demo.pdf"),
+            page=1,
+            base_payload={
+                "page": 1,
+                "structure_confidence": 0.5,
+                "blocks": [{"id": "b1", "kind": "paragraph", "text": "Demo paragraph", "zone_type": "main_body"}],
+                "sections": [],
+            },
+        )
+    assert exc_info.value.code == "DOCMIND_LAYOUT_DIGEST_EMPTY"
 
 
 def test_mm_should_trigger_per_build_when_budget_allows(monkeypatch):
@@ -1236,7 +1324,7 @@ def test_mm_should_trigger_per_build_when_budget_allows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mm_prompt_payload_should_include_prev_current_next_images(monkeypatch):
+async def test_mm_prompt_payload_should_include_current_image_only(monkeypatch):
     service = ReaderMultimodalLayoutService()
 
     async def _fake_render(*, pdf_path: str, page: int):
@@ -1260,7 +1348,7 @@ async def test_mm_prompt_payload_should_include_prev_current_next_images(monkeyp
     assert isinstance(payload, dict)
     images = list(payload.get("images") or [])
     scopes = [str(item.get("scope") or "") for item in images]
-    assert scopes == ["prev", "current", "next"]
+    assert scopes == ["current"]
     assert str(payload.get("image_data_url") or "").startswith("data:image/jpeg;base64,page-2")
     assert isinstance(payload.get("native_page_extract"), dict)
     assert isinstance(payload.get("valid_word_ids"), list)
@@ -2115,7 +2203,7 @@ def test_node_level_anchor_gate_should_not_strip_entire_page():
                 "props": {"text": "Good paragraph", "source_block_id": "p1_b1"},
                 "children": [],
                 "capabilities": ["jump_anchor", "copy"],
-                "actions": [{"key": "jump_anchor", "label": "定位到证据"}],
+                "actions": [{"key": "jump_anchor", "label": "Jump"}],
                 "source_anchor_refs": [
                     {
                         "page": 1,
@@ -2134,7 +2222,7 @@ def test_node_level_anchor_gate_should_not_strip_entire_page():
                 "props": {"text": "Bad paragraph", "source_block_id": "p1_b2"},
                 "children": [],
                 "capabilities": ["jump_anchor", "copy"],
-                "actions": [{"key": "jump_anchor", "label": "定位到证据"}],
+                "actions": [{"key": "jump_anchor", "label": "Jump"}],
                 "source_anchor_refs": [
                     {
                         "page": 1,
@@ -2805,49 +2893,75 @@ def test_reader_component_contract_service_rejects_invalid_ui_ops():
 
 
 @pytest.mark.asyncio
+async def test_apply_multimodal_layout_assist_should_fail_loud_when_not_docmind_source():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=78, user_id=1, title="Demo", pdf_path="demo.pdf")
+
+    with pytest.raises(RenderPipelineContractError) as exc:
+        await service._apply_multimodal_layout_assist(  # pylint: disable=protected-access
+            paper=paper,
+            page=1,
+            base_payload={"page_structure_v3": {"source": "local_parser", "block_groups": []}},
+        )
+
+    assert exc.value.code == "DOCMIND_LAYOUT_DIGEST_EMPTY"
+    assert exc.value.stage == "docmind"
+
+
+@pytest.mark.asyncio
 async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monkeypatch):
     service = LiteratureReaderComposeService()
     paper = SimpleNamespace(id=78, user_id=1, title="Demo", pdf_path="demo.pdf")
 
-    async def _prompt_payload(**_kwargs):
-        return {"native_page_extract": {}, "valid_line_ids": []}
-
-    async def _plan_builder(**_kwargs):
-        return (
-            {
-                "segments": [
-                    {
-                        "segment_id": "seg_1",
-                        "kind": "paragraph",
-                        "component_hint": "ParagraphProse",
-                        "block_ids": ["p1_dm_p1_l001_b001"],
-                        "reason": "main prose",
-                    }
-                ],
-                "zones": [],
-                "continuation": {},
-                "ui_suggestions": [],
-                "notes": [],
-            },
-            {"model": "qwen3.5-plus", "fallback_used": False},
-        )
-
     async def _should_not_call_parser(**_kwargs):
         raise AssertionError("build_line_parse_advice should be skipped when docmind structure exists")
+
+    async def _stage1(**_kwargs):
+        return (
+            {
+                "blocks": [
+                    {
+                        "layout_id": "l1",
+                        "role": "paragraph",
+                        "section_id": "sec_body",
+                        "column": 0,
+                        "confidence": 0.92,
+                    }
+                ],
+                "sections": [
+                    {
+                        "section_id": "sec_body",
+                        "title_layout_id": "l1",
+                        "children": ["l1"],
+                    }
+                ],
+            },
+            {"used": True, "model": "qwen3-vl-flash", "fallback_used": False},
+        )
+
+    async def _stage2(**_kwargs):
+        return (
+            {
+                "page_layout": [
+                    {
+                        "component": "ParagraphProse",
+                        "source_layout_ids": ["l1"],
+                        "props": {},
+                    }
+                ],
+                "unused_layout_ids": [],
+            },
+            {"used": True, "model": "qwen3.5-plus", "fallback_used": False},
+        )
 
     monkeypatch.setattr(
         service._reader_service,  # pylint: disable=protected-access
         "_resolve_local_pdf_path",
-        lambda **_kwargs: "dummy.pdf",
+        lambda **_kwargs: "",
     )
-    monkeypatch.setattr(
-        "app.services.literature_reader_compose_service.os.path.exists",
-        lambda _path: True,
-    )
-    monkeypatch.setattr(service._mm_layout_service, "build_mm_prompt_payload", _prompt_payload)
-    monkeypatch.setattr(service._mm_layout_service, "build_layout_plan_v2", _plan_builder)
     monkeypatch.setattr(service._mm_layout_service, "build_line_parse_advice", _should_not_call_parser)
-    monkeypatch.setattr(service._mm_layout_service, "mark_mm_triggered", lambda **_kwargs: None)
+    monkeypatch.setattr(service._mm_layout_service, "build_stage1_structural_annotations", _stage1)
+    monkeypatch.setattr(service._mm_layout_service, "build_stage2_design_layout", _stage2)
 
     base_payload = {
         "page_structure_v3": {
@@ -2855,6 +2969,7 @@ async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monk
             "block_groups": [
                 {
                     "block_id": "dm_p1_l001_b001",
+                    "layout_unique_id": "l1",
                     "kind": "paragraph",
                     "zone_type": "main_body",
                     "text": "Demo paragraph.",
@@ -2863,15 +2978,18 @@ async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monk
             ],
             "counts": {"block_count": 1},
         },
-        "blocks": [
-            {
-                "id": "dm_p1_l001_b001",
-                "kind": "paragraph",
-                "text": "Demo paragraph.",
-                "zone_type": "main_body",
-                "source_anchor": {"page": 1, "start_char": 0, "end_char": 14},
-            }
-        ],
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 1,
+                    "uniqueId": "l1",
+                    "type": "text",
+                    "subType": "para",
+                    "text": "Demo paragraph.",
+                    "pos": [{"x": 100, "y": 100}, {"x": 700, "y": 100}, {"x": 700, "y": 130}, {"x": 100, "y": 130}],
+                }
+            ]
+        },
     }
 
     output = await service._apply_multimodal_layout_assist(  # pylint: disable=protected-access
@@ -2880,12 +2998,12 @@ async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monk
         base_payload=base_payload,
     )
 
-    mm_parser_meta = dict(output.get("mm_parser_meta") or {})
-    layout_advice_meta = dict(output.get("layout_advice_meta") or {})
-    assert str(mm_parser_meta.get("reason") or "") == "skipped_docmind_structure_present"
-    assert bool(layout_advice_meta.get("used")) is True
     assert str((output.get("page_structure_v3") or {}).get("source") or "") == "document_mind"
-    assert str((output.get("mm_assist_meta") or {}).get("reason") or "") == "docmind_structure_with_layout_advice"
+    assert str((output.get("layout_advice_v3") or {}).get("source") or "") == "stage2_design_v1"
+    assert bool((output.get("pipeline_contract_meta") or {}).get("used")) is True
+    assert bool((output.get("mm_assist_meta") or {}).get("used")) is True
+    assert len(list((output.get("stage1_structural_annotations") or {}).get("blocks") or [])) == 1
+    assert len(list((output.get("stage2_design_layout") or {}).get("page_layout") or [])) == 1
 
 
 def test_layout_plan_prompt_should_include_all_block_ids_without_truncation():
@@ -2950,3 +3068,251 @@ def test_build_main_blocks_from_page_structure_should_use_docmind_geometry_when_
     bbox = dict(anchor.get("bbox_hint") or {})
     assert float(bbox.get("x0") or 0.0) == 80.0
     assert float(bbox.get("x1") or 0.0) == 760.0
+
+
+def _simplified_docmind_payload() -> dict:
+    return {
+        "layouts": [
+            {
+                "uniqueId": "L1",
+                "index": 1,
+                "type": "title",
+                "subType": "doc_title",
+                "text": "Title",
+                "pageNum": [1],
+                "pos": [{"x": 10, "y": 10}, {"x": 510, "y": 10}, {"x": 510, "y": 50}, {"x": 10, "y": 50}],
+                "blocks": [{"text": "Title", "pos": [{"x": 10, "y": 10}, {"x": 510, "y": 10}, {"x": 510, "y": 50}, {"x": 10, "y": 50}]}],
+            },
+            {
+                "uniqueId": "L2",
+                "index": 2,
+                "type": "text",
+                "subType": "para",
+                "text": "Paragraph",
+                "pageNum": [1],
+                "pos": [{"x": 10, "y": 70}, {"x": 510, "y": 70}, {"x": 510, "y": 140}, {"x": 10, "y": 140}],
+                "blocks": [{"text": "Paragraph", "pos": [{"x": 10, "y": 70}, {"x": 510, "y": 70}, {"x": 510, "y": 140}, {"x": 10, "y": 140}]}],
+            },
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_simplified_pipeline_stage1_fail_should_use_deterministic_baseline(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
+    async def _fake_model(**_kwargs):
+        return {}
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_model)
+    async def _fake_mm_prompt(**_kwargs):
+        return {}
+
+    async def _fake_stage1(**_kwargs):
+        return None, {"used": False, "fallback_used": True}
+
+    monkeypatch.setattr(service._mm_layout_service, "build_mm_prompt_payload", _fake_mm_prompt)
+    monkeypatch.setattr(service._mm_layout_service, "build_stage1_semantic_annotations", _fake_stage1)
+
+    async def _should_not_call_stage2(**_kwargs):
+        raise AssertionError("stage2 should not be called when stage1 failed in simplified pipeline")
+
+    monkeypatch.setattr(service._mm_layout_service, "build_stage2_design_slots", _should_not_call_stage2)
+
+    monkeypatch.setattr(
+        service,
+        "_build_initial_ui_plan",
+        lambda **kwargs: {
+            "plan_id": "p1",
+            "components": [
+                {
+                    "id": f"node_{idx}",
+                    "type": "ParagraphProse",
+                    "props": {"text": "x"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": list((seg or {}).get("block_ids") or []),
+                }
+                for idx, seg in enumerate(list(((kwargs.get("base_payload") or {}).get("segment_map") or {}).get("segments") or []), start=1)
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+    )
+    async def _identity_assembly(**kwargs):
+        return kwargs["ui_plan"]
+
+    monkeypatch.setattr(service, "_apply_deepseek_assembly_decision", _identity_assembly)
+
+    result = await service._build_simplified_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        base_payload={
+            "docmind_structure": _simplified_docmind_payload(),
+            "page_structure_v3": {
+                "block_groups": [
+                    {"layout_unique_id": "L1", "block_id": "p1_b1"},
+                    {"layout_unique_id": "L2", "block_id": "p1_b2"},
+                ],
+            },
+            "blocks": [
+                {"id": "p1_b1", "source_anchor": {"page": 1, "start_char": 0, "end_char": 5}},
+                {"id": "p1_b2", "source_anchor": {"page": 1, "start_char": 6, "end_char": 15}},
+            ],
+            "assets": [],
+        },
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=8000,
+        selected_kb_id=None,
+    )
+    payload = dict(result.get("base_payload") or {})
+    ui_plan = dict((result.get("loop_result") or {}).get("ui_plan") or {})
+    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "single_agent_v2"
+    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "single_agent_v2"
+    full_coverage_passed = (
+        ((payload.get("pipeline_contract_meta") or {}).get("validation_report") or {})
+        .get("gates", {})
+        .get("full_coverage", {})
+        .get("passed")
+    )
+    assert isinstance(full_coverage_passed, bool)
+    assert len(list(ui_plan.get("components") or [])) > 0
+
+
+@pytest.mark.asyncio
+async def test_simplified_pipeline_stage2_fail_should_use_deterministic_baseline(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
+    async def _fake_model(**_kwargs):
+        return {}
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_model)
+
+    async def _fake_mm_prompt(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(service._mm_layout_service, "build_mm_prompt_payload", _fake_mm_prompt)
+
+    async def _valid_stage1(**_kwargs):
+        return (
+            {
+                "annotations": [
+                    {"atom_id": "p1:lL1:b1", "role": "doc_title", "importance": "high", "grouping_hint": "", "component_hint": "SectionHeading", "confidence": 0.9},
+                    {"atom_id": "p1:lL2:b1", "role": "paragraph", "importance": "normal", "grouping_hint": "", "component_hint": "ParagraphProse", "confidence": 0.9},
+                ]
+            },
+            {"used": True},
+        )
+
+    monkeypatch.setattr(service._mm_layout_service, "build_stage1_semantic_annotations", _valid_stage1)
+    async def _fake_stage2(**_kwargs):
+        return None, {"used": False, "fallback_used": True, "fallback_reason": "stage2_failed"}
+
+    monkeypatch.setattr(service._mm_layout_service, "build_stage2_design_slots", _fake_stage2)
+    monkeypatch.setattr(
+        service,
+        "_build_initial_ui_plan",
+        lambda **kwargs: {
+            "plan_id": "p1",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "x"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p1_b1"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+    )
+    async def _identity_assembly(**kwargs):
+        return kwargs["ui_plan"]
+
+    monkeypatch.setattr(service, "_apply_deepseek_assembly_decision", _identity_assembly)
+
+    result = await service._build_simplified_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        base_payload={
+            "docmind_structure": _simplified_docmind_payload(),
+            "page_structure_v3": {"block_groups": [{"layout_unique_id": "L1", "block_id": "p1_b1"}]},
+            "blocks": [{"id": "p1_b1", "source_anchor": {"page": 1, "start_char": 0, "end_char": 5}}],
+            "assets": [],
+        },
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=8000,
+        selected_kb_id=None,
+    )
+    payload = dict(result.get("base_payload") or {})
+    ui_plan = dict((result.get("loop_result") or {}).get("ui_plan") or {})
+    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "single_agent_v2"
+    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "single_agent_v2"
+    assert len(list(ui_plan.get("components") or [])) > 0
+
+
+@pytest.mark.asyncio
+async def test_reader_composed_soft_disabled_endpoints(monkeypatch):
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_allowlist_papers", "")
+    monkeypatch.setattr(settings, "reader_pipeline_allowlist_pages", "")
+
+    result = await literature_api.action_reader_composed_node(
+        paper_id=78,
+        payload=SimpleNamespace(page=1, node_id="n1", action="degrade", reason=None, selected_kb_id=None, style_intent=None),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=1),
+    )
+    assert bool(result.disabled) is True
+    assert str(result.disabled_reason or "") == "single_agent_v2_node_action_disabled"
+
+    async def _fake_get_paper(_db, _user, paper_id):
+        return SimpleNamespace(id=int(paper_id), user_id=1, title="demo", pdf_path="")
+
+    class _FakeService:
+        async def build_inline_answer_card(self, **_kwargs):
+            return {
+                "disabled": True,
+                "disabled_reason": "inline_query_missing_source_anchor_refs",
+                "message": "Inline query contract validation failed.",
+            }
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_paper)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeService())
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    stream_response = await literature_api.stream_reader_composed_inline_query(
+        paper_id=78,
+        payload=SimpleNamespace(page=1, node_id="n1", question="q", scope="section", selected_kb_id=None, style_intent=None),
+        request=_FakeRequest(),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=1),
+    )
+    events = []
+    async for chunk in stream_response.body_iterator:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[len("data: "):])
+                events.append(str(data.get("event") or ""))
+    assert events[:2] == ["disabled", "done"]
+

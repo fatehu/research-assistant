@@ -2990,6 +2990,7 @@ export default function PaperReaderPage() {
                 foldable: true,
               },
               children: [],
+              source_block_ids: Array.isArray(node.source_block_ids) ? node.source_block_ids : [],
               source_anchor_refs: sourceAnchors,
             }
             const answerNode = doneData.node?.id ? doneData.node : fallbackNode
@@ -3017,6 +3018,7 @@ export default function PaperReaderPage() {
             foldable: true,
           },
           children: [],
+          source_block_ids: Array.isArray(node.source_block_ids) ? node.source_block_ids : [],
           source_anchor_refs: toAnchorList(sourceRows),
         }
         applyNodeInsertToComposeState(String(node.id), fallbackNode)
@@ -3564,9 +3566,6 @@ export default function PaperReaderPage() {
                     qualityReport: composedQuality || composedPayload?.quality_report || null,
                     inlineQueryLoadingNodeId,
                     isActionableAnchor,
-                    onNodeAction: (node, action) => {
-                      void handleComposedNodeAction(node, action)
-                    },
                     onInlineQuery: async (node, question) => {
                       await handleInlineQuery(node, question)
                     },
@@ -3591,6 +3590,7 @@ export default function PaperReaderPage() {
                         type: 'InlineQuerySlot',
                         props: { placeholder: '请输入您关于上述段落的疑问...' },
                         children: [],
+                        source_block_ids: [String(nodeId)],
                         source_anchor_refs: [],
                       }
                       applyNodeInsertToComposeState(nodeId, slotNode)
@@ -4571,4 +4571,3 @@ export default function PaperReaderPage() {
     </div>
   )
 }
-

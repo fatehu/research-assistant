@@ -1,0 +1,51 @@
+{
+  "manifest_version": "reader_simplified_eval_v1",
+  "pipeline_version": "simplified_v2",
+  "generated_at": "2026-03-02T00:00:00Z",
+  "samples": [
+    {
+      "sample_id": "paper78_page1",
+      "paper_id": 78,
+      "page": 1,
+      "non_empty_input": true,
+      "expected": {
+        "non_empty_plan": true,
+        "min_coverage_rate": 1.0
+      },
+      "baseline_metrics": {
+        "pipeline_latency_ms": 9200,
+        "failure_rate": 0.18,
+        "empty_plan_rate": 0.06,
+        "coverage_rate": 0.91
+      },
+      "current_metrics": {
+        "pipeline_latency_ms": 7600,
+        "failure_rate": 0.04,
+        "empty_plan_rate": 0.0,
+        "coverage_rate": 1.0
+      }
+    },
+    {
+      "sample_id": "paper78_page2",
+      "paper_id": 78,
+      "page": 2,
+      "non_empty_input": true,
+      "expected": {
+        "non_empty_plan": true,
+        "min_coverage_rate": 1.0
+      },
+      "baseline_metrics": {
+        "pipeline_latency_ms": 10100,
+        "failure_rate": 0.22,
+        "empty_plan_rate": 0.08,
+        "coverage_rate": 0.88
+      },
+      "current_metrics": {
+        "pipeline_latency_ms": 8100,
+        "failure_rate": 0.05,
+        "empty_plan_rate": 0.0,
+        "coverage_rate": 1.0
+      }
+    }
+  ]
+}

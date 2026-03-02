@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ============ Paper Schemas ============
@@ -333,7 +333,7 @@ class ReaderComposeRequest(BaseModel):
     selected_kb_id: Optional[int] = None
     force_refresh: bool = False
     regenerate: bool = False
-    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
+    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=600000)
     quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
     max_iterations: Optional[int] = Field(default=None, ge=1, le=16)
     style_intent: Optional[str] = None
@@ -381,6 +381,7 @@ class ReaderComponentSourceAnchor(BaseModel):
     page: int = Field(..., ge=1)
     start_char: int = Field(..., ge=0)
     end_char: int = Field(..., ge=0)
+    quote: Optional[str] = None
     quote_text: Optional[str] = None
     anchor_id: Optional[str] = None
     segment_index: Optional[int] = Field(default=None, ge=1)
@@ -394,6 +395,15 @@ class ReaderComponentSourceAnchor(BaseModel):
     geometry: Optional[ReaderAnchorGeometry] = None
     source_word_ids: List[str] = Field(default_factory=list)
     source_char_ranges: List[Dict[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_quote(self):
+        merged = str(self.quote or self.quote_text or "").strip()
+        self.quote = merged or None
+        self.quote_text = merged or None
+        if int(self.end_char) <= int(self.start_char):
+            self.end_char = int(self.start_char) + max(1, len(merged) or 1)
+        return self
 
 
 class ReaderComponentAction(BaseModel):
@@ -414,6 +424,8 @@ class ReaderComponentNode(BaseModel):
     props: Dict[str, Any] = Field(default_factory=dict)
     children: List["ReaderComponentNode"] = Field(default_factory=list)
     source_anchor_refs: List[ReaderComponentSourceAnchor] = Field(default_factory=list)
+    source_block_ids: List[str] = Field(default_factory=list)
+    source_atom_ids: List[str] = Field(default_factory=list)
     zone_type: Optional[Literal["main_body", "side_context", "figure_meta"]] = None
     column_id: Optional[str] = None
     heading_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -449,7 +461,7 @@ class ReaderComposeQualityReport(BaseModel):
     iterations: int = Field(default=0, ge=0)
     degraded: bool = False
     stop_reason: str = ""
-    latency_budget_ms: int = Field(default=8500, ge=1200, le=25000)
+    latency_budget_ms: int = Field(default=8500, ge=1200, le=600000)
     deductions: List[Dict[str, Any]] = Field(default_factory=list)
     fix_suggestions: List[str] = Field(default_factory=list)
     iteration_trace_summary: List[Dict[str, Any]] = Field(default_factory=list)
@@ -497,6 +509,26 @@ class NodeGateReport(BaseModel):
     rows: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class ReaderValidationGateResult(BaseModel):
+    passed: bool = False
+    errors: List[str] = Field(default_factory=list)
+
+
+class ReaderValidationGates(BaseModel):
+    id_integrity: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    full_coverage: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    whitelist_only: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    ownership_unchanged: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    non_empty_plan_for_non_empty_input: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    source_text_immutable: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+
+
+class ReaderValidationReport(BaseModel):
+    passed: bool = False
+    gates: ReaderValidationGates = Field(default_factory=ReaderValidationGates)
+    errors: List[str] = Field(default_factory=list)
+
+
 class ReaderComposeAsset(BaseModel):
     kind: Literal["link", "annotation", "image_hint", "external_image"]
     label: str
@@ -509,6 +541,9 @@ class ReaderComposeAsset(BaseModel):
 class ReaderComposePayload(BaseModel):
     paper_id: int
     page: int
+    status: Literal["done", "fallback"] = "done"
+    degraded_reason: str = ""
+    pipeline_version: str = ""
     engine_version: str
     source_signature: str
     build_mode: str
@@ -516,11 +551,25 @@ class ReaderComposePayload(BaseModel):
     assets: List[ReaderComposeAsset] = Field(default_factory=list)
     quality_report: ReaderComposeQualityReport = Field(default_factory=ReaderComposeQualityReport)
     iteration_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    main_block_ids: List[str] = Field(default_factory=list)
+    aux_block_ids: List[str] = Field(default_factory=list)
+    validation_report: ReaderValidationReport = Field(default_factory=ReaderValidationReport)
     asset_policy: Dict[str, Any] = Field(default_factory=dict)
     layout_channels: Dict[str, List[str]] = Field(default_factory=dict)
     mm_assist_meta: Dict[str, Any] = Field(default_factory=dict)
     parser_chain_meta: Dict[str, Any] = Field(default_factory=dict)
     page_structure_v3: Dict[str, Any] = Field(default_factory=dict)
+    canonical_atoms: Dict[str, Any] = Field(default_factory=dict)
+    atom_semantics: Dict[str, Any] = Field(default_factory=dict)
+    deterministic_page_skeleton: Dict[str, Any] = Field(default_factory=dict)
+    stage2_style_plan: Dict[str, Any] = Field(default_factory=dict)
+    minimal_gate_report: Dict[str, Any] = Field(default_factory=dict)
+    candidate_ranking: Dict[str, Any] = Field(default_factory=dict)
+    repair_report: Dict[str, Any] = Field(default_factory=dict)
+    segment_id_map: Dict[str, Any] = Field(default_factory=dict)
+    stage1_structural_annotations: Dict[str, Any] = Field(default_factory=dict)
+    stage2_design_layout: Dict[str, Any] = Field(default_factory=dict)
+    pipeline_contract_meta: Dict[str, Any] = Field(default_factory=dict)
     qwen_layout_plan_v2: Optional[LayoutPlanV2] = None
     layout_advice_v3: Dict[str, Any] = Field(default_factory=dict)
     qwen_plan_meta: Dict[str, Any] = Field(default_factory=dict)
@@ -541,7 +590,7 @@ class ReaderComposePrefetchRequest(BaseModel):
     pages: List[int] = Field(default_factory=list, max_length=16)
     selected_kb_id: Optional[int] = None
     style_intent: Optional[str] = None
-    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=25000)
+    latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=600000)
     quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)
     max_iterations: Optional[int] = Field(default=None, ge=1, le=16)
     theme_mode: Optional[Literal["light", "dark"]] = None
@@ -575,6 +624,8 @@ class ReaderNodeActionResponse(BaseModel):
     quality_delta: float = 0.0
     overlay_saved: bool = False
     message: str = ""
+    disabled: bool = False
+    disabled_reason: Optional[str] = None
 
 
 class ReaderInlineQueryRequest(BaseModel):
@@ -594,7 +645,17 @@ class ReaderInlineQuerySource(BaseModel):
     page: int = Field(..., ge=1)
     start_char: int = Field(..., ge=0)
     end_char: int = Field(..., ge=0)
+    quote: Optional[str] = None
     quote_text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _normalize_quote(self):
+        merged = str(self.quote or self.quote_text or "").strip()
+        self.quote = merged or None
+        self.quote_text = merged or None
+        if int(self.end_char) <= int(self.start_char):
+            raise ValueError("inline_query_source.end_char must be greater than start_char")
+        return self
 
 
 class ReaderInlineQueryDonePayload(BaseModel):

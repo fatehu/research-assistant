@@ -89,6 +89,7 @@ from app.services.literature_service import PaperResult, get_literature_service
 from app.services.literature_reader_compose_service import get_literature_reader_compose_service
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
+from app.services.render_pipeline_contract import RenderPipelineContractError
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
 from app.services.status_event_bus import (
@@ -154,6 +155,57 @@ _pdf_page_count_cache: Dict[str, tuple[float, int]] = {}
 
 def _sse_payload(event: str, data: Any) -> str:
     return f"data: {json.dumps({'event': event, 'data': data}, ensure_ascii=False)}\n\n"
+
+
+def _parse_int_allowlist(raw: str) -> Set[int]:
+    values: Set[int] = set()
+    text = str(raw or "").strip()
+    if not text:
+        return values
+    for part in text.split(","):
+        token = str(part or "").strip()
+        if token.isdigit():
+            values.add(int(token))
+    return values
+
+
+def _reader_pipeline_mode() -> str:
+    explicit = str(getattr(settings, "reader_pipeline_mode", "legacy") or "").strip().lower()
+    raw_mode_env = str(os.getenv("READER_PIPELINE_MODE", "") or "").strip().lower()
+    valid_modes = {"legacy", "single_agent_v2"}
+
+    if raw_mode_env:
+        if explicit in valid_modes:
+            return explicit
+        logger.warning(
+            f"[Literature API] invalid READER_PIPELINE_MODE='{raw_mode_env}', fallback to compatibility switch."
+        )
+
+    if explicit == "single_agent_v2":
+        return "single_agent_v2"
+    if bool(getattr(settings, "reader_simplified_pipeline_enabled", False)):
+        logger.warning(
+            "[Literature API] reader_simplified_pipeline_enabled is deprecated; "
+            "use reader_pipeline_mode=single_agent_v2"
+        )
+        return "single_agent_v2"
+    return "legacy"
+
+
+def _is_single_agent_v2_active(*, paper_id: int, page: Optional[int] = None) -> bool:
+    if _reader_pipeline_mode() != "single_agent_v2":
+        return False
+    paper_allow = _parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_papers", "") or ""))
+    page_allow = _parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_pages", "") or ""))
+    if not paper_allow:
+        paper_allow = _parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_papers", "") or ""))
+    if not page_allow:
+        page_allow = _parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_pages", "") or ""))
+    if paper_allow and int(paper_id) not in paper_allow:
+        return False
+    if page is not None and page_allow and int(page) not in page_allow:
+        return False
+    return True
 
 
 async def _publish_paper_link_status_event(link: PaperKnowledgeLink) -> None:
@@ -3217,6 +3269,8 @@ async def stream_reader_composed_page(
             yield _sse_payload(
                 "done",
                 {
+                    "status": str(composed_payload.get("status") or "done"),
+                    "degraded_reason": str(composed_payload.get("degraded_reason") or ""),
                     "payload": composed_payload,
                     "cache_meta": {
                         "cache_hit": bool(meta.cache_hit),
@@ -3238,6 +3292,17 @@ async def stream_reader_composed_page(
                     "parser_chain_meta": dict(composed_payload.get("parser_chain_meta") or {}),
                     "docmind_meta": dict(composed_payload.get("docmind_meta") or {}),
                     "page_structure_source": str((composed_payload.get("page_structure_v3") or {}).get("source") or ""),
+                    "pipeline_contract_meta": dict(composed_payload.get("pipeline_contract_meta") or {}),
+                    "stage1_structural_annotations": dict(composed_payload.get("stage1_structural_annotations") or {}),
+                    "stage2_design_layout": dict(composed_payload.get("stage2_design_layout") or {}),
+                    "canonical_atoms": dict(composed_payload.get("canonical_atoms") or {}),
+                    "atom_semantics": dict(composed_payload.get("atom_semantics") or {}),
+                    "deterministic_page_skeleton": dict(composed_payload.get("deterministic_page_skeleton") or {}),
+                    "stage2_style_plan": dict(composed_payload.get("stage2_style_plan") or {}),
+                    "minimal_gate_report": dict(composed_payload.get("minimal_gate_report") or {}),
+                    "candidate_ranking": dict(composed_payload.get("candidate_ranking") or {}),
+                    "repair_report": dict(composed_payload.get("repair_report") or {}),
+                    "segment_id_map": dict(composed_payload.get("segment_id_map") or {}),
                     "layout_advice_meta": dict(composed_payload.get("layout_advice_meta") or {}),
                     "segment_stats": {
                         "used": bool((composed_payload.get("segment_map_meta") or {}).get("used")),
@@ -3245,7 +3310,32 @@ async def stream_reader_composed_page(
                         "source": str((composed_payload.get("segment_map") or {}).get("source") or ""),
                         "segment_count": len(list((composed_payload.get("segment_map") or {}).get("segments") or [])),
                     },
+                    "validation_report": dict(composed_payload.get("validation_report") or {}),
                     "node_gate_stats": dict(composed_payload.get("node_gate_report") or {}),
+                },
+            )
+        except RenderPipelineContractError as exc:
+            logger.warning(
+                f"[Literature API] composed stream contract failed paper={paper_id}, page={page_num}: "
+                f"stage={exc.stage} code={exc.code} message={exc.message}"
+            )
+            error_payload = exc.to_dict()
+            yield _sse_payload(
+                "component_error",
+                {
+                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                    "stage": str(error_payload.get("stage") or ""),
+                    "code": str(error_payload.get("code") or ""),
+                    "details": dict(error_payload.get("details") or {}),
+                    "errors": [str(error_payload.get("code") or "")],
+                },
+            )
+            yield _sse_payload(
+                "error",
+                {
+                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                    "stage": str(error_payload.get("stage") or ""),
+                    "code": str(error_payload.get("code") or ""),
                 },
             )
         except Exception as exc:
@@ -3315,6 +3405,17 @@ async def action_reader_composed_node(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if _is_single_agent_v2_active(paper_id=int(paper_id), page=int(payload.page)):
+        return ReaderNodeActionResponse(
+            patch_type="node_update",
+            node_before=None,
+            node_after=None,
+            quality_delta=0.0,
+            overlay_saved=False,
+            message="Node actions are disabled in single_agent_v2 mode.",
+            disabled=True,
+            disabled_reason="single_agent_v2_node_action_disabled",
+        )
     paper = await _get_owned_paper_or_404(db, current_user, paper_id)
     service = get_literature_reader_compose_service()
     try:
@@ -3367,6 +3468,24 @@ async def stream_reader_composed_inline_query(
                 citation_tldr=getattr(payload, "citation_tldr", None),
             )
             if await request.is_disconnected():
+                return
+            if bool(result.get("disabled")):
+                yield _sse_payload(
+                    "disabled",
+                    {
+                        "disabled": True,
+                        "disabled_reason": str(result.get("disabled_reason") or "inline_query_contract_failed"),
+                        "message": str(result.get("message") or "Inline query is disabled for this node."),
+                    },
+                )
+                yield _sse_payload(
+                    "done",
+                    {
+                        "disabled": True,
+                        "disabled_reason": str(result.get("disabled_reason") or "inline_query_contract_failed"),
+                        "sources": [],
+                    },
+                )
                 return
             node = dict(result.get("node") or {})
             sources = list(result.get("sources") or [])
