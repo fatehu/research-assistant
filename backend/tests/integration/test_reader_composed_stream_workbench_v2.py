@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 from types import SimpleNamespace

@@ -34,6 +34,11 @@ class ReaderComponentContractService:
         "CompareInsightsCard": {"required": [], "properties": {"items": "array"}},
         "PdfSnippetCard": {"required": [], "properties": {"title": "string", "description": "string"}},
         "ContextRail": {"required": [], "properties": {"title": "string", "items": "array"}},
+        "CitationCard": {"required": ["title"], "properties": {"citation_key": "string", "authors": "array", "year": "string_or_number", "title": "string", "journal": "string", "doi": "string", "abstract_tldr": "string"}},
+        "EquationBlock": {"required": ["latex"], "properties": {"latex": "string", "label": "string", "description": "string"}},
+        "MethodologyCard": {"required": ["steps"], "properties": {"title": "string", "steps": "array", "participants": "string", "tools": "array"}},
+        "CalloutBox": {"required": ["content"], "properties": {"type": "string", "title": "string", "content": "string"}},
+        "AbstractCard": {"required": ["text"], "properties": {"text": "string"}},
     }
 
     ALLOWED_UI_OPS = {
@@ -67,6 +72,10 @@ class ReaderComponentContractService:
             return isinstance(value, str)
         if expected == "number":
             return isinstance(value, (int, float))
+        if expected == "string_or_number":
+            if isinstance(value, bool):
+                return False
+            return isinstance(value, (str, int, float))
         if expected == "array":
             return isinstance(value, list)
         if expected == "object":

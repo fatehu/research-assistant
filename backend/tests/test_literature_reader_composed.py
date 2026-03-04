@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -124,6 +124,163 @@ async def test_force_refresh_lock_contention_should_not_read_stale_cache(monkeyp
     assert str(payload.get("status") or "") == "fallback"
     assert str(payload.get("degraded_reason") or "") == "force_refresh_lock_timeout"
     assert reads["redis"] == 0
+
+
+def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
+    service = LiteratureReaderComposeService()
+    should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
+        {
+            "status": "fallback",
+            "degraded_reason": "simplified_pipeline",
+            "build_mode": "compose_agent_simplified",
+            "minimal_gate_report": {
+                "used_atom_count": 0,
+                "usable_atom_count": 42,
+            },
+        }
+    )
+    assert should_rebuild is True
+
+    should_not_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
+        {
+            "status": "fallback",
+            "degraded_reason": "simplified_pipeline",
+            "build_mode": "compose_agent_simplified",
+            "minimal_gate_report": {
+                "used_atom_count": 5,
+                "usable_atom_count": 42,
+            },
+        }
+    )
+    assert should_not_rebuild is False
+
+
+@pytest.mark.asyncio
+async def test_cached_simplified_fallback_should_bypass_cache_and_rebuild(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
+    monkeypatch.setattr(service, "_is_single_agent_v2_enabled", lambda **_kwargs: True)
+
+    rebuild_calls = {"count": 0}
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-rebuild-fallback"
+
+    async def _read_payload_from_redis(_key):
+        return {
+            "paper_id": 82,
+            "page": 1,
+            "status": "fallback",
+            "degraded_reason": "simplified_pipeline",
+            "build_mode": "compose_agent_simplified",
+            "minimal_gate_report": {
+                "passed": False,
+                "used_atom_count": 0,
+                "usable_atom_count": 42,
+            },
+        }
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _acquire_lock(_lock_key):
+        return "lock-token"
+
+    async def _release_lock(_lock_key, _token):
+        return None
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _reader_payload(**_kwargs):
+        return (
+            {
+                "blocks": [
+                    {
+                        "id": "p1_b1",
+                        "text": "Recovered paragraph",
+                        "source_anchor": {"page": 1, "start_char": 0, "end_char": 18},
+                    }
+                ],
+                "assets": [],
+            },
+            SimpleNamespace(),
+        )
+
+    async def _fake_single_agent_v2_result(**_kwargs):
+        rebuild_calls["count"] += 1
+        return {
+            "base_payload": {
+                "minimal_gate_report": {
+                    "passed": True,
+                    "schema_valid": True,
+                    "whitelist_valid": True,
+                    "layout_contract": True,
+                    "ownership_unchanged": True,
+                    "full_coverage": True,
+                    "non_empty_plan_for_non_empty_input": True,
+                    "source_text_immutable": True,
+                    "used_atom_count": 1,
+                    "usable_atom_count": 1,
+                },
+            },
+            "loop_result": {
+                "build_mode": "compose_agent_single_agent_v2",
+                "ui_plan": {
+                    "plan_id": "plan_rebuilt",
+                    "components": [
+                        {
+                            "id": "rebuilt_001",
+                            "type": "ParagraphProse",
+                            "props": {"text": "Recovered paragraph"},
+                            "children": [],
+                            "source_anchor_refs": [],
+                            "source_block_ids": ["p1_b1"],
+                        }
+                    ],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {"overall": 0.92, "hard_constraints_passed": True},
+                "iteration_trace": [],
+                "iterations": 1,
+                "degraded": False,
+                "stop_reason": "single_agent_v2_done",
+            },
+            "assets": [],
+        }
+
+    async def _no_db_upsert(**_kwargs):
+        return None
+
+    async def _no_redis_write(_key, _payload):
+        return None
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _acquire_lock)
+    monkeypatch.setattr(service, "_release_lock", _release_lock)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _no_db_upsert)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _no_redis_write)
+    monkeypatch.setattr(service, "_partition_main_aux_block_ids", lambda **_kwargs: (["p1_b1"], []))
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _reader_payload)
+    monkeypatch.setattr(service, "_build_single_agent_v2_result", _fake_single_agent_v2_result)
+
+    payload, _ = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=82, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=False,
+    )
+
+    assert rebuild_calls["count"] == 1
+    assert str(payload.get("status") or "") == "done"
+    assert str(payload.get("build_mode") or "") == "compose_agent_single_agent_v2"
 
 
 @pytest.mark.asyncio
@@ -3098,6 +3255,246 @@ def _simplified_docmind_payload() -> dict:
 
 
 @pytest.mark.asyncio
+async def test_single_agent_v2_should_force_refresh_once_when_docmind_empty(monkeypatch):
+    service = LiteratureReaderComposeService()
+    refresh_calls = {"count": 0}
+
+    async def _fake_refresh_payload(**kwargs):
+        refresh_calls["count"] += 1
+        assert bool(kwargs.get("force_refresh")) is True
+        return (
+            {
+                "docmind_structure": _simplified_docmind_payload(),
+                "page_structure_v3": {
+                    "block_groups": [
+                        {"layout_unique_id": "L1", "block_id": "p1_b1"},
+                        {"layout_unique_id": "L2", "block_id": "p1_b2"},
+                    ]
+                },
+                "blocks": [
+                    {"id": "p1_b1", "text": "Title", "source_anchor": {"page": 1, "start_char": 0, "end_char": 5}},
+                    {"id": "p1_b2", "text": "Paragraph", "source_anchor": {"page": 1, "start_char": 6, "end_char": 16}},
+                ],
+                "assets": [],
+            },
+            SimpleNamespace(),
+        )
+
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _fake_refresh_payload)
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
+
+    async def _fake_controller_run(**_kwargs):
+        return {
+            "status": "done",
+            "degraded_reason": "",
+            "step_result": {
+                "classification": {"items": [{"layout_id": "L2", "bucket": "main_content"}]},
+                "cleaning": {"items": [{"layout_id": "L2", "source_text": "Paragraph", "normalized_text": "Paragraph"}]},
+                "ui_plan_draft": {
+                    "components": [
+                        {"component": "ParagraphProse", "source_block_ids": ["L2"], "props": {"text": "Paragraph"}}
+                    ]
+                },
+            },
+            "validation_report": _validation_report_stub(True),
+            "repair_report": {"steps_executed": 1, "step_metrics": []},
+        }
+
+    monkeypatch.setattr(service._single_agent_controller, "run", _fake_controller_run)
+
+    result = await service._build_single_agent_v2_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        base_payload={
+            "docmind_structure": {"layouts": []},
+            "page_structure_v3": {"block_groups": []},
+            "blocks": [],
+            "assets": [],
+        },
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=8000,
+        selected_kb_id=None,
+    )
+
+    loop_result = dict(result.get("loop_result") or {})
+    ui_plan = dict(loop_result.get("ui_plan") or {})
+    components = list(ui_plan.get("components") or [])
+    assert refresh_calls["count"] == 1
+    assert str(loop_result.get("stop_reason") or "") == "single_agent_v2_done"
+    assert len(components) > 0
+
+
+@pytest.mark.asyncio
+async def test_single_agent_v2_missing_aux_block_should_trigger_no_drop_blocks_fallback_and_keep_renderable_ui(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "single_agent_v2")
+    monkeypatch.setattr(service, "_is_single_agent_v2_enabled", lambda **_kwargs: True)
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-no-drop"
+
+    async def _read_payload_from_redis(_key):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _upsert_payload_to_db(**_kwargs):
+        return None
+
+    async def _write_payload_to_redis(_key, _payload):
+        return None
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _acquire_lock(_lock_key):
+        return "lock-token"
+
+    async def _release_lock(_lock_key, _token):
+        return None
+
+    async def _fake_reader_payload(**_kwargs):
+        return (
+            {
+                "docmind_structure": {
+                    "layouts": [
+                        {
+                            "uniqueId": "L1",
+                            "index": 1,
+                            "type": "text",
+                            "subType": "para",
+                            "text": "Main paragraph.",
+                            "pageNum": [1],
+                            "blocks": [{"text": "Main paragraph."}],
+                        },
+                        {
+                            "uniqueId": "L2",
+                            "index": 2,
+                            "type": "header",
+                            "subType": "header",
+                            "text": "OPEN ACCESS",
+                            "pageNum": [1],
+                            "blocks": [{"text": "OPEN ACCESS"}],
+                        },
+                    ]
+                },
+                "page_structure_v3": {
+                    "block_groups": [
+                        {"layout_unique_id": "L1", "block_id": "p1_b1"},
+                        {"layout_unique_id": "L2", "block_id": "p1_aux1"},
+                    ]
+                },
+                "blocks": [
+                    {"id": "p1_b1", "text": "Main paragraph.", "source_anchor": {"page": 1, "start_char": 0, "end_char": 15}},
+                    {"id": "p1_aux1", "text": "OPEN ACCESS", "source_anchor": {"page": 1, "start_char": 16, "end_char": 27}},
+                ],
+                "assets": [],
+            },
+            SimpleNamespace(),
+        )
+
+    async def _fake_controller_run(**_kwargs):
+        return {
+            "status": "fallback",
+            "degraded_reason": "no_drop_blocks_failed",
+            "step_result": {
+                "classification": {
+                    "items": [
+                        {
+                            "layout_id": "L1",
+                            "bucket": "main_content",
+                            "role": "paragraph",
+                            "confidence": 0.96,
+                            "reason": "main_only",
+                        }
+                    ]
+                },
+                "cleaning": {
+                    "items": [
+                        {
+                            "layout_id": "L1",
+                            "source_text": "Main paragraph.",
+                            "normalized_text": "Main paragraph.",
+                            "clean_ops": ["whitespace_normalize"],
+                            "clean_confidence": 0.99,
+                            "needs_review": False,
+                        },
+                        {
+                            "layout_id": "L2",
+                            "source_text": "OPEN ACCESS",
+                            "normalized_text": "OPEN ACCESS",
+                            "clean_ops": [],
+                            "clean_confidence": 1.0,
+                            "needs_review": False,
+                        },
+                    ]
+                },
+                "ui_plan_draft": {
+                    "components": [
+                        {"component": "ParagraphProse", "source_block_ids": ["L1"], "props": {"text": "Main paragraph."}},
+                    ],
+                    "layout_tokens": {},
+                },
+            },
+            "validation_report": {
+                "passed": False,
+                "gates": {
+                    "id_integrity": {"passed": True, "errors": []},
+                    "full_coverage": {"passed": False, "errors": ["no_drop_blocks_failed:missing:L2"]},
+                    "whitelist_only": {"passed": True, "errors": []},
+                    "layout_contract": {"passed": True, "errors": []},
+                    "ownership_unchanged": {"passed": True, "errors": []},
+                    "non_empty_plan_for_non_empty_input": {"passed": True, "errors": []},
+                    "source_text_immutable": {"passed": True, "errors": []},
+                },
+                "errors": ["full_coverage:no_drop_blocks_failed:missing:L2"],
+            },
+            "repair_report": {"steps_executed": 1, "step_metrics": []},
+        }
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _upsert_payload_to_db)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _write_payload_to_redis)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "_acquire_lock", _acquire_lock)
+    monkeypatch.setattr(service, "_release_lock", _release_lock)
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _fake_reader_payload)
+    monkeypatch.setattr(service._single_agent_controller, "run", _fake_controller_run)
+
+    payload, _ = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=False,
+    )
+
+    assert str(payload.get("status") or "") == "fallback"
+    assert "no_drop_blocks_failed" in str(payload.get("degraded_reason") or "")
+    assert bool(((payload.get("validation_report") or {}).get("gates") or {}).get("full_coverage", {}).get("passed")) is False
+    assert "no_drop_blocks_failed" in str(
+        (((payload.get("pipeline_contract_meta") or {}).get("validation_report") or {}).get("errors") or [])
+    )
+    assert list(payload.get("main_block_ids") or []) == ["p1_b1"]
+    assert list(payload.get("aux_block_ids") or []) == ["p1_aux1"]
+    components = list(((payload.get("ui_plan") or {}).get("components") or []))
+    assert len(components) >= 1
+    assert str((components[0] or {}).get("type") or "") == "ParagraphProse"
+    assert str(((components[0] or {}).get("props") or {}).get("text") or "").strip()
+    assert list((components[0] or {}).get("source_block_ids") or []) == ["p1_b1"]
+
+
+@pytest.mark.asyncio
 async def test_simplified_pipeline_stage1_fail_should_use_deterministic_baseline(monkeypatch):
     service = LiteratureReaderComposeService()
     monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
@@ -3320,6 +3717,81 @@ def test_single_agent_step_result_listblock_object_items_are_sanitized():
     assert len(components) == 1
     assert str((components[0] or {}).get("type") or "") == "ListBlock"
     assert list(((components[0] or {}).get("props") or {}).get("items") or []) == ["first", "second", "third", "4"]
+    assert str((components[0] or {}).get("zone_type") or "") in {"main_body", "side_context", "figure_meta"}
+    assert str((components[0] or {}).get("column_id") or "").strip()
+    assert str((components[0] or {}).get("region") or "").strip()
+    assert str((components[0] or {}).get("display") or "") in {"default", "collapsed", "pinned", "hidden_until_expand"}
+    assert isinstance((components[0] or {}).get("order_key"), (int, float))
+    assert bool((components[0] or {}).get("compat_filled")) is True
+    assert len(list((components[0] or {}).get("compat_filled_fields") or [])) > 0
+
+
+def test_step_result_to_ui_plan_compat_filled_for_legacy_layout_fields():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._step_result_to_ui_plan(  # pylint: disable=protected-access
+        page=5,
+        step_result={
+            "classification": {
+                "items": [
+                    {"layout_id": "L1", "bucket": "main_content"},
+                    {"layout_id": "L2", "bucket": "aux_content"},
+                ]
+            },
+            "cleaning": {
+                "items": [
+                    {"layout_id": "L1", "source_text": "Main paragraph", "normalized_text": "Main paragraph"},
+                    {"layout_id": "L2", "source_text": "Data Availability Statement", "normalized_text": "Data Availability Statement"},
+                ]
+            },
+            "ui_plan_draft": {
+                "components": [
+                    {
+                        "component": "ParagraphProse",
+                        "source_block_ids": ["L1"],
+                        "props": {"text": "Main paragraph"},
+                    },
+                    {
+                        "component": "ParagraphProse",
+                        "source_block_ids": ["L2"],
+                        "props": {"text": "Data Availability Statement"},
+                        "display": "collapsed",
+                    },
+                ],
+                "layout_tokens": {
+                    "layout_mode": "split",
+                    "regions": [{"id": "main", "kind": "content"}, {"id": "sidebar", "kind": "rail"}],
+                },
+            },
+        },
+        docmind_blocks=[
+            {"layout_id": "L1", "source_text": "Main paragraph", "type": "text", "subType": "para", "block_ids": ["p5_b1"]},
+            {"layout_id": "L2", "source_text": "Data Availability Statement", "type": "text", "subType": "para", "block_ids": ["p5_aux1"]},
+        ],
+        layout_to_block_ids={"L1": ["p5_b1"], "L2": ["p5_aux1"]},
+        base_payload={
+            "blocks": [
+                {"id": "p5_b1", "text": "Main paragraph", "source_anchor": {"page": 5, "start_char": 0, "end_char": 14}},
+                {"id": "p5_aux1", "text": "Data Availability Statement", "source_anchor": {"page": 5, "start_char": 20, "end_char": 46}},
+            ]
+        },
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list((ui_plan.get("components") or []))
+    assert len(components) == 2
+    for node in components:
+        assert str((node or {}).get("zone_type") or "") in {"main_body", "side_context", "figure_meta"}
+        assert str((node or {}).get("column_id") or "").strip()
+        assert str((node or {}).get("region") or "").strip()
+        assert str((node or {}).get("display") or "") in {"default", "collapsed", "pinned", "hidden_until_expand"}
+        assert isinstance((node or {}).get("order_key"), (int, float))
+    assert bool((components[0] or {}).get("compat_filled")) is True
+    assert "zone_type" in list((components[0] or {}).get("compat_filled_fields") or [])
+    trace_meta = dict(ui_plan.get("trace_meta") or {})
+    assert int(trace_meta.get("compat_filled_count") or 0) >= 1
 
 
 @pytest.mark.asyncio

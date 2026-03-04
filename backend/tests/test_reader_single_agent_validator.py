@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -68,19 +68,35 @@ def _valid_step_result():
             ]
         },
         "ui_plan_draft": {
+            "layout_tokens": {
+                "layout_mode": "split",
+                "regions": [
+                    {"id": "main", "kind": "content"},
+                    {"id": "sidebar", "kind": "rail"},
+                ],
+            },
             "components": [
                 {
                     "component": "SectionHeading",
                     "source_block_ids": ["l_title"],
                     "props": {"text": "Sample Paper Title", "level": 2},
+                    "zone_type": "main_body",
+                    "column_id": "main",
+                    "region": "main",
+                    "display": "default",
+                    "order_key": 1.0,
                 },
                 {
                     "component": "ParagraphProse",
                     "source_block_ids": ["l_para"],
                     "props": {"text": "This is body paragraph."},
+                    "zone_type": "main_body",
+                    "column_id": "main",
+                    "region": "main",
+                    "display": "default",
+                    "order_key": 2.0,
                 },
             ],
-            "layout_tokens": {},
         },
     }
 
@@ -98,6 +114,8 @@ def test_validator_hard_gates_pass_for_valid_step_result():
         "id_integrity",
         "full_coverage",
         "whitelist_only",
+        "layout_contract",
+        "no_drop_blocks",
         "ownership_unchanged",
         "non_empty_plan_for_non_empty_input",
         "source_text_immutable",
@@ -141,6 +159,11 @@ def test_validator_rejects_listblock_items_object_shape():
             "component": "ListBlock",
             "source_block_ids": ["l_para"],
             "props": {"items": [{"content": "x"}]},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
         }
     ]
 
@@ -189,6 +212,11 @@ def test_deterministic_repair_drops_invalid_component_props_and_converges():
             "component": "ListBlock",
             "source_block_ids": ["l_para"],
             "props": {"items": [{"content": "x"}]},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
         }
     ]
 
@@ -205,6 +233,241 @@ def test_deterministic_repair_drops_invalid_component_props_and_converges():
     )
 
     assert validation["passed"] is True
+
+
+def test_validator_rejects_invalid_methodology_and_callout_props():
+    validator = ReaderSingleAgentValidator()
+    invalid = _valid_step_result()
+    invalid["ui_plan_draft"]["components"] = [
+        {
+            "component": "MethodologyCard",
+            "source_block_ids": ["l_para"],
+            "props": {"steps": [{"text": "bad"}]},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
+        },
+        {
+            "component": "CalloutBox",
+            "source_block_ids": ["l_title"],
+            "props": {"type": "danger", "content": "check"},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 2,
+        },
+    ]
+
+    result = validator.validate(
+        step_result=invalid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "MethodologyCard", "CalloutBox"],
+    )
+
+    assert result["passed"] is False
+    errors = list(result["gates"]["whitelist_only"]["errors"] or [])
+    assert any("component_props_invalid:MethodologyCard:steps.0:string_required" in str(item) for item in errors)
+    assert any("component_props_invalid:CalloutBox:type:enum_required" in str(item) for item in errors)
+
+
+def test_validator_accepts_citation_card_year_as_number():
+    validator = ReaderSingleAgentValidator()
+    valid = _valid_step_result()
+    valid["ui_plan_draft"]["components"] = [
+        {
+            "component": "CitationCard",
+            "source_block_ids": ["l_title"],
+            "props": {
+                "title": "Paper",
+                "authors": ["Alice", "Bob"],
+                "year": 2024,
+                "journal": "Test Journal",
+                "doi": "10.1000/test",
+            },
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
+        },
+        {
+            "component": "ParagraphProse",
+            "source_block_ids": ["l_para"],
+            "props": {"text": "This is body paragraph."},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 2,
+        },
+    ]
+
+    result = validator.validate(
+        step_result=valid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "CitationCard"],
+    )
+
+    assert result["passed"] is True
+
+
+def test_validator_accepts_valid_layout_contract_fields():
+    validator = ReaderSingleAgentValidator()
+    valid = _valid_step_result()
+    valid["ui_plan_draft"]["layout_tokens"] = {
+        "layout_mode": "split",
+        "regions": [
+            {"id": "main", "kind": "content"},
+            {"id": "sidebar", "kind": "rail"},
+        ],
+    }
+    valid["ui_plan_draft"]["components"] = [
+        {
+            "component": "SectionHeading",
+            "source_block_ids": ["l_title"],
+            "props": {"text": "Sample Paper Title", "level": 2},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
+        },
+        {
+            "component": "ParagraphProse",
+            "source_block_ids": ["l_para"],
+            "props": {"text": "This is body paragraph."},
+            "zone_type": "side_context",
+            "column_id": "sidebar",
+            "region": "sidebar",
+            "display": "collapsed",
+            "order_key": 2.5,
+        },
+    ]
+
+    result = validator.validate(
+        step_result=valid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse"],
+    )
+
+    assert result["passed"] is True
+    assert result["gates"]["layout_contract"]["passed"] is True
+    layout_errors = list(result["gates"]["layout_contract"]["errors"] or [])
+    assert not layout_errors
+
+
+def test_validator_rejects_bad_payload_missing_source_fake_block_and_invalid_layout_fields():
+    validator = ReaderSingleAgentValidator()
+    invalid = _valid_step_result()
+    invalid["ui_plan_draft"]["layout_tokens"] = {
+        "layout_mode": "split",
+        "regions": [{"id": "main", "kind": "content"}],
+    }
+    invalid["ui_plan_draft"]["components"] = [
+        {
+            "component": "SectionHeading",
+            "props": {"text": "Sample Paper Title", "level": 2},
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "component": "ParagraphProse",
+            "source_block_ids": ["fake_layout_id"],
+            "props": {"text": "bad"},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "ghost_region",
+            "display": "hover_only",
+            "order_key": "not-a-number",
+        },
+    ]
+
+    result = validator.validate(
+        step_result=invalid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse"],
+    )
+
+    assert result["passed"] is False
+    assert result["gates"]["whitelist_only"]["passed"] is False
+    assert result["gates"]["layout_contract"]["passed"] is False
+    whitelist_errors = list(result["gates"]["whitelist_only"]["errors"] or [])
+    layout_errors = list(result["gates"]["layout_contract"]["errors"] or [])
+    assert any("missing_source_block_ids:SectionHeading" in str(item) for item in whitelist_errors)
+    assert any("unknown_source_block_ids:ParagraphProse:fake_layout_id" in str(item) for item in layout_errors)
+    assert any("region_not_declared:ParagraphProse:ghost_region" in str(item) for item in layout_errors)
+    assert any("display_invalid:ParagraphProse" in str(item) for item in layout_errors)
+    assert any("order_key_invalid:ParagraphProse" in str(item) for item in layout_errors)
+
+
+def test_validator_rejects_missing_required_layout_fields():
+    validator = ReaderSingleAgentValidator()
+    invalid = _valid_step_result()
+    invalid["ui_plan_draft"]["components"] = [
+        {
+            "component": "SectionHeading",
+            "source_block_ids": ["l_title"],
+            "props": {"text": "Sample Paper Title", "level": 2},
+        },
+        {
+            "component": "ParagraphProse",
+            "source_block_ids": ["l_para"],
+            "props": {"text": "This is body paragraph."},
+        },
+    ]
+
+    result = validator.validate(
+        step_result=invalid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse"],
+    )
+
+    assert result["passed"] is False
+    assert result["gates"]["layout_contract"]["passed"] is False
+    layout_errors = list(result["gates"]["layout_contract"]["errors"] or [])
+    assert any("required_layout_field_missing|component=SectionHeading|field=zone_type" in str(item) for item in layout_errors)
+    assert any("required_layout_field_missing|component=SectionHeading|field=column_id" in str(item) for item in layout_errors)
+    assert any("required_layout_field_missing|component=SectionHeading|field=region" in str(item) for item in layout_errors)
+    assert any("required_layout_field_missing|component=SectionHeading|field=display" in str(item) for item in layout_errors)
+    assert any("required_layout_field_missing|component=SectionHeading|field=order_key" in str(item) for item in layout_errors)
+
+
+def test_deterministic_repair_fills_layout_contract_fields_with_compat_mark():
+    validator = ReaderSingleAgentValidator()
+    broken = _valid_step_result()
+    broken["ui_plan_draft"]["layout_tokens"] = {}
+    broken["ui_plan_draft"]["components"] = [
+        {
+            "component": "SectionHeading",
+            "source_block_ids": ["l_title"],
+            "props": {"text": "Sample Paper Title", "level": 2},
+        },
+        {
+            "component": "ParagraphProse",
+            "source_block_ids": ["l_para"],
+            "props": {"text": "This is body paragraph."},
+        },
+    ]
+
+    repaired = validator.deterministic_repair(
+        step_result=broken,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse"],
+    )
+    repaired_step_result = repaired["step_result"]
+    repaired_components = list(((repaired_step_result.get("ui_plan_draft") or {}).get("components") or []))
+    assert len(repaired_components) == 2
+    for row in repaired_components:
+        assert str(row.get("zone_type") or "") in {"main_body", "side_context", "figure_meta"}
+        assert str(row.get("column_id") or "").strip()
+        assert str(row.get("region") or "").strip()
+        assert str(row.get("display") or "") in {"default", "collapsed", "pinned", "hidden_until_expand"}
+        assert isinstance(row.get("order_key"), (int, float))
+        assert bool(row.get("compat_filled")) is True
+        assert len(list(row.get("compat_filled_fields") or [])) > 0
 
 
 def test_text_hygiene_detection_flags_replacement_and_pua_and_mojibake():

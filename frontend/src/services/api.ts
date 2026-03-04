@@ -1080,6 +1080,9 @@ export interface ReaderComponentNode {
   source_atom_ids?: string[]
   zone_type?: 'main_body' | 'side_context' | 'figure_meta'
   column_id?: string
+  region?: string
+  display?: 'default' | 'collapsed' | 'pinned' | 'hidden_until_expand'
+  order_key?: number
   heading_prob?: number
   capabilities?: string[]
   actions?: ReaderComponentAction[]
@@ -1181,6 +1184,7 @@ export interface ReaderValidationGates {
   id_integrity: ReaderValidationGateResult
   full_coverage: ReaderValidationGateResult
   whitelist_only: ReaderValidationGateResult
+  layout_contract: ReaderValidationGateResult
   ownership_unchanged: ReaderValidationGateResult
   non_empty_plan_for_non_empty_input: ReaderValidationGateResult
   source_text_immutable: ReaderValidationGateResult

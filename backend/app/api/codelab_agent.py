@@ -153,7 +153,7 @@ async def save_agent_message(notebook_id: str, user_id: int, message: AgentMessa
 
 
 async def clear_agent_history_state(notebook_id: str, user_id: int) -> None:
-    """娓呯┖ Agent 瀵硅瘽鍘嗗彶"""
+    """清空 Agent 对话历史"""
     key = f"{user_id}:{notebook_id}"
     _agent_histories[key] = await clear_history_in_db(
         notebook_id=notebook_id,

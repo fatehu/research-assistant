@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 from typing import Any, Dict, List, Mapping, MutableMapping
@@ -11,7 +11,8 @@ SYSTEM_PROMPT_A = (
     "You are ReaderAgent-Orchestrator.\n"
     "You must produce structured JSON only.\n"
     "Validator is authoritative for pass/fail.\n"
-    "Never invent IDs. Never drop IDs."
+    "Never invent IDs. Never drop IDs.\n"
+    "Use specialized components for research papers: AbstractCard for abstract, MethodologyCard for methods/experiment setup, EquationBlock for LaTeX math, CitationCard for detailed source metadata, and CalloutBox for important highlights."
 )
 
 SYSTEM_PROMPT_B = (
@@ -52,7 +53,7 @@ def build_first_turn_prompt(
         },
         "task": (
             "Classify all blocks into main_content/aux_content, clean text safely, "
-            "and draft UI plan for main_content."
+            "and draft UI plan with explicit layout contract fields."
         ),
         "inputs": {
             "page_meta": _safe_json_obj(page_meta),
@@ -67,6 +68,10 @@ def build_first_turn_prompt(
             "source_text must remain unchanged",
             "Only whitelist components allowed",
             "Attach source_block_ids for every proposed component",
+            "Every component must include zone_type, column_id, region, display, order_key (no omission)",
+            "For contiguous prose statements, group consecutive source_block_ids into one semantic component when possible",
+            "Do not split statement prose into one-line fragments unless it is structurally list/table/caption-like",
+            "If you provide layout fields, they must be valid and consistent (layout_mode/regions/region/display/order_key/zone_type/column_id)",
         ],
         "classification_policy": {
             "aux_defaults_by_type": [
@@ -126,9 +131,23 @@ def build_first_turn_prompt(
                             "component": "string",
                             "source_block_ids": ["layout_id"],
                             "props": {},
+                            "zone_type": "main_body|side_context|figure_meta",
+                            "column_id": "string",
+                            "region": "string",
+                            "display": "default|collapsed|pinned|hidden_until_expand",
+                            "order_key": 0.0,
                         }
                     ],
-                    "layout_tokens": {},
+                    "layout_tokens": {
+                        "layout_mode": "single_column|split|drawer|section_inline",
+                        "regions": [
+                            {
+                                "id": "string",
+                                "kind": "string",
+                                "collapsed_by_default": False,
+                            }
+                        ],
+                    },
                 },
             },
             "self_check": {
@@ -175,6 +194,9 @@ def build_iterative_turn_prompt(
             "No ID invention/deletion",
             "Preserve atomic paragraph ownership",
             "Keep source_text immutable",
+            "Do not invent layout tokens or region references",
+            "Output components with mandatory layout fields: zone_type, column_id, region, display, order_key",
+            "Keep contiguous prose as semantic groups instead of one-line fragments when structure allows",
             "Output full updated step_result JSON",
         ],
         "required_output_schema": {
@@ -189,7 +211,30 @@ def build_iterative_turn_prompt(
             "step_result": {
                 "classification": {"items": []},
                 "cleaning": {"items": []},
-                "ui_plan_draft": {"components": [], "layout_tokens": {}},
+                "ui_plan_draft": {
+                    "components": [
+                        {
+                            "component": "string",
+                            "source_block_ids": ["layout_id"],
+                            "props": {},
+                            "zone_type": "main_body|side_context|figure_meta",
+                            "column_id": "string",
+                            "region": "string",
+                            "display": "default|collapsed|pinned|hidden_until_expand",
+                            "order_key": 0.0,
+                        }
+                    ],
+                    "layout_tokens": {
+                        "layout_mode": "single_column|split|drawer|section_inline",
+                        "regions": [
+                            {
+                                "id": "string",
+                                "kind": "string",
+                                "collapsed_by_default": False,
+                            }
+                        ],
+                    },
+                },
             },
             "self_check": {
                 "coverage_ratio": 0.0,
@@ -255,10 +300,16 @@ def build_step_result_digest(step_result: Mapping[str, Any]) -> Dict[str, Any]:
                         for item in list(row.get("source_block_ids") or [])
                         if str(item).strip()
                     ],
+                    "zone_type": str(row.get("zone_type") or ""),
+                    "column_id": str(row.get("column_id") or ""),
+                    "region": str(row.get("region") or ""),
+                    "display": str(row.get("display") or ""),
+                    "order_key": row.get("order_key"),
                 }
                 for row in components
                 if str(row.get("component") or "")
             ],
+            "layout_tokens": _safe_json_obj((result.get("ui_plan_draft") or {}).get("layout_tokens")),
         },
     }
     return digest

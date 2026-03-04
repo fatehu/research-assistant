@@ -428,6 +428,11 @@ class ReaderComponentNode(BaseModel):
     source_atom_ids: List[str] = Field(default_factory=list)
     zone_type: Optional[Literal["main_body", "side_context", "figure_meta"]] = None
     column_id: Optional[str] = None
+    region: Optional[str] = None
+    display: Optional[Literal["default", "collapsed", "pinned", "hidden_until_expand"]] = None
+    order_key: Optional[float] = None
+    compat_filled: bool = False
+    compat_filled_fields: List[str] = Field(default_factory=list)
     heading_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     capabilities: List[str] = Field(default_factory=list)
     actions: List[ReaderComponentAction] = Field(default_factory=list)
@@ -518,6 +523,8 @@ class ReaderValidationGates(BaseModel):
     id_integrity: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
     full_coverage: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
     whitelist_only: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    layout_contract: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
+    no_drop_blocks: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
     ownership_unchanged: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
     non_empty_plan_for_non_empty_input: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)
     source_text_immutable: ReaderValidationGateResult = Field(default_factory=ReaderValidationGateResult)

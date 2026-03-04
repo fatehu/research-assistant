@@ -633,6 +633,16 @@ type PendingSectionJump = {
 }
 
 type ReaderDetailLevel = 'concise' | 'standard' | 'deep'
+type ComposedBackendOptions = {
+  detailLevel: ReaderDetailLevel
+  compareMode: boolean
+  citationTldr: boolean
+}
+type PendingComposedRun = {
+  forceRefresh: boolean
+  regenerate: boolean
+  applyCurrentOptions: boolean
+}
 type AnchorMatchMethod = 'polygon' | 'bbox_hint' | 'quote_exact' | 'quote_fuzzy' | 'char_range' | 'fallback'
 
 type AnchorPreviewState = {
@@ -911,7 +921,6 @@ function isActionableAnchor(anchor: ReaderComponentSourceAnchor): boolean {
   const start = Number(anchor.start_char || 0)
   const end = Number(anchor.end_char || 0)
   if (end <= start) return false
-  if (Number(anchor.segment_index || 0) > 0 || Number(anchor.segment_total || 0) > 0) return false
   const canonicalBlockId = String(anchor.canonical_block_id || '').trim()
   if (!canonicalBlockId) return false
   const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
@@ -966,6 +975,87 @@ function pickPrimaryAnchor(
   })
   scored.sort((a, b) => b.score - a.score)
   return scored[0]?.item || null
+}
+
+function mergeAnchorsForPreview(
+  primary: ReaderComponentSourceAnchor,
+  anchors: ReaderComponentSourceAnchor[],
+): ReaderComponentSourceAnchor {
+  const cluster = (Array.isArray(anchors) ? anchors : [])
+    .filter((item) => Number.isFinite(Number(item.page || 0)) && Number(item.page || 0) > 0)
+    .sort((left, right) => Number(left.start_char || 0) - Number(right.start_char || 0))
+  if (cluster.length <= 1) return primary
+
+  const page = Number(primary.page || cluster[0]?.page || 1)
+  const startChar = cluster.reduce((minValue, item) => Math.min(minValue, Number(item.start_char || minValue)), Number(primary.start_char || 0))
+  const endChar = cluster.reduce((maxValue, item) => Math.max(maxValue, Number(item.end_char || maxValue)), Number(primary.end_char || 0))
+  const confidence = cluster.reduce((maxValue, item) => Math.max(maxValue, Number(item.anchor_confidence || 0)), Number(primary.anchor_confidence || 0))
+
+  const bboxHints = cluster
+    .map((item) => item.bbox_hint)
+    .filter((hint) => hint && Number.isFinite(Number(hint.x0)) && Number.isFinite(Number(hint.x1)))
+  let mergedBbox = primary.bbox_hint || undefined
+  if (bboxHints.length > 0) {
+    const pageWidth = Number(bboxHints[0]?.page_width || primary.bbox_hint?.page_width || 0) || undefined
+    const pageHeight = Number(bboxHints[0]?.page_height || primary.bbox_hint?.page_height || 0) || undefined
+    mergedBbox = {
+      x0: Math.min(...bboxHints.map((hint) => Number(hint?.x0 || 0))),
+      x1: Math.max(...bboxHints.map((hint) => Number(hint?.x1 || 0))),
+      top: Math.min(...bboxHints.map((hint) => Number(hint?.top || 0))),
+      bottom: Math.max(...bboxHints.map((hint) => Number(hint?.bottom || 0))),
+      page_width: pageWidth,
+      page_height: pageHeight,
+    }
+  }
+
+  const polygons = cluster.flatMap((item) => (
+    Array.isArray(item.geometry?.polygons) ? item.geometry!.polygons : []
+  ))
+  const geometry = polygons.length > 0
+    ? {
+      polygons,
+      page_width: Number(cluster[0]?.geometry?.page_width || primary.geometry?.page_width || 0) || undefined,
+      page_height: Number(cluster[0]?.geometry?.page_height || primary.geometry?.page_height || 0) || undefined,
+    }
+    : primary.geometry
+
+  return {
+    ...primary,
+    page,
+    start_char: startChar,
+    end_char: Math.max(startChar + 1, endChar),
+    quote: undefined,
+    quote_text: undefined,
+    anchor_confidence: confidence > 0 ? confidence : primary.anchor_confidence,
+    segment_index: 0,
+    segment_total: cluster.length,
+    bbox_hint: mergedBbox,
+    geometry_version: geometry ? 'poly_v1' : primary.geometry_version,
+    geometry,
+    anchor_v2: primary.anchor_v2
+      ? {
+        ...primary.anchor_v2,
+        page,
+        start_char: startChar,
+        end_char: Math.max(startChar + 1, endChar),
+      }
+      : primary.anchor_v2,
+  }
+}
+
+function buildAnchorPreviewTarget(
+  anchors: ReaderComponentSourceAnchor[],
+  preferredPage?: number,
+): { previewAnchor: ReaderComponentSourceAnchor; previewAnchors: ReaderComponentSourceAnchor[] } | null {
+  const orderedAnchors = sortAnchorsForPreview(anchors, preferredPage)
+  if (orderedAnchors.length === 0) return null
+  const primary = pickPrimaryAnchor(orderedAnchors, preferredPage) || orderedAnchors[0]
+  if (!primary) return null
+  const page = Number(primary.page || preferredPage || 0)
+  const pageAnchors = orderedAnchors.filter((item) => Number(item.page || 0) === page)
+  const previewAnchors = pageAnchors.length > 0 ? pageAnchors : [primary]
+  const previewAnchor = mergeAnchorsForPreview(primary, previewAnchors)
+  return { previewAnchor, previewAnchors }
 }
 
 function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
@@ -1597,9 +1687,15 @@ export default function PaperReaderPage() {
   const sectionPageCacheRef = useRef<Map<string, number>>(new Map())
   const generativeStreamControllerRef = useRef<AbortController | null>(null)
   const composedStreamControllerRef = useRef<AbortController | null>(null)
-  const pendingComposedRunRef = useRef<{ forceRefresh: boolean; regenerate: boolean }>({
+  const pendingComposedRunRef = useRef<PendingComposedRun>({
     forceRefresh: false,
     regenerate: false,
+    applyCurrentOptions: false,
+  })
+  const composedAppliedOptionsRef = useRef<ComposedBackendOptions>({
+    detailLevel: 'standard',
+    compareMode: false,
+    citationTldr: false,
   })
   const inlineQueryStreamControllerRef = useRef<AbortController | null>(null)
   const annotationInputRef = useRef<any>(null)
@@ -1683,11 +1779,7 @@ export default function PaperReaderPage() {
     return {}
   }, [composedPlan, composedPayload])
   const activeComposedStyle = useMemo<GenerativeStyleTokens>(() => {
-    const styleIntent = pickStyleTokenString(composedStyleTokens, ['style_intent', 'styleIntent'])
-    const themeToken = pickStyleTokenString(composedStyleTokens, ['theme_mode', 'themeMode']).toLowerCase()
-    const resolvedThemeMode: ReaderThemeMode = themeToken === 'dark' ? 'dark' : themeMode
-    const resolvedStyleKey = mapComposeStyleIntentToKey(styleIntent, generativeStyleKey)
-    const base = resolveGenerativeStyleTokens(resolvedStyleKey, resolvedThemeMode)
+    const base = resolveGenerativeStyleTokens(generativeStyleKey, themeMode)
 
     const tokenBodySize = pickStyleTokenNumber(composedStyleTokens, ['body_font_size', 'bodyFontSize'])
     const tokenLineHeight = pickStyleTokenNumber(composedStyleTokens, ['body_line_height', 'bodyLineHeight'])
@@ -1697,13 +1789,6 @@ export default function PaperReaderPage() {
     ) / 10
     const nextStyle: GenerativeStyleTokens = {
       ...base,
-      pageBackground: pickStyleTokenString(composedStyleTokens, ['page_background', 'pageBackground']) || base.pageBackground,
-      panelBackground: pickStyleTokenString(composedStyleTokens, ['panel_background', 'panelBackground']) || base.panelBackground,
-      borderColor: pickStyleTokenString(composedStyleTokens, ['border_color', 'borderColor']) || base.borderColor,
-      headingColor: pickStyleTokenString(composedStyleTokens, ['heading_color', 'headingColor']) || base.headingColor,
-      bodyColor: pickStyleTokenString(composedStyleTokens, ['body_color', 'bodyColor']) || base.bodyColor,
-      bodyFontFamily: pickStyleTokenString(composedStyleTokens, ['body_font_family', 'bodyFontFamily']) || base.bodyFontFamily,
-      headingFontFamily: pickStyleTokenString(composedStyleTokens, ['heading_font_family', 'headingFontFamily']) || base.headingFontFamily,
       bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
       bodyLineHeight: tokenLineHeight !== null
         ? Math.max(1.55, Math.min(2.2, tokenLineHeight))
@@ -1961,6 +2046,11 @@ export default function PaperReaderPage() {
       4,
       Math.min(24, Number(sessionAnchor.compose_max_iterations || DEFAULT_COMPOSE_MAX_ITERATIONS) || DEFAULT_COMPOSE_MAX_ITERATIONS),
     )
+    composedAppliedOptionsRef.current = {
+      detailLevel: restoredDetailLevel,
+      compareMode: restoredCompareMode,
+      citationTldr: restoredCitationTldr,
+    }
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
@@ -2179,6 +2269,7 @@ export default function PaperReaderPage() {
     pendingComposedRunRef.current = {
       forceRefresh: Boolean(options?.forceRefresh),
       regenerate: Boolean(options?.preferAgent),
+      applyCurrentOptions: true,
     }
     setComposedRunSeed((prev) => prev + 1)
   }
@@ -2193,7 +2284,15 @@ export default function PaperReaderPage() {
     }
 
     const runOptions = pendingComposedRunRef.current
-    pendingComposedRunRef.current = { forceRefresh: false, regenerate: false }
+    pendingComposedRunRef.current = { forceRefresh: false, regenerate: false, applyCurrentOptions: false }
+    if (runOptions.applyCurrentOptions) {
+      composedAppliedOptionsRef.current = {
+        detailLevel,
+        compareMode,
+        citationTldr,
+      }
+    }
+    const appliedOptions = composedAppliedOptionsRef.current
 
     const controller = new AbortController()
     composedStreamControllerRef.current?.abort()
@@ -2215,11 +2314,9 @@ export default function PaperReaderPage() {
           selected_kb_id: selectedKbId,
           force_refresh: runOptions.forceRefresh,
           regenerate: runOptions.regenerate,
-          style_intent: generativeStyleKey,
-          theme_mode: themeMode,
-          detail_level: detailLevel,
-          compare_mode: compareMode,
-          citation_tldr: citationTldr,
+          detail_level: appliedOptions.detailLevel,
+          compare_mode: appliedOptions.compareMode,
+          citation_tldr: appliedOptions.citationTldr,
           max_iterations: composeMaxIterations,
         },
         (event, data) => {
@@ -2351,11 +2448,6 @@ export default function PaperReaderPage() {
     textMode,
     readPage,
     selectedKbId,
-    generativeStyleKey,
-    themeMode,
-    detailLevel,
-    compareMode,
-    citationTldr,
     composeMaxIterations,
     composedRunSeed,
   ])
@@ -2366,15 +2458,14 @@ export default function PaperReaderPage() {
       (value) => value > 0 && (pdfNumPages <= 0 || value <= pdfNumPages),
     )
     if (candidates.length === 0) return
+    const appliedOptions = composedAppliedOptionsRef.current
     literatureApi
       .prefetchReaderComposed(parsedPaperId, {
         pages: candidates,
         selected_kb_id: selectedKbId,
-        style_intent: generativeStyleKey,
-        theme_mode: themeMode,
-        detail_level: detailLevel,
-        compare_mode: compareMode,
-        citation_tldr: citationTldr,
+        detail_level: appliedOptions.detailLevel,
+        compare_mode: appliedOptions.compareMode,
+        citation_tldr: appliedOptions.citationTldr,
         max_iterations: Math.max(4, composeMaxIterations - 2),
       })
       .then((result) => {
@@ -2391,11 +2482,6 @@ export default function PaperReaderPage() {
     readPage,
     pdfNumPages,
     selectedKbId,
-    generativeStyleKey,
-    themeMode,
-    detailLevel,
-    compareMode,
-    citationTldr,
     composeMaxIterations,
   ])
 
@@ -3064,11 +3150,10 @@ export default function PaperReaderPage() {
     anchors: ReaderComponentSourceAnchor[],
     options?: { pinPreview?: boolean; segmentIndex?: number },
   ) => {
-    const orderedAnchors = sortAnchorsForPreview(anchors, readPage)
-    if (orderedAnchors.length === 0) return
-    const anchor = pickPrimaryAnchor(orderedAnchors, readPage) || orderedAnchors[0]
-    if (!anchor) return
-    const previewAnchors = [anchor]
+    const target = buildAnchorPreviewTarget(anchors, readPage)
+    if (!target) return
+    const anchor = target.previewAnchor
+    const previewAnchors = target.previewAnchors
     const resolvedIndex = 0
 
     const previewKey = buildPreviewKey(anchor)
@@ -3156,10 +3241,9 @@ export default function PaperReaderPage() {
     anchors: ReaderComponentSourceAnchor[],
     options?: { preferredPage?: number; segmentIndex?: number },
   ): Promise<string | null> => {
-    const orderedAnchors = sortAnchorsForPreview(anchors, options?.preferredPage || readPage)
-    if (orderedAnchors.length === 0) return null
-    const anchor = pickPrimaryAnchor(orderedAnchors, options?.preferredPage || readPage) || orderedAnchors[0]
-    if (!anchor) return null
+    const target = buildAnchorPreviewTarget(anchors, options?.preferredPage || readPage)
+    if (!target) return null
+    const anchor = target.previewAnchor
 
     const previewKey = buildPreviewKey(anchor)
     const cached = anchorPreviewCacheRef.current.get(previewKey)

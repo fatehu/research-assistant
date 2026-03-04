@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -25,6 +25,9 @@ def test_first_turn_prompt_template_contains_required_contract():
     assert payload.get("inputs", {}).get("rendered_page_image") == "data:image/jpeg;base64,abc"
     assert payload.get("inputs", {}).get("component_whitelist") == ["ParagraphProse", "SectionHeading"]
     assert "required_output_schema" in payload
+    rules = [str(item) for item in list(payload.get("rules") or [])]
+    assert any("Every component must include zone_type, column_id, region, display, order_key" in item for item in rules)
+    assert any("contiguous prose statements" in item for item in rules)
 
 
 def test_iterative_turn_prompt_template_contains_delta_contract():
@@ -46,4 +49,6 @@ def test_iterative_turn_prompt_template_contains_delta_contract():
     assert payload.get("inputs", {}).get("must_fix") == ["full_coverage", "id_integrity"]
     assert payload.get("inputs", {}).get("do_not_change") == ["whitelist_only"]
     assert "required_output_schema" in payload
+    rules = [str(item) for item in list(payload.get("rules") or [])]
+    assert any("mandatory layout fields" in item for item in rules)
 

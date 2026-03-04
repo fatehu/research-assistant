@@ -584,6 +584,88 @@ async def test_redis_hit_skips_rebuild(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_redis_hit_with_stale_docmind_cache_should_rebuild(monkeypatch):
+    service = LiteratureReaderService()
+    db = _FakeDB()
+    paper = SimpleNamespace(id=12, user_id=9, title="P", pdf_path="x", url=None, pdf_url=None, arxiv_url=None, arxiv_id=None, doi=None)
+    stale_cached = {
+        "paper_id": 12,
+        "page": 2,
+        "build_mode": "cache",
+        "blocks": [],
+        "sections": [],
+        "assets": [],
+        "summary": "",
+        "style_key": "journal_classic",
+        "structure_confidence": 0.2,
+        "docmind_structure": {"layouts": []},
+        "parser_chain_meta": {"document_mind": {"used": False, "reason": "client_unavailable"}},
+        "page_structure_v3": {"source": "document_mind", "block_groups": []},
+    }
+    rebuilt_payload = {
+        "raw_text": "DocMind text",
+        "style_key": "journal_classic",
+        "structure_confidence": 0.92,
+        "summary": "",
+        "sections": [],
+        "blocks": [
+            {
+                "id": "b1",
+                "kind": "paragraph",
+                "text": "DocMind text",
+                "order": 0,
+                "section_title": "Body",
+                "source_anchor": {"page": 2, "start_char": 0, "end_char": 11},
+            }
+        ],
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 1,
+                    "uniqueId": "l1",
+                    "type": "text",
+                    "subType": "para",
+                    "blocks": [{"text": "DocMind text"}],
+                    "pageNum": [2],
+                }
+            ]
+        },
+        "parser_chain_meta": {"document_mind": {"used": True, "reason": "applied"}},
+        "page_structure_v3": {"source": "document_mind", "block_groups": [{"layout_unique_id": "l1", "block_id": "p2_b1"}]},
+    }
+    parse_calls = {"count": 0}
+
+    async def _parse(**_kwargs):
+        parse_calls["count"] += 1
+        return dict(rebuilt_payload)
+
+    monkeypatch.setattr(settings, "pdf_layout_parser", "document_mind", raising=False)
+    monkeypatch.setattr(settings, "reader_document_mind_enabled", True, raising=False)
+    monkeypatch.setattr(service, "_build_source_signature", _async_return("sig-cache-stale"))
+    monkeypatch.setattr(service, "_read_payload_from_redis", _async_return(stale_cached))
+    monkeypatch.setattr(service, "_read_payload_from_db", _async_return(None))
+    monkeypatch.setattr(service, "_acquire_lock", _async_return("token-cache-stale"))
+    monkeypatch.setattr(service, "_release_lock", _async_return(None))
+    monkeypatch.setattr(service, "_resolve_local_pdf_path", lambda **_: "dummy.pdf")
+    monkeypatch.setattr(service, "parse_page_structure", _parse)
+    monkeypatch.setattr(service, "collect_page_assets", _async_return([]))
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _async_return(None))
+    monkeypatch.setattr(service, "_write_payload_to_redis", _async_return(None))
+
+    payload, meta = await service.build_or_get_page_payload(
+        db=db,
+        user_id=9,
+        paper=paper,
+        page=2,
+    )
+
+    assert parse_calls["count"] == 1
+    assert meta.cache_hit is False
+    assert str(((payload.get("parser_chain_meta") or {}).get("document_mind") or {}).get("reason") or "") == "applied"
+    assert len(list((payload.get("docmind_structure") or {}).get("layouts") or [])) > 0
+
+
+@pytest.mark.asyncio
 async def test_source_signature_change_triggers_rebuild(monkeypatch):
     service = LiteratureReaderService()
     db = _FakeDB()
