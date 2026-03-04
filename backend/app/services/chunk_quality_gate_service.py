@@ -46,12 +46,12 @@ class ChunkQualityGateService:
     )
     SCORE_USER_PROMPT = """
 Evaluate this chunk and return JSON with fields:
-{
+{{
   "score": 0.0 to 1.0,
   "issues": ["..."],
   "composition": ["main_text|header|footer|caption|table_fragment|reference|noise|garbled"],
   "reason": "short explanation"
-}
+}}
 
 Scoring rubric:
 - 0.85~1.00: coherent, mostly main text, little noise.
@@ -79,12 +79,12 @@ Rules:
 5) Max fragments: {max_fragments}. Max chars total: {max_chars}.
 
 Return JSON:
-{
+{{
   "fragments": [
-    {"source": "self|prev_1|next_1|prev_2|next_2", "text": "exact substring"}
+    {{"source": "self|prev_1|next_1|prev_2|next_2", "text": "exact substring"}}
   ],
   "reason": "short explanation"
-}
+}}
 
 Input JSON:
 {payload}
@@ -165,16 +165,43 @@ Input JSON:
         max_tokens: int,
     ) -> Any:
         llm = self._ensure_llm_service()
-        response = await asyncio.wait_for(
-            llm.chat(
-                messages=[{"role": "user", "content": user_prompt}],
-                system_prompt=system_prompt,
-                temperature=0.0,
-                max_tokens=max_tokens,
-            ),
-            timeout=max(1, int(timeout_seconds)),
-        )
-        raw = str(response.get("content") or "")
+        request = {
+            "model": llm.config["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        response = None
+        try:
+            response = await asyncio.wait_for(
+                llm.client.chat.completions.create(
+                    **request,
+                    extra_body={"reasoning": {"effort": "none"}},
+                ),
+                timeout=max(1, int(timeout_seconds)),
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            disable_reasoning_unsupported = (
+                "reasoning" in message
+                or "cannot unmarshal" in message
+                or "invalid_request_error" in message
+            )
+            if not disable_reasoning_unsupported:
+                raise
+            response = await asyncio.wait_for(
+                llm.client.chat.completions.create(**request),
+                timeout=max(1, int(timeout_seconds)),
+            )
+
+        msg = response.choices[0].message
+        raw = str(getattr(msg, "content", "") or "")
+        if not raw:
+            # Some local models place all output in reasoning-only fields.
+            raw = str(getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "") or "")
         return self._extract_json_value(raw)
 
     @staticmethod
