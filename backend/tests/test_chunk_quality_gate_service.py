@@ -169,5 +169,6 @@ async def test_unrepaired_bad_chunk_can_fail_document(monkeypatch):
     result = await service.gate_chunks(_chunks(), document_name="paper.pdf")
     assert result["should_fail_document"] is True
     assert result["report"]["unrepaired_bad_count"] == 1
+    assert result["report"]["dropped_bad_count"] == 1
     assert result["report"]["total_output"] == 1
     assert result["report"]["dropped_bad_chunk_ids"] == ["c1"]

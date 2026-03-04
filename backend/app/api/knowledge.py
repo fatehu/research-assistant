@@ -961,6 +961,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     f"bad={gate_report.get('bad_count', 0)}, "
                     f"repaired={gate_report.get('repaired_count', 0)}, "
                     f"unrepaired_bad={gate_report.get('unrepaired_bad_count', 0)}, "
+                    f"dropped_bad={gate_report.get('dropped_bad_count', 0)}, "
                     f"should_fail={bool(gate_result.get('should_fail_document'))}, "
                     f"elapsed={_task_elapsed_ms():.2f}ms"
                 )
