@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.core.database import async_session_factory, get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_for_stream
 from app.models.user import User
 from app.models.literature import (
     AskScope,
@@ -104,6 +104,166 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     redis_async = None
 
 router = APIRouter(prefix="/literature", tags=["literature"])
+
+def _build_mojibake_variants(text: str) -> Set[str]:
+    raw = str(text or "").encode("utf-8")
+    replaced = raw.decode("gbk", errors="replace")
+    ignored = raw.decode("gbk", errors="ignore")
+    replacement_char = chr(0xFFFD)
+    variants = {
+        replaced,
+        ignored,
+        replaced.replace(replacement_char, "?"),
+    }
+    return {item for item in variants if item and item != text}
+
+
+_CANONICAL_COLLECTION_NAMES = ("所有论文", "待读", "已读", "收藏")
+_CANONICAL_COLLECTION_DESCRIPTIONS = (
+    "所有保存的论文",
+    "待阅读的论文",
+    "已阅读的论文",
+    "重要论文",
+)
+
+_MOJIBAKE_COLLECTION_NAME_MAP: Dict[str, str] = {}
+for _name in _CANONICAL_COLLECTION_NAMES:
+    for _token in _build_mojibake_variants(_name):
+        _MOJIBAKE_COLLECTION_NAME_MAP[_token] = _name
+
+_MOJIBAKE_COLLECTION_DESCRIPTION_MAP: Dict[str, str] = {}
+for _desc in _CANONICAL_COLLECTION_DESCRIPTIONS:
+    for _token in _build_mojibake_variants(_desc):
+        _MOJIBAKE_COLLECTION_DESCRIPTION_MAP[_token] = _desc
+
+_DEFAULT_COLLECTION_CANONICAL_NAMES = {"所有论文", "待读", "已读", "收藏"}
+
+
+def _normalize_collection_name(value: Optional[str]) -> str:
+    token = str(value or "").strip()
+    return _MOJIBAKE_COLLECTION_NAME_MAP.get(token, token)
+
+
+def _normalize_collection_description(value: Optional[str]) -> str:
+    token = str(value or "")
+    return _MOJIBAKE_COLLECTION_DESCRIPTION_MAP.get(token, token)
+
+
+async def _merge_collection_memberships(
+    db: AsyncSession,
+    source_collection_id: int,
+    target_collection_id: int,
+) -> None:
+    if int(source_collection_id) == int(target_collection_id):
+        return
+
+    source_rows = await db.execute(
+        select(paper_collection_association.c.paper_id).where(
+            paper_collection_association.c.collection_id == int(source_collection_id)
+        )
+    )
+    source_paper_ids = [int(row[0]) for row in source_rows.fetchall()]
+    for paper_id in source_paper_ids:
+        exists_result = await db.execute(
+            select(paper_collection_association.c.paper_id).where(
+                and_(
+                    paper_collection_association.c.paper_id == int(paper_id),
+                    paper_collection_association.c.collection_id == int(target_collection_id),
+                )
+            )
+        )
+        if exists_result.first() is None:
+            await db.execute(
+                paper_collection_association.insert().values(
+                    paper_id=int(paper_id),
+                    collection_id=int(target_collection_id),
+                )
+            )
+
+    await db.execute(
+        delete(paper_collection_association).where(
+            paper_collection_association.c.collection_id == int(source_collection_id)
+        )
+    )
+
+
+async def _repair_user_collection_mojibake(
+    db: AsyncSession,
+    user_id: int,
+) -> bool:
+    rows = await db.execute(
+        select(PaperCollection)
+        .where(PaperCollection.user_id == int(user_id))
+        .order_by(PaperCollection.id.asc())
+    )
+    user_collections = list(rows.scalars().all())
+    if not user_collections:
+        return False
+
+    changed = False
+    for coll in user_collections:
+        normalized_name = _normalize_collection_name(getattr(coll, "name", None))
+        if normalized_name and str(coll.name or "") != normalized_name:
+            coll.name = normalized_name
+            changed = True
+
+        normalized_description = _normalize_collection_description(
+            getattr(coll, "description", None)
+        )
+        if str(coll.description or "") != normalized_description:
+            coll.description = normalized_description
+            changed = True
+
+    grouped_by_name: Dict[str, List[PaperCollection]] = {}
+    for coll in user_collections:
+        grouped_by_name.setdefault(str(coll.name or ""), []).append(coll)
+
+    for canonical_name in _DEFAULT_COLLECTION_CANONICAL_NAMES:
+        same_name_collections = list(grouped_by_name.get(canonical_name) or [])
+        if len(same_name_collections) <= 1:
+            continue
+
+        if canonical_name == "所有论文":
+            same_name_collections.sort(
+                key=lambda item: (0 if bool(item.is_default) else 1, int(item.id))
+            )
+        else:
+            same_name_collections.sort(key=lambda item: int(item.id))
+
+        keep = same_name_collections[0]
+        if canonical_name == "所有论文" and not bool(keep.is_default):
+            keep.is_default = True
+            changed = True
+
+        for dup in same_name_collections[1:]:
+            await _merge_collection_memberships(
+                db=db,
+                source_collection_id=int(dup.id),
+                target_collection_id=int(keep.id),
+            )
+            await db.delete(dup)
+            changed = True
+
+    if not changed:
+        return False
+
+    await db.flush()
+
+    after_rows = await db.execute(
+        select(PaperCollection).where(PaperCollection.user_id == int(user_id))
+    )
+    after_collections = list(after_rows.scalars().all())
+    for coll in after_collections:
+        count_result = await db.execute(
+            select(func.count())
+            .select_from(paper_collection_association)
+            .where(paper_collection_association.c.collection_id == int(coll.id))
+        )
+        real_count = int(count_result.scalar() or 0)
+        if int(coll.paper_count or 0) != real_count:
+            coll.paper_count = real_count
+
+    return True
 
 
 def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
@@ -2343,6 +2503,10 @@ async def get_collections(
     current_user: User = Depends(get_current_user)
 ):
     """获取收藏夹列表"""
+    repaired = await _repair_user_collection_mojibake(db, int(current_user.id))
+    if repaired:
+        await db.commit()
+
     stmt = select(PaperCollection).where(
         PaperCollection.user_id == current_user.id
     ).order_by(PaperCollection.is_default.desc(), PaperCollection.created_at.asc())
@@ -3095,6 +3259,11 @@ async def stream_reader_composed_page(
 
     async def event_generator():
         try:
+            logger.info(
+                "[Literature API] composed stream start "
+                f"paper={paper_id} page={page_num} force_refresh={bool(payload.force_refresh)} "
+                f"regenerate={bool(payload.regenerate)}"
+            )
             yield _sse_payload(
                 "start",
                 {
@@ -3130,7 +3299,18 @@ async def stream_reader_composed_page(
                 citation_tldr=getattr(payload, "citation_tldr", None),
                 publish_ready_event_enabled=False,
             )
+            logger.info(
+                "[Literature API] composed stream built "
+                f"paper={paper_id} page={page_num} cache_hit={bool(meta.cache_hit)} cache_layer={meta.cache_layer} "
+                f"build_mode={meta.build_mode} iterations={int(meta.iterations or 0)} degraded={bool(meta.degraded)} "
+                f"stop_reason={str(meta.stop_reason or '')} status={str(composed_payload.get('status') or '')} "
+                f"degraded_reason={str(composed_payload.get('degraded_reason') or '')}"
+            )
             if await request.is_disconnected():
+                logger.warning(
+                    f"[Literature API] composed stream client disconnected before emit done "
+                    f"paper={paper_id} page={page_num}"
+                )
                 return
 
             trace_rows = list(composed_payload.get("iteration_trace") or [])
@@ -3313,6 +3493,9 @@ async def stream_reader_composed_page(
                     "validation_report": dict(composed_payload.get("validation_report") or {}),
                     "node_gate_stats": dict(composed_payload.get("node_gate_report") or {}),
                 },
+            )
+            logger.info(
+                f"[Literature API] composed stream done emitted paper={paper_id} page={page_num}"
             )
         except RenderPipelineContractError as exc:
             logger.warning(
@@ -4012,12 +4195,12 @@ async def list_paper_knowledge_links(
 async def stream_literature_status_events(
     request: Request,
     paper_id: Optional[int] = Query(default=None, ge=1, description="可选：仅订阅指定论文"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_for_stream),
 ):
     """文献模块状态事件流（SSE）。"""
     if paper_id is not None:
-        await _get_owned_paper_or_404(db, current_user, int(paper_id))
+        async with async_session_factory() as db:
+            await _get_owned_paper_or_404(db, current_user, int(paper_id))
 
     channel = build_status_channel_for_user(int(current_user.id))
 
@@ -4696,6 +4879,8 @@ async def init_user_literature(
     current_user: User = Depends(get_current_user)
 ):
     """初始化用户的文献管理（创建默认收藏夹）。"""
+    repaired = await _repair_user_collection_mojibake(db, int(current_user.id))
+
     # 预定义的收藏夹配置
     default_collection_configs = [
         ("所有论文", "所有保存的论文", "#3b82f6", "folder", "default", True),
@@ -4715,6 +4900,9 @@ async def init_user_literature(
     # 如果已有所有默认收藏夹，直接返回
     default_names = set(config[0] for config in default_collection_configs)
     if default_names.issubset(existing_names):
+        if repaired:
+            await db.commit()
+            return {"message": "已初始化，并完成乱码修复"}
         return {"message": "已初始化"}
     
     # 只创建不存在的收藏夹
@@ -4733,9 +4921,11 @@ async def init_user_literature(
             db.add(new_coll)
             created_count += 1
     
-    if created_count > 0:
+    if created_count > 0 or repaired:
         try:
             await db.commit()
+            if repaired and created_count <= 0:
+                return {"message": "已初始化，并完成乱码修复"}
             return {"message": f"初始化成功，创建了 {created_count} 个收藏夹"}
         except Exception as e:
             await db.rollback()

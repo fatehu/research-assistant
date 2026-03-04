@@ -117,14 +117,21 @@ class LiteratureReaderService:
         if not force_refresh:
             cached_payload = await self._read_payload_from_redis(redis_key)
             if isinstance(cached_payload, dict):
-                payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
-                return payload, ReaderBuildMeta(
-                    cache_hit=True,
-                    cache_layer="redis",
-                    build_mode=str(payload.get("build_mode") or "cache"),
-                    source_signature=source_signature,
-                    source_sig_hash=sig_hash,
-                )
+                should_bypass, bypass_reason = self._should_bypass_cached_docmind_payload(cached_payload)
+                if should_bypass:
+                    logger.info(
+                        "[ReaderService] bypass stale redis cache due to missing DocMind layouts "
+                        f"paper={paper.id} page={page_num} reason={bypass_reason or 'missing_docmind_layouts'}"
+                    )
+                else:
+                    payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                    return payload, ReaderBuildMeta(
+                        cache_hit=True,
+                        cache_layer="redis",
+                        build_mode=str(payload.get("build_mode") or "cache"),
+                        source_signature=source_signature,
+                        source_sig_hash=sig_hash,
+                    )
 
             cached_row = await self._read_payload_from_db(
                 db=db,
@@ -133,15 +140,22 @@ class LiteratureReaderService:
                 source_signature=source_signature,
             )
             if isinstance(cached_row, dict):
-                await self._write_payload_to_redis(redis_key, cached_row)
-                payload = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
-                return payload, ReaderBuildMeta(
-                    cache_hit=True,
-                    cache_layer="db",
-                    build_mode=str(payload.get("build_mode") or "cache"),
-                    source_signature=source_signature,
-                    source_sig_hash=sig_hash,
-                )
+                should_bypass, bypass_reason = self._should_bypass_cached_docmind_payload(cached_row)
+                if should_bypass:
+                    logger.info(
+                        "[ReaderService] bypass stale db cache due to missing DocMind layouts "
+                        f"paper={paper.id} page={page_num} reason={bypass_reason or 'missing_docmind_layouts'}"
+                    )
+                else:
+                    await self._write_payload_to_redis(redis_key, cached_row)
+                    payload = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
+                    return payload, ReaderBuildMeta(
+                        cache_hit=True,
+                        cache_layer="db",
+                        build_mode=str(payload.get("build_mode") or "cache"),
+                        source_signature=source_signature,
+                        source_sig_hash=sig_hash,
+                    )
 
         lock_token = await self._acquire_lock(lock_key)
         if lock_token is None:
@@ -1524,6 +1538,29 @@ class LiteratureReaderService:
             f"source_url:{source_url[:180]}"
         )
         return signature[:240]
+
+    @staticmethod
+    def _should_bypass_cached_docmind_payload(payload: Dict[str, Any]) -> Tuple[bool, str]:
+        parser_mode = str(getattr(settings, "pdf_layout_parser", "auto") or "auto").strip().lower()
+        if parser_mode != "document_mind":
+            return False, ""
+        if not bool(getattr(settings, "reader_document_mind_enabled", False)):
+            return False, ""
+        if not isinstance(payload, dict):
+            return False, ""
+        layouts = [
+            row
+            for row in list(((payload.get("docmind_structure") or {}).get("layouts") or []))
+            if isinstance(row, dict)
+        ]
+        if layouts:
+            return False, ""
+        dm_reason = str(
+            (((payload.get("parser_chain_meta") or {}).get("document_mind") or {}).get("reason") or "")
+        ).strip().lower()
+        if dm_reason in {"disabled_or_not_allowlisted", "client_unavailable"}:
+            return True, dm_reason
+        return False, ""
 
     @staticmethod
     def _signature_hash(signature: str) -> str:

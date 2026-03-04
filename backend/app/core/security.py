@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.config import settings
-from app.core.database import get_db
+from app.core.database import async_session_factory, get_db
 from app.models.user import User
 
 
@@ -98,3 +98,41 @@ async def get_current_active_user(
 ) -> User:
     """获取当前活跃用户"""
     return current_user
+
+
+async def get_current_user_for_stream(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> User:
+    """
+    Stream-safe auth dependency.
+
+    Avoid binding stream lifetimes to `get_db` yield sessions, which can keep
+    DB connections checked out for long-lived SSE responses.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    token = credentials.credentials
+    payload = decode_token(token)
+    if payload is None:
+        raise credentials_exception
+
+    user_id: str = payload.get("sub")
+    if user_id is None:
+        raise credentials_exception
+
+    async with async_session_factory() as db:
+        result = await db.execute(select(User).where(User.id == int(user_id)))
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise credentials_exception
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User is disabled",
+            )
+        db.expunge(user)
+        return user

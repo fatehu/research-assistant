@@ -44,6 +44,14 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => String(item || '').trim()).filter(Boolean)
 }
 
+function normalizeDoiHref(value: unknown): string {
+  const doi = asString(value)
+  if (!doi) return ''
+  if (/^https?:\/\//i.test(doi)) return doi
+  const trimmed = doi.replace(/^doi:\s*/i, '')
+  return `https://doi.org/${trimmed}`
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
@@ -172,6 +180,23 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
       .filter(Boolean)
       .slice(0, 12)
     return [`### 侧栏信息`, ...lines.map((line) => `- ${line}`)].join('\n')
+  }
+  if (node.type === 'CitationCard') {
+    return [`### 引用文献: ${text('title')}`, `- 作者: ${asStringArray((props as Record<string, unknown>).authors).join(', ')}`, `- 年份: ${text('year')}`, `- 期刊: ${text('journal')}`, `- DOI: ${text('doi')}`, text('abstract_tldr') ? `- TL;DR: ${text('abstract_tldr')}` : ''].filter(Boolean).join('\n')
+  }
+  if (node.type === 'EquationBlock') {
+    return [`$$`, text('latex'), `$$`, text('description') ? `*注: ${text('description')}*` : ''].filter(Boolean).join('\n')
+  }
+  if (node.type === 'MethodologyCard') {
+    const steps = asStringArray((props as Record<string, unknown>).steps)
+    return [`### 研究方法: ${text('title') || '实验设计'}`, ...steps.map((s, i) => `${i + 1}. ${s}`), text('participants') ? `*参与对象: ${text('participants')}*` : '', text('tools') ? `*工具: ${asStringArray((props as Record<string, unknown>).tools).join(', ')}*` : ''].filter(Boolean).join('\n')
+  }
+  if (node.type === 'CalloutBox') {
+    const emoji = { info: 'ℹ️', warning: '⚠️', success: '✅', tip: '💡' }[asString((props as Record<string, unknown>).type)] || 'ℹ️'
+    return [`> ${emoji} **${text('title') || '提示'}**`, `> ${text('content')}`].join('\n')
+  }
+  if (node.type === 'AbstractCard') {
+    return [`### 摘要`, text('text')].join('\n')
   }
   return JSON.stringify(node.props || {}, null, 2)
 }
@@ -1028,6 +1053,245 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
         <Card size="small" title={title} style={baseCardStyle(ctx)}>
           <Paragraph style={{ marginBottom: 8 }}>{description}</Paragraph>
           {page > 0 ? <Tag color="blue">第 {page} 页</Tag> : null}
+        </Card>
+      )
+    }
+
+    case 'CitationCard': {
+      const title = asString(props.title)
+      const authors = asStringArray(props.authors)
+      const year = asString(props.year)
+      const journal = asString(props.journal)
+      const doi = asString(props.doi)
+      const doiHref = normalizeDoiHref(doi)
+      const abstractTldr = asString(props.abstract_tldr)
+      const citationKey = asString(props.citation_key)
+
+      return withAnchorPreview(
+        <Card
+          size="small"
+          style={{
+            ...baseCardStyle(ctx),
+            borderLeft: '4px solid #faad14',
+            marginBottom: 16,
+          }}
+          title={
+            <Space>
+              <Tag color="warning">{citationKey || 'REF'}</Tag>
+              <Text strong>{title}</Text>
+            </Space>
+          }
+        >
+          <ActionBar node={node} ctx={ctx} />
+          <div style={{ marginBottom: 8 }}>
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              {authors.join(', ')} {year ? `(${year})` : ''}
+            </Text>
+            {journal && (
+              <div style={{ marginTop: 2 }}>
+                <Text italic style={{ fontSize: 13 }}>{journal}</Text>
+              </div>
+            )}
+          </div>
+          {doi && (
+            <div style={{ marginBottom: 10 }}>
+              <Tag icon={<LinkOutlined />} color="blue">
+                <a href={doiHref} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>
+                  {doi}
+                </a>
+              </Tag>
+            </div>
+          )}
+          {abstractTldr && (
+            <div style={{
+              padding: '8px 12px',
+              backgroundColor: isDarkTheme(ctx) ? 'rgba(250, 173, 20, 0.05)' : '#fffbe6',
+              borderRadius: 8,
+              fontSize: 14,
+              lineHeight: 1.6,
+              color: ctx.themeStyle?.bodyColor,
+            }}>
+              <Text strong style={{ display: 'block', marginBottom: 4, fontSize: 12, color: '#d48806' }}>
+                文献简评 / TL;DR
+              </Text>
+              {abstractTldr}
+            </div>
+          )}
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
+        </Card>
+      )
+    }
+
+    case 'EquationBlock': {
+      const latex = asString(props.latex)
+      const label = asString(props.label)
+      const description = asString(props.description)
+
+      return withAnchorPreview(
+        <div style={{
+          margin: '24px 0',
+          padding: '16px',
+          textAlign: 'center',
+          backgroundColor: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.01)',
+          borderRadius: 12,
+          position: 'relative',
+        }}>
+          <ActionBar node={node} ctx={ctx} />
+          <div style={{
+            fontSize: 20,
+            fontFamily: 'serif',
+            overflowX: 'auto',
+            padding: '10px 0',
+            color: ctx.themeStyle?.bodyColor,
+          }}>
+            {/* Simple centered display for LaTeX, assuming frontend handles MathJax/KaTeX globally or we just show it nicely */}
+            <div style={{ display: 'inline-block', verticalAlign: 'middle' }}>
+              {latex}
+            </div>
+            {label && (
+              <span style={{
+                position: 'absolute',
+                right: 20,
+                top: '50%',
+                transform: 'translateY(-50%)',
+                fontWeight: 'bold',
+                color: ctx.themeStyle?.bodyColor,
+                opacity: 0.6,
+              }}>
+                ({label})
+              </span>
+            )}
+          </div>
+          {description && (
+            <div style={{
+              marginTop: 12,
+              fontSize: 13,
+              color: ctx.themeStyle?.bodyColor,
+              opacity: 0.7,
+              fontStyle: 'italic'
+            }}>
+              {description}
+            </div>
+          )}
+          {renderChildren(node.children || [], ctx)}
+        </div>
+      )
+    }
+
+    case 'MethodologyCard': {
+      const title = asString(props.title) || '实验设计与方法'
+      const steps = asStringArray(props.steps)
+      const participants = asString(props.participants)
+      const tools = asStringArray(props.tools)
+
+      return withAnchorPreview(
+        <Card
+          size="small"
+          title={<Title level={5} style={{ margin: 0, color: ctx.themeStyle?.headingColor }}>🔬 {title}</Title>}
+          style={{ ...baseCardStyle(ctx), borderLeft: '4px solid #722ed1', marginBottom: 16 }}
+        >
+          <ActionBar node={node} ctx={ctx} />
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            {participants && (
+              <div>
+                <Text strong style={{ color: '#722ed1' }}>参与对象: </Text>
+                <Text>{participants}</Text>
+              </div>
+            )}
+            <div>
+              <Text strong style={{ color: '#722ed1' }}>关键步骤: </Text>
+              <List
+                size="small"
+                dataSource={steps}
+                renderItem={(item, index) => (
+                  <List.Item style={{ border: 'none', padding: '4px 0' }}>
+                    <Space align="start">
+                      <div style={{
+                        width: 20, height: 20, borderRadius: '50%',
+                        backgroundColor: '#f9f0ff', color: '#722ed1',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontSize: 11, fontWeight: 'bold', flexShrink: 0, marginTop: 2
+                      }}>
+                        {index + 1}
+                      </div>
+                      <Text style={{ fontSize: 14 }}>{item}</Text>
+                    </Space>
+                  </List.Item>
+                )}
+              />
+            </div>
+            {tools.length > 0 && (
+              <div>
+                <Text strong style={{ color: '#722ed1' }}>研究工具: </Text>
+                <Space wrap size={4}>
+                  {tools.map((t, i) => <Tag key={i} color="purple">{t}</Tag>)}
+                </Space>
+              </div>
+            )}
+          </Space>
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
+        </Card>
+      )
+    }
+
+    case 'CalloutBox': {
+      const type = asString(props.type) as 'info' | 'warning' | 'success' | 'tip'
+      const title = asString(props.title)
+      const content = asString(props.content)
+      const colorMap = {
+        info: { border: '#1677ff', bg: 'rgba(22, 119, 255, 0.05)', icon: 'ℹ️' },
+        warning: { border: '#faad14', bg: 'rgba(250, 173, 20, 0.05)', icon: '⚠️' },
+        success: { border: '#52c41a', bg: 'rgba(82, 196, 26, 0.05)', icon: '✅' },
+        tip: { border: '#13c2c2', bg: 'rgba(19, 194, 194, 0.05)', icon: '💡' },
+      }
+      const style = colorMap[type] || colorMap.info
+
+      return (
+        <div style={{
+          margin: '16px 0',
+          padding: '16px 20px',
+          backgroundColor: style.bg,
+          borderLeft: `4px solid ${style.border}`,
+          borderRadius: '0 12px 12px 0',
+          position: 'relative'
+        }}>
+          <ActionBar node={node} ctx={ctx} />
+          <Space align="start" size={10}>
+            <span style={{ fontSize: 18 }}>{style.icon}</span>
+            <div>
+              {title && <Text strong style={{ display: 'block', marginBottom: 4, fontSize: 15 }}>{title}</Text>}
+              <Text style={{ fontSize: 14, lineHeight: 1.6 }}>{content}</Text>
+            </div>
+          </Space>
+          {renderChildren(node.children || [], ctx)}
+        </div>
+      )
+    }
+
+    case 'AbstractCard': {
+      const text = asString(props.text)
+      return withAnchorPreview(
+        <Card
+          size="small"
+          title={<Title level={5} style={{ margin: 0, color: ctx.themeStyle?.headingColor }}>📝 Abstract / 摘要</Title>}
+          style={{
+            ...baseCardStyle(ctx),
+            backgroundColor: isDarkTheme(ctx) ? 'rgba(22, 119, 255, 0.03)' : 'rgba(22, 119, 255, 0.01)',
+            border: `1px dashed ${ctx.themeStyle?.borderColor || '#1677ff'}`,
+            marginBottom: 20
+          }}
+        >
+          <ActionBar node={node} ctx={ctx} />
+          <Paragraph style={{
+            fontSize: 15,
+            lineHeight: 1.8,
+            textAlign: 'justify',
+            color: ctx.themeStyle?.bodyColor,
+            marginBottom: 0
+          }}>
+            {text}
+          </Paragraph>
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
         </Card>
       )
     }

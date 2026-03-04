@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 
 import pytest
@@ -30,7 +30,7 @@ async def test_controller_done_when_hard_gates_pass():
 
     async def _model(_system_prompt, _user_prompt, _step, _phase):
         return {
-            "status": "continue",
+            "status": "done",
             "step_result": {
                 "classification": {
                     "items": [
@@ -61,9 +61,17 @@ async def test_controller_done_when_hard_gates_pass():
                             "component": "ParagraphProse",
                             "source_block_ids": ["l1"],
                             "props": {"text": "Paragraph one."},
+                            "zone_type": "main_body",
+                            "column_id": "main",
+                            "region": "main",
+                            "display": "default",
+                            "order_key": 1.0,
                         }
                     ],
-                    "layout_tokens": {},
+                    "layout_tokens": {
+                        "layout_mode": "single_column",
+                        "regions": [{"id": "main", "kind": "content"}],
+                    },
                 },
             },
             "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
@@ -112,6 +120,8 @@ class _AlwaysFailValidator(ReaderSingleAgentValidator):
                 "id_integrity": {"passed": False, "errors": ["forced"]},
                 "full_coverage": {"passed": False, "errors": ["forced"]},
                 "whitelist_only": {"passed": False, "errors": ["forced"]},
+                "layout_contract": {"passed": False, "errors": ["forced"]},
+                "no_drop_blocks": {"passed": False, "errors": ["forced"]},
                 "ownership_unchanged": {"passed": False, "errors": ["forced"]},
                 "non_empty_plan_for_non_empty_input": {"passed": False, "errors": ["forced"]},
                 "source_text_immutable": {"passed": False, "errors": ["forced"]},

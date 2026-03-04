@@ -69,6 +69,34 @@ export const readerComponentSchemas = {
     items: z.array(z.any()).optional(),
     default_collapsed: z.boolean().optional(),
   }),
+  CitationCard: z.object({
+    citation_key: z.string().optional(),
+    authors: z.array(z.string()).optional(),
+    year: z.union([z.string(), z.number()]).optional(),
+    title: z.string().min(1),
+    journal: z.string().optional(),
+    doi: z.string().optional(),
+    abstract_tldr: z.string().optional(),
+  }),
+  EquationBlock: z.object({
+    latex: z.string().min(1),
+    label: z.string().optional(),
+    description: z.string().optional(),
+  }),
+  MethodologyCard: z.object({
+    title: z.string().optional(),
+    steps: z.array(z.string().min(1)).min(1),
+    participants: z.string().optional(),
+    tools: z.array(z.string()).optional(),
+  }),
+  CalloutBox: z.object({
+    type: z.enum(['info', 'warning', 'success', 'tip']).default('info'),
+    title: z.string().optional(),
+    content: z.string().min(1),
+  }),
+  AbstractCard: z.object({
+    text: z.string().min(1),
+  }),
 } as const
 
 export type ReaderRegisteredComponentName = keyof typeof readerComponentSchemas

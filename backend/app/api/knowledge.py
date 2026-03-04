@@ -17,8 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from loguru import logger
 
 from app.config import settings
-from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.database import async_session_factory, get_db
+from app.core.security import get_current_user, get_current_user_for_stream
 from app.models.user import User
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk, DocumentStatus
 from app.schemas.knowledge import (
@@ -601,14 +601,14 @@ async def list_documents(
 async def stream_knowledge_status_events(
     request: Request,
     kb_id: Optional[int] = Query(default=None, ge=1, description="可选：仅订阅指定知识库"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_for_stream),
 ):
     """知识库状态事件流（SSE）。"""
     if kb_id is not None:
-        kb = await db.get(KnowledgeBase, int(kb_id))
-        if not kb or kb.user_id != current_user.id:
-            raise HTTPException(status_code=404, detail="知识库不存在")
+        async with async_session_factory() as db:
+            kb = await db.get(KnowledgeBase, int(kb_id))
+            if not kb or kb.user_id != current_user.id:
+                raise HTTPException(status_code=404, detail="知识库不存在")
 
     channel = build_status_channel_for_user(int(current_user.id))
 

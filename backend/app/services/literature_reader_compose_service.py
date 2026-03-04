@@ -104,6 +104,11 @@ COMPONENT_WHITELIST = {
     "CompareInsightsCard",
     "PdfSnippetCard",
     "ContextRail",
+    "CitationCard",
+    "EquationBlock",
+    "MethodologyCard",
+    "CalloutBox",
+    "AbstractCard",
 }
 
 _SIDEBAR_TEXT_PATTERNS = (
@@ -135,6 +140,11 @@ SIMPLIFIED_ALLOWED_COMPONENTS: List[str] = [
     "AnswerCard",
     "CitationLinks",
     "InlineQuerySlot",
+    "CitationCard",
+    "EquationBlock",
+    "MethodologyCard",
+    "CalloutBox",
+    "AbstractCard",
 ]
 
 INLINE_QUERY_SUPPORTED_NODE_TYPES = {
@@ -253,6 +263,37 @@ class LiteratureReaderComposeService:
             return False
         return True
 
+    def _should_rebuild_cached_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        status_value = str(payload.get("status") or "").strip().lower()
+        if status_value != "fallback":
+            return False
+        degraded_reason = str(payload.get("degraded_reason") or "").strip().lower()
+        build_mode = str(payload.get("build_mode") or "").strip().lower()
+        gate = payload.get("minimal_gate_report")
+        if not isinstance(gate, dict):
+            return False
+        used_atom_count = self._safe_int(gate.get("used_atom_count"), 0)
+        usable_atom_count = self._safe_int(gate.get("usable_atom_count"), 0)
+        # Auto-heal only when cached simplified fallback clearly dropped all usable atoms.
+        if usable_atom_count <= 0 or used_atom_count > 0:
+            return False
+        if degraded_reason == "simplified_pipeline":
+            return True
+        if build_mode == "compose_agent_simplified":
+            return True
+        return False
+
+    async def _delete_payload_from_redis(self, key: str) -> None:
+        client = await self._get_redis_client()
+        if client is None:
+            return
+        try:
+            await client.delete(key)
+        except Exception:
+            return
+
     async def build_or_get_composed_payload(
         self,
         *,
@@ -317,71 +358,13 @@ class LiteratureReaderComposeService:
         if not force_refresh:
             cached_payload = await self._read_payload_from_redis(redis_key)
             if isinstance(cached_payload, dict):
-                payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
-                payload = await self._apply_overlay_for_user(
-                    db=db,
-                    user_id=int(user_id),
-                    paper_id=int(paper.id),
-                    page=page_num,
-                    source_signature=source_signature,
-                    payload=payload,
-                )
-                payload = self._ensure_payload_contract(page=page_num, payload=payload)
-                quality_report = payload.get("quality_report") or {}
-                return payload, ReaderComposeBuildMeta(
-                    cache_hit=True,
-                    cache_layer="redis",
-                    build_mode=str(payload.get("build_mode") or "compose_cache"),
-                    source_signature=source_signature,
-                    source_sig_hash=sig_hash,
-                    iterations=int(quality_report.get("iterations") or 0),
-                    degraded=bool(quality_report.get("degraded")),
-                    stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
-                )
-
-            cached_row = await self._read_payload_from_db(
-                db=db,
-                paper_id=int(paper.id),
-                page=page_num,
-                source_signature=source_signature,
-            )
-            if isinstance(cached_row, dict):
-                await self._write_payload_to_redis(redis_key, cached_row)
-                payload = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
-                payload = await self._apply_overlay_for_user(
-                    db=db,
-                    user_id=int(user_id),
-                    paper_id=int(paper.id),
-                    page=page_num,
-                    source_signature=source_signature,
-                    payload=payload,
-                )
-                payload = self._ensure_payload_contract(page=page_num, payload=payload)
-                quality_report = payload.get("quality_report") or {}
-                return payload, ReaderComposeBuildMeta(
-                    cache_hit=True,
-                    cache_layer="db",
-                    build_mode=str(payload.get("build_mode") or "compose_cache"),
-                    source_signature=source_signature,
-                    source_sig_hash=sig_hash,
-                    iterations=int(quality_report.get("iterations") or 0),
-                    degraded=bool(quality_report.get("degraded")),
-                    stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
-                )
-
-        lock_token = await self._acquire_lock(lock_key)
-        if lock_token is None:
-            waited = 0.0
-            while waited < LOCK_WAIT_SECONDS and lock_token is None:
-                await asyncio.sleep(LOCK_POLL_INTERVAL_SECONDS)
-                waited += LOCK_POLL_INTERVAL_SECONDS
-                lock_token = await self._acquire_lock(lock_key)
-                if lock_token is not None:
-                    break
-                if force_refresh:
-                    continue
-                cached_payload = await self._read_payload_from_redis(redis_key)
-                if isinstance(cached_payload, dict):
+                if self._should_rebuild_cached_payload(cached_payload):
+                    logger.info(
+                        "[ReaderComposeService] skip stale fallback redis cache and rebuild "
+                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                    )
+                    await self._delete_payload_from_redis(redis_key)
+                else:
                     payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
                     payload = await self._apply_overlay_for_user(
                         db=db,
@@ -403,6 +386,80 @@ class LiteratureReaderComposeService:
                         degraded=bool(quality_report.get("degraded")),
                         stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
                     )
+
+            cached_row = await self._read_payload_from_db(
+                db=db,
+                paper_id=int(paper.id),
+                page=page_num,
+                source_signature=source_signature,
+            )
+            if isinstance(cached_row, dict):
+                if self._should_rebuild_cached_payload(cached_row):
+                    logger.info(
+                        "[ReaderComposeService] skip stale fallback db cache and rebuild "
+                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                    )
+                else:
+                    await self._write_payload_to_redis(redis_key, cached_row)
+                    payload = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
+                    payload = await self._apply_overlay_for_user(
+                        db=db,
+                        user_id=int(user_id),
+                        paper_id=int(paper.id),
+                        page=page_num,
+                        source_signature=source_signature,
+                        payload=payload,
+                    )
+                    payload = self._ensure_payload_contract(page=page_num, payload=payload)
+                    quality_report = payload.get("quality_report") or {}
+                    return payload, ReaderComposeBuildMeta(
+                        cache_hit=True,
+                        cache_layer="db",
+                        build_mode=str(payload.get("build_mode") or "compose_cache"),
+                        source_signature=source_signature,
+                        source_sig_hash=sig_hash,
+                        iterations=int(quality_report.get("iterations") or 0),
+                        degraded=bool(quality_report.get("degraded")),
+                        stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
+                    )
+
+        lock_token = await self._acquire_lock(lock_key)
+        if lock_token is None:
+            waited = 0.0
+            while waited < LOCK_WAIT_SECONDS and lock_token is None:
+                await asyncio.sleep(LOCK_POLL_INTERVAL_SECONDS)
+                waited += LOCK_POLL_INTERVAL_SECONDS
+                lock_token = await self._acquire_lock(lock_key)
+                if lock_token is not None:
+                    break
+                if force_refresh:
+                    continue
+                cached_payload = await self._read_payload_from_redis(redis_key)
+                if isinstance(cached_payload, dict):
+                    if self._should_rebuild_cached_payload(cached_payload):
+                        await self._delete_payload_from_redis(redis_key)
+                    else:
+                        payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                        payload = await self._apply_overlay_for_user(
+                            db=db,
+                            user_id=int(user_id),
+                            paper_id=int(paper.id),
+                            page=page_num,
+                            source_signature=source_signature,
+                            payload=payload,
+                        )
+                        payload = self._ensure_payload_contract(page=page_num, payload=payload)
+                        quality_report = payload.get("quality_report") or {}
+                        return payload, ReaderComposeBuildMeta(
+                            cache_hit=True,
+                            cache_layer="redis",
+                            build_mode=str(payload.get("build_mode") or "compose_cache"),
+                            source_signature=source_signature,
+                            source_sig_hash=sig_hash,
+                            iterations=int(quality_report.get("iterations") or 0),
+                            degraded=bool(quality_report.get("degraded")),
+                            stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
+                        )
 
             if lock_token is None and force_refresh:
                 fallback_payload = await self._build_force_refresh_timeout_fallback_payload(
@@ -715,12 +772,127 @@ class LiteratureReaderComposeService:
             base_payload=payload,
         )
         if not docmind_blocks:
-            raise RenderPipelineContractError(
-                code="DOCMIND_LAYOUT_DIGEST_EMPTY",
-                stage="docmind",
-                message="single_agent_v2 requires docmind layout blocks",
-                details={"paper_id": int(paper.id), "page": int(page)},
+            logger.warning(
+                "[ReaderComposeService] single_agent_v2 detected empty DocMind layouts on first pass; "
+                f"forcing page payload refresh paper={paper.id} page={page}"
             )
+            try:
+                refreshed_payload, _ = await self._reader_service.build_or_get_page_payload(
+                    db=db,
+                    user_id=int(user_id),
+                    paper=paper,
+                    page=int(page),
+                    selected_kb_id=selected_kb_id,
+                    force_refresh=True,
+                    style_hint=None,
+                    prefer_agent=False,
+                    publish_ready_event_enabled=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ReaderComposeService] single_agent_v2 forced refresh failed; "
+                    f"paper={paper.id} page={page}: {type(exc).__name__}: {exc}"
+                )
+            else:
+                if isinstance(refreshed_payload, dict):
+                    payload = dict(refreshed_payload)
+                    docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
+                        page=page,
+                        base_payload=payload,
+                    )
+        if not docmind_blocks:
+            # Expected on some pages where DocMind did not emit layout rows.
+            # Keep this path non-exceptional to avoid expensive traceback logging and retry churn.
+            logger.warning(
+                "[ReaderComposeService] single_agent_v2 degraded to deterministic baseline "
+                f"paper={paper.id} page={page} reason=docmind_layout_empty"
+            )
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            ui_plan = self._build_initial_ui_plan(
+                paper=paper,
+                page=int(page),
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            quality_report = {
+                "overall": 0.0,
+                "hard_constraints_passed": False,
+                "validation_errors": ["docmind_layout_empty"],
+                "quality_target": 0.0,
+                "elapsed_ms": elapsed_ms,
+                "iterations": 0,
+                "degraded": True,
+                "stop_reason": "docmind_layout_empty",
+                "schema_valid": False,
+                "whitelist_valid": False,
+                "ownership_unchanged": False,
+                "full_coverage": False,
+                "non_empty_plan_for_non_empty_input": bool(list((ui_plan or {}).get("components") or [])),
+                "source_text_immutable": False,
+                "pipeline_latency_ms": elapsed_ms,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+            payload["repair_report"] = {
+                "rounds": 0,
+                "used": False,
+                "reason": "docmind_layout_empty",
+                "failed_gates": [
+                    "id_integrity",
+                    "full_coverage",
+                    "whitelist_only",
+                    "ownership_unchanged",
+                    "source_text_immutable",
+                ],
+                "step_metrics": [],
+            }
+            payload["qwen_plan_meta"] = {
+                "used": False,
+                "reason": "docmind_layout_empty",
+                "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+                "steps_executed": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "pipeline_version": self._pipeline_version(),
+            }
+            payload["minimal_gate_report"] = {
+                "passed": False,
+                "schema_valid": False,
+                "whitelist_valid": False,
+                "layout_contract": False,
+                "ownership_unchanged": False,
+                "full_coverage": False,
+                "non_empty_plan_for_non_empty_input": bool(list((ui_plan or {}).get("components") or [])),
+                "source_text_immutable": False,
+                "used_atom_count": 0,
+                "usable_atom_count": 0,
+            }
+            payload["pipeline_contract_meta"] = {
+                **dict(payload.get("pipeline_contract_meta") or {}),
+                "used": True,
+                "pipeline": "single_agent_v2",
+                "elapsed_ms": elapsed_ms,
+                "degraded_reason": "docmind_layout_empty",
+            }
+            return {
+                "base_payload": payload,
+                "loop_result": {
+                    "ui_plan": ui_plan,
+                    "quality_report": quality_report,
+                    "node_gate_report": {},
+                    "iteration_trace": [],
+                    "iterations": 0,
+                    "degraded": True,
+                    "stop_reason": "docmind_layout_empty",
+                    "build_mode": "compose_agent_single_agent_v2",
+                },
+                "assets": [],
+            }
 
         rendered_page_image = ""
         pdf_path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
@@ -848,6 +1020,7 @@ class LiteratureReaderComposeService:
             "passed": bool(validation_report.get("passed")),
             "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
             "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
+            "layout_contract": bool((validation_report.get("gates") or {}).get("layout_contract", {}).get("passed")),
             "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
             "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
             "non_empty_plan_for_non_empty_input": bool(
@@ -1099,6 +1272,15 @@ class LiteratureReaderComposeService:
             for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
             if isinstance(row, dict)
         ]
+        layout_tokens = dict((step_result.get("ui_plan_draft") or {}).get("layout_tokens") or {})
+        layout_bucket_map: Dict[str, str] = {}
+        for row in classification_rows:
+            layout_id = str(row.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            bucket = str(row.get("bucket") or "").strip().lower()
+            if bucket in {"main_content", "aux_content"}:
+                layout_bucket_map[layout_id] = bucket
 
         docmind_map = {
             str(row.get("layout_id") or ""): dict(row)
@@ -1128,6 +1310,58 @@ class LiteratureReaderComposeService:
             if anchor:
                 block_anchor_map[canonical] = anchor
 
+        def infer_bucket(source_layout_ids: Sequence[str]) -> str:
+            aux_count = 0
+            main_count = 0
+            for layout_id in source_layout_ids:
+                bucket = layout_bucket_map.get(str(layout_id))
+                if bucket == "aux_content":
+                    aux_count += 1
+                elif bucket == "main_content":
+                    main_count += 1
+            if aux_count > 0 and aux_count >= main_count:
+                return "aux_content"
+            return "main_content"
+
+        def normalize_zone_type(value: Any) -> str:
+            token = str(value or "").strip().lower()
+            return token if token in {"main_body", "side_context", "figure_meta"} else ""
+
+        def normalize_region(value: Any) -> str:
+            return str(value or "").strip()
+
+        def normalize_display(value: Any) -> str:
+            token = str(value or "").strip().lower()
+            return token if token in {"default", "collapsed", "pinned", "hidden_until_expand"} else ""
+
+        layout_regions = [
+            str((row or {}).get("id") or "").strip()
+            for row in list(layout_tokens.get("regions") or [])
+            if isinstance(row, dict) and str((row or {}).get("id") or "").strip()
+        ]
+        layout_region_set = set(layout_regions)
+        lower_region_pairs = [(region_id, region_id.lower()) for region_id in layout_regions]
+        main_region_candidates = [
+            region_id
+            for region_id, token in lower_region_pairs
+            if any(key in token for key in ("main", "content", "body", "primary"))
+        ]
+        side_region_candidates = [
+            region_id
+            for region_id, token in lower_region_pairs
+            if any(key in token for key in ("side", "sidebar", "rail", "aux", "meta"))
+        ]
+
+        def default_region_for_zone(zone_type: str) -> str:
+            if layout_regions:
+                if zone_type == "side_context" and side_region_candidates:
+                    return side_region_candidates[0]
+                if zone_type != "side_context" and main_region_candidates:
+                    return main_region_candidates[0]
+                return layout_regions[0]
+            return "sidebar" if zone_type == "side_context" else "main"
+
+        compat_filled_count = 0
         nodes: List[Dict[str, Any]] = []
         for idx, row in enumerate(component_rows, start=1):
             component_name = str(row.get("component") or "").strip()
@@ -1140,6 +1374,13 @@ class LiteratureReaderComposeService:
             ]
             if not source_layout_ids:
                 continue
+            explicit_zone_type = normalize_zone_type(row.get("zone_type"))
+            component_bucket = infer_bucket(source_layout_ids)
+            zone_type = explicit_zone_type or ("side_context" if component_bucket == "aux_content" else "main_body")
+            default_region = default_region_for_zone(zone_type)
+            default_column = (
+                default_region if (layout_region_set and default_region in layout_region_set) else ("sidebar" if zone_type == "side_context" else "main")
+            )
             source_block_ids: List[str] = []
             source_anchor_refs: List[Dict[str, Any]] = []
             for layout_id in source_layout_ids:
@@ -1198,18 +1439,56 @@ class LiteratureReaderComposeService:
                     normalized_items = [fallback_text]
                 props["items"] = normalized_items
 
+            compat_filled_fields: List[str] = []
+            if not explicit_zone_type:
+                compat_filled_fields.append("zone_type")
+            column_id = normalize_region(row.get("column_id"))
+            if not column_id or (layout_region_set and column_id not in layout_region_set):
+                column_id = default_column
+                compat_filled_fields.append("column_id")
+            region = normalize_region(row.get("region"))
+            if not region or (layout_region_set and region not in layout_region_set):
+                region = default_region
+                compat_filled_fields.append("region")
+            display_mode = normalize_display(row.get("display"))
+            if not display_mode:
+                display_mode = "collapsed" if zone_type == "side_context" else "default"
+                compat_filled_fields.append("display")
+            order_key = row.get("order_key")
+            resolved_order_key: Optional[float] = None
+            if isinstance(order_key, (int, float)) and not isinstance(order_key, bool):
+                resolved_order_key = float(order_key)
+            else:
+                fallback_order = row.get("order")
+                if isinstance(fallback_order, (int, float)) and not isinstance(fallback_order, bool):
+                    resolved_order_key = float(fallback_order)
+                else:
+                    resolved_order_key = float(idx)
+                    compat_filled_fields.append("order_key")
+
+            node_payload: Dict[str, Any] = {
+                "id": f"sgv2_{idx:03d}",
+                "type": component_name,
+                "props": props,
+                "children": [],
+                "source_anchor_refs": source_anchor_refs,
+                "source_block_ids": source_block_ids,
+                "zone_type": zone_type,
+                "column_id": column_id,
+                "region": region,
+                "display": display_mode,
+                "order_key": float(resolved_order_key),
+                "capabilities": ["copy", "jump_anchor", "inline_query"],
+                "actions": [],
+                "layout_slot": {"reserved_height": 160, "lock_height": False},
+            }
+            if compat_filled_fields:
+                node_payload["compat_filled"] = True
+                node_payload["compat_filled_fields"] = sorted(set(compat_filled_fields))
+                compat_filled_count += 1
+
             nodes.append(
-                {
-                    "id": f"sgv2_{idx:03d}",
-                    "type": component_name,
-                    "props": props,
-                    "children": [],
-                    "source_anchor_refs": source_anchor_refs,
-                    "source_block_ids": source_block_ids,
-                    "capabilities": ["copy", "jump_anchor", "inline_query"],
-                    "actions": [],
-                    "layout_slot": {"reserved_height": 160, "lock_height": False},
-                }
+                node_payload
             )
 
         if not nodes and classification_rows:
@@ -1241,20 +1520,45 @@ class LiteratureReaderComposeService:
                         "children": [],
                         "source_anchor_refs": anchors,
                         "source_block_ids": block_ids,
+                        "zone_type": "main_body",
+                        "column_id": "main",
+                        "region": "main",
+                        "display": "default",
+                        "order_key": 1.0,
+                        "compat_filled": True,
+                        "compat_filled_fields": ["zone_type", "column_id", "region", "display", "order_key"],
                         "capabilities": ["copy", "jump_anchor", "inline_query"],
                         "actions": [],
                         "layout_slot": {"reserved_height": 160, "lock_height": False},
                     }
                 )
 
+        requested_layout_mode = str(layout_tokens.get("layout_mode") or "").strip().lower()
+        if requested_layout_mode not in {"single_column", "split", "drawer", "section_inline"}:
+            requested_layout_mode = "single_column"
+        layout_payload: Dict[str, Any] = {
+            "content_max_width": 980,
+            "column_count": 2 if requested_layout_mode == "split" else 1,
+            "layout_mode": requested_layout_mode,
+        }
+        if isinstance(layout_tokens.get("sidebar_width"), (int, float)) and not isinstance(layout_tokens.get("sidebar_width"), bool):
+            layout_payload["sidebar_width"] = float(layout_tokens.get("sidebar_width"))
+        if isinstance(layout_tokens.get("regions"), list):
+            region_rows = []
+            for row in list(layout_tokens.get("regions") or []):
+                if not isinstance(row, dict):
+                    continue
+                region_id = str(row.get("id") or "").strip()
+                if not region_id:
+                    continue
+                region_rows.append(dict(row))
+            if region_rows:
+                layout_payload["regions"] = region_rows
+
         return {
             "plan_id": f"single_agent_v2_p{int(page)}",
             "components": nodes,
-            "layout": {
-                "content_max_width": 980,
-                "column_count": 1,
-                "layout_mode": "single_column",
-            },
+            "layout": layout_payload,
             "style_tokens": {
                 "intent": str(style_intent or detail_level or "standard"),
                 "theme_mode": str(theme_mode or "light"),
@@ -1263,6 +1567,13 @@ class LiteratureReaderComposeService:
             "trace_meta": {
                 "pipeline": "single_agent_v2",
                 "component_count": len(nodes),
+                "layout_mode": requested_layout_mode,
+                "compat_filled_count": int(compat_filled_count),
+                "compat_filled_ratio": (
+                    float(compat_filled_count) / float(len(nodes))
+                    if len(nodes) > 0
+                    else 0.0
+                ),
             },
             "ui_ops": [],
             "agent_trace": [],
@@ -7483,6 +7794,7 @@ class LiteratureReaderComposeService:
             "id_integrity": _gate(bool(minimal_gate_report.get("schema_valid")), "id_integrity_failed"),
             "full_coverage": _gate(bool(minimal_gate_report.get("full_coverage")), "full_coverage_failed"),
             "whitelist_only": _gate(bool(minimal_gate_report.get("whitelist_valid")), "whitelist_only_failed"),
+            "layout_contract": _gate(bool(minimal_gate_report.get("layout_contract", True)), "layout_contract_failed"),
             "ownership_unchanged": _gate(bool(minimal_gate_report.get("ownership_unchanged")), "ownership_unchanged_failed"),
             "non_empty_plan_for_non_empty_input": _gate(
                 bool(minimal_gate_report.get("non_empty_plan_for_non_empty_input")),
@@ -7503,6 +7815,245 @@ class LiteratureReaderComposeService:
             errors.extend([name for name, row in gates.items() if not bool((row or {}).get("passed"))])
         return {"passed": bool(passed), "gates": gates, "errors": list(dict.fromkeys(errors))}
 
+    def _enforce_no_drop_blocks_fallback(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        components = [row for row in list((ui_plan or {}).get("components") or []) if isinstance(row, dict)]
+        known_block_ids = self._collect_known_block_ids(page=page, base_payload=payload)
+        if not known_block_ids:
+            return {
+                "triggered": False,
+                "error_code": "",
+                "strategy": "collapsed_paragraph_fallback_v1",
+                "known_block_count": 0,
+                "covered_block_count_before": 0,
+                "covered_block_count_after": 0,
+                "missing_block_ids": [],
+                "inserted_node_ids": [],
+            }
+
+        known_set = set(known_block_ids)
+        covered_before: List[str] = []
+        for node in self._flatten_components(components):
+            for raw in list(node.get("source_block_ids") or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(raw))
+                if canonical and canonical in known_set and canonical not in covered_before:
+                    covered_before.append(canonical)
+
+        missing_block_ids = [item for item in known_block_ids if item not in set(covered_before)]
+        if not missing_block_ids:
+            return {
+                "triggered": False,
+                "error_code": "",
+                "strategy": "collapsed_paragraph_fallback_v1",
+                "known_block_count": len(known_block_ids),
+                "covered_block_count_before": len(covered_before),
+                "covered_block_count_after": len(covered_before),
+                "missing_block_ids": [],
+                "inserted_node_ids": [],
+            }
+
+        existing_node_ids = {
+            str((row or {}).get("id") or "").strip()
+            for row in self._flatten_components(components)
+            if isinstance(row, dict) and str((row or {}).get("id") or "").strip()
+        }
+        inserted_node_ids: List[str] = []
+        for seq, block_id in enumerate(missing_block_ids, start=1):
+            node = self._build_no_drop_fallback_node(
+                page=page,
+                payload=payload,
+                canonical_block_id=str(block_id),
+                seq=seq,
+                existing_node_ids=existing_node_ids,
+            )
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            if not node_id:
+                continue
+            components.append(node)
+            inserted_node_ids.append(node_id)
+
+        ui_plan["components"] = components
+        covered_after = [
+            item
+            for item in known_block_ids
+            if item in {
+                self._normalize_canonical_block_id(page=page, raw_id=str(raw))
+                for node in self._flatten_components(components)
+                if isinstance(node, dict)
+                for raw in list(node.get("source_block_ids") or [])
+            }
+        ]
+        return {
+            "triggered": True,
+            "error_code": "no_drop_blocks_failed_auto_fallback",
+            "strategy": "collapsed_paragraph_fallback_v1",
+            "known_block_count": len(known_block_ids),
+            "covered_block_count_before": len(covered_before),
+            "covered_block_count_after": len(covered_after),
+            "missing_block_ids": list(missing_block_ids),
+            "inserted_node_ids": list(inserted_node_ids),
+        }
+
+    def _build_no_drop_fallback_node(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        canonical_block_id: str,
+        seq: int,
+        existing_node_ids: set[str],
+    ) -> Dict[str, Any]:
+        block_index: Dict[str, Dict[str, Any]] = {}
+        for row in list((payload or {}).get("blocks") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(
+                page=page,
+                raw_id=str(((row.get("source_anchor") or {}).get("canonical_block_id") or row.get("id") or "")),
+            )
+            if canonical and canonical not in block_index:
+                block_index[canonical] = row
+
+        group_index: Dict[str, Dict[str, Any]] = {}
+        for row in list(((payload or {}).get("page_structure_v3") or {}).get("block_groups") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
+            if canonical and canonical not in group_index:
+                group_index[canonical] = row
+
+        block_row = dict(block_index.get(canonical_block_id) or {})
+        group_row = dict(group_index.get(canonical_block_id) or {})
+        source_text = self._normalize_spaces(
+            str(
+                block_row.get("text")
+                or group_row.get("text")
+                or group_row.get("title")
+                or f"Recovered content for {canonical_block_id}"
+            )
+        ) or f"Recovered content for {canonical_block_id}"
+
+        zone_type = str(block_row.get("zone_type") or group_row.get("zone_type") or "").strip().lower()
+        if zone_type not in {"main_body", "side_context", "figure_meta"}:
+            zone_type = "main_body"
+        column_id = str(block_row.get("column_id") or group_row.get("column_id") or "").strip()
+        if not column_id:
+            column_id = "sidebar" if zone_type == "side_context" else "main"
+
+        fallback_title = "Recovered block"
+        if zone_type == "side_context":
+            fallback_title = "Recovered side context"
+        elif zone_type == "figure_meta":
+            fallback_title = "Recovered figure metadata"
+
+        anchor = self._normalize_anchor_ref(
+            anchor=block_row.get("source_anchor"),
+            page=page,
+            quote_text=source_text,
+            source_block_id=canonical_block_id,
+        )
+        anchor_rows = [anchor] if anchor else []
+
+        base_id = re.sub(r"[^0-9a-zA-Z_]+", "_", str(canonical_block_id)).strip("_") or f"b{int(seq)}"
+        node_id = f"no_drop_fb_{base_id}"
+        suffix = 1
+        while node_id in existing_node_ids:
+            suffix += 1
+            node_id = f"no_drop_fb_{base_id}_{suffix}"
+        existing_node_ids.add(node_id)
+
+        capabilities = ["copy", "drag_markdown", "inline_query"]
+        if anchor_rows:
+            capabilities.append("jump_anchor")
+
+        return {
+            "id": node_id,
+            "type": "ParagraphProse",
+            "props": {
+                "title": fallback_title,
+                "text": source_text,
+                "fallback_reason": "no_drop_blocks_failed_auto_fallback",
+                "fallback_source_block_id": canonical_block_id,
+            },
+            "children": [],
+            "source_anchor_refs": anchor_rows,
+            "source_block_ids": [canonical_block_id],
+            "zone_type": zone_type,
+            "column_id": column_id,
+            "display": "collapsed",
+            "capabilities": capabilities,
+            "actions": [],
+            "layout_slot": {"reserved_height": 150, "lock_height": False},
+        }
+
+    @staticmethod
+    def _merge_no_drop_validation_report(
+        *,
+        validation_report: Dict[str, Any],
+        fallback_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = dict(validation_report or {})
+        gates = dict(cloned.get("gates") or {})
+        full_coverage = dict(gates.get("full_coverage") or {})
+        missing_block_ids = [
+            str(item).strip()
+            for item in list(fallback_report.get("missing_block_ids") or [])
+            if str(item).strip()
+        ]
+        full_errors = [
+            str(item).strip()
+            for item in list(full_coverage.get("errors") or [])
+            if str(item).strip()
+        ]
+        if missing_block_ids:
+            full_errors.append(f"missing:{','.join(missing_block_ids[:80])}")
+        injected_count = len(list(fallback_report.get("inserted_node_ids") or []))
+        full_errors.append(f"auto_fallback_injected:{int(injected_count)}")
+        full_errors.append("no_drop_blocks_failed_auto_fallback")
+        full_coverage["passed"] = False
+        full_coverage["errors"] = list(dict.fromkeys(full_errors))
+        gates["full_coverage"] = full_coverage
+        cloned["gates"] = gates
+        errors = [str(item).strip() for item in list(cloned.get("errors") or []) if str(item).strip()]
+        errors.extend(["full_coverage", "no_drop_blocks_failed_auto_fallback"])
+        cloned["errors"] = list(dict.fromkeys(errors))
+        cloned["passed"] = False
+        return cloned
+
+    @staticmethod
+    def _merge_no_drop_quality_report(
+        *,
+        quality_report: Dict[str, Any],
+        fallback_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = dict(quality_report or {})
+        missing_block_ids = [
+            str(item).strip()
+            for item in list(fallback_report.get("missing_block_ids") or [])
+            if str(item).strip()
+        ]
+        validation_errors = [
+            str(item).strip()
+            for item in list(cloned.get("validation_errors") or [])
+            if str(item).strip()
+        ]
+        validation_errors.append("no_drop_blocks_failed_auto_fallback")
+        if missing_block_ids:
+            validation_errors.append(f"no_drop_blocks_missing:{','.join(missing_block_ids[:80])}")
+        cloned["validation_errors"] = list(dict.fromkeys(validation_errors))
+        cloned["degraded"] = True
+        cloned["hard_constraints_passed"] = False
+        cloned["full_coverage"] = False
+        cloned["stop_reason"] = "no_drop_blocks_failed_auto_fallback"
+        return cloned
+
     def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         cloned = dict(payload or {})
         ui_plan = dict(cloned.get("ui_plan") or {})
@@ -7519,6 +8070,48 @@ class LiteratureReaderComposeService:
                 quality_report=quality_report,
                 minimal_gate_report=dict(cloned.get("minimal_gate_report") or {}),
             )
+        no_drop_report = self._enforce_no_drop_blocks_fallback(
+            page=page,
+            payload=cloned,
+            ui_plan=ui_plan,
+        )
+        if bool(no_drop_report.get("triggered")):
+            validation_report = self._merge_no_drop_validation_report(
+                validation_report=validation_report,
+                fallback_report=no_drop_report,
+            )
+            quality_report = self._merge_no_drop_quality_report(
+                quality_report=quality_report,
+                fallback_report=no_drop_report,
+            )
+            cloned["quality_report"] = quality_report
+
+            minimal_gate_report = dict(cloned.get("minimal_gate_report") or {})
+            if minimal_gate_report:
+                minimal_gate_report["passed"] = False
+                minimal_gate_report["full_coverage"] = False
+                cloned["minimal_gate_report"] = minimal_gate_report
+
+            repair_report = dict(cloned.get("repair_report") or {})
+            failed_gates = [str(item) for item in list(repair_report.get("failed_gates") or []) if str(item)]
+            if "full_coverage" not in failed_gates:
+                failed_gates.append("full_coverage")
+            repair_report["failed_gates"] = failed_gates
+            repair_report["no_drop_blocks_fallback"] = {
+                "applied": True,
+                "strategy": str(no_drop_report.get("strategy") or ""),
+                "error_code": str(no_drop_report.get("error_code") or ""),
+                "missing_block_ids": list(no_drop_report.get("missing_block_ids") or []),
+                "inserted_node_ids": list(no_drop_report.get("inserted_node_ids") or []),
+            }
+            cloned["repair_report"] = repair_report
+
+            pipeline_contract_meta = dict(cloned.get("pipeline_contract_meta") or {})
+            pipeline_contract_meta["no_drop_blocks_fallback"] = {
+                **dict(no_drop_report or {}),
+                "applied_at": datetime.utcnow().isoformat(),
+            }
+            cloned["pipeline_contract_meta"] = pipeline_contract_meta
         cloned["validation_report"] = validation_report
 
         main_block_ids, aux_block_ids = self._partition_main_aux_block_ids(
@@ -7530,11 +8123,15 @@ class LiteratureReaderComposeService:
         cloned["aux_block_ids"] = list(cloned.get("aux_block_ids") or aux_block_ids)
 
         status_value = str(cloned.get("status") or "").strip().lower()
-        if status_value not in {"done", "fallback"}:
+        if bool(no_drop_report.get("triggered")):
+            status_value = "fallback"
+        elif status_value not in {"done", "fallback"}:
             status_value = "done" if bool(validation_report.get("passed")) else "fallback"
         cloned["status"] = status_value
         degraded_reason = str(cloned.get("degraded_reason") or "").strip()
-        if status_value == "done":
+        if bool(no_drop_report.get("triggered")):
+            degraded_reason = "no_drop_blocks_failed_auto_fallback"
+        elif status_value == "done":
             degraded_reason = ""
         elif not degraded_reason:
             degraded_reason = str(quality_report.get("stop_reason") or "validator_non_converged").strip() or "validator_non_converged"

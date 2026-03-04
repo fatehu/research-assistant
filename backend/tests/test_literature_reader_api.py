@@ -182,3 +182,27 @@ def test_derive_link_status_from_document_processing_clears_error():
     assert status == KnowledgeLinkStatus.RUNNING.value
     assert error_message is None
     assert doc_id == 9
+
+
+def test_normalize_collection_name_repairs_known_mojibake_tokens():
+    for token in literature_api._build_mojibake_variants("所有论文"):
+        assert literature_api._normalize_collection_name(token) == "所有论文"
+    for token in literature_api._build_mojibake_variants("待读"):
+        assert literature_api._normalize_collection_name(token) == "待读"
+    for token in literature_api._build_mojibake_variants("已读"):
+        assert literature_api._normalize_collection_name(token) == "已读"
+    for token in literature_api._build_mojibake_variants("收藏"):
+        assert literature_api._normalize_collection_name(token) == "收藏"
+    assert literature_api._normalize_collection_name("我的收藏") == "我的收藏"
+
+
+def test_normalize_collection_description_repairs_known_mojibake_tokens():
+    for token in literature_api._build_mojibake_variants("所有保存的论文"):
+        assert literature_api._normalize_collection_description(token) == "所有保存的论文"
+    for token in literature_api._build_mojibake_variants("待阅读的论文"):
+        assert literature_api._normalize_collection_description(token) == "待阅读的论文"
+    for token in literature_api._build_mojibake_variants("已阅读的论文"):
+        assert literature_api._normalize_collection_description(token) == "已阅读的论文"
+    for token in literature_api._build_mojibake_variants("重要论文"):
+        assert literature_api._normalize_collection_description(token) == "重要论文"
+    assert literature_api._normalize_collection_description("用户自定义描述") == "用户自定义描述"
