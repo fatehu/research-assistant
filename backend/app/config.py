@@ -119,6 +119,22 @@ class Settings(BaseSettings):
     # Document processing safety guard
     document_processing_stale_timeout_seconds: int = 7200
 
+    # Chunk quality gate (RAG ingestion)
+    chunk_quality_gate_enabled: bool = False
+    chunk_quality_gate_model: str = "qwen3.5:0.8b-stable"
+    chunk_quality_gate_timeout_seconds: int = 40
+    chunk_quality_gate_bad_threshold: float = 0.50
+    chunk_quality_gate_suspect_threshold: float = 0.65
+    chunk_quality_gate_neighbor_window: int = 1
+    chunk_quality_gate_max_chunks: int = 300
+    chunk_quality_gate_doc_fail_ratio: float = 0.55
+    chunk_quality_gate_fail_open: bool = True
+    chunk_quality_gate_fail_on_unrepaired_bad: bool = False
+    chunk_repair_enabled: bool = True
+    chunk_repair_max_rounds: int = 1
+    chunk_repair_max_fragments: int = 120
+    chunk_repair_max_chars_per_chunk: int = 1800
+
     # LLM runtime
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096

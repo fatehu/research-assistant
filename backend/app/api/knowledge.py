@@ -64,6 +64,7 @@ from app.services.document_status_guard_service import (
 )
 from app.services.embedding_dimension_policy_service import get_embedding_dimension_policy_service
 from app.services.dimension_rebuild_service import get_dimension_rebuild_service
+from app.services.chunk_quality_gate_service import get_chunk_quality_gate_service
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -936,6 +937,48 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 
             # 按位置排序
             chunks_to_save.sort(key=lambda x: x["start_char"])
+
+            # Chunk quality gate (optional): score + mark bad chunks + local repair.
+            if settings.chunk_quality_gate_enabled:
+                gate_started_at = time.perf_counter()
+                gate_service = get_chunk_quality_gate_service()
+                gate_result = await gate_service.gate_chunks(
+                    chunks_to_save,
+                    document_name=doc.original_filename or doc.filename or "",
+                )
+                chunks_to_save = list(gate_result.get("chunks") or [])
+                gate_report = dict(gate_result.get("report") or {})
+                gate_report["stage_ms"] = (time.perf_counter() - gate_started_at) * 1000
+                gate_report["failure_reason"] = gate_result.get("failure_reason")
+
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["chunk_quality_gate"] = gate_report
+                doc.metadata_ = current_metadata
+                logger.info(
+                    f"[doc:{task_trace_id}] chunk quality gate: "
+                    f"input={gate_report.get('total_input', 0)}, "
+                    f"output={gate_report.get('total_output', len(chunks_to_save))}, "
+                    f"bad={gate_report.get('bad_count', 0)}, "
+                    f"repaired={gate_report.get('repaired_count', 0)}, "
+                    f"unrepaired_bad={gate_report.get('unrepaired_bad_count', 0)}, "
+                    f"should_fail={bool(gate_result.get('should_fail_document'))}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+
+                if bool(gate_result.get("should_fail_document")):
+                    reason = str(gate_result.get("failure_reason") or "chunk_quality_gate_failed")
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = f"chunk quality gate failed: {reason}"[:2000]
+                    await db.commit()
+                    await _emit_status()
+                    return
+
+                if not chunks_to_save:
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = "chunk quality gate dropped all chunks"
+                    await db.commit()
+                    await _emit_status()
+                    return
 
             # 生成嵌入向量
             logger.info(f"[doc:{task_trace_id}] 开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
