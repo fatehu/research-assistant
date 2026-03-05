@@ -65,6 +65,7 @@ from app.services.document_status_guard_service import (
 from app.services.embedding_dimension_policy_service import get_embedding_dimension_policy_service
 from app.services.dimension_rebuild_service import get_dimension_rebuild_service
 from app.services.chunk_quality_gate_service import get_chunk_quality_gate_service
+from app.services.ai_line_denoise_service import get_ai_line_denoise_service
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -809,9 +810,16 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 提取文本
             extract_started_at = time.perf_counter()
             logger.info(f"[doc:{task_trace_id}] 开始提取文档文本: {doc_id}")
-            text = await processor.extract_text(doc.file_path, doc.file_type)
+            denoise_line_spans: list[dict[str, Any]] = []
+            if doc.file_type.lower() == "pdf" and settings.ai_line_denoise_enabled:
+                extract_payload = await processor.extract_text_with_line_spans(doc.file_path, doc.file_type)
+                text = str(extract_payload.get("text") or "")
+                denoise_line_spans = list(extract_payload.get("line_spans") or [])
+            else:
+                text = await processor.extract_text(doc.file_path, doc.file_type)
             logger.info(
                 f"[doc:{task_trace_id}] 文本提取完成: chars={len(text)}, "
+                f"line_spans={len(denoise_line_spans)}, "
                 f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
                 f"elapsed={_task_elapsed_ms():.2f}ms"
             )
@@ -822,7 +830,35 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 await db.commit()
                 await _emit_status()
                 return
-            
+
+            if doc.file_type.lower() == "pdf" and settings.ai_line_denoise_enabled:
+                denoise_started_at = time.perf_counter()
+                denoise_service = get_ai_line_denoise_service()
+                denoise_result = await denoise_service.denoise_text(
+                    text,
+                    document_name=doc.original_filename or doc.filename or "",
+                    file_type=doc.file_type,
+                    line_spans=denoise_line_spans,
+                )
+                denoised_text = str(denoise_result.get("text") or "")
+                if denoised_text:
+                    text = denoised_text
+                denoise_report = dict(denoise_result.get("report") or {})
+                denoise_report["stage_ms"] = (time.perf_counter() - denoise_started_at) * 1000
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["ai_line_denoise"] = denoise_report
+                doc.metadata_ = current_metadata
+                logger.info(
+                    f"[doc:{task_trace_id}] ai line denoise: "
+                    f"lines={denoise_report.get('total_lines', 0)}, "
+                    f"dropped={denoise_report.get('dropped_lines', 0)}, "
+                    f"votes={denoise_report.get('valid_vote_count', 0)}, "
+                    f"malformed={denoise_report.get('malformed_vote_count', 0)}, "
+                    f"batch_errors={denoise_report.get('batch_error_count', 0)}, "
+                    f"stage_ms={denoise_report.get('stage_ms', 0):.2f}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+             
             doc.content = text
             doc.content_hash = processor.compute_hash(text)
             doc.char_count = len(text)
