@@ -135,6 +135,26 @@ class Settings(BaseSettings):
     chunk_repair_max_fragments: int = 120
     chunk_repair_max_chars_per_chunk: int = 1800
 
+    # AI line-level denoise before chunking (PDF only)
+    ai_line_denoise_enabled: bool = True
+    ai_line_denoise_model: str = "qwen3.5:0.8b-stable"
+    ai_line_denoise_timeout_seconds: int = 30
+    ai_line_denoise_max_lines_per_call: int = 60
+    ai_line_denoise_parallel_votes: int = 3
+    ai_line_denoise_retry_rounds: int = 2
+    ai_line_denoise_max_parallel_batches: int = 3
+    ai_line_denoise_fail_open: bool = True
+    ai_line_denoise_join_lines_with_space: bool = True
+    ai_line_denoise_drop_ocr_enabled: bool = True
+    ai_line_denoise_drop_ocr_model: str = "qwen3.5:0.8b-stable"
+    ai_line_denoise_drop_ocr_timeout_seconds: int = 24
+    ai_line_denoise_drop_ocr_dpi: int = 180
+    ai_line_denoise_drop_ocr_max_lines: int = 64
+    ai_line_denoise_drop_ocr_max_parallel: int = 3
+    ai_line_denoise_drop_ocr_confidence_threshold: float = 0.60
+    ai_line_denoise_drop_ocr_image_max_side: int = 768
+    ai_line_denoise_drop_ocr_pad_ratio: float = 0.06
+
     # LLM runtime
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096

@@ -9,6 +9,8 @@ Design:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import re
 from dataclasses import dataclass
@@ -58,6 +60,7 @@ Input JSON:
 
     def __init__(self) -> None:
         self._llm_service: Optional[LLMService] = None
+        self._ocr_llm_service: Optional[LLMService] = None
 
     def _ensure_llm_service(self) -> LLMService:
         if self._llm_service is None:
@@ -72,6 +75,12 @@ Input JSON:
         except Exception as exc:
             logger.warning(f"[AILineDenoise] LLM init failed: {exc}")
             return False
+
+    def _ensure_ocr_llm_service(self) -> LLMService:
+        if self._ocr_llm_service is None:
+            self._ocr_llm_service = LLMService("ollama")
+            self._ocr_llm_service.config["model"] = settings.ai_line_denoise_drop_ocr_model
+        return self._ocr_llm_service
 
     @staticmethod
     def _extract_json_value(content: str) -> Any:
@@ -301,8 +310,22 @@ Input JSON:
         return dropped, malformed_count, valid_count
 
     @staticmethod
-    def _rebuild_text(lines: Sequence[LineUnit], dropped_ids: set[int], join_with_space: bool) -> str:
-        kept = [line.text for line in lines if int(line.line_id) not in dropped_ids]
+    def _rebuild_text(
+        lines: Sequence[LineUnit],
+        dropped_ids: set[int],
+        join_with_space: bool,
+        replacements: Optional[Mapping[int, str]] = None,
+    ) -> str:
+        recovered = dict(replacements or {})
+        kept: list[str] = []
+        for line in lines:
+            line_id = int(line.line_id)
+            if line_id in dropped_ids:
+                replacement = re.sub(r"\s+", " ", str(recovered.get(line_id) or "")).strip()
+                if replacement:
+                    kept.append(replacement)
+                continue
+            kept.append(line.text)
         if not kept:
             return ""
         if join_with_space:
@@ -364,6 +387,312 @@ Input JSON:
             dropped.append(payload)
         return dropped
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    async def _ocr_drop_line_once(
+        self,
+        *,
+        model: str,
+        timeout_seconds: int,
+        line_id: int,
+        original_text: str,
+        image_data_url: str,
+    ) -> dict[str, Any]:
+        ocr_llm = self._ensure_ocr_llm_service()
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "Read OCR from image for one dropped PDF line.\n"
+                    "Return JSON only: "
+                    '{"line_id": <int>, "ocr_text": "...", "confidence": 0.0-1.0, "use_recovered": true/false, "reason": "..."}\n'
+                    "Rules:\n"
+                    "1) Prefer exact visible text from image.\n"
+                    "2) Keep punctuation/case as seen.\n"
+                    "3) If unreadable, set ocr_text=\"\" and use_recovered=false.\n"
+                    f"line_id={int(line_id)}\n"
+                    f"original_text={str(original_text)[:600]}"
+                ),
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": str(image_data_url)},
+            },
+        ]
+        request = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict OCR validator for PDF lines. "
+                        "Output compact JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": 220,
+        }
+        response = None
+        try:
+            response = await asyncio.wait_for(
+                ocr_llm.client.chat.completions.create(
+                    **request,
+                    extra_body={"reasoning": {"effort": "none"}},
+                ),
+                timeout=max(1, int(timeout_seconds)),
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            disable_reasoning_unsupported = (
+                "reasoning" in message
+                or "cannot unmarshal" in message
+                or "invalid_request_error" in message
+            )
+            if not disable_reasoning_unsupported:
+                raise
+            response = await asyncio.wait_for(
+                ocr_llm.client.chat.completions.create(**request),
+                timeout=max(1, int(timeout_seconds)),
+            )
+
+        msg = response.choices[0].message
+        raw = str(getattr(msg, "content", "") or "")
+        if not raw:
+            raw = str(getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "") or "")
+        parsed = self._extract_json_value(raw)
+        if not isinstance(parsed, Mapping):
+            parsed = {}
+        conf = max(0.0, min(1.0, self._safe_float(parsed.get("confidence"), 0.0)))
+        ocr_text = re.sub(r"\s+", " ", str(parsed.get("ocr_text") or "")).strip()
+        use_recovered = bool(parsed.get("use_recovered"))
+        reason = str(parsed.get("reason") or "").strip()
+        return {
+            "line_id": int(line_id),
+            "ocr_text": ocr_text,
+            "confidence": conf,
+            "use_recovered": use_recovered,
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _render_drop_ocr_crops_sync(
+        *,
+        pdf_path: str,
+        spans: Sequence[Mapping[str, Any]],
+        dpi: int,
+        image_max_side: int,
+        pad_ratio: float,
+    ) -> list[dict[str, Any]]:
+        import pdfplumber
+
+        rows_by_page: dict[int, list[Mapping[str, Any]]] = {}
+        for row in spans:
+            try:
+                page = int(row.get("page") or 0)
+            except Exception:
+                page = 0
+            if page <= 0:
+                continue
+            rows_by_page.setdefault(page, []).append(row)
+
+        output: list[dict[str, Any]] = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page, page_rows in rows_by_page.items():
+                idx = int(page) - 1
+                if idx < 0 or idx >= len(pdf.pages):
+                    continue
+                page_obj = pdf.pages[idx]
+                page_width = float(getattr(page_obj, "width", 0.0) or 0.0)
+                page_height = float(getattr(page_obj, "height", 0.0) or 0.0)
+                if page_width <= 0 or page_height <= 0:
+                    continue
+
+                image = page_obj.to_image(resolution=max(96, int(dpi or 180))).original
+                if image is None:
+                    continue
+                if int(image_max_side or 0) > 0:
+                    image.thumbnail((int(image_max_side), int(image_max_side)))
+                img_width = float(image.size[0] or 0.0)
+                img_height = float(image.size[1] or 0.0)
+                if img_width <= 1 or img_height <= 1:
+                    continue
+                scale_x = img_width / page_width
+                scale_y = img_height / page_height
+
+                for span in page_rows:
+                    x0 = AILineDenoiseService._safe_float(span.get("x0"), -1.0)
+                    y0 = AILineDenoiseService._safe_float(span.get("y0"), -1.0)
+                    x1 = AILineDenoiseService._safe_float(span.get("x1"), -1.0)
+                    y1 = AILineDenoiseService._safe_float(span.get("y1"), -1.0)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+
+                    top_pdf = page_height - y1
+                    bottom_pdf = page_height - y0
+                    pad_x = max(1.0, (x1 - x0) * max(0.0, float(pad_ratio)))
+                    pad_y = max(1.0, (bottom_pdf - top_pdf) * max(0.0, float(pad_ratio)))
+                    left = max(0, int(round((x0 - pad_x) * scale_x)))
+                    top = max(0, int(round((top_pdf - pad_y) * scale_y)))
+                    right = min(int(img_width), int(round((x1 + pad_x) * scale_x)))
+                    bottom = min(int(img_height), int(round((bottom_pdf + pad_y) * scale_y)))
+                    if right <= left + 4 or bottom <= top + 4:
+                        continue
+
+                    crop = image.crop((left, top, right, bottom))
+                    if crop.size[0] <= 4 or crop.size[1] <= 4:
+                        continue
+
+                    buffer = io.BytesIO()
+                    crop.save(buffer, format="JPEG", quality=86, optimize=True)
+                    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    output.append(
+                        {
+                            "line_id": int(span.get("line_id") or 0),
+                            "page": int(page),
+                            "original_text": str(span.get("text") or ""),
+                            "image_data_url": f"data:image/jpeg;base64,{encoded}",
+                        }
+                    )
+        output.sort(key=lambda item: int(item.get("line_id") or 0))
+        return output
+
+    async def _recover_dropped_lines_with_ocr(
+        self,
+        *,
+        pdf_path: str,
+        dropped_spans: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if not dropped_spans:
+            return {
+                "recovered_map": {},
+                "attempted": 0,
+                "recovered": 0,
+                "errors": 0,
+                "rows": [],
+            }
+
+        selected_spans: list[Mapping[str, Any]] = []
+        for row in dropped_spans:
+            if len(selected_spans) >= max(1, int(settings.ai_line_denoise_drop_ocr_max_lines or 64)):
+                break
+            if not isinstance(row, Mapping):
+                continue
+            if row.get("x0") is None or row.get("y0") is None or row.get("x1") is None or row.get("y1") is None:
+                continue
+            selected_spans.append(row)
+
+        if not selected_spans:
+            return {
+                "recovered_map": {},
+                "attempted": 0,
+                "recovered": 0,
+                "errors": 0,
+                "rows": [],
+            }
+
+        try:
+            crops = await asyncio.to_thread(
+                self._render_drop_ocr_crops_sync,
+                pdf_path=str(pdf_path),
+                spans=selected_spans,
+                dpi=max(96, int(settings.ai_line_denoise_drop_ocr_dpi or 180)),
+                image_max_side=max(256, int(settings.ai_line_denoise_drop_ocr_image_max_side or 768)),
+                pad_ratio=max(0.0, float(settings.ai_line_denoise_drop_ocr_pad_ratio or 0.06)),
+            )
+        except Exception as exc:
+            logger.warning(f"[AILineDenoise] drop OCR crop render failed: {exc}")
+            return {
+                "recovered_map": {},
+                "attempted": 0,
+                "recovered": 0,
+                "errors": 1,
+                "rows": [],
+            }
+
+        if not crops:
+            return {
+                "recovered_map": {},
+                "attempted": 0,
+                "recovered": 0,
+                "errors": 0,
+                "rows": [],
+            }
+
+        ocr_model = str(settings.ai_line_denoise_drop_ocr_model or settings.ai_line_denoise_model).strip()
+        threshold = max(0.0, min(1.0, self._safe_float(settings.ai_line_denoise_drop_ocr_confidence_threshold, 0.6)))
+        timeout_seconds = max(2, int(settings.ai_line_denoise_drop_ocr_timeout_seconds or 24))
+        semaphore = asyncio.Semaphore(max(1, int(settings.ai_line_denoise_drop_ocr_max_parallel or 3)))
+
+        async def run_one(row: Mapping[str, Any]) -> Any:
+            async with semaphore:
+                return await self._ocr_drop_line_once(
+                    model=ocr_model,
+                    timeout_seconds=timeout_seconds,
+                    line_id=int(row.get("line_id") or 0),
+                    original_text=str(row.get("original_text") or ""),
+                    image_data_url=str(row.get("image_data_url") or ""),
+                )
+
+        results = await asyncio.gather(*(run_one(row) for row in crops), return_exceptions=True)
+        recovered_map: dict[int, str] = {}
+        rows: list[dict[str, Any]] = []
+        errors = 0
+        recovered_count = 0
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                errors += 1
+                rows.append(
+                    {
+                        "line_id": int((crops[idx] or {}).get("line_id") or 0) if idx < len(crops) else 0,
+                        "accepted": False,
+                        "confidence": 0.0,
+                        "ocr_text": "",
+                        "reason": f"error:{type(result).__name__}",
+                    }
+                )
+                continue
+            line_id = int(result.get("line_id") or 0)
+            ocr_text = re.sub(r"\s+", " ", str(result.get("ocr_text") or "")).strip()
+            confidence = max(0.0, min(1.0, self._safe_float(result.get("confidence"), 0.0)))
+            use_recovered = bool(result.get("use_recovered"))
+            accepted = (
+                line_id > 0
+                and use_recovered
+                and bool(ocr_text)
+                and confidence >= threshold
+                and not self._looks_noisy_line(ocr_text)
+            )
+            if accepted:
+                recovered_map[line_id] = ocr_text
+                recovered_count += 1
+            rows.append(
+                {
+                    "line_id": line_id,
+                    "accepted": bool(accepted),
+                    "confidence": confidence,
+                    "ocr_text": ocr_text[:320],
+                    "reason": str(result.get("reason") or "")[:160],
+                }
+            )
+        rows.sort(key=lambda item: int(item.get("line_id") or 0))
+        return {
+            "recovered_map": recovered_map,
+            "attempted": len(crops),
+            "recovered": recovered_count,
+            "errors": int(errors),
+            "rows": rows,
+        }
+
     async def denoise_text(
         self,
         text: str,
@@ -371,6 +700,7 @@ Input JSON:
         document_name: str = "",
         file_type: str = "",
         line_spans: Optional[Sequence[Mapping[str, Any]]] = None,
+        pdf_path: str = "",
     ) -> dict[str, Any]:
         normalized_type = (file_type or "").lower().replace(".", "")
         sanitized_spans = self._sanitize_line_spans(line_spans)
@@ -439,31 +769,6 @@ Input JSON:
             if self._is_hard_noise_line(line.text)
         }
         candidate_lines = [line for line in lines if int(line.line_id) not in rule_dropped_ids]
-        if not candidate_lines:
-            dropped_spans = self._build_dropped_line_spans(
-                dropped_ids=rule_dropped_ids,
-                line_spans=sanitized_spans,
-            )
-            return {
-                "text": "",
-                "report": {
-                    "enabled": True,
-                    "model": settings.ai_line_denoise_model,
-                    "total_lines": len(lines),
-                    "batch_count": 0,
-                    "parallel_votes": int(settings.ai_line_denoise_parallel_votes or 3),
-                    "retry_rounds": int(settings.ai_line_denoise_retry_rounds or 2),
-                    "valid_vote_count": 0,
-                    "malformed_vote_count": 0,
-                    "batch_error_count": 0,
-                    "rule_dropped_lines": len(rule_dropped_ids),
-                    "dropped_lines": len(rule_dropped_ids),
-                    "dropped_line_ids": sorted(rule_dropped_ids),
-                    "dropped_line_spans": dropped_spans,
-                    "fail_open": bool(settings.ai_line_denoise_fail_open),
-                    "line_spans_available": spans_available,
-                },
-            }
 
         batches = self._build_batches(candidate_lines, int(settings.ai_line_denoise_max_lines_per_call or 60))
         semaphore = asyncio.Semaphore(max(1, int(settings.ai_line_denoise_max_parallel_batches or 3)))
@@ -507,16 +812,52 @@ Input JSON:
                 },
             }
 
+        dropped_spans = self._build_dropped_line_spans(
+            dropped_ids=dropped_ids,
+            line_spans=sanitized_spans,
+        )
+        ocr_recovered_map: dict[int, str] = {}
+        ocr_attempted = 0
+        ocr_recovered = 0
+        ocr_errors = 0
+        ocr_rows: list[dict[str, Any]] = []
+        drop_ocr_enabled = bool(settings.ai_line_denoise_drop_ocr_enabled)
+        if (
+            drop_ocr_enabled
+            and bool(pdf_path)
+            and dropped_spans
+            and spans_available
+        ):
+            ocr_result = await self._recover_dropped_lines_with_ocr(
+                pdf_path=str(pdf_path),
+                dropped_spans=dropped_spans,
+            )
+            ocr_recovered_map = {
+                int(k): str(v)
+                for k, v in dict(ocr_result.get("recovered_map") or {}).items()
+                if str(v or "").strip()
+            }
+            ocr_attempted = int(ocr_result.get("attempted") or 0)
+            ocr_recovered = int(ocr_result.get("recovered") or 0)
+            ocr_errors = int(ocr_result.get("errors") or 0)
+            ocr_rows = list(ocr_result.get("rows") or [])
+
+        final_dropped_ids = {
+            int(line_id)
+            for line_id in dropped_ids
+            if int(line_id) not in ocr_recovered_map
+        }
         denoised_text = self._rebuild_text(
             lines,
             dropped_ids,
             join_with_space=bool(settings.ai_line_denoise_join_lines_with_space),
+            replacements=ocr_recovered_map,
         )
         if not denoised_text and bool(settings.ai_line_denoise_fail_open):
             denoised_text = self._collapse_newlines_to_spaces(text)
 
-        dropped_spans = self._build_dropped_line_spans(
-            dropped_ids=dropped_ids,
+        final_dropped_spans = self._build_dropped_line_spans(
+            dropped_ids=final_dropped_ids,
             line_spans=sanitized_spans,
         )
         return {
@@ -532,9 +873,18 @@ Input JSON:
                 "malformed_vote_count": int(malformed_count),
                 "batch_error_count": int(batch_error_count),
                 "rule_dropped_lines": len(rule_dropped_ids),
-                "dropped_lines": len(dropped_ids),
-                "dropped_line_ids": sorted(dropped_ids),
-                "dropped_line_spans": dropped_spans,
+                "raw_dropped_lines": len(dropped_ids),
+                "raw_dropped_line_ids": sorted(dropped_ids),
+                "dropped_lines": len(final_dropped_ids),
+                "dropped_line_ids": sorted(final_dropped_ids),
+                "dropped_line_spans": final_dropped_spans,
+                "drop_ocr_enabled": drop_ocr_enabled,
+                "drop_ocr_model": str(settings.ai_line_denoise_drop_ocr_model or ""),
+                "drop_ocr_attempted": int(ocr_attempted),
+                "drop_ocr_recovered": int(ocr_recovered),
+                "drop_ocr_errors": int(ocr_errors),
+                "drop_ocr_recovered_line_ids": sorted(int(k) for k in ocr_recovered_map.keys()),
+                "drop_ocr_rows": ocr_rows[:80],
                 "fail_open": bool(settings.ai_line_denoise_fail_open),
                 "line_spans_available": spans_available,
             },

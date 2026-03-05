@@ -124,6 +124,24 @@ services:
       - CHUNK_REPAIR_MAX_ROUNDS=${CHUNK_REPAIR_MAX_ROUNDS:-1}
       - CHUNK_REPAIR_MAX_FRAGMENTS=${CHUNK_REPAIR_MAX_FRAGMENTS:-120}
       - CHUNK_REPAIR_MAX_CHARS_PER_CHUNK=${CHUNK_REPAIR_MAX_CHARS_PER_CHUNK:-1800}
+      - AI_LINE_DENOISE_ENABLED=${AI_LINE_DENOISE_ENABLED:-true}
+      - AI_LINE_DENOISE_MODEL=${AI_LINE_DENOISE_MODEL:-qwen3.5:0.8b-stable}
+      - AI_LINE_DENOISE_TIMEOUT_SECONDS=${AI_LINE_DENOISE_TIMEOUT_SECONDS:-30}
+      - AI_LINE_DENOISE_MAX_LINES_PER_CALL=${AI_LINE_DENOISE_MAX_LINES_PER_CALL:-60}
+      - AI_LINE_DENOISE_PARALLEL_VOTES=${AI_LINE_DENOISE_PARALLEL_VOTES:-3}
+      - AI_LINE_DENOISE_RETRY_ROUNDS=${AI_LINE_DENOISE_RETRY_ROUNDS:-2}
+      - AI_LINE_DENOISE_MAX_PARALLEL_BATCHES=${AI_LINE_DENOISE_MAX_PARALLEL_BATCHES:-3}
+      - AI_LINE_DENOISE_FAIL_OPEN=${AI_LINE_DENOISE_FAIL_OPEN:-true}
+      - AI_LINE_DENOISE_JOIN_LINES_WITH_SPACE=${AI_LINE_DENOISE_JOIN_LINES_WITH_SPACE:-true}
+      - AI_LINE_DENOISE_DROP_OCR_ENABLED=${AI_LINE_DENOISE_DROP_OCR_ENABLED:-true}
+      - AI_LINE_DENOISE_DROP_OCR_MODEL=${AI_LINE_DENOISE_DROP_OCR_MODEL:-qwen3.5:0.8b-stable}
+      - AI_LINE_DENOISE_DROP_OCR_TIMEOUT_SECONDS=${AI_LINE_DENOISE_DROP_OCR_TIMEOUT_SECONDS:-24}
+      - AI_LINE_DENOISE_DROP_OCR_DPI=${AI_LINE_DENOISE_DROP_OCR_DPI:-180}
+      - AI_LINE_DENOISE_DROP_OCR_MAX_LINES=${AI_LINE_DENOISE_DROP_OCR_MAX_LINES:-64}
+      - AI_LINE_DENOISE_DROP_OCR_MAX_PARALLEL=${AI_LINE_DENOISE_DROP_OCR_MAX_PARALLEL:-3}
+      - AI_LINE_DENOISE_DROP_OCR_CONFIDENCE_THRESHOLD=${AI_LINE_DENOISE_DROP_OCR_CONFIDENCE_THRESHOLD:-0.60}
+      - AI_LINE_DENOISE_DROP_OCR_IMAGE_MAX_SIDE=${AI_LINE_DENOISE_DROP_OCR_IMAGE_MAX_SIDE:-768}
+      - AI_LINE_DENOISE_DROP_OCR_PAD_RATIO=${AI_LINE_DENOISE_DROP_OCR_PAD_RATIO:-0.06}
       - PDF_LAYOUT_PARSER=${PDF_LAYOUT_PARSER:-document_mind}
       - READER_DOCUMENT_MIND_ENABLED=${READER_DOCUMENT_MIND_ENABLED:-true}
       - READER_DOCUMENT_MIND_ALLOWLIST=${READER_DOCUMENT_MIND_ALLOWLIST:-}
@@ -202,7 +220,12 @@ services:
       codelab-runner:
         condition: service_started
     command: >
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --timeout-graceful-shutdown 5"
+      sh -c "alembic upgrade head &&
+      if [ \"${BACKEND_AUTO_RELOAD:-false}\" = \"true\" ]; then
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-include 'app/**/*.py' --reload-exclude 'tests/*' --reload-exclude 'scripts/*' --reload-exclude 'tmp/*' --timeout-graceful-shutdown 5;
+      else
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 5;
+      fi"
     networks:
       - research_network
 

@@ -839,6 +839,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     document_name=doc.original_filename or doc.filename or "",
                     file_type=doc.file_type,
                     line_spans=denoise_line_spans,
+                    pdf_path=doc.file_path,
                 )
                 denoised_text = str(denoise_result.get("text") or "")
                 if denoised_text:
