@@ -233,6 +233,7 @@ class Settings(BaseSettings):
     document_mind_option: str = "docStructure"
     document_mind_poll_interval_seconds: float = 1.5
     document_mind_timeout_seconds: int = 90
+    document_mind_raw_cache_dir: str = "./uploads/docmind_raw_cache"
     # Reader compose multimodal assist (layout only, no rewriting)
     reader_mm_assist_enabled: bool = True
     # Cheap multimodal advisor for parser/line-level hints
@@ -261,7 +262,7 @@ class Settings(BaseSettings):
     # Deprecated: layout plan v2 now applies globally when enabled.
     reader_layout_plan_v2_allowlist: str = ""
     # Unified reader pipeline mode switch.
-    reader_pipeline_mode: Literal["legacy", "single_agent_v2"] = "legacy"
+    reader_pipeline_mode: Literal["legacy", "single_agent_v2"] = "single_agent_v2"
     # Optional allowlist for gradual rollout. Empty means all papers/pages for current mode.
     reader_pipeline_allowlist_papers: str = ""
     reader_pipeline_allowlist_pages: str = ""

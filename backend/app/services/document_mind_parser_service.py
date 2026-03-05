@@ -10,7 +10,9 @@ This adapter is optional and must fail-open:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import os
 import re
 import time
@@ -73,6 +75,99 @@ class DocumentMindParserService:
         if not isinstance(paper_id, int) or paper_id <= 0:
             return False
         return int(paper_id) in allowlist
+
+    @staticmethod
+    def _cache_dir() -> Path:
+        raw = str(getattr(settings, "document_mind_raw_cache_dir", "./uploads/docmind_raw_cache") or "").strip()
+        token = raw or "./uploads/docmind_raw_cache"
+        return Path(token).expanduser().resolve()
+
+    def _cache_file_path(
+        self,
+        *,
+        paper_id: Optional[int],
+        page: int,
+        local_pdf_path: Optional[str],
+        file_name: Optional[str],
+    ) -> Optional[Path]:
+        path_text = str(local_pdf_path or "").strip()
+        if not path_text:
+            return None
+        pdf_path = Path(path_text)
+        if not pdf_path.exists() or not pdf_path.is_file():
+            return None
+        try:
+            st = pdf_path.stat()
+            stat_sig = f"{int(st.st_mtime)}:{int(st.st_size)}"
+        except Exception:
+            stat_sig = "0:0"
+        opt = str(getattr(settings, "document_mind_option", "docStructure") or "docStructure").strip().lower()
+        paper_token = int(paper_id or 0)
+        name_token = str(file_name or pdf_path.name or "paper.pdf").strip().lower()
+        seed = f"paper={paper_token}|page={int(page)}|opt={opt}|name={name_token}|sig={stat_sig}"
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+        cache_dir = self._cache_dir()
+        return cache_dir / f"docmind_p{int(page)}_{digest}.json"
+
+    def _load_cached_docmind_data(
+        self,
+        *,
+        paper_id: Optional[int],
+        page: int,
+        local_pdf_path: Optional[str],
+        file_name: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        cache_path = self._cache_file_path(
+            paper_id=paper_id,
+            page=page,
+            local_pdf_path=local_pdf_path,
+            file_name=file_name,
+        )
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            data = payload.get("docmind_data")
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _save_cached_docmind_data(
+        self,
+        *,
+        paper_id: Optional[int],
+        page: int,
+        local_pdf_path: Optional[str],
+        file_name: Optional[str],
+        docmind_data: Dict[str, Any],
+    ) -> None:
+        cache_path = self._cache_file_path(
+            paper_id=paper_id,
+            page=page,
+            local_pdf_path=local_pdf_path,
+            file_name=file_name,
+        )
+        if cache_path is None:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": "ok",
+                "mode": "docmind_cached_raw",
+                "paper_id": int(paper_id or 0),
+                "page": int(page),
+                "local_pdf_path": str(local_pdf_path or ""),
+                "file_name": str(file_name or ""),
+                "docmind_data": docmind_data,
+                "saved_at": int(time.time()),
+            }
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return
 
     def _build_client(self) -> Optional[Any]:
         if self._client is not None:
@@ -608,13 +703,36 @@ class DocumentMindParserService:
         file_name: Optional[str] = None,
         local_pdf_path: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        data, meta = await self._run_parse_job(
+        cached_data = self._load_cached_docmind_data(
             paper_id=paper_id,
             page=page,
-            file_url=file_url,
-            file_name=file_name,
             local_pdf_path=local_pdf_path,
+            file_name=file_name,
         )
+        if isinstance(cached_data, dict):
+            data = dict(cached_data)
+            meta = {
+                "used": True,
+                "reason": "cache_hit",
+                "api": "docmind_cache",
+                "status": "success",
+            }
+        else:
+            data, meta = await self._run_parse_job(
+                paper_id=paper_id,
+                page=page,
+                file_url=file_url,
+                file_name=file_name,
+                local_pdf_path=local_pdf_path,
+            )
+            if isinstance(data, dict):
+                self._save_cached_docmind_data(
+                    paper_id=paper_id,
+                    page=page,
+                    local_pdf_path=local_pdf_path,
+                    file_name=file_name,
+                    docmind_data=data,
+                )
         if not isinstance(data, dict):
             return None, meta
 

@@ -2054,7 +2054,7 @@ export default function PaperReaderPage() {
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
-    setTextMode(restoredReaderMode === 'generative')
+    setTextMode(false)
     setGenerativeStyleKey(restoredStyleKey)
     setThemeMode(restoredThemeMode)
     setDetailLevel(restoredDetailLevel)
@@ -4176,7 +4176,7 @@ export default function PaperReaderPage() {
                     {fitWidth ? '已适宽' : '适宽'}
                   </Button>
                   <Button onClick={() => setTextMode((prev) => !prev)}>
-                    {textMode ? 'PDF模式' : '生成式模式'}
+                    {textMode ? '切到PDF' : '切到AI阅读'}
                   </Button>
                   <Tag color={readerAutoSaveTag.color}>{readerAutoSaveTag.label}</Tag>
                 </Space>

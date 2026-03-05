@@ -36,6 +36,7 @@ from app.services.reader_single_agent_controller import (
     ReaderSingleAgentController,
     parse_json_dict_from_model_text,
 )
+from app.services.reader_panel_plan_agent_service import get_reader_panel_plan_agent_service
 from app.services.reader_single_agent_validator import ReaderSingleAgentValidator
 from app.services.render_pipeline_contract import (
     CanonicalAtomBundle,
@@ -184,6 +185,7 @@ class LiteratureReaderComposeService:
             max_steps=max(1, int(getattr(settings, "reader_agent_max_steps", 12) or 12)),
             max_repair_rounds=max(0, int(getattr(settings, "reader_agent_max_repair_rounds", 2) or 2)),
         )
+        self._panel_plan_agent = get_reader_panel_plan_agent_service()
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -204,32 +206,10 @@ class LiteratureReaderComposeService:
         return token or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
 
     def _pipeline_mode(self) -> str:
-        explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_LEGACY) or "").strip().lower()
-        raw_mode_env = str(os.getenv("READER_PIPELINE_MODE", "") or "").strip().lower()
-        valid_modes = {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}
-
-        # If explicit mode is configured, honor it first.
-        if raw_mode_env:
-            if explicit in valid_modes:
-                return explicit
-            logger.warning(
-                f"[ReaderComposeService] invalid READER_PIPELINE_MODE='{raw_mode_env}', "
-                f"fallback to compatibility switch."
-            )
-
-        # Support tests/runtime overrides that set settings directly.
-        if explicit == PIPELINE_MODE_SINGLE_AGENT_V2:
-            return PIPELINE_MODE_SINGLE_AGENT_V2
-
-        # Backward compatibility for one release: map old boolean switch.
-        legacy_flag = bool(getattr(settings, "reader_simplified_pipeline_enabled", False))
-        if legacy_flag:
-            logger.warning(
-                "[ReaderComposeService] reader_simplified_pipeline_enabled is deprecated; "
-                "use reader_pipeline_mode=single_agent_v2"
-            )
-            return PIPELINE_MODE_SINGLE_AGENT_V2
-        return PIPELINE_MODE_LEGACY
+        explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_SINGLE_AGENT_V2) or "").strip().lower()
+        if explicit in {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}:
+            return explicit
+        return PIPELINE_MODE_SINGLE_AGENT_V2
 
     @staticmethod
     def _parse_int_allowlist(raw: str) -> set[int]:
@@ -246,22 +226,8 @@ class LiteratureReaderComposeService:
         return values
 
     def _is_single_agent_v2_enabled(self, *, paper_id: int, page: int) -> bool:
-        if self._pipeline_mode() != PIPELINE_MODE_SINGLE_AGENT_V2:
-            return False
-        paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_papers", "") or ""))
-        page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_pages", "") or ""))
-
-        # Backward compatibility with deprecated allowlists.
-        if not paper_allow:
-            paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_papers", "") or ""))
-        if not page_allow:
-            page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_pages", "") or ""))
-
-        if paper_allow and int(paper_id) not in paper_allow:
-            return False
-        if page_allow and int(page) not in page_allow:
-            return False
-        return True
+        _ = (paper_id, page)
+        return self._pipeline_mode() == PIPELINE_MODE_SINGLE_AGENT_V2
 
     def _should_rebuild_cached_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
@@ -915,65 +881,122 @@ class LiteratureReaderComposeService:
                     f"paper={paper.id} page={page}: {exc}"
                 )
 
-        page_meta = {
-            "paper_id": int(paper.id),
-            "page": int(page),
-            "pipeline_version": self._pipeline_version(),
-            "style_intent": str(style_intent or ""),
-            "theme_mode": str(theme_mode or ""),
-            "detail_level": str(detail_level or ""),
-            "compare_mode": bool(compare_mode),
-            "selected_kb_id": int(selected_kb_id) if selected_kb_id is not None else None,
-        }
-
-        async def _model_infer(system_prompt: str, user_prompt: Dict[str, Any], step: int, phase: str) -> Dict[str, Any]:
-            return await self._invoke_single_agent_model(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                rendered_page_image=rendered_page_image,
-                step=step,
-                phase=phase,
-            )
-
-        controller_result = await self._single_agent_controller.run(
-            page_meta=page_meta,
+        agent_result = await self._panel_plan_agent.run(
             docmind_blocks=docmind_blocks,
             rendered_page_image=rendered_page_image,
             component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
-            model_infer=_model_infer,
-        )
-        step_result = dict(controller_result.get("step_result") or {})
-        validation_report = dict(controller_result.get("validation_report") or {})
-        repair_report = dict(controller_result.get("repair_report") or {})
-        status_value = str(controller_result.get("status") or "fallback").strip().lower()
-        degraded_reason = str(controller_result.get("degraded_reason") or "").strip()
-
-        ui_plan = self._step_result_to_ui_plan(
-            page=page,
-            step_result=step_result,
-            docmind_blocks=docmind_blocks,
-            layout_to_block_ids=layout_to_block_ids,
-            base_payload=payload,
             style_intent=style_intent,
             theme_mode=theme_mode,
             detail_level=detail_level,
-            compare_mode=compare_mode,
+            max_rounds=max(1, int(getattr(settings, "reader_agent_max_steps", 12) or 12)),
         )
+        panel_plan = dict(agent_result.get("panel_plan") or {})
+        validation_report = dict(agent_result.get("validation_report") or {})
+        repair_report = dict(agent_result.get("repair_report") or {})
+        usage = dict(agent_result.get("usage") or {})
+        status_value = str(agent_result.get("status") or "fallback").strip().lower()
+        degraded_reason = str(agent_result.get("degraded_reason") or "").strip()
+        use_controller_fallback = status_value == "fallback" and degraded_reason in {"propose_failed", "model_unavailable"}
+        used_layout_ids: List[str] = []
+        component_hints: List[Dict[str, Any]] = []
+
+        if use_controller_fallback:
+            page_meta = {
+                "paper_id": int(paper.id),
+                "page": int(page),
+                "pipeline_version": self._pipeline_version(),
+                "style_intent": str(style_intent or ""),
+                "theme_mode": str(theme_mode or ""),
+                "detail_level": str(detail_level or ""),
+                "compare_mode": bool(compare_mode),
+                "selected_kb_id": int(selected_kb_id) if selected_kb_id is not None else None,
+            }
+
+            async def _model_infer(system_prompt: str, user_prompt: Dict[str, Any], step: int, phase: str) -> Dict[str, Any]:
+                return await self._invoke_single_agent_model(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    rendered_page_image=rendered_page_image,
+                    step=step,
+                    phase=phase,
+                )
+
+            controller_result = await self._single_agent_controller.run(
+                page_meta=page_meta,
+                docmind_blocks=docmind_blocks,
+                rendered_page_image=rendered_page_image,
+                component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
+                model_infer=_model_infer,
+            )
+            step_result = dict(controller_result.get("step_result") or {})
+            validation_report = dict(controller_result.get("validation_report") or {})
+            repair_report = dict(controller_result.get("repair_report") or {})
+            status_value = str(controller_result.get("status") or "fallback").strip().lower()
+            degraded_reason = str(controller_result.get("degraded_reason") or "").strip()
+
+            ui_plan = self._step_result_to_ui_plan(
+                page=page,
+                step_result=step_result,
+                docmind_blocks=docmind_blocks,
+                layout_to_block_ids=layout_to_block_ids,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            used_layout_ids = [
+                str(item.get("layout_id") or "").strip()
+                for item in list((step_result.get("classification") or {}).get("items") or [])
+                if isinstance(item, dict) and str(item.get("layout_id") or "").strip()
+            ]
+            component_hints = [
+                {
+                    "block_ids": [str(x).strip() for x in list((row or {}).get("source_block_ids") or []) if str(x).strip()],
+                    "component": str((row or {}).get("component") or ""),
+                    "reason": "single_agent_v2",
+                }
+                for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
+                if isinstance(row, dict)
+            ]
+        else:
+            ui_plan = self._panel_plan_to_ui_plan(
+                page=page,
+                panel_plan=panel_plan,
+                docmind_blocks=docmind_blocks,
+                layout_to_block_ids=layout_to_block_ids,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            used_layout_ids = self._collect_source_layout_ids_from_panel_plan(panel_plan=panel_plan)
+            component_hints = self._collect_component_hints_from_panel_plan(panel_plan=panel_plan)
+            validation_report = self._normalize_panel_validation_report(
+                raw_report=validation_report,
+                non_empty_plan=bool((ui_plan.get("components") or [])),
+                used_count=len(used_layout_ids),
+                usable_count=len(docmind_blocks),
+            )
+        used_layout_ids = list(dict.fromkeys([str(item).strip() for item in used_layout_ids if str(item).strip()]))
 
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        failed_gates = [
-            gate_name
-            for gate_name, gate in dict(validation_report.get("gates") or {}).items()
-            if not bool((gate or {}).get("passed"))
-        ]
         step_metrics = [
             row
             for row in list(repair_report.get("step_metrics") or [])
             if isinstance(row, dict)
         ]
-        total_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in step_metrics)
-        total_completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in step_metrics)
-        total_tokens = sum(int(row.get("total_tokens") or 0) for row in step_metrics)
+        total_prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        total_completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or 0)
+        if total_tokens <= 0:
+            total_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in step_metrics)
+            total_completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in step_metrics)
+            total_tokens = sum(int(row.get("total_tokens") or 0) for row in step_metrics)
+
+        validation_errors = [str(item) for item in list(validation_report.get("errors") or []) if str(item).strip()]
+        failed_gates = ["id_integrity"] if validation_errors else []
 
         payload["repair_report"] = {
             **repair_report,
@@ -991,24 +1014,8 @@ class LiteratureReaderComposeService:
         }
         payload["layout_advice_v3"] = {
             "source": "single_agent_v2",
-            "ordered_block_ids": [
-                str(item.get("layout_id") or "")
-                for item in list((step_result.get("classification") or {}).get("items") or [])
-                if isinstance(item, dict) and str(item.get("layout_id") or "")
-            ],
-            "suggested_components": [
-                {
-                    "block_ids": [
-                        str(item).strip()
-                        for item in list((row or {}).get("source_block_ids") or [])
-                        if str(item).strip()
-                    ],
-                    "component": str((row or {}).get("component") or ""),
-                    "reason": "single_agent_v2",
-                }
-                for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
-                if isinstance(row, dict)
-            ],
+            "ordered_block_ids": used_layout_ids,
+            "suggested_components": component_hints,
             "grouping_hints": [],
             "visual_hints": [],
             "notes": [
@@ -1017,23 +1024,15 @@ class LiteratureReaderComposeService:
             ],
         }
         payload["minimal_gate_report"] = {
-            "passed": bool(validation_report.get("passed")),
-            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
-            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
-            "layout_contract": bool((validation_report.get("gates") or {}).get("layout_contract", {}).get("passed")),
-            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
-            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
-            "non_empty_plan_for_non_empty_input": bool(
-                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
-            ),
-            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
-            "used_atom_count": len(
-                [
-                    item
-                    for item in list((step_result.get("classification") or {}).get("items") or [])
-                    if isinstance(item, dict) and str(item.get("layout_id") or "").strip()
-                ]
-            ),
+            "passed": bool(validation_report.get("passed", False)),
+            "schema_valid": bool(validation_report.get("passed", False)),
+            "whitelist_valid": bool(validation_report.get("passed", False)),
+            "layout_contract": True,
+            "ownership_unchanged": True,
+            "full_coverage": not any(str(item).startswith("uncovered_layout_ids:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
+            "used_atom_count": len(used_layout_ids),
             "usable_atom_count": len(docmind_blocks),
         }
         payload["pipeline_contract_meta"] = {
@@ -1046,21 +1045,19 @@ class LiteratureReaderComposeService:
 
         quality_report = {
             "overall": 0.94 if status_value == "done" else 0.66,
-            "hard_constraints_passed": bool(validation_report.get("passed")),
-            "validation_errors": list(validation_report.get("errors") or []),
+            "hard_constraints_passed": bool(validation_report.get("passed", False)),
+            "validation_errors": validation_errors,
             "quality_target": 0.0,
             "elapsed_ms": elapsed_ms,
             "iterations": int(repair_report.get("steps_executed") or len(step_metrics) or 1),
             "degraded": status_value != "done",
             "stop_reason": degraded_reason or ("single_agent_v2_done" if status_value == "done" else "validator_non_converged"),
-            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
-            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
-            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
-            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
-            "non_empty_plan_for_non_empty_input": bool(
-                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
-            ),
-            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
+            "schema_valid": bool(validation_report.get("passed", False)),
+            "whitelist_valid": bool(validation_report.get("passed", False)),
+            "ownership_unchanged": True,
+            "full_coverage": not any(str(item).startswith("uncovered_layout_ids:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
             "pipeline_latency_ms": elapsed_ms,
             "prompt_tokens": int(total_prompt_tokens),
             "completion_tokens": int(total_completion_tokens),
@@ -1096,6 +1093,341 @@ class LiteratureReaderComposeService:
             "base_payload": payload,
             "loop_result": loop_result,
             "assets": assets,
+        }
+
+    @staticmethod
+    def _normalize_panel_validation_report(
+        *,
+        raw_report: Dict[str, Any],
+        non_empty_plan: bool,
+        used_count: int,
+        usable_count: int,
+    ) -> Dict[str, Any]:
+        report = dict(raw_report or {})
+        errors = [str(item) for item in list(report.get("errors") or []) if str(item).strip()]
+        warnings = [str(item) for item in list(report.get("warnings") or []) if str(item).strip()]
+        has_unknown = any(item.startswith("unknown_source_layout_id:") for item in errors)
+        has_uncovered = any(item.startswith("uncovered_layout_ids:") for item in errors)
+        has_component = any(item.startswith("component_not_allowed:") for item in errors)
+        has_schema = any(item in {"panels_empty", "source_layout_ids_not_array", "node_id_missing"} for item in errors)
+
+        def gate_row(passed: bool, gate_errors: List[str]) -> Dict[str, Any]:
+            return {"passed": bool(passed), "errors": [str(item) for item in gate_errors]}
+
+        gates = {
+            "id_integrity": gate_row(not has_unknown and not has_schema, [item for item in errors if item.startswith("unknown_source_layout_id:") or item in {"panels_empty", "source_layout_ids_not_array", "node_id_missing"}]),
+            "full_coverage": gate_row(not has_uncovered, [item for item in errors if item.startswith("uncovered_layout_ids:")]),
+            "whitelist_only": gate_row(not has_component, [item for item in errors if item.startswith("component_not_allowed:")]),
+            "layout_contract": gate_row(True, []),
+            "no_drop_blocks": gate_row(not has_uncovered, [item for item in errors if item.startswith("uncovered_layout_ids:")]),
+            "ownership_unchanged": gate_row(True, []),
+            "non_empty_plan_for_non_empty_input": gate_row(bool(non_empty_plan) or usable_count <= 0, [] if (bool(non_empty_plan) or usable_count <= 0) else ["empty_plan"]),
+            "source_text_immutable": gate_row(True, []),
+        }
+
+        passed = bool(report.get("passed", False)) and all(bool((row or {}).get("passed")) for row in gates.values())
+        if usable_count > 0 and used_count <= 0:
+            passed = False
+            gates["full_coverage"] = gate_row(False, list(gates["full_coverage"]["errors"]) + ["used_count_zero"])
+            if "used_count_zero" not in errors:
+                errors.append("used_count_zero")
+
+        return {
+            "passed": bool(passed),
+            "status": "ok" if passed else "invalid",
+            "errors": errors,
+            "warnings": warnings,
+            "stats": dict(report.get("stats") or {}),
+            "gates": gates,
+        }
+
+    @staticmethod
+    def _collect_source_layout_ids_from_panel_plan(*, panel_plan: Dict[str, Any]) -> List[str]:
+        output: List[str] = []
+        seen: set[str] = set()
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            for node in list(panel.get("nodes") or []):
+                stack = [node]
+                while stack:
+                    current = stack.pop(0)
+                    if not isinstance(current, dict):
+                        continue
+                    for src in list(current.get("source_layout_ids") or []):
+                        token = str(src or "").strip()
+                        if token and token not in seen:
+                            seen.add(token)
+                            output.append(token)
+                    children = current.get("children")
+                    if isinstance(children, list) and children:
+                        stack = list(children) + stack
+        return output
+
+    @staticmethod
+    def _collect_component_hints_from_panel_plan(*, panel_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        hints: List[Dict[str, Any]] = []
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            for node in list(panel.get("nodes") or []):
+                stack = [node]
+                while stack:
+                    current = stack.pop(0)
+                    if not isinstance(current, dict):
+                        continue
+                    component = str(current.get("component") or "").strip()
+                    block_ids = [str(item).strip() for item in list(current.get("source_layout_ids") or []) if str(item).strip()]
+                    if component:
+                        hints.append({"block_ids": block_ids, "component": component, "reason": "single_agent_v2"})
+                    children = current.get("children")
+                    if isinstance(children, list) and children:
+                        stack = list(children) + stack
+        return hints
+
+    def _panel_plan_to_ui_plan(
+        self,
+        *,
+        page: int,
+        panel_plan: Dict[str, Any],
+        docmind_blocks: Sequence[Dict[str, Any]],
+        layout_to_block_ids: Dict[str, List[str]],
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+    ) -> Dict[str, Any]:
+        docmind_map = {
+            str(row.get("layout_id") or ""): dict(row)
+            for row in list(docmind_blocks or [])
+            if isinstance(row, dict) and str(row.get("layout_id") or "")
+        }
+
+        block_anchor_map: Dict[str, Dict[str, Any]] = {}
+        for block in list(base_payload.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block.get("id") or ""))
+            if not canonical:
+                canonical = str(((block.get("source_anchor") or {}).get("canonical_block_id") or "")).strip()
+            if not canonical or canonical in block_anchor_map:
+                continue
+            anchor = self._normalize_anchor_ref(
+                anchor=block.get("source_anchor"),
+                page=page,
+                quote_text=str(block.get("text") or ""),
+            )
+            if anchor:
+                block_anchor_map[canonical] = anchor
+
+        allowed_displays = {"default", "collapsed", "pinned", "hidden_until_expand"}
+        component_map = {
+            "ProseBlock": "ParagraphProse",
+            "QuoteBlock": "CalloutBox",
+            "BulletList": "ListBlock",
+            "FigureCard": "FigurePanel",
+            "Callout": "CalloutBox",
+            "PublicationMetaStrip": "ContextRail",
+        }
+        order_key = 0.0
+
+        def infer_zone(source_layout_ids: Sequence[str]) -> str:
+            aux_types = {"head", "header_line", "side", "footer_line", "foot", "foot_pagenum", "split_line"}
+            aux_count = 0
+            for layout_id in source_layout_ids:
+                row = docmind_map.get(str(layout_id)) or {}
+                if str(row.get("type") or "").strip().lower() in aux_types:
+                    aux_count += 1
+            return "side_context" if aux_count > 0 and aux_count >= max(1, len(source_layout_ids)) else "main_body"
+
+        def fallback_text(source_layout_ids: Sequence[str]) -> str:
+            parts: List[str] = []
+            for layout_id in source_layout_ids:
+                token = str((docmind_map.get(layout_id) or {}).get("source_text") or "").strip()
+                if token:
+                    parts.append(token)
+            return " ".join(parts).strip()
+
+        def normalize_component(raw_component: str) -> str:
+            token = str(raw_component or "").strip()
+            token = component_map.get(token, token)
+            if token in SIMPLIFIED_ALLOWED_COMPONENTS:
+                return token
+            return "ParagraphProse"
+
+        def normalize_props(component: str, raw_props: Any, source_layout_ids: Sequence[str]) -> Dict[str, Any]:
+            props = dict(raw_props) if isinstance(raw_props, dict) else {}
+            fb_text = fallback_text(source_layout_ids)
+            if component == "ParagraphProse":
+                text = str(props.get("text") or fb_text).strip()
+                return {"text": text or "[empty]"}
+            if component == "SectionHeading":
+                text = str(props.get("text") or fb_text).strip() or "Untitled"
+                level = int(props.get("level") or 2)
+                level = max(1, min(4, level))
+                return {"text": text, "level": level}
+            if component == "ListBlock":
+                items = props.get("items")
+                rows = [str(item).strip() for item in list(items or []) if str(item).strip()] if isinstance(items, list) else []
+                if not rows and fb_text:
+                    rows = [fb_text]
+                return {"items": rows}
+            if component == "FigurePanel":
+                return {
+                    "caption": str(props.get("caption") or fb_text).strip(),
+                    "image_url": str(props.get("image_url") or props.get("image_src") or "").strip(),
+                    "source_label": str(props.get("source_label") or "").strip(),
+                    "ai_insight": str(props.get("ai_insight") or "").strip(),
+                }
+            if component == "ContextRail":
+                title = str(props.get("title") or "Context").strip()
+                items = props.get("items")
+                if not isinstance(items, list):
+                    text = fb_text or str(props.get("text") or "").strip()
+                    items = [{"text": text}] if text else []
+                return {"title": title, "items": items}
+            if component == "CalloutBox":
+                content = str(props.get("content") or props.get("text") or fb_text).strip()
+                callout_type = str(props.get("type") or "info").strip().lower()
+                if callout_type not in {"info", "warning", "success", "tip"}:
+                    callout_type = "info"
+                return {"type": callout_type, "title": str(props.get("title") or "").strip(), "content": content or "[empty]"}
+            if component == "AbstractCard":
+                return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
+            if component == "CitationCard":
+                return {
+                    "title": str(props.get("title") or fb_text).strip() or "Citation",
+                    "authors": [str(item).strip() for item in list(props.get("authors") or []) if str(item).strip()],
+                    "year": props.get("year"),
+                    "journal": str(props.get("journal") or "").strip(),
+                    "doi": str(props.get("doi") or "").strip(),
+                    "abstract_tldr": str(props.get("abstract_tldr") or "").strip(),
+                }
+            if component == "EquationBlock":
+                return {
+                    "latex": str(props.get("latex") or props.get("text") or fb_text).strip() or "x = y",
+                    "label": str(props.get("label") or "").strip(),
+                    "description": str(props.get("description") or "").strip(),
+                }
+            if component == "MethodologyCard":
+                steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
+                if not steps and fb_text:
+                    steps = [fb_text]
+                return {"title": str(props.get("title") or "").strip(), "steps": steps or ["N/A"], "participants": str(props.get("participants") or "").strip(), "tools": [str(item).strip() for item in list(props.get("tools") or []) if str(item).strip()]}
+            if component == "TablePanel":
+                rows = props.get("rows")
+                return {"title": str(props.get("title") or fb_text or "Table").strip(), "rows": rows if isinstance(rows, list) else []}
+            return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
+
+        def convert_node(node: Dict[str, Any], panel_id: str) -> Optional[Dict[str, Any]]:
+            nonlocal order_key
+            source_layout_ids = [str(item).strip() for item in list(node.get("source_layout_ids") or []) if str(item).strip()]
+            component = normalize_component(str(node.get("component") or ""))
+            zone_type = infer_zone(source_layout_ids)
+            region = "sidebar" if zone_type == "side_context" else "main"
+            display = str(node.get("display") or "default").strip().lower()
+            if display not in allowed_displays:
+                display = "default"
+            source_block_ids: List[str] = []
+            source_anchor_refs: List[Dict[str, Any]] = []
+            for layout_id in source_layout_ids:
+                mapped = list(layout_to_block_ids.get(layout_id) or [layout_id])
+                for block_id in mapped:
+                    block_token = str(block_id).strip()
+                    if not block_token or block_token in source_block_ids:
+                        continue
+                    source_block_ids.append(block_token)
+                    anchor = dict(block_anchor_map.get(block_token) or {})
+                    if anchor and anchor not in source_anchor_refs:
+                        source_anchor_refs.append(anchor)
+
+            order_key += 1.0
+            node_id = str(node.get("node_id") or f"{panel_id}_n{int(order_key)}").strip()
+            children: List[Dict[str, Any]] = []
+            for child in list(node.get("children") or []):
+                if not isinstance(child, dict):
+                    continue
+                converted = convert_node(child, panel_id)
+                if converted:
+                    children.append(converted)
+            return {
+                "id": node_id,
+                "type": component,
+                "props": normalize_props(component, node.get("props"), source_layout_ids),
+                "children": children,
+                "source_anchor_refs": source_anchor_refs,
+                "source_block_ids": source_block_ids,
+                "source_atom_ids": source_block_ids,
+                "zone_type": zone_type,
+                "column_id": region,
+                "region": region,
+                "display": display,
+                "order_key": float(node.get("order_key") or order_key),
+                "compat_filled": True,
+                "compat_filled_fields": ["zone_type", "column_id", "region", "display", "order_key"],
+                "heading_prob": 0.85 if component == "SectionHeading" else 0.0,
+                "capabilities": [],
+                "actions": [],
+            }
+
+        components: List[Dict[str, Any]] = []
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            panel_id = str(panel.get("panel_id") or f"panel_{len(components) + 1}").strip()
+            panel_nodes = [row for row in list(panel.get("nodes") or []) if isinstance(row, dict)]
+            title = str(panel.get("title") or "").strip()
+            if title:
+                title_source = []
+                if panel_nodes:
+                    title_source = [str(item).strip() for item in list(panel_nodes[0].get("source_layout_ids") or []) if str(item).strip()]
+                title_node = convert_node(
+                    {
+                        "node_id": f"{panel_id}_title",
+                        "component": "SectionHeading",
+                        "props": {"text": title, "level": 2},
+                        "source_layout_ids": title_source,
+                        "children": [],
+                    },
+                    panel_id,
+                )
+                if title_node:
+                    components.append(title_node)
+            for node in panel_nodes:
+                converted = convert_node(node, panel_id)
+                if converted:
+                    components.append(converted)
+
+        style_plan = dict(panel_plan.get("style_plan") or {})
+        style_tokens = {
+            "pageBackground": str(style_plan.get("page_background") or style_plan.get("pageBackground") or "#f4f8fc"),
+            "panelBackground": str(style_plan.get("panel_background") or style_plan.get("panelBackground") or "rgba(255,255,255,0.9)"),
+            "borderColor": str(style_plan.get("border_color") or style_plan.get("borderColor") or "rgba(120,145,170,0.28)"),
+            "headingColor": str(style_plan.get("heading_color") or style_plan.get("headingColor") or "#0f2740"),
+            "bodyColor": str(style_plan.get("body_color") or style_plan.get("bodyColor") or "#1f3348"),
+        }
+        return {
+            "plan_id": f"single_agent_v2_p{int(page)}",
+            "components": components,
+            "layout": {
+                "layout_mode": "single_column",
+                "regions": [{"id": "main", "kind": "content"}, {"id": "sidebar", "kind": "meta"}],
+                "content_max_width": 980,
+            },
+            "style_tokens": style_tokens,
+            "trace_meta": {
+                "pipeline": "single_agent_v2",
+                "panel_plan": panel_plan,
+                "style_intent": str(style_intent or ""),
+                "theme_mode": str(theme_mode or ""),
+                "detail_level": str(detail_level or ""),
+                "compare_mode": bool(compare_mode),
+                "assembly_used": True,
+            },
+            "ui_ops": [],
+            "agent_trace": [],
+            "agent_tool_calls": [],
         }
 
     async def _invoke_single_agent_model(

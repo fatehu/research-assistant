@@ -1,8 +1,8 @@
 """
-文档处理服务 - 解析、分片、embedding
+鏂囨。澶勭悊鏈嶅姟 - 瑙ｆ瀽銆佸垎鐗囥€乪mbedding
 
-V3 变更:
-  - estimate_tokens 委托给 smart_chunking.token_utils（更精确的中英文估算）
+V3 鍙樻洿:
+  - estimate_tokens 濮旀墭缁?smart_chunking.token_utils锛堟洿绮剧‘鐨勪腑鑻辨枃浼扮畻锛?
 """
 import hashlib
 import os
@@ -16,21 +16,21 @@ from app.services.embedding_service import embedding_service
 
 
 class TextSplitter:
-    """文本分割器"""
-    
+    """Text splitter."""
+
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
     
     def split_text(self, text: str) -> List[Tuple[str, int, int]]:
         """
-        分割文本
-        返回: [(chunk_text, start_char, end_char), ...]
+        鍒嗗壊鏂囨湰
+        杩斿洖: [(chunk_text, start_char, end_char), ...]
         """
         if not text:
             return []
         
-        # 清理文本
+        # 娓呯悊鏂囨湰
         text = self._clean_text(text)
         
         if len(text) <= self.chunk_size:
@@ -40,24 +40,24 @@ class TextSplitter:
         start = 0
         
         while start < len(text):
-            # 计算结束位置
+            # 璁＄畻缁撴潫浣嶇疆
             end = start + self.chunk_size
             
             if end >= len(text):
-                # 最后一块
+                # 鏈€鍚庝竴鍧?
                 chunk = text[start:]
                 if chunk.strip():
                     chunks.append((chunk, start, len(text)))
                 break
             
-            # 尝试在句子边界分割
+            # 灏濊瘯鍦ㄥ彞瀛愯竟鐣屽垎鍓?
             end = self._find_sentence_boundary(text, start, end)
             
             chunk = text[start:end]
             if chunk.strip():
                 chunks.append((chunk, start, end))
             
-            # 计算下一块的起始位置（考虑重叠）
+            # 璁＄畻涓嬩竴鍧楃殑璧峰浣嶇疆锛堣€冭檻閲嶅彔锛?
             start = end - self.chunk_overlap
             if start <= chunks[-1][1] if chunks else 0:
                 start = end
@@ -65,23 +65,23 @@ class TextSplitter:
         return chunks
     
     def _clean_text(self, text: str) -> str:
-        """清理文本"""
-        # 统一换行符
+        """娓呯悊鏂囨湰"""
+        # 缁熶竴鎹㈣绗?
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # 移除多余空白
+        # 绉婚櫎澶氫綑绌虹櫧
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
         return text.strip()
     
     def _find_sentence_boundary(self, text: str, start: int, end: int) -> int:
-        """找到句子边界"""
-        # 优先在段落边界分割
+        """鎵惧埌鍙ュ瓙杈圭晫"""
+        # 浼樺厛鍦ㄦ钀借竟鐣屽垎鍓?
         last_para = text.rfind('\n\n', start, end)
         if last_para > start + self.chunk_size // 2:
             return last_para + 2
         
-        # 然后在句子边界分割
-        sentence_endings = ['. ', '。', '！', '？', '! ', '? ', '；', ';']
+        # 鐒跺悗鍦ㄥ彞瀛愯竟鐣屽垎鍓?
+        sentence_endings = ['. ', '! ', '? ', '; ']
         best_pos = end
         
         for ending in sentence_endings:
@@ -91,7 +91,7 @@ class TextSplitter:
                     best_pos = pos + len(ending)
                 break
         
-        # 最后在换行处分割
+        # 鏈€鍚庡湪鎹㈣澶勫垎鍓?
         if best_pos == end:
             last_newline = text.rfind('\n', start, end)
             if last_newline > start + self.chunk_size // 2:
@@ -101,7 +101,7 @@ class TextSplitter:
 
 
 class DocumentProcessor:
-    """文档处理器"""
+    """Document processor."""
     
     SUPPORTED_TYPES = {
         'txt': 'text/plain',
@@ -112,15 +112,26 @@ class DocumentProcessor:
         'htm': 'text/html',
     }
 
-    _CAPTION_PREFIXES = ("figure", "fig", "table", "tab", "图", "表")
-    _SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？")
+    _CAPTION_PREFIXES = ("figure", "fig", "table", "tab")
+    _SENTENCE_ENDINGS = (".", "!", "?", ";")
     
+    _PYPDF_HEADER_RATIO = 0.08
+    _PYPDF_FOOTER_RATIO = 0.06
+    _BACK_MATTER_HEADING = re.compile(
+        r"^(references|bibliography|acknowledg(?:e)?ments?|supplementary(?: materials?)?|appendix)\b",
+        re.IGNORECASE,
+    )
+    _REFERENCE_LINE = re.compile(
+        r"^(\[\d+\]|\d+\.)\s+.+|.+\b(?:doi|pmid|arxiv)\b.+",
+        re.IGNORECASE,
+    )
+
     def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
         self.splitter = TextSplitter(chunk_size, chunk_overlap)
         self.last_pdf_extractor: Optional[str] = None
     
     async def extract_text(self, file_path: str, file_type: str) -> str:
-        """从文件中提取文本"""
+        """浠庢枃浠朵腑鎻愬彇鏂囨湰"""
         file_type = file_type.lower().replace('.', '')
         
         if file_type in ['txt', 'md', 'markdown']:
@@ -130,10 +141,10 @@ class DocumentProcessor:
         elif file_type in ['html', 'htm']:
             return await self._extract_html(file_path)
         else:
-            raise ValueError(f"不支持的文件类型: {file_type}")
+            raise ValueError(f"涓嶆敮鎸佺殑鏂囦欢绫诲瀷: {file_type}")
     
     async def _extract_text_file(self, file_path: str) -> str:
-        """提取纯文本文件"""
+        """Extract text from plain text/markdown files."""
         encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1']
         
         for encoding in encodings:
@@ -143,13 +154,13 @@ class DocumentProcessor:
             except UnicodeDecodeError:
                 continue
         
-        raise ValueError("无法解码文件")
+        raise ValueError("鏃犳硶瑙ｇ爜鏂囦欢")
     
     async def _extract_pdf(self, file_path: str) -> str:
-        """提取 PDF 文本"""
+        """鎻愬彇 PDF 鏂囨湰"""
         self.last_pdf_extractor = None
 
-        # 优先使用 layout-aware 解析器，减少图表 OCR 碎片噪声
+        # 浼樺厛浣跨敤 layout-aware 瑙ｆ瀽鍣紝鍑忓皯鍥捐〃 OCR 纰庣墖鍣０
         layout_text = self._extract_pdf_with_layout_parser(file_path)
         if layout_text:
             return layout_text
@@ -157,23 +168,15 @@ class DocumentProcessor:
         try:
             import pypdf
 
-            text_parts = []
-            with open(file_path, 'rb') as f:
-                reader = pypdf.PdfReader(f)
-                for page in reader.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_parts.append(page_text)
-
-            normalized = self._normalize_extracted_text('\n\n'.join(text_parts))
+            normalized = self._extract_pdf_with_pypdf_clean(file_path)
             if normalized:
                 self.last_pdf_extractor = "pypdf"
                 return normalized
-            logger.warning("pypdf 提取结果为空，尝试使用 pdfplumber")
+            logger.warning("pypdf 鎻愬彇缁撴灉涓虹┖锛屽皾璇曚娇鐢?pdfplumber")
         except ImportError:
-            logger.warning("pypdf 未安装，尝试使用 pdfplumber")
+            logger.warning("pypdf 鏈畨瑁咃紝灏濊瘯浣跨敤 pdfplumber")
         except Exception as e:
-            logger.warning(f"pypdf 提取失败，尝试使用 pdfplumber: {e}")
+            logger.warning(f"pypdf 鎻愬彇澶辫触锛屽皾璇曚娇鐢?pdfplumber: {e}")
 
         try:
             import pdfplumber
@@ -190,9 +193,9 @@ class DocumentProcessor:
                 self.last_pdf_extractor = "pdfplumber"
                 return normalized
         except ImportError:
-            raise ValueError("需要安装 pypdf 或 pdfplumber 来处理 PDF 文件")
+            raise ValueError("pypdf or pdfplumber is required to parse PDF files")
 
-        raise ValueError("PDF 文本提取失败：无法获得有效文本内容")
+        raise ValueError("PDF text extraction failed: no usable content")
 
     def _extract_pdf_with_layout_parser(self, file_path: str) -> Optional[str]:
         parser_preference = (getattr(settings, "pdf_layout_parser", "auto") or "auto").lower()
@@ -207,10 +210,10 @@ class DocumentProcessor:
             try:
                 raw_text = extractor(file_path)
             except ImportError:
-                logger.info(f"{parser_name} 未安装，跳过 layout 解析")
+                logger.info(f"{parser_name} 鏈畨瑁咃紝璺宠繃 layout 瑙ｆ瀽")
                 continue
             except Exception as e:
-                logger.warning(f"{parser_name} layout 解析失败: {e}")
+                logger.warning(f"{parser_name} layout 瑙ｆ瀽澶辫触: {e}")
                 continue
 
             normalized = self._normalize_extracted_text(raw_text)
@@ -218,7 +221,7 @@ class DocumentProcessor:
                 quality = self._layout_quality_metrics(normalized)
                 if self._is_layout_text_degraded(quality):
                     logger.warning(
-                        f"{parser_name} 结果疑似碎片化，跳过 layout 文本并尝试回退: "
+                        f"{parser_name} 缁撴灉鐤戜技纰庣墖鍖栵紝璺宠繃 layout 鏂囨湰骞跺皾璇曞洖閫€: "
                         f"fragment={quality['fragment_ratio']:.2f}, "
                         f"sentence_like={quality['sentence_like_ratio']:.2f}, "
                         f"lines={quality['lines']}"
@@ -226,11 +229,11 @@ class DocumentProcessor:
                     continue
 
                 self.last_pdf_extractor = parser_name
-                logger.info(f"PDF 使用 {parser_name} 完成 layout 解析")
+                logger.info(f"PDF 浣跨敤 {parser_name} 瀹屾垚 layout 瑙ｆ瀽")
                 return normalized
 
             logger.warning(
-                f"{parser_name} 提取文本长度不足，跳过（chars={len(normalized)}）"
+                f"{parser_name} extracted text too short, skip (chars={len(normalized)})"
             )
 
         return None
@@ -242,7 +245,7 @@ class DocumentProcessor:
         if parser_preference == "docling":
             return ["docling"]
         if parser_preference not in {"auto", "markitdown", "docling", "none"}:
-            logger.warning(f"未知 pdf_layout_parser={parser_preference}，回退到 auto")
+            logger.warning(f"鏈煡 pdf_layout_parser={parser_preference}锛屽洖閫€鍒?auto")
         return ["markitdown", "docling"]
 
     @staticmethod
@@ -252,6 +255,166 @@ class DocumentProcessor:
         normalized = text.replace('\r\n', '\n').replace('\r', '\n')
         normalized = re.sub(r'\n{3,}', '\n\n', normalized)
         return normalized.strip()
+
+    def _extract_pdf_with_pypdf_clean(self, file_path: str) -> str:
+        import pypdf
+
+        pages_lines: list[list[str]] = []
+        with open(file_path, 'rb') as f:
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                page_text = self._extract_page_text_with_vertical_crop(page)
+                lines = self._normalize_pdf_lines(page_text)
+                lines = self._merge_hyphenated_lines(lines)
+                pages_lines.append(lines)
+
+        pages_lines = self._drop_repeated_edge_lines(pages_lines)
+        pages_lines = self._drop_back_matter_lines(pages_lines)
+        merged = "\n\n".join("\n".join(lines) for lines in pages_lines if lines)
+        return self._normalize_extracted_text(merged)
+
+    def _extract_page_text_with_vertical_crop(self, page: Any) -> str:
+        page_height = 0.0
+        try:
+            page_height = float(getattr(page.mediabox, "height", 0.0) or 0.0)
+        except Exception:
+            page_height = 0.0
+
+        if page_height <= 0:
+            return str(page.extract_text() or "")
+
+        top_y = page_height * (1.0 - float(self._PYPDF_HEADER_RATIO))
+        bottom_y = page_height * float(self._PYPDF_FOOTER_RATIO)
+        fragments: list[str] = []
+
+        def _visitor(text: str, cm, tm, font_dict, font_size):  # type: ignore[no-untyped-def]
+            if not text:
+                return
+            y = 0.0
+            try:
+                y = float(tm[5] or 0.0)
+            except Exception:
+                y = 0.0
+            if bottom_y <= y <= top_y:
+                fragments.append(str(text))
+
+        try:
+            page.extract_text(visitor_text=_visitor)
+        except Exception:
+            return str(page.extract_text() or "")
+
+        if not fragments:
+            return str(page.extract_text() or "")
+        return "".join(fragments)
+
+    @staticmethod
+    def _normalize_pdf_lines(text: str) -> list[str]:
+        raw = str(text or "").replace('\r\n', '\n').replace('\r', '\n')
+        lines: list[str] = []
+        for line in raw.split('\n'):
+            cleaned = re.sub(r'\s+', ' ', line).strip()
+            if not cleaned:
+                continue
+            if re.fullmatch(r"(?:page\s*)?\d+(?:\s*/\s*\d+)?", cleaned, re.IGNORECASE):
+                continue
+            lines.append(cleaned)
+        return lines
+
+    @staticmethod
+    def _merge_hyphenated_lines(lines: list[str]) -> list[str]:
+        if not lines:
+            return []
+        output: list[str] = []
+        i = 0
+        while i < len(lines):
+            current = lines[i]
+            if i + 1 < len(lines):
+                nxt = lines[i + 1]
+                if current.endswith('-') and nxt and nxt[0].islower():
+                    output.append(current[:-1] + nxt)
+                    i += 2
+                    continue
+            output.append(current)
+            i += 1
+        return output
+
+    @staticmethod
+    def _drop_repeated_edge_lines(pages_lines: list[list[str]]) -> list[list[str]]:
+        if len(pages_lines) < 3:
+            return pages_lines
+
+        hit: dict[str, int] = {}
+        for lines in pages_lines:
+            if not lines:
+                continue
+            edge = lines[:2] + lines[-2:]
+            seen: set[str] = set()
+            for line in edge:
+                key = line.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                hit[key] = hit.get(key, 0) + 1
+
+        threshold = max(2, int(len(pages_lines) * 0.6))
+        repeated = {k for k, v in hit.items() if v >= threshold and len(k) <= 140}
+        if not repeated:
+            return pages_lines
+
+        cleaned_pages: list[list[str]] = []
+        for lines in pages_lines:
+            cleaned_pages.append([line for line in lines if line.lower() not in repeated])
+        return cleaned_pages
+
+    def _drop_back_matter_lines(self, pages_lines: list[list[str]]) -> list[list[str]]:
+        flattened: list[tuple[int, str]] = []
+        for page_idx, lines in enumerate(pages_lines):
+            for line in lines:
+                flattened.append((page_idx, line))
+        if not flattened:
+            return pages_lines
+
+        heading_idx = -1
+        for idx, (_, line) in enumerate(flattened):
+            if self._BACK_MATTER_HEADING.match(line):
+                heading_idx = idx
+                break
+
+        output = [list(lines) for lines in pages_lines]
+        if heading_idx >= 0 and heading_idx >= int(len(flattened) * 0.45):
+            start_page = flattened[heading_idx][0]
+            start_line = flattened[heading_idx][1]
+            for page_idx in range(start_page, len(output)):
+                new_lines: list[str] = []
+                for line in output[page_idx]:
+                    if page_idx == start_page and line == start_line:
+                        continue
+                    if self._is_reference_like_line(line):
+                        continue
+                    new_lines.append(line)
+                output[page_idx] = new_lines
+            return output
+
+        for page_idx, lines in enumerate(output):
+            output[page_idx] = [line for line in lines if not self._is_reference_like_line(line)]
+        return output
+
+    def _is_reference_like_line(self, line: str) -> bool:
+        s = str(line or "").strip()
+        if not s:
+            return False
+        if self._REFERENCE_LINE.match(s):
+            return True
+        if re.search(r"\b(et al\.?|vol\.|pp\.|journal|proceedings)\b", s, flags=re.IGNORECASE):
+            if re.search(r"\b(19|20)\d{2}\b", s):
+                return True
+        if ("https://" in s.lower() or "http://" in s.lower()) and re.search(
+            r"\b(doi|pmid|arxiv|available)\b",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        return False
 
     @staticmethod
     def _is_layout_text_usable(text: str) -> bool:
@@ -324,7 +487,7 @@ class DocumentProcessor:
         if value and value.strip():
             return value
 
-        raise ValueError("markitdown 返回了空结果")
+        raise ValueError("markitdown 杩斿洖浜嗙┖缁撴灉")
 
     @classmethod
     def _extract_pdf_with_docling(cls, file_path: str) -> str:
@@ -350,7 +513,7 @@ class DocumentProcessor:
         if value and value.strip():
             return value
 
-        raise ValueError("docling 返回了空结果")
+        raise ValueError("docling 杩斿洖浜嗙┖缁撴灉")
 
     @staticmethod
     def _as_text(value: Any) -> Optional[str]:
@@ -363,24 +526,24 @@ class DocumentProcessor:
         return None
     
     async def _extract_html(self, file_path: str) -> str:
-        """提取 HTML 文本"""
+        """鎻愬彇 HTML 鏂囨湰"""
         try:
             from bs4 import BeautifulSoup
             
             with open(file_path, 'r', encoding='utf-8') as f:
                 soup = BeautifulSoup(f.read(), 'html.parser')
                 
-                # 移除脚本和样式
+                # 绉婚櫎鑴氭湰鍜屾牱寮?
                 for script in soup(['script', 'style']):
                     script.decompose()
                 
                 return soup.get_text(separator='\n', strip=True)
         except ImportError:
-            # 简单的正则提取
+            # 绠€鍗曠殑姝ｅ垯鎻愬彇
             with open(file_path, 'r', encoding='utf-8') as f:
                 html = f.read()
             
-            # 移除标签
+            # 绉婚櫎鏍囩
             text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
             text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
             text = re.sub(r'<[^>]+>', ' ', text)
@@ -388,32 +551,32 @@ class DocumentProcessor:
             return text.strip()
     
     def chunk_text(self, text: str) -> List[Tuple[str, int, int]]:
-        """分割文本为多个块"""
+        """鍒嗗壊鏂囨湰涓哄涓潡"""
         return self.splitter.split_text(text)
     
     async def embed_chunks(self, chunks: List[str], embedding_svc=None) -> List[List[float]]:
-        """为文本块生成嵌入向量
+        """涓烘枃鏈潡鐢熸垚宓屽叆鍚戦噺
         
         Args:
-            chunks: 文本块列表
-            embedding_svc: 可选的 EmbeddingService 实例。为 None 时使用全局默认实例。
+            chunks: 鏂囨湰鍧楀垪琛?
+            embedding_svc: 鍙€夌殑 EmbeddingService 瀹炰緥銆備负 None 鏃朵娇鐢ㄥ叏灞€榛樿瀹炰緥銆?
         """
         svc = embedding_svc or embedding_service
         return await svc.embed_texts(chunks)
     
     def compute_hash(self, content: str) -> str:
-        """计算内容哈希"""
+        """璁＄畻鍐呭鍝堝笇"""
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
     
     def estimate_tokens(self, text: str) -> int:
         """
-        估算 token 数量 — 委托给 token_utils（更精确的中英文加权估算）
+        浼扮畻 token 鏁伴噺 鈥?濮旀墭缁?token_utils锛堟洿绮剧‘鐨勪腑鑻辨枃鍔犳潈浼扮畻锛?
         """
         try:
             from app.services.smart_chunking.token_utils import estimate_tokens
             return estimate_tokens(text)
         except ImportError:
-            # 回退到旧的简单估算
+            # 鍥為€€鍒版棫鐨勭畝鍗曚及绠?
             chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
             other_chars = len(text) - chinese_chars
             chinese_tokens = chinese_chars / 1.5
@@ -422,15 +585,15 @@ class DocumentProcessor:
     
     @staticmethod
     def get_file_type(filename: str) -> str:
-        """获取文件类型"""
+        """鑾峰彇鏂囦欢绫诲瀷"""
         ext = os.path.splitext(filename)[1].lower().replace('.', '')
         return ext if ext else 'txt'
 
 
-# 全局实例
+# 鍏ㄥ眬瀹炰緥
 document_processor = DocumentProcessor()
 
 
 def get_document_processor(chunk_size: int = 500, chunk_overlap: int = 50) -> DocumentProcessor:
-    """获取文档处理器实例"""
+    """Create a document processor instance."""
     return DocumentProcessor(chunk_size, chunk_overlap)
