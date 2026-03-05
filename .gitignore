@@ -52,6 +52,11 @@ __pycache__/
 backend/debug_scripts/
 backend/scripts/
 scripts/
+!backend/scripts/
+!backend/scripts/line_noise_finetune/
+!backend/scripts/line_noise_finetune/**
+backend/scripts/line_noise_finetune/**/__pycache__/
+backend/scripts/line_noise_finetune/**/*.py[cod]
 
 # Build artifacts
 *.tsbuildinfo
@@ -85,3 +90,6 @@ tmp/
 backend/eval/results/**
 !backend/eval/results/
 !backend/eval/results/README.md
+
+codelab-runner
+.pytest_cache
