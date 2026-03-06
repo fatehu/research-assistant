@@ -10,7 +10,7 @@ import uuid
 import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, delete, distinct, text
@@ -34,6 +34,7 @@ from app.models.literature import (
     PaperComment,
     PaperEntity,
     PaperKnowledgeLink,
+    PaperReaderPageCache,
     PaperRating,
     PaperReadSession,
     PaperSearchHistory,
@@ -67,6 +68,15 @@ from app.schemas.literature import (
     ReaderComposePrefetchRequest,
     ReaderComposePrefetchResponse,
     ReaderComposeRequest,
+    ReaderComposeReviewAutoPatchRequest,
+    ReaderComposeReviewAutoPatchResponse,
+    ReaderComposeReviewDiagnostic,
+    ReaderComposeReviewObservationRequest,
+    ReaderComposeReviewPatchRequest,
+    ReaderComposeReviewPublishRequest,
+    ReaderComposeReviewPublishResponse,
+    ReaderComposeReviewSessionRequest,
+    ReaderComposeReviewSnapshot,
     ReaderInlineQueryRequest,
     ReaderNodeActionRequest,
     ReaderNodeActionResponse,
@@ -2953,6 +2963,146 @@ async def stream_paper_pdf(
     )
 
 
+@router.get("/reader/figure-assets/{paper_id}/{page}/{asset_id}")
+async def stream_reader_figure_asset(
+    paper_id: int,
+    page: int,
+    asset_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """按需返回已缓存的 figure 图片资产（文件 URL，不使用 base64）。"""
+    # TODO(security): 当前路由为前端 <img src> 兼容而临时放开鉴权。
+    # 后续需收敛为：1) 短时效签名 URL（推荐）或 2) 前端 fetch(Bearer)+blob 渲染。
+    # 目的：避免“知道 URL 即可读取资源”的风险。
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    normalized_asset_id = str(asset_id or "").strip()
+    if not normalized_asset_id or not re.fullmatch(r"[0-9A-Za-z_.-]{1,96}", normalized_asset_id):
+        raise HTTPException(status_code=400, detail="asset_id 非法")
+
+    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+    base_dir = os.path.abspath(
+        os.path.join(upload_dir, "reader_figure_assets", str(int(paper.id)), f"p{int(page)}")
+    )
+
+    def _locate_candidate_file() -> tuple[Optional[str], str]:
+        if not os.path.isdir(base_dir):
+            return None, ""
+        for ext in ("jpg", "jpeg", "png", "webp"):
+            path = os.path.abspath(os.path.join(base_dir, f"{normalized_asset_id}.{ext}"))
+            if not path.startswith(base_dir + os.sep):
+                continue
+            if os.path.exists(path):
+                return path, ext
+        return None, ""
+
+    candidate_path, candidate_ext = _locate_candidate_file()
+
+    # 兼容旧缓存：如果文件尚未生成，尝试基于该页已缓存 payload + 本地 PDF 现场补抽 figure 资产。
+    if not candidate_path:
+        try:
+            cache_stmt = (
+                select(PaperReaderPageCache)
+                .where(
+                    and_(
+                        PaperReaderPageCache.paper_id == int(paper.id),
+                        PaperReaderPageCache.page == int(page),
+                        PaperReaderPageCache.source_signature.like("compose_v3|%"),
+                    )
+                )
+                .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
+                .limit(1)
+            )
+            cache_row = (await db.execute(cache_stmt)).scalar_one_or_none()
+            payload_json = dict(getattr(cache_row, "payload_json", None) or {}) if cache_row else {}
+            layouts = [
+                row
+                for row in list((payload_json.get("docmind_structure") or {}).get("layouts") or [])
+                if isinstance(row, dict) and str(row.get("type") or "").strip().lower() == "figure"
+            ]
+            pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
+            if layouts and pdf_path and os.path.exists(pdf_path):
+                compose_service = get_literature_reader_compose_service()
+                await asyncio.to_thread(
+                    compose_service._build_figure_assets_sync,  # pylint: disable=protected-access
+                    int(paper.id),
+                    int(page),
+                    str(pdf_path),
+                    payload_json,
+                    layouts,
+                )
+                candidate_path, candidate_ext = _locate_candidate_file()
+        except Exception as exc:
+            logger.warning(
+                "[Literature API] figure asset lazy-build failed "
+                f"paper={paper_id} page={page} asset_id={normalized_asset_id}: {exc}"
+            )
+
+    if not candidate_path:
+        raise HTTPException(status_code=404, detail="图片资源不存在")
+
+    media_type = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(candidate_ext, "application/octet-stream")
+
+    return FileResponse(path=candidate_path, media_type=media_type, filename=os.path.basename(candidate_path))
+
+
+@router.get("/reader/page-assets/{paper_id}/{page}")
+async def stream_reader_page_asset(
+    paper_id: int,
+    page: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """按需返回已缓存的整页 PDF render 资产（文件 URL，不使用 base64）。"""
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    compose_service = get_literature_reader_compose_service()
+    candidate_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+        paper_id=int(paper.id),
+        page=int(page),
+    )
+    if not candidate_path:
+        pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                candidate_url = await compose_service.ensure_page_render_asset(
+                    paper_id=int(paper.id),
+                    page=int(page),
+                    pdf_path=str(pdf_path),
+                )
+                if candidate_url:
+                    candidate_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+                        paper_id=int(paper.id),
+                        page=int(page),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Literature API] page render asset lazy-build failed "
+                    f"paper={paper_id} page={page}: {exc}"
+                )
+
+    if not candidate_path or not os.path.exists(candidate_path):
+        raise HTTPException(status_code=404, detail="页面渲染资源不存在")
+
+    return FileResponse(
+        path=candidate_path,
+        media_type="image/jpeg",
+        filename=os.path.basename(candidate_path),
+    )
+
+
 async def process_document_background(doc_id: int, kb_id: int, file_path: str):
     """兼容旧调用：转发到知识库文档处理任务。"""
     from app.api.knowledge import process_document_task
@@ -3534,6 +3684,285 @@ async def stream_reader_composed_page(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def create_reader_composed_review_session(
+    paper_id: int,
+    payload: ReaderComposeReviewSessionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    snapshot = await service.create_review_session(
+        db=db,
+        user_id=int(current_user.id),
+        paper=paper,
+        page=max(1, int(payload.page)),
+        selected_kb_id=payload.selected_kb_id,
+        force_refresh=bool(payload.force_refresh),
+        regenerate=bool(payload.regenerate),
+        latency_budget_ms=payload.latency_budget_ms,
+        quality_target=payload.quality_target,
+        max_iterations=payload.max_iterations,
+        style_intent=payload.style_intent,
+        theme_mode=payload.theme_mode,
+        detail_level=payload.detail_level,
+        compare_mode=payload.compare_mode,
+        citation_tldr=payload.citation_tldr,
+        snapshot_label=payload.snapshot_label,
+    )
+    return snapshot
+
+
+@router.get(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def get_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    snapshot_id: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    snapshot = await service.get_review_snapshot(
+        session_id=str(session_id),
+        snapshot_id=snapshot_id,
+    )
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+def _parse_review_observation_diagnostics_json(raw: Optional[str]) -> List[Dict[str, Any]]:
+    token = str(raw or "").strip()
+    if not token:
+        return []
+    try:
+        parsed = json.loads(token)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="diagnostics_json 不是合法 JSON") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=422, detail="diagnostics_json 必须是数组")
+    normalized: List[Dict[str, Any]] = []
+    for row in parsed:
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=422, detail="diagnostics_json 只能包含对象")
+        normalized.append(ReaderComposeReviewDiagnostic.model_validate(row).model_dump())
+    return normalized
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/patch",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def patch_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewPatchRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.apply_review_patch(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            ui_ops=[row for row in list(payload.ui_ops or []) if isinstance(row, dict)],
+            decision_log_append=[str(item).strip() for item in list(payload.decision_log_append or []) if str(item).strip()],
+            omission_decisions=[row.model_dump() for row in list(payload.omission_decisions or [])] if payload.omission_decisions is not None else None,
+            scheme_choice=payload.scheme_choice.model_dump() if payload.scheme_choice is not None else None,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def observe_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewObservationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.record_review_observation(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            render_image_url=payload.render_image_url,
+            render_image_path=None,
+            render_image_media_type=None,
+            diagnostics=[row.model_dump() for row in list(payload.diagnostics or [])],
+            note=payload.note,
+            source=payload.source,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation-image",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def upload_reader_composed_review_observation_image(
+    paper_id: int,
+    session_id: str,
+    image: UploadFile = File(...),
+    snapshot_id: Optional[str] = Form(default=None),
+    diagnostics_json: Optional[str] = Form(default=None),
+    note: Optional[str] = Form(default=None),
+    source: Optional[str] = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        image_bytes = await image.read()
+        stored = await service.store_review_observation_image(
+            session_id=str(session_id),
+            snapshot_id=snapshot_id,
+            filename=image.filename,
+            content_type=image.content_type,
+            data=image_bytes,
+        )
+        snapshot = await service.record_review_observation(
+            session_id=str(session_id),
+            snapshot_id=str(stored.get("snapshot_id") or snapshot_id or ""),
+            render_image_url=str(stored.get("render_image_url") or ""),
+            render_image_path=str(stored.get("file_path") or ""),
+            render_image_media_type=str(stored.get("media_type") or ""),
+            diagnostics=_parse_review_observation_diagnostics_json(diagnostics_json),
+            note=note,
+            source=source or "uploaded_render_image",
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    finally:
+        await image.close()
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.get(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation-image/{snapshot_id}",
+)
+async def stream_reader_composed_review_observation_image(
+    paper_id: int,
+    session_id: str,
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    # TODO(security): 当前路由为前端 <img src> 与多模态 URL 兼容而临时放开鉴权。
+    # 后续应切换为短时效签名 URL 或前端 fetch(Bearer)+blob 渲染。
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    service = get_literature_reader_compose_service()
+    resolved = await service.resolve_review_observation_image(
+        session_id=str(session_id),
+        snapshot_id=str(snapshot_id),
+    )
+    if not isinstance(resolved, dict):
+        raise HTTPException(status_code=404, detail="review observation image not found")
+    if int(resolved.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review observation image not found")
+    return FileResponse(
+        path=str(resolved.get("file_path") or ""),
+        media_type=str(resolved.get("media_type") or "application/octet-stream"),
+        filename=os.path.basename(str(resolved.get("file_path") or "")),
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/auto-patch",
+    response_model=ReaderComposeReviewAutoPatchResponse,
+)
+async def auto_patch_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewAutoPatchRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.auto_patch_review_snapshot(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            user_id=int(current_user.id),
+            user_intent=payload.user_intent,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    snapshot = dict(result.get("snapshot") or {})
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return result
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/publish",
+    response_model=ReaderComposeReviewPublishResponse,
+)
+async def publish_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewPublishRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.publish_review_snapshot(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(result.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return result
 
 
 @router.post(

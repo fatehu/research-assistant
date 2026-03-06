@@ -22,6 +22,7 @@ export const readerComponentSchemas = {
   }),
   ParagraphProse: z.object({
     text: z.string().min(1),
+    paragraphs: z.array(z.any()).optional(),
   }),
   ListBlock: z.object({
     items: stringArray,

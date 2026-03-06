@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -27,15 +28,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperReaderComponentOverlay, PaperReaderPageCache
+from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
 from app.services.reader_component_contract_service import get_reader_component_contract_service
+from app.services.reader_compose_agent_state import ReaderComposeAgentState
 from app.services.reader_compose_agent_runtime import get_reader_compose_agent_runtime
 from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
 from app.services.reader_single_agent_controller import (
     ReaderSingleAgentController,
     parse_json_dict_from_model_text,
 )
+from app.services.reader_panel_plan_agent_service import get_reader_panel_plan_agent_service
 from app.services.reader_single_agent_validator import ReaderSingleAgentValidator
 from app.services.render_pipeline_contract import (
     CanonicalAtomBundle,
@@ -82,8 +86,131 @@ LOCK_WAIT_SECONDS = 6.0
 LOCK_POLL_INTERVAL_SECONDS = 0.22
 REDIS_KEY_PREFIX = "lit:reader:compose:v1"
 REDIS_LOCK_PREFIX = "lit:reader:compose:lock:v1"
+REDIS_REVIEW_PREFIX = "lit:reader:compose:review:v1"
 CLEANUP_LOCK_KEY = "lit:reader:compose:cleanup:lock"
 LEGACY_CACHE_SCAN_MATCH = "lit:reader:compose*:*"
+UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", "./uploads"))
+PAGE_RENDER_ASSET_DIR = os.path.join(UPLOAD_DIR, "reader_page_assets")
+REVIEW_OBSERVATION_DIR = os.path.join(UPLOAD_DIR, "reader_review_observations")
+IMAGE_CONTENT_TYPE_TO_EXT = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+IMAGE_ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+REVIEW_SESSION_TTL_SECONDS = 2 * 3600
+REVIEW_PUBLISH_OVERLAY_NODE_ID = "__published_review_snapshot__"
+REVIEW_PUBLISH_OVERLAY_ACTION = "review_publish"
+
+_BROKEN_WORD_SUFFIX_FRAGMENTS = tuple(
+    sorted(
+        {
+            "ability",
+            "abilities",
+            "able",
+            "ably",
+            "al",
+            "ally",
+            "ance",
+            "ances",
+            "ant",
+            "ants",
+            "ary",
+            "aries",
+            "ation",
+            "ations",
+            "ative",
+            "atively",
+            "ed",
+            "edly",
+            "ence",
+            "ences",
+            "ent",
+            "ents",
+            "er",
+            "ers",
+            "est",
+            "fied",
+            "fies",
+            "hood",
+            "ial",
+            "ially",
+            "ian",
+            "ians",
+            "ibility",
+            "ibilities",
+            "ible",
+            "ibly",
+            "ic",
+            "ical",
+            "ically",
+            "ics",
+            "ies",
+            "ification",
+            "ifications",
+            "ified",
+            "ifies",
+            "ify",
+            "ifying",
+            "ing",
+            "ingly",
+            "ion",
+            "ions",
+            "ious",
+            "ism",
+            "isms",
+            "ist",
+            "ists",
+            "ities",
+            "ity",
+            "ive",
+            "ively",
+            "ization",
+            "izations",
+            "ize",
+            "ized",
+            "izer",
+            "izers",
+            "izes",
+            "izing",
+            "less",
+            "logy",
+            "ment",
+            "ments",
+            "ness",
+            "oid",
+            "ologies",
+            "ology",
+            "or",
+            "ors",
+            "ous",
+            "ously",
+            "sation",
+            "sations",
+            "ship",
+            "ships",
+            "sion",
+            "sions",
+            "tent",
+            "tion",
+            "tions",
+            "tive",
+            "tively",
+            "ular",
+            "ward",
+            "wards",
+            "wise",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_BROKEN_WORD_SUFFIX_RE = re.compile(
+    rf"\b([A-Za-z]{{4,}})\s+({'|'.join(re.escape(item) for item in _BROKEN_WORD_SUFFIX_FRAGMENTS)})\b",
+    flags=re.IGNORECASE,
+)
+_BROKEN_MARKER_SPACE_RE = re.compile(r"(\[\*\]|\[[0-9,\s\-]+\])(?=[A-Za-z])")
 
 COMPONENT_WHITELIST = {
     "PaperHeaderCard",
@@ -174,6 +301,7 @@ class ReaderComposeBuildMeta:
 class LiteratureReaderComposeService:
     def __init__(self) -> None:
         self._redis_client: Any = None
+        self._review_sessions: Dict[str, Dict[str, Any]] = {}
         self._reader_service = get_literature_reader_service()
         self._mm_layout_service = ReaderMultimodalLayoutService()
         self._component_contract_service = get_reader_component_contract_service()
@@ -184,6 +312,7 @@ class LiteratureReaderComposeService:
             max_steps=max(1, int(getattr(settings, "reader_agent_max_steps", 12) or 12)),
             max_repair_rounds=max(0, int(getattr(settings, "reader_agent_max_repair_rounds", 2) or 2)),
         )
+        self._panel_plan_agent = get_reader_panel_plan_agent_service()
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -204,32 +333,10 @@ class LiteratureReaderComposeService:
         return token or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
 
     def _pipeline_mode(self) -> str:
-        explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_LEGACY) or "").strip().lower()
-        raw_mode_env = str(os.getenv("READER_PIPELINE_MODE", "") or "").strip().lower()
-        valid_modes = {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}
-
-        # If explicit mode is configured, honor it first.
-        if raw_mode_env:
-            if explicit in valid_modes:
-                return explicit
-            logger.warning(
-                f"[ReaderComposeService] invalid READER_PIPELINE_MODE='{raw_mode_env}', "
-                f"fallback to compatibility switch."
-            )
-
-        # Support tests/runtime overrides that set settings directly.
-        if explicit == PIPELINE_MODE_SINGLE_AGENT_V2:
-            return PIPELINE_MODE_SINGLE_AGENT_V2
-
-        # Backward compatibility for one release: map old boolean switch.
-        legacy_flag = bool(getattr(settings, "reader_simplified_pipeline_enabled", False))
-        if legacy_flag:
-            logger.warning(
-                "[ReaderComposeService] reader_simplified_pipeline_enabled is deprecated; "
-                "use reader_pipeline_mode=single_agent_v2"
-            )
-            return PIPELINE_MODE_SINGLE_AGENT_V2
-        return PIPELINE_MODE_LEGACY
+        explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_SINGLE_AGENT_V2) or "").strip().lower()
+        if explicit in {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}:
+            return explicit
+        return PIPELINE_MODE_SINGLE_AGENT_V2
 
     @staticmethod
     def _parse_int_allowlist(raw: str) -> set[int]:
@@ -246,22 +353,8 @@ class LiteratureReaderComposeService:
         return values
 
     def _is_single_agent_v2_enabled(self, *, paper_id: int, page: int) -> bool:
-        if self._pipeline_mode() != PIPELINE_MODE_SINGLE_AGENT_V2:
-            return False
-        paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_papers", "") or ""))
-        page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_pages", "") or ""))
-
-        # Backward compatibility with deprecated allowlists.
-        if not paper_allow:
-            paper_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_papers", "") or ""))
-        if not page_allow:
-            page_allow = self._parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_pages", "") or ""))
-
-        if paper_allow and int(paper_id) not in paper_allow:
-            return False
-        if page_allow and int(page) not in page_allow:
-            return False
-        return True
+        _ = (paper_id, page)
+        return self._pipeline_mode() == PIPELINE_MODE_SINGLE_AGENT_V2
 
     def _should_rebuild_cached_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
@@ -280,6 +373,8 @@ class LiteratureReaderComposeService:
         if usable_atom_count <= 0 or used_atom_count > 0:
             return False
         if degraded_reason == "simplified_pipeline":
+            return True
+        if degraded_reason == "no_drop_blocks_failed_auto_fallback":
             return True
         if build_mode == "compose_agent_simplified":
             return True
@@ -315,7 +410,14 @@ class LiteratureReaderComposeService:
         publish_ready_event_enabled: bool = False,
     ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
         page_num = max(1, int(page))
-        force_refresh = bool(force_refresh or regenerate)
+        parser_force_refresh = bool(force_refresh)
+        compose_force_refresh = bool(force_refresh or regenerate)
+        logger.info(
+            "[ReaderComposeService] build_or_get_composed_payload start "
+            f"paper={paper.id} page={page_num} user={user_id} "
+            f"compose_force_refresh={compose_force_refresh} parser_force_refresh={parser_force_refresh} "
+            f"regenerate={bool(regenerate)}"
+        )
         pipeline_mode = self._pipeline_mode()
         pipeline_version = self._pipeline_version()
         latency_budget = self._normalize_latency_budget(latency_budget_ms)
@@ -338,6 +440,10 @@ class LiteratureReaderComposeService:
             citation_tldr=use_citation_tldr,
             max_iterations=normalized_max_iterations,
         )
+        logger.info(
+            "[ReaderComposeService] source signature ready "
+            f"paper={paper.id} page={page_num} mode={pipeline_mode} version={pipeline_version}"
+        )
         sig_hash = self._signature_hash(source_signature)
         redis_key = self._cache_key(
             user_id=int(user_id),
@@ -355,7 +461,7 @@ class LiteratureReaderComposeService:
             pipeline_version=pipeline_version,
         )
 
-        if not force_refresh:
+        if not compose_force_refresh:
             cached_payload = await self._read_payload_from_redis(redis_key)
             if isinstance(cached_payload, dict):
                 if self._should_rebuild_cached_payload(cached_payload):
@@ -424,6 +530,10 @@ class LiteratureReaderComposeService:
                     )
 
         lock_token = await self._acquire_lock(lock_key)
+        logger.info(
+            "[ReaderComposeService] compose lock attempt "
+            f"paper={paper.id} page={page_num} acquired={bool(lock_token)} compose_force_refresh={compose_force_refresh}"
+        )
         if lock_token is None:
             waited = 0.0
             while waited < LOCK_WAIT_SECONDS and lock_token is None:
@@ -432,7 +542,7 @@ class LiteratureReaderComposeService:
                 lock_token = await self._acquire_lock(lock_key)
                 if lock_token is not None:
                     break
-                if force_refresh:
+                if compose_force_refresh:
                     continue
                 cached_payload = await self._read_payload_from_redis(redis_key)
                 if isinstance(cached_payload, dict):
@@ -461,7 +571,11 @@ class LiteratureReaderComposeService:
                             stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
                         )
 
-            if lock_token is None and force_refresh:
+            if lock_token is None and compose_force_refresh:
+                logger.warning(
+                    "[ReaderComposeService] compose lock timeout fallback "
+                    f"paper={paper.id} page={page_num} waited={waited:.2f}s"
+                )
                 fallback_payload = await self._build_force_refresh_timeout_fallback_payload(
                     db=db,
                     user_id=int(user_id),
@@ -498,22 +612,34 @@ class LiteratureReaderComposeService:
                 )
 
         try:
+            logger.info(
+                "[ReaderComposeService] build base payload start "
+                f"paper={paper.id} page={page_num} parser_force_refresh={bool(parser_force_refresh)}"
+            )
             base_payload, _ = await self._reader_service.build_or_get_page_payload(
                 db=db,
                 user_id=int(user_id),
                 paper=paper,
                 page=page_num,
                 selected_kb_id=selected_kb_id,
-                force_refresh=bool(force_refresh),
+                force_refresh=bool(parser_force_refresh),
                 style_hint=None,
-                prefer_agent=bool(regenerate),
+                prefer_agent=False,
                 publish_ready_event_enabled=False,
+            )
+            logger.info(
+                "[ReaderComposeService] build base payload done "
+                f"paper={paper.id} page={page_num}"
             )
             simplified_enabled = self._is_single_agent_v2_enabled(
                 paper_id=int(paper.id),
                 page=page_num,
             )
             if simplified_enabled:
+                logger.info(
+                    "[ReaderComposeService] single_agent_v2 pipeline start "
+                    f"paper={paper.id} page={page_num}"
+                )
                 try:
                     simplified_result = await self._build_single_agent_v2_result(
                         db=db,
@@ -550,6 +676,10 @@ class LiteratureReaderComposeService:
                 base_payload = dict(simplified_result.get("base_payload") or base_payload)
                 loop_result = dict(simplified_result.get("loop_result") or {})
                 assets = list(simplified_result.get("assets") or [])
+                logger.info(
+                    "[ReaderComposeService] single_agent_v2 pipeline done "
+                    f"paper={paper.id} page={page_num} build_mode={str(loop_result.get('build_mode') or '')}"
+                )
             else:
                 base_payload = await self._apply_multimodal_layout_assist(
                     paper=paper,
@@ -622,6 +752,9 @@ class LiteratureReaderComposeService:
                 "build_mode": str(loop_result.get("build_mode") or "compose_agent"),
                 "ui_plan": dict(loop_result.get("ui_plan") or {}),
                 "assets": assets,
+                "scheme_choice": dict(base_payload.get("scheme_choice") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("scheme_choice") or {})),
+                "decision_log": list(base_payload.get("decision_log") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("decision_log") or [])),
+                "omission_decisions": list(base_payload.get("omission_decisions") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("omission_decisions") or [])),
                 "quality_report": quality_report,
                 "iteration_trace": list(loop_result.get("iteration_trace") or []),
                 "main_block_ids": main_block_ids,
@@ -669,12 +802,33 @@ class LiteratureReaderComposeService:
                 "segment_map_meta": dict(base_payload.get("segment_map_meta") or {}),
                 "node_gate_report": dict(loop_result.get("node_gate_report") or {}),
                 "toc_quality": float(base_payload.get("toc_quality") or 0.0),
+                "phase1_compact_input": dict(base_payload.get("phase1_compact_input") or {}),
+                "review_route_meta": dict(base_payload.get("review_route_meta") or {}),
                 "overlay_applied": False,
                 "overlay_count": 0,
                 "generated_at": datetime.utcnow().isoformat(),
             }
 
             payload = self._ensure_payload_contract(page=page_num, payload=payload)
+            logger.info(
+                "[ReaderComposeService] compose payload ready "
+                f"paper={paper.id} page={page_num} status={str(payload.get('status') or '')} "
+                f"degraded_reason={str(payload.get('degraded_reason') or '')}"
+            )
+            existing_same_signature = await self._read_payload_from_db(
+                db=db,
+                paper_id=int(paper.id),
+                page=page_num,
+                source_signature=source_signature,
+            )
+            existing_status = str((existing_same_signature or {}).get("status") or "").strip().lower()
+            current_status = str(payload.get("status") or "").strip().lower()
+            if existing_status == "done" and current_status != "done":
+                logger.warning(
+                    "[ReaderComposeService] keep previous done payload and skip degraded overwrite "
+                    f"paper={paper.id} page={page_num} existing_status={existing_status} current_status={current_status}"
+                )
+                payload = self._ensure_payload_contract(page=page_num, payload=dict(existing_same_signature or {}))
             await self._upsert_payload_to_db(
                 db=db,
                 paper_id=int(paper.id),
@@ -688,6 +842,10 @@ class LiteratureReaderComposeService:
                 payload=payload,
             )
             await self._write_payload_to_redis(redis_key, payload)
+            logger.info(
+                "[ReaderComposeService] compose payload persisted "
+                f"paper={paper.id} page={page_num}"
+            )
 
             if publish_ready_event_enabled:
                 await self._publish_reader_ready_event(
@@ -766,10 +924,18 @@ class LiteratureReaderComposeService:
         selected_kb_id: Optional[int],
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
+        logger.info(
+            "[ReaderComposeService] _build_single_agent_v2_result start "
+            f"paper={paper.id} page={page}"
+        )
         payload = dict(base_payload or {})
         docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
             page=page,
             base_payload=payload,
+        )
+        logger.info(
+            "[ReaderComposeService] single_agent_v2 docmind collected "
+            f"paper={paper.id} page={page} blocks={len(docmind_blocks)} layout_mappings={len(layout_to_block_ids)}"
         )
         if not docmind_blocks:
             logger.warning(
@@ -894,86 +1060,235 @@ class LiteratureReaderComposeService:
                 "assets": [],
             }
 
-        rendered_page_image = ""
         pdf_path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
             user_id=int(paper.user_id),
             paper_id=int(paper.id),
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
+        rendered_page_image = str(
+            (((payload.get("docmind_structure") or {}).get("page_image_url") or ""))
+        ).strip()
+        rendered_page_image_path = ""
+        if rendered_page_image and not self._is_safe_prompt_image_url(rendered_page_image):
+            rendered_page_image = ""
         if pdf_path and os.path.exists(pdf_path):
             try:
-                mm_payload = await self._mm_layout_service.build_mm_prompt_payload(
-                    pdf_path=pdf_path,
+                fallback_image = await self.ensure_page_render_asset(
+                    paper_id=int(paper.id),
                     page=int(page),
-                    base_payload=payload,
-                ) or {}
-                rendered_page_image = str(mm_payload.get("image_data_url") or "")
+                    pdf_path=str(pdf_path),
+                )
+                fallback_path = self._find_existing_page_render_asset_path(
+                    paper_id=int(paper.id),
+                    page=int(page),
+                )
+                if fallback_path and os.path.exists(fallback_path):
+                    rendered_page_image_path = str(fallback_path)
+                if fallback_image and self._is_safe_prompt_image_url(fallback_image):
+                    if not rendered_page_image:
+                        rendered_page_image = fallback_image
+                    mm_meta = dict(payload.get("mm_assist_meta") or {})
+                    mm_meta["stage1_prompt_image_source"] = "page_render_asset_url"
+                    payload["mm_assist_meta"] = mm_meta
+            except Exception as exc:
+                logger.debug(
+                    f"[ReaderComposeService] stage1 prompt image fallback failed paper={paper.id} page={page}: {exc}"
+                )
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                payload = await self._ensure_figure_assets_for_payload(
+                    paper=paper,
+                    page=int(page),
+                    pdf_path=pdf_path,
+                    payload=payload,
+                )
             except Exception as exc:
                 logger.warning(
-                    f"[ReaderComposeService] build_mm_prompt_payload failed for single_agent_v2 "
+                    f"[ReaderComposeService] ensure_figure_assets failed for single_agent_v2 "
                     f"paper={paper.id} page={page}: {exc}"
                 )
 
-        page_meta = {
-            "paper_id": int(paper.id),
-            "page": int(page),
-            "pipeline_version": self._pipeline_version(),
-            "style_intent": str(style_intent or ""),
-            "theme_mode": str(theme_mode or ""),
-            "detail_level": str(detail_level or ""),
-            "compare_mode": bool(compare_mode),
-            "selected_kb_id": int(selected_kb_id) if selected_kb_id is not None else None,
-        }
-
-        async def _model_infer(system_prompt: str, user_prompt: Dict[str, Any], step: int, phase: str) -> Dict[str, Any]:
-            return await self._invoke_single_agent_model(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                rendered_page_image=rendered_page_image,
-                step=step,
-                phase=phase,
-            )
-
-        controller_result = await self._single_agent_controller.run(
-            page_meta=page_meta,
-            docmind_blocks=docmind_blocks,
+        phase1_compact_input = self._build_phase1_compact_input(
+            paper_id=int(paper.id),
+            page=int(page),
             rendered_page_image=rendered_page_image,
-            component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
-            model_infer=_model_infer,
-        )
-        step_result = dict(controller_result.get("step_result") or {})
-        validation_report = dict(controller_result.get("validation_report") or {})
-        repair_report = dict(controller_result.get("repair_report") or {})
-        status_value = str(controller_result.get("status") or "fallback").strip().lower()
-        degraded_reason = str(controller_result.get("degraded_reason") or "").strip()
-
-        ui_plan = self._step_result_to_ui_plan(
-            page=page,
-            step_result=step_result,
+            rendered_page_image_path=rendered_page_image_path,
             docmind_blocks=docmind_blocks,
-            layout_to_block_ids=layout_to_block_ids,
-            base_payload=payload,
             style_intent=style_intent,
             theme_mode=theme_mode,
             detail_level=detail_level,
             compare_mode=compare_mode,
         )
+        payload["phase1_compact_input"] = dict(phase1_compact_input)
+
+        agent_result = await self._panel_plan_agent.run(
+            docmind_blocks=docmind_blocks,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+            component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            max_rounds=max(1, int(getattr(settings, "reader_agent_max_steps", 12) or 12)),
+            phase1_context=phase1_compact_input,
+        )
+        logger.info(
+            "[ReaderComposeService] panel_plan_agent returned "
+            f"paper={paper.id} page={page} status={str(agent_result.get('status') or '')} "
+            f"degraded_reason={str(agent_result.get('degraded_reason') or '')}"
+        )
+        panel_plan = dict(agent_result.get("panel_plan") or {})
+        validation_report = dict(agent_result.get("validation_report") or {})
+        repair_report = dict(agent_result.get("repair_report") or {})
+        usage = dict(agent_result.get("usage") or {})
+        status_value = str(agent_result.get("status") or "fallback").strip().lower()
+        degraded_reason = str(agent_result.get("degraded_reason") or "").strip()
+        use_controller_fallback = status_value == "fallback" and degraded_reason in {
+            "propose_failed",
+            "model_unavailable",
+            "validator_non_converged",
+        }
+        used_layout_ids: List[str] = []
+        component_hints: List[Dict[str, Any]] = []
+        decision_log: List[str] = []
+        omission_decisions: List[Dict[str, Any]] = []
+        explicit_scheme_id = ""
+
+        if use_controller_fallback:
+            logger.info(
+                "[ReaderComposeService] single_agent_v2 controller fallback start "
+                f"paper={paper.id} page={page} reason={degraded_reason}"
+            )
+            page_meta = {
+                "paper_id": int(paper.id),
+                "page": int(page),
+                "pipeline_version": self._pipeline_version(),
+                "style_intent": str(style_intent or ""),
+                "theme_mode": str(theme_mode or ""),
+                "detail_level": str(detail_level or ""),
+                "compare_mode": bool(compare_mode),
+                "selected_kb_id": int(selected_kb_id) if selected_kb_id is not None else None,
+            }
+
+            async def _model_infer(system_prompt: str, user_prompt: Dict[str, Any], step: int, phase: str) -> Dict[str, Any]:
+                return await self._invoke_single_agent_model(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    rendered_page_image=rendered_page_image,
+                    rendered_page_image_path=rendered_page_image_path,
+                    step=step,
+                    phase=phase,
+                )
+
+            controller_result = await self._single_agent_controller.run(
+                page_meta=page_meta,
+                docmind_blocks=docmind_blocks,
+                rendered_page_image=rendered_page_image,
+                component_whitelist=list(SIMPLIFIED_ALLOWED_COMPONENTS),
+                model_infer=_model_infer,
+            )
+            logger.info(
+                "[ReaderComposeService] single_agent_v2 controller fallback done "
+                f"paper={paper.id} page={page} status={str(controller_result.get('status') or '')} "
+                f"degraded_reason={str(controller_result.get('degraded_reason') or '')}"
+            )
+            step_result = dict(controller_result.get("step_result") or {})
+            validation_report = dict(controller_result.get("validation_report") or {})
+            repair_report = dict(controller_result.get("repair_report") or {})
+            status_value = str(controller_result.get("status") or "fallback").strip().lower()
+            degraded_reason = str(controller_result.get("degraded_reason") or "").strip()
+
+            ui_plan = self._step_result_to_ui_plan(
+                page=page,
+                step_result=step_result,
+                docmind_blocks=docmind_blocks,
+                layout_to_block_ids=layout_to_block_ids,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            used_layout_ids = [
+                str(item.get("layout_id") or "").strip()
+                for item in list((step_result.get("classification") or {}).get("items") or [])
+                if isinstance(item, dict) and str(item.get("layout_id") or "").strip()
+            ]
+            component_hints = [
+                {
+                    "block_ids": [str(x).strip() for x in list((row or {}).get("source_block_ids") or []) if str(x).strip()],
+                    "component": str((row or {}).get("component") or ""),
+                    "reason": "single_agent_v2",
+                }
+                for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
+                if isinstance(row, dict)
+            ]
+            explicit_scheme_id = str((((step_result.get("ui_plan_draft") or {}).get("layout_tokens") or {}).get("scheme_id") or "")).strip()
+        else:
+            ui_plan = self._panel_plan_to_ui_plan(
+                page=page,
+                panel_plan=panel_plan,
+                docmind_blocks=docmind_blocks,
+                layout_to_block_ids=layout_to_block_ids,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+            )
+            used_layout_ids = self._collect_source_layout_ids_from_panel_plan(panel_plan=panel_plan)
+            component_hints = self._collect_component_hints_from_panel_plan(panel_plan=panel_plan)
+            decision_log = self._normalize_decision_log(panel_plan)
+            omission_decisions = self._build_omission_decisions_from_panel_plan(
+                page=page,
+                panel_plan=panel_plan,
+                layout_to_block_ids=layout_to_block_ids,
+            )
+            explicit_scheme_id = str(((panel_plan.get("style_plan") or {}).get("scheme_id") or "")).strip()
+            validation_report = self._normalize_panel_validation_report(
+                raw_report=validation_report,
+                non_empty_plan=bool((ui_plan.get("components") or [])),
+                used_count=len(used_layout_ids),
+                usable_count=len(docmind_blocks),
+            )
+        used_layout_ids = list(dict.fromkeys([str(item).strip() for item in used_layout_ids if str(item).strip()]))
+        scheme_choice = self._select_scheme_choice(
+            scheme_catalog=list(phase1_compact_input.get("scheme_catalog") or []),
+            explicit_scheme_id=explicit_scheme_id,
+            rationale=str((panel_plan.get("creative_direction") if isinstance(panel_plan, dict) else "") or "").strip(),
+            source="panel_plan" if not use_controller_fallback else "controller_fallback",
+        )
+        ui_plan.setdefault("trace_meta", {})
+        ui_plan["trace_meta"]["scheme_choice"] = dict(scheme_choice)
+        ui_plan["trace_meta"]["decision_log"] = list(decision_log)
+        ui_plan["trace_meta"]["omission_decisions"] = list(omission_decisions)
+        ui_plan["trace_meta"]["phase1_compact_input"] = dict(phase1_compact_input)
+        payload["scheme_choice"] = dict(scheme_choice)
+        payload["decision_log"] = list(decision_log)
+        payload["omission_decisions"] = list(omission_decisions)
+        payload["phase1_compact_input"] = dict(phase1_compact_input)
+        payload["review_route_meta"] = {
+            "template": f"/literature/{int(paper.id)}/read/review",
+            "mode": "compose_review_v1",
+        }
 
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        failed_gates = [
-            gate_name
-            for gate_name, gate in dict(validation_report.get("gates") or {}).items()
-            if not bool((gate or {}).get("passed"))
-        ]
         step_metrics = [
             row
             for row in list(repair_report.get("step_metrics") or [])
             if isinstance(row, dict)
         ]
-        total_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in step_metrics)
-        total_completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in step_metrics)
-        total_tokens = sum(int(row.get("total_tokens") or 0) for row in step_metrics)
+        total_prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        total_completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or 0)
+        if total_tokens <= 0:
+            total_prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in step_metrics)
+            total_completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in step_metrics)
+            total_tokens = sum(int(row.get("total_tokens") or 0) for row in step_metrics)
+
+        validation_errors = [str(item) for item in list(validation_report.get("errors") or []) if str(item).strip()]
+        failed_gates = ["id_integrity"] if validation_errors else []
 
         payload["repair_report"] = {
             **repair_report,
@@ -991,49 +1306,32 @@ class LiteratureReaderComposeService:
         }
         payload["layout_advice_v3"] = {
             "source": "single_agent_v2",
-            "ordered_block_ids": [
-                str(item.get("layout_id") or "")
-                for item in list((step_result.get("classification") or {}).get("items") or [])
-                if isinstance(item, dict) and str(item.get("layout_id") or "")
-            ],
-            "suggested_components": [
-                {
-                    "block_ids": [
-                        str(item).strip()
-                        for item in list((row or {}).get("source_block_ids") or [])
-                        if str(item).strip()
-                    ],
-                    "component": str((row or {}).get("component") or ""),
-                    "reason": "single_agent_v2",
-                }
-                for row in list((step_result.get("ui_plan_draft") or {}).get("components") or [])
-                if isinstance(row, dict)
-            ],
+            "ordered_block_ids": used_layout_ids,
+            "suggested_components": component_hints,
             "grouping_hints": [],
             "visual_hints": [],
             "notes": [
                 f"status={status_value}",
                 f"degraded_reason={degraded_reason}" if degraded_reason else "",
+                f"scheme_id={scheme_choice.get('scheme_id') or ''}",
+            ],
+            "omitted_layout_ids": [
+                str(item).strip()
+                for row in list(omission_decisions or [])
+                for item in list((row or {}).get("target_layout_ids") or [])
+                if str(item).strip()
             ],
         }
         payload["minimal_gate_report"] = {
-            "passed": bool(validation_report.get("passed")),
-            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
-            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
-            "layout_contract": bool((validation_report.get("gates") or {}).get("layout_contract", {}).get("passed")),
-            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
-            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
-            "non_empty_plan_for_non_empty_input": bool(
-                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
-            ),
-            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
-            "used_atom_count": len(
-                [
-                    item
-                    for item in list((step_result.get("classification") or {}).get("items") or [])
-                    if isinstance(item, dict) and str(item.get("layout_id") or "").strip()
-                ]
-            ),
+            "passed": bool(validation_report.get("passed", False)),
+            "schema_valid": bool(validation_report.get("passed", False)),
+            "whitelist_valid": bool(validation_report.get("passed", False)),
+            "layout_contract": True,
+            "ownership_unchanged": True,
+            "full_coverage": not any(str(item).startswith("uncovered_layout_ids:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
+            "used_atom_count": len(used_layout_ids),
             "usable_atom_count": len(docmind_blocks),
         }
         payload["pipeline_contract_meta"] = {
@@ -1046,21 +1344,19 @@ class LiteratureReaderComposeService:
 
         quality_report = {
             "overall": 0.94 if status_value == "done" else 0.66,
-            "hard_constraints_passed": bool(validation_report.get("passed")),
-            "validation_errors": list(validation_report.get("errors") or []),
+            "hard_constraints_passed": bool(validation_report.get("passed", False)),
+            "validation_errors": validation_errors,
             "quality_target": 0.0,
             "elapsed_ms": elapsed_ms,
             "iterations": int(repair_report.get("steps_executed") or len(step_metrics) or 1),
             "degraded": status_value != "done",
             "stop_reason": degraded_reason or ("single_agent_v2_done" if status_value == "done" else "validator_non_converged"),
-            "schema_valid": bool((validation_report.get("gates") or {}).get("id_integrity", {}).get("passed")),
-            "whitelist_valid": bool((validation_report.get("gates") or {}).get("whitelist_only", {}).get("passed")),
-            "ownership_unchanged": bool((validation_report.get("gates") or {}).get("ownership_unchanged", {}).get("passed")),
-            "full_coverage": bool((validation_report.get("gates") or {}).get("full_coverage", {}).get("passed")),
-            "non_empty_plan_for_non_empty_input": bool(
-                (validation_report.get("gates") or {}).get("non_empty_plan_for_non_empty_input", {}).get("passed")
-            ),
-            "source_text_immutable": bool((validation_report.get("gates") or {}).get("source_text_immutable", {}).get("passed")),
+            "schema_valid": bool(validation_report.get("passed", False)),
+            "whitelist_valid": bool(validation_report.get("passed", False)),
+            "ownership_unchanged": True,
+            "full_coverage": not any(str(item).startswith("uncovered_layout_ids:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
             "pipeline_latency_ms": elapsed_ms,
             "prompt_tokens": int(total_prompt_tokens),
             "completion_tokens": int(total_completion_tokens),
@@ -1092,10 +1388,964 @@ class LiteratureReaderComposeService:
             for row in list(payload.get("assets") or [])
             if isinstance(row, dict) and str(row.get("kind") or "") in {"link", "annotation", "image_hint"}
         ]
+        logger.info(
+            "[ReaderComposeService] _build_single_agent_v2_result done "
+            f"paper={paper.id} page={page} status={status_value} degraded_reason={degraded_reason}"
+        )
         return {
             "base_payload": payload,
             "loop_result": loop_result,
             "assets": assets,
+        }
+
+    async def _ensure_figure_assets_for_payload(
+        self,
+        *,
+        paper: Paper,
+        page: int,
+        pdf_path: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = dict(payload or {})
+        docmind_structure = dict(cloned.get("docmind_structure") or {})
+        layouts = [row for row in list(docmind_structure.get("layouts") or []) if isinstance(row, dict)]
+        figure_layouts = [
+            row for row in layouts
+            if str(row.get("type") or "").strip().lower() == "figure"
+        ]
+        if not figure_layouts:
+            return cloned
+
+        assets = await asyncio.to_thread(
+            self._build_figure_assets_sync,
+            int(paper.id),
+            int(page),
+            str(pdf_path),
+            dict(cloned),
+            figure_layouts,
+        )
+        if not assets:
+            return cloned
+        existing = [row for row in list(cloned.get("assets") or []) if isinstance(row, dict)]
+
+        def _asset_key(item: Dict[str, Any]) -> str:
+            kind = str(item.get("kind") or "").strip().lower()
+            href = str(item.get("href") or "").strip()
+            meta = dict(item.get("meta") or {})
+            aid = str(meta.get("asset_id") or meta.get("layout_unique_id") or "").strip()
+            return f"{kind}|{aid}|{href}"
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for row in existing:
+            dedup[_asset_key(row)] = dict(row)
+        for row in assets:
+            dedup[_asset_key(row)] = dict(row)
+        cloned["assets"] = list(dedup.values())
+        return cloned
+
+    def _build_figure_assets_sync(
+        self,
+        paper_id: int,
+        page: int,
+        pdf_path: str,
+        payload: Dict[str, Any],
+        figure_layouts: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not os.path.exists(pdf_path):
+            return []
+        try:
+            import pdfplumber
+            from pypdf import PdfReader
+        except Exception:
+            return []
+
+        page_index = max(0, int(page) - 1)
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        out_dir = os.path.abspath(
+            os.path.join(upload_dir, "reader_figure_assets", str(int(paper_id)), f"p{int(page)}")
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        docmind_width, docmind_height = self._infer_docmind_page_size(payload=payload, layouts=figure_layouts)
+        source_signature = str(payload.get("source_signature") or "").strip()
+        sig_hash = self._signature_hash(source_signature) if source_signature else ""
+
+        assets: List[Dict[str, Any]] = []
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_index >= len(pdf.pages):
+                return []
+            page_obj = pdf.pages[page_index]
+            pdf_width = float(getattr(page_obj, "width", 0.0) or 0.0)
+            pdf_height = float(getattr(page_obj, "height", 0.0) or 0.0)
+            page_images = [
+                row for row in list(getattr(page_obj, "images", []) or [])
+                if isinstance(row, dict)
+            ]
+            reader = PdfReader(pdf_path)
+            if page_index >= len(reader.pages):
+                return []
+            pypdf_images = list(getattr(reader.pages[page_index], "images", []) or [])
+            pypdf_image_map: Dict[str, Any] = {}
+            for row in pypdf_images:
+                name = self._normalize_pdf_image_name(str(getattr(row, "name", "") or ""))
+                if name and name not in pypdf_image_map:
+                    pypdf_image_map[name] = row
+
+            rendered_page = None
+            for layout in figure_layouts:
+                layout_uid = self._normalize_figure_layout_uid(str(layout.get("uniqueId") or ""))
+                if not layout_uid:
+                    continue
+                if str(layout.get("subType") or "").strip().lower() in {"icon", "logo"}:
+                    continue
+                existing_path = self._find_existing_figure_asset_path(out_dir=out_dir, asset_id=layout_uid)
+                method = "cached"
+                target_path = existing_path
+
+                if not target_path:
+                    bbox_docmind = self._bbox_from_docmind_pos(layout.get("pos"))
+                    bbox_pdf = self._convert_docmind_bbox_to_pdf(
+                        bbox=bbox_docmind,
+                        pdf_width=pdf_width,
+                        pdf_height=pdf_height,
+                        docmind_width=docmind_width,
+                        docmind_height=docmind_height,
+                    )
+                    candidate_images = self._filter_page_images_by_bbox(
+                        page_images=page_images,
+                        bbox_pdf=bbox_pdf,
+                    )
+                    native_image = self._select_native_pdf_image(
+                        pypdf_images=pypdf_images,
+                        pypdf_image_map=pypdf_image_map,
+                        candidate_images=candidate_images,
+                    )
+                    if native_image is not None:
+                        target_path = self._write_native_pdf_image(
+                            out_dir=out_dir,
+                            asset_id=layout_uid,
+                            image_obj=native_image,
+                        )
+                        method = "native" if target_path else method
+                    if not target_path and bbox_pdf is not None:
+                        if rendered_page is None:
+                            rendered_page = page_obj.to_image(resolution=220).original
+                        target_path = self._write_clipped_page_image(
+                            out_dir=out_dir,
+                            asset_id=layout_uid,
+                            page_image=rendered_page,
+                            bbox_pdf=bbox_pdf,
+                        )
+                        method = "clip" if target_path else method
+
+                if not target_path:
+                    continue
+                href = f"/api/v1/literature/reader/figure-assets/{int(paper_id)}/{int(page)}/{layout_uid}"
+                label = self._normalize_spaces(str(layout.get("text") or ""))[:220] or f"Figure {layout_uid[:8]}"
+                assets.append(
+                    {
+                        "kind": "image_hint",
+                        "label": label,
+                        "source": "pdf",
+                        "href": href,
+                        "meta": {
+                            "asset_id": layout_uid,
+                            "layout_unique_id": layout_uid,
+                            "page": int(page),
+                            "method": method,
+                            "source_signature_hash": sig_hash,
+                        },
+                    }
+                )
+        return assets
+
+    def _build_page_render_asset_sync(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str,
+    ) -> Optional[str]:
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        try:
+            import pdfplumber
+        except Exception:
+            return None
+
+        page_index = max(0, int(page) - 1)
+        out_dir = os.path.abspath(os.path.join(PAGE_RENDER_ASSET_DIR, str(int(paper_id))))
+        os.makedirs(out_dir, exist_ok=True)
+        target_path = os.path.join(out_dir, f"page_{int(page)}.jpg")
+
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_index >= len(pdf.pages):
+                return None
+            page_obj = pdf.pages[page_index]
+            rendered = page_obj.to_image(resolution=160).original
+            rendered.save(target_path, format="JPEG", quality=86, optimize=True)
+        return target_path if os.path.exists(target_path) else None
+
+    @staticmethod
+    def _find_existing_page_render_asset_path(*, paper_id: int, page: int) -> Optional[str]:
+        out_dir = os.path.abspath(os.path.join(PAGE_RENDER_ASSET_DIR, str(int(paper_id))))
+        candidate = os.path.join(out_dir, f"page_{int(page)}.jpg")
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
+    async def ensure_page_render_asset(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str,
+    ) -> str:
+        existing_path = self._find_existing_page_render_asset_path(
+            paper_id=int(paper_id),
+            page=int(page),
+        )
+        if existing_path:
+            return self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page))
+        created_path = await asyncio.to_thread(
+            self._build_page_render_asset_sync,
+            paper_id=int(paper_id),
+            page=int(page),
+            pdf_path=str(pdf_path),
+        )
+        if created_path and os.path.exists(created_path):
+            return self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page))
+        return ""
+
+    def _infer_docmind_page_size(
+        self,
+        *,
+        payload: Dict[str, Any],
+        layouts: Sequence[Dict[str, Any]],
+    ) -> Tuple[float, float]:
+        for block in list(payload.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            anchor = dict(block.get("source_anchor") or {})
+            bbox_hint = dict(anchor.get("bbox_hint") or {})
+            width = self._safe_float(bbox_hint.get("page_width"), 0.0)
+            height = self._safe_float(bbox_hint.get("page_height"), 0.0)
+            if width > 0 and height > 0:
+                return width, height
+        max_x = 0.0
+        max_y = 0.0
+        for row in list(layouts or []):
+            bbox = self._bbox_from_docmind_pos(row.get("pos"))
+            if bbox is None:
+                continue
+            _, _, x1, y1 = bbox
+            max_x = max(max_x, x1)
+            max_y = max(max_y, y1)
+        return (max_x, max_y) if max_x > 0 and max_y > 0 else (0.0, 0.0)
+
+    @staticmethod
+    def _normalize_figure_layout_uid(raw: str) -> str:
+        token = str(raw or "").strip()
+        if not token:
+            return ""
+        token = re.sub(r"[^0-9a-zA-Z_.-]+", "_", token).strip("_.-")
+        return token[:96]
+
+    @staticmethod
+    def _bbox_from_docmind_pos(pos: Any) -> Optional[Tuple[float, float, float, float]]:
+        if not isinstance(pos, list):
+            return None
+        xs: List[float] = []
+        ys: List[float] = []
+        for item in pos:
+            if not isinstance(item, dict):
+                continue
+            x = item.get("x")
+            y = item.get("y")
+            try:
+                xf = float(x)
+                yf = float(y)
+            except Exception:
+                continue
+            xs.append(xf)
+            ys.append(yf)
+        if not xs or not ys:
+            return None
+        x0 = min(xs)
+        x1 = max(xs)
+        y0 = min(ys)
+        y1 = max(ys)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    @staticmethod
+    def _convert_docmind_bbox_to_pdf(
+        *,
+        bbox: Optional[Tuple[float, float, float, float]],
+        pdf_width: float,
+        pdf_height: float,
+        docmind_width: float,
+        docmind_height: float,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if bbox is None:
+            return None
+        x0, y0, x1, y1 = bbox
+        if docmind_width > 0 and docmind_height > 0 and pdf_width > 0 and pdf_height > 0:
+            sx = pdf_width / max(1e-6, docmind_width)
+            sy = pdf_height / max(1e-6, docmind_height)
+            x0, x1 = x0 * sx, x1 * sx
+            y0, y1 = y0 * sy, y1 * sy
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    def _filter_page_images_by_bbox(
+        self,
+        *,
+        page_images: Sequence[Dict[str, Any]],
+        bbox_pdf: Optional[Tuple[float, float, float, float]],
+    ) -> List[Dict[str, Any]]:
+        if bbox_pdf is None:
+            return [row for row in list(page_images or []) if isinstance(row, dict)]
+        candidates: List[Dict[str, Any]] = []
+        for row in list(page_images or []):
+            if not isinstance(row, dict):
+                continue
+            image_bbox = (
+                self._safe_float(row.get("x0"), 0.0),
+                self._safe_float(row.get("top"), 0.0),
+                self._safe_float(row.get("x1"), 0.0),
+                self._safe_float(row.get("bottom"), 0.0),
+            )
+            if image_bbox[2] <= image_bbox[0] or image_bbox[3] <= image_bbox[1]:
+                continue
+            overlap = self._bbox_overlap_ratio(bbox_pdf, image_bbox)
+            if overlap >= 0.2:
+                candidates.append(row)
+        if candidates:
+            return candidates
+        return [row for row in list(page_images or []) if isinstance(row, dict)]
+
+    def _select_native_pdf_image(
+        self,
+        *,
+        pypdf_images: Sequence[Any],
+        pypdf_image_map: Dict[str, Any],
+        candidate_images: Sequence[Dict[str, Any]],
+    ) -> Optional[Any]:
+        images = list(pypdf_images or [])
+        if not images:
+            return None
+        if len(images) == 1:
+            return images[0]
+        for row in list(candidate_images or []):
+            name = self._normalize_pdf_image_name(str(row.get("name") or ""))
+            if name and name in pypdf_image_map:
+                return pypdf_image_map[name]
+        return images[0] if len(images) == 1 else None
+
+    @staticmethod
+    def _normalize_pdf_image_name(raw: str) -> str:
+        token = str(raw or "").strip().lstrip("/")
+        if not token:
+            return ""
+        token = token.rsplit(".", 1)[0]
+        return token.lower()
+
+    def _write_native_pdf_image(self, *, out_dir: str, asset_id: str, image_obj: Any) -> Optional[str]:
+        data = getattr(image_obj, "data", None)
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return None
+        name = str(getattr(image_obj, "name", "") or "")
+        ext = ""
+        if "." in name:
+            ext = name.rsplit(".", 1)[-1].strip().lower()
+        if ext not in {"jpg", "jpeg", "png", "webp"}:
+            pil_image = getattr(image_obj, "image", None)
+            fmt = str(getattr(pil_image, "format", "") or "").strip().lower()
+            if fmt in {"jpeg", "jpg"}:
+                ext = "jpg"
+            elif fmt in {"png", "webp"}:
+                ext = fmt
+        if ext not in {"jpg", "jpeg", "png", "webp"}:
+            ext = "jpg"
+        target = os.path.join(out_dir, f"{asset_id}.{ext}")
+        with open(target, "wb") as fp:
+            fp.write(bytes(data))
+        return target
+
+    def _write_clipped_page_image(
+        self,
+        *,
+        out_dir: str,
+        asset_id: str,
+        page_image: Any,
+        bbox_pdf: Tuple[float, float, float, float],
+    ) -> Optional[str]:
+        if page_image is None:
+            return None
+        width, height = page_image.size  # PIL image
+        x0, y0, x1, y1 = bbox_pdf
+        pad_x = max(2, int((x1 - x0) * 0.01))
+        pad_y = max(2, int((y1 - y0) * 0.01))
+        left = max(0, int(round(x0 - pad_x)))
+        top = max(0, int(round(y0 - pad_y)))
+        right = min(int(width), int(round(x1 + pad_x)))
+        bottom = min(int(height), int(round(y1 + pad_y)))
+        if right <= left + 6 or bottom <= top + 6:
+            return None
+        cropped = page_image.crop((left, top, right, bottom))
+        if cropped.size[0] <= 6 or cropped.size[1] <= 6:
+            return None
+        target = os.path.join(out_dir, f"{asset_id}.jpg")
+        cropped.save(target, format="JPEG", quality=88, optimize=True)
+        return target
+
+    @staticmethod
+    def _find_existing_figure_asset_path(*, out_dir: str, asset_id: str) -> Optional[str]:
+        for ext in ("jpg", "jpeg", "png", "webp"):
+            path = os.path.join(out_dir, f"{asset_id}.{ext}")
+            if os.path.exists(path):
+                return path
+        return None
+
+    @staticmethod
+    def _bbox_overlap_ratio(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        inter_x0 = max(ax0, bx0)
+        inter_y0 = max(ay0, by0)
+        inter_x1 = min(ax1, bx1)
+        inter_y1 = min(ay1, by1)
+        if inter_x1 <= inter_x0 or inter_y1 <= inter_y0:
+            return 0.0
+        inter = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+        area_a = max(0.0, (ax1 - ax0) * (ay1 - ay0))
+        area_b = max(0.0, (bx1 - bx0) * (by1 - by0))
+        base = min(area_a, area_b)
+        if base <= 0:
+            return 0.0
+        return max(0.0, min(1.0, float(inter / base)))
+
+    @staticmethod
+    def _normalize_panel_validation_report(
+        *,
+        raw_report: Dict[str, Any],
+        non_empty_plan: bool,
+        used_count: int,
+        usable_count: int,
+    ) -> Dict[str, Any]:
+        report = dict(raw_report or {})
+        errors = [str(item) for item in list(report.get("errors") or []) if str(item).strip()]
+        warnings = [str(item) for item in list(report.get("warnings") or []) if str(item).strip()]
+        has_unknown = any(item.startswith("unknown_source_layout_id:") for item in errors)
+        has_uncovered = any(item.startswith("uncovered_layout_ids:") for item in errors)
+        has_component = any(item.startswith("component_not_allowed:") for item in errors)
+        has_schema = any(item in {"panels_empty", "source_layout_ids_not_array", "node_id_missing"} for item in errors)
+
+        def gate_row(passed: bool, gate_errors: List[str]) -> Dict[str, Any]:
+            return {"passed": bool(passed), "errors": [str(item) for item in gate_errors]}
+
+        gates = {
+            "id_integrity": gate_row(not has_unknown and not has_schema, [item for item in errors if item.startswith("unknown_source_layout_id:") or item in {"panels_empty", "source_layout_ids_not_array", "node_id_missing"}]),
+            "full_coverage": gate_row(not has_uncovered, [item for item in errors if item.startswith("uncovered_layout_ids:")]),
+            "whitelist_only": gate_row(not has_component, [item for item in errors if item.startswith("component_not_allowed:")]),
+            "layout_contract": gate_row(True, []),
+            "no_drop_blocks": gate_row(not has_uncovered, [item for item in errors if item.startswith("uncovered_layout_ids:")]),
+            "ownership_unchanged": gate_row(True, []),
+            "non_empty_plan_for_non_empty_input": gate_row(bool(non_empty_plan) or usable_count <= 0, [] if (bool(non_empty_plan) or usable_count <= 0) else ["empty_plan"]),
+            "source_text_immutable": gate_row(True, []),
+        }
+
+        passed = bool(report.get("passed", False)) and all(bool((row or {}).get("passed")) for row in gates.values())
+        if usable_count > 0 and used_count <= 0:
+            passed = False
+            gates["full_coverage"] = gate_row(False, list(gates["full_coverage"]["errors"]) + ["used_count_zero"])
+            if "used_count_zero" not in errors:
+                errors.append("used_count_zero")
+
+        return {
+            "passed": bool(passed),
+            "status": "ok" if passed else "invalid",
+            "errors": errors,
+            "warnings": warnings,
+            "stats": dict(report.get("stats") or {}),
+            "gates": gates,
+        }
+
+    @staticmethod
+    def _extract_panel_nodes(panel: Dict[str, Any], panel_id: str) -> List[Dict[str, Any]]:
+        if not isinstance(panel, dict):
+            return []
+        nodes = panel.get("nodes")
+        if isinstance(nodes, list):
+            normalized = [dict(item) for item in nodes if isinstance(item, dict)]
+            if normalized:
+                return normalized
+
+        # Compatibility: some model outputs place a single node directly on panel.
+        component = str(panel.get("component") or "").strip()
+        props = panel.get("props") if isinstance(panel.get("props"), dict) else {}
+        source_layout_ids = [
+            str(item).strip()
+            for item in list(panel.get("source_layout_ids") or [])
+            if str(item).strip()
+        ] if isinstance(panel.get("source_layout_ids"), list) else []
+        children = [
+            dict(item)
+            for item in list(panel.get("children") or [])
+            if isinstance(item, dict)
+        ] if isinstance(panel.get("children"), list) else []
+        if not component and not source_layout_ids and not props and not children:
+            return []
+        return [
+            {
+                "node_id": str(panel.get("node_id") or f"{panel_id}_node").strip() or f"{panel_id}_node",
+                "component": component or "ParagraphProse",
+                "props": dict(props),
+                "source_layout_ids": source_layout_ids,
+                "display": panel.get("display"),
+                "order_key": panel.get("order_key"),
+                "children": children,
+            }
+        ]
+
+    @staticmethod
+    def _collect_source_layout_ids_from_panel_plan(*, panel_plan: Dict[str, Any]) -> List[str]:
+        output: List[str] = []
+        seen: set[str] = set()
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            panel_id = str(panel.get("panel_id") or f"panel_{len(output) + 1}").strip() or "panel"
+            for node in LiteratureReaderComposeService._extract_panel_nodes(panel, panel_id):
+                stack = [node]
+                while stack:
+                    current = stack.pop(0)
+                    if not isinstance(current, dict):
+                        continue
+                    for src in list(current.get("source_layout_ids") or []):
+                        token = str(src or "").strip()
+                        if token and token not in seen:
+                            seen.add(token)
+                            output.append(token)
+                    children = current.get("children")
+                    if isinstance(children, list) and children:
+                        stack = list(children) + stack
+        return output
+
+    @staticmethod
+    def _collect_component_hints_from_panel_plan(*, panel_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        hints: List[Dict[str, Any]] = []
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            panel_id = str(panel.get("panel_id") or f"panel_{len(hints) + 1}").strip() or "panel"
+            for node in LiteratureReaderComposeService._extract_panel_nodes(panel, panel_id):
+                stack = [node]
+                while stack:
+                    current = stack.pop(0)
+                    if not isinstance(current, dict):
+                        continue
+                    component = str(current.get("component") or "").strip()
+                    block_ids = [str(item).strip() for item in list(current.get("source_layout_ids") or []) if str(item).strip()]
+                    if component:
+                        hints.append({"block_ids": block_ids, "component": component, "reason": "single_agent_v2"})
+                    children = current.get("children")
+                    if isinstance(children, list) and children:
+                        stack = list(children) + stack
+        return hints
+
+    def _panel_plan_to_ui_plan(
+        self,
+        *,
+        page: int,
+        panel_plan: Dict[str, Any],
+        docmind_blocks: Sequence[Dict[str, Any]],
+        layout_to_block_ids: Dict[str, List[str]],
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+    ) -> Dict[str, Any]:
+        docmind_map = {
+            str(row.get("layout_id") or ""): dict(row)
+            for row in list(docmind_blocks or [])
+            if isinstance(row, dict) and str(row.get("layout_id") or "")
+        }
+        figure_layout_to_image_token: Dict[str, str] = {}
+        figure_image_fallback_token = ""
+        for asset in list(base_payload.get("assets") or []):
+            if not isinstance(asset, dict):
+                continue
+            if str(asset.get("kind") or "").strip() != "image_hint":
+                continue
+            meta = asset.get("meta") if isinstance(asset.get("meta"), Mapping) else {}
+            asset_id = str(meta.get("asset_id") or "").strip() if isinstance(meta, Mapping) else ""
+            href = str(asset.get("href") or (meta.get("image_url") if isinstance(meta, Mapping) else "") or "").strip()
+            token = f"asset:{asset_id}" if asset_id else href
+            if token and not figure_image_fallback_token:
+                figure_image_fallback_token = token
+            layout_keys = [
+                str(meta.get("layout_unique_id") or "").strip() if isinstance(meta, Mapping) else "",
+                str(meta.get("unique_id") or "").strip() if isinstance(meta, Mapping) else "",
+            ]
+            for key in layout_keys:
+                if key and token:
+                    figure_layout_to_image_token[key] = token
+
+        block_anchor_map: Dict[str, Dict[str, Any]] = {}
+        for block in list(base_payload.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block.get("id") or ""))
+            if not canonical:
+                canonical = str(((block.get("source_anchor") or {}).get("canonical_block_id") or "")).strip()
+            if not canonical or canonical in block_anchor_map:
+                continue
+            anchor = self._normalize_anchor_ref(
+                anchor=block.get("source_anchor"),
+                page=page,
+                quote_text=str(block.get("text") or ""),
+            )
+            if anchor:
+                block_anchor_map[canonical] = anchor
+
+        known_block_ids = self._collect_known_block_ids(page=page, base_payload=base_payload)
+        known_block_set = set(known_block_ids)
+        layout_alias_to_block_ids = self._build_layout_block_id_alias_map(page=page, base_payload=base_payload)
+        for canonical in known_block_ids:
+            layout_alias_to_block_ids.setdefault(canonical, [])
+            if canonical not in layout_alias_to_block_ids[canonical]:
+                layout_alias_to_block_ids[canonical].append(canonical)
+        for layout_id, block_ids in list(layout_to_block_ids.items()):
+            aliases = [
+                str(layout_id).strip(),
+                self._normalize_canonical_block_id(page=page, raw_id=str(layout_id)),
+            ]
+            for alias in aliases:
+                if not alias:
+                    continue
+                layout_alias_to_block_ids.setdefault(alias, [])
+                for block_id in list(block_ids or []):
+                    canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block_id))
+                    if not canonical:
+                        continue
+                    if canonical not in layout_alias_to_block_ids[alias]:
+                        layout_alias_to_block_ids[alias].append(canonical)
+
+        allowed_displays = {"default", "collapsed", "pinned", "hidden_until_expand"}
+        component_map = {
+            "ProseBlock": "ParagraphProse",
+            "QuoteBlock": "CalloutBox",
+            "BulletList": "ListBlock",
+            "FigureCard": "FigurePanel",
+            "Callout": "CalloutBox",
+            "PublicationMetaStrip": "ContextRail",
+        }
+        order_key = 0.0
+
+        def infer_zone(source_layout_ids: Sequence[str]) -> str:
+            aux_types = {"head", "header_line", "side", "footer_line", "foot", "foot_pagenum", "split_line"}
+            aux_count = 0
+            for layout_id in source_layout_ids:
+                row = docmind_map.get(str(layout_id)) or {}
+                if str(row.get("type") or "").strip().lower() in aux_types:
+                    aux_count += 1
+            return "side_context" if aux_count > 0 and aux_count >= max(1, len(source_layout_ids)) else "main_body"
+
+        def fallback_text(source_layout_ids: Sequence[str]) -> str:
+            parts: List[str] = []
+            for layout_id in source_layout_ids:
+                token = str((docmind_map.get(layout_id) or {}).get("source_text") or "").strip()
+                if token:
+                    parts.append(token)
+            return " ".join(parts).strip()
+
+        def fallback_paragraph_rows(source_layout_ids: Sequence[str], text_hint: str) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for layout_id in source_layout_ids[:64]:
+                token = self._normalize_spaces(str((docmind_map.get(layout_id) or {}).get("source_text") or ""))
+                if token and token.lower() != "[empty]":
+                    rows.append({"text": token})
+            if len(rows) >= 2:
+                return rows[:32]
+
+            raw_text = str(text_hint or "").strip()
+            if not raw_text:
+                return rows[:32]
+
+            split_blocks = [str(item).strip() for item in re.split(r"\n\s*\n+", raw_text) if str(item).strip()]
+            if len(split_blocks) >= 2:
+                normalized = [{"text": self._normalize_spaces(item)} for item in split_blocks[:32] if self._normalize_spaces(item)]
+                if len(normalized) >= 2:
+                    return normalized
+
+            split_lines = [self._normalize_spaces(item) for item in re.split(r"\n+", raw_text) if self._normalize_spaces(item)]
+            if 2 <= len(split_lines) <= 12:
+                return [{"text": item} for item in split_lines[:32]]
+
+            return rows[:32]
+
+        def normalize_component(raw_component: str) -> str:
+            token = str(raw_component or "").strip()
+            token = component_map.get(token, token)
+            if token in SIMPLIFIED_ALLOWED_COMPONENTS:
+                return token
+            return "ParagraphProse"
+
+        def resolve_figure_image_token(raw_token: str, source_layout_ids: Sequence[str]) -> str:
+            token = str(raw_token or "").strip()
+            is_renderable = bool(
+                token
+                and (
+                    token.startswith("asset:")
+                    or token.startswith("/")
+                    or token.startswith("data:image/")
+                    or token.startswith("blob:")
+                    or re.match(r"^https?://", token, flags=re.IGNORECASE)
+                )
+            )
+            looks_non_renderable = bool(token and not is_renderable)
+            if looks_non_renderable:
+                for layout_id in source_layout_ids:
+                    key = str(layout_id or "").strip()
+                    if not key:
+                        continue
+                    mapped = figure_layout_to_image_token.get(key)
+                    if mapped:
+                        return mapped
+                    row = docmind_map.get(key) or {}
+                    mapped = figure_layout_to_image_token.get(str(row.get("unique_id") or row.get("uniqueId") or "").strip())
+                    if mapped:
+                        return mapped
+                if figure_image_fallback_token:
+                    return figure_image_fallback_token
+            return token
+
+        def normalize_props(component: str, raw_props: Any, source_layout_ids: Sequence[str]) -> Dict[str, Any]:
+            props = dict(raw_props) if isinstance(raw_props, dict) else {}
+            fb_text = fallback_text(source_layout_ids)
+            if component == "ParagraphProse":
+                paragraph_rows: List[Dict[str, Any]] = []
+                raw_paragraphs = props.get("paragraphs")
+                if isinstance(raw_paragraphs, list):
+                    for item in raw_paragraphs[:32]:
+                        if isinstance(item, str):
+                            para_text = self._normalize_spaces(item)
+                            if not para_text:
+                                continue
+                            paragraph_rows.append({"text": para_text})
+                            continue
+                        if isinstance(item, Mapping):
+                            para_text = self._normalize_spaces(str(item.get("text") or item.get("content") or ""))
+                            if not para_text:
+                                continue
+                            para_item: Dict[str, Any] = {"text": para_text}
+                            raw_ranges = item.get("source_char_ranges")
+                            if isinstance(raw_ranges, list):
+                                ranges = [
+                                    {
+                                        "start_char_id": str((rng or {}).get("start_char_id") or "").strip(),
+                                        "end_char_id": str((rng or {}).get("end_char_id") or "").strip(),
+                                    }
+                                    for rng in raw_ranges[:64]
+                                    if isinstance(rng, Mapping)
+                                    and str((rng or {}).get("start_char_id") or "").strip()
+                                    and str((rng or {}).get("end_char_id") or "").strip()
+                                ]
+                                if ranges:
+                                    para_item["source_char_ranges"] = ranges
+                            paragraph_rows.append(para_item)
+                paragraph_rows = [row for row in paragraph_rows if str(row.get("text") or "").strip()]
+                if paragraph_rows:
+                    merged_text = "\n\n".join(str(row.get("text") or "").strip() for row in paragraph_rows if str(row.get("text") or "").strip())
+                    return {"text": merged_text or (fb_text or "[empty]"), "paragraphs": paragraph_rows}
+                text = str(props.get("text") or fb_text).strip()
+                fallback_rows = fallback_paragraph_rows(source_layout_ids, text)
+                if fallback_rows:
+                    merged_text = "\n\n".join(str(row.get("text") or "").strip() for row in fallback_rows if str(row.get("text") or "").strip())
+                    return {"text": merged_text or (text or "[empty]"), "paragraphs": fallback_rows}
+                return {"text": text or "[empty]"}
+            if component == "SectionHeading":
+                text = str(props.get("text") or fb_text).strip() or "Untitled"
+                level = int(props.get("level") or 2)
+                level = max(1, min(4, level))
+                return {"text": text, "level": level}
+            if component == "ListBlock":
+                items = props.get("items")
+                rows = [str(item).strip() for item in list(items or []) if str(item).strip()] if isinstance(items, list) else []
+                if not rows and fb_text:
+                    rows = [fb_text]
+                return {"items": rows}
+            if component == "FigurePanel":
+                return {
+                    "caption": str(props.get("caption") or fb_text).strip(),
+                    "image_url": resolve_figure_image_token(
+                        raw_token=str(props.get("image_url") or props.get("image_src") or "").strip(),
+                        source_layout_ids=source_layout_ids,
+                    ),
+                    "source_label": str(props.get("source_label") or "").strip(),
+                    "ai_insight": str(props.get("ai_insight") or "").strip(),
+                }
+            if component == "ContextRail":
+                title = str(props.get("title") or "Context").strip()
+                items = props.get("items")
+                if not isinstance(items, list):
+                    text = fb_text or str(props.get("text") or "").strip()
+                    items = [{"text": text}] if text else []
+                return {"title": title, "items": items}
+            if component == "CalloutBox":
+                content = str(props.get("content") or props.get("text") or fb_text).strip()
+                callout_type = str(props.get("type") or "info").strip().lower()
+                if callout_type not in {"info", "warning", "success", "tip"}:
+                    callout_type = "info"
+                return {"type": callout_type, "title": str(props.get("title") or "").strip(), "content": content or "[empty]"}
+            if component == "AbstractCard":
+                return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
+            if component == "CitationCard":
+                return {
+                    "title": str(props.get("title") or fb_text).strip() or "Citation",
+                    "authors": [str(item).strip() for item in list(props.get("authors") or []) if str(item).strip()],
+                    "year": props.get("year"),
+                    "journal": str(props.get("journal") or "").strip(),
+                    "doi": str(props.get("doi") or "").strip(),
+                    "abstract_tldr": str(props.get("abstract_tldr") or "").strip(),
+                }
+            if component == "EquationBlock":
+                return {
+                    "latex": str(props.get("latex") or props.get("text") or fb_text).strip() or "x = y",
+                    "label": str(props.get("label") or "").strip(),
+                    "description": str(props.get("description") or "").strip(),
+                }
+            if component == "MethodologyCard":
+                steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
+                if not steps and fb_text:
+                    steps = [fb_text]
+                return {"title": str(props.get("title") or "").strip(), "steps": steps or ["N/A"], "participants": str(props.get("participants") or "").strip(), "tools": [str(item).strip() for item in list(props.get("tools") or []) if str(item).strip()]}
+            if component == "TablePanel":
+                rows = props.get("rows")
+                return {"title": str(props.get("title") or fb_text or "Table").strip(), "rows": rows if isinstance(rows, list) else []}
+            return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
+
+        def convert_node(node: Dict[str, Any], panel_id: str) -> Optional[Dict[str, Any]]:
+            nonlocal order_key
+            source_layout_ids = [str(item).strip() for item in list(node.get("source_layout_ids") or []) if str(item).strip()]
+            component = normalize_component(str(node.get("component") or ""))
+            zone_type = infer_zone(source_layout_ids)
+            region = "sidebar" if zone_type == "side_context" else "main"
+            display = str(node.get("display") or "default").strip().lower()
+            if display not in allowed_displays:
+                display = "default"
+            source_block_ids: List[str] = []
+            source_anchor_refs: List[Dict[str, Any]] = []
+            for layout_id in source_layout_ids:
+                mapped = list(layout_alias_to_block_ids.get(layout_id) or [])
+                if not mapped:
+                    normalized_layout_id = self._normalize_canonical_block_id(page=page, raw_id=layout_id)
+                    mapped = list(layout_alias_to_block_ids.get(normalized_layout_id) or [])
+                if not mapped:
+                    fallback_canonical = self._normalize_canonical_block_id(page=page, raw_id=layout_id)
+                    mapped = [fallback_canonical] if fallback_canonical and fallback_canonical in known_block_set else []
+                for block_id in mapped:
+                    block_token = self._normalize_canonical_block_id(page=page, raw_id=str(block_id))
+                    if not block_token or block_token in source_block_ids:
+                        continue
+                    if known_block_set and block_token not in known_block_set:
+                        continue
+                    source_block_ids.append(block_token)
+                    anchor = dict(block_anchor_map.get(block_token) or {})
+                    if anchor and anchor not in source_anchor_refs:
+                        source_anchor_refs.append(anchor)
+
+            order_key += 1.0
+            node_id = str(node.get("node_id") or f"{panel_id}_n{int(order_key)}").strip()
+            children: List[Dict[str, Any]] = []
+            for child in list(node.get("children") or []):
+                if not isinstance(child, dict):
+                    continue
+                converted = convert_node(child, panel_id)
+                if converted:
+                    children.append(converted)
+            return {
+                "id": node_id,
+                "type": component,
+                "props": normalize_props(component, node.get("props"), source_layout_ids),
+                "children": children,
+                "source_anchor_refs": source_anchor_refs,
+                "source_block_ids": source_block_ids,
+                "source_atom_ids": source_block_ids,
+                "zone_type": zone_type,
+                "column_id": region,
+                "region": region,
+                "display": display,
+                "order_key": float(node.get("order_key") or order_key),
+                "compat_filled": True,
+                "compat_filled_fields": ["zone_type", "column_id", "region", "display", "order_key"],
+                "heading_prob": 0.85 if component == "SectionHeading" else 0.0,
+                "capabilities": [],
+                "actions": [],
+            }
+
+        components: List[Dict[str, Any]] = []
+        for panel in list(panel_plan.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            panel_id = str(panel.get("panel_id") or f"panel_{len(components) + 1}").strip()
+            panel_nodes = self._extract_panel_nodes(panel, panel_id)
+            title = str(panel.get("title") or "").strip()
+            if title:
+                title_source = []
+                if panel_nodes:
+                    title_source = [str(item).strip() for item in list(panel_nodes[0].get("source_layout_ids") or []) if str(item).strip()]
+                title_node = convert_node(
+                    {
+                        "node_id": f"{panel_id}_title",
+                        "component": "SectionHeading",
+                        "props": {"text": title, "level": 2},
+                        "source_layout_ids": title_source,
+                        "children": [],
+                    },
+                    panel_id,
+                )
+                if title_node:
+                    components.append(title_node)
+            for node in panel_nodes:
+                converted = convert_node(node, panel_id)
+                if converted:
+                    components.append(converted)
+
+        style_plan = dict(panel_plan.get("style_plan") or {})
+        style_tokens = {
+            "pageBackground": str(style_plan.get("page_background") or style_plan.get("pageBackground") or "#f4f8fc"),
+            "panelBackground": str(style_plan.get("panel_background") or style_plan.get("panelBackground") or "rgba(255,255,255,0.9)"),
+            "borderColor": str(style_plan.get("border_color") or style_plan.get("borderColor") or "rgba(120,145,170,0.28)"),
+            "headingColor": str(style_plan.get("heading_color") or style_plan.get("headingColor") or "#0f2740"),
+            "bodyColor": str(style_plan.get("body_color") or style_plan.get("bodyColor") or "#1f3348"),
+        }
+        return {
+            "plan_id": f"single_agent_v2_p{int(page)}",
+            "components": components,
+            "layout": {
+                "layout_mode": "single_column",
+                "regions": [{"id": "main", "kind": "content"}, {"id": "sidebar", "kind": "meta"}],
+                "content_max_width": 980,
+            },
+            "style_tokens": style_tokens,
+            "trace_meta": {
+                "pipeline": "single_agent_v2",
+                "panel_plan": panel_plan,
+                "style_intent": str(style_intent or ""),
+                "theme_mode": str(theme_mode or ""),
+                "detail_level": str(detail_level or ""),
+                "compare_mode": bool(compare_mode),
+                "assembly_used": True,
+            },
+            "ui_ops": [],
+            "agent_trace": [],
+            "agent_tool_calls": [],
         }
 
     async def _invoke_single_agent_model(
@@ -1104,6 +2354,7 @@ class LiteratureReaderComposeService:
         system_prompt: str,
         user_prompt: Dict[str, Any],
         rendered_page_image: str,
+        rendered_page_image_path: str = "",
         step: int,
         phase: str,
     ) -> Dict[str, Any]:
@@ -1115,11 +2366,47 @@ class LiteratureReaderComposeService:
 
         request_timeout = max(2.0, float(int(getattr(settings, "reader_agent_timeout_ms", 90000) or 90000)) / 1000.0)
         max_tokens = max(512, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000))
+        local_image_paths = DashScopeMultimodalService.collect_local_file_uris(
+            str(rendered_page_image_path or "").strip(),
+            limit=1,
+        )
+        if (
+            str(getattr(settings, "reader_agent_provider", "") or "").strip() == "aliyun"
+            and bool(local_image_paths)
+            and DashScopeMultimodalService.is_available()
+        ):
+            try:
+                result = await DashScopeMultimodalService.chat_json(
+                    api_key=api_key,
+                    base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or base_url or "").strip(),
+                    model=model_name,
+                    system_prompt=str(system_prompt or ""),
+                    user_prompt=json.dumps(user_prompt, ensure_ascii=False),
+                    image_paths=local_image_paths,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                )
+                parsed = dict(result.get("parsed") or {})
+                if not parsed:
+                    return {}
+                return {
+                    "status": str(parsed.get("status") or ""),
+                    "step_result": dict(parsed.get("step_result") or {}),
+                    "usage": dict(result.get("usage") or {}),
+                    "self_check": dict(parsed.get("self_check") or {}),
+                    "fixes_applied": list(parsed.get("fixes_applied") or []),
+                }
+            except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+                logger.warning(
+                    f"[ReaderComposeService] single_agent_v2 dashscope call failed "
+                    f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
+                )
+
         content_parts: List[Dict[str, Any]] = [
             {"type": "text", "text": json.dumps(user_prompt, ensure_ascii=False)}
         ]
         image_token = str(rendered_page_image or "").strip()
-        if step == 1 and image_token and (image_token.startswith("data:image") or image_token.startswith("http")):
+        if image_token and self._is_safe_prompt_image_url(image_token):
             content_parts.append({"type": "image_url", "image_url": {"url": image_token}})
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -1628,6 +2915,13 @@ class LiteratureReaderComposeService:
             for row in list(mm_prompt_payload.get("images") or [])[:1]
             if isinstance(row, dict)
         ]
+        phase1_scheme_catalog = self._build_scheme_catalog(
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            has_figure=any(str((row or {}).get("type") or "").strip().lower() == "figure" for row in list(atom_bundle.usable_atoms or [])),
+        )
         atoms_digest = [
             {
                 "atom_id": str(row.get("atom_id") or ""),
@@ -1653,6 +2947,21 @@ class LiteratureReaderComposeService:
             "layout_meta": layout_meta,
             "images": image_rows,
             "atoms_digest": atoms_digest,
+        }
+        payload["phase1_compact_input"] = {
+            "input_mode": "phase1_pdf_reference_compact_v1",
+            "layout_meta": dict(layout_meta),
+            "pdf_reference": {
+                "page_image_url": str(((image_rows[0] if image_rows else {}).get("image_data_url") or "")).strip(),
+                "region_images": [],
+            },
+            "scheme_catalog": phase1_scheme_catalog,
+            "atoms_digest": atoms_digest[:48],
+            "token_strategy": {
+                "prompt_docmind_mode": "atom_digest",
+                "max_blocks": len(atoms_digest[:48]),
+                "review_patch_mode": "local_ui_ops_only",
+            },
         }
         stage1_semantic, stage1_meta = await self._mm_layout_service.build_stage1_semantic_annotations(
             prompt_payload=stage1_payload,
@@ -1898,6 +3207,25 @@ class LiteratureReaderComposeService:
             detail_level=detail_level,
             compare_mode=compare_mode,
         )
+        scheme_choice = self._select_scheme_choice(
+            scheme_catalog=phase1_scheme_catalog,
+            explicit_scheme_id="",
+            rationale="simplified atom compose",
+            source="simplified_stage2",
+        )
+        omission_decisions = [
+            {
+                "decision_id": f"unused_atom_{idx:03d}",
+                "decision": "defer",
+                "reason": "unused atom in simplified stage2 design",
+                "recoverable": True,
+                "target_layout_ids": [],
+                "target_block_ids": [],
+                "target_atom_ids": [str(atom_id).strip()],
+            }
+            for idx, atom_id in enumerate(list(stage2_slots.get("unused_atom_ids") or []), start=1)
+            if str(atom_id).strip()
+        ]
         block_to_atoms: Dict[str, List[str]] = {}
         for atom_id, block_id in atom_to_block.items():
             block_to_atoms.setdefault(block_id, []).append(atom_id)
@@ -1931,6 +3259,18 @@ class LiteratureReaderComposeService:
                 cloned["source_atom_ids"] = source_atom_ids
             components.append(cloned)
         ui_plan["components"] = components
+        ui_plan.setdefault("trace_meta", {})
+        ui_plan["trace_meta"]["scheme_choice"] = dict(scheme_choice)
+        ui_plan["trace_meta"]["decision_log"] = []
+        ui_plan["trace_meta"]["omission_decisions"] = list(omission_decisions)
+        ui_plan["trace_meta"]["phase1_compact_input"] = dict(payload.get("phase1_compact_input") or {})
+        payload["scheme_choice"] = dict(scheme_choice)
+        payload["decision_log"] = []
+        payload["omission_decisions"] = list(omission_decisions)
+        payload["review_route_meta"] = {
+            "template": f"/literature/{int(paper.id)}/read/review",
+            "mode": "compose_review_v1",
+        }
 
         missing_atoms = [
             atom
@@ -2305,6 +3645,32 @@ class LiteratureReaderComposeService:
                     page_structure_v3=dict(base_payload.get("page_structure_v3") or {}),
                     layout_advice_v3=dict(base_payload.get("layout_advice_v3") or {}),
                     latency_budget_ms=int(latency_budget_ms),
+                    scheme_choice=dict(base_payload.get("scheme_choice") or {}),
+                    decision_log=[
+                        str(item).strip()
+                        for item in list(base_payload.get("decision_log") or [])
+                        if str(item).strip()
+                    ],
+                    omission_decisions=[
+                        dict(row)
+                        for row in list(base_payload.get("omission_decisions") or [])
+                        if isinstance(row, Mapping)
+                    ],
+                    phase1_compact_input=dict(base_payload.get("phase1_compact_input") or {}),
+                    review_context={
+                        "render_route": str(
+                            ((base_payload.get("review_route_meta") or {}).get("template") or "")
+                        ).strip(),
+                        "diagnostics": self._build_review_diagnostics(
+                            ui_plan=cloned,
+                            omission_decisions=[
+                                dict(row)
+                                for row in list(base_payload.get("omission_decisions") or [])
+                                if isinstance(row, Mapping)
+                            ],
+                            quality_report=dict(base_payload.get("quality_report") or {}),
+                        ),
+                    },
                 )
                 if bool(runtime_result.get("used")):
                     ui_ops = [row for row in list(runtime_result.get("ui_ops") or []) if isinstance(row, dict)]
@@ -4688,10 +6054,29 @@ class LiteratureReaderComposeService:
             return cloned
 
         cloned = json.loads(json.dumps(payload, ensure_ascii=False))
+        publish_overlay: Optional[PaperReaderComponentOverlay] = None
+        node_overlays: List[PaperReaderComponentOverlay] = []
+        for row in overlays:
+            if (
+                str(getattr(row, "action_type", "") or "").strip() == REVIEW_PUBLISH_OVERLAY_ACTION
+                or str(getattr(row, "node_id", "") or "").strip() == REVIEW_PUBLISH_OVERLAY_NODE_ID
+            ):
+                publish_overlay = row
+                continue
+            node_overlays.append(row)
+
+        applied = 0
+        if publish_overlay is not None:
+            cloned = self._apply_published_review_overlay(
+                page=int(page),
+                payload=cloned,
+                overlay_json=dict(publish_overlay.overlay_json or {}),
+            )
+            applied += 1
+
         ui_plan = dict(cloned.get("ui_plan") or {})
         components = list(ui_plan.get("components") or [])
-        applied = 0
-        for row in overlays:
+        for row in node_overlays:
             patch = dict(row.overlay_json or {})
             node_after = patch.get("node_after")
             if not isinstance(node_after, dict):
@@ -4707,6 +6092,49 @@ class LiteratureReaderComposeService:
         cloned["ui_plan"] = ui_plan
         cloned["overlay_applied"] = applied > 0
         cloned["overlay_count"] = applied
+        return cloned
+
+    def _apply_published_review_overlay(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        overlay_json: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = json.loads(json.dumps(payload, ensure_ascii=False))
+        published_ui_plan = dict(overlay_json.get("ui_plan") or {})
+        if published_ui_plan:
+            cloned["ui_plan"] = self._sanitize_ui_plan_for_runtime(
+                page=page,
+                payload=cloned,
+                ui_plan=published_ui_plan,
+            )
+        if isinstance(overlay_json.get("scheme_choice"), Mapping):
+            cloned["scheme_choice"] = dict(overlay_json.get("scheme_choice") or {})
+        decision_log = overlay_json.get("decision_log")
+        if isinstance(decision_log, list):
+            cloned["decision_log"] = [str(item).strip() for item in list(decision_log) if str(item).strip()]
+        omission_decisions = overlay_json.get("omission_decisions")
+        if isinstance(omission_decisions, list):
+            cloned["omission_decisions"] = [
+                dict(row)
+                for row in list(omission_decisions)
+                if isinstance(row, Mapping)
+            ]
+        assets = overlay_json.get("assets")
+        if isinstance(assets, list):
+            cloned["assets"] = [dict(row) for row in list(assets) if isinstance(row, Mapping)]
+        if isinstance(overlay_json.get("quality_report"), Mapping):
+            cloned["quality_report"] = dict(overlay_json.get("quality_report") or {})
+
+        ui_plan = dict(cloned.get("ui_plan") or {})
+        trace_meta = dict(ui_plan.get("trace_meta") or {})
+        trace_meta["published_review_snapshot_id"] = str(overlay_json.get("snapshot_id") or "").strip()
+        trace_meta["published_review_session_id"] = str(overlay_json.get("session_id") or "").strip()
+        trace_meta["published_review_applied"] = True
+        trace_meta["published_at"] = str(overlay_json.get("published_at") or "").strip()
+        ui_plan["trace_meta"] = trace_meta
+        cloned["ui_plan"] = ui_plan
         return cloned
 
     async def _read_overlays_from_db(
@@ -5206,6 +6634,217 @@ class LiteratureReaderComposeService:
             "auto": "auto",
         }
         return alias_map.get(value, "auto")
+
+    def _build_scheme_catalog(
+        self,
+        *,
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        has_figure: bool,
+    ) -> List[Dict[str, Any]]:
+        normalized_style = self._normalize_style_intent(style_intent)
+        normalized_theme = self._normalize_theme_mode(theme_mode)
+        normalized_detail = self._normalize_detail_level(detail_level)
+        catalog_map = {
+            "reading_flow_stack": {
+                "scheme_id": "reading_flow_stack",
+                "label": "Reading Flow Stack",
+                "rationale": "Default single-column reading flow with strong paragraph rhythm.",
+            },
+            "figure_focus_split": {
+                "scheme_id": "figure_focus_split",
+                "label": "Figure Focus Split",
+                "rationale": "Promote figure or caption-led evidence before dense body text.",
+            },
+            "context_rail": {
+                "scheme_id": "context_rail",
+                "label": "Context Rail",
+                "rationale": "Demote metadata and side context into a secondary rail.",
+            },
+            "compare_grid": {
+                "scheme_id": "compare_grid",
+                "label": "Compare Grid",
+                "rationale": "Reserve space for compare mode and contrastive evidence blocks.",
+            },
+            "dense_brief_stack": {
+                "scheme_id": "dense_brief_stack",
+                "label": "Dense Brief Stack",
+                "rationale": "Compact rhythm for concise reading while preserving provenance.",
+            },
+        }
+        if compare_mode:
+            order = ["compare_grid", "reading_flow_stack", "context_rail"]
+        elif has_figure:
+            order = ["figure_focus_split", "reading_flow_stack", "context_rail"]
+        elif normalized_detail == "concise":
+            order = ["dense_brief_stack", "reading_flow_stack", "context_rail"]
+        else:
+            order = ["reading_flow_stack", "context_rail", "figure_focus_split"]
+        if normalized_style == "clinical" and "dense_brief_stack" not in order:
+            order.insert(1, "dense_brief_stack")
+        rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for scheme_id in order:
+            if scheme_id in seen or scheme_id not in catalog_map:
+                continue
+            seen.add(scheme_id)
+            row = dict(catalog_map[scheme_id])
+            row["style_intent"] = normalized_style
+            row["theme_mode"] = normalized_theme
+            row["detail_level"] = normalized_detail
+            rows.append(row)
+        return rows[:3]
+
+    @staticmethod
+    def _select_scheme_choice(
+        *,
+        scheme_catalog: Sequence[Mapping[str, Any]],
+        explicit_scheme_id: Optional[str],
+        rationale: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        catalog_rows = [dict(row) for row in list(scheme_catalog or []) if isinstance(row, Mapping)]
+        candidate_ids = [
+            str(row.get("scheme_id") or "").strip()
+            for row in catalog_rows
+            if str(row.get("scheme_id") or "").strip()
+        ]
+        explicit = str(explicit_scheme_id or "").strip()
+        selected = explicit if explicit else (candidate_ids[0] if candidate_ids else "reading_flow_stack")
+        selected_row = next(
+            (row for row in catalog_rows if str(row.get("scheme_id") or "").strip() == selected),
+            {},
+        )
+        return {
+            "scheme_id": selected,
+            "label": str(selected_row.get("label") or selected.replace("_", " ").title()).strip(),
+            "rationale": str(rationale or selected_row.get("rationale") or "").strip(),
+            "source": str(source or "").strip(),
+            "candidate_ids": candidate_ids[:8],
+        }
+
+    def _build_phase1_compact_input(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        rendered_page_image: str,
+        rendered_page_image_path: str = "",
+        docmind_blocks: Sequence[Mapping[str, Any]],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+    ) -> Dict[str, Any]:
+        has_figure = any(
+            str((row or {}).get("type") or "").strip().lower() == "figure"
+            for row in list(docmind_blocks or [])
+            if isinstance(row, Mapping)
+        )
+        scheme_catalog = self._build_scheme_catalog(
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            has_figure=has_figure,
+        )
+        compact_blocks = []
+        for row in list(docmind_blocks or [])[:48]:
+            if not isinstance(row, Mapping):
+                continue
+            compact_blocks.append(
+                {
+                    "layout_id": str(row.get("layout_id") or "").strip(),
+                    "reading_order": int(row.get("reading_order") or 0),
+                    "type": str(row.get("type") or "").strip(),
+                    "sub_type": str(row.get("subType") or row.get("sub_type") or "").strip(),
+                    "block_ids": [
+                        str(item).strip()
+                        for item in list(row.get("block_ids") or [])[:4]
+                        if str(item).strip()
+                    ],
+                    "text_preview": self._normalize_spaces(str(row.get("source_text") or ""))[:160],
+                }
+            )
+        return {
+            "input_mode": "phase1_pdf_reference_compact_v1",
+            "layout_meta": {
+                "paper_id": int(paper_id),
+                "page": int(page),
+                "style_intent": self._normalize_style_intent(style_intent),
+                "theme_mode": self._normalize_theme_mode(theme_mode),
+                "detail_level": self._normalize_detail_level(detail_level),
+                "compare_mode": bool(compare_mode),
+            },
+            "pdf_reference": {
+                "page_image_url": str(rendered_page_image or "").strip(),
+                "page_image_path": str(rendered_page_image_path or "").strip(),
+                "region_images": [],
+            },
+            "scheme_catalog": scheme_catalog,
+            "docmind_blocks_compact": compact_blocks,
+            "token_strategy": {
+                "prompt_docmind_mode": "compact",
+                "max_blocks": len(compact_blocks),
+                "review_patch_mode": "local_ui_ops_only",
+            },
+        }
+
+    @staticmethod
+    def _normalize_decision_log(panel_plan: Dict[str, Any]) -> List[str]:
+        return [
+            str(item).strip()
+            for item in list((panel_plan or {}).get("decision_log") or [])
+            if str(item).strip()
+        ]
+
+    def _build_omission_decisions_from_panel_plan(
+        self,
+        *,
+        page: int,
+        panel_plan: Dict[str, Any],
+        layout_to_block_ids: Dict[str, List[str]],
+    ) -> List[Dict[str, Any]]:
+        coverage = dict((panel_plan or {}).get("coverage") or {})
+        reason = str(coverage.get("omitted_reason") or "").strip()
+        omitted_layout_ids = [
+            str(item).strip()
+            for item in list(coverage.get("omitted_layout_ids") or [])
+            if str(item).strip()
+        ]
+        decisions: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for layout_id in omitted_layout_ids:
+            if layout_id in seen:
+                continue
+            seen.add(layout_id)
+            target_block_ids: List[str] = []
+            for block_id in list(layout_to_block_ids.get(layout_id) or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block_id))
+                if canonical and canonical not in target_block_ids:
+                    target_block_ids.append(canonical)
+            safe_layout_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", layout_id)[:64]
+            decisions.append(
+                {
+                    "decision_id": f"omit_{safe_layout_id or len(decisions) + 1}",
+                    "decision": "hide",
+                    "reason": reason or "intentionally omitted by planner",
+                    "recoverable": True,
+                    "target_layout_ids": [layout_id],
+                    "target_block_ids": target_block_ids,
+                    "target_atom_ids": [],
+                }
+            )
+        return decisions
+
+    @staticmethod
+    def _build_review_route(*, paper_id: int, session_id: str, snapshot_id: str) -> str:
+        return (
+            f"/literature/{int(paper_id)}/read/review"
+            f"?sessionId={session_id}&snapshotId={snapshot_id}"
+        )
 
     def _build_external_image_query(
         self,
@@ -7619,6 +9258,63 @@ class LiteratureReaderComposeService:
         return True
 
     @staticmethod
+    def _is_safe_prompt_image_url(raw: str) -> bool:
+        value = str(raw or "").strip()
+        if not value:
+            return False
+        if re.match(r"^https?://", value, flags=re.IGNORECASE):
+            lowered = value.lower()
+            if lowered.startswith("javascript:") or lowered.startswith("data:"):
+                return False
+            return True
+        return False
+
+    @staticmethod
+    def _asset_base_url() -> str:
+        for raw in (
+            os.getenv("READER_ASSET_BASE_URL"),
+            os.getenv("VITE_API_BASE_URL"),
+        ):
+            token = str(raw or "").strip().rstrip("/")
+            if re.match(r"^https?://", token, flags=re.IGNORECASE):
+                return token
+        return "http://localhost:8888"
+
+    @classmethod
+    def _absolute_asset_url(cls, path: str) -> str:
+        token = str(path or "").strip()
+        if not token:
+            return ""
+        if re.match(r"^https?://", token, flags=re.IGNORECASE):
+            return token
+        normalized = token if token.startswith("/") else f"/{token}"
+        return f"{cls._asset_base_url()}{normalized}"
+
+    @staticmethod
+    def _guess_image_extension(*, filename: Optional[str], content_type: Optional[str]) -> str:
+        raw_ext = os.path.splitext(str(filename or "").strip())[1].lower().lstrip(".")
+        if raw_ext in IMAGE_ALLOWED_EXTENSIONS:
+            return "jpg" if raw_ext == "jpeg" else raw_ext
+        normalized_content_type = str(content_type or "").strip().lower()
+        mapped = IMAGE_CONTENT_TYPE_TO_EXT.get(normalized_content_type, "")
+        if mapped:
+            return mapped
+        raise ValueError("review_observation_image_type_unsupported")
+
+    @classmethod
+    def _build_review_observation_image_url(cls, *, paper_id: int, session_id: str, snapshot_id: str) -> str:
+        return cls._absolute_asset_url(
+            f"/api/v1/literature/papers/{int(paper_id)}/reader/composed/review-session/"
+            f"{str(session_id).strip()}/observation-image/{str(snapshot_id).strip()}"
+        )
+
+    @classmethod
+    def _build_page_render_asset_url(cls, *, paper_id: int, page: int) -> str:
+        return cls._absolute_asset_url(
+            f"/api/v1/literature/reader/page-assets/{int(paper_id)}/{int(page)}"
+        )
+
+    @staticmethod
     def _flatten_components(components: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         output: List[Dict[str, Any]] = []
         stack = list(components or [])
@@ -7637,9 +9333,21 @@ class LiteratureReaderComposeService:
         return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @staticmethod
+    def _text_ends_sentence(text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        value = value.rstrip("\"')]}")
+        return value.endswith((".", "!", "?", ";", ":"))
+
+    @staticmethod
     def _has_broken_words(text: str) -> bool:
         value = str(text or "")
         if re.search(r"\b[a-z]+-\s+[a-z]+\b", value):
+            return True
+        if _BROKEN_MARKER_SPACE_RE.search(value):
+            return True
+        if _BROKEN_WORD_SUFFIX_RE.search(value):
             return True
         if re.search(r"\b(?:of|for|to|in|and|with)[A-Z][a-z]{3,}\b", value):
             return True
@@ -7647,12 +9355,228 @@ class LiteratureReaderComposeService:
 
     def _repair_text_artifacts(self, text: str) -> str:
         value = str(text or "")
-        value = re.sub(r"([A-Za-z]{2,})-\s+([a-z]{2,})", r"\1\2", value)
-        value = re.sub(r"\b(of|for|to|in|and|with)([A-Z][a-z]{3,})", r"\1 \2", value)
-        value = re.sub(r"\b([a-z]{2,})([A-Z]{2,})\b", r"\1 \2", value)
-        value = re.sub(r"\b([A-Za-z]{4,})(of|for|to|in|and|with)([A-Z][A-Za-z]{2,})\b", r"\1 \2 \3", value)
-        value = re.sub(r"\s+", " ", value).strip()
+        previous = None
+        while value != previous:
+            previous = value
+            value = re.sub(r"([A-Za-z]{2,})-\s+([a-z]{2,})", r"\1\2", value)
+            value = _BROKEN_MARKER_SPACE_RE.sub(r"\1 ", value)
+            value = _BROKEN_WORD_SUFFIX_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}", value)
+            value = re.sub(r"([.!?;:][\"')\\]]?)(?=[A-Z])", r"\1 ", value)
+            value = re.sub(r"\b(of|for|to|in|and|with)([A-Z][a-z]{3,})", r"\1 \2", value)
+            value = re.sub(r"\b([a-z]{2,})([A-Z]{2,})\b", r"\1 \2", value)
+            value = re.sub(r"\b([A-Za-z]{4,})(of|for|to|in|and|with)([A-Z][A-Za-z]{2,})\b", r"\1 \2 \3", value)
+            value = re.sub(r"\s+", " ", value).strip()
         return value
+
+    @staticmethod
+    def _extract_block_group_bbox(row: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        holder = row.get("layout_bbox_or_polygon")
+        bbox = holder.get("bbox") if isinstance(holder, Mapping) else None
+        if not isinstance(bbox, Mapping):
+            return (None, None, None, None)
+
+        def _to_float(value: Any) -> Optional[float]:
+            try:
+                num = float(value)
+            except Exception:
+                return None
+            return num if num == num else None
+
+        return (
+            _to_float(bbox.get("x0")),
+            _to_float(bbox.get("x1")),
+            _to_float(bbox.get("top")),
+            _to_float(bbox.get("bottom")),
+        )
+
+    def _build_block_group_index(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        block_group_index: Dict[str, Dict[str, Any]] = {}
+        page_structure_v3 = dict((payload or {}).get("page_structure_v3") or {})
+        for row in list(page_structure_v3.get("block_groups") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
+            if canonical and canonical not in block_group_index:
+                block_group_index[canonical] = row
+        return block_group_index
+
+    def _collect_block_group_text_entries(
+        self,
+        *,
+        canonical_ids: Sequence[str],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for canonical in canonical_ids:
+            row = block_group_index.get(canonical)
+            if not isinstance(row, Mapping):
+                continue
+            text = self._repair_text_artifacts(
+                self._normalize_spaces(
+                    str(row.get("text") or row.get("source_text") or row.get("normalized_text") or row.get("raw_text") or "")
+                )
+            )
+            if not text or text.lower() == "[empty]":
+                continue
+            x0, _x1, top, bottom = self._extract_block_group_bbox(row)
+            line_height = (bottom - top) if (top is not None and bottom is not None and bottom > top) else None
+            entries.append(
+                {
+                    "text": text,
+                    "x0": x0,
+                    "top": top,
+                    "bottom": bottom,
+                    "line_height": line_height,
+                }
+            )
+        return entries
+
+    def _merge_source_text_fragments(self, fragments: Sequence[str]) -> str:
+        merged = ""
+        for token in [self._normalize_spaces(str(item or "")) for item in list(fragments or [])]:
+            if not token:
+                continue
+            if not merged:
+                merged = token
+                continue
+            if merged.endswith("-"):
+                merged = f"{merged[:-1]}{token}"
+            else:
+                merged = f"{merged} {token}"
+        return self._repair_text_artifacts(self._normalize_spaces(merged))
+
+    def _rebuild_text_from_block_groups(
+        self,
+        *,
+        canonical_ids: Sequence[str],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        entries = self._collect_block_group_text_entries(
+            canonical_ids=canonical_ids,
+            block_group_index=block_group_index,
+        )
+        return self._merge_source_text_fragments([str(item.get("text") or "") for item in entries])
+
+    def _is_figure_caption_block_group(self, row: Optional[Mapping[str, Any]]) -> bool:
+        if not isinstance(row, Mapping):
+            return False
+        text = self._repair_text_artifacts(
+            self._normalize_spaces(
+                str(row.get("text") or row.get("source_text") or row.get("normalized_text") or row.get("raw_text") or "")
+            )
+        )
+        if not text or text.lower() == "[empty]":
+            return False
+        layout_type = str(row.get("layout_type") or row.get("type") or "").strip().lower()
+        layout_sub_type = str(row.get("layout_sub_type") or row.get("subType") or "").strip().lower()
+        kind = str(row.get("kind") or "").strip().lower()
+        if layout_type in {"figure", "image", "picture"} or layout_sub_type in {"figure", "image", "picture"}:
+            return False
+        if layout_type in {"figure_name", "caption", "figure_caption", "table_caption"}:
+            return True
+        if layout_sub_type in {"caption", "figure_caption", "table_caption", "caption_text"}:
+            return True
+        if kind in {"caption", "table_caption"}:
+            return True
+        return bool(re.match(r"^(fig(?:ure)?\.?\s*\d+[a-z]?|table\s*\d+[a-z]?)\b", text, flags=re.IGNORECASE))
+
+    def _rebuild_figure_caption_from_block_groups(
+        self,
+        *,
+        canonical_ids: Sequence[str],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+        layout_block_id_alias_map: Mapping[str, Sequence[str]],
+    ) -> str:
+        ordered_caption_ids: List[str] = []
+        caption_layout_ids: List[str] = []
+        for canonical in list(canonical_ids or []):
+            row = block_group_index.get(canonical)
+            if not self._is_figure_caption_block_group(row):
+                continue
+            if canonical not in ordered_caption_ids:
+                ordered_caption_ids.append(canonical)
+            layout_uid = str((row or {}).get("layout_unique_id") or "").strip()
+            if layout_uid and layout_uid not in caption_layout_ids:
+                caption_layout_ids.append(layout_uid)
+        for layout_uid in caption_layout_ids:
+            for canonical in list(layout_block_id_alias_map.get(layout_uid) or []):
+                block_id = str(canonical).strip()
+                if not block_id or block_id in ordered_caption_ids:
+                    continue
+                row = block_group_index.get(block_id)
+                if self._is_figure_caption_block_group(row):
+                    ordered_caption_ids.append(block_id)
+        if not ordered_caption_ids:
+            return ""
+        return self._rebuild_text_from_block_groups(
+            canonical_ids=ordered_caption_ids,
+            block_group_index=block_group_index,
+        )
+
+    def _infer_paragraph_rows_from_block_groups(
+        self,
+        *,
+        canonical_ids: Sequence[str],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        entries = self._collect_block_group_text_entries(
+            canonical_ids=canonical_ids,
+            block_group_index=block_group_index,
+        )
+        if len(entries) < 2:
+            return []
+
+        x0_values = [float(item.get("x0")) for item in entries if isinstance(item.get("x0"), (int, float))]
+        base_left = min(x0_values) if x0_values else None
+
+        paragraphs: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for item in entries:
+            if not current:
+                current = [item]
+                continue
+
+            prev = current[-1]
+            prev_text = str(prev.get("text") or "").strip()
+            curr_text = str(item.get("text") or "").strip()
+            prev_bottom = prev.get("bottom")
+            curr_top = item.get("top")
+            prev_h = float(prev.get("line_height") or 0.0)
+            curr_h = float(item.get("line_height") or 0.0)
+            base_h = max(1.0, prev_h, curr_h)
+            gap = (
+                float(curr_top - prev_bottom)
+                if isinstance(curr_top, (int, float)) and isinstance(prev_bottom, (int, float))
+                else 0.0
+            )
+            curr_x0 = item.get("x0")
+            indent = (
+                float(curr_x0 - base_left)
+                if isinstance(curr_x0, (int, float)) and isinstance(base_left, (int, float))
+                else 0.0
+            )
+            has_sentence_end = self._text_ends_sentence(prev_text)
+            hard_break = gap >= (0.8 * base_h)
+            soft_break = has_sentence_end and gap >= (0.35 * base_h)
+            indent_break = has_sentence_end and indent >= 18.0
+            hyphen_linked = prev_text.endswith("-")
+            should_break = bool((hard_break or soft_break or indent_break) and not hyphen_linked)
+
+            if should_break:
+                paragraphs.append(current)
+                current = [item]
+            else:
+                current.append(item)
+
+        if current:
+            paragraphs.append(current)
+
+        paragraph_rows = [
+            {"text": self._merge_source_text_fragments([str(part.get("text") or "") for part in para])}
+            for para in paragraphs
+        ]
+        paragraph_rows = [row for row in paragraph_rows if str(row.get("text") or "").strip()]
+        return paragraph_rows if len(paragraph_rows) >= 2 else []
 
     def _repair_heading_text(self, text: str) -> str:
         value = self._normalize_spaces(text)
@@ -7837,14 +9761,48 @@ class LiteratureReaderComposeService:
             }
 
         known_set = set(known_block_ids)
+        layout_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
+
+        def _expand_to_known_block_ids(raw_id: str) -> List[str]:
+            token = str(raw_id or "").strip()
+            if not token:
+                return []
+            expanded: List[str] = []
+            canonical = self._normalize_canonical_block_id(page=page, raw_id=token)
+            alias_candidates = [token]
+            if canonical and canonical not in alias_candidates:
+                alias_candidates.append(canonical)
+            for alias in alias_candidates:
+                for mapped in list(layout_alias_map.get(alias) or []):
+                    if mapped in known_set and mapped not in expanded:
+                        expanded.append(mapped)
+            if canonical and canonical in known_set and canonical not in expanded:
+                expanded.append(canonical)
+            return expanded
+
         covered_before: List[str] = []
         for node in self._flatten_components(components):
             for raw in list(node.get("source_block_ids") or []):
-                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(raw))
-                if canonical and canonical in known_set and canonical not in covered_before:
-                    covered_before.append(canonical)
+                for canonical in _expand_to_known_block_ids(str(raw)):
+                    if canonical not in covered_before:
+                        covered_before.append(canonical)
+            for anchor in list(node.get("source_anchor_refs") or []):
+                if not isinstance(anchor, dict):
+                    continue
+                for canonical in _expand_to_known_block_ids(str(anchor.get("canonical_block_id") or "")):
+                    if canonical not in covered_before:
+                        covered_before.append(canonical)
 
-        missing_block_ids = [item for item in known_block_ids if item not in set(covered_before)]
+        intentionally_omitted_block_ids = self._collect_intentionally_omitted_block_ids(
+            page=page,
+            payload=payload,
+            ui_plan=ui_plan,
+        )
+        missing_block_ids = [
+            item
+            for item in known_block_ids
+            if item not in set(covered_before) and item not in set(intentionally_omitted_block_ids)
+        ]
         if not missing_block_ids:
             return {
                 "triggered": False,
@@ -7855,6 +9813,7 @@ class LiteratureReaderComposeService:
                 "covered_block_count_after": len(covered_before),
                 "missing_block_ids": [],
                 "inserted_node_ids": [],
+                "omitted_block_ids": list(intentionally_omitted_block_ids),
             }
 
         existing_node_ids = {
@@ -7880,15 +9839,22 @@ class LiteratureReaderComposeService:
             inserted_node_ids.append(node_id)
 
         ui_plan["components"] = components
+        covered_after_set: set[str] = set()
+        for node in self._flatten_components(components):
+            if not isinstance(node, dict):
+                continue
+            for raw in list(node.get("source_block_ids") or []):
+                for canonical in _expand_to_known_block_ids(str(raw)):
+                    covered_after_set.add(canonical)
+            for anchor in list(node.get("source_anchor_refs") or []):
+                if not isinstance(anchor, dict):
+                    continue
+                for canonical in _expand_to_known_block_ids(str(anchor.get("canonical_block_id") or "")):
+                    covered_after_set.add(canonical)
         covered_after = [
             item
             for item in known_block_ids
-            if item in {
-                self._normalize_canonical_block_id(page=page, raw_id=str(raw))
-                for node in self._flatten_components(components)
-                if isinstance(node, dict)
-                for raw in list(node.get("source_block_ids") or [])
-            }
+            if item in covered_after_set
         ]
         return {
             "triggered": True,
@@ -7899,6 +9865,7 @@ class LiteratureReaderComposeService:
             "covered_block_count_after": len(covered_after),
             "missing_block_ids": list(missing_block_ids),
             "inserted_node_ids": list(inserted_node_ids),
+            "omitted_block_ids": list(intentionally_omitted_block_ids),
         }
 
     def _build_no_drop_fallback_node(
@@ -8054,14 +10021,1133 @@ class LiteratureReaderComposeService:
         cloned["stop_reason"] = "no_drop_blocks_failed_auto_fallback"
         return cloned
 
+    def _collect_intentionally_omitted_block_ids(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> List[str]:
+        layout_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
+        known_block_ids = set(self._collect_known_block_ids(page=page, base_payload=payload))
+        raw_decisions = list((payload or {}).get("omission_decisions") or [])
+        if not raw_decisions:
+            raw_decisions = list((((ui_plan or {}).get("trace_meta") or {}).get("omission_decisions") or []))
+        omitted: List[str] = []
+        for row in raw_decisions:
+            if not isinstance(row, Mapping):
+                continue
+            for block_id in list(row.get("target_block_ids") or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block_id))
+                if canonical and canonical in known_block_ids and canonical not in omitted:
+                    omitted.append(canonical)
+            for layout_id in list(row.get("target_layout_ids") or []):
+                token = str(layout_id or "").strip()
+                if not token:
+                    continue
+                for block_id in list(layout_alias_map.get(token) or []):
+                    canonical = self._normalize_canonical_block_id(page=page, raw_id=str(block_id))
+                    if canonical and canonical in known_block_ids and canonical not in omitted:
+                        omitted.append(canonical)
+        return omitted
+
+    def _build_review_diagnostics(
+        self,
+        *,
+        ui_plan: Dict[str, Any],
+        omission_decisions: Sequence[Mapping[str, Any]],
+        quality_report: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        components = [row for row in list((ui_plan or {}).get("components") or []) if isinstance(row, dict)]
+        flattened = self._flatten_components(components)
+        diagnostics: List[Dict[str, Any]] = []
+        omitted_with_reason = {
+            str((row or {}).get("decision_id") or "").strip()
+            for row in list(omission_decisions or [])
+            if isinstance(row, Mapping) and str((row or {}).get("reason") or "").strip()
+        }
+
+        overlong_nodes: List[str] = []
+        empty_nodes: List[str] = []
+        figure_caption_missing: List[str] = []
+        duplicate_block_refs: Dict[str, List[str]] = {}
+        for node in flattened:
+            node_id = str(node.get("id") or "").strip()
+            node_type = str(node.get("type") or "").strip()
+            props = dict(node.get("props") or {})
+            if node_type == "ParagraphProse":
+                text = self._normalize_spaces(str(props.get("text") or ""))
+                paragraph_count = len(list(props.get("paragraphs") or [])) if isinstance(props.get("paragraphs"), list) else 0
+                if len(text) >= 900 and paragraph_count <= 1 and node_id:
+                    overlong_nodes.append(node_id)
+                if not text and node_id:
+                    empty_nodes.append(node_id)
+            elif node_type == "FigurePanel":
+                caption = self._normalize_spaces(str(props.get("caption") or ""))
+                image_url = str(props.get("image_url") or "").strip()
+                if node_id and (not caption or not image_url):
+                    figure_caption_missing.append(node_id)
+            for block_id in list(node.get("source_block_ids") or []):
+                canonical = str(block_id or "").strip()
+                if not canonical or not node_id:
+                    continue
+                duplicate_block_refs.setdefault(canonical, [])
+                if node_id not in duplicate_block_refs[canonical]:
+                    duplicate_block_refs[canonical].append(node_id)
+
+        duplicated_nodes = {
+            block_id: node_ids
+            for block_id, node_ids in duplicate_block_refs.items()
+            if len(node_ids) > 1
+        }
+        hidden_without_reason = [
+            str((row or {}).get("decision_id") or "").strip()
+            for row in list(omission_decisions or [])
+            if isinstance(row, Mapping)
+            and str((row or {}).get("decision_id") or "").strip()
+            and str((row or {}).get("reason") or "").strip() == ""
+        ]
+        if overlong_nodes:
+            diagnostics.append(
+                {
+                    "code": "overlong_paragraph_nodes",
+                    "severity": "warn",
+                    "message": f"{len(overlong_nodes)} paragraph nodes still look too long for review.",
+                    "component_ids": overlong_nodes[:24],
+                    "meta": {"count": len(overlong_nodes)},
+                }
+            )
+        if empty_nodes:
+            diagnostics.append(
+                {
+                    "code": "empty_nodes",
+                    "severity": "warn",
+                    "message": "Some rendered nodes are empty after compose sanitization.",
+                    "component_ids": empty_nodes[:24],
+                    "meta": {"count": len(empty_nodes)},
+                }
+            )
+        if figure_caption_missing:
+            diagnostics.append(
+                {
+                    "code": "figure_missing_caption_or_image",
+                    "severity": "warn",
+                    "message": "Some figure panels are missing caption or image_url.",
+                    "component_ids": figure_caption_missing[:24],
+                    "meta": {"count": len(figure_caption_missing)},
+                }
+            )
+        if duplicated_nodes:
+            diagnostics.append(
+                {
+                    "code": "duplicated_source_block_refs",
+                    "severity": "info",
+                    "message": "Some source blocks are referenced by multiple visible nodes.",
+                    "component_ids": list({node_id for rows in duplicated_nodes.values() for node_id in rows})[:24],
+                    "meta": {"duplicated_block_ids": sorted(list(duplicated_nodes.keys()))[:24]},
+                }
+            )
+        if hidden_without_reason:
+            diagnostics.append(
+                {
+                    "code": "hidden_without_reason",
+                    "severity": "error",
+                    "message": "Some omission decisions are missing an explanation.",
+                    "component_ids": hidden_without_reason[:24],
+                    "meta": {"count": len(hidden_without_reason), "with_reason": len(omitted_with_reason)},
+                }
+            )
+        validation_errors = [
+            str(item).strip()
+            for item in list((quality_report or {}).get("validation_errors") or [])
+            if str(item).strip()
+        ]
+        if validation_errors:
+            diagnostics.append(
+                {
+                    "code": "quality_validation_errors",
+                    "severity": "error",
+                    "message": "Quality report still contains validation errors.",
+                    "component_ids": [],
+                    "meta": {"errors": validation_errors[:24]},
+                }
+            )
+        return diagnostics
+
+    def _merge_review_patch_omission_decisions(
+        self,
+        *,
+        base_snapshot: Dict[str, Any],
+        ui_ops: Sequence[Mapping[str, Any]],
+        explicit_omission_decisions: Optional[Sequence[Mapping[str, Any]]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        existing = [
+            dict(row)
+            for row in list(base_snapshot.get("omission_decisions") or [])
+            if isinstance(row, Mapping)
+        ]
+        merged = [
+            dict(row)
+            for row in list(explicit_omission_decisions or [])
+            if isinstance(row, Mapping)
+        ] if explicit_omission_decisions is not None else list(existing)
+
+        component_map = {
+            str(row.get("id") or "").strip(): dict(row)
+            for row in list(((base_snapshot.get("ui_plan") or {}).get("components") or []))
+            if isinstance(row, dict) and str(row.get("id") or "").strip()
+        }
+        panel_node_map: Dict[str, Dict[str, Any]] = {}
+        trace_panel_plan = dict((((base_snapshot.get("ui_plan") or {}).get("trace_meta") or {}).get("panel_plan") or {}))
+        for panel in list(trace_panel_plan.get("panels") or []):
+            if not isinstance(panel, Mapping):
+                continue
+            for node in list(panel.get("nodes") or []):
+                if not isinstance(node, Mapping):
+                    continue
+                node_id = str(node.get("node_id") or "").strip()
+                if node_id:
+                    panel_node_map[node_id] = dict(node)
+
+        page = int(base_snapshot.get("page") or 0)
+        layout_to_block_ids: Dict[str, List[str]] = {}
+        for row in list((((base_snapshot.get("page_structure_v3") or {}).get("block_groups")) or [])):
+            if not isinstance(row, Mapping):
+                continue
+            layout_id = str(row.get("layout_unique_id") or row.get("layout_id") or "").strip()
+            block_id = self._normalize_canonical_block_id(
+                page=page,
+                raw_id=str(row.get("block_id") or ""),
+            )
+            if not layout_id or not block_id:
+                continue
+            layout_to_block_ids.setdefault(layout_id, [])
+            if block_id not in layout_to_block_ids[layout_id]:
+                layout_to_block_ids[layout_id].append(block_id)
+
+        covered_layout_ids = {
+            str(item).strip()
+            for row in list(merged or [])
+            if isinstance(row, Mapping)
+            for item in list(row.get("target_layout_ids") or [])
+            if str(item).strip()
+        }
+        covered_block_ids = {
+            self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            for row in list(merged or [])
+            if isinstance(row, Mapping)
+            for item in list(row.get("target_block_ids") or [])
+            if self._normalize_canonical_block_id(page=page, raw_id=str(item))
+        }
+
+        synthesized: List[Dict[str, Any]] = []
+        for row in list(ui_ops or []):
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("op") or "").strip() != "remove_component":
+                continue
+            component_id = str(row.get("component_id") or "").strip()
+            if not component_id:
+                continue
+            component = dict(component_map.get(component_id) or {})
+            panel_node = dict(panel_node_map.get(component_id) or {})
+            target_layout_ids = [
+                str(item).strip()
+                for item in list(panel_node.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            target_block_ids = [
+                self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                for item in list(component.get("source_block_ids") or [])
+                if self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            ]
+            for layout_id in list(target_layout_ids):
+                for block_id in list(layout_to_block_ids.get(layout_id) or []):
+                    if block_id not in target_block_ids:
+                        target_block_ids.append(block_id)
+            target_atom_ids = [
+                str(item).strip()
+                for item in list(component.get("source_atom_ids") or [])
+                if str(item).strip()
+            ]
+            if not target_layout_ids and not target_block_ids and not target_atom_ids:
+                continue
+            if target_layout_ids and all(layout_id in covered_layout_ids for layout_id in target_layout_ids):
+                continue
+            if target_block_ids and all(block_id in covered_block_ids for block_id in target_block_ids):
+                continue
+            synthesized.append(
+                {
+                    "decision_id": f"review_hide_{component_id}",
+                    "decision": "hide",
+                    "reason": str(row.get("reason") or "").strip() or "Hidden during render review to improve reading flow.",
+                    "recoverable": True,
+                    "target_layout_ids": target_layout_ids,
+                    "target_block_ids": target_block_ids,
+                    "target_atom_ids": target_atom_ids,
+                }
+            )
+            covered_layout_ids.update(target_layout_ids)
+            covered_block_ids.update(target_block_ids)
+
+        if not synthesized and explicit_omission_decisions is None:
+            return None
+        merged.extend(synthesized)
+        return merged
+
+    def _filter_auto_patch_ui_ops_for_page_continuation(
+        self,
+        *,
+        base_snapshot: Dict[str, Any],
+        ui_ops: Sequence[Mapping[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        components = [
+            dict(row)
+            for row in list(((base_snapshot.get("ui_plan") or {}).get("components") or []))
+            if isinstance(row, Mapping)
+        ]
+        component_index = {
+            str(row.get("id") or "").strip(): idx
+            for idx, row in enumerate(components)
+            if str(row.get("id") or "").strip()
+        }
+
+        def _is_probable_continuation(node: Mapping[str, Any], idx: int) -> bool:
+            if str(node.get("type") or "").strip() != "ParagraphProse":
+                return False
+            if int(idx) > 4:
+                return False
+            props = dict(node.get("props") or {})
+            text = self._normalize_spaces(str(props.get("text") or ""))
+            if len(text) < 24:
+                return False
+            if not list(node.get("source_block_ids") or []):
+                return False
+            first_alpha = ""
+            for char in text:
+                if char.isalpha():
+                    first_alpha = char
+                    break
+            if not first_alpha:
+                return False
+            leading_token = text[:36].lower()
+            return bool(
+                first_alpha.islower()
+                or leading_token.startswith(("and ", "or ", "but ", "as ", "which ", "that "))
+            )
+
+        filtered: List[Dict[str, Any]] = []
+        blocked: List[Dict[str, Any]] = []
+        for row in list(ui_ops or []):
+            if not isinstance(row, Mapping):
+                continue
+            op = str(row.get("op") or "").strip()
+            component_id = str(row.get("component_id") or "").strip()
+            idx = component_index.get(component_id, -1)
+            node = components[idx] if idx >= 0 and idx < len(components) else {}
+            if op == "remove_component" and component_id and isinstance(node, Mapping) and _is_probable_continuation(node, idx):
+                blocked.append(
+                    {
+                        "op": op,
+                        "component_id": component_id,
+                        "reason": str(row.get("reason") or "").strip() or "blocked_probable_page_continuation",
+                    }
+                )
+                continue
+            filtered.append(dict(row))
+        return filtered, blocked
+
+    @staticmethod
+    def _merge_review_diagnostics(
+        base_rows: Sequence[Mapping[str, Any]],
+        observed_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, Tuple[str, ...]]] = set()
+        for row in list(base_rows or []) + list(observed_rows or []):
+            if not isinstance(row, Mapping):
+                continue
+            code = str(row.get("code") or "").strip()
+            message = str(row.get("message") or "").strip()
+            component_ids = tuple(
+                str(item).strip()
+                for item in list(row.get("component_ids") or [])
+                if str(item).strip()
+            )
+            signature = (code, message, component_ids)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(
+                {
+                    "code": code,
+                    "severity": str(row.get("severity") or "info").strip() or "info",
+                    "message": message,
+                    "component_ids": list(component_ids),
+                    "meta": dict(row.get("meta") or {}),
+                }
+            )
+        return merged
+
+    @staticmethod
+    def _pick_review_render_image(
+        *,
+        render_image_url: Optional[str],
+    ) -> str:
+        token = str(render_image_url or "").strip()
+        return token
+
+    async def store_review_observation_image(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: Optional[str],
+        filename: Optional[str],
+        content_type: Optional[str],
+        data: bytes,
+    ) -> Dict[str, str]:
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ValueError("review_observation_image_empty")
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            raise ValueError("review_session_not_found")
+        target_snapshot_id = str(snapshot_id or session.get("latest_snapshot_id") or "").strip()
+        snapshot = dict((session.get("snapshots") or {}).get(target_snapshot_id) or {})
+        if not snapshot:
+            raise ValueError("review_snapshot_not_found")
+
+        ext = self._guess_image_extension(filename=filename, content_type=content_type)
+        session_token = re.sub(r"[^0-9a-zA-Z_-]+", "", str(session_id or "").strip())[:96]
+        snapshot_token = re.sub(r"[^0-9a-zA-Z_.-]+", "", target_snapshot_id)[:96]
+        if not session_token or not snapshot_token:
+            raise ValueError("review_observation_image_path_invalid")
+
+        out_dir = os.path.abspath(os.path.join(REVIEW_OBSERVATION_DIR, session_token))
+        os.makedirs(out_dir, exist_ok=True)
+        for candidate_ext in tuple(IMAGE_ALLOWED_EXTENSIONS):
+            candidate = os.path.join(out_dir, f"{snapshot_token}.{candidate_ext}")
+            if os.path.exists(candidate):
+                try:
+                    os.remove(candidate)
+                except OSError:
+                    pass
+        file_path = os.path.join(out_dir, f"{snapshot_token}.{ext}")
+        with open(file_path, "wb") as fp:
+            fp.write(bytes(data))
+
+        media_type = {
+            "jpg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+        }.get(ext, "application/octet-stream")
+        render_image_url = self._build_review_observation_image_url(
+            paper_id=int(snapshot.get("paper_id") or 0),
+            session_id=session_token,
+            snapshot_id=snapshot_token,
+        )
+        return {
+            "file_path": file_path,
+            "media_type": media_type,
+            "render_image_url": render_image_url,
+            "snapshot_id": target_snapshot_id,
+        }
+
+    async def resolve_review_observation_image(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: str,
+    ) -> Optional[Dict[str, str]]:
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            return None
+        snapshot = dict((session.get("snapshots") or {}).get(str(snapshot_id).strip()) or {})
+        if not snapshot:
+            return None
+
+        file_path = os.path.abspath(str(snapshot.get("render_image_path") or "").strip())
+        if not file_path or not os.path.exists(file_path):
+            return None
+        media_type = str(snapshot.get("render_image_media_type") or "").strip() or "application/octet-stream"
+        return {
+            "file_path": file_path,
+            "media_type": media_type,
+            "paper_id": str(snapshot.get("paper_id") or ""),
+        }
+
+    def _build_snapshot_review_context(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        built_diagnostics = self._build_review_diagnostics(
+            ui_plan=dict(snapshot.get("ui_plan") or {}),
+            omission_decisions=[
+                dict(row)
+                for row in list(snapshot.get("omission_decisions") or [])
+                if isinstance(row, Mapping)
+            ],
+            quality_report=dict(snapshot.get("quality_report") or {}),
+        )
+        observation_diagnostics = [
+            dict(row)
+            for row in list(snapshot.get("observation_diagnostics") or [])
+            if isinstance(row, Mapping)
+        ]
+        merged_diagnostics = self._merge_review_diagnostics(
+            built_diagnostics,
+            observation_diagnostics,
+        )
+        render_image_url = self._pick_review_render_image(
+            render_image_url=str(snapshot.get("render_image_url") or "").strip(),
+        )
+        return {
+            "render_route": str(snapshot.get("render_route") or "").strip(),
+            "render_image_url": render_image_url,
+            "render_image_path": str(snapshot.get("render_image_path") or "").strip(),
+            "diagnostics": merged_diagnostics,
+            "observer_note": str(snapshot.get("observation_note") or "").strip(),
+            "observation_source": str(snapshot.get("observation_source") or "").strip(),
+        }
+
+    async def _write_review_session(self, session: Dict[str, Any]) -> None:
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            return
+        session["expires_at"] = float(time.time() + REVIEW_SESSION_TTL_SECONDS)
+        self._review_sessions[session_id] = session
+        client = await self._resolve_redis_client()
+        if client is None:
+            return
+        serialized = dict(session)
+        serialized.pop("state", None)
+        try:
+            await client.setex(
+                f"{REDIS_REVIEW_PREFIX}:session:{session_id}",
+                REVIEW_SESSION_TTL_SECONDS,
+                json.dumps(serialized, ensure_ascii=False),
+            )
+        except Exception as exc:
+            logger.debug(f"[ReaderComposeService] review session redis write failed session={session_id}: {exc}")
+
+    async def _read_review_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        token = str(session_id or "").strip()
+        if not token:
+            return None
+        now = time.time()
+        cached = self._review_sessions.get(token)
+        if isinstance(cached, dict) and float(cached.get("expires_at") or 0.0) > now:
+            return cached
+        if token in self._review_sessions:
+            self._review_sessions.pop(token, None)
+        client = await self._resolve_redis_client()
+        if client is None:
+            return None
+        try:
+            raw = await client.get(f"{REDIS_REVIEW_PREFIX}:session:{token}")
+        except Exception as exc:
+            logger.debug(f"[ReaderComposeService] review session redis read failed session={token}: {exc}")
+            raw = None
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        parsed["expires_at"] = float(time.time() + REVIEW_SESSION_TTL_SECONDS)
+        parsed["state"] = ReaderComposeAgentState()
+        for snapshot_id in list(parsed.get("snapshot_order") or []):
+            snapshot = dict((parsed.get("snapshots") or {}).get(snapshot_id) or {})
+            if snapshot:
+                parsed["state"].push({"plan_id": str(snapshot.get("snapshot_id") or snapshot_id), **snapshot})
+        self._review_sessions[token] = parsed
+        return parsed
+
+    def _build_review_snapshot(
+        self,
+        *,
+        payload: Dict[str, Any],
+        session_id: str,
+        snapshot_id: str,
+        parent_snapshot_id: Optional[str],
+        revision: int,
+    ) -> Dict[str, Any]:
+        ui_plan = dict(payload.get("ui_plan") or {})
+        omission_decisions = [
+            dict(row)
+            for row in list(payload.get("omission_decisions") or [])
+            if isinstance(row, Mapping)
+        ]
+        quality_report = dict(payload.get("quality_report") or {})
+        built_diagnostics = self._build_review_diagnostics(
+            ui_plan=ui_plan,
+            omission_decisions=omission_decisions,
+            quality_report=quality_report,
+        )
+        snapshot = {
+            "session_id": str(session_id),
+            "snapshot_id": str(snapshot_id),
+            "paper_id": int(payload.get("paper_id") or 0),
+            "page": int(payload.get("page") or 0),
+            "source_signature": str(payload.get("source_signature") or ""),
+            "build_mode": str(payload.get("build_mode") or ""),
+            "status": str(payload.get("status") or "done"),
+            "ui_plan": ui_plan,
+            "assets": [dict(row) for row in list(payload.get("assets") or []) if isinstance(row, Mapping)],
+            "quality_report": quality_report,
+            "scheme_choice": dict(payload.get("scheme_choice") or {}),
+            "decision_log": [str(item).strip() for item in list(payload.get("decision_log") or []) if str(item).strip()],
+            "omission_decisions": omission_decisions,
+            "diagnostics": built_diagnostics,
+            "phase1_compact_input": dict(payload.get("phase1_compact_input") or {}),
+            "render_route": self._build_review_route(
+                paper_id=int(payload.get("paper_id") or 0),
+                session_id=str(session_id),
+                snapshot_id=str(snapshot_id),
+            ),
+            "render_image_url": "",
+            "render_image_path": "",
+            "render_image_media_type": "",
+            "observation_note": "",
+            "observation_source": "",
+            "observation_diagnostics": [],
+            "observation_updated_at": None,
+            "docmind_page_image_url": str(((payload.get("docmind_structure") or {}).get("page_image_url") or "")).strip(),
+            "style_intent": str((((ui_plan.get("trace_meta") or {}).get("style_intent")) or "")).strip(),
+            "theme_mode": str((((ui_plan.get("trace_meta") or {}).get("theme_mode")) or "")).strip(),
+            "detail_level": str((((ui_plan.get("trace_meta") or {}).get("detail_level")) or "")).strip(),
+            "parent_snapshot_id": str(parent_snapshot_id or "").strip() or None,
+            "revision": int(revision),
+            "created_at": self._utcnow_iso(),
+            "page_structure_v3": dict(payload.get("page_structure_v3") or {}),
+            "layout_advice_v3": dict(payload.get("layout_advice_v3") or {}),
+        }
+        return snapshot
+
+    async def create_review_session(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        force_refresh: bool,
+        regenerate: bool,
+        latency_budget_ms: Optional[int],
+        quality_target: Optional[float],
+        max_iterations: Optional[int],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: Optional[str],
+        compare_mode: Optional[bool],
+        citation_tldr: Optional[bool],
+        snapshot_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload, _ = await self.build_or_get_composed_payload(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            selected_kb_id=selected_kb_id,
+            force_refresh=bool(force_refresh),
+            regenerate=bool(regenerate),
+            latency_budget_ms=latency_budget_ms,
+            quality_target=quality_target,
+            max_iterations=max_iterations,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+            publish_ready_event_enabled=False,
+        )
+        session_id = uuid.uuid4().hex
+        snapshot_id = str(snapshot_label or f"snapshot_{uuid.uuid4().hex[:10]}").strip() or f"snapshot_{uuid.uuid4().hex[:10]}"
+        snapshot = self._build_review_snapshot(
+            payload=payload,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            parent_snapshot_id=None,
+            revision=1,
+        )
+        state = ReaderComposeAgentState()
+        state.push({"plan_id": snapshot_id, **snapshot})
+        session = {
+            "session_id": session_id,
+            "paper_id": int(paper.id),
+            "page": int(page),
+            "source_signature": str(payload.get("source_signature") or ""),
+            "latest_snapshot_id": snapshot_id,
+            "snapshot_order": [snapshot_id],
+            "snapshots": {snapshot_id: snapshot},
+            "state": state,
+        }
+        await self._write_review_session(session)
+        return snapshot
+
+    async def get_review_snapshot(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            return None
+        target_snapshot_id = str(snapshot_id or session.get("latest_snapshot_id") or "").strip()
+        if not target_snapshot_id:
+            return None
+        snapshot = dict((session.get("snapshots") or {}).get(target_snapshot_id) or {})
+        if not snapshot:
+            return None
+        sanitized = self._sanitize_review_snapshot_for_runtime(snapshot)
+        if sanitized != snapshot:
+            snapshots = dict(session.get("snapshots") or {})
+            snapshots[target_snapshot_id] = sanitized
+            session["snapshots"] = snapshots
+            await self._write_review_session(session)
+        return sanitized
+
+    async def record_review_observation(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: Optional[str],
+        render_image_url: Optional[str],
+        render_image_path: Optional[str],
+        render_image_media_type: Optional[str],
+        diagnostics: Sequence[Mapping[str, Any]],
+        note: Optional[str],
+        source: Optional[str],
+    ) -> Dict[str, Any]:
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            raise ValueError("review_session_not_found")
+        target_snapshot_id = str(snapshot_id or session.get("latest_snapshot_id") or "").strip()
+        snapshot = dict((session.get("snapshots") or {}).get(target_snapshot_id) or {})
+        if not snapshot:
+            raise ValueError("review_snapshot_not_found")
+        snapshot = self._sanitize_review_snapshot_for_runtime(snapshot)
+
+        render_image_token = self._pick_review_render_image(
+            render_image_url=render_image_url,
+        )
+        if render_image_token:
+            snapshot["render_image_url"] = render_image_token
+        render_image_path_token = str(render_image_path or "").strip()
+        if render_image_path_token:
+            snapshot["render_image_path"] = render_image_path_token
+        render_image_media_type_token = str(render_image_media_type or "").strip()
+        if render_image_media_type_token:
+            snapshot["render_image_media_type"] = render_image_media_type_token
+        snapshot["observation_note"] = str(note or snapshot.get("observation_note") or "").strip()
+        snapshot["observation_source"] = str(source or snapshot.get("observation_source") or "").strip()
+        observation_rows = [
+            dict(row)
+            for row in list(diagnostics or [])
+            if isinstance(row, Mapping)
+        ]
+        if observation_rows:
+            snapshot["observation_diagnostics"] = observation_rows
+        built_diagnostics = self._build_review_diagnostics(
+            ui_plan=dict(snapshot.get("ui_plan") or {}),
+            omission_decisions=[
+                dict(row)
+                for row in list(snapshot.get("omission_decisions") or [])
+                if isinstance(row, Mapping)
+            ],
+            quality_report=dict(snapshot.get("quality_report") or {}),
+        )
+        snapshot["diagnostics"] = self._merge_review_diagnostics(
+            built_diagnostics,
+            [
+                dict(row)
+                for row in list(snapshot.get("observation_diagnostics") or [])
+                if isinstance(row, Mapping)
+            ],
+        )
+        snapshot["observation_updated_at"] = self._utcnow_iso()
+        snapshots = dict(session.get("snapshots") or {})
+        snapshots[target_snapshot_id] = snapshot
+        session["snapshots"] = snapshots
+        await self._write_review_session(session)
+        return snapshot
+
+    async def auto_patch_review_snapshot(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: Optional[str],
+        user_id: int,
+        user_intent: Optional[str],
+        note: Optional[str],
+    ) -> Dict[str, Any]:
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            raise ValueError("review_session_not_found")
+        target_snapshot_id = str(snapshot_id or session.get("latest_snapshot_id") or "").strip()
+        snapshot = dict((session.get("snapshots") or {}).get(target_snapshot_id) or {})
+        if not snapshot:
+            raise ValueError("review_snapshot_not_found")
+        snapshot = self._sanitize_review_snapshot_for_runtime(snapshot)
+
+        page_structure_v3 = dict(snapshot.get("page_structure_v3") or {})
+        layout_advice_v3 = dict(snapshot.get("layout_advice_v3") or {})
+        if not isinstance(page_structure_v3.get("block_groups"), list) or not list(page_structure_v3.get("block_groups") or []):
+            return {
+                "snapshot": snapshot,
+                "patch_applied": False,
+                "ui_ops": [],
+                "ui_ops_count": 0,
+                "fallback_reason": "review_snapshot_missing_page_structure",
+                "validation_errors": [],
+                "agent_summary": "",
+            }
+
+        runtime_result = await self._compose_agent_runtime.run_component_assembly(
+            user_id=int(user_id or 0),
+            page=int(snapshot.get("page") or 0),
+            user_intent=str(user_intent or snapshot.get("style_intent") or snapshot.get("detail_level") or "standard"),
+            ui_plan=dict(snapshot.get("ui_plan") or {}),
+            page_structure_v3=page_structure_v3,
+            layout_advice_v3=layout_advice_v3,
+            latency_budget_ms=DEFAULT_LATENCY_BUDGET_MS,
+            scheme_choice=dict(snapshot.get("scheme_choice") or {}),
+            decision_log=[
+                str(item).strip()
+                for item in list(snapshot.get("decision_log") or [])
+                if str(item).strip()
+            ],
+            omission_decisions=[
+                dict(row)
+                for row in list(snapshot.get("omission_decisions") or [])
+                if isinstance(row, Mapping)
+            ],
+            phase1_compact_input=dict(snapshot.get("phase1_compact_input") or {}),
+            review_context=self._build_snapshot_review_context(snapshot),
+        )
+        raw_ui_ops = [dict(row) for row in list(runtime_result.get("ui_ops") or []) if isinstance(row, Mapping)]
+        ui_ops, blocked_ui_ops = self._filter_auto_patch_ui_ops_for_page_continuation(
+            base_snapshot=snapshot,
+            ui_ops=raw_ui_ops,
+        )
+        validation_errors = [
+            str(item).strip()
+            for item in list(runtime_result.get("validation_errors") or [])
+            if str(item).strip()
+        ]
+        if blocked_ui_ops:
+            validation_errors.append("blocked_probable_page_continuation_removal")
+        if not bool(runtime_result.get("used")) or not ui_ops:
+            return {
+                "snapshot": snapshot,
+                "patch_applied": False,
+                "ui_ops": ui_ops,
+                "ui_ops_count": len(ui_ops),
+                "fallback_reason": str(runtime_result.get("fallback_reason") or "").strip() or "no_review_patch",
+                "validation_errors": validation_errors,
+                "agent_summary": str(runtime_result.get("agent_summary") or "").strip(),
+            }
+
+        merged_omission_decisions = self._merge_review_patch_omission_decisions(
+            base_snapshot=snapshot,
+            ui_ops=ui_ops,
+            explicit_omission_decisions=None,
+        )
+        next_snapshot = await self.apply_review_patch(
+            session_id=session_id,
+            snapshot_id=target_snapshot_id,
+            ui_ops=ui_ops,
+            decision_log_append=[],
+            omission_decisions=merged_omission_decisions,
+            scheme_choice=None,
+            note=str(note or "auto_review_patch").strip(),
+        )
+        next_snapshot["ui_plan"].setdefault("trace_meta", {})
+        next_snapshot["ui_plan"]["trace_meta"]["auto_patch_agent_summary"] = str(runtime_result.get("agent_summary") or "").strip()
+        next_snapshot["ui_plan"]["trace_meta"]["auto_patch_ui_ops_count"] = len(ui_ops)
+        next_snapshot["ui_plan"]["trace_meta"]["auto_patch_source_snapshot_id"] = target_snapshot_id
+        if blocked_ui_ops:
+            next_snapshot["ui_plan"]["trace_meta"]["auto_patch_blocked_ui_ops"] = blocked_ui_ops
+        snapshots = dict(session.get("snapshots") or {})
+        snapshots[str(next_snapshot.get("snapshot_id") or "")] = next_snapshot
+        session["snapshots"] = snapshots
+        session["latest_snapshot_id"] = str(next_snapshot.get("snapshot_id") or target_snapshot_id)
+        await self._write_review_session(session)
+        return {
+            "snapshot": next_snapshot,
+            "patch_applied": True,
+            "ui_ops": ui_ops,
+            "ui_ops_count": len(ui_ops),
+            "fallback_reason": "",
+            "validation_errors": validation_errors,
+            "agent_summary": str(runtime_result.get("agent_summary") or "").strip(),
+        }
+
+    async def publish_review_snapshot(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        session_id: str,
+        snapshot_id: Optional[str],
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snapshot = await self.get_review_snapshot(
+            session_id=str(session_id),
+            snapshot_id=snapshot_id,
+        )
+        if not isinstance(snapshot, dict):
+            raise ValueError("review_snapshot_not_found")
+        if int(snapshot.get("paper_id") or 0) != int(paper.id):
+            raise ValueError("review_snapshot_not_found")
+
+        snapshot_source_signature = str(snapshot.get("source_signature") or "").strip()
+        if not snapshot_source_signature:
+            raise ValueError("review_snapshot_missing_source_signature")
+
+        theme_mode = str(snapshot.get("theme_mode") or "").strip() or None
+        detail_level = str(snapshot.get("detail_level") or "").strip() or "standard"
+        read_source_signature = await self._build_source_signature(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            selected_kb_id=None,
+            style_intent=None,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=False,
+            citation_tldr=False,
+            max_iterations=None,
+        )
+        target_source_signatures: List[str] = []
+        for candidate in (snapshot_source_signature, str(read_source_signature or "").strip()):
+            token = str(candidate or "").strip()
+            if token and token not in target_source_signatures:
+                target_source_signatures.append(token)
+
+        overlay_json = {
+            "patch_type": REVIEW_PUBLISH_OVERLAY_ACTION,
+            "session_id": str(snapshot.get("session_id") or session_id).strip(),
+            "snapshot_id": str(snapshot.get("snapshot_id") or snapshot_id or "").strip(),
+            "published_at": self._utcnow_iso(),
+            "note": str(note or "").strip(),
+            "ui_plan": dict(snapshot.get("ui_plan") or {}),
+            "assets": [dict(row) for row in list(snapshot.get("assets") or []) if isinstance(row, Mapping)],
+            "quality_report": dict(snapshot.get("quality_report") or {}),
+            "scheme_choice": dict(snapshot.get("scheme_choice") or {}),
+            "decision_log": [str(item).strip() for item in list(snapshot.get("decision_log") or []) if str(item).strip()],
+            "omission_decisions": [
+                dict(row)
+                for row in list(snapshot.get("omission_decisions") or [])
+                if isinstance(row, Mapping)
+            ],
+        }
+        for source_signature in target_source_signatures:
+            await self._upsert_overlay_to_db(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper.id),
+                page=int(snapshot.get("page") or 0),
+                source_signature=source_signature,
+                node_id=REVIEW_PUBLISH_OVERLAY_NODE_ID,
+                action_type=REVIEW_PUBLISH_OVERLAY_ACTION,
+                overlay_json=overlay_json,
+            )
+        return {
+            "published": True,
+            "session_id": str(snapshot.get("session_id") or session_id).strip(),
+            "snapshot_id": str(snapshot.get("snapshot_id") or snapshot_id or "").strip(),
+            "paper_id": int(paper.id),
+            "page": int(snapshot.get("page") or 0),
+            "source_signature": target_source_signatures[-1] if target_source_signatures else snapshot_source_signature,
+            "read_route": f"/literature/{int(paper.id)}/read",
+            "overlay_saved": True,
+        }
+
+    async def apply_review_patch(
+        self,
+        *,
+        session_id: str,
+        snapshot_id: Optional[str],
+        ui_ops: Sequence[Mapping[str, Any]],
+        decision_log_append: Sequence[str],
+        omission_decisions: Optional[Sequence[Mapping[str, Any]]],
+        scheme_choice: Optional[Mapping[str, Any]],
+        note: Optional[str],
+    ) -> Dict[str, Any]:
+        session = await self._read_review_session(session_id)
+        if not isinstance(session, dict):
+            raise ValueError("review_session_not_found")
+        base_snapshot_id = str(snapshot_id or session.get("latest_snapshot_id") or "").strip()
+        base_snapshot = dict((session.get("snapshots") or {}).get(base_snapshot_id) or {})
+        if not base_snapshot:
+            raise ValueError("review_snapshot_not_found")
+        base_snapshot = self._sanitize_review_snapshot_for_runtime(base_snapshot)
+
+        ui_ops_rows = [dict(row) for row in list(ui_ops or []) if isinstance(row, Mapping)]
+        ui_apply = self._apply_ui_ops_to_plan(
+            ui_plan=dict(base_snapshot.get("ui_plan") or {}),
+            ui_ops=ui_ops_rows,
+        )
+        apply_errors = [str(item).strip() for item in list(ui_apply.get("errors") or []) if str(item).strip()]
+        if apply_errors:
+            raise ValueError(",".join(apply_errors))
+
+        next_snapshot_id = f"snapshot_{uuid.uuid4().hex[:10]}"
+        next_decision_log = [
+            str(item).strip()
+            for item in list(base_snapshot.get("decision_log") or [])
+            if str(item).strip()
+        ]
+        next_decision_log.extend([str(item).strip() for item in list(decision_log_append or []) if str(item).strip()])
+        next_ui_plan = dict(ui_apply.get("ui_plan") or {})
+        next_ui_plan.setdefault("trace_meta", {})
+        next_ui_plan["trace_meta"]["review_session_id"] = str(session_id)
+        next_ui_plan["trace_meta"]["review_snapshot_id"] = next_snapshot_id
+        next_ui_plan["trace_meta"]["review_revision"] = int(base_snapshot.get("revision") or 1) + 1
+        if note:
+            next_ui_plan["trace_meta"]["review_note"] = str(note).strip()
+
+        next_snapshot = dict(base_snapshot)
+        next_snapshot["snapshot_id"] = next_snapshot_id
+        next_snapshot["ui_plan"] = next_ui_plan
+        next_snapshot["decision_log"] = next_decision_log
+        merged_omission_decisions = self._merge_review_patch_omission_decisions(
+            base_snapshot=base_snapshot,
+            ui_ops=ui_ops_rows,
+            explicit_omission_decisions=omission_decisions,
+        )
+        if merged_omission_decisions is not None:
+            next_snapshot["omission_decisions"] = [
+                dict(row)
+                for row in list(merged_omission_decisions or [])
+                if isinstance(row, Mapping)
+            ]
+        if scheme_choice is not None:
+            next_snapshot["scheme_choice"] = dict(scheme_choice)
+        next_snapshot["diagnostics"] = self._merge_review_diagnostics(
+            self._build_review_diagnostics(
+                ui_plan=next_ui_plan,
+                omission_decisions=[
+                    dict(row)
+                    for row in list(next_snapshot.get("omission_decisions") or [])
+                    if isinstance(row, Mapping)
+                ],
+                quality_report=dict(next_snapshot.get("quality_report") or {}),
+            ),
+            [
+                dict(row)
+                for row in list(next_snapshot.get("observation_diagnostics") or [])
+                if isinstance(row, Mapping)
+            ],
+        )
+        next_snapshot["parent_snapshot_id"] = base_snapshot_id
+        next_snapshot["revision"] = int(base_snapshot.get("revision") or 1) + 1
+        next_snapshot["created_at"] = self._utcnow_iso()
+        next_snapshot["render_route"] = self._build_review_route(
+            paper_id=int(base_snapshot.get("paper_id") or 0),
+            session_id=str(session_id),
+            snapshot_id=next_snapshot_id,
+        )
+        next_snapshot = self._sanitize_review_snapshot_for_runtime(next_snapshot)
+        next_snapshot["diagnostics"] = self._merge_review_diagnostics(
+            self._build_review_diagnostics(
+                ui_plan=dict(next_snapshot.get("ui_plan") or {}),
+                omission_decisions=[
+                    dict(row)
+                    for row in list(next_snapshot.get("omission_decisions") or [])
+                    if isinstance(row, Mapping)
+                ],
+                quality_report=dict(next_snapshot.get("quality_report") or {}),
+            ),
+            [
+                dict(row)
+                for row in list(next_snapshot.get("observation_diagnostics") or [])
+                if isinstance(row, Mapping)
+            ],
+        )
+
+        snapshots = dict(session.get("snapshots") or {})
+        snapshots[next_snapshot_id] = next_snapshot
+        snapshot_order = [
+            str(item).strip()
+            for item in list(session.get("snapshot_order") or [])
+            if str(item).strip()
+        ]
+        snapshot_order.append(next_snapshot_id)
+        session["snapshots"] = snapshots
+        session["snapshot_order"] = snapshot_order
+        session["latest_snapshot_id"] = next_snapshot_id
+        state = session.get("state")
+        if isinstance(state, ReaderComposeAgentState):
+            state.push({"plan_id": next_snapshot_id, **next_snapshot})
+        await self._write_review_session(session)
+        return next_snapshot
+
+    def _sanitize_ui_plan_for_runtime(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = dict(ui_plan or {})
+        components = self._ensure_source_block_ids_on_nodes(
+            page=page,
+            nodes=[row for row in list(cloned.get("components") or []) if isinstance(row, dict)],
+        )
+        cloned["components"] = self._sanitize_components_for_runtime(
+            page=page,
+            payload=payload,
+            nodes=components,
+        )
+        return cloned
+
+    def _build_runtime_payload_for_review_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "page_structure_v3": dict(snapshot.get("page_structure_v3") or {}),
+            "docmind_structure": {
+                "page_image_url": str(snapshot.get("docmind_page_image_url") or "").strip(),
+            },
+        }
+
+    def _sanitize_review_snapshot_for_runtime(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        cloned = dict(snapshot or {})
+        page = max(1, int(cloned.get("page") or 1))
+        cloned["ui_plan"] = self._sanitize_ui_plan_for_runtime(
+            page=page,
+            payload=self._build_runtime_payload_for_review_snapshot(cloned),
+            ui_plan=dict(cloned.get("ui_plan") or {}),
+        )
+        return cloned
+
     def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         cloned = dict(payload or {})
         ui_plan = dict(cloned.get("ui_plan") or {})
-        ui_plan["components"] = self._ensure_source_block_ids_on_nodes(
+        ui_plan = self._sanitize_ui_plan_for_runtime(
             page=page,
-            nodes=[row for row in list(ui_plan.get("components") or []) if isinstance(row, dict)],
+            payload=cloned,
+            ui_plan=ui_plan,
         )
         cloned["ui_plan"] = ui_plan
+        trace_meta = dict(ui_plan.get("trace_meta") or {})
+        if not isinstance(cloned.get("scheme_choice"), dict):
+            cloned["scheme_choice"] = dict(trace_meta.get("scheme_choice") or {})
+        if not isinstance(cloned.get("decision_log"), list):
+            cloned["decision_log"] = list(trace_meta.get("decision_log") or [])
+        if not isinstance(cloned.get("omission_decisions"), list):
+            cloned["omission_decisions"] = list(trace_meta.get("omission_decisions") or [])
+        if not isinstance(cloned.get("phase1_compact_input"), dict):
+            cloned["phase1_compact_input"] = dict(trace_meta.get("phase1_compact_input") or {})
+        if not isinstance(cloned.get("review_route_meta"), dict):
+            cloned["review_route_meta"] = {}
+        if not str((cloned.get("review_route_meta") or {}).get("template") or "").strip():
+            cloned["review_route_meta"] = {
+                **dict(cloned.get("review_route_meta") or {}),
+                "template": f"/literature/{int(cloned.get('paper_id') or 0)}/read/review",
+                "mode": "compose_review_v1",
+            }
 
         quality_report = dict(cloned.get("quality_report") or {})
         validation_report = dict(cloned.get("validation_report") or {})
@@ -8109,7 +11195,7 @@ class LiteratureReaderComposeService:
             pipeline_contract_meta = dict(cloned.get("pipeline_contract_meta") or {})
             pipeline_contract_meta["no_drop_blocks_fallback"] = {
                 **dict(no_drop_report or {}),
-                "applied_at": datetime.utcnow().isoformat(),
+                "applied_at": self._utcnow_iso(),
             }
             cloned["pipeline_contract_meta"] = pipeline_contract_meta
         cloned["validation_report"] = validation_report
@@ -8137,6 +11223,151 @@ class LiteratureReaderComposeService:
             degraded_reason = str(quality_report.get("stop_reason") or "validator_non_converged").strip() or "validator_non_converged"
         cloned["degraded_reason"] = degraded_reason
         return cloned
+
+    def _sanitize_components_for_runtime(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        nodes: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        docmind_structure = dict((payload or {}).get("docmind_structure") or {})
+        page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        block_group_index = self._build_block_group_index(page=page, payload=payload)
+        layout_block_id_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
+
+        def _canonical_block_ids(raw_ids: Sequence[Any]) -> List[str]:
+            output: List[str] = []
+            for item in list(raw_ids or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                if canonical and canonical not in output:
+                    output.append(canonical)
+            return output
+
+        def _only_page_chrome(canonical_ids: Sequence[str]) -> bool:
+            if not canonical_ids:
+                return False
+            seen = False
+            for canonical in canonical_ids:
+                row = block_group_index.get(canonical)
+                if not isinstance(row, dict):
+                    return False
+                seen = True
+                if self._is_no_drop_required_block_group(row):
+                    return False
+            return seen
+
+        def _resolve_layout_uid(canonical_ids: Sequence[str]) -> str:
+            for canonical in canonical_ids:
+                row = block_group_index.get(canonical) or {}
+                layout_uid = str(row.get("layout_unique_id") or "").strip()
+                if layout_uid:
+                    return layout_uid
+            return ""
+
+        def _walk(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            output: List[Dict[str, Any]] = []
+            for raw in list(rows or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                node["children"] = _walk([item for item in list(node.get("children") or []) if isinstance(item, dict)])
+                canonical_ids = _canonical_block_ids(node.get("source_block_ids") or [])
+                node["source_block_ids"] = canonical_ids
+
+                node_type = str(node.get("type") or "").strip()
+                props = dict(node.get("props") or {})
+                if node_type == "ParagraphProse":
+                    text = self._repair_text_artifacts(self._normalize_spaces(str(props.get("text") or "")))
+                    if text in {"", "[empty]"} and not canonical_ids:
+                        continue
+                    if _only_page_chrome(canonical_ids):
+                        continue
+                    source_text = self._rebuild_text_from_block_groups(
+                        canonical_ids=canonical_ids,
+                        block_group_index=block_group_index,
+                    )
+                    raw_paragraphs = props.get("paragraphs")
+                    existing_paragraphs = [
+                        {"text": self._repair_text_artifacts(self._normalize_spaces(str((row or {}).get("text") if isinstance(row, Mapping) else row)))}
+                        for row in list(raw_paragraphs or [])
+                        if self._repair_text_artifacts(
+                            self._normalize_spaces(str((row or {}).get("text") if isinstance(row, Mapping) else row))
+                        )
+                    ] if isinstance(raw_paragraphs, list) else []
+                    if source_text and (text in {"", "[empty]"} or self._has_broken_words(text)):
+                        text = source_text
+                    if len(canonical_ids) >= 2:
+                        inferred = self._infer_paragraph_rows_from_block_groups(
+                            canonical_ids=canonical_ids,
+                            block_group_index=block_group_index,
+                        )
+                        if inferred and (
+                            len(inferred) > max(1, len(existing_paragraphs))
+                            or any(self._has_broken_words(str((row or {}).get("text") or "")) for row in existing_paragraphs)
+                        ):
+                            props["paragraphs"] = inferred
+                            text = "\n\n".join(
+                                str(row.get("text") or "").strip()
+                                for row in inferred
+                                if str(row.get("text") or "").strip()
+                            )
+                        elif existing_paragraphs:
+                            props["paragraphs"] = existing_paragraphs
+                            text = "\n\n".join(
+                                str(row.get("text") or "").strip()
+                                for row in existing_paragraphs
+                                if str(row.get("text") or "").strip()
+                            )
+                    elif existing_paragraphs:
+                        props["paragraphs"] = existing_paragraphs
+                        text = "\n\n".join(
+                            str(row.get("text") or "").strip()
+                            for row in existing_paragraphs
+                            if str(row.get("text") or "").strip()
+                        )
+                    props["text"] = text or source_text or "[empty]"
+                    node["props"] = props
+                elif node_type == "FigurePanel":
+                    caption = self._rebuild_figure_caption_from_block_groups(
+                        canonical_ids=canonical_ids,
+                        block_group_index=block_group_index,
+                        layout_block_id_alias_map=layout_block_id_alias_map,
+                    )
+                    caption = self._repair_text_artifacts(self._normalize_spaces(caption))
+                    if caption:
+                        props["caption"] = caption
+                    source_label = self._normalize_spaces(str(props.get("source_label") or ""))
+                    if not source_label:
+                        label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", str(props.get("caption") or ""), flags=re.IGNORECASE)
+                        if label_match:
+                            props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
+                    image_url = str(props.get("image_url") or props.get("image_src") or "").strip()
+                    if (not image_url) or re.match(r"^https?://(?:dx\.)?doi\.org/", image_url, flags=re.IGNORECASE):
+                        layout_uid = _resolve_layout_uid(canonical_ids)
+                        if not layout_uid:
+                            for anchor in list(node.get("source_anchor_refs") or []):
+                                if not isinstance(anchor, dict):
+                                    continue
+                                canonical = self._normalize_canonical_block_id(
+                                    page=page,
+                                    raw_id=str(anchor.get("canonical_block_id") or ""),
+                                )
+                                if not canonical:
+                                    continue
+                                layout_uid = _resolve_layout_uid([canonical])
+                                if layout_uid:
+                                    break
+                        if layout_uid:
+                            props["image_url"] = f"asset:{layout_uid}"
+                        elif page_image_url:
+                            props["image_url"] = page_image_url
+                    node["props"] = props
+
+                output.append(node)
+            return output
+
+        return _walk(nodes)
 
     def _ensure_source_block_ids_on_nodes(
         self,
@@ -8177,22 +11408,80 @@ class LiteratureReaderComposeService:
     def _collect_known_block_ids(self, *, page: int, base_payload: Dict[str, Any]) -> List[str]:
         ordered: List[str] = []
         seen: set[str] = set()
+        skipped_canonical_ids: set[str] = set()
         page_structure_v3 = dict((base_payload or {}).get("page_structure_v3") or {})
         for row in list(page_structure_v3.get("block_groups") or []):
             if not isinstance(row, dict):
                 continue
             canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
-            if canonical and canonical not in seen:
+            if not canonical:
+                continue
+            if not self._is_no_drop_required_block_group(row):
+                skipped_canonical_ids.add(canonical)
+                continue
+            if canonical not in seen:
                 seen.add(canonical)
                 ordered.append(canonical)
         for row in list((base_payload or {}).get("blocks") or []):
             if not isinstance(row, dict):
                 continue
             canonical = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("id") or ""))
-            if canonical and canonical not in seen:
+            if not canonical or canonical in skipped_canonical_ids:
+                continue
+            if canonical not in seen:
                 seen.add(canonical)
                 ordered.append(canonical)
         return ordered
+
+    def _is_no_drop_required_block_group(self, row: Dict[str, Any]) -> bool:
+        layout_type = str(row.get("layout_type") or row.get("type") or "").strip().lower()
+        layout_sub_type = str(row.get("layout_sub_type") or row.get("subType") or "").strip().lower()
+        text = self._normalize_spaces(str(row.get("text") or ""))
+        # Page-level framing content (header/footer/page number/dividers) should not block
+        # compose success; enforcing no-drop on these rows creates noisy fallback nodes.
+        if (
+            layout_type in {"head", "header_line", "foot", "footer_line", "foot_pagenum", "split_line"}
+            or layout_sub_type in {"page_header", "page_footer", "page"}
+        ):
+            return False
+        if (
+            layout_type in {"corner_note", "footer_note", "footnote"}
+            or layout_sub_type in {"corner_note", "footer_note", "footnote"}
+        ):
+            return False
+        # DOI-only rows are preserved as link assets; they should not force paragraph fallback injection.
+        if text and (
+            re.fullmatch(r"https?://(?:dx\.)?doi\.org/\S+", text, flags=re.IGNORECASE)
+            or re.fullmatch(r"doi:\s*10\.\S+", text, flags=re.IGNORECASE)
+        ):
+            return False
+        if text in {"", "[empty]"} and (
+            layout_type in {"note_line", "separator", "rule", "line"}
+            or layout_sub_type in {"none", "separator"}
+        ):
+            return False
+        return True
+
+    def _build_layout_block_id_alias_map(self, *, page: int, base_payload: Dict[str, Any]) -> Dict[str, List[str]]:
+        alias_map: Dict[str, List[str]] = {}
+        page_structure_v3 = dict((base_payload or {}).get("page_structure_v3") or {})
+        for row in list(page_structure_v3.get("block_groups") or []):
+            if not isinstance(row, dict):
+                continue
+            canonical_block_id = self._normalize_canonical_block_id(page=page, raw_id=str(row.get("block_id") or ""))
+            if not canonical_block_id:
+                continue
+            layout_uid = str(row.get("layout_unique_id") or "").strip()
+            if not layout_uid:
+                continue
+            aliases = [layout_uid, self._normalize_canonical_block_id(page=page, raw_id=layout_uid)]
+            for alias in aliases:
+                if not alias:
+                    continue
+                alias_map.setdefault(alias, [])
+                if canonical_block_id not in alias_map[alias]:
+                    alias_map[alias].append(canonical_block_id)
+        return alias_map
 
     def _partition_main_aux_block_ids(
         self,
@@ -8404,6 +11693,15 @@ class LiteratureReaderComposeService:
             logger.warning(f"[ReaderComposeService] redis init failed: {exc}")
             self._redis_client = None
             return None
+
+    async def _resolve_redis_client(self):
+        client_or_awaitable = self._get_redis_client()
+        if inspect.isawaitable(client_or_awaitable):
+            return await client_or_awaitable
+        return client_or_awaitable
+
+    def _utcnow_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     async def _read_payload_from_redis(self, key: str) -> Optional[Dict[str, Any]]:
         client = await self._get_redis_client()

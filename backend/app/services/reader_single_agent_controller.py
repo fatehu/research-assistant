@@ -88,6 +88,7 @@ class ReaderSingleAgentController:
                     validator_result=previous_validation,
                     must_fix=must_fix,
                     do_not_change=do_not_change,
+                    rendered_page_image=str(rendered_page_image or ""),
                     component_whitelist=[str(item).strip() for item in list(component_whitelist or []) if str(item).strip()],
                     max_steps=self.max_steps,
                 )

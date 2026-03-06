@@ -985,6 +985,66 @@ export interface ReaderComposeRequest {
   citation_tldr?: boolean
 }
 
+export interface ReaderComposeSchemeChoice {
+  scheme_id: string
+  label: string
+  rationale: string
+  source: string
+  candidate_ids: string[]
+}
+
+export interface ReaderComposeOmissionDecision {
+  decision_id: string
+  decision: 'hide' | 'collapse' | 'defer'
+  reason: string
+  recoverable: boolean
+  target_layout_ids: string[]
+  target_block_ids: string[]
+  target_atom_ids: string[]
+}
+
+export interface ReaderComposeReviewDiagnostic {
+  code: string
+  severity: 'info' | 'warn' | 'error'
+  message: string
+  component_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderComposeReviewSessionRequest extends ReaderComposeRequest {
+  snapshot_label?: string
+}
+
+export interface ReaderComposeReviewPatchRequest {
+  snapshot_id?: string
+  ui_ops: Record<string, unknown>[]
+  decision_log_append?: string[]
+  omission_decisions?: ReaderComposeOmissionDecision[] | null
+  scheme_choice?: ReaderComposeSchemeChoice | null
+  note?: string
+}
+
+export interface ReaderComposeReviewObservationRequest {
+  snapshot_id?: string
+  render_image_url?: string
+  diagnostics?: ReaderComposeReviewDiagnostic[]
+  note?: string
+  source?: string
+}
+
+export interface ReaderComposeReviewObservationUploadOptions {
+  snapshot_id?: string
+  diagnostics?: ReaderComposeReviewDiagnostic[]
+  note?: string
+  source?: string
+}
+
+export interface ReaderComposeReviewAutoPatchRequest {
+  snapshot_id?: string
+  user_intent?: string
+  note?: string
+}
+
 export interface ReaderComponentBBoxHint {
   x0: number
   x1: number
@@ -1216,6 +1276,9 @@ export interface ReaderComposePayload {
   build_mode: string
   ui_plan: ReaderUIPlan
   assets: ReaderComposeAsset[]
+  scheme_choice?: ReaderComposeSchemeChoice
+  decision_log?: string[]
+  omission_decisions?: ReaderComposeOmissionDecision[]
   quality_report: ReaderComposeQualityReport
   iteration_trace: Array<Record<string, unknown>>
   main_block_ids: string[]
@@ -1246,11 +1309,54 @@ export interface ReaderComposePayload {
   segment_map_meta?: Record<string, unknown>
   node_gate_report?: NodeGateReport | null
   toc_quality?: number
+  phase1_compact_input?: Record<string, unknown>
+  review_route_meta?: Record<string, unknown>
   generated_at: string
   cache_hit?: boolean
   cache_layer?: 'redis' | 'db' | 'none' | string
   overlay_applied?: boolean
   overlay_count?: number
+}
+
+export interface ReaderComposeReviewSnapshot {
+  session_id: string
+  snapshot_id: string
+  paper_id: number
+  page: number
+  source_signature: string
+  build_mode: string
+  status: 'done' | 'fallback'
+  ui_plan: ReaderUIPlan
+  assets: ReaderComposeAsset[]
+  quality_report: ReaderComposeQualityReport
+  scheme_choice?: ReaderComposeSchemeChoice
+  decision_log: string[]
+  omission_decisions: ReaderComposeOmissionDecision[]
+  diagnostics: ReaderComposeReviewDiagnostic[]
+  phase1_compact_input?: Record<string, unknown>
+  render_route: string
+  render_image_url?: string
+  observation_note?: string
+  observation_source?: string
+  observation_diagnostics?: ReaderComposeReviewDiagnostic[]
+  observation_updated_at?: string | null
+  docmind_page_image_url?: string
+  style_intent?: string
+  theme_mode?: string
+  detail_level?: string
+  parent_snapshot_id?: string | null
+  revision: number
+  created_at: string
+}
+
+export interface ReaderComposeReviewAutoPatchResponse {
+  snapshot: ReaderComposeReviewSnapshot
+  patch_applied: boolean
+  ui_ops: Record<string, unknown>[]
+  ui_ops_count: number
+  fallback_reason?: string | null
+  validation_errors: string[]
+  agent_summary: string
 }
 
 export interface ReaderComposePrefetchRequest {
@@ -1899,6 +2005,74 @@ export const literatureApi = {
         }
       }
     }
+  },
+
+  createReaderComposeReviewSession: async (
+    paperId: number,
+    payload: ReaderComposeReviewSessionRequest,
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/review-session`, payload)
+    return response.data
+  },
+
+  getReaderComposeReviewSnapshot: async (
+    paperId: number,
+    sessionId: string,
+    snapshotId?: string,
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/reader/composed/review-session/${sessionId}`, {
+      params: snapshotId ? { snapshot_id: snapshotId } : undefined,
+    })
+    return response.data
+  },
+
+  observeReaderComposeReviewSnapshot: async (
+    paperId: number,
+    sessionId: string,
+    payload: ReaderComposeReviewObservationRequest,
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/review-session/${sessionId}/observation`, payload)
+    return response.data
+  },
+
+  uploadReaderComposeReviewObservationImage: async (
+    paperId: number,
+    sessionId: string,
+    image: File | Blob,
+    options: ReaderComposeReviewObservationUploadOptions = {},
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const formData = new FormData()
+    formData.append('image', image)
+    if (options.snapshot_id) formData.append('snapshot_id', options.snapshot_id)
+    if (options.note) formData.append('note', options.note)
+    if (options.source) formData.append('source', options.source)
+    if (options.diagnostics?.length) {
+      formData.append('diagnostics_json', JSON.stringify(options.diagnostics))
+    }
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/reader/composed/review-session/${sessionId}/observation-image`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+    return response.data
+  },
+
+  patchReaderComposeReviewSnapshot: async (
+    paperId: number,
+    sessionId: string,
+    payload: ReaderComposeReviewPatchRequest,
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/review-session/${sessionId}/patch`, payload)
+    return response.data
+  },
+
+  autoPatchReaderComposeReviewSnapshot: async (
+    paperId: number,
+    sessionId: string,
+    payload: ReaderComposeReviewAutoPatchRequest,
+  ): Promise<ReaderComposeReviewAutoPatchResponse> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/review-session/${sessionId}/auto-patch`, payload)
+    return response.data
   },
 
   prefetchReaderComposed: async (

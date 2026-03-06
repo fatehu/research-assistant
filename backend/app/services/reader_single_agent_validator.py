@@ -1141,6 +1141,8 @@ class ReaderSingleAgentValidator:
         block_type = str(block.get("type") or "").strip().lower()
         sub_type = str(block.get("subType") or block.get("sub_type") or "").strip().lower()
         source_text = str(block.get("source_text") or "").strip().lower()
+        if block_type in {"figure", "figure_name", "caption"} or sub_type in {"picture", "figure", "figure_name", "caption", "table_caption"}:
+            return "main_content"
         if block_type in AUX_DEFAULT_TYPES or sub_type in AUX_DEFAULT_TYPES:
             return "aux_content"
         if any(keyword in source_text for keyword in AUX_KEYWORDS):
@@ -1154,6 +1156,8 @@ class ReaderSingleAgentValidator:
             "title",
             "section_heading",
             "paragraph",
+            "figure",
+            "caption",
             "metadata",
             "header",
             "footer",
@@ -1168,6 +1172,10 @@ class ReaderSingleAgentValidator:
             return "title"
         if sub_type in {"section_title", "heading", "head"}:
             return "section_heading"
+        if block_type == "figure" or sub_type in {"picture", "figure"}:
+            return "figure"
+        if block_type in {"figure_name", "caption"} or sub_type in {"figure_name", "caption", "table_caption"}:
+            return "caption"
         if block_type == "text" and sub_type in {"para", "paragraph", "body"}:
             return "paragraph"
         if block_type in AUX_DEFAULT_TYPES or sub_type in AUX_DEFAULT_TYPES:
@@ -1340,17 +1348,65 @@ class ReaderSingleAgentValidator:
         }
         allow_para = (not component_whitelist) or ("ParagraphProse" in component_whitelist)
         allow_heading = (not component_whitelist) or ("SectionHeading" in component_whitelist)
+        allow_figure = (not component_whitelist) or ("FigurePanel" in component_whitelist)
 
         components: List[Dict[str, Any]] = []
+        pending_figure_component: Optional[Dict[str, Any]] = None
+
+        def append_caption(target: Dict[str, Any], caption_text: str, layout_id: str) -> None:
+            if caption_text:
+                existing_caption = _normalize_spaces(str(((target.get("props") or {}).get("caption") or "")))
+                merged_caption = caption_text if not existing_caption else f"{existing_caption} {caption_text}"
+                target.setdefault("props", {})["caption"] = merged_caption.strip()
+            source_block_ids = target.setdefault("source_block_ids", [])
+            if layout_id and layout_id not in source_block_ids:
+                source_block_ids.append(layout_id)
+
         for row in classification_items:
             layout_id = str(row.get("layout_id") or "").strip()
-            if str(row.get("bucket") or "") != "main_content" or not layout_id:
+            if not layout_id:
                 continue
             role = str(row.get("role") or "").strip()
+            bucket = str(row.get("bucket") or "").strip()
             text = _normalize_spaces(
                 text_by_id.get(layout_id)
                 or str((docmind_index.get(layout_id) or {}).get("source_text") or "")
             )
+            if role == "figure" and allow_figure:
+                figure_component = {
+                    "component": "FigurePanel",
+                    "source_block_ids": [layout_id],
+                    "props": {
+                        "caption": text,
+                        "image_url": "",
+                    },
+                }
+                components.append(figure_component)
+                pending_figure_component = figure_component
+                if len(components) >= 24:
+                    break
+                continue
+            if role == "caption" and allow_figure:
+                if pending_figure_component is None:
+                    figure_component = {
+                        "component": "FigurePanel",
+                        "source_block_ids": [layout_id],
+                        "props": {
+                            "caption": text,
+                            "image_url": "",
+                        },
+                    }
+                    components.append(figure_component)
+                    pending_figure_component = figure_component
+                else:
+                    append_caption(pending_figure_component, text, layout_id)
+                if len(components) >= 24:
+                    break
+                continue
+
+            pending_figure_component = None
+            if bucket != "main_content":
+                continue
             if not text:
                 continue
             if role in {"section_heading", "title"} and allow_heading:

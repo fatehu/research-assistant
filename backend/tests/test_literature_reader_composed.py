@@ -10,10 +10,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from app.api import literature as literature_api
 from app.config import settings
 from app.services import literature_reader_compose_service as compose_module
+from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
 from app.services.literature_reader_compose_service import LiteratureReaderComposeService
 from app.services.reader_component_contract_service import ReaderComponentContractService
+from app.services.reader_compose_agent_runtime import ReaderComposeAgentRuntime
 from app.services.reader_multimodal_layout_service import ReaderMultimodalLayoutService
+from app.services.reader_panel_plan_agent_service import ReaderPanelPlanAgentService
 from app.services.render_pipeline_contract import RenderPipelineContractError
 
 
@@ -153,6 +156,1444 @@ def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
         }
     )
     assert should_not_rebuild is False
+
+
+def test_sanitize_components_for_runtime_should_override_single_paragraph_with_pdf_geometry_split():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "n1",
+            "type": "ParagraphProse",
+            "props": {
+                "text": "First paragraph text. Second paragraph text.",
+                "paragraphs": [{"text": "First paragraph text. Second paragraph text."}],
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_block_a", "p7_block_b"],
+        }
+    ]
+    payload = {
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_block_a",
+                    "text": "First paragraph text.",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_a",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 100, "x1": 300, "top": 100, "bottom": 120}
+                    },
+                },
+                {
+                    "block_id": "p7_block_b",
+                    "text": "Second paragraph text.",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_b",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 100, "x1": 300, "top": 150, "bottom": 170}
+                    },
+                },
+            ]
+        }
+    }
+
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        nodes=nodes,
+    )
+
+    props = dict((sanitized[0] or {}).get("props") or {})
+    paragraphs = list(props.get("paragraphs") or [])
+    assert len(paragraphs) == 2
+    assert [str((row or {}).get("text") or "") for row in paragraphs] == [
+        "First paragraph text.",
+        "Second paragraph text.",
+    ]
+    assert str(props.get("text") or "") == "First paragraph text.\n\nSecond paragraph text."
+
+
+def test_repair_text_artifacts_should_fix_pdf_line_wrap_residuals():
+    service = LiteratureReaderComposeService()
+
+    cleaned = service._repair_text_artifacts(  # pylint: disable=protected-access
+        "Insight frequency was generally consis tent and items[*]in S1 Data. AI-generated explana- tions were reviewed."
+    )
+
+    assert "consistent" in cleaned
+    assert "items[*] in" in cleaned
+    assert "explanations" in cleaned
+
+
+def test_sanitize_components_for_runtime_should_rebuild_page7_like_paragraphs_from_source_blocks():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "n_page7",
+            "type": "ParagraphProse",
+            "props": {
+                "text": (
+                    "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at "
+                    "least one significant insight in 88.9% of all responses. Insight frequency was generally consis tent "
+                    "between exam type and question input format (Fig 3C). Review of this subset of questions did not "
+                    "reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*]in S1 Data). "
+                    "Next, we quantified the density of insight (DOI) contained within AI-generated explana- tions."
+                )
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": [
+                "p7_dm_p7_l010_b001",
+                "p7_dm_p7_l010_b002",
+                "p7_dm_p7_l010_b003",
+                "p7_dm_p7_l010_b004",
+                "p7_dm_p7_l010_b005",
+                "p7_dm_p7_l010_b006",
+                "p7_dm_p7_l010_b007",
+                "p7_dm_p7_l010_b008",
+                "p7_dm_p7_l010_b009",
+                "p7_dm_p7_l010_b010",
+            ],
+        }
+    ]
+    payload = {
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "dm_p7_l010_b001",
+                    "text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 510, "x1": 1356, "top": 1396, "bottom": 1425}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b002",
+                    "text": "least one significant insight in 88.9% of all responses. Insight frequency was generally consis",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 479, "x1": 1371, "top": 1430, "bottom": 1455}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b003",
+                    "text": "tent between exam type and question input format (Fig 3C). In Step 2CK however, insight",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 481, "x1": 1353, "top": 1461, "bottom": 1488}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b004",
+                    "text": "decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 480, "x1": 1356, "top": 1491, "bottom": 1519}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b005",
+                    "text": "decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 480, "x1": 1386, "top": 1523, "bottom": 1550}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b006",
+                    "text": "pattern for the paradoxical decrease (see specifically annotated items[*]in S1 Data).",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 480, "x1": 1296, "top": 1556, "bottom": 1581}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b007",
+                    "text": "Next, we quantified the density of insight (DOI) contained within AI-generated explana-",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 509, "x1": 1368, "top": 1587, "bottom": 1612}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b008",
+                    "text": "tions. A density index was defined by normalizing the number of unique insights against the",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 479, "x1": 1371, "top": 1619, "bottom": 1644}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b009",
+                    "text": "number of possible answer choices. This analysis was performed on MC-J entries only. High",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 480, "x1": 1371, "top": 1649, "bottom": 1676}
+                    },
+                },
+                {
+                    "block_id": "dm_p7_l010_b010",
+                    "text": "quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_p7_para",
+                    "layout_bbox_or_polygon": {
+                        "bbox": {"x0": 479, "x1": 1394, "top": 1681, "bottom": 1709}
+                    },
+                },
+            ]
+        }
+    }
+
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        nodes=nodes,
+    )
+
+    props = dict((sanitized[0] or {}).get("props") or {})
+    paragraphs = list(props.get("paragraphs") or [])
+
+    assert len(paragraphs) == 2
+    assert "consistent between exam type" in str(paragraphs[0].get("text") or "")
+    assert "items[*] in S1 Data)." in str(paragraphs[0].get("text") or "")
+    assert str(paragraphs[1].get("text") or "").startswith("Next, we quantified the density of insight")
+    assert "AI-generated explanations." in str(paragraphs[1].get("text") or "")
+    assert "\n\n" in str(props.get("text") or "")
+
+
+def test_sanitize_components_for_runtime_should_rebuild_full_figure_caption_from_caption_blocks():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "n_fig",
+            "type": "FigurePanel",
+            "props": {
+                "caption": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated",
+                "image_url": "asset:layout_fig",
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_fig_img", "p7_fig_cap1"],
+        }
+    ]
+    payload = {
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_fig_img",
+                    "text": "A B Answer-Explanation Concordance",
+                    "layout_type": "figure",
+                    "layout_sub_type": "picture",
+                    "layout_unique_id": "layout_fig",
+                },
+                {
+                    "block_id": "p7_fig_cap1",
+                    "text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3,",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "none",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+                {
+                    "block_id": "p7_fig_cap2",
+                    "text": "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams.",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "none",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+            ]
+        }
+    }
+
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        nodes=nodes,
+    )
+
+    props = dict((sanitized[0] or {}).get("props") or {})
+    assert str(props.get("caption") or "") == (
+        "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, "
+        "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams."
+    )
+    assert str(props.get("source_label") or "") == "Fig 3"
+
+
+def test_enforce_no_drop_blocks_fallback_should_ignore_intentional_omissions():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 78,
+        "page": 7,
+        "blocks": [
+            {"id": "dm_p7_b001", "text": "Visible paragraph", "source_anchor": {"page": 7, "start_char": 0, "end_char": 16}},
+            {"id": "dm_p7_b002", "text": "Optional figure note", "source_anchor": {"page": 7, "start_char": 17, "end_char": 35}},
+        ],
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "dm_p7_b001",
+                    "text": "Visible paragraph",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_visible",
+                },
+                {
+                    "block_id": "dm_p7_b002",
+                    "text": "Optional figure note",
+                    "layout_type": "figure",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_omit",
+                },
+            ]
+        },
+        "omission_decisions": [
+            {
+                "decision_id": "omit_layout_omit",
+                "decision": "hide",
+                "reason": "auxiliary visual is not shown in this scheme",
+                "recoverable": True,
+                "target_layout_ids": ["layout_omit"],
+                "target_block_ids": ["p7_dm_p7_b002"],
+                "target_atom_ids": [],
+            }
+        ],
+    }
+    ui_plan = {
+        "components": [
+            {
+                "id": "visible_node",
+                "type": "ParagraphProse",
+                "props": {"text": "Visible paragraph"},
+                "children": [],
+                "source_anchor_refs": [],
+                "source_block_ids": ["p7_dm_p7_b001"],
+            }
+        ],
+        "trace_meta": {
+            "omission_decisions": list(payload["omission_decisions"]),
+        },
+    }
+
+    report = service._enforce_no_drop_blocks_fallback(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        ui_plan=ui_plan,
+    )
+
+    assert report["triggered"] is False
+    assert report["missing_block_ids"] == []
+    assert report["omitted_block_ids"] == ["p7_dm_p7_b002"]
+
+
+@pytest.mark.asyncio
+async def test_apply_review_patch_should_create_next_snapshot_with_local_ui_ops(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    base_snapshot = {
+        "session_id": "sess_demo",
+        "snapshot_id": "snapshot_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_base",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Original paragraph"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack", "label": "Reading Flow Stack", "rationale": "", "source": "panel_plan", "candidate_ids": ["reading_flow_stack"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "reading_flow_stack"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_demo&snapshotId=snapshot_base",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+    }
+    state = compose_module.ReaderComposeAgentState()
+    state.push({"plan_id": "snapshot_base", **base_snapshot})
+    service._review_sessions["sess_demo"] = {
+        "session_id": "sess_demo",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_base",
+        "snapshot_order": ["snapshot_base"],
+        "snapshots": {"snapshot_base": base_snapshot},
+        "state": state,
+        "expires_at": 9999999999.0,
+    }
+
+    updated = await service.apply_review_patch(
+        session_id="sess_demo",
+        snapshot_id="snapshot_base",
+        ui_ops=[
+            {
+                "op": "update_component_props",
+                "component_id": "n1",
+                "props_patch": {"text": "Patched paragraph"},
+            }
+        ],
+        decision_log_append=["tightened body spacing"],
+        omission_decisions=[
+            {
+                "decision_id": "omit_aux",
+                "decision": "collapse",
+                "reason": "secondary context kept recoverable",
+                "recoverable": True,
+                "target_layout_ids": ["layout_aux"],
+                "target_block_ids": [],
+                "target_atom_ids": [],
+            }
+        ],
+        scheme_choice={
+            "scheme_id": "context_rail",
+            "label": "Context Rail",
+            "rationale": "review patch switched scheme",
+            "source": "review_patch",
+            "candidate_ids": ["reading_flow_stack", "context_rail"],
+        },
+        note="review round 2",
+    )
+
+    assert updated["revision"] == 2
+    assert updated["parent_snapshot_id"] == "snapshot_base"
+    assert updated["ui_plan"]["components"][0]["props"]["text"] == "Patched paragraph"
+    assert updated["decision_log"][-1] == "tightened body spacing"
+    assert updated["scheme_choice"]["scheme_id"] == "context_rail"
+    assert updated["omission_decisions"][0]["decision"] == "collapse"
+    assert updated["ui_plan"]["trace_meta"]["review_note"] == "review round 2"
+    assert service._review_sessions["sess_demo"]["latest_snapshot_id"] == updated["snapshot_id"]
+
+
+@pytest.mark.asyncio
+async def test_record_review_observation_should_attach_render_context(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+    monkeypatch.setattr(compose_module, "REVIEW_OBSERVATION_DIR", str(tmp_path))
+
+    base_snapshot = {
+        "session_id": "sess_obs",
+        "snapshot_id": "snapshot_obs_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_obs",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Observation target"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack", "label": "Reading Flow Stack", "rationale": "", "source": "panel_plan", "candidate_ids": ["reading_flow_stack"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "reading_flow_stack"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_obs&snapshotId=snapshot_obs_base",
+        "render_image_url": "",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {"block_groups": [{"block_id": "p7_dm_p7_b001", "text": "Observation target"}]},
+        "layout_advice_v3": {},
+    }
+    service._review_sessions["sess_obs"] = {
+        "session_id": "sess_obs",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_obs_base",
+        "snapshot_order": ["snapshot_obs_base"],
+        "snapshots": {"snapshot_obs_base": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    stored = await service.store_review_observation_image(
+        session_id="sess_obs",
+        snapshot_id="snapshot_obs_base",
+        filename="review.png",
+        content_type="image/png",
+        data=b"fake-render-image",
+    )
+
+    updated = await service.record_review_observation(
+        session_id="sess_obs",
+        snapshot_id="snapshot_obs_base",
+        render_image_url=stored["render_image_url"],
+        render_image_path=stored["file_path"],
+        render_image_media_type=stored["media_type"],
+        diagnostics=[
+            {
+                "code": "crowded_panel",
+                "severity": "warn",
+                "message": "Main panel is too crowded.",
+                "component_ids": ["n1"],
+                "meta": {"density": 0.92},
+            }
+        ],
+        note="manual review on render snapshot",
+        source="assistant_observer",
+    )
+
+    assert updated["render_image_url"].endswith("/api/v1/literature/papers/78/reader/composed/review-session/sess_obs/observation-image/snapshot_obs_base")
+    assert os.path.exists(stored["file_path"])
+    assert updated["observation_note"] == "manual review on render snapshot"
+    assert updated["observation_source"] == "assistant_observer"
+    assert updated["observation_diagnostics"][0]["code"] == "crowded_panel"
+    assert any(row.get("code") == "crowded_panel" for row in updated["diagnostics"])
+    resolved = await service.resolve_review_observation_image(
+        session_id="sess_obs",
+        snapshot_id="snapshot_obs_base",
+    )
+    assert resolved is not None
+    assert resolved["media_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_apply_overlay_for_user_should_prefer_published_review_snapshot(monkeypatch):
+    service = LiteratureReaderComposeService()
+
+    async def _fake_read_overlays_from_db(**_kwargs):
+        return [
+            SimpleNamespace(
+                action_type=compose_module.REVIEW_PUBLISH_OVERLAY_ACTION,
+                node_id=compose_module.REVIEW_PUBLISH_OVERLAY_NODE_ID,
+                overlay_json={
+                    "session_id": "sess_publish",
+                    "snapshot_id": "snapshot_publish",
+                    "published_at": "2026-03-06T12:00:00Z",
+                    "ui_plan": {
+                        "plan_id": "plan_published",
+                        "components": [
+                            {
+                                "id": "n_pub",
+                                "type": "ParagraphProse",
+                                "props": {"text": "Published body"},
+                                "children": [],
+                                "source_anchor_refs": [],
+                                "source_block_ids": ["p7_dm_p7_b001"],
+                            }
+                        ],
+                        "layout": {},
+                        "style_tokens": {},
+                        "trace_meta": {},
+                    },
+                    "scheme_choice": {"scheme_id": "context_rail"},
+                    "decision_log": ["published from review"],
+                    "omission_decisions": [
+                        {
+                            "decision_id": "omit_demo",
+                            "decision": "hide",
+                            "reason": "demo omit",
+                            "recoverable": True,
+                            "target_layout_ids": ["layout_x"],
+                            "target_block_ids": [],
+                            "target_atom_ids": [],
+                        }
+                    ],
+                },
+            )
+        ]
+
+    monkeypatch.setattr(service, "_read_overlays_from_db", _fake_read_overlays_from_db)
+
+    payload = {
+        "ui_plan": {
+            "plan_id": "plan_base",
+            "components": [
+                {
+                    "id": "n_base",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Base body"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b000"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "scheme_choice": {"scheme_id": "reading_flow_stack"},
+        "decision_log": ["base compose"],
+        "omission_decisions": [],
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_b001",
+                    "text": "Published body",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_main",
+                }
+            ]
+        },
+    }
+
+    updated = await service._apply_overlay_for_user(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper_id=78,
+        page=7,
+        source_signature="sig-demo",
+        payload=payload,
+    )
+
+    assert updated["overlay_applied"] is True
+    assert updated["overlay_count"] == 1
+    assert updated["ui_plan"]["components"][0]["props"]["text"] == "Published body"
+    assert updated["scheme_choice"]["scheme_id"] == "context_rail"
+    assert updated["decision_log"] == ["published from review"]
+    assert updated["omission_decisions"][0]["decision"] == "hide"
+    assert updated["ui_plan"]["trace_meta"]["published_review_applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_review_snapshot_should_repair_legacy_truncated_figure_caption(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    base_snapshot = {
+        "session_id": "sess_fig",
+        "snapshot_id": "snapshot_fig_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_fig",
+            "components": [
+                {
+                    "id": "n_fig",
+                    "type": "FigurePanel",
+                    "props": {
+                        "caption": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated",
+                        "image_url": "asset:layout_fig",
+                        "source_label": "",
+                    },
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_fig_img", "p7_fig_cap1"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "figure_focus_split", "label": "Figure Focus Split", "rationale": "", "source": "panel_plan", "candidate_ids": ["figure_focus_split"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "figure_focus_split"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_fig&snapshotId=snapshot_fig_base",
+        "render_image_url": "",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_fig_img",
+                    "text": "A B Answer-Explanation Concordance",
+                    "layout_type": "figure",
+                    "layout_sub_type": "picture",
+                    "layout_unique_id": "layout_fig",
+                },
+                {
+                    "block_id": "p7_fig_cap1",
+                    "text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3,",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "none",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+                {
+                    "block_id": "p7_fig_cap2",
+                    "text": "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams.",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "none",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+            ]
+        },
+        "layout_advice_v3": {"ordered_block_ids": ["p7_fig_img", "p7_fig_cap1", "p7_fig_cap2"]},
+    }
+    service._review_sessions["sess_fig"] = {
+        "session_id": "sess_fig",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_fig_base",
+        "snapshot_order": ["snapshot_fig_base"],
+        "snapshots": {"snapshot_fig_base": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    resolved = await service.get_review_snapshot(
+        session_id="sess_fig",
+        snapshot_id="snapshot_fig_base",
+    )
+
+    props = dict(((resolved or {}).get("ui_plan") or {}).get("components", [{}])[0].get("props") or {})
+    assert str(props.get("caption") or "") == (
+        "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, "
+        "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams."
+    )
+    assert str(props.get("source_label") or "") == "Fig 3"
+
+
+@pytest.mark.asyncio
+async def test_publish_review_snapshot_should_save_published_review_overlay(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+    captured: list[dict] = []
+
+    async def _fake_upsert_overlay_to_db(**kwargs):
+        captured.append(dict(kwargs))
+        return None
+
+    async def _fake_build_source_signature(**_kwargs):
+        return "sig-auto"
+
+    monkeypatch.setattr(service, "_upsert_overlay_to_db", _fake_upsert_overlay_to_db)
+    monkeypatch.setattr(service, "_build_source_signature", _fake_build_source_signature)
+
+    base_snapshot = {
+        "session_id": "sess_publish",
+        "snapshot_id": "snapshot_publish",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-publish",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_publish",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Published text"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack", "label": "Reading Flow Stack", "rationale": "", "source": "panel_plan", "candidate_ids": ["reading_flow_stack"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [],
+        "phase1_compact_input": {},
+        "render_route": "/literature/78/read/review?sessionId=sess_publish&snapshotId=snapshot_publish",
+        "render_image_url": "",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_b001",
+                    "text": "Published text",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_main",
+                }
+            ]
+        },
+        "layout_advice_v3": {},
+    }
+    service._review_sessions["sess_publish"] = {
+        "session_id": "sess_publish",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-publish",
+        "latest_snapshot_id": "snapshot_publish",
+        "snapshot_order": ["snapshot_publish"],
+        "snapshots": {"snapshot_publish": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    result = await service.publish_review_snapshot(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78),
+        session_id="sess_publish",
+        snapshot_id="snapshot_publish",
+        note="publish for main read page",
+    )
+
+    assert result["published"] is True
+    assert result["source_signature"] == "sig-auto"
+    assert len(captured) == 2
+    assert {row["source_signature"] for row in captured} == {"sig-publish", "sig-auto"}
+    assert all(row["node_id"] == compose_module.REVIEW_PUBLISH_OVERLAY_NODE_ID for row in captured)
+    assert all(row["action_type"] == compose_module.REVIEW_PUBLISH_OVERLAY_ACTION for row in captured)
+    assert all(row["overlay_json"]["snapshot_id"] == "snapshot_publish" for row in captured)
+
+
+@pytest.mark.asyncio
+async def test_ensure_page_render_asset_should_return_asset_url_from_cached_file(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path))
+
+    asset_dir = tmp_path / "78"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    cached = asset_dir / "page_7.jpg"
+    cached.write_bytes(b"cached-jpg")
+
+    url = await service.ensure_page_render_asset(
+        paper_id=78,
+        page=7,
+        pdf_path="D:/missing.pdf",
+    )
+
+    assert url.endswith("/api/v1/literature/reader/page-assets/78/7")
+
+
+def test_reader_compose_runtime_direct_review_content_should_ignore_data_urls():
+    runtime = ReaderComposeAgentRuntime()
+
+    content = runtime._build_direct_review_content(  # pylint: disable=protected-access
+        prompt="review current layout",
+        review_context={"render_image_url": "data:image/png;base64,ZmFrZQ=="},
+        phase1_compact_input={
+            "pdf_reference": {
+                "page_image_url": "https://example.com/page7.jpg",
+            }
+        },
+        include_images=True,
+    )
+
+    image_urls = [
+        str(((item.get("image_url") or {}).get("url")) or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "image_url"
+    ]
+
+    assert image_urls == ["https://example.com/page7.jpg"]
+
+
+def test_dashscope_multimodal_service_should_normalize_local_file_uri(tmp_path):
+    image_path = tmp_path / "page7.png"
+    image_path.write_bytes(b"fake-image")
+
+    uris = DashScopeMultimodalService.collect_local_file_uris(str(image_path))
+
+    assert len(uris) == 1
+    assert uris[0].startswith("file://")
+    assert "page7.png" in uris[0]
+
+
+@pytest.mark.asyncio
+async def test_reader_compose_runtime_should_use_reader_agent_provider_and_model(monkeypatch):
+    captured: dict = {}
+
+    class _FakeLLM:
+        def __init__(self) -> None:
+            self.config = {"model": "placeholder"}
+
+    async def _fake_get_llm_service(provider=None):
+        captured["provider"] = provider
+        return _FakeLLM()
+
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(compose_module.settings, "reader_agent_model", "qwen-3.5-plus")
+    monkeypatch.setattr(
+        __import__("app.services.reader_compose_agent_runtime", fromlist=["get_llm_service"]),
+        "get_llm_service",
+        _fake_get_llm_service,
+    )
+
+    runtime = ReaderComposeAgentRuntime()
+    llm = await runtime._build_reader_llm()  # pylint: disable=protected-access
+
+    assert captured["provider"] == "aliyun"
+    assert llm.config["model"] == "qwen-3.5-plus"
+
+
+def test_build_phase1_compact_input_should_keep_local_page_image_path():
+    service = LiteratureReaderComposeService()
+
+    payload = service._build_phase1_compact_input(  # pylint: disable=protected-access
+        paper_id=78,
+        page=7,
+        rendered_page_image="https://example.com/page7.jpg",
+        rendered_page_image_path="D:/tmp/page7.png",
+        docmind_blocks=[
+            {
+                "layout_id": "layout_1",
+                "reading_order": 1,
+                "type": "paragraph",
+                "source_text": "A compact paragraph",
+            }
+        ],
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    assert payload["pdf_reference"]["page_image_url"] == "https://example.com/page7.jpg"
+    assert payload["pdf_reference"]["page_image_path"] == "D:/tmp/page7.png"
+
+
+@pytest.mark.asyncio
+async def test_reader_panel_plan_agent_should_prefer_dashscope_local_image(monkeypatch, tmp_path):
+    service = ReaderPanelPlanAgentService()
+    image_path = tmp_path / "page7.png"
+    image_path.write_bytes(b"fake-image")
+    captured = {"dashscope": 0, "tool": 0}
+
+    async def _fake_dashscope(**_kwargs):
+        captured["dashscope"] += 1
+        return {
+            "panel_plan": {
+                "schema_version": "panel_plan_v2",
+                "creative_direction": "dashscope_local_file",
+                "style_plan": {"scheme_id": "reading_flow_stack"},
+                "decision_log": [],
+                "coverage": {"omitted_layout_ids": [], "omitted_reason": ""},
+                "panels": [
+                    {
+                        "panel_id": "panel_main",
+                        "title": "",
+                        "layout": {"type": "stack", "gap": 12},
+                        "nodes": [
+                            {
+                                "node_id": "n1",
+                                "component": "ParagraphProse",
+                                "props": {"text": "Paragraph"},
+                                "source_layout_ids": ["layout_1"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }, {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
+    async def _fake_tool(**_kwargs):
+        captured["tool"] += 1
+        return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(service, "_call_dashscope_json", _fake_dashscope)
+    monkeypatch.setattr(service, "_call_tool", _fake_tool)
+    monkeypatch.setattr(
+        __import__("app.services.reader_panel_plan_agent_service", fromlist=["DashScopeMultimodalService"]),
+        "DashScopeMultimodalService",
+        SimpleNamespace(
+            collect_local_file_uris=lambda *args, **kwargs: [image_path.as_uri()],
+            is_available=lambda: True,
+            chat_json=None,
+        ),
+    )
+
+    result = await service.run(
+        docmind_blocks=[{"layout_id": "layout_1", "source_text": "Paragraph"}],
+        rendered_page_image="https://example.com/page7.jpg",
+        rendered_page_image_path=str(image_path),
+        component_whitelist=["ParagraphProse"],
+        style_intent="journal",
+        theme_mode="light",
+        detail_level="standard",
+        max_rounds=1,
+        phase1_context={"pdf_reference": {"page_image_path": str(image_path)}},
+    )
+
+    assert captured["dashscope"] == 1
+    assert captured["tool"] == 0
+    assert result["panel_plan"]["panels"][0]["nodes"][0]["source_layout_ids"] == ["layout_1"]
+
+
+@pytest.mark.asyncio
+async def test_reader_compose_runtime_should_prefer_dashscope_local_review(monkeypatch, tmp_path):
+    runtime = ReaderComposeAgentRuntime()
+    image_path = tmp_path / "review.png"
+    image_path.write_bytes(b"fake-review")
+
+    class _FakeLLM:
+        @staticmethod
+        def supports_function_calling():
+            return False
+
+    captured = {"dashscope": 0}
+
+    async def _fake_dashscope(**kwargs):
+        captured["dashscope"] += 1
+        assert kwargs["review_context"]["render_image_path"] == str(image_path)
+        return {
+            "used": True,
+            "model": "qwen-3.5-plus",
+            "ui_ops": [
+                {
+                    "op": "update_component_props",
+                    "component_id": "n1",
+                    "props_patch": {"text": "Patched locally"},
+                }
+            ],
+            "agent_trace": [],
+            "agent_tool_calls": [],
+            "agent_summary": "patched via dashscope",
+            "fallback_reason": "",
+        }
+
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(runtime, "_run_dashscope_local_review_patch", _fake_dashscope)
+    monkeypatch.setattr(
+        __import__("app.services.reader_compose_agent_runtime", fromlist=["DashScopeMultimodalService"]),
+        "DashScopeMultimodalService",
+        SimpleNamespace(
+            collect_local_file_uris=lambda *args, **kwargs: [image_path.as_uri()],
+            is_available=lambda: True,
+        ),
+    )
+
+    result = await runtime._run_direct_review_patch(  # pylint: disable=protected-access
+        llm=_FakeLLM(),
+        prompt="review this page",
+        existing_component_ids=["n1"],
+        valid_block_ids={"p7_dm_p7_b001"},
+        review_context={"render_image_path": str(image_path)},
+        phase1_compact_input={},
+    )
+
+    assert captured["dashscope"] == 1
+    assert result["used"] is True
+    assert result["ui_ops"][0]["props_patch"]["text"] == "Patched locally"
+
+
+@pytest.mark.asyncio
+async def test_auto_patch_review_snapshot_should_apply_runtime_ui_ops(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    base_snapshot = {
+        "session_id": "sess_auto",
+        "snapshot_id": "snapshot_auto_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_auto",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Original paragraph"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack", "label": "Reading Flow Stack", "rationale": "", "source": "panel_plan", "candidate_ids": ["reading_flow_stack"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [
+            {
+                "code": "overlong_paragraph_nodes",
+                "severity": "warn",
+                "message": "Paragraph should be shortened.",
+                "component_ids": ["n1"],
+                "meta": {},
+            }
+        ],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "reading_flow_stack"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_auto&snapshotId=snapshot_auto_base",
+        "render_image_url": "http://localhost:8888/api/v1/literature/papers/78/reader/composed/review-session/sess_auto/observation-image/snapshot_auto_base",
+        "render_image_path": "",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_b001",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "reading_order": 1,
+                    "text": "Original paragraph",
+                }
+            ]
+        },
+        "layout_advice_v3": {"ordered_block_ids": ["p7_dm_p7_b001"]},
+    }
+    service._review_sessions["sess_auto"] = {
+        "session_id": "sess_auto",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_auto_base",
+        "snapshot_order": ["snapshot_auto_base"],
+        "snapshots": {"snapshot_auto_base": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    async def _runtime(**_kwargs):
+        return {
+            "used": True,
+            "ui_ops": [
+                {
+                    "op": "update_component_props",
+                    "component_id": "n1",
+                    "props_patch": {"text": "Patched from auto review"},
+                }
+            ],
+            "agent_summary": "Shortened a crowded paragraph after render review.",
+            "validation_errors": [],
+            "fallback_reason": "",
+        }
+
+    monkeypatch.setattr(service._compose_agent_runtime, "run_component_assembly", _runtime)
+
+    result = await service.auto_patch_review_snapshot(
+        session_id="sess_auto",
+        snapshot_id="snapshot_auto_base",
+        user_id=1,
+        user_intent="render review",
+        note="auto pass 1",
+    )
+
+    assert result["patch_applied"] is True
+    assert result["ui_ops_count"] == 1
+    assert result["snapshot"]["ui_plan"]["components"][0]["props"]["text"] == "Patched from auto review"
+    assert result["snapshot"]["ui_plan"]["trace_meta"]["auto_patch_agent_summary"].startswith("Shortened a crowded paragraph")
+    assert service._review_sessions["sess_auto"]["latest_snapshot_id"] == result["snapshot"]["snapshot_id"]
+
+
+@pytest.mark.asyncio
+async def test_auto_patch_review_snapshot_should_synthesize_omission_for_removed_component(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    base_snapshot = {
+        "session_id": "sess_auto_omit",
+        "snapshot_id": "snapshot_auto_omit_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_auto_omit",
+            "components": [
+                {
+                    "id": "n_doi_link",
+                    "type": "ParagraphProse",
+                    "props": {"text": "https://doi.org/10.1371/journal.pdig.0000198.g003"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": [],
+                    "source_atom_ids": [],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {
+                "panel_plan": {
+                    "panels": [
+                        {
+                            "panel_id": "panel_figure",
+                            "nodes": [
+                                {
+                                    "node_id": "n_doi_link",
+                                    "component": "ParagraphProse",
+                                    "props": {"text": "https://doi.org/10.1371/journal.pdig.0000198.g003"},
+                                    "source_layout_ids": ["layout_doi"],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "figure_focus_split", "label": "Figure Focus Split", "rationale": "", "source": "panel_plan", "candidate_ids": ["figure_focus_split"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "figure_focus_split"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_auto_omit&snapshotId=snapshot_auto_omit_base",
+        "render_image_url": "http://localhost:8888/api/v1/literature/papers/78/reader/composed/review-session/sess_auto_omit/observation-image/snapshot_auto_omit_base",
+        "render_image_path": "/tmp/review.png",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "layout_unique_id": "layout_doi",
+                    "block_id": "p7_dm_p7_b002",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "reading_order": 2,
+                    "text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+                }
+            ]
+        },
+        "layout_advice_v3": {"ordered_block_ids": ["p7_dm_p7_b002"]},
+    }
+    service._review_sessions["sess_auto_omit"] = {
+        "session_id": "sess_auto_omit",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_auto_omit_base",
+        "snapshot_order": ["snapshot_auto_omit_base"],
+        "snapshots": {"snapshot_auto_omit_base": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    async def _runtime(**_kwargs):
+        return {
+            "used": True,
+            "ui_ops": [
+                {
+                    "op": "remove_component",
+                    "component_id": "n_doi_link",
+                    "reason": "Hide DOI-only line after render review.",
+                }
+            ],
+            "agent_summary": "Removed standalone DOI line.",
+            "validation_errors": [],
+            "fallback_reason": "",
+        }
+
+    monkeypatch.setattr(service._compose_agent_runtime, "run_component_assembly", _runtime)
+
+    result = await service.auto_patch_review_snapshot(
+        session_id="sess_auto_omit",
+        snapshot_id="snapshot_auto_omit_base",
+        user_id=1,
+        user_intent="render review",
+        note="auto omit",
+    )
+
+    assert result["patch_applied"] is True
+    assert result["snapshot"]["omission_decisions"]
+    assert result["snapshot"]["omission_decisions"][0]["target_layout_ids"] == ["layout_doi"]
+    assert result["snapshot"]["omission_decisions"][0]["decision"] == "hide"
+
+
+@pytest.mark.asyncio
+async def test_auto_patch_review_snapshot_should_block_probable_page_continuation_removal(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    base_snapshot = {
+        "session_id": "sess_auto_continue",
+        "snapshot_id": "snapshot_auto_continue_base",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "build_mode": "compose_agent_single_agent_v2",
+        "status": "done",
+        "ui_plan": {
+            "plan_id": "plan_auto_continue",
+            "components": [
+                {
+                    "id": "n_text_1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_l009_b001"],
+                    "source_atom_ids": ["p7_dm_p7_l009_b001"],
+                },
+                {
+                    "id": "n_text_2",
+                    "type": "ParagraphProse",
+                    "props": {"text": "We first examined the frequency of insight."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_l010_b001"],
+                    "source_atom_ids": ["p7_dm_p7_l010_b001"],
+                },
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "figure_focus_split", "label": "Figure Focus Split", "rationale": "", "source": "panel_plan", "candidate_ids": ["figure_focus_split"]},
+        "decision_log": ["initial compose"],
+        "omission_decisions": [],
+        "diagnostics": [],
+        "observation_diagnostics": [],
+        "phase1_compact_input": {"scheme_catalog": [{"scheme_id": "figure_focus_split"}]},
+        "render_route": "/literature/78/read/review?sessionId=sess_auto_continue&snapshotId=snapshot_auto_continue_base",
+        "render_image_url": "http://localhost:8888/api/v1/literature/papers/78/reader/composed/review-session/sess_auto_continue/observation-image/snapshot_auto_continue_base",
+        "render_image_path": "/tmp/review.png",
+        "docmind_page_image_url": "",
+        "style_intent": "journal",
+        "theme_mode": "light",
+        "detail_level": "standard",
+        "parent_snapshot_id": None,
+        "revision": 1,
+        "created_at": "2026-03-06T00:00:00Z",
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "layout_unique_id": "layout_continue",
+                    "block_id": "p7_dm_p7_l009_b001",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "reading_order": 1,
+                    "text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK.",
+                },
+                {
+                    "layout_unique_id": "layout_main",
+                    "block_id": "p7_dm_p7_l010_b001",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "reading_order": 2,
+                    "text": "We first examined the frequency of insight.",
+                },
+            ]
+        },
+        "layout_advice_v3": {"ordered_block_ids": ["p7_dm_p7_l009_b001", "p7_dm_p7_l010_b001"]},
+    }
+    service._review_sessions["sess_auto_continue"] = {
+        "session_id": "sess_auto_continue",
+        "paper_id": 78,
+        "page": 7,
+        "source_signature": "sig-demo",
+        "latest_snapshot_id": "snapshot_auto_continue_base",
+        "snapshot_order": ["snapshot_auto_continue_base"],
+        "snapshots": {"snapshot_auto_continue_base": base_snapshot},
+        "state": compose_module.ReaderComposeAgentState(),
+        "expires_at": 9999999999.0,
+    }
+
+    async def _runtime(**_kwargs):
+        return {
+            "used": True,
+            "ui_ops": [
+                {
+                    "op": "remove_component",
+                    "component_id": "n_text_1",
+                    "reason": "Looks like a carry-over fragment.",
+                }
+            ],
+            "agent_summary": "Attempted to remove carry-over fragment.",
+            "validation_errors": [],
+            "fallback_reason": "",
+        }
+
+    monkeypatch.setattr(service._compose_agent_runtime, "run_component_assembly", _runtime)
+
+    result = await service.auto_patch_review_snapshot(
+        session_id="sess_auto_continue",
+        snapshot_id="snapshot_auto_continue_base",
+        user_id=1,
+        user_intent="render review",
+        note="block continuation removal",
+    )
+
+    assert result["patch_applied"] is False
+    assert result["fallback_reason"] == "no_review_patch"
+    assert "blocked_probable_page_continuation_removal" in result["validation_errors"]
 
 
 @pytest.mark.asyncio
@@ -3459,6 +4900,19 @@ async def test_single_agent_v2_missing_aux_block_should_trigger_no_drop_blocks_f
             "repair_report": {"steps_executed": 1, "step_metrics": []},
         }
 
+    async def _fake_panel_plan_run(**_kwargs):
+        return {
+            "status": "fallback",
+            "degraded_reason": "validator_non_converged",
+            "panel_plan": {},
+            "validation_report": {
+                "passed": False,
+                "errors": ["validator_non_converged"],
+            },
+            "repair_report": {"steps_executed": 1, "step_metrics": []},
+            "usage": {},
+        }
+
     monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
     monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
     monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
@@ -3469,6 +4923,7 @@ async def test_single_agent_v2_missing_aux_block_should_trigger_no_drop_blocks_f
     monkeypatch.setattr(service, "_release_lock", _release_lock)
     monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
     monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _fake_reader_payload)
+    monkeypatch.setattr(service._panel_plan_agent, "run", _fake_panel_plan_run)
     monkeypatch.setattr(service._single_agent_controller, "run", _fake_controller_run)
 
     payload, _ = await service.build_or_get_composed_payload(

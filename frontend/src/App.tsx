@@ -13,6 +13,7 @@ const ChatManagePage = lazy(() => import('@/pages/chat/ChatManagePage'))
 const SmartChunkingPage = lazy(() => import('@/pages/knowledge/SmartChunkingPage'))
 const LiteraturePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.LiteraturePage })))
 const PaperReaderPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderPage })))
+const PaperReaderReviewPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderReviewPage })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
 const MentorStudentsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.StudentsPage })))
@@ -144,6 +145,16 @@ function App() {
             <PublicRoute>
               <RegisterPage />
             </PublicRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/read/review"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderReviewPage />)}
+              </ErrorBoundary>
+            </PrivateRoute>
           }
         />
 

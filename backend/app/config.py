@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o"
     aliyun_api_key: str = ""
     aliyun_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    aliyun_dashscope_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
     aliyun_model: str = "qwen-plus"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
@@ -217,6 +218,7 @@ class Settings(BaseSettings):
     document_mind_option: str = "docStructure"
     document_mind_poll_interval_seconds: float = 1.5
     document_mind_timeout_seconds: int = 90
+    document_mind_raw_cache_dir: str = "./uploads/docmind_raw_cache"
     # Reader compose multimodal assist (layout only, no rewriting)
     reader_mm_assist_enabled: bool = True
     # Cheap multimodal advisor for parser/line-level hints
@@ -245,7 +247,7 @@ class Settings(BaseSettings):
     # Deprecated: layout plan v2 now applies globally when enabled.
     reader_layout_plan_v2_allowlist: str = ""
     # Unified reader pipeline mode switch.
-    reader_pipeline_mode: Literal["legacy", "single_agent_v2"] = "legacy"
+    reader_pipeline_mode: Literal["legacy", "single_agent_v2"] = "single_agent_v2"
     # Optional allowlist for gradual rollout. Empty means all papers/pages for current mode.
     reader_pipeline_allowlist_papers: str = ""
     reader_pipeline_allowlist_pages: str = ""
@@ -259,6 +261,7 @@ class Settings(BaseSettings):
     # Cache/payload version isolation token for simplified pipeline.
     reader_pipeline_version: str = "simplified_v2"
     # Single-agent V2 runtime contract
+    reader_agent_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
     reader_agent_model: str = "qwen-3.5-plus"
     reader_agent_timeout_ms: int = 90000
     reader_agent_max_tokens: int = 7000
