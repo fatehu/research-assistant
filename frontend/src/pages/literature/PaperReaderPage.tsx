@@ -89,6 +89,9 @@ const { Title, Text } = Typography
 const { TextArea } = Input
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
+const READER_API_BASE_URL = String(
+  ((import.meta as any).env?.VITE_API_BASE_URL as string) || 'http://localhost:8888',
+).trim()
 
 function parseZoomPercent(zoom: string | undefined): number {
   if (!zoom) return 120
@@ -639,7 +642,6 @@ type ComposedBackendOptions = {
   citationTldr: boolean
 }
 type PendingComposedRun = {
-  forceRefresh: boolean
   regenerate: boolean
   applyCurrentOptions: boolean
 }
@@ -1688,7 +1690,6 @@ export default function PaperReaderPage() {
   const generativeStreamControllerRef = useRef<AbortController | null>(null)
   const composedStreamControllerRef = useRef<AbortController | null>(null)
   const pendingComposedRunRef = useRef<PendingComposedRun>({
-    forceRefresh: false,
     regenerate: false,
     applyCurrentOptions: false,
   })
@@ -2054,7 +2055,7 @@ export default function PaperReaderPage() {
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
-    setTextMode(restoredReaderMode === 'generative')
+    setTextMode(false)
     setGenerativeStyleKey(restoredStyleKey)
     setThemeMode(restoredThemeMode)
     setDetailLevel(restoredDetailLevel)
@@ -2264,11 +2265,10 @@ export default function PaperReaderPage() {
     }
   }, [pdfDoc, readPage, pdfNumPages])
 
-  const requestGenerativeRefresh = (options?: { forceRefresh?: boolean; preferAgent?: boolean }) => {
+  const requestGenerativeRefresh = () => {
     // 把“本次刷新参数”写入 ref，仅供下一次请求消费。
     pendingComposedRunRef.current = {
-      forceRefresh: Boolean(options?.forceRefresh),
-      regenerate: Boolean(options?.preferAgent),
+      regenerate: true,
       applyCurrentOptions: true,
     }
     setComposedRunSeed((prev) => prev + 1)
@@ -2284,7 +2284,7 @@ export default function PaperReaderPage() {
     }
 
     const runOptions = pendingComposedRunRef.current
-    pendingComposedRunRef.current = { forceRefresh: false, regenerate: false, applyCurrentOptions: false }
+    pendingComposedRunRef.current = { regenerate: false, applyCurrentOptions: false }
     if (runOptions.applyCurrentOptions) {
       composedAppliedOptionsRef.current = {
         detailLevel,
@@ -2312,7 +2312,7 @@ export default function PaperReaderPage() {
         {
           page: readPage,
           selected_kb_id: selectedKbId,
-          force_refresh: runOptions.forceRefresh,
+          force_refresh: false,
           regenerate: runOptions.regenerate,
           detail_level: appliedOptions.detailLevel,
           compare_mode: appliedOptions.compareMode,
@@ -3489,6 +3489,100 @@ export default function PaperReaderPage() {
       Boolean(composedError) ||
       Boolean(composedPayload)
     const composedLinkAssets = composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image')
+    const composedDecisionLog = Array.isArray(composedPayload?.decision_log)
+      ? composedPayload.decision_log.map((item) => String(item || '').trim()).filter(Boolean)
+      : []
+    const composedOmissions = Array.isArray(composedPayload?.omission_decisions)
+      ? composedPayload.omission_decisions.filter((item) => item && typeof item === 'object')
+      : []
+    const composedPageImageUrl = String(
+      ((composedPayload as unknown as { docmind_structure?: { page_image_url?: unknown } })?.docmind_structure?.page_image_url) || '',
+    ).trim()
+    const toAbsoluteApiUrl = (rawUrl: string): string => {
+      const token = String(rawUrl || '').trim()
+      if (!token) return ''
+      if (/^https?:\/\//i.test(token) || token.startsWith('data:') || token.startsWith('blob:')) return token
+      if (!token.startsWith('/')) return token
+      if (!READER_API_BASE_URL) return token
+      return `${READER_API_BASE_URL}${token}`
+    }
+    const resolveFigureImageUrl = (rawUrl: string, node?: ReaderComponentNode): string => {
+      const token = String(rawUrl || '').trim()
+      if (!token) return ''
+      const assetPage = (() => {
+        const pages = Array.isArray(node?.source_anchor_refs)
+          ? node.source_anchor_refs
+            .map((item) => Number((item as ReaderComponentSourceAnchor | undefined)?.page || 0))
+            .filter((item) => Number.isFinite(item) && item > 0)
+          : []
+        return pages[0] || readPage
+      })()
+      const sourceBlockIds = Array.isArray(node?.source_block_ids)
+        ? node!.source_block_ids.map((item) => String(item || '').trim()).filter((item) => item.length > 0)
+        : []
+      const pickImageHintUrl = (): string => {
+        for (const asset of composedAssets) {
+          if (asset.kind !== 'image_hint') continue
+          const meta = (asset.meta && typeof asset.meta === 'object')
+            ? asset.meta as Record<string, unknown>
+            : {}
+          const candidateUrl = String(asset.href || meta.image_url || '').trim()
+          if (!candidateUrl || candidateUrl.startsWith('data:image/')) continue
+          const layoutUniqueId = String(meta.layout_unique_id || meta.unique_id || '').trim()
+          if (!sourceBlockIds.length || (layoutUniqueId && sourceBlockIds.includes(layoutUniqueId))) {
+            return toAbsoluteApiUrl(candidateUrl)
+          }
+        }
+        for (const asset of composedAssets) {
+          if (asset.kind !== 'image_hint') continue
+          const meta = (asset.meta && typeof asset.meta === 'object')
+            ? asset.meta as Record<string, unknown>
+            : {}
+          const candidateUrl = String(asset.href || meta.image_url || '').trim()
+          if (!candidateUrl || candidateUrl.startsWith('data:image/')) continue
+          return toAbsoluteApiUrl(candidateUrl)
+        }
+        return ''
+      }
+      if (token.startsWith('data:image/')) {
+        return token
+      }
+      if (token.startsWith('asset:')) {
+        const assetId = token.slice('asset:'.length).trim()
+        for (const asset of composedAssets) {
+          if (asset.kind !== 'image_hint') continue
+          const meta = (asset.meta && typeof asset.meta === 'object')
+            ? asset.meta as Record<string, unknown>
+            : {}
+          const candidateId = String(meta.asset_id || meta.layout_unique_id || meta.unique_id || '').trim()
+          const candidateUrl = String(
+            asset.href || meta.image_url || '',
+          ).trim()
+          if (candidateUrl.startsWith('data:image/')) continue
+          if (assetId && candidateId && candidateId === assetId && candidateUrl) {
+            return toAbsoluteApiUrl(candidateUrl)
+          }
+        }
+        if (assetId) {
+          return toAbsoluteApiUrl(`/api/v1/literature/reader/figure-assets/${paperId}/${assetPage}/${assetId}`)
+        }
+        if (composedPageImageUrl) return toAbsoluteApiUrl(composedPageImageUrl)
+        return ''
+      }
+      if (/^https?:\/\/(?:dx\.)?doi\.org\//i.test(token) && composedPageImageUrl) {
+        return toAbsoluteApiUrl(composedPageImageUrl)
+      }
+      if (
+        !token.startsWith('/')
+        && !/^https?:\/\//i.test(token)
+        && !token.startsWith('blob:')
+        && !token.startsWith('data:')
+      ) {
+        const hinted = pickImageHintUrl()
+        if (hinted) return hinted
+      }
+      return toAbsoluteApiUrl(token)
+    }
 
     if (useComposedView) {
       return (
@@ -3630,7 +3724,7 @@ export default function PaperReaderPage() {
                   size="small"
                   icon={<ReloadOutlined />}
                   loading={composedLoading}
-                  onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
+                  onClick={() => requestGenerativeRefresh()}
                 >
                   重新生成
                 </Button>
@@ -3670,6 +3764,7 @@ export default function PaperReaderPage() {
                     themeStyle: activeComposedStyle,
                     qualityReport: composedQuality || composedPayload?.quality_report || null,
                     inlineQueryLoadingNodeId,
+                    resolveFigureImageUrl: (imageUrl, node) => resolveFigureImageUrl(imageUrl, node),
                     isActionableAnchor,
                     onInlineQuery: async (node, question) => {
                       await handleInlineQuery(node, question)
@@ -3714,6 +3809,44 @@ export default function PaperReaderPage() {
                     },
                   })}
                 </div>
+              ) : null}
+
+              {!composedLoading && (composedDecisionLog.length > 0 || composedOmissions.length > 0) ? (
+                <Card size="small" title="AI 决策" style={{ marginTop: 12, borderRadius: 12 }}>
+                  <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                    {composedPayload?.scheme_choice?.scheme_id ? (
+                      <Space size={8} wrap>
+                        <Tag color="geekblue">{String(composedPayload.scheme_choice.scheme_id || '').trim()}</Tag>
+                        {composedPayload.scheme_choice.rationale ? (
+                          <Text type="secondary">{String(composedPayload.scheme_choice.rationale || '').trim()}</Text>
+                        ) : null}
+                      </Space>
+                    ) : null}
+                    {composedDecisionLog.length > 0 ? (
+                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                        {composedDecisionLog.map((item, idx) => (
+                          <Text key={`compose-decision-${idx}`}>{item}</Text>
+                        ))}
+                      </Space>
+                    ) : null}
+                    {composedOmissions.length > 0 ? (
+                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                        {composedOmissions.map((item, idx) => {
+                          const decision = String(item.decision || '').trim()
+                          const reason = String(item.reason || '').trim()
+                          return (
+                            <div key={`compose-omit-${idx}`} style={{ paddingBottom: 8, borderBottom: '1px solid rgba(79, 148, 255, 0.14)' }}>
+                              <Space size={8} wrap>
+                                {decision ? <Tag color={decision === 'hide' ? 'red' : (decision === 'collapse' ? 'gold' : 'blue')}>{decision}</Tag> : null}
+                                {reason ? <Text>{reason}</Text> : <Text type="secondary">未提供原因</Text>}
+                              </Space>
+                            </div>
+                          )
+                        })}
+                      </Space>
+                    ) : null}
+                  </Space>
+                </Card>
               ) : null}
 
               {!composedLoading && !hasComposedPlan ? (
@@ -3810,7 +3943,7 @@ export default function PaperReaderPage() {
               size="small"
               icon={<ReloadOutlined />}
               loading={generativeLoading}
-              onClick={() => requestGenerativeRefresh({ forceRefresh: true, preferAgent: true })}
+              onClick={() => requestGenerativeRefresh()}
             >
               重新生成
             </Button>
@@ -4176,7 +4309,7 @@ export default function PaperReaderPage() {
                     {fitWidth ? '已适宽' : '适宽'}
                   </Button>
                   <Button onClick={() => setTextMode((prev) => !prev)}>
-                    {textMode ? 'PDF模式' : '生成式模式'}
+                    {textMode ? '切到PDF' : '切到AI阅读'}
                   </Button>
                   <Tag color={readerAutoSaveTag.color}>{readerAutoSaveTag.label}</Tag>
                 </Space>

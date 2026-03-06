@@ -343,6 +343,32 @@ class ReaderComposeRequest(BaseModel):
     citation_tldr: Optional[bool] = None
 
 
+class ReaderComposeSchemeChoice(BaseModel):
+    scheme_id: str = ""
+    label: str = ""
+    rationale: str = ""
+    source: str = ""
+    candidate_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderComposeOmissionDecision(BaseModel):
+    decision_id: str
+    decision: Literal["hide", "collapse", "defer"] = "hide"
+    reason: str = ""
+    recoverable: bool = True
+    target_layout_ids: List[str] = Field(default_factory=list)
+    target_block_ids: List[str] = Field(default_factory=list)
+    target_atom_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderComposeReviewDiagnostic(BaseModel):
+    code: str
+    severity: Literal["info", "warn", "error"] = "info"
+    message: str
+    component_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ReaderComponentBBoxHint(BaseModel):
     x0: float = 0.0
     x1: float = 0.0
@@ -556,6 +582,9 @@ class ReaderComposePayload(BaseModel):
     build_mode: str
     ui_plan: ReaderUIPlan
     assets: List[ReaderComposeAsset] = Field(default_factory=list)
+    scheme_choice: ReaderComposeSchemeChoice = Field(default_factory=ReaderComposeSchemeChoice)
+    decision_log: List[str] = Field(default_factory=list)
+    omission_decisions: List[ReaderComposeOmissionDecision] = Field(default_factory=list)
     quality_report: ReaderComposeQualityReport = Field(default_factory=ReaderComposeQualityReport)
     iteration_trace: List[Dict[str, Any]] = Field(default_factory=list)
     main_block_ids: List[str] = Field(default_factory=list)
@@ -586,6 +615,8 @@ class ReaderComposePayload(BaseModel):
     segment_map_meta: Dict[str, Any] = Field(default_factory=dict)
     node_gate_report: Optional[NodeGateReport] = None
     toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
+    phase1_compact_input: Dict[str, Any] = Field(default_factory=dict)
+    review_route_meta: Dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime
     cache_hit: bool = False
     cache_layer: Optional[Literal["redis", "db", "none"]] = None
@@ -609,6 +640,91 @@ class ReaderComposePrefetchRequest(BaseModel):
 class ReaderComposePrefetchResponse(BaseModel):
     queued: List[int] = Field(default_factory=list)
     skipped: List[int] = Field(default_factory=list)
+
+
+class ReaderComposeReviewSessionRequest(ReaderComposeRequest):
+    snapshot_label: Optional[str] = None
+
+
+class ReaderComposeReviewPatchRequest(BaseModel):
+    snapshot_id: Optional[str] = None
+    ui_ops: List[Dict[str, Any]] = Field(default_factory=list)
+    decision_log_append: List[str] = Field(default_factory=list)
+    omission_decisions: Optional[List[ReaderComposeOmissionDecision]] = None
+    scheme_choice: Optional[ReaderComposeSchemeChoice] = None
+    note: Optional[str] = None
+
+
+class ReaderComposeReviewObservationRequest(BaseModel):
+    snapshot_id: Optional[str] = None
+    render_image_url: Optional[str] = None
+    diagnostics: List[ReaderComposeReviewDiagnostic] = Field(default_factory=list)
+    note: Optional[str] = None
+    source: Optional[str] = None
+
+
+class ReaderComposeReviewAutoPatchRequest(BaseModel):
+    snapshot_id: Optional[str] = None
+    user_intent: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReaderComposeReviewPublishRequest(BaseModel):
+    snapshot_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReaderComposeReviewSnapshot(BaseModel):
+    session_id: str
+    snapshot_id: str
+    paper_id: int
+    page: int
+    source_signature: str
+    build_mode: str
+    status: Literal["done", "fallback"] = "done"
+    ui_plan: ReaderUIPlan
+    assets: List[ReaderComposeAsset] = Field(default_factory=list)
+    quality_report: ReaderComposeQualityReport = Field(default_factory=ReaderComposeQualityReport)
+    scheme_choice: ReaderComposeSchemeChoice = Field(default_factory=ReaderComposeSchemeChoice)
+    decision_log: List[str] = Field(default_factory=list)
+    omission_decisions: List[ReaderComposeOmissionDecision] = Field(default_factory=list)
+    diagnostics: List[ReaderComposeReviewDiagnostic] = Field(default_factory=list)
+    phase1_compact_input: Dict[str, Any] = Field(default_factory=dict)
+    render_route: str = ""
+    render_image_url: str = ""
+    observation_note: str = ""
+    observation_source: str = ""
+    observation_diagnostics: List[ReaderComposeReviewDiagnostic] = Field(default_factory=list)
+    observation_updated_at: Optional[datetime] = None
+    docmind_page_image_url: str = ""
+    style_intent: str = ""
+    theme_mode: str = ""
+    detail_level: str = ""
+    parent_snapshot_id: Optional[str] = None
+    revision: int = 1
+    created_at: datetime
+
+
+class ReaderComposeReviewAutoPatchResponse(BaseModel):
+    snapshot: ReaderComposeReviewSnapshot
+    patch_applied: bool = False
+    ui_ops: List[Dict[str, Any]] = Field(default_factory=list)
+    ui_ops_count: int = 0
+    fallback_reason: Optional[str] = None
+    validation_errors: List[str] = Field(default_factory=list)
+    agent_summary: str = ""
+
+
+class ReaderComposeReviewPublishResponse(BaseModel):
+    published: bool = False
+    session_id: str
+    snapshot_id: str
+    paper_id: int
+    page: int
+    source_signature: str
+    read_route: str = ""
+    overlay_saved: bool = False
+
 
 
 class ReaderNodeActionRequest(BaseModel):

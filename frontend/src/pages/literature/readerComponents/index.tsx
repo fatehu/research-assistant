@@ -16,7 +16,9 @@ const { Text, Title, Paragraph } = Typography
 export type ReaderComponentRenderContext = {
   themeStyle?: GenerativeStyleTokens
   qualityReport?: ReaderComposeQualityReport | null
+  readOnly?: boolean
   inlineQueryLoadingNodeId?: string | null
+  resolveFigureImageUrl?: (imageUrl: string, node?: ReaderComponentNode) => string
   isActionableAnchor?: (anchor: ReaderComponentSourceAnchor) => boolean
   onJumpAnchor?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
   onPreviewAnchors?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
@@ -52,9 +54,62 @@ function normalizeDoiHref(value: unknown): string {
   return `https://doi.org/${trimmed}`
 }
 
+function deriveFigureSourceLabel(caption: string, sourceLabel: string): string {
+  const explicit = asString(sourceLabel)
+  if (explicit) return explicit
+  const text = asString(caption)
+  if (!text) return ''
+  const matched = text.match(/^(Fig(?:ure)?\s*\d+[A-Za-z]?)/i)
+  return matched ? matched[1] : ''
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+}
+
+type ParagraphSegment = {
+  text: string
+  source_char_ranges?: Array<{ start_char_id: string; end_char_id: string }>
+}
+
+function normalizeParagraphSegments(value: unknown): ParagraphSegment[] {
+  if (!Array.isArray(value)) return []
+  const rows: ParagraphSegment[] = []
+  for (const item of value) {
+    if (typeof item === 'string') {
+      const text = asString(item)
+      if (!text) continue
+      rows.push({ text })
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const text = asString(row.text || row.content)
+    if (!text) continue
+    const segment: ParagraphSegment = { text }
+    const ranges = row.source_char_ranges
+    if (Array.isArray(ranges)) {
+      const normalizedRanges = ranges
+        .filter((rng): rng is { start_char_id: string; end_char_id: string } => (
+          Boolean(rng)
+          && typeof rng === 'object'
+          && typeof (rng as any).start_char_id === 'string'
+          && typeof (rng as any).end_char_id === 'string'
+          && String((rng as any).start_char_id).trim().length > 0
+          && String((rng as any).end_char_id).trim().length > 0
+        ))
+        .map((rng) => ({
+          start_char_id: String(rng.start_char_id).trim(),
+          end_char_id: String(rng.end_char_id).trim(),
+        }))
+      if (normalizedRanges.length > 0) {
+        segment.source_char_ranges = normalizedRanges
+      }
+    }
+    rows.push(segment)
+  }
+  return rows
 }
 
 function normalizeAnchorRows(value: unknown): ReaderComponentSourceAnchor[] {
@@ -146,7 +201,13 @@ function isDarkTheme(ctx?: ReaderComponentRenderContext): boolean {
 export function componentToMarkdown(node: ReaderComponentNode): string {
   const props = node.props || {}
   const text = (key: string) => asString((props as Record<string, unknown>)[key])
-  if (node.type === 'ParagraphProse') return text('text')
+  if (node.type === 'ParagraphProse') {
+    const paragraphs = normalizeParagraphSegments((props as Record<string, unknown>).paragraphs)
+    if (paragraphs.length > 0) {
+      return paragraphs.map((item) => item.text).join('\n\n')
+    }
+    return text('text')
+  }
   if (node.type === 'SectionHeading') return `## ${text('text')}`
   if (node.type === 'KeyTakeaways') {
     const items = asRecordArray((props as Record<string, unknown>).items)
@@ -278,6 +339,7 @@ function ActionBar(props: {
   extraActions?: ReactNode
 }): ReactNode {
   const { node, ctx, extraActions } = props
+  if (ctx.readOnly) return null
   const [hovered, setHovered] = useState(false)
   const markdown = componentToMarkdown(node)
   const nodeGatePassed = isNodeGatePassed(node)
@@ -459,7 +521,29 @@ function ParagraphProseNode(props: {
 }): ReactNode {
   const { node, ctx, withAnchorPreview } = props
   const text = asString(node.props?.text)
+  const paragraphs = normalizeParagraphSegments((node.props as Record<string, unknown>)?.paragraphs)
   const [hovered, setHovered] = useState(false)
+  const paragraphStyle: CSSProperties = {
+    margin: 0,
+    lineHeight: ctx.themeStyle?.bodyLineHeight || 1.95,
+    fontSize: ctx.themeStyle?.bodyFontSize || 18,
+    textAlign: 'justify',
+    color: ctx.themeStyle?.bodyColor,
+    fontFamily: ctx.themeStyle?.bodyFontFamily,
+  }
+  const paragraphRows = paragraphs.length > 0
+    ? paragraphs
+    : (() => {
+      if (!text) return []
+      const blocks = text
+        .split(/\n\s*\n+/)
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+      if (blocks.length >= 2) {
+        return blocks.map((item) => ({ text: item }))
+      }
+      return [{ text }]
+    })()
 
   return withAnchorPreview(
     <div
@@ -470,44 +554,47 @@ function ParagraphProseNode(props: {
       <DraggableContainer node={node}>
         <div>
           <ActionBar node={node} ctx={ctx} />
-          <p
-            style={{
-              margin: 0,
-              lineHeight: ctx.themeStyle?.bodyLineHeight || 1.95,
-              fontSize: ctx.themeStyle?.bodyFontSize || 18,
-              textAlign: 'justify',
-              color: ctx.themeStyle?.bodyColor,
-              fontFamily: ctx.themeStyle?.bodyFontFamily,
-            }}
-          >
-            {text}
+          <div>
+            {paragraphRows.map((item, idx) => (
+              <p
+                key={`${node.id}-p-${idx}`}
+                style={{
+                  ...paragraphStyle,
+                  margin: idx === 0 ? 0 : '10px 0 0 0',
+                }}
+              >
+                {item.text}
+              </p>
+            ))}
             {renderChildren(node.children || [], ctx)}
-          </p>
+          </div>
         </div>
       </DraggableContainer>
 
-      <div
-        style={{
-          position: 'absolute',
-          bottom: -18,
-          left: '50%',
-          transform: hovered ? 'translate(-50%, 0) scale(1)' : 'translate(-50%, -10px) scale(0.9)',
-          opacity: hovered ? 1 : 0,
-          transition: 'all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
-          zIndex: 10,
-          pointerEvents: hovered ? 'auto' : 'none',
-        }}
-      >
-        <Button
-          type="primary"
-          shape="circle"
-          size="small"
-          icon={<PlusOutlined />}
-          onClick={() => ctx.onManualInsertSlot?.(String(node.id))}
-          title="在此段落后插入提问"
-          style={{ boxShadow: '0 4px 12px rgba(22, 119, 255, 0.35)' }}
-        />
-      </div>
+      {!ctx.readOnly ? (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: -18,
+            left: '50%',
+            transform: hovered ? 'translate(-50%, 0) scale(1)' : 'translate(-50%, -10px) scale(0.9)',
+            opacity: hovered ? 1 : 0,
+            transition: 'all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
+            zIndex: 10,
+            pointerEvents: hovered ? 'auto' : 'none',
+          }}
+        >
+          <Button
+            type="primary"
+            shape="circle"
+            size="small"
+            icon={<PlusOutlined />}
+            onClick={() => ctx.onManualInsertSlot?.(String(node.id))}
+            title="在此段落后插入提问"
+            style={{ boxShadow: '0 4px 12px rgba(22, 119, 255, 0.35)' }}
+          />
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -702,8 +789,14 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
 
     case 'FigurePanel': {
       const caption = asString(props.caption)
-      const imageUrl = asString(props.image_url)
-      const sourceLabel = asString(props.source_label)
+      const rawImageUrl = asString(props.image_url)
+      const imageUrl = asString(
+        typeof ctx.resolveFigureImageUrl === 'function'
+          ? ctx.resolveFigureImageUrl(rawImageUrl, node)
+          : rawImageUrl,
+      )
+      const preferContain = rawImageUrl.startsWith('asset:') || /^https?:\/\/(?:dx\.)?doi\.org\//i.test(rawImageUrl)
+      const sourceLabel = deriveFigureSourceLabel(caption, asString(props.source_label))
       const aiInsight = asString(props.ai_insight)
       return withAnchorPreview(
         <DraggableContainer node={node}>
@@ -729,14 +822,54 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               )}
             />
             {imageUrl ? (
-              <img
-                src={imageUrl}
-                alt={caption || 'figure'}
-                style={{ width: '100%', maxHeight: 360, objectFit: 'cover', borderRadius: 10 }}
-              />
+              <div
+                style={{
+                  background: preferContain ? 'rgba(15, 23, 42, 0.03)' : 'transparent',
+                  borderRadius: 12,
+                  padding: preferContain ? 12 : 0,
+                }}
+              >
+                <img
+                  src={imageUrl}
+                  alt={caption || 'figure'}
+                  style={{
+                    width: '100%',
+                    maxHeight: 520,
+                    objectFit: preferContain ? 'contain' : 'cover',
+                    borderRadius: 10,
+                    display: 'block',
+                  }}
+                />
+              </div>
             ) : null}
-            {caption ? <Text type="secondary" style={{ display: 'block', marginTop: 10, color: ctx?.themeStyle?.bodyColor, opacity: 0.85 }}>{caption}</Text> : null}
-            {sourceLabel ? <Tag style={{ marginTop: 8 }}>{sourceLabel}</Tag> : null}
+            {(caption || sourceLabel) ? (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: '12px 14px',
+                  borderRadius: 12,
+                  background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44')
+                    ? 'rgba(255, 255, 255, 0.04)'
+                    : 'rgba(15, 23, 42, 0.03)',
+                  border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                }}
+              >
+                {sourceLabel ? <Tag style={{ marginBottom: 8 }}>{sourceLabel}</Tag> : null}
+                {caption ? (
+                  <Paragraph
+                    style={{
+                      marginBottom: 0,
+                      color: ctx?.themeStyle?.bodyColor,
+                      opacity: 0.88,
+                      lineHeight: 1.72,
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {caption}
+                  </Paragraph>
+                ) : null}
+              </div>
+            ) : null}
             {aiInsight ? (
               <div style={{
                 marginTop: 14, padding: '12px 16px',

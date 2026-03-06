@@ -26,6 +26,30 @@ DOCMIND_BLOCKS = [
     },
 ]
 
+FIGURE_DOCMIND_BLOCKS = [
+    {
+        "layout_id": "l_fig",
+        "type": "figure",
+        "subType": "picture",
+        "source_text": "",
+        "block_ids": ["p7_fig"],
+    },
+    {
+        "layout_id": "l_caption",
+        "type": "figure_name",
+        "subType": "none",
+        "source_text": "Fig 3. Example result. https://doi.org/10.1000/example",
+        "block_ids": ["p7_caption"],
+    },
+    {
+        "layout_id": "l_para",
+        "type": "text",
+        "subType": "para",
+        "source_text": "Follow-up discussion paragraph.",
+        "block_ids": ["p7_para"],
+    },
+]
+
 
 def _valid_step_result():
     return {
@@ -202,6 +226,26 @@ def test_deterministic_repair_converges_to_valid_result():
     assert validation["passed"] is True
     assert len(repaired_step_result["classification"]["items"]) == 2
     assert len(repaired_step_result["ui_plan_draft"]["components"]) >= 1
+
+
+def test_deterministic_baseline_preserves_figure_and_caption_when_model_unavailable():
+    validator = ReaderSingleAgentValidator()
+    baseline = validator.build_deterministic_baseline_step_result(
+        docmind_blocks=FIGURE_DOCMIND_BLOCKS,
+        component_whitelist=["ParagraphProse", "FigurePanel"],
+    )
+
+    components = list(((baseline.get("ui_plan_draft") or {}).get("components") or []))
+    figure_components = [row for row in components if str(row.get("component") or "") == "FigurePanel"]
+    paragraph_components = [row for row in components if str(row.get("component") or "") == "ParagraphProse"]
+
+    assert len(figure_components) == 1
+    assert any(str(item).strip() == "l_fig" for item in list(figure_components[0].get("source_block_ids") or []))
+    assert any(str(item).strip() == "l_caption" for item in list(figure_components[0].get("source_block_ids") or []))
+    assert "Fig 3. Example result." in str((figure_components[0].get("props") or {}).get("caption") or "")
+
+    assert len(paragraph_components) == 1
+    assert list(paragraph_components[0].get("source_block_ids") or []) == ["l_para"]
 
 
 def test_deterministic_repair_drops_invalid_component_props_and_converges():
