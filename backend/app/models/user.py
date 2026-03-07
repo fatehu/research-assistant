@@ -68,6 +68,7 @@ class User(Base):
     # 公告关系
     announcements = relationship("Announcement", back_populates="mentor", cascade="all, delete-orphan")
     announcement_reads = relationship("AnnouncementRead", back_populates="user", cascade="all, delete-orphan")
+    admin_audit_logs = relationship("AdminAuditLog", foreign_keys="AdminAuditLog.admin_user_id", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<User {self.username} role={self.role}>"

@@ -1013,6 +1013,13 @@ export interface ReaderComposeReviewDiagnostic {
 
 export interface ReaderComposeReviewSessionRequest extends ReaderComposeRequest {
   snapshot_label?: string
+  prefer_cache_clone?: boolean
+  allow_recompute_on_cache_miss?: boolean
+}
+
+export interface ReaderComposeReviewImportRequest {
+  snapshot_label?: string
+  payload: ReaderComposePayload
 }
 
 export interface ReaderComposeReviewPatchRequest {
@@ -1131,7 +1138,14 @@ export interface ReaderComponentNode {
     | 'InlineQuerySlot'
     | 'AnswerCard'
     | 'CompareInsightsCard'
+    | 'InsightClusterCard'
+    | 'SectionBridgeCard'
     | 'PdfSnippetCard'
+    | 'CitationCard'
+    | 'EquationBlock'
+    | 'MethodologyCard'
+    | 'CalloutBox'
+    | 'AbstractCard'
     | string
   props: Record<string, unknown>
   children: ReaderComponentNode[]
@@ -2028,6 +2042,14 @@ export const literatureApi = {
     return response.data
   },
 
+  importReaderComposeReviewSession: async (
+    paperId: number,
+    payload: ReaderComposeReviewImportRequest,
+  ): Promise<ReaderComposeReviewSnapshot> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed/review-session/import`, payload)
+    return response.data
+  },
+
   getReaderComposeReviewSnapshot: async (
     paperId: number,
     sessionId: string,
@@ -2846,15 +2868,152 @@ export interface Announcement {
 }
 
 export interface SystemStatistics {
+  time_window_days: number
   total_users: number
   admin_count: number
   mentor_count: number
   student_count: number
   active_users: number
+  inactive_users: number
   total_conversations: number
   total_knowledge_bases: number
+  total_documents: number
   total_papers: number
   total_notebooks: number
+  total_groups: number
+  pending_invitations: number
+  total_shared_resources: number
+  total_announcements: number
+  students_with_mentor: number
+  students_without_mentor: number
+  activity: {
+    new_users_last_7_days: number
+    new_conversations_last_7_days: number
+    new_knowledge_bases_last_7_days: number
+    new_papers_last_7_days: number
+    new_notebooks_last_7_days: number
+  }
+  collaboration: {
+    total_groups: number
+    active_groups: number
+    total_group_members: number
+    pending_invitations: number
+    total_shared_resources: number
+    total_announcements: number
+    active_announcements: number
+  }
+  mentorship: {
+    students_with_mentor: number
+    students_without_mentor: number
+  }
+  document_pipeline: {
+    total_documents: number
+    completed_documents: number
+    running_documents: number
+    failed_documents: number
+    pending_documents: number
+    timeout_documents: number
+    cancelled_documents: number
+  }
+  trends_7d: {
+    users: Array<{ date: string; count: number }>
+    conversations: Array<{ date: string; count: number }>
+    knowledge_bases: Array<{ date: string; count: number }>
+    papers: Array<{ date: string; count: number }>
+    notebooks: Array<{ date: string; count: number }>
+  }
+  share_breakdown: Array<{ key: string; label: string; count: number }>
+  invitation_breakdown: Array<{ key: string; label: string; count: number }>
+  top_mentors: Array<{
+    mentor_id: number
+    username: string
+    full_name?: string
+    student_count: number
+    group_count: number
+  }>
+  recent_activity: Array<{
+    id: string
+    type: string
+    title: string
+    owner_name: string
+    owner_role: string
+    created_at: string
+  }>
+  ai_rag: {
+    assistant_messages_last_window: number
+    rag_messages_last_window: number
+    knowledge_search_calls_last_window: number
+    citation_required_answers_last_window: number
+    citation_valid_answers_last_window: number
+    citation_repair_attempts_last_window: number
+    citation_repair_successes_last_window: number
+    compression_calls_last_window: number
+    compression_fallback_chunks_last_window: number
+    assistant_total_tokens_last_window: number
+    agent_runs_last_window: number
+    successful_agent_runs_last_window: number
+  }
+  codelab: {
+    notebooks_active_last_window: number
+    executed_notebooks: number
+    total_execution_count: number
+    code_cells: number
+    executed_code_cells: number
+    agent_runs_last_window: number
+    agent_tokens_last_window: number
+  }
+  literature: {
+    total_collections: number
+    active_read_sessions_last_window: number
+    annotations_last_window: number
+    comments_last_window: number
+    ratings_last_window: number
+    qa_sessions_last_window: number
+    qa_messages_last_window: number
+    knowledge_links_total: number
+    knowledge_link_breakdown: Array<{ key: string; label: string; count: number }>
+  }
+}
+
+export interface StatisticsDetailItem {
+  id: string
+  entity: string
+  title: string
+  subtitle?: string
+  status?: string
+  category?: string
+  owner_name?: string
+  owner_role?: string
+  target_name?: string
+  permission?: string
+  member_count?: number
+  created_at?: string
+  updated_at?: string
+}
+
+export interface StatisticsDetailResponse {
+  entity: string
+  total: number
+  page: number
+  page_size: number
+  items: StatisticsDetailItem[]
+}
+
+export interface AdminAuditLogItem {
+  id: number
+  action: string
+  target_type?: string
+  target_id?: string
+  admin_name: string
+  summary: string
+  created_at: string
+}
+
+export interface AdminAuditLogResponse {
+  total: number
+  page: number
+  page_size: number
+  items: AdminAuditLogItem[]
 }
 
 
@@ -2889,9 +3048,47 @@ export const adminApi = {
     await api.delete(`/api/v1/admin/users/${userId}`)
   },
 
-  getStatistics: async (): Promise<SystemStatistics> => {
-    const response = await api.get('/api/v1/admin/statistics')
+  getStatistics: async (params?: { days?: number }): Promise<SystemStatistics> => {
+    const response = await api.get('/api/v1/admin/statistics', { params })
     return response.data
+  },
+
+  getStatisticsDetails: async (params: {
+    entity: 'groups' | 'shares' | 'invitations' | 'announcements'
+    page?: number
+    page_size?: number
+    status?: string
+    category?: string
+    search?: string
+  }): Promise<StatisticsDetailResponse> => {
+    const response = await api.get('/api/v1/admin/statistics/details', { params })
+    return response.data
+  },
+
+  getAuditLogs: async (params?: {
+    page?: number
+    page_size?: number
+    action?: string
+    search?: string
+  }): Promise<AdminAuditLogResponse> => {
+    const response = await api.get('/api/v1/admin/audit-logs', { params })
+    return response.data
+  },
+
+  exportStatistics: async (params: {
+    scope: 'summary' | 'details' | 'audit'
+    days?: number
+    entity?: 'groups' | 'shares' | 'invitations' | 'announcements'
+    action?: string
+    status?: string
+    category?: string
+    search?: string
+  }): Promise<Blob> => {
+    const response = await api.get('/api/v1/admin/statistics/export', {
+      params,
+      responseType: 'blob',
+    })
+    return response.data as Blob
   },
 
   setUserMentor: async (userId: number, mentorId: number | null): Promise<UserWithRole> => {

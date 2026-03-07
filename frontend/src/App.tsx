@@ -16,6 +16,7 @@ const PaperReaderPage = lazy(() => import('@/pages/literature').then((m) => ({ d
 const PaperReaderReviewPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderReviewPage })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
+const AdminStatisticsPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.StatisticsPage })))
 const MentorStudentsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.StudentsPage })))
 const MentorGroupsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.GroupsPage })))
 const MentorAnnouncementsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.AnnouncementsPage })))
@@ -96,16 +97,6 @@ const RoleRoute = ({
 
   return <>{children}</>
 }
-
-// 占位页面组件
-const PlaceholderPage = ({ title }: { title: string }) => (
-  <div className="h-full flex items-center justify-center bg-slate-950">
-    <div className="text-center">
-      <h1 className="text-2xl font-bold text-white mb-2">{title}</h1>
-      <p className="text-slate-400">功能开发中...</p>
-    </div>
-  </div>
-)
 
 const RouteLoading = () => (
   <div className="h-full flex items-center justify-center bg-slate-950">
@@ -196,7 +187,7 @@ function App() {
             path="admin/statistics"
             element={
               <RoleRoute allowedRoles={['admin']}>
-                <PlaceholderPage title="系统统计" />
+                {withSuspense(<AdminStatisticsPage />)}
               </RoleRoute>
             }
           />

@@ -34,6 +34,7 @@ from app.models.role import (
     SharedResource,
     Announcement,
     AnnouncementRead,
+    AdminAuditLog,
 )
 
 __all__ = [
@@ -79,4 +80,5 @@ __all__ = [
     "SharedResource",
     "Announcement",
     "AnnouncementRead",
+    "AdminAuditLog",
 ]
