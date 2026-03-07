@@ -124,9 +124,13 @@ export default function PaperReaderReviewPage() {
     return {
       pageBackground: pickTokenString(overlay, ['pageBackground', 'page_background'], base.pageBackground),
       panelBackground: pickTokenString(overlay, ['panelBackground', 'panel_background'], base.panelBackground),
+      surfaceBackground: pickTokenString(overlay, ['surfaceBackground', 'surface_background'], base.surfaceBackground),
+      railBackground: pickTokenString(overlay, ['railBackground', 'rail_background'], base.railBackground),
+      overlayBackground: pickTokenString(overlay, ['overlayBackground', 'overlay_background'], base.overlayBackground),
       borderColor: pickTokenString(overlay, ['borderColor', 'border_color'], base.borderColor),
       headingColor: pickTokenString(overlay, ['headingColor', 'heading_color'], base.headingColor),
       bodyColor: pickTokenString(overlay, ['bodyColor', 'body_color'], base.bodyColor),
+      mutedColor: pickTokenString(overlay, ['mutedColor', 'muted_color'], base.mutedColor),
       bodyFontFamily: pickTokenString(overlay, ['bodyFontFamily', 'body_font_family'], base.bodyFontFamily),
       headingFontFamily: pickTokenString(overlay, ['headingFontFamily', 'heading_font_family'], base.headingFontFamily),
       bodyFontSize: pickTokenNumber(overlay, ['bodyFontSize', 'body_font_size'], base.bodyFontSize),
@@ -204,153 +208,169 @@ export default function PaperReaderReviewPage() {
   return (
     <ConfigProvider theme={{ algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
       <div
+        className="reader-composed-surface reader-workbench reader-workbench--review-page"
         style={{
-          minHeight: '100vh',
-          padding: '24px 28px 40px',
-          background: activeStyle.pageBackground,
-        }}
+          '--reader-card-bg': activeStyle.panelBackground,
+          '--reader-card-border': activeStyle.borderColor,
+          '--reader-text': activeStyle.bodyColor,
+          '--reader-heading': activeStyle.headingColor,
+          '--reader-muted-text': activeStyle.mutedColor,
+          '--reader-workbench-page-bg': activeStyle.pageBackground,
+          '--reader-workbench-surface-bg': activeStyle.surfaceBackground,
+          '--reader-workbench-rail-bg': activeStyle.railBackground,
+          '--reader-workbench-overlay-bg': activeStyle.overlayBackground,
+          '--reader-workbench-measure': `${contentMaxWidth}px`,
+          '--reader-workbench-body-font': activeStyle.bodyFontFamily,
+          '--reader-workbench-heading-font': activeStyle.headingFontFamily,
+        } as CSSProperties}
       >
-        <div style={{ maxWidth: 1320, margin: '0 auto', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 320px', gap: 18 }}>
-          <div className="reader-composed-surface" style={{
-            '--reader-card-bg': activeStyle.panelBackground,
-            '--reader-card-border': activeStyle.borderColor,
-            '--reader-text': activeStyle.bodyColor,
-            '--reader-heading': activeStyle.headingColor,
-            border: `1px solid ${activeStyle.borderColor}`,
-            borderRadius: 16,
-            background: activeStyle.pageBackground,
-            color: activeStyle.bodyColor,
-            padding: '12px 14px 24px',
-          } as CSSProperties}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
-              <Space size={8} wrap>
+        <div className="reader-workbench__frame">
+          <div className="reader-workbench__topbar">
+            <div className="reader-workbench__meta">
+              <div className="reader-workbench__eyebrow">
                 <Tag color="blue">Compose Review</Tag>
                 {snapshot ? <Tag color="purple">Revision {snapshot.revision}</Tag> : null}
                 {snapshot?.scheme_choice?.scheme_id ? <Tag color="geekblue">{snapshot.scheme_choice.scheme_id}</Tag> : null}
                 {snapshot?.status ? <Tag color={snapshot.status === 'done' ? 'green' : 'orange'}>{snapshot.status}</Tag> : null}
-              </Space>
-              <Space size={8} wrap>
-                {snapshot?.session_id ? <Text type="secondary">Session {snapshot.session_id.slice(0, 10)}</Text> : null}
-                {snapshot?.snapshot_id ? <Text type="secondary">Snapshot {snapshot.snapshot_id}</Text> : null}
-              </Space>
+              </div>
+              <Title level={2} className="reader-workbench__title">
+                Review Workbench
+              </Title>
+              <Text className="reader-workbench__subtitle">
+                在正式发布到阅读页之前，这里展示 AI 编排后的真实 React 渲染、意图说明和诊断信息。
+              </Text>
             </div>
-
-            {error ? (
-              <Alert
-                type="error"
-                showIcon
-                message="Review snapshot unavailable"
-                description={error}
-                style={{ marginBottom: 16 }}
-              />
-            ) : null}
-
-            {loading ? (
-              <div style={{ minHeight: 360, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <Spin />
-              </div>
-            ) : null}
-
-            {!loading && snapshot ? (
-              <div style={{ maxWidth: contentMaxWidth, margin: '0 auto', width: '100%' }}>
-                {renderReaderComponentTree(snapshot.ui_plan.components, {
-                  themeStyle: activeStyle,
-                  qualityReport: snapshot.quality_report,
-                  resolveFigureImageUrl,
-                  readOnly: true,
-                })}
-              </div>
-            ) : null}
-
-            {!loading && !snapshot && !error ? (
-              <Empty description="No review snapshot found." />
-            ) : null}
+            <div className="reader-workbench__controls">
+              {snapshot?.session_id ? <Text type="secondary">Session {snapshot.session_id.slice(0, 10)}</Text> : null}
+              {snapshot?.snapshot_id ? <Text type="secondary">Snapshot {snapshot.snapshot_id}</Text> : null}
+            </div>
           </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <Card size="small" title="Scheme">
-              <Space direction="vertical" size={6} style={{ width: '100%' }}>
-                <Text strong>{snapshot?.scheme_choice?.label || snapshot?.scheme_choice?.scheme_id || 'Unspecified'}</Text>
-                <Text type="secondary">{snapshot?.scheme_choice?.rationale || 'No explicit scheme rationale.'}</Text>
-              </Space>
-            </Card>
-
-            <Card size="small" title="Decision Log">
-              {snapshot?.decision_log?.length ? (
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  {snapshot.decision_log.map((item, idx) => (
-                    <Text key={`decision-${idx}`}>{item}</Text>
-                  ))}
-                </Space>
-              ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No decision log." />
-              )}
-            </Card>
-
-            <Card size="small" title="Omissions">
-              {snapshot?.omission_decisions?.length ? (
-                <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                  {snapshot.omission_decisions.map((item) => (
-                    <div key={item.decision_id} style={{ paddingBottom: 8, borderBottom: '1px solid rgba(120,145,170,0.18)' }}>
-                      <Space size={6} wrap>
-                        <Tag color={item.decision === 'hide' ? 'red' : (item.decision === 'collapse' ? 'gold' : 'blue')}>
-                          {item.decision}
-                        </Tag>
-                        {item.recoverable ? <Tag color="green">recoverable</Tag> : null}
-                      </Space>
-                      <div style={{ marginTop: 6 }}>
-                        <Text>{item.reason || 'No reason provided.'}</Text>
-                      </div>
-                    </div>
-                  ))}
-                </Space>
-              ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No intentional omissions." />
-              )}
-            </Card>
-
-            <Card size="small" title="Observed Render">
-              {snapshot?.render_image_url ? (
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <img
-                    src={snapshot.render_image_url}
-                    alt="Observed review render"
-                    style={{ width: '100%', borderRadius: 10, border: '1px solid rgba(120,145,170,0.18)' }}
+          <div className="reader-workbench__body">
+            <div className="reader-workbench__canvas">
+              <div className="reader-workbench__surface reader-workbench__surface--scroll">
+                {error ? (
+                  <Alert
+                    type="error"
+                    showIcon
+                    message="Review snapshot unavailable"
+                    description={error}
+                    style={{ marginBottom: 16 }}
                   />
-                  {snapshot.observation_note ? <Text type="secondary">{snapshot.observation_note}</Text> : null}
-                  {snapshot.observation_source ? <Text type="secondary">Source: {snapshot.observation_source}</Text> : null}
-                </Space>
-              ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No render observation." />
-              )}
-            </Card>
+                ) : null}
 
-            <Card size="small" title="Diagnostics">
-              {snapshot?.diagnostics?.length ? (
-                <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                  {snapshot.diagnostics.map((item) => (
-                    <Alert
-                      key={item.code}
-                      type={item.severity === 'error' ? 'error' : (item.severity === 'warn' ? 'warning' : 'info')}
-                      showIcon
-                      message={item.code}
-                      description={item.message}
+                {loading ? (
+                  <div style={{ minHeight: 360, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Spin />
+                  </div>
+                ) : null}
+
+                {!loading && snapshot ? (
+                  <div className="reader-workbench__content" style={{ maxWidth: contentMaxWidth, margin: '0 auto' }}>
+                    {renderReaderComponentTree(snapshot.ui_plan.components, {
+                      themeStyle: activeStyle,
+                      qualityReport: snapshot.quality_report,
+                      resolveFigureImageUrl,
+                      readOnly: true,
+                    })}
+                  </div>
+                ) : null}
+
+                {!loading && !snapshot && !error ? (
+                  <Empty description="No review snapshot found." />
+                ) : null}
+              </div>
+            </div>
+
+            <div className="reader-workbench__rail">
+              <Card size="small" title="Scheme">
+                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                  <Text strong>{snapshot?.scheme_choice?.label || snapshot?.scheme_choice?.scheme_id || 'Unspecified'}</Text>
+                  <Text className="reader-workbench__rail-note">
+                    {snapshot?.scheme_choice?.rationale || 'No explicit scheme rationale.'}
+                  </Text>
+                </Space>
+              </Card>
+
+              <Card size="small" title="Decision Log">
+                {snapshot?.decision_log?.length ? (
+                  <div className="reader-workbench__decision-list">
+                    {snapshot.decision_log.map((item, idx) => (
+                      <div key={`decision-${idx}`} className="reader-workbench__decision-item">
+                        <Text>{item}</Text>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No decision log." />
+                )}
+              </Card>
+
+              <Card size="small" title="Omissions">
+                {snapshot?.omission_decisions?.length ? (
+                  <div className="reader-workbench__omission-list">
+                    {snapshot.omission_decisions.map((item) => (
+                      <div key={item.decision_id} className="reader-workbench__omission-item">
+                        <Space size={6} wrap>
+                          <Tag color={item.decision === 'hide' ? 'red' : (item.decision === 'collapse' ? 'gold' : 'blue')}>
+                            {item.decision}
+                          </Tag>
+                          {item.recoverable ? <Tag color="green">recoverable</Tag> : null}
+                        </Space>
+                        <div style={{ marginTop: 6 }}>
+                          <Text>{item.reason || 'No reason provided.'}</Text>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No intentional omissions." />
+                )}
+              </Card>
+
+              <Card size="small" title="Observed Render">
+                {snapshot?.render_image_url ? (
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <img
+                      src={snapshot.render_image_url}
+                      alt="Observed review render"
+                      style={{ width: '100%', borderRadius: 10, border: '1px solid rgba(120,145,170,0.18)' }}
                     />
-                  ))}
-                </Space>
-              ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No diagnostics." />
-              )}
-            </Card>
+                    {snapshot.observation_note ? <Text className="reader-workbench__rail-note">{snapshot.observation_note}</Text> : null}
+                    {snapshot.observation_source ? <Text className="reader-workbench__rail-note">Source: {snapshot.observation_source}</Text> : null}
+                  </Space>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No render observation." />
+                )}
+              </Card>
 
-            <Card size="small" title="Metadata">
-              <Space direction="vertical" size={6} style={{ width: '100%' }}>
-                <Text>Paper {snapshot?.paper_id || paperId}</Text>
-                <Text>Page {snapshot?.page || '-'}</Text>
-                <Text>Theme {snapshot?.theme_mode || themeMode}</Text>
-                <Text>Detail {snapshot?.detail_level || '-'}</Text>
-              </Space>
-            </Card>
+              <Card size="small" title="Diagnostics">
+                {snapshot?.diagnostics?.length ? (
+                  <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                    {snapshot.diagnostics.map((item) => (
+                      <Alert
+                        key={item.code}
+                        type={item.severity === 'error' ? 'error' : (item.severity === 'warn' ? 'warning' : 'info')}
+                        showIcon
+                        message={item.code}
+                        description={item.message}
+                      />
+                    ))}
+                  </Space>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No diagnostics." />
+                )}
+              </Card>
+
+              <Card size="small" title="Metadata">
+                <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                  <Text>Paper {snapshot?.paper_id || paperId}</Text>
+                  <Text>Page {snapshot?.page || '-'}</Text>
+                  <Text>Theme {snapshot?.theme_mode || themeMode}</Text>
+                  <Text>Detail {snapshot?.detail_level || '-'}</Text>
+                </Space>
+              </Card>
+            </div>
           </div>
         </div>
       </div>

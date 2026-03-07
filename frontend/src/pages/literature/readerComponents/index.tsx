@@ -1,6 +1,6 @@
 import { Fragment, type CSSProperties, type ReactNode, useState } from 'react'
 import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Popover, Typography, message } from 'antd'
-import { DownOutlined, DragOutlined, LinkOutlined, PlusOutlined } from '@ant-design/icons'
+import { DownOutlined, DragOutlined, LinkOutlined, MoreOutlined, PlusOutlined } from '@ant-design/icons'
 
 import type {
   ReaderComponentAction,
@@ -209,6 +209,7 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
     return text('text')
   }
   if (node.type === 'SectionHeading') return `## ${text('text')}`
+  if (node.type === 'Separator') return '---'
   if (node.type === 'KeyTakeaways') {
     const items = asRecordArray((props as Record<string, unknown>).items)
     if (items.length > 0) {
@@ -340,7 +341,6 @@ function ActionBar(props: {
 }): ReactNode {
   const { node, ctx, extraActions } = props
   if (ctx.readOnly) return null
-  const [hovered, setHovered] = useState(false)
   const markdown = componentToMarkdown(node)
   const nodeGatePassed = isNodeGatePassed(node)
   const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
@@ -351,8 +351,6 @@ function ActionBar(props: {
     .filter((row) => !(canonicalActionKey(asString(row.key)) === 'jump_anchor' && anchorRefs.length === 0))
     .filter((row) => !(asString(row.key).toLowerCase() === 'preview_anchor' && anchorRefs.length === 0))
   const canJump = anchorRefs.length > 0
-  const darkTheme = isDarkTheme(ctx)
-  const idleOpacity = darkTheme ? 0.62 : 0.9
   const actionBtnStyle: CSSProperties = {
     color: ctx?.themeStyle?.bodyColor,
     borderColor: ctx?.themeStyle?.borderColor,
@@ -365,93 +363,98 @@ function ActionBar(props: {
     event.dataTransfer.setData('text/plain', markdown)
   }
   if (actionRows.length === 0 && !extraActions) return null
-  return (
-    <div
-      className="reader-action-bar"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        opacity: hovered ? 1 : idleOpacity,
-        transition: 'opacity 0.25s',
-        marginBottom: 8,
-        display: 'flex',
-        justifyContent: 'flex-end', // 靠右对齐更不影响阅读
-      }}
-    >
-      <Space size={6} wrap>
-        {actionRows.map((row, idx) => {
-          const key = canonicalActionKey(asString(row.key))
-          const label = asString(row.label) || key || `action-${idx + 1}`
-          const payload = (row.payload && typeof row.payload === 'object')
-            ? row.payload as Record<string, unknown>
-            : {}
-          if (!key) return null
-          if (key === 'jump_anchor') {
-            return (
-              <Button
-                key={`${node.id}:jump:${idx}`}
-                size="small"
-                icon={<LinkOutlined />}
-                style={actionBtnStyle}
-                disabled={!canJump}
-                onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true })}
-              >
-                {label}
-              </Button>
-            )
-          }
-          if (key === 'copy') {
-            return (
-              <Button
-                key={`${node.id}:copy:${idx}`}
-                size="small"
-                style={actionBtnStyle}
-                onClick={() => copyNodeMarkdown(markdown)}
-              >
-                {label}
-              </Button>
-            )
-          }
-          if (key === 'preview_anchor') {
-            return (
-              <Button
-                key={`${node.id}:preview:${idx}`}
-                size="small"
-                style={actionBtnStyle}
-                disabled={!canJump}
-                onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true })}
-              >
-                {label}
-              </Button>
-            )
-          }
-          const href = asString(payload.href)
+  const actionMenu = (
+    <div className="reader-action-menu">
+      {actionRows.map((row, idx) => {
+        const key = canonicalActionKey(asString(row.key))
+        const label = asString(row.label) || key || `action-${idx + 1}`
+        const payload = (row.payload && typeof row.payload === 'object')
+          ? row.payload as Record<string, unknown>
+          : {}
+        if (!key) return null
+        if (key === 'jump_anchor') {
           return (
             <Button
-              key={`${node.id}:${key}:${idx}`}
+              key={`${node.id}:jump:${idx}`}
               size="small"
+              icon={<LinkOutlined />}
               style={actionBtnStyle}
-              disabled={!href}
-              onClick={() => {
-                if (!href) return
-                window.open(href, '_blank', 'noopener,noreferrer')
-              }}
+              disabled={!canJump}
+              onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true })}
             >
               {label}
             </Button>
           )
-        })}
-        <span draggable onDragStart={onDragMarkdown} style={{ display: 'inline-flex', cursor: 'grab' }}>
+        }
+        if (key === 'copy') {
+          return (
+            <Button
+              key={`${node.id}:copy:${idx}`}
+              size="small"
+              style={actionBtnStyle}
+              onClick={() => copyNodeMarkdown(markdown)}
+            >
+              {label}
+            </Button>
+          )
+        }
+        if (key === 'preview_anchor') {
+          return (
+            <Button
+              key={`${node.id}:preview:${idx}`}
+              size="small"
+              style={actionBtnStyle}
+              disabled={!canJump}
+              onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true })}
+            >
+              {label}
+            </Button>
+          )
+        }
+        const href = asString(payload.href)
+        return (
           <Button
+            key={`${node.id}:${key}:${idx}`}
             size="small"
-            icon={<DragOutlined />}
             style={actionBtnStyle}
+            disabled={!href}
+            onClick={() => {
+              if (!href) return
+              window.open(href, '_blank', 'noopener,noreferrer')
+            }}
           >
-            拖拽Markdown
+            {label}
           </Button>
-        </span>
-        {extraActions}
-      </Space>
+        )
+      })}
+      <span draggable onDragStart={onDragMarkdown} style={{ display: 'inline-flex', cursor: 'grab' }}>
+        <Button
+          size="small"
+          icon={<DragOutlined />}
+          style={actionBtnStyle}
+        >
+          拖拽Markdown
+        </Button>
+      </span>
+      {extraActions ? <div>{extraActions}</div> : null}
+    </div>
+  )
+  return (
+    <div className="reader-action-bar">
+      <Popover
+        trigger="click"
+        placement="bottomRight"
+        overlayClassName="reader-composed-popover"
+        content={actionMenu}
+      >
+        <Button
+          size="small"
+          shape="circle"
+          className="reader-action-trigger"
+          icon={<MoreOutlined />}
+          aria-label="更多段落操作"
+        />
+      </Popover>
     </div>
   )
 }
@@ -637,6 +640,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
 
   const withAnchorPreview = (child: ReactNode): ReactNode => (
     <div
+      className="reader-node-shell"
       style={layoutStyle}
       onMouseEnter={() => {
         if (anchorRefs.length > 0) {
@@ -759,6 +763,44 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
           </Title>
           {renderChildren(node.children || [], ctx)}
         </div>,
+      )
+    }
+
+    case 'Separator': {
+      const tone = asString(props.tone).toLowerCase()
+      const borderColor = tone === 'strong'
+        ? (isDarkTheme(ctx) ? 'rgba(226, 232, 240, 0.32)' : 'rgba(15, 23, 42, 0.18)')
+        : tone === 'muted'
+          ? (isDarkTheme(ctx) ? 'rgba(226, 232, 240, 0.12)' : 'rgba(15, 23, 42, 0.08)')
+          : (ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)')
+      const label = asString(props.label)
+      return (
+        <div style={{ margin: '18px 0 14px' }}>
+          <div
+            style={{
+              borderTop: `1px solid ${borderColor}`,
+              position: 'relative',
+            }}
+          >
+            {label ? (
+              <span
+                style={{
+                  position: 'absolute',
+                  top: -11,
+                  left: 0,
+                  paddingRight: 10,
+                  background: ctx?.themeStyle?.pageBackground || '#fdfbf7',
+                  color: ctx?.themeStyle?.bodyColor || 'rgba(15, 23, 42, 0.48)',
+                  fontSize: 12,
+                  letterSpacing: 0.4,
+                  textTransform: 'uppercase',
+                }}
+              >
+                {label}
+              </span>
+            ) : null}
+          </div>
+        </div>
       )
     }
 
@@ -1445,11 +1487,43 @@ export function renderReaderComponentTree(
   components: ReaderComponentNode[],
   ctx: ReaderComponentRenderContext,
 ): ReactNode {
+  const resolveReaderBandKind = (node: ReaderComponentNode): 'prose' | 'feature' | 'break' => {
+    switch (String(node.type || '').trim()) {
+      case 'FigurePanel':
+      case 'AbstractCard':
+      case 'MethodologyCard':
+      case 'CitationCard':
+      case 'CompareInsightsCard':
+      case 'KeyTakeaways':
+      case 'EquationBlock':
+        return 'feature'
+      case 'CalloutBox':
+      case 'AnnotationRail':
+      case 'QualityPanel':
+      case 'QualityBadge':
+      case 'AnswerCard':
+      case 'Separator':
+      case 'InlineQuerySlot':
+        return 'break'
+      default:
+        return 'prose'
+    }
+  }
+
   return (
     <Fragment>
-      {components.map((node) => (
-        <Fragment key={node.id}>{renderReaderNode(node, ctx)}</Fragment>
-      ))}
+      {components.map((node) => {
+        const bandKind = resolveReaderBandKind(node)
+        return (
+          <div
+            key={node.id}
+            className={`reader-band reader-band--${bandKind}`}
+            data-reader-node-type={node.type}
+          >
+            {renderReaderNode(node, ctx)}
+          </div>
+        )
+      })}
     </Fragment>
   )
 }

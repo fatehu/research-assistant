@@ -8,16 +8,20 @@ import {
   QuestionCircleOutlined,
   ReloadOutlined,
   RightOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
   Button,
   Card,
+  Collapse,
   Col,
   Empty,
   Input,
   List,
   message,
+  Popconfirm,
+  Popover,
   Radio,
   Rate,
   Row,
@@ -85,7 +89,7 @@ import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import './composedReader.css'
 
-const { Title, Text } = Typography
+const { Title, Text, Paragraph } = Typography
 const { TextArea } = Input
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
@@ -342,6 +346,89 @@ function collectPageResourceLinks(paper: Paper | null, pageText: string): PageRe
   })
 
   return Array.from(linkMap.values()).slice(0, 12)
+}
+
+const CONTEXT_ONLY_COMPONENT_TYPES = new Set([
+  'PaperHeaderCard',
+  'MetadataSidebarCard',
+  'ContextRail',
+  'SectionTOC',
+  'CitationLinks',
+  'AnnotationRail',
+  'QualityBadge',
+  'QualityPanel',
+])
+
+function collectReaderNodeTextHints(node: ReaderComponentNode): string[] {
+  const props = ((node.props && typeof node.props === 'object') ? node.props : {}) as Record<string, unknown>
+  const hints = [
+    props.text,
+    props.title,
+    props.caption,
+    props.content,
+    props.description,
+    props.doi,
+    props.label,
+    props.subtitle,
+  ]
+  if (Array.isArray(props.items)) {
+    for (const item of props.items.slice(0, 6)) {
+      if (!item || typeof item !== 'object') continue
+      const row = item as Record<string, unknown>
+      hints.push(row.text, row.label, row.value)
+    }
+  }
+  return hints.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function isLikelyContextOnlyText(raw: string): boolean {
+  const text = String(raw || '').trim()
+  if (!text) return false
+  if (/^(?:research article|open access|corresponding author|supplementary material)$/i.test(text)) return true
+  if (text.length <= 240 && /(?:https?:\/\/)?(?:dx\.)?doi\.org\/\S+/i.test(text)) return true
+  if (text.length <= 180 && /^doi:\s*10\.\S+/i.test(text)) return true
+  if (text.length <= 140 && /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i.test(text)) return true
+  if (
+    text.length <= 420
+    && /\b(?:Department of|School of Medicine|University|Hospital|Medical Center|Inc\b|LLC\b|Institute)\b/i.test(text)
+    && (text.match(/\b\d+\b/g) || []).length >= 2
+  ) {
+    return true
+  }
+  if (
+    text.length <= 360
+    && (text.match(/,/g) || []).length >= 5
+    && /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\d/.test(text)
+  ) {
+    return true
+  }
+  if (text.length <= 220 && /\b(?:received|accepted|published|copyright|pmid|pmcid)\b/i.test(text)) return true
+  if (
+    text.length <= 220
+    && /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b/i.test(text)
+    && /\b\d+\s*\/\s*\d+\b/.test(text)
+  ) {
+    return true
+  }
+  return false
+}
+
+function isContextOnlyReaderNode(node: ReaderComponentNode): boolean {
+  const type = String(node.type || '').trim()
+  if (CONTEXT_ONLY_COMPONENT_TYPES.has(type)) return true
+
+  const zoneType = String(node.zone_type || '').trim().toLowerCase()
+  const columnId = String(node.column_id || '').trim().toLowerCase()
+  const region = String(node.region || '').trim().toLowerCase()
+  if (zoneType === 'side_context') return true
+  if (columnId === 'sidebar' || region === 'sidebar') return true
+
+  if (type === 'ParagraphProse' || type === 'ListBlock' || type === 'CalloutBox' || type === 'SectionHeading') {
+    const hints = collectReaderNodeTextHints(node)
+    if (hints.some((item) => isLikelyContextOnlyText(item))) return true
+  }
+
+  return false
 }
 
 function isLikelyStandalonePageNumber(text: string): boolean {
@@ -1608,6 +1695,9 @@ export default function PaperReaderPage() {
   const [annotationPage, setAnnotationPage] = useState<number>(1)
   const [annotationContent, setAnnotationContent] = useState<string>('')
   const [annotationType, setAnnotationType] = useState<AnnotationType>('note')
+  const [editingAnnotationId, setEditingAnnotationId] = useState<number | null>(null)
+  const [annotationSubmitting, setAnnotationSubmitting] = useState<boolean>(false)
+  const [deletingAnnotationId, setDeletingAnnotationId] = useState<number | null>(null)
 
   const [commentText, setCommentText] = useState<string>('')
 
@@ -1628,6 +1718,7 @@ export default function PaperReaderPage() {
   const [zoomPercent, setZoomPercent] = useState<number>(120)
   const [fitWidth, setFitWidth] = useState<boolean>(true)
   const [textMode, setTextMode] = useState<boolean>(false)
+  const [workspaceTab, setWorkspaceTab] = useState<string>('annotation')
   const [readerAutoSaveStatus, setReaderAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [readerAutoSaveAt, setReaderAutoSaveAt] = useState<string>('')
   const [readerAutoSaveError, setReaderAutoSaveError] = useState<string>('')
@@ -1685,6 +1776,7 @@ export default function PaperReaderPage() {
 
   const viewerRef = useRef<HTMLDivElement | null>(null)
   const textModeContainerRef = useRef<HTMLDivElement | null>(null)
+  const lastTextModeRef = useRef<boolean>(false)
   const headingRefMap = useRef<Map<number, HTMLDivElement>>(new Map())
   const sectionPageCacheRef = useRef<Map<string, number>>(new Map())
   const generativeStreamControllerRef = useRef<AbortController | null>(null)
@@ -1708,6 +1800,7 @@ export default function PaperReaderPage() {
     fallbackUsed: boolean
   }>>(new Map())
   const prefetchedPagesRef = useRef<Set<number>>(new Set())
+  const prefetchInFlightPagesRef = useRef<Set<number>>(new Set())
   const [viewerWidth, setViewerWidth] = useState<number>(860)
   const pdfObjectUrlRef = useRef<string | null>(null)
   const readerSessionHydratedRef = useRef<boolean>(false)
@@ -1790,6 +1883,10 @@ export default function PaperReaderPage() {
     ) / 10
     const nextStyle: GenerativeStyleTokens = {
       ...base,
+      surfaceBackground: pickStyleTokenString(composedStyleTokens, ['surfaceBackground', 'surface_background']) || base.surfaceBackground,
+      railBackground: pickStyleTokenString(composedStyleTokens, ['railBackground', 'rail_background']) || base.railBackground,
+      overlayBackground: pickStyleTokenString(composedStyleTokens, ['overlayBackground', 'overlay_background']) || base.overlayBackground,
+      mutedColor: pickStyleTokenString(composedStyleTokens, ['mutedColor', 'muted_color']) || base.mutedColor,
       bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
       bodyLineHeight: tokenLineHeight !== null
         ? Math.max(1.55, Math.min(2.2, tokenLineHeight))
@@ -1807,6 +1904,15 @@ export default function PaperReaderPage() {
         .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()),
     [annotations, readPage],
   )
+  useEffect(() => {
+    const wasTextMode = lastTextModeRef.current
+    if (textMode && !wasTextMode) {
+      setWorkspaceTab('ai_context')
+    } else if (!textMode && wasTextMode) {
+      setWorkspaceTab((prev) => (prev === 'ai_context' ? 'annotation' : prev))
+    }
+    lastTextModeRef.current = textMode
+  }, [textMode])
   const pageResourceLinks = useMemo(
     () => collectPageResourceLinks(paper, rawPageText || pageText),
     [paper, rawPageText, pageText],
@@ -1816,6 +1922,68 @@ export default function PaperReaderPage() {
     if (!normalized) return ''
     return normalized.length > 2400 ? `${normalized.slice(0, 2400)}...` : normalized
   }, [rawPageText, pageText])
+  const activeComposedPlan = useMemo(
+    () => composedPlan || composedPayload?.ui_plan || null,
+    [composedPlan, composedPayload],
+  )
+  const hasComposedPlan = Boolean(activeComposedPlan?.components?.length)
+  const composedMainComponents = useMemo(
+    () => (Array.isArray(activeComposedPlan?.components)
+      ? activeComposedPlan.components.filter((node) => {
+        const normalizedPaperTitle = normalizeAcademicArtifacts(String(paper?.title || '')).toLowerCase()
+        const titleHints = collectReaderNodeTextHints(node)
+          .map((item) => normalizeAcademicArtifacts(item).toLowerCase())
+          .filter(Boolean)
+        const duplicatesPageTitle = Boolean(normalizedPaperTitle) && titleHints.includes(normalizedPaperTitle)
+        return !isContextOnlyReaderNode(node) && !duplicatesPageTitle
+      })
+      : []),
+    [activeComposedPlan, paper],
+  )
+  const composedContextComponents = useMemo(
+    () => (Array.isArray(activeComposedPlan?.components)
+      ? activeComposedPlan.components.filter((node) => {
+        const normalizedPaperTitle = normalizeAcademicArtifacts(String(paper?.title || '')).toLowerCase()
+        const titleHints = collectReaderNodeTextHints(node)
+          .map((item) => normalizeAcademicArtifacts(item).toLowerCase())
+          .filter(Boolean)
+        const duplicatesPageTitle = Boolean(normalizedPaperTitle) && titleHints.includes(normalizedPaperTitle)
+        return isContextOnlyReaderNode(node) || duplicatesPageTitle
+      })
+      : []),
+    [activeComposedPlan, paper],
+  )
+  const composedLayout = useMemo(
+    () => ((activeComposedPlan?.layout || {}) as Record<string, unknown>),
+    [activeComposedPlan],
+  )
+  const composedContentMaxWidth = useMemo(() => {
+    const width = Number(composedLayout.content_max_width ?? composedLayout.contentMaxWidth ?? 920)
+    if (!Number.isFinite(width)) return 920
+    return clamp(width, 680, 1280)
+  }, [composedLayout])
+  const composedDecisionLog = useMemo(
+    () => (Array.isArray(composedPayload?.decision_log)
+      ? composedPayload.decision_log.map((item) => String(item || '').trim()).filter(Boolean)
+      : []),
+    [composedPayload],
+  )
+  const composedOmissions = useMemo(
+    () => (Array.isArray(composedPayload?.omission_decisions)
+      ? composedPayload.omission_decisions.filter((item) => item && typeof item === 'object')
+      : []),
+    [composedPayload],
+  )
+  const composedLinkAssets = useMemo(
+    () => composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image'),
+    [composedAssets],
+  )
+  const composedPageImageUrl = useMemo(
+    () => String(
+      ((composedPayload as unknown as { docmind_structure?: { page_image_url?: unknown } })?.docmind_structure?.page_image_url) || '',
+    ).trim(),
+    [composedPayload],
+  )
   const readerAutoSaveAtText = useMemo(() => {
     if (!readerAutoSaveAt) return '尚未同步'
     const ts = new Date(readerAutoSaveAt)
@@ -2274,6 +2442,30 @@ export default function PaperReaderPage() {
     setComposedRunSeed((prev) => prev + 1)
   }
 
+  const resolveComposedCacheLabel = (
+    input: {
+      cacheHit?: boolean
+      cacheLayer?: string
+      buildMode?: string
+      status?: string
+      degradedReason?: string
+    },
+  ) => {
+    const cacheHit = Boolean(input.cacheHit)
+    const cacheLayer = String(input.cacheLayer || 'unknown').trim() || 'unknown'
+    const buildMode = String(input.buildMode || 'compose_agent').trim() || 'compose_agent'
+    const status = String(input.status || '').trim()
+    const degradedReason = String(input.degradedReason || '').trim()
+
+    if (cacheHit) {
+      return `Cache hit (${cacheLayer})`
+    }
+    if (status === 'fallback' || degradedReason) {
+      return `Fallback (${degradedReason || status || buildMode})`
+    }
+    return `Built (${buildMode})`
+  }
+
   useEffect(() => {
     if (!validPaperId || !textMode) {
       generativeStreamControllerRef.current?.abort()
@@ -2306,6 +2498,54 @@ export default function PaperReaderPage() {
     setComposedPayload(null)
     setComposedQuality(null)
 
+    const applyRecoveredComposePayload = (
+      recoveredPayload: ReaderComposePayload,
+      cacheMeta?: Record<string, unknown>,
+    ) => {
+      setComposedPayload(recoveredPayload)
+      setComposedPlan(recoveredPayload.ui_plan || null)
+      setComposedAssets(Array.isArray(recoveredPayload.assets) ? recoveredPayload.assets : [])
+      setComposedQuality(recoveredPayload.quality_report || null)
+      setComposedError('')
+      setComposedCacheLabel(resolveComposedCacheLabel({
+        cacheHit: Boolean(cacheMeta?.cache_hit),
+        cacheLayer: String(cacheMeta?.cache_layer || ''),
+        buildMode: String(cacheMeta?.build_mode || recoveredPayload.build_mode || ''),
+        status: recoveredPayload.status,
+        degradedReason: recoveredPayload.degraded_reason,
+      }))
+      setComposedLoading(false)
+    }
+
+    const attemptRecoverFromCachedCompose = async (failureMessage: string) => {
+      if (controller.signal.aborted) return false
+      setComposedCacheLabel('Recovering cache...')
+      try {
+        const recovered = await literatureApi.getCachedReaderComposed(parsedPaperId, {
+          page: readPage,
+          selected_kb_id: selectedKbId,
+          force_refresh: false,
+          regenerate: false,
+          detail_level: appliedOptions.detailLevel,
+          compare_mode: appliedOptions.compareMode,
+          citation_tldr: appliedOptions.citationTldr,
+          max_iterations: composeMaxIterations,
+        })
+        if (controller.signal.aborted) return false
+        if (recovered?.payload) {
+          applyRecoveredComposePayload(recovered.payload, recovered.cache_meta)
+          return true
+        }
+      } catch {
+        // ignore cache recovery miss and preserve original failure below
+      }
+      if (controller.signal.aborted) return false
+      setComposedError(failureMessage)
+      setComposedCacheLabel('Failed')
+      setComposedLoading(false)
+      return false
+    }
+
     literatureApi
       .streamReaderComposed(
         parsedPaperId,
@@ -2328,9 +2568,11 @@ export default function PaperReaderPage() {
               cache_layer?: string
               build_mode?: string
             }
-            const cacheLabel = startData.cache_hit
-              ? `Cache hit (${startData.cache_layer || 'unknown'})`
-              : `Built (${startData.build_mode || 'compose_agent'})`
+            const cacheLabel = resolveComposedCacheLabel({
+              cacheHit: startData.cache_hit,
+              cacheLayer: startData.cache_layer,
+              buildMode: startData.build_mode,
+            })
             setComposedCacheLabel(cacheLabel)
             return
           }
@@ -2410,21 +2652,33 @@ export default function PaperReaderPage() {
           }
 
           if (event === 'done') {
-            const doneData = data as { payload?: ReaderComposePayload }
+            const doneData = data as {
+              status?: string
+              degraded_reason?: string
+              payload?: ReaderComposePayload
+              cache_meta?: Record<string, unknown>
+            }
             if (doneData.payload) {
               setComposedPayload(doneData.payload)
               setComposedPlan(doneData.payload.ui_plan || null)
               setComposedAssets(Array.isArray(doneData.payload.assets) ? doneData.payload.assets : [])
               setComposedQuality(doneData.payload.quality_report || null)
             }
+            const cacheMeta = doneData.cache_meta || {}
+            setComposedCacheLabel(resolveComposedCacheLabel({
+              cacheHit: Boolean(cacheMeta.cache_hit),
+              cacheLayer: String(cacheMeta.cache_layer || ''),
+              buildMode: String(cacheMeta.build_mode || doneData.payload?.build_mode || ''),
+              status: doneData.status || doneData.payload?.status,
+              degradedReason: doneData.degraded_reason || doneData.payload?.degraded_reason,
+            }))
             setComposedLoading(false)
             return
           }
 
           if (event === 'error') {
             const errorData = data as { message?: string }
-            setComposedError(String(errorData.message || 'AI 组件编排失败，已降级到本地提取'))
-            setComposedLoading(false)
+            void attemptRecoverFromCachedCompose(String(errorData.message || 'AI 组件编排失败，已降级到本地提取'))
           }
         },
         controller,
@@ -2432,8 +2686,7 @@ export default function PaperReaderPage() {
       .catch((error) => {
         if (controller.signal.aborted) return
         const msg = error instanceof Error ? error.message : 'AI 组件编排失败，已降级到本地提取'
-        setComposedError(msg)
-        setComposedLoading(false)
+        void attemptRecoverFromCachedCompose(msg)
       })
 
     return () => {
@@ -2453,15 +2706,20 @@ export default function PaperReaderPage() {
   ])
 
   useEffect(() => {
-    if (!validPaperId) return
-    const candidates = [readPage - 1, readPage + 1, readPage + 2].filter(
+    if (!validPaperId || !textMode) return
+    if (composedLoading || !composedPayload || String(composedPayload.status || '') !== 'done') return
+    const candidates = [readPage + 1].filter(
       (value) => value > 0 && (pdfNumPages <= 0 || value <= pdfNumPages),
     )
-    if (candidates.length === 0) return
+    const queuedCandidates = candidates.filter(
+      (value) => !prefetchedPagesRef.current.has(value) && !prefetchInFlightPagesRef.current.has(value),
+    )
+    if (queuedCandidates.length === 0) return
+    queuedCandidates.forEach((item) => prefetchInFlightPagesRef.current.add(item))
     const appliedOptions = composedAppliedOptionsRef.current
     literatureApi
       .prefetchReaderComposed(parsedPaperId, {
-        pages: candidates,
+        pages: queuedCandidates,
         selected_kb_id: selectedKbId,
         detail_level: appliedOptions.detailLevel,
         compare_mode: appliedOptions.compareMode,
@@ -2470,19 +2728,27 @@ export default function PaperReaderPage() {
       })
       .then((result) => {
         if (Array.isArray(result.queued)) {
-          result.queued.forEach((item) => prefetchedPagesRef.current.add(Number(item)))
+          result.queued.forEach((item) => {
+            const page = Number(item)
+            prefetchedPagesRef.current.add(page)
+            prefetchInFlightPagesRef.current.delete(page)
+          })
         }
       })
       .catch(() => {
         // keep silent for prefetch errors
+        queuedCandidates.forEach((item) => prefetchInFlightPagesRef.current.delete(item))
       })
   }, [
     validPaperId,
     parsedPaperId,
+    textMode,
     readPage,
     pdfNumPages,
     selectedKbId,
     composeMaxIterations,
+    composedLoading,
+    composedPayload,
   ])
 
   useEffect(() => {
@@ -2783,21 +3049,70 @@ export default function PaperReaderPage() {
     return null
   }
 
-  const handleAddAnnotation = async () => {
+  const handleStartEditAnnotation = (item: PaperAnnotation) => {
+    setEditingAnnotationId(item.id)
+    setAnnotationType(item.annotation_type)
+    setAnnotationPage(Number(item.page || readPage) || readPage)
+    setAnnotationContent(String(item.content || item.quote_text || '').trim())
+    setWorkspaceTab('annotation')
+  }
+
+  const handleCancelEditAnnotation = () => {
+    setEditingAnnotationId(null)
+    setAnnotationType('note')
+    setAnnotationPage(readPage)
+    setAnnotationContent('')
+  }
+
+  const handleSaveAnnotation = async () => {
     if (!validPaperId || !annotationContent.trim()) return
+    setAnnotationSubmitting(true)
     try {
-      const item = await literatureApi.createAnnotation(parsedPaperId, {
-        annotation_type: annotationType,
-        page: annotationPage,
-        content: annotationContent.trim(),
-        anchor: { page: annotationPage },
-      })
-      setAnnotations((prev) => [...prev, item])
-      setAnnotationContent('')
-      message.success('批注已添加')
+      if (editingAnnotationId) {
+        const item = await literatureApi.updateAnnotation(parsedPaperId, editingAnnotationId, {
+          annotation_type: annotationType,
+          page: annotationPage,
+          content: annotationContent.trim(),
+          anchor: { page: annotationPage },
+        })
+        setAnnotations((prev) => prev.map((row) => (row.id === item.id ? item : row)))
+        handleCancelEditAnnotation()
+        message.success('批注已更新')
+      } else {
+        const item = await literatureApi.createAnnotation(parsedPaperId, {
+          annotation_type: annotationType,
+          page: annotationPage,
+          content: annotationContent.trim(),
+          anchor: { page: annotationPage },
+        })
+        setAnnotations((prev) => [...prev, item])
+        setAnnotationContent('')
+        setAnnotationPage(readPage)
+        message.success('批注已添加')
+      }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : '添加批注失败'
+      const msg = err instanceof Error ? err.message : (editingAnnotationId ? '更新批注失败' : '添加批注失败')
       message.error(msg)
+    } finally {
+      setAnnotationSubmitting(false)
+    }
+  }
+
+  const handleDeleteAnnotation = async (annotationId: number) => {
+    if (!validPaperId || annotationId <= 0) return
+    setDeletingAnnotationId(annotationId)
+    try {
+      await literatureApi.deleteAnnotation(parsedPaperId, annotationId)
+      setAnnotations((prev) => prev.filter((row) => row.id !== annotationId))
+      if (editingAnnotationId === annotationId) {
+        handleCancelEditAnnotation()
+      }
+      message.success('批注已删除')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '删除批注失败'
+      message.error(msg)
+    } finally {
+      setDeletingAnnotationId(null)
     }
   }
 
@@ -3443,6 +3758,76 @@ export default function PaperReaderPage() {
     )
   }
 
+  const renderReaderSettingsContent = () => (
+    <Space direction="vertical" size={12} style={{ width: 280 }}>
+      <div>
+        <Text strong>阅读设置</Text>
+        <div>
+          <Text type="secondary">这些是低频调整项，收起后把阅读画布还给正文。</Text>
+        </div>
+      </div>
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <Text type="secondary">主题</Text>
+        <Select
+          size="small"
+          style={{ width: '100%' }}
+          value={themeMode}
+          onChange={(value) => setThemeMode(value as ReaderThemeMode)}
+          options={[
+            { label: '浅色', value: 'light' },
+            { label: '深色', value: 'dark' },
+          ]}
+        />
+      </Space>
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <Text type="secondary">细节层级</Text>
+        <Select
+          size="small"
+          style={{ width: '100%' }}
+          value={detailLevel}
+          onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
+          options={[
+            { label: '简洁', value: 'concise' },
+            { label: '标准', value: 'standard' },
+            { label: '深入', value: 'deep' },
+          ]}
+        />
+      </Space>
+      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+        <Text type="secondary">阅读风格</Text>
+        <Select
+          size="small"
+          style={{ width: '100%' }}
+          value={generativeStyleKey}
+          onChange={(value) => {
+            const nextStyle = value as ReaderGenerativeStyleKey
+            setGenerativeStyleKey(nextStyle)
+            setGenerativeStyleTuning(
+              normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
+            )
+          }}
+          options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+        />
+      </Space>
+      <Space size={8} wrap>
+        <Button
+          size="small"
+          type={compareMode ? 'primary' : 'default'}
+          onClick={() => setCompareMode((prev) => !prev)}
+        >
+          对比模式
+        </Button>
+        <Button
+          size="small"
+          type={citationTldr ? 'primary' : 'default'}
+          onClick={() => setCitationTldr((prev) => !prev)}
+        >
+          引用 TL;DR
+        </Button>
+      </Space>
+    </Space>
+  )
+
   const renderAnswerWithCitations = () => {
     if (!askAnswer) {
       return <Text>暂无回答</Text>
@@ -3475,29 +3860,11 @@ export default function PaperReaderPage() {
   }
 
   const renderGenerativeTextPanel = () => {
-    const activeComposedPlan = composedPlan || composedPayload?.ui_plan || null
-    const hasComposedPlan = Boolean(activeComposedPlan?.components?.length)
-    const composedLayout = (activeComposedPlan?.layout || {}) as Record<string, unknown>
-    const composedContentMaxWidth = (() => {
-      const width = Number(composedLayout.content_max_width ?? composedLayout.contentMaxWidth ?? 920)
-      if (!Number.isFinite(width)) return 920
-      return clamp(width, 680, 1280)
-    })()
     const useComposedView =
       hasComposedPlan ||
       composedLoading ||
       Boolean(composedError) ||
       Boolean(composedPayload)
-    const composedLinkAssets = composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image')
-    const composedDecisionLog = Array.isArray(composedPayload?.decision_log)
-      ? composedPayload.decision_log.map((item) => String(item || '').trim()).filter(Boolean)
-      : []
-    const composedOmissions = Array.isArray(composedPayload?.omission_decisions)
-      ? composedPayload.omission_decisions.filter((item) => item && typeof item === 'object')
-      : []
-    const composedPageImageUrl = String(
-      ((composedPayload as unknown as { docmind_structure?: { page_image_url?: unknown } })?.docmind_structure?.page_image_url) || '',
-    ).trim()
     const toAbsoluteApiUrl = (rawUrl: string): string => {
       const token = String(rawUrl || '').trim()
       if (!token) return ''
@@ -3598,128 +3965,70 @@ export default function PaperReaderPage() {
               Typography: {
                 colorText: activeComposedStyle.bodyColor,
                 colorTextHeading: activeComposedStyle.headingColor,
-              }
-            }
+              },
+            },
           }}
         >
           <div
-            className="reader-composed-surface"
+            className="reader-composed-surface reader-workbench reader-workbench--embedded"
             style={{
-              // 显式注入阅读主题变量，覆盖全局暗色 Ant 样式，确保浅色模式可读。
               '--reader-card-bg': activeComposedStyle.panelBackground,
               '--reader-card-border': activeComposedStyle.borderColor,
               '--reader-text': activeComposedStyle.bodyColor,
               '--reader-heading': activeComposedStyle.headingColor,
+              '--reader-muted-text': activeComposedStyle.mutedColor,
+              '--reader-workbench-page-bg': activeComposedStyle.pageBackground,
+              '--reader-workbench-surface-bg': activeComposedStyle.surfaceBackground,
+              '--reader-workbench-rail-bg': activeComposedStyle.railBackground,
+              '--reader-workbench-overlay-bg': activeComposedStyle.overlayBackground,
+              '--reader-workbench-measure': `${composedContentMaxWidth}px`,
+              '--reader-workbench-body-font': activeComposedStyle.bodyFontFamily,
+              '--reader-workbench-heading-font': activeComposedStyle.headingFontFamily,
               border: `1px solid ${activeComposedStyle.borderColor}`,
-              borderRadius: 12,
               background: activeComposedStyle.pageBackground,
-              boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.85)',
+              boxShadow: '0 18px 42px rgba(15, 23, 42, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.86)',
               color: activeComposedStyle.bodyColor,
             } as CSSProperties}
           >
-            <div
-              style={{
-                borderBottom: '1px solid rgba(79, 148, 255, 0.24)',
-                padding: '10px 14px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 10,
-                flexWrap: 'wrap',
-              }}
-            >
-              <Space size={8} wrap>
-                <Tag color="blue">AI Composed Reader</Tag>
-                <Text style={{ color: activeComposedStyle.headingColor }}>第 {readPage} 页 · 词数: {pageWordCount}</Text>
-                {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
-                {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
-                {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
-                {composedQuality?.mm_assist_used ? (
-                  <Tag color="magenta">
-                    MM: {composedQuality.mm_model || 'enabled'}
-                    {composedQuality.mm_fallback_used ? ' (fallback)' : ''}
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.cross_column_merge_ratio === 'number' ? (
-                  <Tag color={composedQuality.cross_column_merge_ratio <= 0.08 ? 'green' : 'gold'}>
-                    跨栏 {(composedQuality.cross_column_merge_ratio * 100).toFixed(1)}%
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.duplicate_ratio === 'number' ? (
-                  <Tag color={composedQuality.duplicate_ratio <= 0.1 ? 'green' : 'orange'}>
-                    重复 {(composedQuality.duplicate_ratio * 100).toFixed(1)}%
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.anchor_quote_hit_rate === 'number' ? (
-                  <Tag color={(composedQuality.anchor_quote_hit_rate || 0) >= 0.8 ? 'green' : 'orange'}>
-                    命中 {(Number(composedQuality.anchor_quote_hit_rate || 0) * 100).toFixed(1)}%
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.anchor_bbox_iou === 'number' ? (
-                  <Tag color={(composedQuality.anchor_bbox_iou || 0) >= 0.25 ? 'green' : 'gold'}>
-                    IoU {(Number(composedQuality.anchor_bbox_iou || 0) * 100).toFixed(1)}%
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.anchor_misjump_rate === 'number' ? (
-                  <Tag color={(composedQuality.anchor_misjump_rate || 1) <= 0.2 ? 'green' : 'red'}>
-                    误跳 {(Number(composedQuality.anchor_misjump_rate || 0) * 100).toFixed(1)}%
-                  </Tag>
-                ) : null}
-                {typeof composedQuality?.anchor_gate_passed === 'boolean' ? (
-                  <Tag color={composedQuality.anchor_gate_passed ? 'green' : 'red'}>
-                    定位门禁 {composedQuality.anchor_gate_passed ? '通过' : '关闭跳转'}
-                  </Tag>
-                ) : null}
-              </Space>
-              <Space size={8} wrap>
-                <Select
-                  size="small"
-                  style={{ minWidth: 98 }}
-                  value={themeMode}
-                  onChange={(value) => setThemeMode(value as ReaderThemeMode)}
-                  options={[
-                    { label: '浅色', value: 'light' },
-                    { label: '深色', value: 'dark' },
-                  ]}
-                />
-                <Select
-                  size="small"
-                  style={{ minWidth: 118 }}
-                  value={detailLevel}
-                  onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
-                  options={[
-                    { label: '简洁', value: 'concise' },
-                    { label: '标准', value: 'standard' },
-                    { label: '深入', value: 'deep' },
-                  ]}
-                />
-                <Button
-                  size="small"
-                  type={compareMode ? 'primary' : 'default'}
-                  onClick={() => setCompareMode((prev) => !prev)}
-                >
-                  对比模式
-                </Button>
-                <Button
-                  size="small"
-                  type={citationTldr ? 'primary' : 'default'}
-                  onClick={() => setCitationTldr((prev) => !prev)}
-                >
-                  引用TL;DR
-                </Button>
-                <Select
-                  size="small"
-                  style={{ minWidth: 168 }}
-                  value={generativeStyleKey}
-                  onChange={(value) => {
-                    const nextStyle = value as ReaderGenerativeStyleKey
-                    setGenerativeStyleKey(nextStyle)
-                    setGenerativeStyleTuning(
-                      normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
-                    )
+            <div className="reader-workbench__topbar">
+              <div className="reader-workbench__meta">
+                <div className="reader-workbench__eyebrow">
+                  <Tag color="blue">AI Reader</Tag>
+                  <Tag color="geekblue">第 {readPage} 页</Tag>
+                  {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+                </div>
+                <Title level={3} className="reader-workbench__title">
+                  AI Reading Workbench
+                </Title>
+                <Text className="reader-workbench__subtitle">
+                  {pageWordCount} 词 · {detailLevel === 'concise' ? '简洁' : detailLevel === 'deep' ? '深入' : '标准'}阅读 · {GENERATIVE_STYLE_LABELS[generativeStyleKey]} · {themeMode === 'dark' ? '深色纸面' : '浅色纸面'}
+                </Text>
+              </div>
+
+              <div className="reader-workbench__controls">
+                <Space size={8} wrap>
+                  <Tag>{compareMode ? '对比开' : '对比关'}</Tag>
+                  <Tag>{citationTldr ? 'TL;DR 开' : 'TL;DR 关'}</Tag>
+                </Space>
+                <Popover
+                  trigger="click"
+                  placement="bottomRight"
+                  content={renderReaderSettingsContent()}
+                  overlayClassName="reader-composed-popover"
+                  styles={{
+                    root: {
+                      '--reader-card-bg': activeComposedStyle.panelBackground,
+                      '--reader-card-border': activeComposedStyle.borderColor,
+                      '--reader-text': activeComposedStyle.bodyColor,
+                      '--reader-muted-text': activeComposedStyle.mutedColor,
+                      '--reader-workbench-overlay-bg': activeComposedStyle.overlayBackground,
+                    } as CSSProperties,
                   }}
-                  options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
-                />
+                >
+                  <Button size="small" icon={<SettingOutlined />}>
+                    阅读设置
+                  </Button>
+                </Popover>
                 <Button
                   size="small"
                   icon={<ReloadOutlined />}
@@ -3728,146 +4037,90 @@ export default function PaperReaderPage() {
                 >
                   重新生成
                 </Button>
-              </Space>
+              </div>
             </div>
 
-            <div ref={textModeContainerRef} style={{ maxHeight: 650, overflowY: 'auto', padding: '18px 20px 24px' }}>
-              {composedError ? (
-                <Alert
-                  showIcon
-                  type="warning"
-                  message="AI 编排视图生成失败"
-                  description={`${composedError}；已降级为本地结构化文本。`}
-                  style={{ marginBottom: 12 }}
-                />
-              ) : null}
+            <div ref={textModeContainerRef} className="reader-workbench__body reader-workbench__body--solo">
+              <div className="reader-workbench__canvas">
+                <div className="reader-workbench__surface reader-workbench__surface--plain">
+                  {composedError ? (
+                    <Alert
+                      showIcon
+                      type="warning"
+                      message="AI 编排视图生成失败"
+                      description={`${composedError}；已降级为本地结构化文本。`}
+                      style={{ marginBottom: 12 }}
+                    />
+                  ) : null}
 
-              {composedLoading && !hasComposedPlan ? (
+                  {composedLoading && !hasComposedPlan ? (
+                    <div className="h-[360px] flex items-center justify-center">
+                      <Spin />
+                    </div>
+                  ) : null}
 
-                <div className="h-[360px] flex items-center justify-center">
-                  <Spin />
+                  {hasComposedPlan && activeComposedPlan ? (
+                    <div className="reader-workbench__content" style={{ maxWidth: composedContentMaxWidth, margin: '0 auto', width: '100%' }}>
+                      {composedMainComponents.length > 0 ? (
+                        renderReaderComponentTree(composedMainComponents, {
+                          themeStyle: activeComposedStyle,
+                          qualityReport: composedQuality || composedPayload?.quality_report || null,
+                          inlineQueryLoadingNodeId,
+                          resolveFigureImageUrl: (imageUrl, node) => resolveFigureImageUrl(imageUrl, node),
+                          isActionableAnchor,
+                          onInlineQuery: async (node, question) => {
+                            await handleInlineQuery(node, question)
+                          },
+                          onPreviewAnchors: (anchors, options) => {
+                            showAnchorPreview(anchors, options)
+                          },
+                          onJumpAnchor: (anchors, options) => {
+                            showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
+                          },
+                          onHidePreview: () => {
+                            hideAnchorPreview()
+                          },
+                          resolveAnchorPreviewImage: async (anchors, options) => {
+                            return resolveAnchorPreviewImage(anchors, options)
+                          },
+                          onDropMarkdown: (markdown) => {
+                            appendMarkdownToAnnotation(markdown)
+                          },
+                          onManualInsertSlot: (nodeId) => {
+                            const targetNode = activeComposedPlan
+                              ? findNodeInTree(activeComposedPlan.components || [], String(nodeId))
+                              : null
+                            const inheritedBlockIds = Array.isArray(targetNode?.source_block_ids)
+                              ? targetNode.source_block_ids
+                              : []
+                            const inheritedAnchors = Array.isArray(targetNode?.source_anchor_refs)
+                              ? targetNode.source_anchor_refs
+                              : []
+                            const slotNode: ReaderComponentNode = {
+                              id: `manual-slot-${Date.now()}`,
+                              type: 'InlineQuerySlot',
+                              props: {
+                                placeholder: '请输入您关于上述段落的疑问...',
+                                target_node_ref: String(nodeId),
+                              },
+                              children: [],
+                              source_block_ids: inheritedBlockIds,
+                              source_anchor_refs: inheritedAnchors,
+                            }
+                            applyNodeInsertToComposeState(nodeId, slotNode)
+                          },
+                        })
+                      ) : (
+                        <Empty description="当前页正文已全部收纳到右侧 AI 上下文。" />
+                      )}
+                    </div>
+                  ) : null}
+
+                  {!composedLoading && !hasComposedPlan ? (
+                    <Empty description="当前页暂未生成可用的 AI 组件视图" />
+                  ) : null}
                 </div>
-              ) : null}
-
-              {hasComposedPlan && activeComposedPlan ? (
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 12,
-                    maxWidth: composedContentMaxWidth,
-                    margin: '0 auto',
-                    width: '100%',
-                  }}
-                >
-                  {renderReaderComponentTree(activeComposedPlan.components, {
-                    themeStyle: activeComposedStyle,
-                    qualityReport: composedQuality || composedPayload?.quality_report || null,
-                    inlineQueryLoadingNodeId,
-                    resolveFigureImageUrl: (imageUrl, node) => resolveFigureImageUrl(imageUrl, node),
-                    isActionableAnchor,
-                    onInlineQuery: async (node, question) => {
-                      await handleInlineQuery(node, question)
-                    },
-                    onPreviewAnchors: (anchors, options) => {
-                      showAnchorPreview(anchors, options)
-                    },
-                    onJumpAnchor: (anchors, options) => {
-                      showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
-                    },
-                    onHidePreview: () => {
-                      hideAnchorPreview()
-                    },
-                    resolveAnchorPreviewImage: async (anchors, options) => {
-                      return resolveAnchorPreviewImage(anchors, options)
-                    },
-                    onDropMarkdown: (markdown) => {
-                      appendMarkdownToAnnotation(markdown)
-                    },
-                    onManualInsertSlot: (nodeId) => {
-                      const targetNode = activeComposedPlan
-                        ? findNodeInTree(activeComposedPlan.components || [], String(nodeId))
-                        : null
-                      const inheritedBlockIds = Array.isArray(targetNode?.source_block_ids)
-                        ? targetNode.source_block_ids
-                        : []
-                      const inheritedAnchors = Array.isArray(targetNode?.source_anchor_refs)
-                        ? targetNode.source_anchor_refs
-                        : []
-                      const slotNode: ReaderComponentNode = {
-                        id: `manual-slot-${Date.now()}`,
-                        type: 'InlineQuerySlot',
-                        props: {
-                          placeholder: '请输入您关于上述段落的疑问...',
-                          target_node_ref: String(nodeId),
-                        },
-                        children: [],
-                        source_block_ids: inheritedBlockIds,
-                        source_anchor_refs: inheritedAnchors,
-                      }
-                      applyNodeInsertToComposeState(nodeId, slotNode)
-                    },
-                  })}
-                </div>
-              ) : null}
-
-              {!composedLoading && (composedDecisionLog.length > 0 || composedOmissions.length > 0) ? (
-                <Card size="small" title="AI 决策" style={{ marginTop: 12, borderRadius: 12 }}>
-                  <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                    {composedPayload?.scheme_choice?.scheme_id ? (
-                      <Space size={8} wrap>
-                        <Tag color="geekblue">{String(composedPayload.scheme_choice.scheme_id || '').trim()}</Tag>
-                        {composedPayload.scheme_choice.rationale ? (
-                          <Text type="secondary">{String(composedPayload.scheme_choice.rationale || '').trim()}</Text>
-                        ) : null}
-                      </Space>
-                    ) : null}
-                    {composedDecisionLog.length > 0 ? (
-                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-                        {composedDecisionLog.map((item, idx) => (
-                          <Text key={`compose-decision-${idx}`}>{item}</Text>
-                        ))}
-                      </Space>
-                    ) : null}
-                    {composedOmissions.length > 0 ? (
-                      <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                        {composedOmissions.map((item, idx) => {
-                          const decision = String(item.decision || '').trim()
-                          const reason = String(item.reason || '').trim()
-                          return (
-                            <div key={`compose-omit-${idx}`} style={{ paddingBottom: 8, borderBottom: '1px solid rgba(79, 148, 255, 0.14)' }}>
-                              <Space size={8} wrap>
-                                {decision ? <Tag color={decision === 'hide' ? 'red' : (decision === 'collapse' ? 'gold' : 'blue')}>{decision}</Tag> : null}
-                                {reason ? <Text>{reason}</Text> : <Text type="secondary">未提供原因</Text>}
-                              </Space>
-                            </div>
-                          )
-                        })}
-                      </Space>
-                    ) : null}
-                  </Space>
-                </Card>
-              ) : null}
-
-              {!composedLoading && !hasComposedPlan ? (
-                <Empty description="当前页暂未生成可用的 AI 组件视图" />
-              ) : null}
-
-              {composedLinkAssets.length > 0 ? (
-                <Card size="small" title="补充资源" style={{ marginTop: 12, borderRadius: 12 }}>
-                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                    {composedLinkAssets.slice(0, 6).map((item, idx) => {
-                      const href = String(item.href || '').trim()
-                      if (!href) return null
-                      return (
-                        <a key={`compose-link-${idx}`} href={href} target="_blank" rel="noreferrer">
-                          {item.label || href}
-                        </a>
-                      )
-                    })}
-                  </Space>
-                </Card>
-              ) : null}
+              </div>
             </div>
           </div>
         </ConfigProvider>
@@ -4207,43 +4460,303 @@ export default function PaperReaderPage() {
 
   const renderWidth = fitWidth ? viewerWidth : undefined
   const renderScale = fitWidth ? undefined : zoomPercent / 100
+  const activeWorkspaceStyle = textMode ? activeComposedStyle : activeGenerativeStyle
+  const workspaceSurfaceVars: CSSProperties = {
+    '--reader-card-bg': activeWorkspaceStyle.panelBackground,
+    '--reader-card-border': activeWorkspaceStyle.borderColor,
+    '--reader-text': activeWorkspaceStyle.bodyColor,
+    '--reader-heading': activeWorkspaceStyle.headingColor,
+    '--reader-muted-text': activeWorkspaceStyle.mutedColor,
+    '--reader-workbench-surface-bg': activeWorkspaceStyle.surfaceBackground,
+    '--reader-workbench-overlay-bg': activeWorkspaceStyle.overlayBackground,
+    '--reader-workbench-accent': activeWorkspaceStyle.headingColor,
+  } as CSSProperties
   const panelCardStyle: CSSProperties = {
-    border: '1px solid rgba(86, 151, 255, 0.24)',
-    borderRadius: 14,
+    ...workspaceSurfaceVars,
+    border: `1px solid ${activeWorkspaceStyle.borderColor}`,
+    borderRadius: 16,
     overflow: 'hidden',
-    background: 'linear-gradient(180deg, rgba(7,19,43,0.45) 0%, rgba(6,15,34,0.34) 100%)',
+    color: activeWorkspaceStyle.bodyColor,
+    background: activeWorkspaceStyle.panelBackground,
+    boxShadow: themeMode === 'dark'
+      ? '0 18px 34px rgba(3, 7, 18, 0.28)'
+      : '0 16px 34px rgba(15, 23, 42, 0.07)',
   }
   const panelHeaderStyle: CSSProperties = {
-    padding: '12px 14px 10px',
-    borderBottom: '1px solid rgba(86, 151, 255, 0.18)',
-    background: 'rgba(8, 24, 52, 0.5)',
+    padding: '13px 16px 11px',
+    borderBottom: `1px solid ${activeWorkspaceStyle.borderColor}`,
+    background: activeWorkspaceStyle.overlayBackground,
   }
   const panelOpsStyle: CSSProperties = {
-    padding: '12px 14px',
-    borderBottom: '1px dashed rgba(86, 151, 255, 0.16)',
+    padding: '14px 16px',
+    borderBottom: `1px dashed ${activeWorkspaceStyle.borderColor}`,
+    background: activeWorkspaceStyle.surfaceBackground,
   }
   const panelListStyle: CSSProperties = {
-    padding: '12px 14px',
+    padding: '14px 16px',
     maxHeight: 'min(64vh, 660px)',
     overflowY: 'auto',
+    background: activeWorkspaceStyle.panelBackground,
   }
+  const workspacePrimaryButtonStyle: CSSProperties = themeMode === 'dark'
+    ? {
+      alignSelf: 'flex-start',
+      height: 40,
+      paddingInline: 22,
+      color: '#eef4ff',
+      borderColor: 'rgba(121, 167, 244, 0.24)',
+      background: 'linear-gradient(180deg, rgba(74, 121, 208, 0.22) 0%, rgba(51, 86, 152, 0.16) 100%)',
+      boxShadow: 'none',
+      fontWeight: 600,
+    }
+    : {
+      alignSelf: 'flex-start',
+      height: 40,
+      paddingInline: 22,
+      color: '#153a82',
+      borderColor: 'rgba(39, 80, 162, 0.18)',
+      background: 'linear-gradient(180deg, rgba(255, 255, 255, 0.94) 0%, rgba(228, 238, 255, 0.98) 100%)',
+      boxShadow: 'none',
+      fontWeight: 600,
+    }
+  const workspaceSecondaryButtonStyle: CSSProperties = themeMode === 'dark'
+    ? {
+      height: 40,
+      paddingInline: 18,
+      color: 'rgba(223, 234, 255, 0.92)',
+      borderColor: 'rgba(121, 167, 244, 0.18)',
+      background: 'rgba(255, 255, 255, 0.04)',
+      boxShadow: 'none',
+    }
+    : {
+      height: 40,
+      paddingInline: 18,
+      color: activeWorkspaceStyle.bodyColor,
+      borderColor: activeWorkspaceStyle.borderColor,
+      background: activeWorkspaceStyle.surfaceBackground,
+      boxShadow: 'none',
+    }
   const renderThreeTierPanel = (
     title: string,
     subtitle: string,
     operations: ReactNode,
     listBlock: ReactNode,
   ) => (
-    <div style={panelCardStyle}>
-      <div style={panelHeaderStyle}>
-        <Text strong>{title}</Text>
-        <div>
-          <Text type="secondary" style={{ fontSize: 12 }}>{subtitle}</Text>
+    <ConfigProvider
+      theme={{
+        algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+        token: {
+          colorBgContainer: activeWorkspaceStyle.panelBackground,
+          colorBgElevated: activeWorkspaceStyle.overlayBackground,
+          colorBorder: activeWorkspaceStyle.borderColor,
+          colorSplit: activeWorkspaceStyle.borderColor,
+          colorText: activeWorkspaceStyle.bodyColor,
+          colorTextHeading: activeWorkspaceStyle.headingColor,
+          colorTextSecondary: activeWorkspaceStyle.mutedColor,
+          colorFillAlter: activeWorkspaceStyle.surfaceBackground,
+        },
+        components: {
+          Typography: {
+            colorText: activeWorkspaceStyle.bodyColor,
+            colorTextHeading: activeWorkspaceStyle.headingColor,
+            colorTextDescription: activeWorkspaceStyle.mutedColor,
+          },
+        },
+      }}
+    >
+      <div className="reader-composed-surface reader-side-panel" style={panelCardStyle}>
+        <div style={panelHeaderStyle}>
+          <Text strong>{title}</Text>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12 }}>{subtitle}</Text>
+          </div>
         </div>
+        <div style={panelOpsStyle}>{operations}</div>
+        <div style={panelListStyle}>{listBlock}</div>
       </div>
-      <div style={panelOpsStyle}>{operations}</div>
-      <div style={panelListStyle}>{listBlock}</div>
-    </div>
+    </ConfigProvider>
   )
+
+  const renderAiContextPanel = () => {
+    const sectionItems = [
+      ...(composedContextComponents.length > 0 ? [{
+        key: 'page-context',
+        label: `页面上下文 · ${composedContextComponents.length}`,
+        children: (
+          <div style={{ maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
+            {renderReaderComponentTree(composedContextComponents, {
+              themeStyle: activeComposedStyle,
+              qualityReport: composedQuality || composedPayload?.quality_report || null,
+              readOnly: true,
+              resolveFigureImageUrl: (imageUrl, node) => {
+                const token = String(imageUrl || '').trim()
+                if (!token) return ''
+                if (/^https?:\/\//i.test(token) || token.startsWith('data:') || token.startsWith('blob:')) return token
+                if (token.startsWith('/')) return READER_API_BASE_URL ? `${READER_API_BASE_URL}${token}` : token
+                return token
+              },
+              isActionableAnchor,
+              onPreviewAnchors: (anchors, options) => {
+                showAnchorPreview(anchors, options)
+              },
+              onJumpAnchor: (anchors, options) => {
+                showAnchorPreview(anchors, { pinPreview: Boolean(options?.pinPreview ?? true) })
+              },
+              onHidePreview: () => {
+                hideAnchorPreview()
+              },
+              resolveAnchorPreviewImage: async (anchors, options) => {
+                return resolveAnchorPreviewImage(anchors, options)
+              },
+            })}
+          </div>
+        ),
+      }] : []),
+      {
+        key: 'decisions',
+        label: `AI 决策${composedDecisionLog.length ? ` · ${composedDecisionLog.length}` : ''}`,
+        children: (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            {composedPayload?.scheme_choice?.scheme_id ? (
+              <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                <Space size={8} wrap>
+                  <Tag color="geekblue">{String(composedPayload.scheme_choice.scheme_id || '').trim()}</Tag>
+                </Space>
+                {composedPayload.scheme_choice.rationale ? (
+                  <Text className="reader-workbench__rail-note">{String(composedPayload.scheme_choice.rationale || '').trim()}</Text>
+                ) : null}
+              </Space>
+            ) : null}
+            {composedDecisionLog.length > 0 ? (
+              <div className="reader-workbench__decision-list">
+                {composedDecisionLog.map((item, idx) => (
+                  <div key={`compose-decision-${idx}`} className="reader-workbench__decision-item">
+                    <Text>{item}</Text>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No decision log." />
+            )}
+          </Space>
+        ),
+      },
+      {
+        key: 'omissions',
+        label: `Intentional Omissions${composedOmissions.length ? ` · ${composedOmissions.length}` : ''}`,
+        children: composedOmissions.length > 0 ? (
+          <div className="reader-workbench__omission-list">
+            {composedOmissions.map((item, idx) => {
+              const decision = String(item.decision || '').trim()
+              const reason = String(item.reason || '').trim()
+              return (
+                <div key={`compose-omit-${idx}`} className="reader-workbench__omission-item">
+                  <Space size={8} wrap>
+                    {decision ? <Tag color={decision === 'hide' ? 'red' : (decision === 'collapse' ? 'gold' : 'blue')}>{decision}</Tag> : null}
+                    {item.recoverable ? <Tag color="green">recoverable</Tag> : null}
+                  </Space>
+                  <div style={{ marginTop: 6 }}>
+                    {reason ? <Text>{reason}</Text> : <Text type="secondary">未提供原因</Text>}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No intentional omissions." />
+        ),
+      },
+      {
+        key: 'quality',
+        label: '质量与定位',
+        children: (
+          <div className="reader-workbench__quality-list">
+            <Space size={8} wrap>
+              {composedQuality ? <Tag color="purple">质量 {Math.round((composedQuality.overall || 0) * 100)}/100</Tag> : null}
+              {prefetchedPagesRef.current.has(readPage) ? <Tag color="green">已预读</Tag> : null}
+              {composedQuality?.anchor_gate_passed === true ? <Tag color="green">定位门禁通过</Tag> : null}
+              {composedQuality?.anchor_gate_passed === false ? <Tag color="red">定位门禁关闭</Tag> : null}
+              {composedQuality?.mm_assist_used ? (
+                <Tag color="magenta">
+                  MM: {composedQuality.mm_model || 'enabled'}
+                  {composedQuality.mm_fallback_used ? ' (fallback)' : ''}
+                </Tag>
+              ) : null}
+              {typeof composedQuality?.cross_column_merge_ratio === 'number' ? (
+                <Tag color={composedQuality.cross_column_merge_ratio <= 0.08 ? 'green' : 'gold'}>
+                  跨栏 {(composedQuality.cross_column_merge_ratio * 100).toFixed(1)}%
+                </Tag>
+              ) : null}
+              {typeof composedQuality?.duplicate_ratio === 'number' ? (
+                <Tag color={composedQuality.duplicate_ratio <= 0.1 ? 'green' : 'orange'}>
+                  重复 {(composedQuality.duplicate_ratio * 100).toFixed(1)}%
+                </Tag>
+              ) : null}
+              {typeof composedQuality?.anchor_quote_hit_rate === 'number' ? (
+                <Tag color={(composedQuality.anchor_quote_hit_rate || 0) >= 0.8 ? 'green' : 'orange'}>
+                  命中 {(Number(composedQuality.anchor_quote_hit_rate || 0) * 100).toFixed(1)}%
+                </Tag>
+              ) : null}
+              {typeof composedQuality?.anchor_bbox_iou === 'number' ? (
+                <Tag color={(composedQuality.anchor_bbox_iou || 0) >= 0.25 ? 'green' : 'gold'}>
+                  IoU {(Number(composedQuality.anchor_bbox_iou || 0) * 100).toFixed(1)}%
+                </Tag>
+              ) : null}
+              {typeof composedQuality?.anchor_misjump_rate === 'number' ? (
+                <Tag color={(composedQuality.anchor_misjump_rate || 1) <= 0.2 ? 'green' : 'red'}>
+                  误跳 {(Number(composedQuality.anchor_misjump_rate || 0) * 100).toFixed(1)}%
+                </Tag>
+              ) : null}
+            </Space>
+            <div style={{ marginTop: 10 }}>
+              {composedQuality?.stop_reason ? (
+                <Text className="reader-workbench__rail-note">停止原因：{composedQuality.stop_reason}</Text>
+              ) : (
+                <Text className="reader-workbench__rail-note">当前证据、决策和质量收束在右栏，正文画布不再重复显示同一块信息。</Text>
+              )}
+            </div>
+          </div>
+        ),
+      },
+    ]
+    if (composedLinkAssets.length > 0) {
+      sectionItems.push({
+        key: 'links',
+        label: `Supplementary Links · ${Math.min(composedLinkAssets.length, 6)}`,
+        children: (
+          <div className="reader-workbench__link-list">
+            {composedLinkAssets.slice(0, 6).map((item, idx) => {
+              const href = String(item.href || '').trim()
+              if (!href) return null
+              return (
+                <a key={`compose-link-${idx}`} href={href} target="_blank" rel="noreferrer">
+                  {item.label || href}
+                </a>
+              )
+            })}
+          </div>
+        ),
+      })
+    }
+
+    return renderThreeTierPanel(
+      'AI 上下文',
+      '把证据、决策和质量说明固定在右栏，阅读画布只保留正文与图。',
+      <Space wrap size={8}>
+        <Tag color="blue">第 {readPage} 页</Tag>
+        <Tag>{pageWordCount} 词</Tag>
+        {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+      </Space>,
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        {renderAnchorEvidenceCard()}
+        <Collapse
+          bordered={false}
+          defaultActiveKey={['decisions', 'quality']}
+          items={sectionItems}
+        />
+      </Space>,
+    )
+  }
 
   return (
     <div className="p-4 space-y-4">
@@ -4255,7 +4768,7 @@ export default function PaperReaderPage() {
       </div>
 
       <Row gutter={16}>
-        <Col span={16}>
+        <Col span={textMode ? 17 : 16}>
           <Card
             title={(
               <Space align="center" size={10}>
@@ -4390,21 +4903,64 @@ export default function PaperReaderPage() {
           </Card>
         </Col>
 
-        <Col span={8}>
-          <Tabs
-            defaultActiveKey="annotation"
-            size="large"
-            tabBarGutter={28}
-            tabBarStyle={{ marginBottom: 14, paddingInline: 2 }}
-            items={[
+        <Col span={textMode ? 7 : 8}>
+          <ConfigProvider
+            theme={{
+              algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+              token: {
+                colorBgContainer: activeWorkspaceStyle.panelBackground,
+                colorBgElevated: activeWorkspaceStyle.overlayBackground,
+                colorBorder: activeWorkspaceStyle.borderColor,
+                colorSplit: activeWorkspaceStyle.borderColor,
+                colorText: activeWorkspaceStyle.bodyColor,
+                colorTextHeading: activeWorkspaceStyle.headingColor,
+                colorTextSecondary: activeWorkspaceStyle.mutedColor,
+                colorFillAlter: activeWorkspaceStyle.surfaceBackground,
+              },
+              components: {
+                Typography: {
+                  colorText: activeWorkspaceStyle.bodyColor,
+                  colorTextHeading: activeWorkspaceStyle.headingColor,
+                  colorTextDescription: activeWorkspaceStyle.mutedColor,
+                },
+              },
+            }}
+          >
+            <div
+              className={`reader-workspace-sidebar reader-workspace-sidebar--${themeMode}`}
+              style={workspaceSurfaceVars}
+            >
+              <Tabs
+                className="reader-workspace-tabs"
+                activeKey={workspaceTab}
+                onChange={(key) => setWorkspaceTab(key)}
+                size="large"
+                tabBarGutter={28}
+                tabBarStyle={{ marginBottom: 14, paddingInline: 2 }}
+                items={[
+              ...(textMode ? [{
+                key: 'ai_context',
+                label: 'AI 上下文',
+                children: renderAiContextPanel(),
+              }] : []),
               {
                 key: 'annotation',
                 label: '批注',
                 children: (
                   renderThreeTierPanel(
                     '批注工作区',
-                    '在阅读过程中记录页级批注，并可一键回跳。',
+                    '在阅读过程中记录页级批注，并用摘要列表快速扫描。',
                     <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                      {editingAnnotationId ? (
+                        <Space size={8} wrap>
+                          <Tag color="processing">编辑中</Tag>
+                          <Text type="secondary">保存后会覆盖原批注内容。</Text>
+                        </Space>
+                      ) : null}
+                      <Space size={8} wrap>
+                        <Tag color="blue">全部 {annotations.length}</Tag>
+                        <Tag color="geekblue">当前页 {currentPageAnnotations.length}</Tag>
+                      </Space>
                       <Space wrap size={10} style={{ width: '100%' }}>
                         <Select
                           value={annotationType}
@@ -4437,36 +4993,78 @@ export default function PaperReaderPage() {
                           rows={4}
                           value={annotationContent}
                           onChange={(e) => setAnnotationContent(e.target.value)}
-                          placeholder="输入批注内容（支持从左侧拖拽组件 Markdown 到此处）"
+                          placeholder={editingAnnotationId ? '编辑批注内容' : '输入批注内容（支持从左侧拖拽组件 Markdown 到此处）'}
                           style={{ borderRadius: 10 }}
                         />
                       </div>
-                      <Button type="primary" onClick={handleAddAnnotation} style={{ alignSelf: 'flex-start', height: 40, paddingInline: 22 }}>
-                        新增批注
-                      </Button>
+                      <Space size={10} wrap>
+                        <Button
+                          loading={annotationSubmitting}
+                          onClick={handleSaveAnnotation}
+                          style={workspacePrimaryButtonStyle}
+                        >
+                          {editingAnnotationId ? '保存修改' : '新增批注'}
+                        </Button>
+                        {editingAnnotationId ? (
+                          <Button
+                            onClick={handleCancelEditAnnotation}
+                            disabled={annotationSubmitting}
+                            style={workspaceSecondaryButtonStyle}
+                          >
+                            取消编辑
+                          </Button>
+                        ) : null}
+                      </Space>
                     </Space>,
                     <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                    <List
-                      size="small"
-                      dataSource={annotations}
-                      style={{ maxHeight: 300, overflowY: 'auto', paddingRight: 4 }}
-                      locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无批注" /> }}
-                      renderItem={(item) => (
-                        <List.Item
-                          actions={[
-                            <Button key="jump" size="small" onClick={() => setReadPage(item.page)}>
-                              跳转
-                            </Button>,
-                          ]}
-                        >
-                          <Space direction="vertical" size={2}>
-                            <Text strong>第 {item.page} 页</Text>
-                            <Text type="secondary">{item.content || item.quote_text || '(空)'}</Text>
-                          </Space>
-                        </List.Item>
-                      )}
-                    />
-                    {renderAnchorEvidenceCard()}
+                      <List
+                        size="small"
+                        dataSource={[...annotations].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())}
+                        style={{ maxHeight: 340, overflowY: 'auto', paddingRight: 4 }}
+                        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无批注" /> }}
+                        renderItem={(item) => (
+                          <List.Item
+                            actions={[
+                              <Button key="jump" size="small" onClick={() => setReadPage(item.page)}>
+                                跳转
+                              </Button>,
+                              <Button key="edit" size="small" onClick={() => handleStartEditAnnotation(item)}>
+                                编辑
+                              </Button>,
+                              <Popconfirm
+                                key="delete"
+                                title="删除这条批注？"
+                                description="删除后不可恢复。"
+                                okText="删除"
+                                cancelText="取消"
+                                okButtonProps={{ danger: true, loading: deletingAnnotationId === item.id }}
+                                onConfirm={async () => handleDeleteAnnotation(item.id)}
+                              >
+                                <Button size="small" danger loading={deletingAnnotationId === item.id}>
+                                  删除
+                                </Button>
+                              </Popconfirm>,
+                            ]}
+                          >
+                            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                              <Space size={8} wrap>
+                                <Text strong>第 {item.page} 页</Text>
+                                <Tag color={item.annotation_type === 'highlight' ? 'gold' : 'blue'} style={{ marginInlineEnd: 0 }}>
+                                  {item.annotation_type === 'highlight' ? '高亮' : '笔记'}
+                                </Tag>
+                                {editingAnnotationId === item.id ? <Tag color="processing">正在编辑</Tag> : null}
+                              </Space>
+                              <Paragraph
+                                style={{ marginBottom: 0 }}
+                                type="secondary"
+                                ellipsis={{ rows: 2, expandable: true, symbol: '展开' }}
+                              >
+                                {item.content || item.quote_text || '(空)'}
+                              </Paragraph>
+                            </Space>
+                          </List.Item>
+                        )}
+                      />
                     </Space>,
                   )
                 ),
@@ -4502,7 +5100,7 @@ export default function PaperReaderPage() {
                         placeholder="输入评论"
                         style={{ borderRadius: 10 }}
                       />
-                      <Button type="primary" onClick={handleAddComment} style={{ alignSelf: 'flex-start', height: 40, paddingInline: 22 }}>
+                      <Button onClick={handleAddComment} style={workspacePrimaryButtonStyle}>
                         发布评论
                       </Button>
                     </Space>,
@@ -4728,8 +5326,10 @@ export default function PaperReaderPage() {
                   )
                 ),
               },
-            ]}
-          />
+                ]}
+              />
+            </div>
+          </ConfigProvider>
         </Col>
       </Row>
 

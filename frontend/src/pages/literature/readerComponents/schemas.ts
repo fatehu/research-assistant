@@ -20,6 +20,10 @@ export const readerComponentSchemas = {
     text: z.string().min(1),
     level: z.number().optional(),
   }),
+  Separator: z.object({
+    label: z.string().optional(),
+    tone: z.enum(['default', 'muted', 'strong']).optional(),
+  }),
   ParagraphProse: z.object({
     text: z.string().min(1),
     paragraphs: z.array(z.any()).optional(),

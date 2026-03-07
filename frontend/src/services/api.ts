@@ -1463,6 +1463,11 @@ export interface ReaderComposeStreamEventMap {
 
 export type ReaderComposeStreamEvent = keyof ReaderComposeStreamEventMap
 
+export interface ReaderComposeFetchResponse {
+  payload: ReaderComposePayload
+  cache_meta?: Record<string, unknown>
+}
+
 export interface ReaderNodeActionRequest {
   page: number
   node_id: string
@@ -2005,6 +2010,14 @@ export const literatureApi = {
         }
       }
     }
+  },
+
+  getCachedReaderComposed: async (
+    paperId: number,
+    payload: ReaderComposeRequest,
+  ): Promise<ReaderComposeFetchResponse> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed`, payload)
+    return response.data
   },
 
   createReaderComposeReviewSession: async (
@@ -3554,6 +3567,7 @@ export enum ChunkingStrategy {
   HIERARCHICAL = 'hierarchical',
   ACADEMIC = 'academic',
   HYBRID = 'hybrid',
+  LLM = 'llm',
 }
 
 export enum ChunkLevel {
@@ -3568,6 +3582,7 @@ export enum ChunkingPreset {
   PRECISE = 'precise',
   ACADEMIC = 'academic',
   DEEP = 'deep',
+  LLM = 'llm',
 }
 
 export interface ChunkingConfig {
@@ -3729,7 +3744,7 @@ export const chunkingApi = {
 
   compareStrategies: async (
     text: string,
-    strategies: ChunkingPreset[] = [ChunkingPreset.FAST, ChunkingPreset.PRECISE, ChunkingPreset.DEEP],
+    strategies: ChunkingPreset[] = [ChunkingPreset.FAST, ChunkingPreset.PRECISE, ChunkingPreset.LLM],
     fileType = 'txt'
   ): Promise<StrategyComparison> => {
     const params = new URLSearchParams()
