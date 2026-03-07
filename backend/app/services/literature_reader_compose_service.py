@@ -332,6 +332,10 @@ class LiteratureReaderComposeService:
         token = str(getattr(settings, "reader_pipeline_version", SIMPLIFIED_PIPELINE_VERSION_DEFAULT) or "").strip()
         return token or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
 
+    def _use_semantic_atom_pipeline(self) -> bool:
+        token = self._pipeline_version().strip().lower()
+        return token in {"simplified_v2", "reader_workbench_v2_phase12", "phase12_semantic_v1"}
+
     def _pipeline_mode(self) -> str:
         explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_SINGLE_AGENT_V2) or "").strip().lower()
         if explicit in {PIPELINE_MODE_LEGACY, PIPELINE_MODE_SINGLE_AGENT_V2}:
@@ -640,8 +644,21 @@ class LiteratureReaderComposeService:
                     "[ReaderComposeService] single_agent_v2 pipeline start "
                     f"paper={paper.id} page={page_num}"
                 )
+                use_semantic_atom_pipeline = self._use_semantic_atom_pipeline()
+                primary_builder = (
+                    self._build_simplified_pipeline_result
+                    if use_semantic_atom_pipeline
+                    else self._build_single_agent_v2_result
+                )
+                fallback_builder = (
+                    self._build_single_agent_v2_result
+                    if use_semantic_atom_pipeline
+                    else self._build_simplified_pipeline_result
+                )
+                primary_label = "semantic_atom_pipeline" if use_semantic_atom_pipeline else "single_agent_v2_controller"
+                fallback_label = "single_agent_v2_controller" if use_semantic_atom_pipeline else "semantic_atom_pipeline"
                 try:
-                    simplified_result = await self._build_single_agent_v2_result(
+                    simplified_result = await primary_builder(
                         db=db,
                         user_id=int(user_id),
                         paper=paper,
@@ -656,11 +673,10 @@ class LiteratureReaderComposeService:
                     )
                 except Exception as exc:
                     logger.exception(
-                        "[ReaderComposeService] single_agent_v2 controller failed; "
-                        "fallback to deterministic simplified baseline "
+                        f"[ReaderComposeService] {primary_label} failed; fallback to {fallback_label} "
                         f"paper={paper.id} page={page_num}: {exc}"
                     )
-                    simplified_result = await self._build_simplified_pipeline_result_legacy(
+                    simplified_result = await fallback_builder(
                         db=db,
                         user_id=int(user_id),
                         paper=paper,
@@ -894,7 +910,7 @@ class LiteratureReaderComposeService:
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
     ) -> Dict[str, Any]:
-        return await self._build_single_agent_v2_result(
+        return await self._build_simplified_pipeline_result_legacy(
             db=db,
             user_id=user_id,
             paper=paper,
@@ -2925,11 +2941,14 @@ class LiteratureReaderComposeService:
         atoms_digest = [
             {
                 "atom_id": str(row.get("atom_id") or ""),
+                "source_layout_id": str(row.get("source_layout_id") or ""),
+                "block_index": int(row.get("block_index") or 0),
                 "reading_order": int(row.get("reading_order") or 0),
                 "type": str(row.get("type") or ""),
                 "sub_type": str(row.get("sub_type") or ""),
                 "default_role": str(row.get("default_role") or "unknown"),
                 "default_component": str(row.get("default_component") or "ParagraphProse"),
+                "style_id": int(row.get("style_id") or 0),
                 "bbox": list(row.get("bbox") or [0.0, 0.0, 0.0, 0.0])[:4],
                 "text_preview": self._normalize_spaces(str(row.get("text") or ""))[:220],
             }

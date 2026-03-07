@@ -3410,8 +3410,8 @@ class ReaderMultimodalLayoutService:
         content_parts: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         model_name = str(model or "").strip().lower()
         use_images_for_prompt = True
-        if str(prompt_kind) in {"stage1_structural_v1", "stage1_semantic_v2"}:
-            # Stage1 is DocMind-truth annotation only; keep image as metadata reference only.
+        if str(prompt_kind) == "stage1_structural_v1":
+            # Structural stage keeps image out of band; it only annotates existing layout IDs.
             use_images_for_prompt = False
         elif str(prompt_kind) == "line_parse_advice_v1" and "vl" not in model_name:
             # Fallback text model: use text-only parse prompt to improve robustness and latency.
@@ -3673,7 +3673,9 @@ class ReaderMultimodalLayoutService:
             "3) Every known atom_id must appear exactly once.\n"
             "4) role must be one of: doc_title,section_title,paragraph,list_item,caption,figure,table,sidebar,metadata,header,footer,noise,unknown.\n"
             "5) confidence in [0,1].\n"
-            "6) visual_reference_only=true: image is optional reference only.\n"
+            "6) visual_reference_only=true: current page image may be used only to judge structure/boundaries, never to invent text.\n"
+            "7) Use grouping_hint conservatively to mark atoms that clearly belong to the same semantic paragraph/list/caption unit.\n"
+            "8) If bbox/reading_order/indent suggests a new paragraph start, do not reuse the previous grouping_hint.\n"
             f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
             f"visual_reference_only: true\n"
             f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
@@ -3729,7 +3731,9 @@ class ReaderMultimodalLayoutService:
             "4) Every known atom_id must be accounted for via page_layout_slots.atom_ids or unused_atom_ids.\n"
             "5) component must come from allowed_components.\n"
             "6) Do not output ownership/topology override fields in any nested object.\n"
-            "7) visual_reference_only=true: image is optional reference only.\n"
+            "7) visual_reference_only=true: image may guide grouping, but never add missing text.\n"
+            "8) Prefer one semantic paragraph per ParagraphProse slot; do not merge across paragraph starts suggested by grouping_hint, reading_order jumps, vertical gaps, or indent changes.\n"
+            "9) Keep captions/figures separate from body paragraphs unless atoms clearly describe the same figure unit.\n"
             f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
             f"visual_reference_only: true\n"
             f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"

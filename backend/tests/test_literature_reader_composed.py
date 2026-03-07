@@ -4955,9 +4955,6 @@ async def test_simplified_pipeline_stage1_fail_should_use_deterministic_baseline
     monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
     monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
     monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
-    async def _fake_model(**_kwargs):
-        return {}
-    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_model)
     async def _fake_mm_prompt(**_kwargs):
         return {}
 
@@ -5026,14 +5023,10 @@ async def test_simplified_pipeline_stage1_fail_should_use_deterministic_baseline
     )
     payload = dict(result.get("base_payload") or {})
     ui_plan = dict((result.get("loop_result") or {}).get("ui_plan") or {})
-    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "single_agent_v2"
-    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "single_agent_v2"
-    full_coverage_passed = (
-        ((payload.get("pipeline_contract_meta") or {}).get("validation_report") or {})
-        .get("gates", {})
-        .get("full_coverage", {})
-        .get("passed")
-    )
+    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "deterministic_baseline"
+    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "reader_simplified_v2"
+    assert str(((result.get("loop_result") or {}).get("build_mode") or "")) == "compose_agent_simplified"
+    full_coverage_passed = (payload.get("minimal_gate_report") or {}).get("full_coverage")
     assert isinstance(full_coverage_passed, bool)
     assert len(list(ui_plan.get("components") or [])) > 0
 
@@ -5044,10 +5037,6 @@ async def test_simplified_pipeline_stage2_fail_should_use_deterministic_baseline
     monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
     monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
     monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_: "")  # pylint: disable=protected-access
-    async def _fake_model(**_kwargs):
-        return {}
-    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_model)
-
     async def _fake_mm_prompt(**_kwargs):
         return {}
 
@@ -5114,9 +5103,138 @@ async def test_simplified_pipeline_stage2_fail_should_use_deterministic_baseline
     )
     payload = dict(result.get("base_payload") or {})
     ui_plan = dict((result.get("loop_result") or {}).get("ui_plan") or {})
-    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "single_agent_v2"
-    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "single_agent_v2"
+    assert str((payload.get("layout_advice_v3") or {}).get("source") or "") == "deterministic_baseline"
+    assert str(((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "")) == "reader_simplified_v2"
+    assert str(((result.get("loop_result") or {}).get("build_mode") or "")) == "compose_agent_simplified"
+    assert bool((((payload.get("pipeline_contract_meta") or {}).get("stage2") or {}).get("degraded"))) is True
     assert len(list(ui_plan.get("components") or [])) > 0
+
+
+@pytest.mark.asyncio
+async def test_build_or_get_composed_payload_should_route_simplified_v2_to_semantic_atom_pipeline(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
+    monkeypatch.setattr(service, "_is_single_agent_v2_enabled", lambda **_kwargs: True)
+
+    calls = {"semantic": 0, "controller": 0}
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-semantic-route"
+
+    async def _read_payload_from_redis(_key):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _acquire_lock(_lock_key):
+        return "lock-token"
+
+    async def _release_lock(_lock_key, _token):
+        return None
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _no_db_upsert(**_kwargs):
+        return None
+
+    async def _no_redis_write(_key, _payload):
+        return None
+
+    async def _reader_payload(**_kwargs):
+        return (
+            {
+                "docmind_structure": _simplified_docmind_payload(),
+                "page_structure_v3": {
+                    "source": "document_mind",
+                    "block_groups": [
+                        {"layout_unique_id": "L1", "block_id": "dm_p1_l001_b001"},
+                        {"layout_unique_id": "L2", "block_id": "dm_p1_l002_b001"},
+                    ],
+                },
+                "blocks": [
+                    {"id": "dm_p1_l001_b001", "text": "Title", "source_anchor": {"page": 1, "start_char": 0, "end_char": 5}},
+                    {"id": "dm_p1_l002_b001", "text": "Paragraph", "source_anchor": {"page": 1, "start_char": 6, "end_char": 16}},
+                ],
+                "assets": [],
+            },
+            SimpleNamespace(),
+        )
+
+    async def _semantic_result(**_kwargs):
+        calls["semantic"] += 1
+        return {
+            "base_payload": {
+                "minimal_gate_report": {
+                    "passed": True,
+                    "schema_valid": True,
+                    "whitelist_valid": True,
+                    "ownership_unchanged": True,
+                    "full_coverage": True,
+                    "non_empty_plan_for_non_empty_input": True,
+                    "used_atom_count": 2,
+                    "usable_atom_count": 2,
+                },
+                "pipeline_contract_meta": {"used": True, "pipeline": "reader_simplified_v2"},
+            },
+            "loop_result": {
+                "build_mode": "compose_agent_simplified",
+                "ui_plan": {
+                    "plan_id": "plan_semantic",
+                    "components": [
+                        {
+                            "id": "semantic_001",
+                            "type": "ParagraphProse",
+                            "props": {"text": "Paragraph"},
+                            "children": [],
+                            "source_anchor_refs": [],
+                            "source_block_ids": ["p1_dm_p1_l002_b001"],
+                        }
+                    ],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {"overall": 0.93, "hard_constraints_passed": True},
+                "iteration_trace": [],
+                "iterations": 1,
+                "degraded": False,
+                "stop_reason": "simplified_pipeline",
+            },
+            "assets": [],
+        }
+
+    async def _controller_result(**_kwargs):
+        calls["controller"] += 1
+        raise AssertionError("single_agent controller path should not be used for simplified_v2 in phase12")
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _acquire_lock)
+    monkeypatch.setattr(service, "_release_lock", _release_lock)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _no_db_upsert)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _no_redis_write)
+    monkeypatch.setattr(service, "_partition_main_aux_block_ids", lambda **_kwargs: (["p1_dm_p1_l002_b001"], []))
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _reader_payload)
+    monkeypatch.setattr(service, "_build_simplified_pipeline_result", _semantic_result)
+    monkeypatch.setattr(service, "_build_single_agent_v2_result", _controller_result)
+
+    payload, _ = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=82, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=False,
+    )
+
+    assert calls["semantic"] == 1
+    assert calls["controller"] == 0
+    assert str(payload.get("build_mode") or "") == "compose_agent_simplified"
+    assert str((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "") == "reader_simplified_v2"
 
 
 def test_single_agent_step_result_listblock_object_items_are_sanitized():
