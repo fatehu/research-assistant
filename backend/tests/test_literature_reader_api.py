@@ -60,6 +60,7 @@ async def test_stream_paper_pdf_reads_local_file(monkeypatch, tmp_path: Path):
 
     assert isinstance(response, FileResponse)
     assert Path(response.path) == pdf_path
+    assert response.headers.get("content-disposition", "").startswith("inline;")
 
 
 @pytest.mark.asyncio

@@ -85,3 +85,6 @@ tmp/
 backend/eval/results/**
 !backend/eval/results/
 !backend/eval/results/README.md
+
+# Reader runtime artifacts
+backend/uploads/

@@ -2960,6 +2960,7 @@ async def stream_paper_pdf(
         path=pdf_path,
         media_type="application/pdf",
         filename=os.path.basename(pdf_path),
+        content_disposition_type="inline",
     )
 
 
