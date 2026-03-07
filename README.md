@@ -1,55 +1,51 @@
 # AI 科研助手 / Research Assistant
 
-截至 2026-03-07，本仓库当前主线工作集中在 `feature/reader-workbench-v2-phase12`：围绕论文阅读工作台 V2，把 PDF 结构解析、生成式阅读界面、人工 Review / Publish 闭环、RAG 检索、CodeLab 实验台和多角色协作串成一套完整的科研工作流。
+面向科研团队的全栈研究工作台，覆盖 AI 对话、知识库与 RAG、论文搜索与阅读、CodeLab Notebook、多角色协作，以及可选的 MCP 工具接入。
 
-它不是单一的“聊天”或“知识库”项目，而是一套面向科研团队的全栈平台：
+这不是单点功能项目，而是一套围绕科研真实工作流搭起来的平台：
 
-- 论文搜索、收藏、下载、入库、按页阅读
-- Reader Workbench V2：把论文页结构转换为可交互的阅读组件树
-- 知识库与 RAG：智能分块、混合检索、重排、上下文压缩
-- CodeLab：Jupyter 风格 Notebook + Python 沙箱执行 + Notebook Agent
-- Chat / Agent / MCP：统一工具链与流式交互
-- 管理员 / 导师 / 学生多角色协作、共享与公告
-
-## 当前分支重点
-
-`feature/reader-workbench-v2-phase12` 最近一轮演进，核心集中在论文阅读链路：
-
-| 日期 | 进展 |
-|------|------|
-| 2026-03-07 | `feat(reader): route simplified pipeline through semantic atoms`，简化链路改为走语义原子 |
-| 2026-03-07 | `fix(reader): render paper pdf inline`，阅读器内联 PDF 呈现稳定化 |
-| 2026-03-07 | `feat(reader): refine workbench readability and controls`，工作台可读性与控件体验继续收口 |
-| 2026-03-06 | `feat(reader): add multimodal review loop and publish pipeline`，补齐 Review / Publish 闭环 |
-| 2026-03-03 | `feat(reader): migrate composed pipeline to single_agent_v2`，生成式阅读主链切到 `single_agent_v2` |
-| 2026-02-26 | `feat(reader): 完成阅读工作台V2阶段改造并补齐文档`，Reader Workbench V2 第一轮落地完成 |
-| 2026-02-25 | `feat(literature-backend): add generative/composed reader core` 与 `feat(literature-frontend): implement actionable composed reader UI`，生成式阅读后端和前端基座建立 |
+- 找论文、收论文、下载 PDF、按页阅读
+- 把论文和资料入库，做向量检索、问答和引用回溯
+- 在阅读页里直接做生成式编排、证据定位、Review / Publish
+- 在 CodeLab 里运行 Python、保留上下文、调用 Notebook Agent
+- 让管理员、导师、学生共享资源、公告和协作入口
 
 ## 核心能力
 
 | 模块 | 当前能力 |
 |------|------|
-| 论文阅读工作台 V2 | Document Mind / PDF 结构解析、`page_structure_v3`、`single_agent_v2` 组件编排、SSE 流式 UI patch、证据锚点定位、Review / Publish 工作台 |
-| 文献管理 | Semantic Scholar / arXiv 搜索、论文收藏、PDF 下载、分类管理、引用图、阅读位置记忆 |
-| 知识库 / RAG | 本地或 API Embedding、智能分块、混合检索、Query Rewrite、Reranker、Contextual Compression、Chunk Quality Gate |
-| CodeLab | Notebook 增删改、单 Cell / 全量运行、变量查看、Notebook Agent、独立沙箱 Runner |
-| Chat / Agent | 流式对话、Agent Core、工具调用、来源引用、跨模块统一配置 |
-| 协作系统 | 管理员 / 导师 / 学生角色路由、资源共享、邀请、公告、统计页 |
-| MCP | 可选外部 MCP Server 接入，支持工具前缀、路由、重试、熔断与前端配置 |
+| AI 对话 | 多 LLM Provider、流式响应、Agent 工具调用、来源引用 |
+| 知识库 / RAG | 文档上传、Embedding、智能分块、混合检索、Reranker、Query Rewrite、Contextual Compression |
+| 文献管理 | Semantic Scholar / arXiv 搜索、收藏、PDF 下载、分类管理、引用信息、阅读位置记忆 |
+| 论文阅读工作台 | Reader Workbench V2、结构化页面解析、组件化阅读界面、证据锚点定位、Review / Publish 闭环 |
+| CodeLab | Jupyter 风格 Notebook、Python 沙箱执行、变量查看、Notebook Agent |
+| 多角色协作 | 管理员 / 导师 / 学生路由、共享资源、邀请、公告、统计页 |
+| MCP | 可选外部 MCP Server 接入，支持工具路由、重试、熔断和前端配置 |
 
-## Reader Workbench V2 是怎么工作的
+## 当前开发重点
 
-以代码和当前分支实现为准，论文页的生成式阅读链路大致如下：
+截至 2026-03-07，这个仓库最近一轮的主增量集中在论文阅读链路：
 
-1. 论文 PDF 下载并入库，Reader 页面按 paper / page 打开。
+- `Reader Workbench V2` 已经从“PDF + 问答面板”升级成“结构化页面 + 组件编排 + 评审发布”的工作台。
+- 阅读链路支持 `single_agent_v2`、语义原子、流式 UI patch，以及更稳的证据锚点定位。
+- Review / Publish 工作流已经接通，支持观察、Patch、自动修复和发布快照。
+- Reader 页内联 PDF、工作台可读性和操作控件在最近一轮里继续收口。
+
+如果你是第一次进入仓库，可以先把这部分理解成：平台整体是稳定多模块结构，而目前最活跃的产品面是论文阅读工作台。
+
+## Reader Workbench V2
+
+Reader 页当前不是简单展示 PDF 文本，而是按页面结构做组件化阅读。实际链路大致如下：
+
+1. 论文 PDF 下载并入库。
 2. 后端优先使用 Document Mind DocStructure 提取版面结构，再标准化为 `page_structure_v3`。
-3. 简化链路与 Compose 链路会把结构块整理为语义原子、关系和页面导航信息。
+3. 页面结构会被整理成语义原子、关系和导航信息。
 4. `single_agent_v2` 基于页面元数据、结构块和渲染图像，输出受约束的 UI 组件树。
-5. 后端对组件白名单、锚点所有权、最小门禁和布局合同做校验，失败时降级而不是整页清空。
-6. 前端通过 SSE 接收 `plan_draft`、`plan_patch`、`assets`、`quality_report`、`done` 等事件，增量渲染 Reader Workbench。
-7. 用户可以进入 `/literature/:paperId/read/review` 对生成结果做人工观察、Patch、自动修复，再发布为可复用快照。
+5. 后端执行组件白名单、锚点所有权、最小门禁和布局合同校验；失败时节点级降级，而不是整页清空。
+6. 前端通过 SSE 接收 `plan_draft`、`plan_patch`、`assets`、`quality_report`、`done` 等事件，增量渲染阅读工作台。
+7. 用户可以进入 Review 页面做人工观察、局部修补、自动修补，并将结果发布为正式阅读快照。
 
-这条链路对应的关键实现主要在：
+关键实现主要在：
 
 - `backend/app/api/literature.py`
 - `backend/app/services/literature_reader_compose_service.py`
@@ -66,9 +62,9 @@
 | 前端 | React 18, TypeScript, Vite, Ant Design, Zustand, Framer Motion |
 | 后端 | FastAPI, SQLAlchemy Async, Pydantic v2, Alembic |
 | 存储 | PostgreSQL + pgvector, Redis |
-| AI / 检索 | OpenAI / DeepSeek / 阿里云 / Ollama，多模态布局辅助，本地嵌入，重排与压缩 |
+| AI / 检索 | OpenAI / DeepSeek / 阿里云 / Ollama，本地嵌入，混合检索，重排与压缩 |
 | PDF / Reader | pypdf, pdfplumber, MarkItDown, Alibaba Cloud Document Mind |
-| Notebook | Monaco Editor, Notebook Agent, 独立 `codelab-runner` 沙箱服务 |
+| Notebook | Monaco Editor, 独立 `codelab-runner` 沙箱服务 |
 | 部署 | Docker Compose，`mcp` profile 可选启用内部 MCP 服务 |
 
 ## 快速开始
@@ -76,8 +72,8 @@
 ### 前置要求
 
 - Docker Desktop 或 Docker Engine + Docker Compose
-- 至少 4 GB 可用内存；如果启用本地 Embedding，建议 8 GB 以上
-- 如在 Windows PowerShell 下运行，建议先执行 `chcp 65001`
+- 至少 4 GB 可用内存；启用本地 Embedding 时建议 8 GB 以上
+- Windows PowerShell 建议先执行 `chcp 65001`
 
 ### 1. 克隆并配置环境变量
 
@@ -87,7 +83,7 @@ cd research-assistant
 cp .env.example .env
 ```
 
-必须至少配置这些值：
+至少确认这些值：
 
 - `POSTGRES_PASSWORD`
 - `DATABASE_URL`
@@ -95,7 +91,7 @@ cp .env.example .env
 - `CODELAB_RUNNER_TOKEN`
 - 至少一组 LLM 凭证：`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ALIYUN_API_KEY`
 
-如果你要启用 Reader Workbench V2 的结构化 PDF 能力，建议额外配置：
+如果你要启用高保真的 Reader Workbench V2，建议额外配置：
 
 - `PDF_LAYOUT_PARSER=document_mind`
 - `READER_DOCUMENT_MIND_ENABLED=true`
@@ -145,7 +141,7 @@ docker compose logs --tail 100 codelab-runner
 
 ## 关键环境变量
 
-README 只列当前分支最关键的一组；完整列表请看 [`.env.example`](.env.example)。
+这里只列最常用的一组；完整列表请看 `.env.example`。
 
 ### 基础运行
 
@@ -200,16 +196,14 @@ READER_COMPOSE_LATENCY_BUDGET_MS=20000
 READER_COMPOSE_LATENCY_BUDGET_MAX_MS=25000
 ```
 
-如果你没有 Document Mind 凭证，可以先把：
+如果没有 Document Mind 凭证，可以先降级为：
 
 ```env
 READER_DOCUMENT_MIND_ENABLED=false
 PDF_LAYOUT_PARSER=markitdown
 ```
 
-作为降级方案，但论文页结构保真度会明显下降。
-
-### CodeLab
+### CodeLab / MCP
 
 ```env
 CODELAB_RUNNER_ENABLED=true
@@ -217,11 +211,7 @@ CODELAB_RUNNER_URL=http://codelab-runner:8099
 CODELAB_RUNNER_TOKEN=change_me_internal_runner_token
 CODELAB_EXEC_TIMEOUT_HARD_SECONDS=20
 CODELAB_MAX_CONCURRENCY_PER_USER=2
-```
 
-### MCP
-
-```env
 MCP_ENABLED=false
 MCP_TOOL_PREFIX=mcp
 MCP_CONFIG_PATH=mcp_servers.json
@@ -262,11 +252,6 @@ pytest tests/test_literature_reader_api.py \
        tests/test_reader_single_agent_validator.py
 ```
 
-如果要回归 Reader Workbench V2 的流式界面链路，还可以重点看：
-
-- `backend/tests/integration/test_reader_composed_stream_workbench_v2.py`
-- `backend/tests/test_literature_reader_api.py`
-
 ## 主要页面与接口
 
 ### 前端页面
@@ -278,7 +263,7 @@ pytest tests/test_literature_reader_api.py \
 | `/knowledge/:kbId/chunking` | Smart Chunking 配置页 |
 | `/literature` | 文献搜索、收藏与分类 |
 | `/literature/:paperId/read` | Reader Workbench / 论文阅读页 |
-| `/literature/:paperId/read/review` | Compose Review / Publish 工作台 |
+| `/literature/:paperId/read/review` | Review / Publish 工作台 |
 | `/code` | CodeLab Notebook 列表 |
 | `/code/:notebookId` | CodeLab Notebook 详情页 |
 | `/admin/statistics` | 管理统计 |
@@ -288,17 +273,17 @@ pytest tests/test_literature_reader_api.py \
 
 | 方法 | 端点 | 用途 |
 |------|------|------|
-| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/stream` | Reader Workbench SSE 流式生成 |
-| `POST` | `/api/v1/literature/papers/{paper_id}/reader/generative/stream` | 文本型 Reader 流式生成 |
-| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session` | 创建 Review Session |
-| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session/{session_id}/publish` | 发布 Review 快照 |
+| `POST` | `/api/v1/chat/send` | 流式对话 |
 | `POST` | `/api/v1/knowledge/search` | 知识库检索 |
 | `GET` | `/api/v1/chunking/presets` | 获取智能分块预设 |
+| `GET` | `/api/v1/literature/search` | 搜索论文 |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/stream` | Reader Workbench SSE 流式生成 |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session` | 创建 Review Session |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session/{session_id}/publish` | 发布 Review 快照 |
 | `GET` | `/api/v1/codelab/notebooks` | Notebook 列表 |
 | `POST` | `/api/v1/codelab/notebooks/{id}/run-all` | 全量执行 Notebook |
-| `POST` | `/api/v1/chat/send` | 流式对话 |
 
-## 目录结构
+## 项目结构
 
 ```text
 research-assistant/
@@ -337,21 +322,19 @@ research-assistant/
 
 ## 推荐先读的文档
 
-如果你接下来要继续开发 phase12，这几份文档最有参考价值：
-
-- [docs/skills/论文阅读器_单一事实来源与现状基线_2026-03-02_11-30.md](docs/skills/论文阅读器_单一事实来源与现状基线_2026-03-02_11-30.md)
-- [docs/V2_DESIGN_DEPLOY_ACCEPTANCE.md](docs/V2_DESIGN_DEPLOY_ACCEPTANCE.md)
-- [docs/SANDBOX_ARCHITECTURE.md](docs/SANDBOX_ARCHITECTURE.md)
-- [docs/MULTI_ROLE_SYSTEM_DESIGN.md](docs/MULTI_ROLE_SYSTEM_DESIGN.md)
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
-- [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md)
+- `docs/CONFIGURATION.md`
+- `docs/TESTING_GUIDE.md`
+- `docs/MULTI_ROLE_SYSTEM_DESIGN.md`
+- `docs/SANDBOX_ARCHITECTURE.md`
+- `docs/V2_DESIGN_DEPLOY_ACCEPTANCE.md`
+- `docs/skills/论文阅读器_单一事实来源与现状基线_2026-03-02_11-30.md`
 
 ## 已知现实
 
-- Reader Workbench V2 仍在持续迭代，当前最强链路是 `single_agent_v2 + semantic atoms + review/publish`。
-- 如果没有 Document Mind 凭证，Reader 页可以降级运行，但结构质量和证据定位会打折。
+- Reader Workbench V2 仍在持续迭代，但已经是平台当前最强的产品面。
+- 如果没有 Document Mind 凭证，Reader 链路可以降级运行，但结构质量和证据定位会打折。
 - 本地 Embedding 首次启动会下载模型权重，冷启动较慢，后续依赖 `model_cache` volume 缓存。
-- CodeLab 默认依赖内部 `codelab-runner`；不要直接把 Runner 暴露到公网。
+- CodeLab 默认依赖内部 `codelab-runner`，不要直接把 Runner 暴露到公网。
 
 ## License
 
