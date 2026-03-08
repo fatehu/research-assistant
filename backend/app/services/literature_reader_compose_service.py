@@ -9853,12 +9853,54 @@ class LiteratureReaderComposeService:
                 row = block_group_index.get(block_id)
                 if self._is_figure_caption_block_group(row):
                     ordered_caption_ids.append(block_id)
-        if not ordered_caption_ids:
+        caption_seed = ""
+        for canonical in list(canonical_ids or []):
+            row = block_group_index.get(canonical)
+            if not isinstance(row, Mapping) or self._is_figure_caption_block_group(row):
+                continue
+            cleaned = self._strip_leading_figure_caption_noise(
+                str(
+                    row.get("text")
+                    or row.get("source_text")
+                    or row.get("normalized_text")
+                    or row.get("raw_text")
+                    or ""
+                )
+            )
+            if self._looks_like_caption_paragraph_text(cleaned):
+                caption_seed = cleaned
+                break
+        caption_tail = ""
+        if ordered_caption_ids:
+            caption_tail = self._rebuild_text_from_block_groups(
+                canonical_ids=ordered_caption_ids,
+                block_group_index=block_group_index,
+            )
+        if caption_seed and caption_tail:
+            return self._merge_source_text_fragments([caption_seed, caption_tail])
+        return caption_seed or caption_tail or ""
+
+    def _strip_leading_figure_caption_noise(self, text: str) -> str:
+        normalized = self._repair_text_artifacts(self._normalize_spaces(str(text or "")))
+        if not normalized:
             return ""
-        return self._rebuild_text_from_block_groups(
-            canonical_ids=ordered_caption_ids,
-            block_group_index=block_group_index,
+        normalized = re.sub(
+            r"\b([A-Za-z]{4,})(or|and|of|in|to|for|with)(\s+[a-z][A-Za-z\-]{2,})\b",
+            r"\1 \2\3",
+            normalized,
+            flags=re.IGNORECASE,
         )
+        match = re.search(
+            r"(fig(?:ure)?\.?\s*\d+[a-z]?|table\s*\d+[a-z]?)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return normalized
+        start = int(match.start() or 0)
+        if start <= 0:
+            return normalized
+        return normalized[start:].strip()
 
     def _infer_paragraph_rows_from_block_groups(
         self,
@@ -9925,9 +9967,8 @@ class LiteratureReaderComposeService:
         paragraph_rows = [row for row in paragraph_rows if str(row.get("text") or "").strip()]
         return paragraph_rows if len(paragraph_rows) >= 2 else []
 
-    @staticmethod
-    def _looks_like_caption_paragraph_text(text: str) -> bool:
-        normalized = str(text or "").strip()
+    def _looks_like_caption_paragraph_text(self, text: str) -> bool:
+        normalized = self._strip_leading_figure_caption_noise(text)
         if not normalized:
             return False
         return bool(re.match(r"^(fig(?:ure)?\.?\s*\d+[a-z]?|table\s*\d+[a-z]?)\b", normalized, flags=re.IGNORECASE))
@@ -9966,6 +10007,28 @@ class LiteratureReaderComposeService:
             start = str(row.get("start_char") or "")
             end = str(row.get("end_char") or "")
             return f"{canonical}:{start}:{end}"
+
+        def _node_is_caption_candidate(candidate: Mapping[str, Any]) -> bool:
+            if str(candidate.get("type") or "").strip() != "ParagraphProse":
+                return False
+            candidate_block_ids = _canonical_block_ids(candidate.get("source_block_ids") or [])
+            if candidate_block_ids:
+                has_caption_block = False
+                for canonical in candidate_block_ids:
+                    row = block_group_index.get(canonical)
+                    if not isinstance(row, Mapping):
+                        return False
+                    if self._is_figure_caption_block_group(row):
+                        has_caption_block = True
+                    elif self._is_no_drop_required_block_group(row):
+                        return False
+                if has_caption_block:
+                    return True
+            candidate_props = dict(candidate.get("props") or {})
+            candidate_text = self._repair_text_artifacts(
+                self._normalize_spaces(str(candidate_props.get("text") or ""))
+            )
+            return self._looks_like_caption_paragraph_text(candidate_text)
 
         merged: List[Dict[str, Any]] = []
         idx = 0
@@ -10049,6 +10112,7 @@ class LiteratureReaderComposeService:
         page: int,
         nodes: Sequence[Dict[str, Any]],
         block_group_index: Mapping[str, Mapping[str, Any]],
+        layout_block_id_alias_map: Mapping[str, Sequence[str]],
     ) -> List[Dict[str, Any]]:
         rows = [dict(item) for item in list(nodes or []) if isinstance(item, dict)]
 
@@ -10081,6 +10145,28 @@ class LiteratureReaderComposeService:
             end = str(row.get("end_char") or "")
             return f"{canonical}:{start}:{end}"
 
+        def _node_is_caption_candidate(candidate: Mapping[str, Any]) -> bool:
+            if str(candidate.get("type") or "").strip() != "ParagraphProse":
+                return False
+            candidate_block_ids = _canonical_block_ids(candidate.get("source_block_ids") or [])
+            if candidate_block_ids:
+                has_caption_block = False
+                for canonical in candidate_block_ids:
+                    row = block_group_index.get(canonical)
+                    if not isinstance(row, Mapping):
+                        return False
+                    if self._is_figure_caption_block_group(row):
+                        has_caption_block = True
+                    elif self._is_no_drop_required_block_group(row):
+                        return False
+                if has_caption_block:
+                    return True
+            candidate_props = dict(candidate.get("props") or {})
+            candidate_text = self._repair_text_artifacts(
+                self._normalize_spaces(str(candidate_props.get("text") or ""))
+            )
+            return self._looks_like_caption_paragraph_text(candidate_text)
+
         idx = 0
         while idx < len(rows):
             node = rows[idx]
@@ -10110,42 +10196,46 @@ class LiteratureReaderComposeService:
                 idx += 1
                 continue
             props = dict(node.get("props") or {})
-            caption = self._repair_text_artifacts(self._normalize_spaces(str(props.get("caption") or "")))
-            needs_caption_rescue = not self._looks_like_caption_paragraph_text(caption)
-            if not needs_caption_rescue:
-                idx += 1
-                continue
-            candidate_idx: Optional[int] = None
+            caption = self._strip_leading_figure_caption_noise(str(props.get("caption") or ""))
+            consumed_indices: List[int] = []
+            consumed_texts: List[str] = []
+            consumed_block_ids: List[str] = []
+            consumed_anchors: List[Dict[str, Any]] = []
             probe_idx = idx + 1
             while probe_idx < len(rows):
                 candidate = rows[probe_idx]
                 candidate_type = str(candidate.get("type") or "").strip()
                 if candidate_type == "FigurePanel":
                     break
-                if candidate_type != "ParagraphProse":
+                if not _node_is_caption_candidate(candidate):
+                    if consumed_indices:
+                        break
                     probe_idx += 1
                     continue
                 candidate_props = dict(candidate.get("props") or {})
-                candidate_text = self._repair_text_artifacts(
-                    self._normalize_spaces(str(candidate_props.get("text") or ""))
-                )
-                if self._looks_like_caption_paragraph_text(candidate_text):
-                    candidate_idx = probe_idx
-                    break
+                candidate_text = self._strip_leading_figure_caption_noise(str(candidate_props.get("text") or ""))
+                if candidate_text:
+                    consumed_texts.append(candidate_text)
+                for canonical in _canonical_block_ids(candidate.get("source_block_ids") or []):
+                    if canonical not in consumed_block_ids:
+                        consumed_block_ids.append(canonical)
+                for anchor in list(candidate.get("source_anchor_refs") or []):
+                    if isinstance(anchor, Mapping):
+                        consumed_anchors.append(dict(anchor))
+                consumed_indices.append(probe_idx)
                 probe_idx += 1
-            if candidate_idx is None:
+            if not consumed_indices and self._looks_like_caption_paragraph_text(caption):
+                props["caption"] = caption
+                if not str(props.get("source_label") or "").strip():
+                    label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption, flags=re.IGNORECASE)
+                    if label_match:
+                        props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
+                node["props"] = props
+                rows[idx] = node
                 idx += 1
                 continue
-            candidate = rows[candidate_idx]
-            candidate_props = dict(candidate.get("props") or {})
-            candidate_text = self._repair_text_artifacts(self._normalize_spaces(str(candidate_props.get("text") or "")))
-            props["caption"] = candidate_text
-            label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", candidate_text, flags=re.IGNORECASE)
-            if label_match and not str(props.get("source_label") or "").strip():
-                props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
-            candidate_block_ids = _canonical_block_ids(candidate.get("source_block_ids") or [])
             figure_block_ids = _canonical_block_ids(node.get("source_block_ids") or [])
-            for canonical in candidate_block_ids:
+            for canonical in consumed_block_ids:
                 if canonical not in figure_block_ids:
                     figure_block_ids.append(canonical)
             if figure_block_ids:
@@ -10156,18 +10246,34 @@ class LiteratureReaderComposeService:
                 if isinstance(anchor, Mapping)
             ]
             existing_anchor_keys = {_anchor_key(anchor) for anchor in figure_anchors}
-            for anchor in list(candidate.get("source_anchor_refs") or []):
-                if not isinstance(anchor, Mapping):
-                    continue
+            for anchor in consumed_anchors:
                 key = _anchor_key(anchor)
                 if key and key not in existing_anchor_keys:
                     figure_anchors.append(dict(anchor))
                     existing_anchor_keys.add(key)
             if figure_anchors:
                 node["source_anchor_refs"] = figure_anchors
+            rebuilt_caption = self._rebuild_figure_caption_from_block_groups(
+                canonical_ids=figure_block_ids,
+                block_group_index=block_group_index,
+                layout_block_id_alias_map=layout_block_id_alias_map,
+            )
+            rebuilt_caption = self._strip_leading_figure_caption_noise(rebuilt_caption)
+            if not rebuilt_caption:
+                rebuilt_caption = self._merge_source_text_fragments([caption, *consumed_texts])
+            props["caption"] = rebuilt_caption or caption or str(props.get("caption") or "")
+            if not str(props.get("source_label") or "").strip():
+                label_match = re.match(
+                    r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)",
+                    str(props.get("caption") or ""),
+                    flags=re.IGNORECASE,
+                )
+                if label_match:
+                    props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
             node["props"] = props
             rows[idx] = node
-            rows.pop(candidate_idx)
+            for candidate_idx in reversed(consumed_indices):
+                rows.pop(candidate_idx)
             continue
 
         return rows
@@ -12180,7 +12286,9 @@ class LiteratureReaderComposeService:
                         block_group_index=block_group_index,
                         layout_block_id_alias_map=layout_block_id_alias_map,
                     )
-                    caption = self._repair_text_artifacts(self._normalize_spaces(caption))
+                    caption = self._strip_leading_figure_caption_noise(caption)
+                    if not caption:
+                        caption = self._strip_leading_figure_caption_noise(str(props.get("caption") or ""))
                     if caption:
                         props["caption"] = caption
                     source_label = self._normalize_spaces(str(props.get("source_label") or ""))
@@ -12260,6 +12368,7 @@ class LiteratureReaderComposeService:
                 page=page,
                 nodes=output,
                 block_group_index=block_group_index,
+                layout_block_id_alias_map=layout_block_id_alias_map,
             )
             return output
 

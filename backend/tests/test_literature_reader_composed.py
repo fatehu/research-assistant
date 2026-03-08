@@ -608,6 +608,144 @@ def test_sanitize_components_for_runtime_should_merge_line_level_runs_and_attach
     )
 
 
+def test_sanitize_components_for_runtime_should_clean_noisy_figure_meta_and_merge_caption_continuations():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "n_fig",
+            "type": "FigurePanel",
+            "props": {
+                "caption": (
+                    "Open-Ended100-Accurate Indeterminate50-Inaccurate USMLE12CK3B Multiple Choice "
+                    "Single Answer100-Pass Range50-Input NJ J NJ J NJ J USMLE12CK3"
+                    "Fig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, "
+                    "AI outputs were adjudicated to be"
+                ),
+                "image_url": "asset:layout_fig",
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p6_fig_meta"],
+            "zone_type": "figure_meta",
+            "column_id": "main",
+        },
+        {
+            "id": "cap_1",
+            "type": "ParagraphProse",
+            "props": {
+                "text": "accurate, inaccurate, or indeterminate based on the ACI scoring system."
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p6_cap_1"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "id": "cap_2",
+            "type": "ParagraphProse",
+            "props": {
+                "text": "for inputs encoded as open-ended questions or multiple choice single answer."
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p6_cap_2"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "id": "cap_3",
+            "type": "ParagraphProse",
+            "props": {
+                "text": "answer without (MC-NJ) or with forced justification(MC-J)."
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p6_cap_3"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "id": "body_1",
+            "type": "ParagraphProse",
+            "props": {"text": "We first examined the frequency (prevalence) of insight."},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p6_body_1"],
+            "zone_type": "main_body",
+            "column_id": "main_right",
+        },
+    ]
+    payload = {
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p6_fig_meta",
+                    "text": (
+                        "Open-Ended100-Accurate Indeterminate50-Inaccurate USMLE12CK3B Multiple Choice "
+                        "Single Answer100-Pass Range50-Input NJ J NJ J NJ J USMLE12CK3"
+                        "Fig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, "
+                        "AI outputs were adjudicated to be"
+                    ),
+                    "layout_type": "figure",
+                    "layout_sub_type": "none",
+                    "kind": "figure_meta",
+                    "layout_unique_id": "layout_fig",
+                },
+                {
+                    "block_id": "p6_cap_1",
+                    "text": "accurate, inaccurate, or indeterminate based on the ACI scoring system.",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+                {
+                    "block_id": "p6_cap_2",
+                    "text": "for inputs encoded as open-ended questions or multiple choice single answer.",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+                {
+                    "block_id": "p6_cap_3",
+                    "text": "answer without (MC-NJ) or with forced justification(MC-J).",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_fig_caption",
+                },
+                {
+                    "block_id": "p6_body_1",
+                    "text": "We first examined the frequency (prevalence) of insight.",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_body",
+                },
+            ]
+        }
+    }
+
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=6,
+        payload=payload,
+        nodes=nodes,
+    )
+
+    assert [str(item.get("type") or "") for item in sanitized] == ["FigurePanel", "ParagraphProse"]
+    figure = sanitized[0]
+    figure_props = dict((figure or {}).get("props") or {})
+    assert str(figure_props.get("caption") or "") == (
+        "Fig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, "
+        "AI outputs were adjudicated to be accurate, inaccurate, or indeterminate based on the ACI scoring system. "
+        "for inputs encoded as open-ended questions or multiple choice single answer. "
+        "answer without (MC-NJ) or with forced justification(MC-J)."
+    )
+    assert str(figure_props.get("source_label") or "") == "Fig 2"
+    assert list(figure.get("source_block_ids") or []) == ["p6_fig_meta", "p6_cap_1", "p6_cap_2", "p6_cap_3"]
+    assert str((sanitized[1] or {}).get("props", {}).get("text") or "") == (
+        "We first examined the frequency (prevalence) of insight."
+    )
+
+
 def test_enforce_no_drop_blocks_fallback_should_ignore_intentional_omissions():
     service = LiteratureReaderComposeService()
     payload = {
