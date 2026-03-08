@@ -173,6 +173,14 @@ async def _document_file_has_other_references(db: AsyncSession, doc: Document) -
 
 # 面向用户的模型描述信息
 EMBEDDING_MODEL_CATALOG = [
+    {
+        "id": "mock/deterministic",
+        "name": "Mock Deterministic (CI)",
+        "dimension": 256,
+        "provider": "mock",
+        "description": "确定性哈希向量，用于 CI / smoke / 离线验证",
+        "max_tokens": 16384,
+    },
     # 本地模型 (sentence-transformers)
     {
         "id": "BAAI/bge-m3",
@@ -355,7 +363,9 @@ async def list_embedding_models(
     from app.models.knowledge import EMBEDDING_DIMENSION
     
     current_model = (
-        settings.local_embedding_model
+        settings.mock_embedding_model
+        if settings.embedding_provider == "mock"
+        else settings.local_embedding_model
         if settings.embedding_provider == "local"
         else settings.aliyun_embedding_model
         if settings.embedding_provider == "aliyun"

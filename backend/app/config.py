@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
 
     # Embedding
-    embedding_provider: str = "local"  # local / aliyun / openai / ollama
+    embedding_provider: str = "local"  # local / mock / aliyun / openai / ollama
     aliyun_embedding_api_key: str = ""
     aliyun_embedding_model: str = "text-embedding-v2"
     local_embedding_model: str = "BAAI/bge-m3"
@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     local_embedding_cache_dir: str = ""
     local_embedding_normalize: bool = True
     local_embedding_dimension: int = 0
+    mock_embedding_model: str = "mock/deterministic"
+    mock_embedding_dimension: int = 256
     embedding_dimension_policy: Literal["fixed", "adaptive"] = "adaptive"
     embedding_dim_small: int = 256
     embedding_dim_medium: int = 512

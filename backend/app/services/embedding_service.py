@@ -3,6 +3,7 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
 
 支持的 Provider:
   - local:  使用 sentence-transformers 加载本地模型 (推荐科研场景)
+  - mock:   使用确定性哈希向量 (CI / smoke / 离线测试)
   - aliyun: 阿里云 text-embedding-v2 API
   - openai: OpenAI text-embedding-3-small API
   - ollama: Ollama 本地 API
@@ -13,6 +14,8 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
   - BAAI/bge-large-zh-v1.5: 中文优化, 1024维
 """
 import asyncio
+import hashlib
+import re
 import threading
 import numpy as np
 from typing import List, Optional, Dict, Tuple
@@ -48,6 +51,8 @@ MODEL_DIMENSIONS: Dict[str, int] = {
     "text-embedding-v2": 1536,
     "text-embedding-3-small": 1536,
     "nomic-embed-text": 768,
+    # CI / smoke
+    "mock/deterministic": 256,
 }
 
 # 查询前缀 (部分模型需要指令前缀以获得最佳检索效果)
@@ -261,6 +266,7 @@ class EmbeddingService:
 
     通过 EMBEDDING_PROVIDER 环境变量切换:
       local  → sentence-transformers 本地推理 (默认, 推荐科研)
+      mock   → 确定性哈希向量 (CI / smoke / 离线验证)
       aliyun → 阿里云 DashScope API
       openai → OpenAI API
       ollama → Ollama 本地 API
@@ -293,8 +299,12 @@ class EmbeddingService:
     @staticmethod
     def _resolve_provider(model_name: Optional[str]) -> str:
         """根据模型名称推断 provider"""
+        forced_provider = str(settings.embedding_provider or "local").strip().lower()
+        if forced_provider == "mock":
+            return "mock"
+
         if model_name is None:
-            return settings.embedding_provider
+            return forced_provider
         
         # API 模型 -> 对应 provider
         API_MODEL_PROVIDERS = {
@@ -346,6 +356,8 @@ class EmbeddingService:
             return self._model_name_override
         if self.provider == "local":
             return settings.local_embedding_model
+        elif self.provider == "mock":
+            return settings.mock_embedding_model
         elif self.provider == "aliyun":
             return settings.aliyun_embedding_model
         elif self.provider == "openai":
@@ -360,6 +372,8 @@ class EmbeddingService:
             return self._target_dimension_override
         if self.provider == "local":
             return self._local_model.dimension
+        elif self.provider == "mock":
+            return max(1, int(settings.mock_embedding_dimension or MODEL_DIMENSIONS["mock/deterministic"]))
         elif self.provider == "aliyun":
             return 1536
         elif self.provider == "openai":
@@ -389,6 +403,8 @@ class EmbeddingService:
 
         if self.provider == "local":
             return await self._local_embed_single(text, is_query=is_query)
+        elif self.provider == "mock":
+            return await self._mock_embed_single(text, is_query=is_query)
         else:
             return await self._api_embed_text(text)
 
@@ -410,6 +426,8 @@ class EmbeddingService:
 
         if self.provider == "local":
             return await self._local_embed_batch(valid_texts, is_query=is_query)
+        elif self.provider == "mock":
+            return await self._mock_embed_batch(valid_texts, is_query=is_query)
         else:
             return await self._api_embed_texts(valid_texts)
 
@@ -444,6 +462,67 @@ class EmbeddingService:
         result = [emb.tolist() for emb in embeddings]
         logger.info(f"本地模型批量 Embedding 完成: {len(result)} 个向量")
         return result
+
+    # ===================================================================
+    #  Mock / CI 确定性向量
+    # ===================================================================
+
+    @staticmethod
+    def _tokenize_for_mock(text: str) -> List[str]:
+        tokens = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", text.lower())
+        if tokens:
+            return tokens
+        chars = [ch for ch in text.strip() if not ch.isspace()]
+        return chars[:256]
+
+    def _mock_embed_sync(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        dim = int(self.get_dimension())
+        if dim <= 0:
+            dim = MODEL_DIMENSIONS["mock/deterministic"]
+
+        salt = self._get_model()
+        vectors: list[np.ndarray] = []
+        for raw_text in texts:
+            text = str(raw_text or "")
+            payload = text if not is_query else f"query::{text}"
+            tokens = self._tokenize_for_mock(payload)
+            if not tokens:
+                tokens = [payload]
+
+            vec = np.zeros(dim, dtype=np.float32)
+            for token in tokens:
+                digest = hashlib.sha256(f"{salt}::{token}".encode("utf-8")).digest()
+                for offset in range(0, 16, 4):
+                    idx = int.from_bytes(digest[offset:offset + 4], "big", signed=False) % dim
+                    sign = 1.0 if digest[(offset + 16) % len(digest)] % 2 == 0 else -1.0
+                    weight = 0.5 + (digest[(offset + 20) % len(digest)] / 255.0)
+                    vec[idx] += sign * weight
+
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            vectors.append(vec)
+
+        return np.vstack(vectors) if vectors else np.zeros((0, dim), dtype=np.float32)
+
+    async def _mock_embed_single(self, text: str, is_query: bool = False) -> List[float]:
+        loop = asyncio.get_event_loop()
+        embeddings = await loop.run_in_executor(
+            None,
+            lambda: self._mock_embed_sync([text], is_query=is_query),
+        )
+        return embeddings[0].tolist()
+
+    async def _mock_embed_batch(
+        self, texts: List[str], is_query: bool = False
+    ) -> List[List[float]]:
+        loop = asyncio.get_event_loop()
+        logger.info(f"Mock Embedding: total={len(texts)}, dim={self.get_dimension()}")
+        embeddings = await loop.run_in_executor(
+            None,
+            lambda: self._mock_embed_sync(texts, is_query=is_query),
+        )
+        return [emb.tolist() for emb in embeddings]
 
     # ===================================================================
     #  API 模型调用
