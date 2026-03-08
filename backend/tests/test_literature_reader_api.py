@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,6 +60,7 @@ async def test_stream_paper_pdf_reads_local_file(monkeypatch, tmp_path: Path):
 
     assert isinstance(response, FileResponse)
     assert Path(response.path) == pdf_path
+    assert response.headers.get("content-disposition", "").startswith("inline;")
 
 
 @pytest.mark.asyncio
@@ -79,6 +80,84 @@ async def test_stream_paper_pdf_raises_404_when_missing(monkeypatch):
         )
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_reader_composed_review_session_forwards_cache_clone_flags(monkeypatch):
+    paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
+    captured: dict[str, object] = {}
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    class _FakeService:
+        async def create_review_session(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "snapshot_id": "snapshot_fast",
+                "session_id": "session_fast",
+                "page": 7,
+                "paper_id": 78,
+                "source_signature": "sig-fast",
+                "ui_plan": {"components": [], "layout": {}, "style_tokens": {}, "trace_meta": {}},
+                "assets": [],
+            }
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeService())
+
+    payload = literature_api.ReaderComposeReviewSessionRequest(
+        page=7,
+        selected_kb_id=84,
+        snapshot_label="snapshot_fast",
+        prefer_cache_clone=True,
+        allow_recompute_on_cache_miss=False,
+    )
+
+    response = await literature_api.create_reader_composed_review_session(
+        paper_id=78,
+        payload=payload,
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert response["snapshot_id"] == "snapshot_fast"
+    assert captured["paper"] is paper
+    assert captured["page"] == 7
+    assert captured["prefer_cache_clone"] is True
+    assert captured["allow_recompute_on_cache_miss"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_reader_composed_review_session_returns_404_for_cache_miss(monkeypatch):
+    paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    class _FakeService:
+        async def create_review_session(self, **_kwargs):
+            raise ValueError("review_cache_not_found")
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeService())
+
+    payload = literature_api.ReaderComposeReviewSessionRequest(
+        page=7,
+        prefer_cache_clone=True,
+        allow_recompute_on_cache_miss=False,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await literature_api.create_reader_composed_review_session(
+            paper_id=78,
+            payload=payload,
+            db=SimpleNamespace(),
+            current_user=SimpleNamespace(id=5),
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "review_cache_not_found"
 
 
 @pytest.mark.asyncio
@@ -182,3 +261,44 @@ def test_derive_link_status_from_document_processing_clears_error():
     assert status == KnowledgeLinkStatus.RUNNING.value
     assert error_message is None
     assert doc_id == 9
+
+
+def test_mark_stale_document_timeout_marks_processing_doc_as_timeout(monkeypatch):
+    monkeypatch.setattr(literature_api.settings, "document_processing_stale_timeout_seconds", 60)
+    doc = SimpleNamespace(
+        id=130,
+        status=DocumentStatus.RUNNING.value,
+        error_message=None,
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+
+    changed = literature_api._mark_stale_document_timeout(doc)
+
+    assert changed is True
+    assert doc.status == DocumentStatus.TIMEOUT.value
+    assert "文档处理超时" in doc.error_message
+
+
+def test_normalize_collection_name_repairs_known_mojibake_tokens():
+    for token in literature_api._build_mojibake_variants("所有论文"):
+        assert literature_api._normalize_collection_name(token) == "所有论文"
+    for token in literature_api._build_mojibake_variants("待读"):
+        assert literature_api._normalize_collection_name(token) == "待读"
+    for token in literature_api._build_mojibake_variants("已读"):
+        assert literature_api._normalize_collection_name(token) == "已读"
+    for token in literature_api._build_mojibake_variants("收藏"):
+        assert literature_api._normalize_collection_name(token) == "收藏"
+    assert literature_api._normalize_collection_name("我的收藏") == "我的收藏"
+
+
+def test_normalize_collection_description_repairs_known_mojibake_tokens():
+    for token in literature_api._build_mojibake_variants("所有保存的论文"):
+        assert literature_api._normalize_collection_description(token) == "所有保存的论文"
+    for token in literature_api._build_mojibake_variants("待阅读的论文"):
+        assert literature_api._normalize_collection_description(token) == "待阅读的论文"
+    for token in literature_api._build_mojibake_variants("已阅读的论文"):
+        assert literature_api._normalize_collection_description(token) == "已阅读的论文"
+    for token in literature_api._build_mojibake_variants("重要论文"):
+        assert literature_api._normalize_collection_description(token) == "重要论文"
+    assert literature_api._normalize_collection_description("用户自定义描述") == "用户自定义描述"

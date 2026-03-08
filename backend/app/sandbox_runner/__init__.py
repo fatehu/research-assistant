@@ -1,2 +1,2 @@
-﻿from app.sandbox_runner.local_executor import CodeLabExecutor as LocalCodeLabExecutor
+from app.sandbox_runner.local_executor import CodeLabExecutor as LocalCodeLabExecutor
 

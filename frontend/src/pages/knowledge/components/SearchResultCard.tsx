@@ -110,7 +110,7 @@ const SearchResultCard = ({ result, index }: SearchResultCardProps) => {
       animate={{ opacity: 1, x: 0 }}
       transition={{ delay: index * 0.05 }}
     >
-      <Card className="bg-slate-800/50 border-slate-700/50 mb-3" bodyStyle={{ padding: '16px' }}>
+      <Card className="bg-slate-800/50 border-slate-700/50 mb-3" styles={{ body: { padding: '16px' } }}>
         <div className="flex items-start gap-3">
           <div className="flex-shrink-0">
             <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500/20 to-indigo-500/20 flex items-center justify-center">

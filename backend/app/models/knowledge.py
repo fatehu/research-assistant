@@ -29,6 +29,8 @@ def _get_embedding_dimension() -> int:
         if target_dim > 0:
             return target_dim
         return MODEL_DIMENSIONS.get(model, 1024)
+    elif settings.embedding_provider == "mock":
+        return max(1, int(settings.mock_embedding_dimension or 256))
     elif settings.embedding_provider == "aliyun":
         return 1536
     elif settings.embedding_provider == "openai":

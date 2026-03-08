@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import { App as AntdApp, ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import App from './App'
+import AntdMessageBridge from './components/common/AntdMessageBridge'
 import './index.css'
 import './styles/design-system.css'
 
@@ -42,6 +43,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={theme}>
       <AntdApp>
+        <AntdMessageBridge />
         <App />
       </AntdApp>
     </ConfigProvider>

@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from enum import Enum as PyEnum
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -164,3 +164,22 @@ class AnnouncementRead(Base):
     
     def __repr__(self):
         return f"<AnnouncementRead announcement={self.announcement_id} user={self.user_id}>"
+
+
+class AdminAuditLog(Base):
+    """管理员操作审计日志"""
+    __tablename__ = "admin_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    admin_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    action = Column(String(64), nullable=False, index=True)
+    target_type = Column(String(64), nullable=True, index=True)
+    target_id = Column(String(64), nullable=True, index=True)
+    summary = Column(String(500), nullable=False)
+    details = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    admin_user = relationship("User", foreign_keys=[admin_user_id], back_populates="admin_audit_logs")
+
+    def __repr__(self):
+        return f"<AdminAuditLog {self.action} admin={self.admin_user_id}>"

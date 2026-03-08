@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Card, Tabs, Table, Button, Tag, Space, Avatar, Typography, Modal,
@@ -94,7 +94,7 @@ const SharedResourcesPage: React.FC = () => {
     return result;
   };
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
       const [withMe, mySharesData, countsData] = await Promise.all([
@@ -112,12 +112,12 @@ const SharedResourcesPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filterType]);
 
-  useEffect(() => { loadData(); }, [filterType]);
+  useEffect(() => { loadData(); }, [loadData]);
 
   // 加载可共享的资源列表
-  const loadResources = async (resourceType: string, search: string) => {
+  const loadResources = useCallback(async (resourceType: string, search: string) => {
     try {
       let data: SelectableResource[] = [];
       if (resourceType === 'paper') {
@@ -134,21 +134,25 @@ const SharedResourcesPage: React.FC = () => {
       console.error('加载资源列表失败:', error);
       setResources([]);
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (shareModalVisible) {
       shareApi.getMyGroups().then(setMyGroups);
-      loadResources(shareResourceType, resourceSearch);
     }
   }, [shareModalVisible]);
 
   useEffect(() => {
     if (shareModalVisible) {
-      setSelectedResources([]);
       loadResources(shareResourceType, resourceSearch);
     }
-  }, [shareResourceType, resourceSearch]);
+  }, [loadResources, resourceSearch, shareModalVisible, shareResourceType]);
+
+  useEffect(() => {
+    if (shareModalVisible) {
+      setSelectedResources([]);
+    }
+  }, [resourceSearch, shareModalVisible, shareResourceType]);
 
   const handleShare = async () => {
     if (selectedResources.length === 0) { message.warning('请选择要共享的资源'); return; }

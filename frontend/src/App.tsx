@@ -13,8 +13,10 @@ const ChatManagePage = lazy(() => import('@/pages/chat/ChatManagePage'))
 const SmartChunkingPage = lazy(() => import('@/pages/knowledge/SmartChunkingPage'))
 const LiteraturePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.LiteraturePage })))
 const PaperReaderPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderPage })))
+const PaperReaderReviewPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderReviewPage })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
+const AdminStatisticsPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.StatisticsPage })))
 const MentorStudentsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.StudentsPage })))
 const MentorGroupsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.GroupsPage })))
 const MentorAnnouncementsPage = lazy(() => import('@/pages/mentor').then((m) => ({ default: m.AnnouncementsPage })))
@@ -96,16 +98,6 @@ const RoleRoute = ({
   return <>{children}</>
 }
 
-// 占位页面组件
-const PlaceholderPage = ({ title }: { title: string }) => (
-  <div className="h-full flex items-center justify-center bg-slate-950">
-    <div className="text-center">
-      <h1 className="text-2xl font-bold text-white mb-2">{title}</h1>
-      <p className="text-slate-400">功能开发中...</p>
-    </div>
-  </div>
-)
-
 const RouteLoading = () => (
   <div className="h-full flex items-center justify-center bg-slate-950">
     <Spin size="large" />
@@ -127,7 +119,7 @@ function App() {
   }, [checkAuth, isInitialized])
 
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <Routes>
         {/* 公共路由 */}
         <Route
@@ -144,6 +136,16 @@ function App() {
             <PublicRoute>
               <RegisterPage />
             </PublicRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/read/review"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderReviewPage />)}
+              </ErrorBoundary>
+            </PrivateRoute>
           }
         />
 
@@ -185,7 +187,7 @@ function App() {
             path="admin/statistics"
             element={
               <RoleRoute allowedRoles={['admin']}>
-                <PlaceholderPage title="系统统计" />
+                {withSuspense(<AdminStatisticsPage />)}
               </RoleRoute>
             }
           />

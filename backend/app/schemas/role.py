@@ -64,17 +64,201 @@ class UserListResponse(UserWithRole):
     pass
 
 
+class DailyCountPoint(BaseModel):
+    """按日计数点"""
+    date: str
+    count: int
+
+
+class StatisticsActivity(BaseModel):
+    """近 7 天活跃概览"""
+    new_users_last_7_days: int = 0
+    new_conversations_last_7_days: int = 0
+    new_knowledge_bases_last_7_days: int = 0
+    new_papers_last_7_days: int = 0
+    new_notebooks_last_7_days: int = 0
+
+
+class StatisticsCollaboration(BaseModel):
+    """协作统计"""
+    total_groups: int = 0
+    active_groups: int = 0
+    total_group_members: int = 0
+    pending_invitations: int = 0
+    total_shared_resources: int = 0
+    total_announcements: int = 0
+    active_announcements: int = 0
+
+
+class StatisticsMentorship(BaseModel):
+    """导师制统计"""
+    students_with_mentor: int = 0
+    students_without_mentor: int = 0
+
+
+class StatisticsDocumentPipeline(BaseModel):
+    """文档处理管线统计"""
+    total_documents: int = 0
+    completed_documents: int = 0
+    running_documents: int = 0
+    failed_documents: int = 0
+    pending_documents: int = 0
+    timeout_documents: int = 0
+    cancelled_documents: int = 0
+
+
+class StatisticsTrendSeries(BaseModel):
+    """近 7 天趋势序列"""
+    users: List[DailyCountPoint] = Field(default_factory=list)
+    conversations: List[DailyCountPoint] = Field(default_factory=list)
+    knowledge_bases: List[DailyCountPoint] = Field(default_factory=list)
+    papers: List[DailyCountPoint] = Field(default_factory=list)
+    notebooks: List[DailyCountPoint] = Field(default_factory=list)
+
+
+class StatisticsBreakdownItem(BaseModel):
+    """分类统计项"""
+    key: str
+    label: str
+    count: int = 0
+
+
+class StatisticsMentorRankItem(BaseModel):
+    """导师排行项"""
+    mentor_id: int
+    username: str
+    full_name: Optional[str] = None
+    student_count: int = 0
+    group_count: int = 0
+
+
+class StatisticsRecentActivityItem(BaseModel):
+    """近期活动项"""
+    id: str
+    type: str
+    title: str
+    owner_name: str
+    owner_role: str
+    created_at: datetime
+
+
+class StatisticsDetailItem(BaseModel):
+    """统计页下钻明细项"""
+    id: str
+    entity: str
+    title: str
+    subtitle: Optional[str] = None
+    status: Optional[str] = None
+    category: Optional[str] = None
+    owner_name: Optional[str] = None
+    owner_role: Optional[str] = None
+    target_name: Optional[str] = None
+    permission: Optional[str] = None
+    member_count: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class StatisticsDetailResponse(BaseModel):
+    """统计页下钻明细分页响应"""
+    entity: str
+    total: int
+    page: int
+    page_size: int
+    items: List[StatisticsDetailItem] = Field(default_factory=list)
+
+
+class StatisticsAIRag(BaseModel):
+    """AI / RAG 统计"""
+    assistant_messages_last_window: int = 0
+    rag_messages_last_window: int = 0
+    knowledge_search_calls_last_window: int = 0
+    citation_required_answers_last_window: int = 0
+    citation_valid_answers_last_window: int = 0
+    citation_repair_attempts_last_window: int = 0
+    citation_repair_successes_last_window: int = 0
+    compression_calls_last_window: int = 0
+    compression_fallback_chunks_last_window: int = 0
+    assistant_total_tokens_last_window: int = 0
+    agent_runs_last_window: int = 0
+    successful_agent_runs_last_window: int = 0
+
+
+class StatisticsCodeLab(BaseModel):
+    """CodeLab 统计"""
+    notebooks_active_last_window: int = 0
+    executed_notebooks: int = 0
+    total_execution_count: int = 0
+    code_cells: int = 0
+    executed_code_cells: int = 0
+    agent_runs_last_window: int = 0
+    agent_tokens_last_window: int = 0
+
+
+class StatisticsLiterature(BaseModel):
+    """文献阅读统计"""
+    total_collections: int = 0
+    active_read_sessions_last_window: int = 0
+    annotations_last_window: int = 0
+    comments_last_window: int = 0
+    ratings_last_window: int = 0
+    qa_sessions_last_window: int = 0
+    qa_messages_last_window: int = 0
+    knowledge_links_total: int = 0
+    knowledge_link_breakdown: List[StatisticsBreakdownItem] = Field(default_factory=list)
+
+
+class AdminAuditLogItem(BaseModel):
+    """管理员审计日志项"""
+    id: int
+    action: str
+    target_type: Optional[str] = None
+    target_id: Optional[str] = None
+    admin_name: str
+    summary: str
+    created_at: datetime
+
+
+class AdminAuditLogResponse(BaseModel):
+    """管理员审计日志分页响应"""
+    total: int
+    page: int
+    page_size: int
+    items: List[AdminAuditLogItem] = Field(default_factory=list)
+
+
 class SystemStatistics(BaseModel):
     """系统统计"""
+    time_window_days: int = 7
     total_users: int
     admin_count: int
     mentor_count: int
     student_count: int
     active_users: int
+    inactive_users: int = 0
     total_conversations: int = 0
     total_knowledge_bases: int = 0
+    total_documents: int = 0
     total_papers: int = 0
     total_notebooks: int = 0
+    total_groups: int = 0
+    pending_invitations: int = 0
+    total_shared_resources: int = 0
+    total_announcements: int = 0
+    students_with_mentor: int = 0
+    students_without_mentor: int = 0
+    activity: StatisticsActivity = Field(default_factory=StatisticsActivity)
+    collaboration: StatisticsCollaboration = Field(default_factory=StatisticsCollaboration)
+    mentorship: StatisticsMentorship = Field(default_factory=StatisticsMentorship)
+    document_pipeline: StatisticsDocumentPipeline = Field(default_factory=StatisticsDocumentPipeline)
+    trends_7d: StatisticsTrendSeries = Field(default_factory=StatisticsTrendSeries)
+    share_breakdown: List[StatisticsBreakdownItem] = Field(default_factory=list)
+    invitation_breakdown: List[StatisticsBreakdownItem] = Field(default_factory=list)
+    top_mentors: List[StatisticsMentorRankItem] = Field(default_factory=list)
+    recent_activity: List[StatisticsRecentActivityItem] = Field(default_factory=list)
+    ai_rag: StatisticsAIRag = Field(default_factory=StatisticsAIRag)
+    codelab: StatisticsCodeLab = Field(default_factory=StatisticsCodeLab)
+    literature: StatisticsLiterature = Field(default_factory=StatisticsLiterature)
 
 
 # ========== 研究组相关 ==========

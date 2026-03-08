@@ -1,4 +1,4 @@
-﻿"""
+"""
 Evaluate retrieval quality for different embedding dimensions.
 """
 from __future__ import annotations

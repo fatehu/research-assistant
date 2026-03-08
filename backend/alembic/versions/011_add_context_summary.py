@@ -1,4 +1,4 @@
-﻿"""
+"""
 011_add_context_summary
 
 Add context_summary column for contextual retrieval.

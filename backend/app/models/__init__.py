@@ -10,6 +10,8 @@ from app.models.literature import (
     PaperSearchHistory,
     PaperEntity,
     PaperReadSession,
+    PaperReaderPageCache,
+    PaperReaderComponentOverlay,
     PaperAnnotation,
     PaperComment,
     PaperRating,
@@ -32,6 +34,7 @@ from app.models.role import (
     SharedResource,
     Announcement,
     AnnouncementRead,
+    AdminAuditLog,
 )
 
 __all__ = [
@@ -50,6 +53,8 @@ __all__ = [
     "PaperSearchHistory",
     "PaperEntity",
     "PaperReadSession",
+    "PaperReaderPageCache",
+    "PaperReaderComponentOverlay",
     "PaperAnnotation",
     "PaperComment",
     "PaperRating",
@@ -75,4 +80,5 @@ __all__ = [
     "SharedResource",
     "Announcement",
     "AnnouncementRead",
+    "AdminAuditLog",
 ]

@@ -134,16 +134,343 @@ export interface Announcement {
 
 // 系统统计接口
 export interface SystemStatistics {
+  time_window_days: number;
   total_users: number;
   admin_count: number;
   mentor_count: number;
   student_count: number;
   active_users: number;
+  inactive_users: number;
   total_conversations: number;
   total_knowledge_bases: number;
+  total_documents: number;
   total_papers: number;
   total_notebooks: number;
+  total_groups: number;
+  pending_invitations: number;
+  total_shared_resources: number;
+  total_announcements: number;
+  students_with_mentor: number;
+  students_without_mentor: number;
+  activity: {
+    new_users_last_7_days: number;
+    new_conversations_last_7_days: number;
+    new_knowledge_bases_last_7_days: number;
+    new_papers_last_7_days: number;
+    new_notebooks_last_7_days: number;
+  };
+  collaboration: {
+    total_groups: number;
+    active_groups: number;
+    total_group_members: number;
+    pending_invitations: number;
+    total_shared_resources: number;
+    total_announcements: number;
+    active_announcements: number;
+  };
+  mentorship: {
+    students_with_mentor: number;
+    students_without_mentor: number;
+  };
+  document_pipeline: {
+    total_documents: number;
+    completed_documents: number;
+    running_documents: number;
+    failed_documents: number;
+    pending_documents: number;
+    timeout_documents: number;
+    cancelled_documents: number;
+  };
+  trends_7d: {
+    users: Array<{ date: string; count: number }>;
+    conversations: Array<{ date: string; count: number }>;
+    knowledge_bases: Array<{ date: string; count: number }>;
+    papers: Array<{ date: string; count: number }>;
+    notebooks: Array<{ date: string; count: number }>;
+  };
+  share_breakdown: Array<{ key: string; label: string; count: number }>;
+  invitation_breakdown: Array<{ key: string; label: string; count: number }>;
+  top_mentors: Array<{
+    mentor_id: number;
+    username: string;
+    full_name?: string;
+    student_count: number;
+    group_count: number;
+  }>;
+  recent_activity: Array<{
+    id: string;
+    type: string;
+    title: string;
+    owner_name: string;
+    owner_role: string;
+    created_at: string;
+  }>;
+  ai_rag: {
+    assistant_messages_last_window: number;
+    rag_messages_last_window: number;
+    knowledge_search_calls_last_window: number;
+    citation_required_answers_last_window: number;
+    citation_valid_answers_last_window: number;
+    citation_repair_attempts_last_window: number;
+    citation_repair_successes_last_window: number;
+    compression_calls_last_window: number;
+    compression_fallback_chunks_last_window: number;
+    assistant_total_tokens_last_window: number;
+    agent_runs_last_window: number;
+    successful_agent_runs_last_window: number;
+  };
+  codelab: {
+    notebooks_active_last_window: number;
+    executed_notebooks: number;
+    total_execution_count: number;
+    code_cells: number;
+    executed_code_cells: number;
+    agent_runs_last_window: number;
+    agent_tokens_last_window: number;
+  };
+  literature: {
+    total_collections: number;
+    active_read_sessions_last_window: number;
+    annotations_last_window: number;
+    comments_last_window: number;
+    ratings_last_window: number;
+    qa_sessions_last_window: number;
+    qa_messages_last_window: number;
+    knowledge_links_total: number;
+    knowledge_link_breakdown: Array<{ key: string; label: string; count: number }>;
+  };
 }
+
+const emptyDailySeries = () => ({
+  users: [],
+  conversations: [],
+  knowledge_bases: [],
+  papers: [],
+  notebooks: [],
+});
+
+const defaultSystemStatistics = (): SystemStatistics => ({
+  time_window_days: 7,
+  total_users: 0,
+  admin_count: 0,
+  mentor_count: 0,
+  student_count: 0,
+  active_users: 0,
+  inactive_users: 0,
+  total_conversations: 0,
+  total_knowledge_bases: 0,
+  total_documents: 0,
+  total_papers: 0,
+  total_notebooks: 0,
+  total_groups: 0,
+  pending_invitations: 0,
+  total_shared_resources: 0,
+  total_announcements: 0,
+  students_with_mentor: 0,
+  students_without_mentor: 0,
+  activity: {
+    new_users_last_7_days: 0,
+    new_conversations_last_7_days: 0,
+    new_knowledge_bases_last_7_days: 0,
+    new_papers_last_7_days: 0,
+    new_notebooks_last_7_days: 0,
+  },
+  collaboration: {
+    total_groups: 0,
+    active_groups: 0,
+    total_group_members: 0,
+    pending_invitations: 0,
+    total_shared_resources: 0,
+    total_announcements: 0,
+    active_announcements: 0,
+  },
+  mentorship: {
+    students_with_mentor: 0,
+    students_without_mentor: 0,
+  },
+  document_pipeline: {
+    total_documents: 0,
+    completed_documents: 0,
+    running_documents: 0,
+    failed_documents: 0,
+    pending_documents: 0,
+    timeout_documents: 0,
+    cancelled_documents: 0,
+  },
+  trends_7d: emptyDailySeries(),
+  share_breakdown: [],
+  invitation_breakdown: [],
+  top_mentors: [],
+  recent_activity: [],
+  ai_rag: {
+    assistant_messages_last_window: 0,
+    rag_messages_last_window: 0,
+    knowledge_search_calls_last_window: 0,
+    citation_required_answers_last_window: 0,
+    citation_valid_answers_last_window: 0,
+    citation_repair_attempts_last_window: 0,
+    citation_repair_successes_last_window: 0,
+    compression_calls_last_window: 0,
+    compression_fallback_chunks_last_window: 0,
+    assistant_total_tokens_last_window: 0,
+    agent_runs_last_window: 0,
+    successful_agent_runs_last_window: 0,
+  },
+  codelab: {
+    notebooks_active_last_window: 0,
+    executed_notebooks: 0,
+    total_execution_count: 0,
+    code_cells: 0,
+    executed_code_cells: 0,
+    agent_runs_last_window: 0,
+    agent_tokens_last_window: 0,
+  },
+  literature: {
+    total_collections: 0,
+    active_read_sessions_last_window: 0,
+    annotations_last_window: 0,
+    comments_last_window: 0,
+    ratings_last_window: 0,
+    qa_sessions_last_window: 0,
+    qa_messages_last_window: 0,
+    knowledge_links_total: 0,
+    knowledge_link_breakdown: [],
+  },
+});
+
+const normalizeDailyPoints = (value: unknown): Array<{ date: string; count: number }> => {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const row = item as { date?: unknown; count?: unknown };
+    return {
+      date: typeof row.date === 'string' ? row.date : '',
+      count: Number(row.count || 0),
+    };
+  });
+};
+
+const normalizeBreakdownItems = (value: unknown): Array<{ key: string; label: string; count: number }> => {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const row = item as { key?: unknown; label?: unknown; count?: unknown };
+    return {
+      key: typeof row.key === 'string' ? row.key : '',
+      label: typeof row.label === 'string' ? row.label : '',
+      count: Number(row.count || 0),
+    };
+  });
+};
+
+const normalizeTopMentors = (
+  value: unknown,
+): Array<{ mentor_id: number; username: string; full_name?: string; student_count: number; group_count: number }> => {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const row = item as {
+      mentor_id?: unknown;
+      username?: unknown;
+      full_name?: unknown;
+      student_count?: unknown;
+      group_count?: unknown;
+    };
+    return {
+      mentor_id: Number(row.mentor_id || 0),
+      username: typeof row.username === 'string' ? row.username : '',
+      full_name: typeof row.full_name === 'string' ? row.full_name : undefined,
+      student_count: Number(row.student_count || 0),
+      group_count: Number(row.group_count || 0),
+    };
+  });
+};
+
+const normalizeRecentActivity = (
+  value: unknown,
+): Array<{ id: string; type: string; title: string; owner_name: string; owner_role: string; created_at: string }> => {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const row = item as {
+      id?: unknown;
+      type?: unknown;
+      title?: unknown;
+      owner_name?: unknown;
+      owner_role?: unknown;
+      created_at?: unknown;
+    };
+    return {
+      id: typeof row.id === 'string' ? row.id : '',
+      type: typeof row.type === 'string' ? row.type : '',
+      title: typeof row.title === 'string' ? row.title : '',
+      owner_name: typeof row.owner_name === 'string' ? row.owner_name : '',
+      owner_role: typeof row.owner_role === 'string' ? row.owner_role : '',
+      created_at: typeof row.created_at === 'string' ? row.created_at : '',
+    };
+  });
+};
+
+const normalizeSystemStatistics = (value: unknown): SystemStatistics => {
+  const defaults = defaultSystemStatistics();
+  const raw = (value && typeof value === 'object' ? value : {}) as Partial<SystemStatistics>;
+
+  return {
+    ...defaults,
+    ...raw,
+    time_window_days: Number(raw.time_window_days || 7),
+    inactive_users: Number(raw.inactive_users ?? Math.max(Number(raw.total_users || 0) - Number(raw.active_users || 0), 0)),
+    total_documents: Number(raw.total_documents || 0),
+    total_groups: Number(raw.total_groups || 0),
+    pending_invitations: Number(raw.pending_invitations || 0),
+    total_shared_resources: Number(raw.total_shared_resources || 0),
+    total_announcements: Number(raw.total_announcements || 0),
+    students_with_mentor: Number(raw.students_with_mentor || 0),
+    students_without_mentor: Number(raw.students_without_mentor || 0),
+    activity: {
+      ...defaults.activity,
+      ...(raw.activity || {}),
+    },
+    collaboration: {
+      ...defaults.collaboration,
+      ...(raw.collaboration || {}),
+    },
+    mentorship: {
+      students_with_mentor: Number(raw.mentorship?.students_with_mentor ?? raw.students_with_mentor ?? 0),
+      students_without_mentor: Number(raw.mentorship?.students_without_mentor ?? raw.students_without_mentor ?? 0),
+    },
+    document_pipeline: {
+      ...defaults.document_pipeline,
+      total_documents: Number(raw.document_pipeline?.total_documents ?? raw.total_documents ?? 0),
+      completed_documents: Number(raw.document_pipeline?.completed_documents || 0),
+      running_documents: Number(raw.document_pipeline?.running_documents || 0),
+      failed_documents: Number(raw.document_pipeline?.failed_documents || 0),
+      pending_documents: Number(raw.document_pipeline?.pending_documents || 0),
+      timeout_documents: Number(raw.document_pipeline?.timeout_documents || 0),
+      cancelled_documents: Number(raw.document_pipeline?.cancelled_documents || 0),
+    },
+    trends_7d: {
+      users: normalizeDailyPoints(raw.trends_7d?.users),
+      conversations: normalizeDailyPoints(raw.trends_7d?.conversations),
+      knowledge_bases: normalizeDailyPoints(raw.trends_7d?.knowledge_bases),
+      papers: normalizeDailyPoints(raw.trends_7d?.papers),
+      notebooks: normalizeDailyPoints(raw.trends_7d?.notebooks),
+    },
+    share_breakdown: normalizeBreakdownItems(raw.share_breakdown),
+    invitation_breakdown: normalizeBreakdownItems(raw.invitation_breakdown),
+    top_mentors: normalizeTopMentors(raw.top_mentors),
+    recent_activity: normalizeRecentActivity(raw.recent_activity),
+    ai_rag: {
+      ...defaults.ai_rag,
+      ...(raw.ai_rag || {}),
+    },
+    codelab: {
+      ...defaults.codelab,
+      ...(raw.codelab || {}),
+    },
+    literature: {
+      ...defaults.literature,
+      ...(raw.literature || {}),
+      knowledge_link_breakdown: normalizeBreakdownItems(raw.literature?.knowledge_link_breakdown),
+    },
+  };
+};
 
 // 状态接口
 interface RoleState {
@@ -177,7 +504,7 @@ interface RoleState {
   updateUserRole: (userId: number, role: UserRole) => Promise<void>;
   toggleUserActive: (userId: number) => Promise<void>;
   deleteUser: (userId: number) => Promise<void>;
-  fetchStatistics: () => Promise<void>;
+  fetchStatistics: (days?: number) => Promise<void>;
 
   // 导师操作
   fetchStudents: () => Promise<void>;
@@ -287,11 +614,13 @@ export const useRoleStore = create<RoleState>()(
         }
       },
 
-      fetchStatistics: async () => {
+      fetchStatistics: async (days) => {
         set({ statisticsLoading: true });
         try {
-          const response = await api.get('/api/v1/admin/statistics');
-          set({ statistics: response.data, statisticsLoading: false });
+          const response = await api.get('/api/v1/admin/statistics', {
+            params: typeof days === 'number' ? { days } : undefined,
+          });
+          set({ statistics: normalizeSystemStatistics(response.data), statisticsLoading: false });
         } catch (error) {
           console.error('获取统计数据失败:', error);
           set({ statisticsLoading: false });

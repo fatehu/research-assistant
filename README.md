@@ -1,265 +1,370 @@
-# 研究助手系统 (Research Assistant)
+# AI 科研助手 / Research Assistant
 
-一个为科研团队设计的智能研究助手平台，集成 AI 对话、知识库管理、文献管理、代码实验室等功能，支持多角色协作与资源共享。
+面向科研团队的全栈研究工作台，覆盖 AI 对话、知识库与 RAG、论文搜索与阅读、CodeLab Notebook、多角色协作，以及可选的 MCP 工具接入。
 
-## ✨ 核心功能
+这不是单点功能项目，而是一套围绕科研真实工作流搭起来的平台：
 
-| 模块 | 说明 |
+- 找论文、收论文、下载 PDF、按页阅读
+- 把论文和资料入库，做向量检索、问答和引用回溯
+- 在阅读页里直接做生成式编排、证据定位、Review / Publish
+- 在 CodeLab 里运行 Python、保留上下文、调用 Notebook Agent
+- 让管理员、导师、学生共享资源、公告和协作入口
+
+## 核心能力
+
+| 模块 | 当前能力 |
 |------|------|
-| 🤖 **AI 智能对话** | 多 LLM 支持（DeepSeek、OpenAI、Ollama）、流式响应、ReAct Agent 工具调用 |
-| 📚 **知识库** | 文档向量化、语义搜索、RAG 检索、**智能分块**（层级化 / 多策略）|
-| 🔬 **文献管理** | Semantic Scholar / arXiv 论文搜索、PDF 下载、收藏分类、阅读标注 |
-| 💻 **代码实验室** | Jupyter 风格笔记本、Python 沙箱执行、AI Notebook Agent |
-| 👥 **多角色协作** | 管理员 / 导师 / 学生三级角色、研究组、邀请系统、资源共享 |
+| AI 对话 | 多 LLM Provider、流式响应、Agent 工具调用、来源引用 |
+| 知识库 / RAG | 文档上传、Embedding、智能分块、混合检索、Reranker、Query Rewrite、Contextual Compression |
+| 文献管理 | Semantic Scholar / arXiv 搜索、收藏、PDF 下载、分类管理、引用信息、阅读位置记忆 |
+| 论文阅读工作台 | Reader Workbench V2、结构化页面解析、组件化阅读界面、证据锚点定位、Review / Publish 闭环 |
+| CodeLab | Jupyter 风格 Notebook、Python 沙箱执行、变量查看、Notebook Agent |
+| 多角色协作 | 管理员 / 导师 / 学生路由、共享资源、邀请、公告、统计页 |
+| MCP | 可选外部 MCP Server 接入，支持工具路由、重试、熔断和前端配置 |
 
-## 🏗️ 技术栈
+## 系统功能矩阵
+
+### 用户侧功能
+
+| 功能域 | 功能点 |
+|------|------|
+| AI 对话 | 流式聊天、多模型接入、Agent 工具调用、来源引用展示 |
+| 知识库 | 创建知识库、上传文档、文档入库、跨库检索、共享知识库访问 |
+| 智能分块 | 多预设策略、层级分块、学术文档优化、分块配置管理 |
+| 文献管理 | 论文搜索、论文收藏、PDF 下载、分类整理、引用信息查看 |
+| 论文阅读 | 按页阅读、结构化阅读界面、证据锚点跳转、阅读位置记忆、内联提问 |
+| Review / Publish | 人工观察、局部 Patch、自动修复、发布快照 |
+| CodeLab | Notebook 创建、编辑、单元运行、全量运行、变量查看、结果回显 |
+| Notebook Agent | 代码建议、错误解释、数据分析辅助、上下文感知问答 |
+| 协作入口 | 管理员、导师、学生分角色页面，资源共享、公告与邀请 |
+
+### 平台能力
+
+| 能力域 | 能力点 |
+|------|------|
+| 检索增强 | Hybrid Retrieval、Reranker、Query Rewrite、Contextual Compression |
+| Reader 引擎 | PDF 结构提取、`page_structure_v3`、语义原子、组件化编排、SSE 流式 patch |
+| 多模态辅助 | 版面理解、布局建议、证据定位增强 |
+| 代码执行 | 独立 `codelab-runner`、沙箱执行、超时控制、内核生命周期管理 |
+| MCP 扩展 | 外部 MCP Server 接入、工具前缀、路由策略、失败回退 |
+| 状态反馈 | 长任务状态流、事件推送、前端感知处理进度 |
+| 管理能力 | 用户管理、统计页、公告、邀请、权限边界 |
+| 基础设施 | Docker Compose、PostgreSQL + pgvector、Redis、Alembic 迁移 |
+
+## 当前开发重点
+
+截至 2026-03-07，这个仓库最近一轮的主增量集中在论文阅读链路：
+
+- `Reader Workbench V2` 已经从“PDF + 问答面板”升级成“结构化页面 + 组件编排 + 评审发布”的工作台。
+- 阅读链路支持 `single_agent_v2`、语义原子、流式 UI patch，以及更稳的证据锚点定位。
+- Review / Publish 工作流已经接通，支持观察、Patch、自动修复和发布快照。
+- Reader 页内联 PDF、工作台可读性和操作控件在最近一轮里继续收口。
+
+如果你是第一次进入仓库，可以先把这部分理解成：平台整体是稳定多模块结构，而目前最活跃的产品面是论文阅读工作台。
+
+## Reader Workbench V2
+
+Reader 页当前不是简单展示 PDF 文本，而是按页面结构做组件化阅读。实际链路大致如下：
+
+1. 论文 PDF 下载并入库。
+2. 后端优先使用 Document Mind DocStructure 提取版面结构，再标准化为 `page_structure_v3`。
+3. 页面结构会被整理成语义原子、关系和导航信息。
+4. `single_agent_v2` 基于页面元数据、结构块和渲染图像，输出受约束的 UI 组件树。
+5. 后端执行组件白名单、锚点所有权、最小门禁和布局合同校验；失败时节点级降级，而不是整页清空。
+6. 前端通过 SSE 接收 `plan_draft`、`plan_patch`、`assets`、`quality_report`、`done` 等事件，增量渲染阅读工作台。
+7. 用户可以进入 Review 页面做人工观察、局部修补、自动修补，并将结果发布为正式阅读快照。
+
+关键实现主要在：
+
+- `backend/app/api/literature.py`
+- `backend/app/services/literature_reader_compose_service.py`
+- `backend/app/services/reader_single_agent_controller.py`
+- `backend/app/services/render_pipeline_contract.py`
+- `frontend/src/pages/literature/PaperReaderPage.tsx`
+- `frontend/src/pages/literature/PaperReaderReviewPage.tsx`
+- `frontend/src/pages/literature/readerComponents/`
+
+## 技术栈
 
 | 层级 | 技术 |
 |------|------|
-| **前端** | React 18 + TypeScript + Vite + Ant Design + Zustand + Framer Motion |
-| **后端** | FastAPI + SQLAlchemy (async) + PostgreSQL + pgvector + Redis |
-| **AI/ML** | sentence-transformers（本地嵌入）、多 LLM Provider 抽象层 |
-| **部署** | Docker Compose 一键部署 |
+| 前端 | React 18, TypeScript, Vite, Ant Design, Zustand, Framer Motion |
+| 后端 | FastAPI, SQLAlchemy Async, Pydantic v2, Alembic |
+| 存储 | PostgreSQL + pgvector, Redis |
+| AI / 检索 | OpenAI / DeepSeek / 阿里云 / Ollama，本地嵌入，混合检索，重排与压缩 |
+| PDF / Reader | pypdf, pdfplumber, MarkItDown, Alibaba Cloud Document Mind |
+| Notebook | Monaco Editor, 独立 `codelab-runner` 沙箱服务 |
+| 部署 | Docker Compose，`mcp` profile 可选启用内部 MCP 服务 |
 
-## 📦 快速开始
+## 快速开始
 
 ### 前置要求
 
-- Docker & Docker Compose
-- 至少 4GB 内存（本地嵌入模型需要）
-- Windows PowerShell 建议执行 `chcp 65001`（避免中文乱码）
+- Docker Desktop 或 Docker Engine + Docker Compose
+- 至少 4 GB 可用内存；启用本地 Embedding 时建议 8 GB 以上
+- Windows PowerShell 建议先执行 `chcp 65001`
 
-### 部署步骤
+### 1. 克隆并配置环境变量
 
 ```bash
-# 1. 克隆仓库
 git clone <repo-url>
 cd research-assistant
-
-# 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env，至少配置以下关键项：
-# - POSTGRES_PASSWORD
-# - DATABASE_URL
-# - SECRET_KEY
-# - CODELAB_RUNNER_TOKEN
-# - LLM API Key（如 DEEPSEEK_API_KEY）
-
-# 3. 启动服务（后端/前端强制重建，避免旧镜像残留）
-docker compose up -d --build backend frontend
-
-# 4. 访问
-# 前端: http://localhost:3000
-# 后端 API: http://localhost:8888
 ```
 
+至少确认这些值：
+
+- `POSTGRES_PASSWORD`
+- `DATABASE_URL`
+- `SECRET_KEY`
+- `CODELAB_RUNNER_TOKEN`
+- 至少一组 LLM 凭证：`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ALIYUN_API_KEY`
+
+如果你要启用高保真的 Reader Workbench V2，建议额外配置：
+
+- `PDF_LAYOUT_PARSER=document_mind`
+- `READER_DOCUMENT_MIND_ENABLED=true`
+- `DOCUMENT_MIND_ACCESS_KEY_ID`
+- `DOCUMENT_MIND_ACCESS_KEY_SECRET`
+
+### 2. 启动默认服务
+
 ```bash
-# 5. 健康检查
+docker compose up -d --build backend frontend
+```
+
+这条命令会连带拉起依赖服务：
+
+- `postgres`
+- `redis`
+- `codelab-runner`
+- `backend`
+- `frontend`
+
+### 3. 可选启用 MCP Profile
+
+```bash
+docker compose --profile mcp up -d mcp_web mcp_literature
+```
+
+### 4. 访问地址
+
+| 服务 | 地址 |
+|------|------|
+| 前端 | http://localhost:3000 |
+| 后端 API | http://localhost:8888 |
+| FastAPI Docs | http://localhost:8888/docs |
+| PostgreSQL | `localhost:5432` |
+| Redis | `localhost:6379` |
+| MCP Web | http://localhost:8091 |
+| MCP Literature | http://localhost:8092 |
+
+### 5. 启动后自检
+
+```bash
 docker compose ps
 docker compose logs --tail 100 backend
 docker compose logs --tail 100 frontend
+docker compose logs --tail 100 codelab-runner
 ```
 
-### 服务端口
+## 关键环境变量
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
-| Frontend | 3000 | React 前端 |
-| Backend | 8888 | FastAPI 后端 API |
-| PostgreSQL | 5432 | 数据库（含 pgvector 扩展）|
-| Redis | 6379 | 缓存 & 会话管理 |
+这里只列最常用的一组；完整列表请看 `.env.example`。
 
-### 编码与容器闭环约束
-
-- 文本文件统一 UTF-8；容器默认使用 `LANG=C.UTF-8`。
-- 涉及 `Dockerfile`、`requirements.txt`、`.env.example`、迁移脚本改动时，必须使用 `docker compose up -d --build`，不要只 `restart`。
-- 手测前至少完成一次链路：上传文档 -> 处理完成 -> 检索 -> 结果卡片可见。
-
-## 🔧 配置说明
-
-### 嵌入模型
-
-系统支持 **本地嵌入** 和 **API 嵌入** 两种方式，在 `.env` 中配置：
+### 基础运行
 
 ```env
-# 嵌入提供者: local / aliyun / openai / ollama
-EMBEDDING_PROVIDER=local
-
-# 本地模型配置
-LOCAL_EMBEDDING_MODEL=BAAI/bge-m3       # 推荐: 多语言SOTA
-LOCAL_EMBEDDING_DEVICE=auto             # auto / cpu / cuda / mps
-LOCAL_EMBEDDING_DIMENSION=0             # 0=使用模型默认维度
+APP_ENV=development
+DATABASE_URL=postgresql://research_user:change_me@postgres:5432/research_assistant
+REDIS_URL=redis://redis:6379/0
+SECRET_KEY=change_me_to_a_random_string_at_least_32_chars_long
 ```
 
-**创建知识库时可选择嵌入模型**，支持的模型包括：
-
-| 模型 | 维度 | 类型 | 说明 |
-|------|------|------|------|
-| `BAAI/bge-m3` | 1024 | 本地 | 多语言 SOTA，推荐 |
-| `BAAI/bge-large-zh-v1.5` | 1024 | 本地 | 中文优化 |
-| `BAAI/bge-large-en-v1.5` | 1024 | 本地 | 英文优化 |
-| `allenai/specter2` | 768 | 本地 | 科研论文专用 |
-| `text-embedding-v2` | 1536 | 阿里云 API | DashScope |
-| `text-embedding-3-small` | 1536 | OpenAI API | OpenAI |
-| `nomic-embed-text` | 768 | Ollama | 本地 API |
-
-### LLM 模型
+### LLM Provider
 
 ```env
-# LLM 提供者: deepseek / openai / ollama
-LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=your_key
+DEFAULT_LLM_PROVIDER=deepseek
+
+DEEPSEEK_API_KEY=
 DEEPSEEK_MODEL=deepseek-chat
 
-# 或使用本地 Ollama
-# LLM_PROVIDER=ollama
-# OLLAMA_BASE_URL=http://host.docker.internal:11434
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o
+
+ALIYUN_API_KEY=
+ALIYUN_MODEL=qwen-plus
+
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=llama3
 ```
 
-## 📚 知识库系统
+### Embedding / 检索
 
-### 智能分块 (Smart Chunking)
-
-系统提供 **层级化智能分块**，支持多种预设策略：
-
-| 预设 | 适用场景 | 特点 |
-|------|----------|------|
-| FAST | 快速处理 | 大块、少分片 |
-| PRECISE | 精确检索 | 小块、多分片 |
-| ACADEMIC | 学术论文 | 识别章节结构 |
-| DEEP | 深度分析 | 最细粒度分块 |
-| DEFAULT | 通用 | 平衡效果 |
-
-分块层级：
-- **段落级** (paragraph) — 适合精确检索
-- **章节级** (section) — 适合获取完整上下文
-- **文档级** (document) — 全文检索
-
-### 向量搜索
-
-```
-POST /api/v1/knowledge/search
-{
-  "query": "深度学习在NLP中的应用",
-  "knowledge_base_ids": [1, 2],
-  "top_k": 5,
-  "chunk_level": "paragraph",
-  "include_parent_context": true
-}
+```env
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_MODEL=BAAI/bge-m3
+ENABLE_HYBRID_RETRIEVAL=true
+ENABLE_RERANKER=true
+ENABLE_QUERY_REWRITE=true
+ENABLE_CONTEXTUAL_COMPRESSION=true
+CHUNK_QUALITY_GATE_ENABLED=false
 ```
 
-## 🗂️ 项目结构
+### Reader Workbench V2
 
+```env
+PDF_LAYOUT_PARSER=document_mind
+READER_DOCUMENT_MIND_ENABLED=true
+READER_PIPELINE_MODE=single_agent_v2
+READER_PIPELINE_VERSION=simplified_v2
+READER_MM_ASSIST_ENABLED=true
+READER_AGENT_MAX_STEPS=12
+READER_AGENT_MAX_REPAIR_ROUNDS=2
+READER_COMPOSE_LATENCY_BUDGET_MS=20000
+READER_COMPOSE_LATENCY_BUDGET_MAX_MS=25000
 ```
+
+如果没有 Document Mind 凭证，可以先降级为：
+
+```env
+READER_DOCUMENT_MIND_ENABLED=false
+PDF_LAYOUT_PARSER=markitdown
+```
+
+### CodeLab / MCP
+
+```env
+CODELAB_RUNNER_ENABLED=true
+CODELAB_RUNNER_URL=http://codelab-runner:8099
+CODELAB_RUNNER_TOKEN=change_me_internal_runner_token
+CODELAB_EXEC_TIMEOUT_HARD_SECONDS=20
+CODELAB_MAX_CONCURRENCY_PER_USER=2
+
+MCP_ENABLED=false
+MCP_TOOL_PREFIX=mcp
+MCP_CONFIG_PATH=mcp_servers.json
+MCP_TOOL_ROUTES={}
+```
+
+## 本地开发
+
+### 前端
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### 后端
+
+```bash
+cd backend
+pip install -r requirements.txt
+alembic upgrade head
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 常用验证命令
+
+```bash
+cd frontend
+npm run build
+```
+
+```bash
+cd backend
+pytest tests/test_literature_reader_api.py \
+       tests/test_literature_reader_composed.py \
+       tests/test_reader_single_agent_controller.py \
+       tests/test_reader_single_agent_validator.py
+```
+
+## 主要页面与接口
+
+### 前端页面
+
+| 路由 | 说明 |
+|------|------|
+| `/chat` | AI 对话 |
+| `/knowledge` | 知识库主页 |
+| `/knowledge/:kbId/chunking` | Smart Chunking 配置页 |
+| `/literature` | 文献搜索、收藏与分类 |
+| `/literature/:paperId/read` | Reader Workbench / 论文阅读页 |
+| `/literature/:paperId/read/review` | Review / Publish 工作台 |
+| `/code` | CodeLab Notebook 列表 |
+| `/code/:notebookId` | CodeLab Notebook 详情页 |
+| `/admin/statistics` | 管理统计 |
+| `/mentor/*` / `/student/*` | 导师 / 学生协作路由 |
+
+### 关键 API
+
+| 方法 | 端点 | 用途 |
+|------|------|------|
+| `POST` | `/api/v1/chat/send` | 流式对话 |
+| `POST` | `/api/v1/knowledge/search` | 知识库检索 |
+| `GET` | `/api/v1/chunking/presets` | 获取智能分块预设 |
+| `GET` | `/api/v1/literature/search` | 搜索论文 |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/stream` | Reader Workbench SSE 流式生成 |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session` | 创建 Review Session |
+| `POST` | `/api/v1/literature/papers/{paper_id}/reader/composed/review-session/{session_id}/publish` | 发布 Review 快照 |
+| `GET` | `/api/v1/codelab/notebooks` | Notebook 列表 |
+| `POST` | `/api/v1/codelab/notebooks/{id}/run-all` | 全量执行 Notebook |
+
+## 项目结构
+
+```text
 research-assistant/
 ├── backend/
 │   ├── app/
-│   │   ├── api/              # FastAPI 路由
-│   │   │   ├── knowledge.py  # 知识库 + 嵌入模型 API
-│   │   │   ├── chat.py       # AI 对话
-│   │   │   ├── literature.py # 文献管理
-│   │   │   ├── codelab.py    # 代码实验室
-│   │   │   ├── chunking.py   # 智能分块配置
-│   │   │   ├── agent.py      # ReAct Agent
-│   │   │   ├── admin.py      # 管理员
-│   │   │   ├── mentor.py     # 导师
-│   │   │   ├── student.py    # 学生
-│   │   │   └── share.py      # 资源共享
-│   │   ├── models/           # SQLAlchemy 数据模型
-│   │   ├── schemas/          # Pydantic 验证模型
-│   │   ├── services/         # 业务逻辑
-│   │   │   ├── embedding_service.py      # 嵌入服务（本地/API）
-│   │   │   ├── smart_chunking_service.py # 智能分块引擎
-│   │   │   └── document_service.py       # 文档处理
-│   │   ├── core/             # 核心组件（数据库、认证、权限）
-│   │   └── config.py         # 配置管理
-│   ├── Dockerfile
-│   └── requirements.txt
+│   │   ├── api/                    # FastAPI 路由
+│   │   ├── core/                   # 配置、认证、数据库
+│   │   ├── models/                 # SQLAlchemy 模型
+│   │   ├── schemas/                # Pydantic Schema
+│   │   ├── services/               # 业务服务
+│   │   │   ├── literature_reader_compose_service.py
+│   │   │   ├── reader_single_agent_controller.py
+│   │   │   ├── render_pipeline_contract.py
+│   │   │   ├── smart_chunking/
+│   │   │   ├── notebook_service.py
+│   │   │   └── ...
+│   │   └── sandbox_runner/         # CodeLab 独立沙箱执行器
+│   ├── alembic/
+│   └── tests/
 ├── frontend/
 │   ├── src/
-│   │   ├── pages/            # 页面组件
-│   │   │   ├── knowledge/    # 知识库（含模型选择）
-│   │   │   ├── chat/         # AI 对话
-│   │   │   ├── literature/   # 文献管理
-│   │   │   ├── codelab/      # 代码实验室
-│   │   │   └── ...           # 管理/导师/学生/共享
-│   │   ├── stores/           # Zustand 状态管理
-│   │   ├── services/api.ts   # API 客户端
-│   │   └── App.tsx           # 路由配置
-│   └── Dockerfile
+│   │   ├── pages/
+│   │   │   ├── literature/
+│   │   │   ├── knowledge/
+│   │   │   ├── chat/
+│   │   │   ├── codelab/
+│   │   │   └── ...
+│   │   ├── components/
+│   │   ├── services/api.ts
+│   │   └── App.tsx
+├── docs/
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
 ```
 
-## 🔌 主要 API
+## 推荐先读的文档
 
-### 知识库
+- `docs/CONFIGURATION.md`
+- `docs/TESTING_GUIDE.md`
+- `docs/MULTI_ROLE_SYSTEM_DESIGN.md`
+- `docs/SANDBOX_ARCHITECTURE.md`
+- `docs/V2_DESIGN_DEPLOY_ACCEPTANCE.md`
+- `docs/skills/论文阅读器_单一事实来源与现状基线_2026-03-02_11-30.md`
 
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/knowledge/embedding-models` | 获取可用嵌入模型列表 |
-| POST | `/api/v1/knowledge/knowledge-bases` | 创建知识库（可选嵌入模型）|
-| POST | `/api/v1/knowledge/knowledge-bases/{id}/documents/upload` | 上传文档 |
-| POST | `/api/v1/knowledge/search` | 向量搜索（支持层级过滤）|
-| GET | `/api/v1/knowledge/available` | 获取可用知识库（含共享）|
+## 已知现实
 
-### AI 对话
+- Reader Workbench V2 仍在持续迭代，但已经是平台当前最强的产品面。
+- 如果没有 Document Mind 凭证，Reader 链路可以降级运行，但结构质量和证据定位会打折。
+- 本地 Embedding 首次启动会下载模型权重，冷启动较慢，后续依赖 `model_cache` volume 缓存。
+- CodeLab 默认依赖内部 `codelab-runner`，不要直接把 Runner 暴露到公网。
 
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| POST | `/api/v1/chat/send` | 流式 AI 对话 |
-| GET | `/api/v1/chat/conversations` | 获取对话列表 |
-
-### 文献管理
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/literature/search` | 搜索论文 |
-| POST | `/api/v1/literature/papers` | 保存论文 |
-| POST | `/api/v1/literature/papers/{id}/download-pdf` | 下载 PDF |
-
-### 智能分块配置
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| GET | `/api/v1/chunking/presets` | 获取分块预设列表 |
-| GET | `/api/v1/chunking/knowledge-bases/{id}/config` | 获取知识库分块配置 |
-| PUT | `/api/v1/chunking/knowledge-bases/{id}/config` | 更新分块配置 |
-
-## 🐛 故障排除
-
-### 本地嵌入模型加载慢
-
-首次启动需下载模型权重（~2GB），后续通过 Docker Volume `model_cache` 缓存：
-
-```bash
-# 查看模型缓存
-docker volume inspect research-assistant_model_cache
-
-# 查看后端日志确认加载状态
-docker logs -f research_backend
-```
-
-### 维度不匹配
-
-不同嵌入模型的向量维度不同，**已有知识库不支持切换模型**。如需切换，需要：
-1. 删除原知识库
-2. 使用新模型重新创建
-3. 重新上传文档
-
-### 容器状态检查
-
-```bash
-docker compose ps
-docker compose logs backend --tail 50
-docker compose logs frontend --tail 50
-```
-
-## 📝 License
+## License
 
 MIT License
-
----
-
-**最后更新**：2026-02-11

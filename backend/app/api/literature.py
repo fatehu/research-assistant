@@ -10,7 +10,7 @@ import uuid
 import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, delete, distinct, text
@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.core.database import async_session_factory, get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_for_stream
 from app.models.user import User
 from app.models.literature import (
     AskScope,
@@ -34,6 +34,7 @@ from app.models.literature import (
     PaperComment,
     PaperEntity,
     PaperKnowledgeLink,
+    PaperReaderPageCache,
     PaperRating,
     PaperReadSession,
     PaperSearchHistory,
@@ -61,6 +62,25 @@ from app.schemas.literature import (
     PaperCommentResponse,
     PaperCommentUpdate,
     PaperCreate,
+    ReaderGenerativePrefetchRequest,
+    ReaderGenerativePrefetchResponse,
+    ReaderGenerativeRequest,
+    ReaderComposePrefetchRequest,
+    ReaderComposePrefetchResponse,
+    ReaderComposeRequest,
+    ReaderComposeReviewAutoPatchRequest,
+    ReaderComposeReviewAutoPatchResponse,
+    ReaderComposeReviewDiagnostic,
+    ReaderComposeReviewImportRequest,
+    ReaderComposeReviewObservationRequest,
+    ReaderComposeReviewPatchRequest,
+    ReaderComposeReviewPublishRequest,
+    ReaderComposeReviewPublishResponse,
+    ReaderComposeReviewSessionRequest,
+    ReaderComposeReviewSnapshot,
+    ReaderInlineQueryRequest,
+    ReaderNodeActionRequest,
+    ReaderNodeActionResponse,
     PaperKnowledgeLinkResponse,
     PaperRatingSummary,
     PaperRatingUpdate,
@@ -77,9 +97,16 @@ from app.schemas.literature import (
 from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.contextual_compression_service import CompressionInput
 from app.services.literature_service import PaperResult, get_literature_service
+from app.services.literature_reader_compose_service import get_literature_reader_compose_service
+from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
+from app.services.render_pipeline_contract import RenderPipelineContractError
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
+from app.services.document_status_guard_service import (
+    build_timeout_error_message,
+    is_stale_processing_status,
+)
 from app.services.status_event_bus import (
     build_status_channel_for_user,
     iter_status_events,
@@ -92,6 +119,166 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     redis_async = None
 
 router = APIRouter(prefix="/literature", tags=["literature"])
+
+def _build_mojibake_variants(text: str) -> Set[str]:
+    raw = str(text or "").encode("utf-8")
+    replaced = raw.decode("gbk", errors="replace")
+    ignored = raw.decode("gbk", errors="ignore")
+    replacement_char = chr(0xFFFD)
+    variants = {
+        replaced,
+        ignored,
+        replaced.replace(replacement_char, "?"),
+    }
+    return {item for item in variants if item and item != text}
+
+
+_CANONICAL_COLLECTION_NAMES = ("所有论文", "待读", "已读", "收藏")
+_CANONICAL_COLLECTION_DESCRIPTIONS = (
+    "所有保存的论文",
+    "待阅读的论文",
+    "已阅读的论文",
+    "重要论文",
+)
+
+_MOJIBAKE_COLLECTION_NAME_MAP: Dict[str, str] = {}
+for _name in _CANONICAL_COLLECTION_NAMES:
+    for _token in _build_mojibake_variants(_name):
+        _MOJIBAKE_COLLECTION_NAME_MAP[_token] = _name
+
+_MOJIBAKE_COLLECTION_DESCRIPTION_MAP: Dict[str, str] = {}
+for _desc in _CANONICAL_COLLECTION_DESCRIPTIONS:
+    for _token in _build_mojibake_variants(_desc):
+        _MOJIBAKE_COLLECTION_DESCRIPTION_MAP[_token] = _desc
+
+_DEFAULT_COLLECTION_CANONICAL_NAMES = {"所有论文", "待读", "已读", "收藏"}
+
+
+def _normalize_collection_name(value: Optional[str]) -> str:
+    token = str(value or "").strip()
+    return _MOJIBAKE_COLLECTION_NAME_MAP.get(token, token)
+
+
+def _normalize_collection_description(value: Optional[str]) -> str:
+    token = str(value or "")
+    return _MOJIBAKE_COLLECTION_DESCRIPTION_MAP.get(token, token)
+
+
+async def _merge_collection_memberships(
+    db: AsyncSession,
+    source_collection_id: int,
+    target_collection_id: int,
+) -> None:
+    if int(source_collection_id) == int(target_collection_id):
+        return
+
+    source_rows = await db.execute(
+        select(paper_collection_association.c.paper_id).where(
+            paper_collection_association.c.collection_id == int(source_collection_id)
+        )
+    )
+    source_paper_ids = [int(row[0]) for row in source_rows.fetchall()]
+    for paper_id in source_paper_ids:
+        exists_result = await db.execute(
+            select(paper_collection_association.c.paper_id).where(
+                and_(
+                    paper_collection_association.c.paper_id == int(paper_id),
+                    paper_collection_association.c.collection_id == int(target_collection_id),
+                )
+            )
+        )
+        if exists_result.first() is None:
+            await db.execute(
+                paper_collection_association.insert().values(
+                    paper_id=int(paper_id),
+                    collection_id=int(target_collection_id),
+                )
+            )
+
+    await db.execute(
+        delete(paper_collection_association).where(
+            paper_collection_association.c.collection_id == int(source_collection_id)
+        )
+    )
+
+
+async def _repair_user_collection_mojibake(
+    db: AsyncSession,
+    user_id: int,
+) -> bool:
+    rows = await db.execute(
+        select(PaperCollection)
+        .where(PaperCollection.user_id == int(user_id))
+        .order_by(PaperCollection.id.asc())
+    )
+    user_collections = list(rows.scalars().all())
+    if not user_collections:
+        return False
+
+    changed = False
+    for coll in user_collections:
+        normalized_name = _normalize_collection_name(getattr(coll, "name", None))
+        if normalized_name and str(coll.name or "") != normalized_name:
+            coll.name = normalized_name
+            changed = True
+
+        normalized_description = _normalize_collection_description(
+            getattr(coll, "description", None)
+        )
+        if str(coll.description or "") != normalized_description:
+            coll.description = normalized_description
+            changed = True
+
+    grouped_by_name: Dict[str, List[PaperCollection]] = {}
+    for coll in user_collections:
+        grouped_by_name.setdefault(str(coll.name or ""), []).append(coll)
+
+    for canonical_name in _DEFAULT_COLLECTION_CANONICAL_NAMES:
+        same_name_collections = list(grouped_by_name.get(canonical_name) or [])
+        if len(same_name_collections) <= 1:
+            continue
+
+        if canonical_name == "所有论文":
+            same_name_collections.sort(
+                key=lambda item: (0 if bool(item.is_default) else 1, int(item.id))
+            )
+        else:
+            same_name_collections.sort(key=lambda item: int(item.id))
+
+        keep = same_name_collections[0]
+        if canonical_name == "所有论文" and not bool(keep.is_default):
+            keep.is_default = True
+            changed = True
+
+        for dup in same_name_collections[1:]:
+            await _merge_collection_memberships(
+                db=db,
+                source_collection_id=int(dup.id),
+                target_collection_id=int(keep.id),
+            )
+            await db.delete(dup)
+            changed = True
+
+    if not changed:
+        return False
+
+    await db.flush()
+
+    after_rows = await db.execute(
+        select(PaperCollection).where(PaperCollection.user_id == int(user_id))
+    )
+    after_collections = list(after_rows.scalars().all())
+    for coll in after_collections:
+        count_result = await db.execute(
+            select(func.count())
+            .select_from(paper_collection_association)
+            .where(paper_collection_association.c.collection_id == int(coll.id))
+        )
+        real_count = int(count_result.scalar() or 0)
+        if int(coll.paper_count or 0) != real_count:
+            coll.paper_count = real_count
+
+    return True
 
 
 def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
@@ -143,6 +330,57 @@ _pdf_page_count_cache: Dict[str, tuple[float, int]] = {}
 
 def _sse_payload(event: str, data: Any) -> str:
     return f"data: {json.dumps({'event': event, 'data': data}, ensure_ascii=False)}\n\n"
+
+
+def _parse_int_allowlist(raw: str) -> Set[int]:
+    values: Set[int] = set()
+    text = str(raw or "").strip()
+    if not text:
+        return values
+    for part in text.split(","):
+        token = str(part or "").strip()
+        if token.isdigit():
+            values.add(int(token))
+    return values
+
+
+def _reader_pipeline_mode() -> str:
+    explicit = str(getattr(settings, "reader_pipeline_mode", "legacy") or "").strip().lower()
+    raw_mode_env = str(os.getenv("READER_PIPELINE_MODE", "") or "").strip().lower()
+    valid_modes = {"legacy", "single_agent_v2"}
+
+    if raw_mode_env:
+        if explicit in valid_modes:
+            return explicit
+        logger.warning(
+            f"[Literature API] invalid READER_PIPELINE_MODE='{raw_mode_env}', fallback to compatibility switch."
+        )
+
+    if explicit == "single_agent_v2":
+        return "single_agent_v2"
+    if bool(getattr(settings, "reader_simplified_pipeline_enabled", False)):
+        logger.warning(
+            "[Literature API] reader_simplified_pipeline_enabled is deprecated; "
+            "use reader_pipeline_mode=single_agent_v2"
+        )
+        return "single_agent_v2"
+    return "legacy"
+
+
+def _is_single_agent_v2_active(*, paper_id: int, page: Optional[int] = None) -> bool:
+    if _reader_pipeline_mode() != "single_agent_v2":
+        return False
+    paper_allow = _parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_papers", "") or ""))
+    page_allow = _parse_int_allowlist(str(getattr(settings, "reader_pipeline_allowlist_pages", "") or ""))
+    if not paper_allow:
+        paper_allow = _parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_papers", "") or ""))
+    if not page_allow:
+        page_allow = _parse_int_allowlist(str(getattr(settings, "reader_simplified_allowlist_pages", "") or ""))
+    if paper_allow and int(paper_id) not in paper_allow:
+        return False
+    if page is not None and page_allow and int(page) not in page_allow:
+        return False
+    return True
 
 
 async def _publish_paper_link_status_event(link: PaperKnowledgeLink) -> None:
@@ -735,7 +973,7 @@ async def _retrieve_rag_sources(
                 )
             ).fetchall()
         except Exception as exc:
-            logger.warning(f"[Literature Ask] FTS检索失败，回退ILIKE: {exc}")
+            logger.warning(f"[Literature Ask] FTS 检索失败，回退 ILIKE: {exc}")
 
     if not rows:
         fallback_stmt = (
@@ -1093,7 +1331,6 @@ _PAPER_READ_SECTION_BACKOFF_TERMS_ZH: List[str] = [
     "结论",
 ]
 
-
 def _detect_text_language(text: str) -> str:
     value = str(text or "")
     zh_chars = len(re.findall(r"[\u4e00-\u9fff]", value))
@@ -1350,7 +1587,7 @@ class LiteratureAskAgentCore(AgentCore):
     SYSTEM_PROMPT = """你是论文阅读问答助手（Agent 模式）。
 
 你的目标是基于可验证证据给出高质量回答。
-你需要自行决定是否调用工具、调用哪个工具以及调用次数。
+你需要自行决定是否调用工具、调用哪一个工具以及调用次数。
 不要机械套用固定流程，应根据问题类型动态选择 strategy（例如 knowledge_search、paper_read、web_search/MCP 网页工具）。
 
 决策原则：
@@ -1358,7 +1595,7 @@ class LiteratureAskAgentCore(AgentCore):
 1.1 调用 paper_read 时，query 必须尽量复用用户问题原文，不要固定套用中文模板词。
 1.2 若 paper_read 首次命中较弱（例如 quality=low 或片段明显不相关），可将 query 做中英互换后重试一次。
 2. 需要知识库片段或跨文档证据时，可使用 knowledge_search。
-3. 本地证据不足且确有必要时，再使用网页/MCP 工具，并标注时效风险。
+3. 本地证据不足且确有必要时，再使用网页/MCP 工具，并标注时效性风险。
 4. 避免无意义重复调用，证据充分后直接作答。
 
 边界：
@@ -1372,7 +1609,7 @@ class LiteratureAskAgentCore(AgentCore):
     CITATION_POLICY_PROMPT = """## 引用规范（必须遵守）
 1. 基于检索证据回答时，关键结论后必须加 `[来源X]`。
 2. `X` 只能来自工具 observation 已出现过的来源编号。
-3. 若使用网页来源，需在结论中明确“网页来源”与时间性风险。
+3. 若使用网页来源，需在结论中明确“网页来源”与时效性风险。
 4. 不得输出未在证据中出现的来源编号。
 """.strip()
 
@@ -1397,18 +1634,20 @@ class LiteratureAskAgentCore(AgentCore):
     def _build_observation_message(tool_name: str, observation_output: str) -> str:
         if tool_name == "paper_read":
             followup = (
-                "请根据工具返回的信息继续。若检索诊断为 quality=low 或片段不相关，可将 query 做中英互换后再调用一次 paper_read。"
-                "若要给出最终回答，必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中出现过的来源编号。"
-                "如证据不足，请明确说明。请用<answer>标签给出最终回答。"
+                "请根据工具返回的信息继续。若检索诊断为 quality=low 或片段不相关，"
+                "可将 query 做中英互换后再调用一次 paper_read。"
+                "若要给出最终回答，必须在关键结论后保留对应的 [来源X] 标注，"
+                "且只能使用 observation 中已出现过的来源编号。"
+                "如证据不足，请明确说明。请用 <answer> 标签给出最终回答。"
             )
         elif tool_name == "knowledge_search":
             followup = (
                 "请根据工具返回的信息继续。若要给出最终回答，"
-                "必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中出现过的来源编号。"
-                "如证据不足，请明确说明。请用<answer>标签给出最终回答。"
+                "必须在关键结论后保留对应的 [来源X] 标注，且只能使用 observation 中已出现过的来源编号。"
+                "如证据不足，请明确说明。请用 <answer> 标签给出最终回答。"
             )
         else:
-            followup = "请根据工具返回的信息继续。如果已有足够信息，请用<answer>标签给出最终回答。"
+            followup = "请根据工具返回的信息继续。如果已有足够信息，请用 <answer> 标签给出最终回答。"
         return f"<observation>\n{observation_output}\n</observation>\n\n{followup}"
 
     @classmethod
@@ -1620,6 +1859,30 @@ def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Opt
     return KnowledgeLinkStatus.RUNNING.value, None, int(doc.id)
 
 
+def _mark_stale_document_timeout(doc: Optional[Document]) -> bool:
+    """将长时间未收尾的 processing 文档统一回写为 timeout。"""
+    if doc is None:
+        return False
+
+    stale_timeout_seconds = max(
+        int(getattr(settings, "document_processing_stale_timeout_seconds", 7200)),
+        60,
+    )
+    last_updated_at = getattr(doc, "updated_at", None) or getattr(doc, "created_at", None)
+    if not is_stale_processing_status(
+        status=getattr(doc, "status", None),
+        last_updated_at=last_updated_at,
+        timeout_seconds=stale_timeout_seconds,
+    ):
+        return False
+
+    previous_error = str(getattr(doc, "error_message", "") or "").strip()
+    timeout_error = build_timeout_error_message(stale_timeout_seconds)
+    doc.status = DocumentStatus.TIMEOUT.value
+    doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
+    return True
+
+
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
     """
     论文入库后台任务：
@@ -1693,7 +1956,7 @@ def _knowledge_not_ready_error(details: Dict[str, Any]) -> HTTPException:
 def _resolve_literature_agent_max_iterations() -> int:
     configured = _to_int(getattr(settings, "literature_agent_max_iterations", None))
     if configured is None or configured <= 0:
-        configured = _to_int(getattr(settings, "react_max_iterations", None)) or 8
+        configured = _to_int(getattr(settings, "react_max_iterations", None)) or 14
     return max(2, min(int(configured), 20))
 
 
@@ -1720,7 +1983,7 @@ def _to_comment_response(comment: PaperComment) -> PaperCommentResponse:
 @router.get("/search", response_model=PaperSearchResponse)
 async def search_papers(
     query: str = Query(..., min_length=1, description="搜索关键词"),
-    source: str = Query("semantic_scholar", description="数据源: semantic_scholar, arxiv, pubmed, openalex, crossref"),
+    source: str = Query("semantic_scholar", description="数据源：semantic_scholar, arxiv, pubmed, openalex, crossref"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     year_start: Optional[int] = Query(None, description="起始年份"),
@@ -1735,7 +1998,7 @@ async def search_papers(
     
     支持的数据源:
     - semantic_scholar: Semantic Scholar (综合学术搜索，有引用数据)
-    - arxiv: arXiv (预印本，计算机/物理/数学)
+    - arxiv: arXiv (预印本平台，含 cs/physics/math 等学科)
     - pubmed: PubMed (生物医学文献)
     - openalex: OpenAlex (开放学术图谱)
     - crossref: CrossRef (DOI 元数据)
@@ -1869,7 +2132,7 @@ async def get_search_history(
 
 @router.get("/papers", response_model=List[PaperResponse])
 async def get_papers(
-    collection_id: Optional[int] = Query(None, description="收藏夹 ID"),
+    collection_id: Optional[int] = Query(None, description="收藏夹ID"),
     is_read: Optional[bool] = Query(None, description="阅读状态"),
     tag: Optional[str] = Query(None, description="标签"),
     min_rating: Optional[int] = Query(None, ge=1, le=5, description="最低评分"),
@@ -1983,7 +2246,7 @@ async def save_paper(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """保存论文（从搜索结果）"""
+    """保存论文（从搜索结果）。"""
     logger.info(f"[Literature API] 保存论文: {request.title[:50]}...")
     
     # 检查是否已存在
@@ -2052,7 +2315,7 @@ async def save_paper(
             )
         )
         default_result = await db.execute(default_stmt)
-        # 使用 scalars().first() 来安全处理可能存在的多个默认收藏夹
+        # 使用 scalars().first() 安全处理可能存在的多个默认收藏夹
         default_collection = default_result.scalars().first()
         
         if default_collection:
@@ -2108,7 +2371,7 @@ async def update_paper(
     if is_becoming_read:
         update_data["read_at"] = datetime.utcnow()
     
-    # 处理评分变更（5星自动收藏）
+    # 处理评分变更（5 星自动收藏）
     was_favorited = paper.rating == 5 if paper.rating else False
     is_becoming_favorited = "rating" in update_data and update_data["rating"] == 5 and not was_favorited
     
@@ -2206,7 +2469,7 @@ async def update_paper(
                 )
                 unread_collection.paper_count += 1
     
-    # 5星评分自动添加到「收藏」
+    # 5 星评分自动添加到「收藏」
     if is_becoming_favorited and fav_collection:
         exists = await db.execute(
             select(paper_collection_association).where(
@@ -2279,6 +2542,10 @@ async def get_collections(
     current_user: User = Depends(get_current_user)
 ):
     """获取收藏夹列表"""
+    repaired = await _repair_user_collection_mojibake(db, int(current_user.id))
+    if repaired:
+        await db.commit()
+
     stmt = select(PaperCollection).where(
         PaperCollection.user_id == current_user.id
     ).order_by(PaperCollection.is_default.desc(), PaperCollection.created_at.asc())
@@ -2447,7 +2714,7 @@ async def update_collection(
         raise HTTPException(status_code=404, detail="收藏夹不存在")
     
     if collection.is_default:
-        raise HTTPException(status_code=400, detail="默认收藏夹不可修改")
+        raise HTTPException(status_code=400, detail="默认收藏夹不允许修改")
     
     update_data = update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -2722,6 +2989,147 @@ async def stream_paper_pdf(
         path=pdf_path,
         media_type="application/pdf",
         filename=os.path.basename(pdf_path),
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/reader/figure-assets/{paper_id}/{page}/{asset_id}")
+async def stream_reader_figure_asset(
+    paper_id: int,
+    page: int,
+    asset_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """按需返回已缓存的 figure 图片资产（文件 URL，不使用 base64）。"""
+    # TODO(security): 当前路由为前端 <img src> 兼容而临时放开鉴权。
+    # 后续需收敛为：1) 短时效签名 URL（推荐）或 2) 前端 fetch(Bearer)+blob 渲染。
+    # 目的：避免“知道 URL 即可读取资源”的风险。
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    normalized_asset_id = str(asset_id or "").strip()
+    if not normalized_asset_id or not re.fullmatch(r"[0-9A-Za-z_.-]{1,96}", normalized_asset_id):
+        raise HTTPException(status_code=400, detail="asset_id 非法")
+
+    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+    base_dir = os.path.abspath(
+        os.path.join(upload_dir, "reader_figure_assets", str(int(paper.id)), f"p{int(page)}")
+    )
+
+    def _locate_candidate_file() -> tuple[Optional[str], str]:
+        if not os.path.isdir(base_dir):
+            return None, ""
+        for ext in ("jpg", "jpeg", "png", "webp"):
+            path = os.path.abspath(os.path.join(base_dir, f"{normalized_asset_id}.{ext}"))
+            if not path.startswith(base_dir + os.sep):
+                continue
+            if os.path.exists(path):
+                return path, ext
+        return None, ""
+
+    candidate_path, candidate_ext = _locate_candidate_file()
+
+    # 兼容旧缓存：如果文件尚未生成，尝试基于该页已缓存 payload + 本地 PDF 现场补抽 figure 资产。
+    if not candidate_path:
+        try:
+            cache_stmt = (
+                select(PaperReaderPageCache)
+                .where(
+                    and_(
+                        PaperReaderPageCache.paper_id == int(paper.id),
+                        PaperReaderPageCache.page == int(page),
+                        PaperReaderPageCache.source_signature.like("compose_v3|%"),
+                    )
+                )
+                .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
+                .limit(1)
+            )
+            cache_row = (await db.execute(cache_stmt)).scalar_one_or_none()
+            payload_json = dict(getattr(cache_row, "payload_json", None) or {}) if cache_row else {}
+            layouts = [
+                row
+                for row in list((payload_json.get("docmind_structure") or {}).get("layouts") or [])
+                if isinstance(row, dict) and str(row.get("type") or "").strip().lower() == "figure"
+            ]
+            pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
+            if layouts and pdf_path and os.path.exists(pdf_path):
+                compose_service = get_literature_reader_compose_service()
+                await asyncio.to_thread(
+                    compose_service._build_figure_assets_sync,  # pylint: disable=protected-access
+                    int(paper.id),
+                    int(page),
+                    str(pdf_path),
+                    payload_json,
+                    layouts,
+                )
+                candidate_path, candidate_ext = _locate_candidate_file()
+        except Exception as exc:
+            logger.warning(
+                "[Literature API] figure asset lazy-build failed "
+                f"paper={paper_id} page={page} asset_id={normalized_asset_id}: {exc}"
+            )
+
+    if not candidate_path:
+        raise HTTPException(status_code=404, detail="图片资源不存在")
+
+    media_type = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(candidate_ext, "application/octet-stream")
+
+    return FileResponse(path=candidate_path, media_type=media_type, filename=os.path.basename(candidate_path))
+
+
+@router.get("/reader/page-assets/{paper_id}/{page}")
+async def stream_reader_page_asset(
+    paper_id: int,
+    page: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """按需返回已缓存的整页 PDF render 资产（文件 URL，不使用 base64）。"""
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    compose_service = get_literature_reader_compose_service()
+    candidate_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+        paper_id=int(paper.id),
+        page=int(page),
+    )
+    if not candidate_path:
+        pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                candidate_url = await compose_service.ensure_page_render_asset(
+                    paper_id=int(paper.id),
+                    page=int(page),
+                    pdf_path=str(pdf_path),
+                )
+                if candidate_url:
+                    candidate_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+                        paper_id=int(paper.id),
+                        page=int(page),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Literature API] page render asset lazy-build failed "
+                    f"paper={paper_id} page={page}: {exc}"
+                )
+
+    if not candidate_path or not os.path.exists(candidate_path):
+        raise HTTPException(status_code=404, detail="页面渲染资源不存在")
+
+    return FileResponse(
+        path=candidate_path,
+        media_type="image/jpeg",
+        filename=os.path.basename(candidate_path),
     )
 
 
@@ -2739,6 +3147,78 @@ async def process_document_background(doc_id: int, kb_id: int, file_path: str):
         chunk_overlap = int(kb.chunk_overlap or 50)
 
     await process_document_task(doc_id, chunk_size, chunk_overlap)
+
+
+def _chunk_reader_blocks(blocks: Sequence[Dict[str, Any]], size: int = 5) -> List[List[Dict[str, Any]]]:
+    batch_size = max(1, int(size))
+    values = list(blocks or [])
+    return [values[i: i + batch_size] for i in range(0, len(values), batch_size)]
+
+
+async def _prefetch_reader_pages_background(
+    *,
+    user_id: int,
+    paper_id: int,
+    pages: Sequence[int],
+    selected_kb_id: Optional[int],
+    style_hint: Optional[str],
+) -> None:
+    if not pages:
+        return
+    service = get_literature_reader_service()
+    async with async_session_factory() as db:
+        stmt = select(Paper).where(and_(Paper.id == int(paper_id), Paper.user_id == int(user_id)))
+        paper = (await db.execute(stmt)).scalar_one_or_none()
+        if paper is None:
+            return
+        await service.prefetch_pages(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            pages=pages,
+            selected_kb_id=selected_kb_id,
+            style_hint=style_hint,
+        )
+
+
+async def _prefetch_reader_composed_pages_background(
+    *,
+    user_id: int,
+    paper_id: int,
+    pages: Sequence[int],
+    selected_kb_id: Optional[int],
+    style_intent: Optional[str],
+    latency_budget_ms: Optional[int],
+    quality_target: Optional[float],
+    max_iterations: Optional[int],
+    theme_mode: Optional[str],
+    detail_level: Optional[str],
+    compare_mode: Optional[bool],
+    citation_tldr: Optional[bool],
+) -> None:
+    if not pages:
+        return
+    service = get_literature_reader_compose_service()
+    async with async_session_factory() as db:
+        stmt = select(Paper).where(and_(Paper.id == int(paper_id), Paper.user_id == int(user_id)))
+        paper = (await db.execute(stmt)).scalar_one_or_none()
+        if paper is None:
+            return
+        await service.prefetch_pages(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            pages=pages,
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            latency_budget_ms=latency_budget_ms,
+            quality_target=quality_target,
+            max_iterations=max_iterations,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+        )
 
 
 # ============ 阅读会话 ============
@@ -2822,7 +3302,893 @@ async def update_reader_session(
     )
 
 
+@router.post("/papers/{paper_id}/reader/generative/stream")
+async def stream_reader_generative_page(
+    paper_id: int,
+    payload: ReaderGenerativeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_service()
+    page_num = max(1, int(payload.page))
+
+    async def event_generator():
+        try:
+            page_payload, meta = await service.build_or_get_page_payload(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=page_num,
+                selected_kb_id=payload.selected_kb_id,
+                force_refresh=bool(payload.force_refresh),
+                prefer_agent=bool(getattr(payload, "prefer_agent", False)),
+                style_hint=payload.style_hint,
+                publish_ready_event_enabled=False,
+            )
+            if await request.is_disconnected():
+                return
+
+            yield _sse_payload(
+                "start",
+                {
+                    "cache_hit": bool(meta.cache_hit),
+                    "cache_layer": meta.cache_layer,
+                    "build_mode": str(meta.build_mode),
+                    "page": int(page_num),
+                    "parser_version": meta.parser_version,
+                },
+            )
+            yield _sse_payload(
+                "skeleton",
+                {
+                    "sections": list(page_payload.get("sections") or []),
+                    "summary": str(page_payload.get("summary") or ""),
+                    "style_recommendation": str(page_payload.get("style_key") or "journal_classic"),
+                    "style_tuning": dict(page_payload.get("style_tuning") or {}),
+                    "structure_confidence": float(page_payload.get("structure_confidence") or 0.0),
+                },
+            )
+
+            for block_chunk in _chunk_reader_blocks(page_payload.get("blocks") or [], size=6):
+                if await request.is_disconnected():
+                    return
+                yield _sse_payload("chunk", {"blocks": block_chunk})
+
+            yield _sse_payload("assets", {"assets": list(page_payload.get("assets") or [])})
+            yield _sse_payload(
+                "done",
+                {
+                    "payload": page_payload,
+                    "cache_meta": {
+                        "cache_hit": bool(meta.cache_hit),
+                        "cache_layer": meta.cache_layer,
+                        "build_mode": str(meta.build_mode),
+                        "source_signature": meta.source_signature,
+                        "source_sig_hash": meta.source_sig_hash,
+                    },
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"[Literature API] generative stream failed paper={paper_id}, page={page_num}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/generative/prefetch",
+    response_model=ReaderGenerativePrefetchResponse,
+)
+async def prefetch_reader_generative_pages(
+    paper_id: int,
+    payload: ReaderGenerativePrefetchRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_service()
+    pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=409, detail="本地 PDF 不存在，请先下载后再执行预读。")
+    max_page = await _get_pdf_page_count(pdf_path)
+    queued, skipped = service.queue_prefetch(
+        pages=list(payload.pages or []),
+        max_page=max_page,
+    )
+
+    if queued:
+        background_tasks.add_task(
+            _prefetch_reader_pages_background,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            pages=queued,
+            selected_kb_id=payload.selected_kb_id,
+            style_hint=payload.style_hint,
+        )
+
+    return ReaderGenerativePrefetchResponse(queued=queued, skipped=skipped)
+
+
 # ============ 批注 ============
+
+
+# ============ Reader Composed ============
+
+@router.post("/papers/{paper_id}/reader/composed/stream")
+async def stream_reader_composed_page(
+    paper_id: int,
+    payload: ReaderComposeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    page_num = max(1, int(payload.page))
+
+    async def event_generator():
+        try:
+            logger.info(
+                "[Literature API] composed stream start "
+                f"paper={paper_id} page={page_num} force_refresh={bool(payload.force_refresh)} "
+                f"regenerate={bool(payload.regenerate)}"
+            )
+            yield _sse_payload(
+                "start",
+                {
+                    "cache_hit": False,
+                    "cache_layer": "none",
+                    "build_mode": "compose_pending",
+                    "page": int(page_num),
+                    "engine_version": "",
+                    "budget": {
+                        "latency_budget_ms": int(
+                            payload.latency_budget_ms
+                            or int(getattr(settings, "reader_compose_latency_budget_ms", 20000) or 20000)
+                        ),
+                        "quality_target": float(payload.quality_target or 0.86),
+                    },
+                },
+            )
+            composed_payload, meta = await service.build_or_get_composed_payload(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=page_num,
+                selected_kb_id=payload.selected_kb_id,
+                force_refresh=bool(payload.force_refresh),
+                regenerate=bool(payload.regenerate),
+                latency_budget_ms=payload.latency_budget_ms,
+                quality_target=payload.quality_target,
+                max_iterations=getattr(payload, "max_iterations", None),
+                style_intent=payload.style_intent,
+                theme_mode=getattr(payload, "theme_mode", None),
+                detail_level=getattr(payload, "detail_level", None),
+                compare_mode=getattr(payload, "compare_mode", None),
+                citation_tldr=getattr(payload, "citation_tldr", None),
+                publish_ready_event_enabled=False,
+            )
+            logger.info(
+                "[Literature API] composed stream built "
+                f"paper={paper_id} page={page_num} cache_hit={bool(meta.cache_hit)} cache_layer={meta.cache_layer} "
+                f"build_mode={meta.build_mode} iterations={int(meta.iterations or 0)} degraded={bool(meta.degraded)} "
+                f"stop_reason={str(meta.stop_reason or '')} status={str(composed_payload.get('status') or '')} "
+                f"degraded_reason={str(composed_payload.get('degraded_reason') or '')}"
+            )
+            if await request.is_disconnected():
+                logger.warning(
+                    f"[Literature API] composed stream client disconnected before emit done "
+                    f"paper={paper_id} page={page_num}"
+                )
+                return
+
+            trace_rows = list(composed_payload.get("iteration_trace") or [])
+            if trace_rows:
+                first = trace_rows[0]
+                yield _sse_payload(
+                    "plan_draft",
+                    {
+                        "iteration": int(first.get("iteration") or 1),
+                        "ui_plan": first.get("ui_plan") or composed_payload.get("ui_plan") or {},
+                        "phase": "skeleton",
+                        "layout_lock": True,
+                    },
+                )
+                first_ops = [row for row in list(first.get("ui_ops") or []) if isinstance(row, dict)]
+                if first_ops:
+                    yield _sse_payload(
+                        "component_patch",
+                        {
+                            "iteration": int(first.get("iteration") or 1),
+                            "seq": 1,
+                            "ui_ops": first_ops,
+                            "source": "agent",
+                        },
+                    )
+                first_agent_trace = [row for row in list(first.get("agent_trace") or []) if isinstance(row, dict)]
+                if first_agent_trace:
+                    yield _sse_payload(
+                        "agent_trace",
+                        {
+                            "iteration": int(first.get("iteration") or 1),
+                            "trace": first_agent_trace,
+                            "tool_calls": [row for row in list(first.get("agent_tool_calls") or []) if isinstance(row, dict)],
+                        },
+                    )
+                for row in trace_rows[1:]:
+                    if await request.is_disconnected():
+                        return
+                    yield _sse_payload(
+                        "plan_patch",
+                        {
+                            "iteration": int(row.get("iteration") or 0),
+                            "ui_plan": row.get("ui_plan") or {},
+                            "phase": "semantic",
+                            "patch_type": "node_replace",
+                        },
+                    )
+                    row_ops = [item for item in list(row.get("ui_ops") or []) if isinstance(item, dict)]
+                    if row_ops:
+                        yield _sse_payload(
+                            "component_patch",
+                            {
+                                "iteration": int(row.get("iteration") or 0),
+                                "seq": int(row.get("iteration") or 0),
+                                "ui_ops": row_ops,
+                                "source": "agent",
+                            },
+                        )
+                    row_agent_trace = [item for item in list(row.get("agent_trace") or []) if isinstance(item, dict)]
+                    if row_agent_trace:
+                        yield _sse_payload(
+                            "agent_trace",
+                            {
+                                "iteration": int(row.get("iteration") or 0),
+                                "trace": row_agent_trace,
+                                "tool_calls": [item for item in list(row.get("agent_tool_calls") or []) if isinstance(item, dict)],
+                            },
+                        )
+                    yield _sse_payload(
+                        "quality",
+                        {
+                            "iteration": int(row.get("iteration") or 0),
+                            "quality_report": row.get("quality_report") or {},
+                            "mm_assist_used": bool((row.get("quality_report") or {}).get("mm_assist_used")),
+                            "mm_fallback_used": bool((row.get("quality_report") or {}).get("mm_fallback_used")),
+                            "cross_column_merge_ratio": float((row.get("quality_report") or {}).get("cross_column_merge_ratio") or 0.0),
+                            "sidebar_recall": float((row.get("quality_report") or {}).get("sidebar_recall") or 0.0),
+                        },
+                    )
+            else:
+                yield _sse_payload(
+                    "plan_draft",
+                    {
+                        "iteration": 1,
+                        "ui_plan": composed_payload.get("ui_plan") or {},
+                        "phase": "skeleton",
+                        "layout_lock": True,
+                    },
+                )
+                final_ops = [
+                    row
+                    for row in list(((composed_payload.get("ui_plan") or {}).get("ui_ops") or []))
+                    if isinstance(row, dict)
+                ]
+                if final_ops:
+                    yield _sse_payload(
+                        "component_patch",
+                        {
+                            "iteration": 1,
+                            "seq": 1,
+                            "ui_ops": final_ops,
+                            "source": "agent",
+                        },
+                    )
+
+            yield _sse_payload("assets", {"assets": list(composed_payload.get("assets") or [])})
+            yield _sse_payload(
+                "quality",
+                {
+                    "iteration": int(meta.iterations or 0),
+                    "quality_report": composed_payload.get("quality_report") or {},
+                    "mm_assist_used": bool((composed_payload.get("quality_report") or {}).get("mm_assist_used")),
+                    "mm_fallback_used": bool((composed_payload.get("quality_report") or {}).get("mm_fallback_used")),
+                    "cross_column_merge_ratio": float((composed_payload.get("quality_report") or {}).get("cross_column_merge_ratio") or 0.0),
+                    "sidebar_recall": float((composed_payload.get("quality_report") or {}).get("sidebar_recall") or 0.0),
+                },
+            )
+            trace_meta = dict(((composed_payload.get("ui_plan") or {}).get("trace_meta") or {}))
+            assembly_errors = [
+                str(item).strip()
+                for item in list(trace_meta.get("assembly_validation_errors") or [])
+                if str(item).strip()
+            ] + [
+                str(item).strip()
+                for item in list(trace_meta.get("assembly_apply_errors") or [])
+                if str(item).strip()
+            ]
+            if assembly_errors:
+                yield _sse_payload(
+                    "component_error",
+                    {
+                        "message": "component_patch_validation_failed",
+                        "errors": assembly_errors[:20],
+                    },
+                )
+            yield _sse_payload(
+                "done",
+                {
+                    "status": str(composed_payload.get("status") or "done"),
+                    "degraded_reason": str(composed_payload.get("degraded_reason") or ""),
+                    "payload": composed_payload,
+                    "cache_meta": {
+                        "cache_hit": bool(meta.cache_hit),
+                        "cache_layer": meta.cache_layer,
+                        "build_mode": str(meta.build_mode),
+                        "source_signature": meta.source_signature,
+                        "source_sig_hash": meta.source_sig_hash,
+                    },
+                    "iteration_stats": {
+                        "iterations": int(meta.iterations or 0),
+                        "degraded": bool(meta.degraded),
+                        "stop_reason": str(meta.stop_reason or ""),
+                    },
+                    "overlay_meta": {
+                        "overlay_applied": bool(composed_payload.get("overlay_applied")),
+                        "overlay_count": int(composed_payload.get("overlay_count") or 0),
+                    },
+                    "qwen_plan_meta": dict(composed_payload.get("qwen_plan_meta") or {}),
+                    "parser_chain_meta": dict(composed_payload.get("parser_chain_meta") or {}),
+                    "docmind_meta": dict(composed_payload.get("docmind_meta") or {}),
+                    "page_structure_source": str((composed_payload.get("page_structure_v3") or {}).get("source") or ""),
+                    "pipeline_contract_meta": dict(composed_payload.get("pipeline_contract_meta") or {}),
+                    "stage1_structural_annotations": dict(composed_payload.get("stage1_structural_annotations") or {}),
+                    "stage2_design_layout": dict(composed_payload.get("stage2_design_layout") or {}),
+                    "canonical_atoms": dict(composed_payload.get("canonical_atoms") or {}),
+                    "atom_semantics": dict(composed_payload.get("atom_semantics") or {}),
+                    "deterministic_page_skeleton": dict(composed_payload.get("deterministic_page_skeleton") or {}),
+                    "stage2_style_plan": dict(composed_payload.get("stage2_style_plan") or {}),
+                    "minimal_gate_report": dict(composed_payload.get("minimal_gate_report") or {}),
+                    "candidate_ranking": dict(composed_payload.get("candidate_ranking") or {}),
+                    "repair_report": dict(composed_payload.get("repair_report") or {}),
+                    "segment_id_map": dict(composed_payload.get("segment_id_map") or {}),
+                    "layout_advice_meta": dict(composed_payload.get("layout_advice_meta") or {}),
+                    "segment_stats": {
+                        "used": bool((composed_payload.get("segment_map_meta") or {}).get("used")),
+                        "reason": str((composed_payload.get("segment_map_meta") or {}).get("reason") or ""),
+                        "source": str((composed_payload.get("segment_map") or {}).get("source") or ""),
+                        "segment_count": len(list((composed_payload.get("segment_map") or {}).get("segments") or [])),
+                    },
+                    "validation_report": dict(composed_payload.get("validation_report") or {}),
+                    "node_gate_stats": dict(composed_payload.get("node_gate_report") or {}),
+                },
+            )
+            logger.info(
+                f"[Literature API] composed stream done emitted paper={paper_id} page={page_num}"
+            )
+        except RenderPipelineContractError as exc:
+            logger.warning(
+                f"[Literature API] composed stream contract failed paper={paper_id}, page={page_num}: "
+                f"stage={exc.stage} code={exc.code} message={exc.message}"
+            )
+            error_payload = exc.to_dict()
+            yield _sse_payload(
+                "component_error",
+                {
+                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                    "stage": str(error_payload.get("stage") or ""),
+                    "code": str(error_payload.get("code") or ""),
+                    "details": dict(error_payload.get("details") or {}),
+                    "errors": [str(error_payload.get("code") or "")],
+                },
+            )
+            yield _sse_payload(
+                "error",
+                {
+                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                    "stage": str(error_payload.get("stage") or ""),
+                    "code": str(error_payload.get("code") or ""),
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def create_reader_composed_review_session(
+    paper_id: int,
+    payload: ReaderComposeReviewSessionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.create_review_session(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            page=max(1, int(payload.page)),
+            selected_kb_id=payload.selected_kb_id,
+            force_refresh=bool(payload.force_refresh),
+            regenerate=bool(payload.regenerate),
+            latency_budget_ms=payload.latency_budget_ms,
+            quality_target=payload.quality_target,
+            max_iterations=payload.max_iterations,
+            style_intent=payload.style_intent,
+            theme_mode=payload.theme_mode,
+            detail_level=payload.detail_level,
+            compare_mode=payload.compare_mode,
+            citation_tldr=payload.citation_tldr,
+            snapshot_label=payload.snapshot_label,
+            prefer_cache_clone=bool(payload.prefer_cache_clone),
+            allow_recompute_on_cache_miss=bool(payload.allow_recompute_on_cache_miss),
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_cache_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/import",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def import_reader_composed_review_session(
+    paper_id: int,
+    payload: ReaderComposeReviewImportRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.create_review_session_from_payload(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            payload=payload.payload.model_dump(),
+            snapshot_label=payload.snapshot_label,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_payload_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    return snapshot
+
+
+@router.get(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def get_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    snapshot_id: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    snapshot = await service.get_review_snapshot(
+        session_id=str(session_id),
+        snapshot_id=snapshot_id,
+    )
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+def _parse_review_observation_diagnostics_json(raw: Optional[str]) -> List[Dict[str, Any]]:
+    token = str(raw or "").strip()
+    if not token:
+        return []
+    try:
+        parsed = json.loads(token)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="diagnostics_json 不是合法 JSON") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=422, detail="diagnostics_json 必须是数组")
+    normalized: List[Dict[str, Any]] = []
+    for row in parsed:
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=422, detail="diagnostics_json 只能包含对象")
+        normalized.append(ReaderComposeReviewDiagnostic.model_validate(row).model_dump())
+    return normalized
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/patch",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def patch_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewPatchRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.apply_review_patch(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            ui_ops=[row for row in list(payload.ui_ops or []) if isinstance(row, dict)],
+            decision_log_append=[str(item).strip() for item in list(payload.decision_log_append or []) if str(item).strip()],
+            omission_decisions=[row.model_dump() for row in list(payload.omission_decisions or [])] if payload.omission_decisions is not None else None,
+            scheme_choice=payload.scheme_choice.model_dump() if payload.scheme_choice is not None else None,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def observe_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewObservationRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.record_review_observation(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            render_image_url=payload.render_image_url,
+            render_image_path=None,
+            render_image_media_type=None,
+            diagnostics=[row.model_dump() for row in list(payload.diagnostics or [])],
+            note=payload.note,
+            source=payload.source,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation-image",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def upload_reader_composed_review_observation_image(
+    paper_id: int,
+    session_id: str,
+    image: UploadFile = File(...),
+    snapshot_id: Optional[str] = Form(default=None),
+    diagnostics_json: Optional[str] = Form(default=None),
+    note: Optional[str] = Form(default=None),
+    source: Optional[str] = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        image_bytes = await image.read()
+        stored = await service.store_review_observation_image(
+            session_id=str(session_id),
+            snapshot_id=snapshot_id,
+            filename=image.filename,
+            content_type=image.content_type,
+            data=image_bytes,
+        )
+        snapshot = await service.record_review_observation(
+            session_id=str(session_id),
+            snapshot_id=str(stored.get("snapshot_id") or snapshot_id or ""),
+            render_image_url=str(stored.get("render_image_url") or ""),
+            render_image_path=str(stored.get("file_path") or ""),
+            render_image_media_type=str(stored.get("media_type") or ""),
+            diagnostics=_parse_review_observation_diagnostics_json(diagnostics_json),
+            note=note,
+            source=source or "uploaded_render_image",
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    finally:
+        await image.close()
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return snapshot
+
+
+@router.get(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/observation-image/{snapshot_id}",
+)
+async def stream_reader_composed_review_observation_image(
+    paper_id: int,
+    session_id: str,
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    # TODO(security): 当前路由为前端 <img src> 与多模态 URL 兼容而临时放开鉴权。
+    # 后续应切换为短时效签名 URL 或前端 fetch(Bearer)+blob 渲染。
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    service = get_literature_reader_compose_service()
+    resolved = await service.resolve_review_observation_image(
+        session_id=str(session_id),
+        snapshot_id=str(snapshot_id),
+    )
+    if not isinstance(resolved, dict):
+        raise HTTPException(status_code=404, detail="review observation image not found")
+    if int(resolved.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review observation image not found")
+    return FileResponse(
+        path=str(resolved.get("file_path") or ""),
+        media_type=str(resolved.get("media_type") or "application/octet-stream"),
+        filename=os.path.basename(str(resolved.get("file_path") or "")),
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/auto-patch",
+    response_model=ReaderComposeReviewAutoPatchResponse,
+)
+async def auto_patch_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewAutoPatchRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.auto_patch_review_snapshot(
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            user_id=int(current_user.id),
+            user_intent=payload.user_intent,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    snapshot = dict(result.get("snapshot") or {})
+    if int(snapshot.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return result
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/{session_id}/publish",
+    response_model=ReaderComposeReviewPublishResponse,
+)
+async def publish_reader_composed_review_snapshot(
+    paper_id: int,
+    session_id: str,
+    payload: ReaderComposeReviewPublishRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.publish_review_snapshot(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            session_id=str(session_id),
+            snapshot_id=payload.snapshot_id,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_session_not_found", "review_snapshot_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    if int(result.get("paper_id") or 0) != int(paper.id):
+        raise HTTPException(status_code=404, detail="review session snapshot not found")
+    return result
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/prefetch",
+    response_model=ReaderComposePrefetchResponse,
+)
+async def prefetch_reader_composed_pages(
+    paper_id: int,
+    payload: ReaderComposePrefetchRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    pdf_path = _resolve_local_pdf_path(user_id=int(current_user.id), paper=paper)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=409, detail="本地 PDF 不存在，请先下载后再执行预读。")
+    max_page = await _get_pdf_page_count(pdf_path)
+    queued, skipped = service.queue_prefetch(
+        pages=list(payload.pages or []),
+        max_page=max_page,
+    )
+
+    if queued:
+        background_tasks.add_task(
+            _prefetch_reader_composed_pages_background,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            pages=queued,
+            selected_kb_id=payload.selected_kb_id,
+            style_intent=payload.style_intent,
+            latency_budget_ms=payload.latency_budget_ms,
+            quality_target=payload.quality_target,
+            max_iterations=getattr(payload, "max_iterations", None),
+            theme_mode=getattr(payload, "theme_mode", None),
+            detail_level=getattr(payload, "detail_level", None),
+            compare_mode=getattr(payload, "compare_mode", None),
+            citation_tldr=getattr(payload, "citation_tldr", None),
+        )
+
+    return ReaderComposePrefetchResponse(queued=queued, skipped=skipped)
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/node/action",
+    response_model=ReaderNodeActionResponse,
+)
+async def action_reader_composed_node(
+    paper_id: int,
+    payload: ReaderNodeActionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if _is_single_agent_v2_active(paper_id=int(paper_id), page=int(payload.page)):
+        return ReaderNodeActionResponse(
+            patch_type="node_update",
+            node_before=None,
+            node_after=None,
+            quality_delta=0.0,
+            overlay_saved=False,
+            message="Node actions are disabled in single_agent_v2 mode.",
+            disabled=True,
+            disabled_reason="single_agent_v2_node_action_disabled",
+        )
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        result = await service.perform_node_action(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            page=int(payload.page),
+            node_id=str(payload.node_id),
+            action=str(payload.action),
+            reason=payload.reason,
+            selected_kb_id=payload.selected_kb_id,
+            style_intent=payload.style_intent,
+            theme_mode=getattr(payload, "theme_mode", None),
+            detail_level=getattr(payload, "detail_level", None),
+            compare_mode=getattr(payload, "compare_mode", None),
+            citation_tldr=getattr(payload, "citation_tldr", None),
+        )
+        return ReaderNodeActionResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/papers/{paper_id}/reader/composed/inline-query/stream")
+async def stream_reader_composed_inline_query(
+    paper_id: int,
+    payload: ReaderInlineQueryRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+
+    async def event_generator():
+        try:
+            result = await service.build_inline_answer_card(
+                db=db,
+                user_id=int(current_user.id),
+                paper=paper,
+                page=int(payload.page),
+                node_id=str(payload.node_id),
+                question=str(payload.question),
+                scope=str(payload.scope),
+                selected_kb_id=payload.selected_kb_id,
+                style_intent=payload.style_intent,
+                theme_mode=getattr(payload, "theme_mode", None),
+                detail_level=getattr(payload, "detail_level", None),
+                compare_mode=getattr(payload, "compare_mode", None),
+                citation_tldr=getattr(payload, "citation_tldr", None),
+            )
+            if await request.is_disconnected():
+                return
+            if bool(result.get("disabled")):
+                yield _sse_payload(
+                    "disabled",
+                    {
+                        "disabled": True,
+                        "disabled_reason": str(result.get("disabled_reason") or "inline_query_contract_failed"),
+                        "message": str(result.get("message") or "当前段落追问不可用，请改用右侧“询问”进行全文问答。"),
+                    },
+                )
+                yield _sse_payload(
+                    "done",
+                    {
+                        "disabled": True,
+                        "disabled_reason": str(result.get("disabled_reason") or "inline_query_contract_failed"),
+                        "sources": [],
+                    },
+                )
+                return
+            node = dict(result.get("node") or {})
+            sources = list(result.get("sources") or [])
+            answer_text = str((node.get("props") or {}).get("answer") or "")
+
+            yield _sse_payload("start", {"page": int(payload.page), "node_id": str(payload.node_id)})
+            for idx in range(0, len(answer_text), 42):
+                if await request.is_disconnected():
+                    return
+                token = answer_text[idx : idx + 42]
+                if token:
+                    yield _sse_payload("token", {"text": token})
+            yield _sse_payload("sources", sources)
+            yield _sse_payload("done", {"node": node, "sources": sources})
+        except Exception as exc:
+            logger.exception(f"[Literature API] composed inline query failed paper={paper_id}: {exc}")
+            yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @router.get("/papers/{paper_id}/annotations", response_model=List[PaperAnnotationResponse])
 async def list_annotations(
@@ -3302,6 +4668,8 @@ async def list_paper_knowledge_links(
         doc = await db.get(Document, int(link.document_id))
         if not doc:
             continue
+        if _mark_stale_document_timeout(doc):
+            need_commit = True
         next_status, next_error, _ = _derive_link_status_from_document(doc)
         if link.status != next_status or (link.error_message or None) != (next_error or None):
             link.status = next_status
@@ -3322,12 +4690,12 @@ async def list_paper_knowledge_links(
 async def stream_literature_status_events(
     request: Request,
     paper_id: Optional[int] = Query(default=None, ge=1, description="可选：仅订阅指定论文"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_for_stream),
 ):
     """文献模块状态事件流（SSE）。"""
     if paper_id is not None:
-        await _get_owned_paper_or_404(db, current_user, int(paper_id))
+        async with async_session_factory() as db:
+            await _get_owned_paper_or_404(db, current_user, int(paper_id))
 
     channel = build_status_channel_for_user(int(current_user.id))
 
@@ -3352,14 +4720,14 @@ async def stream_literature_status_events(
                 yield _sse_payload("heartbeat", data)
                 continue
 
-            if event != "paper_link_status" or not isinstance(data, dict):
+            if event not in {"paper_link_status", "reader_page_ready"} or not isinstance(data, dict):
                 continue
 
             event_paper_id = int(data.get("paper_id") or 0)
             if paper_id is not None and event_paper_id != int(paper_id):
                 continue
 
-            yield _sse_payload("paper_link_status", data)
+            yield _sse_payload(event, data)
 
     return StreamingResponse(
         event_generator(),
@@ -3895,8 +5263,8 @@ async def literature_ask(
     joined_context = "\n\n".join(context_blocks)
     enriched_user_content = (
         f"问题：{payload.question.strip()}\n\n"
-        f"请仅基于以下检索片段回答。\n"
-        f"若证据不足，请明确说明“无法从当前资料确定”。\n\n"
+        "请仅基于以下检索片段回答。\n"
+        "若证据不足，请明确说明“无法从当前资料确定”。\n\n"
         f"检索片段：\n{joined_context}"
     )
     messages.append({"role": "user", "content": enriched_user_content})
@@ -3904,7 +5272,7 @@ async def literature_ask(
     system_prompt = (
         "你是论文阅读问答助手。"
         "必须基于提供的检索片段回答，不得编造事实。"
-        "回答尽量简洁准确，引用时使用[序号]标注。"
+        "回答尽量简洁准确，引用时使用 [序号] 标注。"
     )
 
     llm_service = await get_llm_service()
@@ -4005,7 +5373,9 @@ async def init_user_literature(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """初始化用户的文献管理（创建默认收藏夹）"""
+    """初始化用户的文献管理（创建默认收藏夹）。"""
+    repaired = await _repair_user_collection_mojibake(db, int(current_user.id))
+
     # 预定义的收藏夹配置
     default_collection_configs = [
         ("所有论文", "所有保存的论文", "#3b82f6", "folder", "default", True),
@@ -4025,6 +5395,9 @@ async def init_user_literature(
     # 如果已有所有默认收藏夹，直接返回
     default_names = set(config[0] for config in default_collection_configs)
     if default_names.issubset(existing_names):
+        if repaired:
+            await db.commit()
+            return {"message": "已初始化，并完成乱码修复"}
         return {"message": "已初始化"}
     
     # 只创建不存在的收藏夹
@@ -4043,9 +5416,11 @@ async def init_user_literature(
             db.add(new_coll)
             created_count += 1
     
-    if created_count > 0:
+    if created_count > 0 or repaired:
         try:
             await db.commit()
+            if repaired and created_count <= 0:
+                return {"message": "已初始化，并完成乱码修复"}
             return {"message": f"初始化成功，创建了 {created_count} 个收藏夹"}
         except Exception as e:
             await db.rollback()

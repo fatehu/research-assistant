@@ -4,6 +4,7 @@ import path from 'path'
 
 const watchPolling = process.env.VITE_DEV_WATCH_POLLING === 'true'
 const watchInterval = Number(process.env.VITE_DEV_WATCH_POLLING_INTERVAL || 300)
+const proxyTarget = process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:8000'
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -24,7 +25,7 @@ export default defineConfig({
       : undefined,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: proxyTarget,
         changeOrigin: true,
       },
     },
