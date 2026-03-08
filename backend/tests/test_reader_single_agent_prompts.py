@@ -28,6 +28,9 @@ def test_first_turn_prompt_template_contains_required_contract():
     rules = [str(item) for item in list(payload.get("rules") or [])]
     assert any("Every component must include zone_type, column_id, region, display, order_key" in item for item in rules)
     assert any("contiguous prose statements" in item for item in rules)
+    assert any("clean obvious OCR/layout noise" in item for item in rules)
+    assert any("Do not modify geometry, bbox, polygon, or source ownership" in item for item in rules)
+    assert any("merge caption continuation text" in item for item in rules)
 
 
 def test_iterative_turn_prompt_template_contains_delta_contract():
@@ -52,4 +55,6 @@ def test_iterative_turn_prompt_template_contains_delta_contract():
     assert "required_output_schema" in payload
     rules = [str(item) for item in list(payload.get("rules") or [])]
     assert any("mandatory layout fields" in item for item in rules)
+    assert any("clean obvious OCR/layout noise" in item for item in rules)
+    assert any("Do not modify geometry, bbox, polygon, or source ownership" in item for item in rules)
 
