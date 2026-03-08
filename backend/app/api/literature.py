@@ -71,6 +71,7 @@ from app.schemas.literature import (
     ReaderComposeReviewAutoPatchRequest,
     ReaderComposeReviewAutoPatchResponse,
     ReaderComposeReviewDiagnostic,
+    ReaderComposeReviewImportRequest,
     ReaderComposeReviewObservationRequest,
     ReaderComposeReviewPatchRequest,
     ReaderComposeReviewPublishRequest,
@@ -102,6 +103,10 @@ from app.services.llm_service import get_llm_service
 from app.services.render_pipeline_contract import RenderPipelineContractError
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
+from app.services.document_status_guard_service import (
+    build_timeout_error_message,
+    is_stale_processing_status,
+)
 from app.services.status_event_bus import (
     build_status_channel_for_user,
     iter_status_events,
@@ -1852,6 +1857,30 @@ def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Opt
     if normalized_status == DocumentStatus.PENDING.value:
         return KnowledgeLinkStatus.PENDING.value, None, int(doc.id)
     return KnowledgeLinkStatus.RUNNING.value, None, int(doc.id)
+
+
+def _mark_stale_document_timeout(doc: Optional[Document]) -> bool:
+    """将长时间未收尾的 processing 文档统一回写为 timeout。"""
+    if doc is None:
+        return False
+
+    stale_timeout_seconds = max(
+        int(getattr(settings, "document_processing_stale_timeout_seconds", 7200)),
+        60,
+    )
+    last_updated_at = getattr(doc, "updated_at", None) or getattr(doc, "created_at", None)
+    if not is_stale_processing_status(
+        status=getattr(doc, "status", None),
+        last_updated_at=last_updated_at,
+        timeout_seconds=stale_timeout_seconds,
+    ):
+        return False
+
+    previous_error = str(getattr(doc, "error_message", "") or "").strip()
+    timeout_error = build_timeout_error_message(stale_timeout_seconds)
+    doc.status = DocumentStatus.TIMEOUT.value
+    doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
+    return True
 
 
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
@@ -3699,24 +3728,58 @@ async def create_reader_composed_review_session(
 ):
     paper = await _get_owned_paper_or_404(db, current_user, paper_id)
     service = get_literature_reader_compose_service()
-    snapshot = await service.create_review_session(
-        db=db,
-        user_id=int(current_user.id),
-        paper=paper,
-        page=max(1, int(payload.page)),
-        selected_kb_id=payload.selected_kb_id,
-        force_refresh=bool(payload.force_refresh),
-        regenerate=bool(payload.regenerate),
-        latency_budget_ms=payload.latency_budget_ms,
-        quality_target=payload.quality_target,
-        max_iterations=payload.max_iterations,
-        style_intent=payload.style_intent,
-        theme_mode=payload.theme_mode,
-        detail_level=payload.detail_level,
-        compare_mode=payload.compare_mode,
-        citation_tldr=payload.citation_tldr,
-        snapshot_label=payload.snapshot_label,
-    )
+    try:
+        snapshot = await service.create_review_session(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            page=max(1, int(payload.page)),
+            selected_kb_id=payload.selected_kb_id,
+            force_refresh=bool(payload.force_refresh),
+            regenerate=bool(payload.regenerate),
+            latency_budget_ms=payload.latency_budget_ms,
+            quality_target=payload.quality_target,
+            max_iterations=payload.max_iterations,
+            style_intent=payload.style_intent,
+            theme_mode=payload.theme_mode,
+            detail_level=payload.detail_level,
+            compare_mode=payload.compare_mode,
+            citation_tldr=payload.citation_tldr,
+            snapshot_label=payload.snapshot_label,
+            prefer_cache_clone=bool(payload.prefer_cache_clone),
+            allow_recompute_on_cache_miss=bool(payload.allow_recompute_on_cache_miss),
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_cache_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
+    return snapshot
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/review-session/import",
+    response_model=ReaderComposeReviewSnapshot,
+)
+async def import_reader_composed_review_session(
+    paper_id: int,
+    payload: ReaderComposeReviewImportRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = get_literature_reader_compose_service()
+    try:
+        snapshot = await service.create_review_session_from_payload(
+            db=db,
+            user_id=int(current_user.id),
+            paper=paper,
+            payload=payload.payload.model_dump(),
+            snapshot_label=payload.snapshot_label,
+        )
+    except ValueError as exc:
+        token = str(exc)
+        status_code = 404 if token in {"review_payload_not_found"} else 409
+        raise HTTPException(status_code=status_code, detail=token) from exc
     return snapshot
 
 
@@ -4088,7 +4151,7 @@ async def stream_reader_composed_inline_query(
                     {
                         "disabled": True,
                         "disabled_reason": str(result.get("disabled_reason") or "inline_query_contract_failed"),
-                        "message": str(result.get("message") or "Inline query is disabled for this node."),
+                        "message": str(result.get("message") or "当前段落追问不可用，请改用右侧“询问”进行全文问答。"),
                     },
                 )
                 yield _sse_payload(
@@ -4605,6 +4668,8 @@ async def list_paper_knowledge_links(
         doc = await db.get(Document, int(link.document_id))
         if not doc:
             continue
+        if _mark_stale_document_timeout(doc):
+            need_commit = True
         next_status, next_error, _ = _derive_link_status_from_document(doc)
         if link.status != next_status or (link.error_message or None) != (next_error or None):
             link.status = next_status

@@ -211,6 +211,48 @@ class ReaderSingleAgentValidator:
                 errs.append("component_props_invalid:CitationCard:abstract_tldr:string_required")
             return errs
 
+        if component == "CompareInsightsCard":
+            items = props.get("items")
+            if items is not None:
+                if not isinstance(items, list):
+                    errs.append("component_props_invalid:CompareInsightsCard:items:not_array")
+                else:
+                    for idx, item in enumerate(items):
+                        if not isinstance(item, (str, Mapping)):
+                            errs.append(
+                                f"component_props_invalid:CompareInsightsCard:items.{idx}:object_or_string_required"
+                            )
+                            break
+            return errs
+
+        if component == "InsightClusterCard":
+            items = props.get("items")
+            if not isinstance(items, list):
+                errs.append("component_props_invalid:InsightClusterCard:items:not_array")
+            elif not items:
+                errs.append("component_props_invalid:InsightClusterCard:items:empty_array")
+            else:
+                for idx, item in enumerate(items):
+                    if not isinstance(item, str) or not str(item).strip():
+                        errs.append(f"component_props_invalid:InsightClusterCard:items.{idx}:string_required")
+                        break
+            title = props.get("title")
+            if title is not None and not isinstance(title, str):
+                errs.append("component_props_invalid:InsightClusterCard:title:string_required")
+            tone = props.get("tone")
+            if tone is not None and str(tone).strip().lower() not in {"finding", "claim", "implication"}:
+                errs.append("component_props_invalid:InsightClusterCard:tone:enum_required")
+            return errs
+
+        if component == "SectionBridgeCard":
+            text = props.get("text")
+            if not isinstance(text, str) or not str(text).strip():
+                errs.append("component_props_invalid:SectionBridgeCard:text:string_required")
+            title = props.get("title")
+            if title is not None and not isinstance(title, str):
+                errs.append("component_props_invalid:SectionBridgeCard:title:string_required")
+            return errs
+
         if component == "EquationBlock":
             latex = props.get("latex")
             if not isinstance(latex, str) or not str(latex).strip():
@@ -1266,6 +1308,8 @@ class ReaderSingleAgentValidator:
             "ListBlock",
             "AbstractCard",
             "CalloutBox",
+            "InsightClusterCard",
+            "SectionBridgeCard",
             "MethodologyCard",
             "EquationBlock",
             "CitationCard",
@@ -1291,6 +1335,10 @@ class ReaderSingleAgentValidator:
             return {"text": fallback_text}
         if component == "CalloutBox":
             return {"type": "info", "content": fallback_text}
+        if component == "InsightClusterCard":
+            return {"items": [fallback_text]}
+        if component == "SectionBridgeCard":
+            return {"text": fallback_text}
         if component == "MethodologyCard":
             return {"steps": [fallback_text]}
         if component == "EquationBlock":

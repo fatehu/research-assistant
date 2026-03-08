@@ -64,6 +64,15 @@ export const readerComponentSchemas = {
   CompareInsightsCard: z.object({
     items: recordArray.optional(),
   }),
+  InsightClusterCard: z.object({
+    title: z.string().optional(),
+    items: z.array(z.string().min(1)).min(1),
+    tone: z.enum(['finding', 'claim', 'implication']).optional(),
+  }),
+  SectionBridgeCard: z.object({
+    title: z.string().optional(),
+    text: z.string().min(1),
+  }),
   PdfSnippetCard: z.object({
     title: z.string().optional(),
     description: z.string().optional(),

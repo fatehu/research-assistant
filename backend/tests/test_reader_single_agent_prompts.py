@@ -39,6 +39,7 @@ def test_iterative_turn_prompt_template_contains_delta_contract():
         must_fix=["full_coverage", "id_integrity"],
         do_not_change=["whitelist_only"],
         component_whitelist=["ParagraphProse"],
+        rendered_page_image="https://example.com/page1.png",
     )
 
     assert isinstance(prompt, dict)

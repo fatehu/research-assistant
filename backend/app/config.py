@@ -3,6 +3,7 @@ Application settings loaded from environment variables.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import field_validator, model_validator
@@ -135,6 +136,25 @@ class Settings(BaseSettings):
     chunk_repair_max_rounds: int = 1
     chunk_repair_max_fragments: int = 120
     chunk_repair_max_chars_per_chunk: int = 1800
+
+    # PDF line-level RAG ingestion
+    pdf_rag_line_pipeline_enabled: bool = True
+    pdf_rag_fail_open: bool = True
+    pdf_rag_qwen_device: Literal["auto", "cpu", "cuda"] = "auto"
+    pdf_rag_action_model_dir: str = str(
+        Path("tmp") / "qwen_lora" / "qwen_action_lora_merged_v1"
+    )
+    pdf_rag_clean_model_dir: str = str(
+        Path("tmp") / "qwen_lora" / "qwen_clean_lora_merged_v1"
+    )
+    pdf_rag_chunk_model_dir: str = str(
+        Path("tmp") / "qwen_lora" / "qwen_chunk_lora_merged_v1"
+    )
+    pdf_rag_ocr_enabled: bool = True
+    pdf_rag_ocr_model: str = "qwen3.5:0.8b-stable"
+    pdf_rag_ocr_timeout_seconds: int = 30
+    pdf_rag_ocr_dpi: int = 180
+    pdf_rag_ocr_padding: float = 4.0
 
     # LLM runtime
     llm_temperature: float = 0.7

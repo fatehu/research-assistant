@@ -32,6 +32,8 @@ class ReaderComponentContractService:
         "InlineQuerySlot": {"required": [], "properties": {"placeholder": "string"}},
         "AnswerCard": {"required": ["question", "answer"], "properties": {"question": "string", "answer": "string"}},
         "CompareInsightsCard": {"required": [], "properties": {"items": "array"}},
+        "InsightClusterCard": {"required": ["items"], "properties": {"title": "string", "items": "array", "tone": "string"}},
+        "SectionBridgeCard": {"required": ["text"], "properties": {"title": "string", "text": "string"}},
         "PdfSnippetCard": {"required": [], "properties": {"title": "string", "description": "string"}},
         "ContextRail": {"required": [], "properties": {"title": "string", "items": "array"}},
         "CitationCard": {"required": ["title"], "properties": {"citation_key": "string", "authors": "array", "year": "string_or_number", "title": "string", "journal": "string", "doi": "string", "abstract_tldr": "string"}},

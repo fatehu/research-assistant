@@ -59,6 +59,111 @@ function toAbsoluteApiUrl(rawUrl: string): string {
   return `${READER_API_BASE_URL}${token}`
 }
 
+const READING_FLOW_COMPONENT_TYPES = new Set([
+  'SectionHeading',
+  'Separator',
+  'ParagraphProse',
+  'ListBlock',
+  'FigurePanel',
+  'TablePanel',
+  'EquationBlock',
+  'AbstractCard',
+  'MethodologyCard',
+  'CalloutBox',
+  'CompareInsightsCard',
+  'InsightClusterCard',
+  'SectionBridgeCard',
+  'InlineQuerySlot',
+  'AnswerCard',
+])
+
+const CONTEXT_ONLY_COMPONENT_TYPES = new Set([
+  'PaperHeaderCard',
+  'MetadataSidebarCard',
+  'ContextRail',
+  'SectionTOC',
+  'CitationLinks',
+  'CitationCard',
+  'PdfSnippetCard',
+  'KeyTakeaways',
+  'AnnotationRail',
+  'QualityBadge',
+  'QualityPanel',
+])
+
+function collectReaderNodeTextHints(node: ReaderComponentNode): string[] {
+  const props = ((node.props && typeof node.props === 'object') ? node.props : {}) as Record<string, unknown>
+  const hints = [
+    props.text,
+    props.title,
+    props.caption,
+    props.content,
+    props.description,
+    props.doi,
+    props.label,
+    props.subtitle,
+  ]
+  if (Array.isArray(props.items)) {
+    for (const item of props.items.slice(0, 6)) {
+      if (!item || typeof item !== 'object') continue
+      const row = item as Record<string, unknown>
+      hints.push(row.text, row.label, row.value)
+    }
+  }
+  return hints.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function isLikelyContextOnlyText(raw: string): boolean {
+  const text = String(raw || '').trim()
+  if (!text) return false
+  if (/^(?:research article|open access|corresponding author|supplementary material)$/i.test(text)) return true
+  if (text.length <= 240 && /(?:https?:\/\/)?(?:dx\.)?doi\.org\/\S+/i.test(text)) return true
+  if (text.length <= 180 && /^doi:\s*10\.\S+/i.test(text)) return true
+  if (text.length <= 140 && /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i.test(text)) return true
+  if (
+    text.length <= 420
+    && /\b(?:Department of|School of Medicine|University|Hospital|Medical Center|Inc\b|LLC\b|Institute)\b/i.test(text)
+    && (text.match(/\b\d+\b/g) || []).length >= 2
+  ) {
+    return true
+  }
+  if (
+    text.length <= 360
+    && (text.match(/,/g) || []).length >= 5
+    && /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\d/.test(text)
+  ) {
+    return true
+  }
+  if (text.length <= 220 && /\b(?:received|accepted|published|copyright|pmid|pmcid)\b/i.test(text)) return true
+  if (
+    text.length <= 220
+    && /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b/i.test(text)
+    && /\b\d+\s*\/\s*\d+\b/.test(text)
+  ) {
+    return true
+  }
+  return false
+}
+
+function getReaderNodePlacement(node: ReaderComponentNode): 'main' | 'context' {
+  const type = String(node.type || '').trim()
+  if (CONTEXT_ONLY_COMPONENT_TYPES.has(type)) return 'context'
+  if (READING_FLOW_COMPONENT_TYPES.has(type)) return 'main'
+
+  const zoneType = String(node.zone_type || '').trim().toLowerCase()
+  const columnId = String(node.column_id || '').trim().toLowerCase()
+  const region = String(node.region || '').trim().toLowerCase()
+  if (zoneType === 'side_context') return 'context'
+  if (columnId === 'sidebar' || region === 'sidebar') return 'context'
+
+  if (type === 'ParagraphProse' || type === 'ListBlock' || type === 'CalloutBox' || type === 'SectionHeading') {
+    const hints = collectReaderNodeTextHints(node)
+    if (hints.some((item) => isLikelyContextOnlyText(item))) return 'context'
+  }
+
+  return 'main'
+}
+
 export default function PaperReaderReviewPage() {
   const { paperId: paperIdParam } = useParams()
   const [searchParams] = useSearchParams()
@@ -147,6 +252,18 @@ export default function PaperReaderReviewPage() {
 
   const assets = useMemo<ReaderComposeAsset[]>(() => snapshot?.assets || [], [snapshot])
   const composedPageImageUrl = String(snapshot?.docmind_page_image_url || '').trim()
+  const reviewComponents = useMemo(
+    () => (Array.isArray(snapshot?.ui_plan?.components) ? snapshot.ui_plan.components : []),
+    [snapshot],
+  )
+  const mainComponents = useMemo(
+    () => reviewComponents.filter((node) => getReaderNodePlacement(node) === 'main'),
+    [reviewComponents],
+  )
+  const contextComponents = useMemo(
+    () => reviewComponents.filter((node) => getReaderNodePlacement(node) === 'context'),
+    [reviewComponents],
+  )
 
   const resolveFigureImageUrl = (rawUrl: string, node?: ReaderComponentNode): string => {
     const token = String(rawUrl || '').trim()
@@ -267,7 +384,7 @@ export default function PaperReaderReviewPage() {
 
                 {!loading && snapshot ? (
                   <div className="reader-workbench__content" style={{ maxWidth: contentMaxWidth, margin: '0 auto' }}>
-                    {renderReaderComponentTree(snapshot.ui_plan.components, {
+                    {renderReaderComponentTree(mainComponents, {
                       themeStyle: activeStyle,
                       qualityReport: snapshot.quality_report,
                       resolveFigureImageUrl,
@@ -283,6 +400,17 @@ export default function PaperReaderReviewPage() {
             </div>
 
             <div className="reader-workbench__rail">
+              {contextComponents.length > 0 ? (
+                <div className="reader-workbench__context-stack">
+                  {renderReaderComponentTree(contextComponents, {
+                    themeStyle: activeStyle,
+                    qualityReport: snapshot?.quality_report,
+                    resolveFigureImageUrl,
+                    readOnly: true,
+                  })}
+                </div>
+              ) : null}
+
               <Card size="small" title="Scheme">
                 <Space direction="vertical" size={6} style={{ width: '100%' }}>
                   <Text strong>{snapshot?.scheme_choice?.label || snapshot?.scheme_choice?.scheme_id || 'Unspecified'}</Text>

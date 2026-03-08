@@ -1365,6 +1365,13 @@ class ReaderMultimodalLayoutService:
             "table": "TablePanel",
             "contextrail": "ContextRail",
             "context": "ContextRail",
+            "calloutbox": "CalloutBox",
+            "abstractcard": "AbstractCard",
+            "citationcard": "CitationCard",
+            "methodologycard": "MethodologyCard",
+            "compareinsightscard": "CompareInsightsCard",
+            "insightclustercard": "InsightClusterCard",
+            "sectionbridgecard": "SectionBridgeCard",
         }
         kind_alias_map = {
             "prose": "paragraph",
@@ -1484,6 +1491,13 @@ class ReaderMultimodalLayoutService:
                     "FigurePanel": "figure",
                     "TablePanel": "table",
                     "ContextRail": "context",
+                    "CalloutBox": "paragraph",
+                    "AbstractCard": "paragraph",
+                    "CitationCard": "paragraph",
+                    "MethodologyCard": "paragraph",
+                    "CompareInsightsCard": "paragraph",
+                    "InsightClusterCard": "paragraph",
+                    "SectionBridgeCard": "paragraph",
                 }.get(component_hint, "paragraph")
             kind = kind_alias_map.get(kind_hint, kind_hint)
             if kind not in allowed_kinds:
@@ -3676,6 +3690,8 @@ class ReaderMultimodalLayoutService:
             "6) visual_reference_only=true: current page image may be used only to judge structure/boundaries, never to invent text.\n"
             "7) Use grouping_hint conservatively to mark atoms that clearly belong to the same semantic paragraph/list/caption unit.\n"
             "8) If bbox/reading_order/indent suggests a new paragraph start, do not reuse the previous grouping_hint.\n"
+            "9) When an atom clearly looks like methods/protocol/setup, citation/meta, figure commentary, or a cross-page continuation bridge, use component_hint to reflect that instead of defaulting everything to ParagraphProse.\n"
+            "10) Prefer component hints such as MethodologyCard, CitationCard, InsightClusterCard, or SectionBridgeCard only when the atom text itself supports that role.\n"
             f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
             f"visual_reference_only: true\n"
             f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
@@ -3734,6 +3750,11 @@ class ReaderMultimodalLayoutService:
             "7) visual_reference_only=true: image may guide grouping, but never add missing text.\n"
             "8) Prefer one semantic paragraph per ParagraphProse slot; do not merge across paragraph starts suggested by grouping_hint, reading_order jumps, vertical gaps, or indent changes.\n"
             "9) Keep captions/figures separate from body paragraphs unless atoms clearly describe the same figure unit.\n"
+            "10) Avoid prose-only流水账 layouts when richer structure exists. If 3 or more prose slots would appear in a row, prefer a structure card such as InsightClusterCard, CalloutBox, MethodologyCard, CitationCard, CompareInsightsCard, or SectionBridgeCard.\n"
+            "11) Figure + analysis should usually become FigurePanel plus InsightClusterCard or CalloutBox.\n"
+            "12) Methods/protocol/setup text should prefer MethodologyCard. Citation-heavy or DOI-heavy text should prefer CitationCard or remain unused for side context. Cross-page continuation should prefer SectionBridgeCard.\n"
+            "13) Prefer one of these composition templates when applicable: figure-led analysis, claim plus evidence, methods aside, citation cluster, section bridge.\n"
+            "14) Keep the main reading canvas focused on reading flow only. Metadata, DOI links, publication info, citation bundles, quality/debug status, and auxiliary AI assets should go to side context rather than the main canvas.\n"
             f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
             f"visual_reference_only: true\n"
             f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"
@@ -3858,6 +3879,9 @@ class ReaderMultimodalLayoutService:
             "5) component must be in allowed_components.\n"
             "6) Do not rewrite scientific facts.\n"
             "7) visual_reference_only=true: image is optional reference only.\n"
+            "8) Avoid pure prose stacks when the page contains figure/caption/method/citation/transition structure.\n"
+            "9) If 3 or more prose-like segments would run consecutively, prefer CalloutBox, InsightClusterCard, MethodologyCard, CitationCard, CompareInsightsCard, or SectionBridgeCard when justified by the source layouts.\n"
+            "10) Figure commentary should often pair FigurePanel with InsightClusterCard or CalloutBox; continuation fragments should prefer SectionBridgeCard over burying the text inside long prose.\n"
             f"layout_meta: {json.dumps(meta, ensure_ascii=False)}\n"
             f"visual_reference_only: true\n"
             f"image_meta: {json.dumps(image_meta, ensure_ascii=False)}\n"

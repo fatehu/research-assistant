@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover
 
 
 COMPOSE_ENGINE_VERSION = "reader_compose_v3"
-COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v1"
+COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
 COMPOSE_LAYOUT_SCHEMA_VERSION = "layout_schema_v2"
@@ -229,6 +229,8 @@ COMPONENT_WHITELIST = {
     "InlineQuerySlot",
     "AnswerCard",
     "CompareInsightsCard",
+    "InsightClusterCard",
+    "SectionBridgeCard",
     "PdfSnippetCard",
     "ContextRail",
     "CitationCard",
@@ -272,6 +274,9 @@ SIMPLIFIED_ALLOWED_COMPONENTS: List[str] = [
     "MethodologyCard",
     "CalloutBox",
     "AbstractCard",
+    "CompareInsightsCard",
+    "InsightClusterCard",
+    "SectionBridgeCard",
 ]
 
 INLINE_QUERY_SUPPORTED_NODE_TYPES = {
@@ -360,6 +365,66 @@ class LiteratureReaderComposeService:
         _ = (paper_id, page)
         return self._pipeline_mode() == PIPELINE_MODE_SINGLE_AGENT_V2
 
+    def _cached_payload_has_meaningful_reading_flow(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        ui_plan = payload.get("ui_plan")
+        if not isinstance(ui_plan, dict):
+            return False
+        components = ui_plan.get("components")
+        if not isinstance(components, list):
+            return False
+
+        reading_flow_types = {
+            "SectionHeading",
+            "ParagraphProse",
+            "ListBlock",
+            "FigurePanel",
+            "TablePanel",
+            "EquationBlock",
+            "AbstractCard",
+            "MethodologyCard",
+            "CalloutBox",
+            "CompareInsightsCard",
+            "InsightClusterCard",
+            "SectionBridgeCard",
+        }
+        meaningful_count = 0
+        for node in components:
+            if not isinstance(node, dict):
+                continue
+            node_type = str(node.get("type") or "").strip()
+            if node_type not in reading_flow_types:
+                continue
+            props = node.get("props")
+            props_map = props if isinstance(props, dict) else {}
+            if node_type == "FigurePanel":
+                image_url = str(props_map.get("image_url") or "").strip()
+                caption = str(props_map.get("caption") or "").strip()
+                if image_url or caption:
+                    meaningful_count += 1
+                    continue
+            text_hint = " ".join(
+                str(props_map.get(key) or "").strip()
+                for key in ("text", "title", "caption", "content", "description")
+            ).strip()
+            if text_hint:
+                meaningful_count += 1
+            if meaningful_count >= 2:
+                return True
+        return meaningful_count >= 2
+
+    @staticmethod
+    def _compatible_source_signature_prefix(source_signature: str) -> str:
+        token = str(source_signature or "").strip()
+        if not token:
+            return ""
+        marker = "|h:"
+        index = token.rfind(marker)
+        if index <= 0:
+            return ""
+        return token[: index + len(marker)]
+
     def _should_rebuild_cached_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
@@ -376,12 +441,13 @@ class LiteratureReaderComposeService:
         # Auto-heal only when cached simplified fallback clearly dropped all usable atoms.
         if usable_atom_count <= 0 or used_atom_count > 0:
             return False
+        has_meaningful_reading_flow = self._cached_payload_has_meaningful_reading_flow(payload)
         if degraded_reason == "simplified_pipeline":
-            return True
+            return not has_meaningful_reading_flow
         if degraded_reason == "no_drop_blocks_failed_auto_fallback":
             return True
         if build_mode == "compose_agent_simplified":
-            return True
+            return not has_meaningful_reading_flow
         return False
 
     async def _delete_payload_from_redis(self, key: str) -> None:
@@ -532,6 +598,43 @@ class LiteratureReaderComposeService:
                         degraded=bool(quality_report.get("degraded")),
                         stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
                     )
+
+            compatible_cached_row = await self._read_compatible_payload_from_db(
+                db=db,
+                paper_id=int(paper.id),
+                page=page_num,
+                source_signature=source_signature,
+            )
+            if isinstance(compatible_cached_row, dict):
+                logger.info(
+                    "[ReaderComposeService] reuse compatible compose cache "
+                    f"paper={paper.id} page={page_num} requested_sig={sig_hash} "
+                    f"payload_sig={self._signature_hash(str(compatible_cached_row.get('source_signature') or ''))}"
+                )
+                compatible_payload = dict(compatible_cached_row)
+                compatible_payload["source_signature"] = source_signature
+                await self._write_payload_to_redis(redis_key, compatible_payload)
+                payload = self._with_cache_meta(compatible_payload, cache_hit=True, cache_layer="db_compatible")
+                payload = await self._apply_overlay_for_user(
+                    db=db,
+                    user_id=int(user_id),
+                    paper_id=int(paper.id),
+                    page=page_num,
+                    source_signature=source_signature,
+                    payload=payload,
+                )
+                payload = self._ensure_payload_contract(page=page_num, payload=payload)
+                quality_report = payload.get("quality_report") or {}
+                return payload, ReaderComposeBuildMeta(
+                    cache_hit=True,
+                    cache_layer="db_compatible",
+                    build_mode=str(payload.get("build_mode") or "compose_cache"),
+                    source_signature=source_signature,
+                    source_sig_hash=sig_hash,
+                    iterations=int(quality_report.get("iterations") or 0),
+                    degraded=bool(quality_report.get("degraded")),
+                    stop_reason=str(quality_report.get("stop_reason") or "compatible_cache_hit"),
+                )
 
         lock_token = await self._acquire_lock(lock_key)
         logger.info(
@@ -820,6 +923,7 @@ class LiteratureReaderComposeService:
                 "toc_quality": float(base_payload.get("toc_quality") or 0.0),
                 "phase1_compact_input": dict(base_payload.get("phase1_compact_input") or {}),
                 "review_route_meta": dict(base_payload.get("review_route_meta") or {}),
+                "style_cues": dict(base_payload.get("style_cues") or {}),
                 "overlay_applied": False,
                 "overlay_count": 0,
                 "generated_at": datetime.utcnow().isoformat(),
@@ -2060,6 +2164,9 @@ class LiteratureReaderComposeService:
             "FigureCard": "FigurePanel",
             "Callout": "CalloutBox",
             "PublicationMetaStrip": "ContextRail",
+            "InsightCluster": "InsightClusterCard",
+            "SectionBridge": "SectionBridgeCard",
+            "CompareInsights": "CompareInsightsCard",
         }
         order_key = 0.0
 
@@ -2111,6 +2218,31 @@ class LiteratureReaderComposeService:
             if token in SIMPLIFIED_ALLOWED_COMPONENTS:
                 return token
             return "ParagraphProse"
+
+        def _compact_sentence_items(text: str, *, limit: int = 4) -> List[str]:
+            value = self._normalize_spaces(str(text or ""))
+            if not value:
+                return []
+            parts = [
+                self._normalize_spaces(item)
+                for item in re.split(r"(?<=[.!?;])\s+|[•\u2022]\s*", value)
+                if self._normalize_spaces(item)
+            ]
+            if len(parts) < 2:
+                parts = [
+                    self._normalize_spaces(item)
+                    for item in re.split(r"\n+|(?<=:)\s+", value)
+                    if self._normalize_spaces(item)
+                ]
+            deduped: List[str] = []
+            for item in parts:
+                if item not in deduped:
+                    deduped.append(item)
+                if len(deduped) >= limit:
+                    break
+            if deduped:
+                return deduped
+            return [value[:240]]
 
         def resolve_figure_image_token(raw_token: str, source_layout_ids: Sequence[str]) -> str:
             token = str(raw_token or "").strip()
@@ -2229,6 +2361,41 @@ class LiteratureReaderComposeService:
                     "journal": str(props.get("journal") or "").strip(),
                     "doi": str(props.get("doi") or "").strip(),
                     "abstract_tldr": str(props.get("abstract_tldr") or "").strip(),
+                }
+            if component == "CompareInsightsCard":
+                raw_items = props.get("items")
+                normalized_items: List[Dict[str, Any]] = []
+                if isinstance(raw_items, list):
+                    for idx, item in enumerate(raw_items[:6], start=1):
+                        if isinstance(item, Mapping):
+                            title = str(item.get("title") or item.get("label") or f"Insight {idx}").strip()
+                            content = str(item.get("content") or item.get("text") or "").strip()
+                            if content:
+                                normalized_items.append({"title": title or f"Insight {idx}", "content": content})
+                        else:
+                            content = str(item or "").strip()
+                            if content:
+                                normalized_items.append({"title": f"Insight {idx}", "content": content})
+                if not normalized_items and fb_text:
+                    normalized_items = [{"title": "Insight 1", "content": fb_text}]
+                return {"items": normalized_items}
+            if component == "InsightClusterCard":
+                raw_items = props.get("items")
+                items = [str(item).strip() for item in list(raw_items or []) if str(item).strip()] if isinstance(raw_items, list) else []
+                if not items:
+                    items = _compact_sentence_items(str(props.get("text") or fb_text), limit=4)
+                tone = str(props.get("tone") or "finding").strip().lower()
+                if tone not in {"finding", "claim", "implication"}:
+                    tone = "finding"
+                return {
+                    "title": str(props.get("title") or "").strip(),
+                    "items": items or [fb_text or "[empty]"],
+                    "tone": tone,
+                }
+            if component == "SectionBridgeCard":
+                return {
+                    "title": str(props.get("title") or "").strip(),
+                    "text": str(props.get("text") or fb_text).strip() or "[empty]",
                 }
             if component == "EquationBlock":
                 return {
@@ -4257,6 +4424,13 @@ class LiteratureReaderComposeService:
             "AnswerCard",
             "CitationLinks",
             "InlineQuerySlot",
+            "CalloutBox",
+            "AbstractCard",
+            "CitationCard",
+            "MethodologyCard",
+            "CompareInsightsCard",
+            "InsightClusterCard",
+            "SectionBridgeCard",
         ]
         stage2_payload = {
             "layout_meta": layout_meta,
@@ -4299,6 +4473,13 @@ class LiteratureReaderComposeService:
             "AnswerCard": "paragraph",
             "CitationLinks": "paragraph",
             "InlineQuerySlot": "paragraph",
+            "CalloutBox": "paragraph",
+            "AbstractCard": "paragraph",
+            "CitationCard": "paragraph",
+            "MethodologyCard": "paragraph",
+            "CompareInsightsCard": "paragraph",
+            "InsightClusterCard": "paragraph",
+            "SectionBridgeCard": "paragraph",
         }
 
         ordered_block_ids: List[str] = []
@@ -5942,7 +6123,7 @@ class LiteratureReaderComposeService:
             return {
                 "disabled": True,
                 "disabled_reason": contract_failure,
-                "message": "Inline query contract validation failed.",
+                "message": "当前段落追问不可用，请改用右侧“询问”进行全文问答。",
             }
         anchor_refs = self._resolve_inline_query_anchors(
             query_node=node,
@@ -5954,7 +6135,7 @@ class LiteratureReaderComposeService:
             return {
                 "disabled": True,
                 "disabled_reason": "inline_query_missing_source_anchor_refs",
-                "message": "Inline query source anchors are required.",
+                "message": "当前段落缺少可引用证据，请改用右侧“询问”进行全文问答。",
             }
         source_block_ids = self._extract_inline_query_source_block_ids(
             page=int(page),
@@ -5965,7 +6146,7 @@ class LiteratureReaderComposeService:
             return {
                 "disabled": True,
                 "disabled_reason": "inline_query_missing_source_block_ids",
-                "message": "Inline query source block IDs are required.",
+                "message": "当前段落缺少可用文本块，请改用右侧“询问”进行全文问答。",
             }
         context_text = self._build_inline_query_context(
             query_node=node,
@@ -6020,14 +6201,16 @@ class LiteratureReaderComposeService:
         compact_question = self._normalize_spaces(question)
         compact_context = self._normalize_spaces(context_text)
         if not compact_context:
-            compact_context = "Current node has limited textual evidence."
+            compact_context = "当前段落缺少稳定证据，仅能做非常有限的局部追问。"
         prompt = (
-            "You are a literature reading assistant.\n"
-            "Answer strictly from the provided context. Do not fabricate.\n"
+            "You are a literature reading assistant handling a paragraph follow-up question.\n"
+            "This is a local follow-up, not a full-paper QA task.\n"
+            "Answer strictly from the provided context and nearby evidence. Do not fabricate.\n"
+            "Do not claim paper-wide conclusions unless the local context clearly supports them.\n"
             "Output in exactly two Chinese sentences:\n"
             "1) 结论：...\n"
             "2) 证据：...\n"
-            "If evidence is insufficient, explicitly answer: 结论：当前证据不足以回答。\n"
+            "If evidence is insufficient, explicitly answer: 结论：当前段落证据不足以回答；请使用右侧“询问”进行全文问答。\n"
             f"问题：{compact_question}\n"
             f"范围：{scope}\n"
             f"上下文：{compact_context[:2200]}"
@@ -6045,8 +6228,8 @@ class LiteratureReaderComposeService:
         except Exception as exc:
             logger.debug(f"[ReaderComposeService] inline answer generation failed: {exc}")
         return (
-            f"结论：当前无法基于现有上下文完整回答“{compact_question}”。"
-            "证据：请先定位到原文证据后再追问。"
+            f"结论：当前段落证据不足以回答“{compact_question}”；请使用右侧“询问”进行全文问答。"
+            "证据：当前只提供了本段及邻近上下文，无法支持更大范围结论。"
         )
 
     async def _apply_overlay_for_user(
@@ -7140,6 +7323,29 @@ class LiteratureReaderComposeService:
         if not target:
             return None
 
+        style_page_width = float(style_cues.get("page_width") or 0.0) or 0.0
+        style_page_height = float(style_cues.get("page_height") or 0.0) or 0.0
+
+        layout_x1_values = [
+            float(row.get("x1") or 0.0)
+            for row in line_layout[:260]
+            if isinstance(row, dict) and self._safe_float(row.get("x1"), 0.0) > 0
+        ]
+        layout_bottom_values = [
+            float(row.get("bottom") or 0.0)
+            for row in line_layout[:260]
+            if isinstance(row, dict) and self._safe_float(row.get("bottom"), 0.0) > 0
+        ]
+        layout_page_width = max(layout_x1_values) if layout_x1_values else 0.0
+        layout_page_height = max(layout_bottom_values) if layout_bottom_values else 0.0
+
+        page_width = style_page_width
+        page_height = style_page_height
+        if page_width <= 0 or (layout_page_width > 0 and layout_page_width > page_width * 1.2):
+            page_width = layout_page_width
+        if page_height <= 0 or (layout_page_height > 0 and layout_page_height > page_height * 1.2):
+            page_height = layout_page_height
+
         scored_rows: List[Tuple[float, Dict[str, Any]]] = []
         for row in line_layout[:260]:
             if not isinstance(row, dict):
@@ -7185,8 +7391,8 @@ class LiteratureReaderComposeService:
             "x1": x1,
             "top": top,
             "bottom": bottom,
-            "page_width": float(style_cues.get("page_width") or 0.0) or None,
-            "page_height": float(style_cues.get("page_height") or 0.0) or None,
+            "page_width": page_width or None,
+            "page_height": page_height or None,
         }
 
     @staticmethod
@@ -8535,6 +8741,7 @@ class LiteratureReaderComposeService:
         components = list(cloned.get("components") or [])
         allowed_canonical = self._build_allowed_canonical_block_ids(base_payload=base_payload, page=page)
         min_conf = float(getattr(settings, "reader_anchor_min_confidence", 0.78) or 0.78)
+        style_cues = dict(base_payload.get("style_cues") or {})
 
         total_nodes = 0
         blocked_nodes = 0
@@ -8548,6 +8755,7 @@ class LiteratureReaderComposeService:
             total_nodes += 1
             normalized_rows: List[Dict[str, Any]] = []
             source_block_id = str((node.get("props") or {}).get("source_block_id") or "")
+            node_text = self._normalize_spaces(self._extract_node_text(node))
             for row in refs:
                 if not isinstance(row, dict):
                     continue
@@ -8568,6 +8776,41 @@ class LiteratureReaderComposeService:
                     continue
                 if normalized.get("segment_index") is not None or normalized.get("segment_total") is not None:
                     continue
+                bbox_hint = normalized.get("bbox_hint") if isinstance(normalized.get("bbox_hint"), dict) else None
+                geometry = normalized.get("geometry") if isinstance(normalized.get("geometry"), dict) else None
+                spatial_hint_valid = self._is_bbox_hint_plausible(bbox_hint) and self._is_geometry_plausible(geometry)
+                if not spatial_hint_valid:
+                    rebuild_quote = self._normalize_spaces(
+                        str(normalized.get("quote_text") or normalized.get("quote") or row.get("quote_text") or "")
+                    )
+                    rebuilt_bbox = self._build_bbox_hint(
+                        style_cues=style_cues,
+                        quote_text=rebuild_quote or node_text,
+                        source_anchor=normalized,
+                    )
+                    if isinstance(rebuilt_bbox, dict):
+                        normalized["bbox_hint"] = rebuilt_bbox
+                        normalized["geometry_version"] = "poly_v1"
+                        normalized["geometry"] = {
+                            "polygons": [
+                                {
+                                    "points": self._build_rect_polygon(
+                                        x0=float(rebuilt_bbox.get("x0") or 0.0),
+                                        x1=float(rebuilt_bbox.get("x1") or 0.0),
+                                        top=float(rebuilt_bbox.get("top") or 0.0),
+                                        bottom=float(rebuilt_bbox.get("bottom") or 0.0),
+                                    ),
+                                    "source": "bbox_rebuilt",
+                                    "component_id": "comp_1",
+                                }
+                            ],
+                            "page_width": rebuilt_bbox.get("page_width"),
+                            "page_height": rebuilt_bbox.get("page_height"),
+                        }
+                    else:
+                        normalized["bbox_hint"] = None
+                        normalized["geometry_version"] = None
+                        normalized["geometry"] = None
                 normalized_rows.append(normalized)
 
             props = node.get("props") if isinstance(node.get("props"), dict) else {}
@@ -8598,6 +8841,50 @@ class LiteratureReaderComposeService:
             "pass_rate": round((max(0, total_nodes - blocked_nodes) / max(1, total_nodes)), 4) if total_nodes else 1.0,
         }
         return {"ui_plan": cloned, "node_gate_report": report}
+
+    @staticmethod
+    def _is_bbox_hint_plausible(bbox: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(bbox, dict):
+            return False
+        x0 = float(bbox.get("x0") or 0.0)
+        x1 = float(bbox.get("x1") or 0.0)
+        top = float(bbox.get("top") or 0.0)
+        bottom = float(bbox.get("bottom") or 0.0)
+        page_width = float(bbox.get("page_width") or 0.0)
+        page_height = float(bbox.get("page_height") or 0.0)
+        if x1 <= x0 or bottom <= top:
+            return False
+        if page_width > 0 and (x0 < -1 or x1 > page_width * 1.1):
+            return False
+        if page_height > 0 and (top < -1 or bottom > page_height * 1.1):
+            return False
+        return True
+
+    @classmethod
+    def _is_geometry_plausible(cls, geometry: Optional[Dict[str, Any]]) -> bool:
+        if geometry is None:
+            return True
+        if not isinstance(geometry, dict):
+            return False
+        page_width = float(geometry.get("page_width") or 0.0)
+        page_height = float(geometry.get("page_height") or 0.0)
+        polygons = list(geometry.get("polygons") or [])
+        if not polygons:
+            return False
+        for polygon in polygons:
+            points = list((polygon or {}).get("points") or [])
+            if len(points) < 3:
+                return False
+            for point in points:
+                if not isinstance(point, dict):
+                    return False
+                x = float(point.get("x") or 0.0)
+                y = float(point.get("y") or 0.0)
+                if page_width > 0 and (x < -1 or x > page_width * 1.1):
+                    return False
+                if page_height > 0 and (y < -1 or y > page_height * 1.1):
+                    return False
+        return True
 
     @staticmethod
     def _bbox_iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -8763,6 +9050,7 @@ class LiteratureReaderComposeService:
             else set()
         )
         min_conf = float(getattr(settings, "reader_anchor_min_confidence", 0.78) or 0.78)
+        style_cues = dict((base_payload or {}).get("style_cues") or {}) if isinstance(base_payload, dict) else {}
 
         def _next_id(node_type: str) -> str:
             nonlocal auto_seq
@@ -8803,6 +9091,7 @@ class LiteratureReaderComposeService:
                 if isinstance(anchors, list):
                     normalized_rows: List[Dict[str, Any]] = []
                     source_block_id = str((node.get("props") or {}).get("source_block_id") or "")
+                    node_text = self._normalize_spaces(self._extract_node_text(node))
                     for row in anchors:
                         if not isinstance(row, dict):
                             continue
@@ -8829,6 +9118,45 @@ class LiteratureReaderComposeService:
                             if isinstance(geometry, dict):
                                 normalized["geometry_version"] = str(row.get("geometry_version") or "poly_v1")
                                 normalized["geometry"] = geometry
+                            if not (
+                                self._is_bbox_hint_plausible(
+                                    normalized.get("bbox_hint") if isinstance(normalized.get("bbox_hint"), dict) else None
+                                )
+                                and self._is_geometry_plausible(
+                                    normalized.get("geometry") if isinstance(normalized.get("geometry"), dict) else None
+                                )
+                            ):
+                                rebuild_quote = self._normalize_spaces(
+                                    str(normalized.get("quote_text") or normalized.get("quote") or row.get("quote_text") or "")
+                                )
+                                rebuilt_bbox = self._build_bbox_hint(
+                                    style_cues=style_cues,
+                                    quote_text=rebuild_quote or node_text,
+                                    source_anchor=normalized,
+                                )
+                                if isinstance(rebuilt_bbox, dict):
+                                    normalized["bbox_hint"] = rebuilt_bbox
+                                    normalized["geometry_version"] = "poly_v1"
+                                    normalized["geometry"] = {
+                                        "polygons": [
+                                            {
+                                                "points": self._build_rect_polygon(
+                                                    x0=float(rebuilt_bbox.get("x0") or 0.0),
+                                                    x1=float(rebuilt_bbox.get("x1") or 0.0),
+                                                    top=float(rebuilt_bbox.get("top") or 0.0),
+                                                    bottom=float(rebuilt_bbox.get("bottom") or 0.0),
+                                                ),
+                                                "source": "bbox_rebuilt",
+                                                "component_id": "comp_1",
+                                            }
+                                        ],
+                                        "page_width": rebuilt_bbox.get("page_width"),
+                                        "page_height": rebuilt_bbox.get("page_height"),
+                                    }
+                                else:
+                                    normalized["bbox_hint"] = None
+                                    normalized["geometry_version"] = None
+                                    normalized["geometry"] = None
                             source_word_ids = [
                                 str(item).strip()
                                 for item in list(row.get("source_word_ids") or [])[:600]
@@ -9597,6 +9925,253 @@ class LiteratureReaderComposeService:
         paragraph_rows = [row for row in paragraph_rows if str(row.get("text") or "").strip()]
         return paragraph_rows if len(paragraph_rows) >= 2 else []
 
+    @staticmethod
+    def _looks_like_caption_paragraph_text(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return bool(re.match(r"^(fig(?:ure)?\.?\s*\d+[a-z]?|table\s*\d+[a-z]?)\b", normalized, flags=re.IGNORECASE))
+
+    def _merge_line_level_paragraph_runs(
+        self,
+        *,
+        page: int,
+        nodes: Sequence[Dict[str, Any]],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        def _canonical_block_ids(raw_ids: Sequence[Any]) -> List[str]:
+            output: List[str] = []
+            for item in list(raw_ids or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                if canonical and canonical not in output:
+                    output.append(canonical)
+            return output
+
+        def _layout_uid_for_node(node: Mapping[str, Any]) -> str:
+            for canonical in _canonical_block_ids(node.get("source_block_ids") or []):
+                row = block_group_index.get(canonical) or {}
+                layout_uid = str(row.get("layout_unique_id") or "").strip()
+                if layout_uid:
+                    return layout_uid
+            return ""
+
+        def _zone_type_for_node(node: Mapping[str, Any]) -> str:
+            return str(node.get("zone_type") or "").strip().lower()
+
+        def _anchor_key(row: Mapping[str, Any]) -> str:
+            anchor_id = str(row.get("anchor_id") or "").strip()
+            if anchor_id:
+                return anchor_id
+            canonical = str(row.get("canonical_block_id") or "").strip()
+            start = str(row.get("start_char") or "")
+            end = str(row.get("end_char") or "")
+            return f"{canonical}:{start}:{end}"
+
+        merged: List[Dict[str, Any]] = []
+        idx = 0
+        rows = [dict(item) for item in list(nodes or []) if isinstance(item, dict)]
+        while idx < len(rows):
+            node = rows[idx]
+            node_type = str(node.get("type") or "").strip()
+            if node_type != "ParagraphProse" or _zone_type_for_node(node) == "side_context":
+                merged.append(node)
+                idx += 1
+                continue
+
+            layout_uid = _layout_uid_for_node(node)
+            if not layout_uid:
+                merged.append(node)
+                idx += 1
+                continue
+
+            run = [node]
+            merged_block_ids = _canonical_block_ids(node.get("source_block_ids") or [])
+            merged_anchors = [
+                dict(anchor)
+                for anchor in list(node.get("source_anchor_refs") or [])
+                if isinstance(anchor, Mapping)
+            ]
+            next_idx = idx + 1
+            while next_idx < len(rows):
+                candidate = rows[next_idx]
+                if str(candidate.get("type") or "").strip() != "ParagraphProse":
+                    break
+                if _zone_type_for_node(candidate) == "side_context":
+                    break
+                if _layout_uid_for_node(candidate) != layout_uid:
+                    break
+                run.append(candidate)
+                for canonical in _canonical_block_ids(candidate.get("source_block_ids") or []):
+                    if canonical not in merged_block_ids:
+                        merged_block_ids.append(canonical)
+                for anchor in list(candidate.get("source_anchor_refs") or []):
+                    if not isinstance(anchor, Mapping):
+                        continue
+                    if _anchor_key(anchor) not in {_anchor_key(item) for item in merged_anchors}:
+                        merged_anchors.append(dict(anchor))
+                next_idx += 1
+
+            if len(run) == 1:
+                merged.append(node)
+                idx = next_idx
+                continue
+
+            merged_node = dict(run[0])
+            props = dict(merged_node.get("props") or {})
+            rebuilt_text = self._rebuild_text_from_block_groups(
+                canonical_ids=merged_block_ids,
+                block_group_index=block_group_index,
+            )
+            inferred = self._infer_paragraph_rows_from_block_groups(
+                canonical_ids=merged_block_ids,
+                block_group_index=block_group_index,
+            )
+            if inferred:
+                props["paragraphs"] = inferred
+                props["text"] = "\n\n".join(
+                    str(item.get("text") or "").strip()
+                    for item in inferred
+                    if str(item.get("text") or "").strip()
+                )
+            else:
+                props["text"] = rebuilt_text or str(props.get("text") or "").strip() or "[empty]"
+            merged_node["props"] = props
+            merged_node["source_block_ids"] = merged_block_ids
+            if merged_anchors:
+                merged_node["source_anchor_refs"] = merged_anchors
+            merged.append(merged_node)
+            idx = next_idx
+        return merged
+
+    def _reposition_and_caption_figure_panels(
+        self,
+        *,
+        page: int,
+        nodes: Sequence[Dict[str, Any]],
+        block_group_index: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        rows = [dict(item) for item in list(nodes or []) if isinstance(item, dict)]
+
+        def _canonical_block_ids(raw_ids: Sequence[Any]) -> List[str]:
+            output: List[str] = []
+            for item in list(raw_ids or []):
+                canonical = self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                if canonical and canonical not in output:
+                    output.append(canonical)
+            return output
+
+        block_order_index: Dict[str, int] = {}
+        for order, canonical in enumerate(block_group_index.keys(), start=1):
+            if canonical not in block_order_index:
+                block_order_index[canonical] = order
+
+        def _first_block_order(node: Mapping[str, Any]) -> int:
+            orders = [
+                block_order_index.get(canonical, 10**9)
+                for canonical in _canonical_block_ids(node.get("source_block_ids") or [])
+            ]
+            return min(orders) if orders else 10**9
+
+        def _anchor_key(row: Mapping[str, Any]) -> str:
+            anchor_id = str(row.get("anchor_id") or "").strip()
+            if anchor_id:
+                return anchor_id
+            canonical = str(row.get("canonical_block_id") or "").strip()
+            start = str(row.get("start_char") or "")
+            end = str(row.get("end_char") or "")
+            return f"{canonical}:{start}:{end}"
+
+        idx = 0
+        while idx < len(rows):
+            node = rows[idx]
+            if str(node.get("type") or "").strip() != "FigurePanel":
+                idx += 1
+                continue
+            figure_order = _first_block_order(node)
+            target_idx = idx
+            for probe_idx, candidate in enumerate(rows):
+                if probe_idx == idx:
+                    continue
+                candidate_order = _first_block_order(candidate)
+                if candidate_order > figure_order:
+                    target_idx = probe_idx
+                    break
+            if target_idx < idx:
+                figure = rows.pop(idx)
+                rows.insert(target_idx, figure)
+                idx = target_idx
+            else:
+                idx += 1
+
+        idx = 0
+        while idx < len(rows):
+            node = rows[idx]
+            if str(node.get("type") or "").strip() != "FigurePanel":
+                idx += 1
+                continue
+            props = dict(node.get("props") or {})
+            caption = self._repair_text_artifacts(self._normalize_spaces(str(props.get("caption") or "")))
+            needs_caption_rescue = not self._looks_like_caption_paragraph_text(caption)
+            if not needs_caption_rescue:
+                idx += 1
+                continue
+            candidate_idx: Optional[int] = None
+            probe_idx = idx + 1
+            while probe_idx < len(rows):
+                candidate = rows[probe_idx]
+                candidate_type = str(candidate.get("type") or "").strip()
+                if candidate_type == "FigurePanel":
+                    break
+                if candidate_type != "ParagraphProse":
+                    probe_idx += 1
+                    continue
+                candidate_props = dict(candidate.get("props") or {})
+                candidate_text = self._repair_text_artifacts(
+                    self._normalize_spaces(str(candidate_props.get("text") or ""))
+                )
+                if self._looks_like_caption_paragraph_text(candidate_text):
+                    candidate_idx = probe_idx
+                    break
+                probe_idx += 1
+            if candidate_idx is None:
+                idx += 1
+                continue
+            candidate = rows[candidate_idx]
+            candidate_props = dict(candidate.get("props") or {})
+            candidate_text = self._repair_text_artifacts(self._normalize_spaces(str(candidate_props.get("text") or "")))
+            props["caption"] = candidate_text
+            label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", candidate_text, flags=re.IGNORECASE)
+            if label_match and not str(props.get("source_label") or "").strip():
+                props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
+            candidate_block_ids = _canonical_block_ids(candidate.get("source_block_ids") or [])
+            figure_block_ids = _canonical_block_ids(node.get("source_block_ids") or [])
+            for canonical in candidate_block_ids:
+                if canonical not in figure_block_ids:
+                    figure_block_ids.append(canonical)
+            if figure_block_ids:
+                node["source_block_ids"] = figure_block_ids
+            figure_anchors = [
+                dict(anchor)
+                for anchor in list(node.get("source_anchor_refs") or [])
+                if isinstance(anchor, Mapping)
+            ]
+            existing_anchor_keys = {_anchor_key(anchor) for anchor in figure_anchors}
+            for anchor in list(candidate.get("source_anchor_refs") or []):
+                if not isinstance(anchor, Mapping):
+                    continue
+                key = _anchor_key(anchor)
+                if key and key not in existing_anchor_keys:
+                    figure_anchors.append(dict(anchor))
+                    existing_anchor_keys.add(key)
+            if figure_anchors:
+                node["source_anchor_refs"] = figure_anchors
+            node["props"] = props
+            rows[idx] = node
+            rows.pop(candidate_idx)
+            continue
+
+        return rows
+
     def _repair_heading_text(self, text: str) -> str:
         value = self._normalize_spaces(text)
         value = value.replace("RESEA RCH", "RESEARCH")
@@ -10070,6 +10645,103 @@ class LiteratureReaderComposeService:
                         omitted.append(canonical)
         return omitted
 
+    def _annotate_layout_monotony_quality_report(
+        self,
+        *,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+        quality_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cloned = dict(quality_report or {})
+        components = [row for row in list((ui_plan or {}).get("components") or []) if isinstance(row, dict)]
+        flattened = self._flatten_components(components)
+        prose_types = {"ParagraphProse"}
+        neutral_types = {"SectionHeading", "Separator"}
+        ignored_types = {"ContextRail", "AnnotationRail", "QualityPanel", "QualityBadge", "InlineQuerySlot"}
+
+        visible_nodes: List[Dict[str, Any]] = []
+        for node in flattened:
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("display") or "default").strip().lower() == "hidden_until_expand":
+                continue
+            if str(node.get("region") or "").strip().lower() == "sidebar":
+                continue
+            node_type = str(node.get("type") or "").strip()
+            if node_type in ignored_types:
+                continue
+            visible_nodes.append(node)
+
+        prose_count = 0
+        max_consecutive_prose = 0
+        current_consecutive_prose = 0
+        non_prose_interrupt_count = 0
+        for node in visible_nodes:
+            node_type = str(node.get("type") or "").strip()
+            if node_type in prose_types:
+                prose_count += 1
+                current_consecutive_prose += 1
+                max_consecutive_prose = max(max_consecutive_prose, current_consecutive_prose)
+                continue
+            current_consecutive_prose = 0
+            if node_type not in neutral_types:
+                non_prose_interrupt_count += 1
+
+        visible_component_count = len(visible_nodes)
+        prose_ratio = float(prose_count / max(1, visible_component_count)) if visible_component_count else 0.0
+
+        structured_material_present = False
+        block_groups = [
+            row
+            for row in list(((payload or {}).get("page_structure_v3") or {}).get("block_groups") or [])
+            if isinstance(row, dict)
+        ]
+        for row in block_groups:
+            kind = str(row.get("kind") or "").strip().lower()
+            text = self._normalize_spaces(str(row.get("text") or ""))
+            if kind in {"list_item", "caption", "figure_meta", "table_caption", "figure", "table"}:
+                structured_material_present = True
+                break
+            if text and re.search(
+                r"\b(method|methods|protocol|participant|participants|procedure|study design|exam setup|dataset|doi)\b",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                structured_material_present = True
+                break
+        if not structured_material_present:
+            for row in list((payload or {}).get("assets") or []):
+                if not isinstance(row, dict):
+                    continue
+                href = str(row.get("href") or "").strip()
+                label = str(row.get("label") or "").strip()
+                if "doi.org" in href.lower() or "doi:" in label.lower():
+                    structured_material_present = True
+                    break
+
+        layout_monotony = bool(
+            structured_material_present
+            and visible_component_count >= 3
+            and (prose_ratio > 0.75 or max_consecutive_prose > 2)
+        )
+
+        cloned["layout_monotony"] = layout_monotony
+        cloned["flowy_layout_detected"] = layout_monotony
+        cloned["max_consecutive_prose_nodes"] = int(max_consecutive_prose)
+        cloned["non_prose_interrupt_count"] = int(non_prose_interrupt_count)
+        cloned["prose_component_ratio"] = round(float(prose_ratio), 4)
+        cloned["visible_component_count"] = int(visible_component_count)
+
+        warnings = [
+            str(item).strip()
+            for item in list(cloned.get("warnings") or [])
+            if str(item).strip()
+        ]
+        if layout_monotony:
+            warnings.append("flowy_layout_detected")
+        cloned["warnings"] = list(dict.fromkeys(warnings))
+        return cloned
+
     def _build_review_diagnostics(
         self,
         *,
@@ -10189,6 +10861,20 @@ class LiteratureReaderComposeService:
                     "message": "Quality report still contains validation errors.",
                     "component_ids": [],
                     "meta": {"errors": validation_errors[:24]},
+                }
+            )
+        if bool((quality_report or {}).get("layout_monotony")):
+            diagnostics.append(
+                {
+                    "code": "flowy_layout_detected",
+                    "severity": "warn",
+                    "message": "Layout still reads as a prose-heavy stack despite structured material on the page.",
+                    "component_ids": [],
+                    "meta": {
+                        "max_consecutive_prose_nodes": int((quality_report or {}).get("max_consecutive_prose_nodes") or 0),
+                        "non_prose_interrupt_count": int((quality_report or {}).get("non_prose_interrupt_count") or 0),
+                        "prose_component_ratio": float((quality_report or {}).get("prose_component_ratio") or 0.0),
+                    },
                 }
             )
         return diagnostics
@@ -10660,8 +11346,10 @@ class LiteratureReaderComposeService:
         compare_mode: Optional[bool],
         citation_tldr: Optional[bool],
         snapshot_label: Optional[str] = None,
+        prefer_cache_clone: bool = True,
+        allow_recompute_on_cache_miss: bool = True,
     ) -> Dict[str, Any]:
-        payload, _ = await self.build_or_get_composed_payload(
+        payload = await self._resolve_review_session_seed_payload(
             db=db,
             user_id=int(user_id),
             paper=paper,
@@ -10677,12 +11365,47 @@ class LiteratureReaderComposeService:
             detail_level=detail_level,
             compare_mode=compare_mode,
             citation_tldr=citation_tldr,
-            publish_ready_event_enabled=False,
+            prefer_cache_clone=bool(prefer_cache_clone),
+            allow_recompute_on_cache_miss=bool(allow_recompute_on_cache_miss),
         )
+        return await self.create_review_session_from_payload(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            payload=payload,
+            snapshot_label=snapshot_label,
+        )
+
+    async def create_review_session_from_payload(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        payload: Mapping[str, Any],
+        snapshot_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        cloned_payload = json.loads(json.dumps(dict(payload or {}), ensure_ascii=False, default=str))
+        if int(cloned_payload.get("paper_id") or int(paper.id)) != int(paper.id):
+            raise ValueError("review_payload_paper_mismatch")
+        page = max(1, int(cloned_payload.get("page") or 0))
+        cloned_payload["paper_id"] = int(paper.id)
+        cloned_payload["page"] = int(page)
+        cloned_payload = self._ensure_payload_contract(page=page, payload=cloned_payload)
+        payload_source_signature = str(cloned_payload.get("source_signature") or "").strip()
+        if payload_source_signature and not bool(cloned_payload.get("overlay_applied")):
+            cloned_payload = await self._apply_overlay_for_user(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper.id),
+                page=page,
+                source_signature=payload_source_signature,
+                payload=cloned_payload,
+            )
         session_id = uuid.uuid4().hex
         snapshot_id = str(snapshot_label or f"snapshot_{uuid.uuid4().hex[:10]}").strip() or f"snapshot_{uuid.uuid4().hex[:10]}"
         snapshot = self._build_review_snapshot(
-            payload=payload,
+            payload=cloned_payload,
             session_id=session_id,
             snapshot_id=snapshot_id,
             parent_snapshot_id=None,
@@ -10694,7 +11417,7 @@ class LiteratureReaderComposeService:
             "session_id": session_id,
             "paper_id": int(paper.id),
             "page": int(page),
-            "source_signature": str(payload.get("source_signature") or ""),
+            "source_signature": str(cloned_payload.get("source_signature") or ""),
             "latest_snapshot_id": snapshot_id,
             "snapshot_order": [snapshot_id],
             "snapshots": {snapshot_id: snapshot},
@@ -10702,6 +11425,103 @@ class LiteratureReaderComposeService:
         }
         await self._write_review_session(session)
         return snapshot
+
+    async def _resolve_review_session_seed_payload(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        force_refresh: bool,
+        regenerate: bool,
+        latency_budget_ms: Optional[int],
+        quality_target: Optional[float],
+        max_iterations: Optional[int],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: Optional[str],
+        compare_mode: Optional[bool],
+        citation_tldr: Optional[bool],
+        prefer_cache_clone: bool,
+        allow_recompute_on_cache_miss: bool,
+    ) -> Dict[str, Any]:
+        page_num = max(1, int(page))
+        pipeline_mode = self._pipeline_mode()
+        pipeline_version = self._pipeline_version()
+        normalized_theme = self._normalize_theme_mode(theme_mode)
+        normalized_detail = self._normalize_detail_level(detail_level)
+        normalized_max_iterations = self._normalize_max_iterations(max_iterations)
+        target_source_signature = await self._build_source_signature(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            theme_mode=normalized_theme,
+            detail_level=normalized_detail,
+            compare_mode=bool(compare_mode),
+            citation_tldr=bool(citation_tldr),
+            max_iterations=normalized_max_iterations,
+        )
+
+        if prefer_cache_clone and not force_refresh and not regenerate:
+            cached_payload = await self._read_review_seed_payload_from_cache(
+                db=db,
+                user_id=int(user_id),
+                paper=paper,
+                page=page_num,
+                source_signature=target_source_signature,
+                pipeline_mode=pipeline_mode,
+                pipeline_version=pipeline_version,
+            )
+            if isinstance(cached_payload, dict):
+                return cached_payload
+            latest_payload = await self._read_latest_payload_from_db(
+                db=db,
+                paper_id=int(paper.id),
+                page=page_num,
+            )
+            if isinstance(latest_payload, dict):
+                logger.info(
+                    "[ReaderComposeService] review session cloned latest cached payload "
+                    f"paper={paper.id} page={page_num} requested_sig={self._signature_hash(target_source_signature)} "
+                    f"payload_sig={self._signature_hash(str(latest_payload.get('source_signature') or ''))}"
+                )
+                latest_payload = self._with_cache_meta(latest_payload, cache_hit=True, cache_layer="db")
+                latest_source_signature = str(latest_payload.get("source_signature") or "").strip() or target_source_signature
+                latest_payload = await self._apply_overlay_for_user(
+                    db=db,
+                    user_id=int(user_id),
+                    paper_id=int(paper.id),
+                    page=page_num,
+                    source_signature=latest_source_signature,
+                    payload=latest_payload,
+                )
+                return self._ensure_payload_contract(page=page_num, payload=latest_payload)
+            if not allow_recompute_on_cache_miss:
+                raise ValueError("review_cache_not_found")
+
+        payload, _ = await self.build_or_get_composed_payload(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=page_num,
+            selected_kb_id=selected_kb_id,
+            force_refresh=bool(force_refresh),
+            regenerate=bool(regenerate),
+            latency_budget_ms=latency_budget_ms,
+            quality_target=quality_target,
+            max_iterations=max_iterations,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+            publish_ready_event_enabled=False,
+        )
+        return payload
 
     async def get_review_snapshot(
         self,
@@ -11217,6 +12037,12 @@ class LiteratureReaderComposeService:
                 "applied_at": self._utcnow_iso(),
             }
             cloned["pipeline_contract_meta"] = pipeline_contract_meta
+        quality_report = self._annotate_layout_monotony_quality_report(
+            payload=cloned,
+            ui_plan=ui_plan,
+            quality_report=quality_report,
+        )
+        cloned["quality_report"] = quality_report
         cloned["validation_report"] = validation_report
 
         main_block_ids, aux_block_ids = self._partition_main_aux_block_ids(
@@ -11252,6 +12078,7 @@ class LiteratureReaderComposeService:
     ) -> List[Dict[str, Any]]:
         docmind_structure = dict((payload or {}).get("docmind_structure") or {})
         page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        style_cues = dict((payload or {}).get("style_cues") or {})
         block_group_index = self._build_block_group_index(page=page, payload=payload)
         layout_block_id_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
 
@@ -11383,7 +12210,57 @@ class LiteratureReaderComposeService:
                             props["image_url"] = page_image_url
                     node["props"] = props
 
+                node_text = self._normalize_spaces(self._extract_node_text(node))
+                repaired_anchor_refs: List[Dict[str, Any]] = []
+                for anchor in list(node.get("source_anchor_refs") or []):
+                    if not isinstance(anchor, dict):
+                        continue
+                    repaired = dict(anchor)
+                    bbox_hint = repaired.get("bbox_hint") if isinstance(repaired.get("bbox_hint"), dict) else None
+                    geometry = repaired.get("geometry") if isinstance(repaired.get("geometry"), dict) else None
+                    if not (self._is_bbox_hint_plausible(bbox_hint) and self._is_geometry_plausible(geometry)):
+                        rebuild_quote = self._normalize_spaces(
+                            str(repaired.get("quote_text") or repaired.get("quote") or "")
+                        )
+                        rebuilt_bbox = self._build_bbox_hint(
+                            style_cues=style_cues,
+                            quote_text=rebuild_quote or node_text,
+                            source_anchor=repaired,
+                        )
+                        if isinstance(rebuilt_bbox, dict):
+                            repaired["bbox_hint"] = rebuilt_bbox
+                            repaired["geometry_version"] = "poly_v1"
+                            repaired["geometry"] = {
+                                "polygons": [
+                                    {
+                                        "points": self._build_rect_polygon(
+                                            x0=float(rebuilt_bbox.get("x0") or 0.0),
+                                            x1=float(rebuilt_bbox.get("x1") or 0.0),
+                                            top=float(rebuilt_bbox.get("top") or 0.0),
+                                            bottom=float(rebuilt_bbox.get("bottom") or 0.0),
+                                        ),
+                                        "source": "bbox_rebuilt",
+                                        "component_id": "comp_1",
+                                    }
+                                ],
+                                "page_width": rebuilt_bbox.get("page_width"),
+                                "page_height": rebuilt_bbox.get("page_height"),
+                            }
+                    repaired_anchor_refs.append(repaired)
+                if repaired_anchor_refs:
+                    node["source_anchor_refs"] = repaired_anchor_refs
+
                 output.append(node)
+            output = self._merge_line_level_paragraph_runs(
+                page=page,
+                nodes=output,
+                block_group_index=block_group_index,
+            )
+            output = self._reposition_and_caption_figure_panels(
+                page=page,
+                nodes=output,
+                block_group_index=block_group_index,
+            )
             return output
 
         return _walk(nodes)
@@ -11663,6 +12540,132 @@ class LiteratureReaderComposeService:
         if not isinstance(row.payload_json, dict):
             return None
         return dict(row.payload_json)
+
+    async def _read_latest_payload_from_db(
+        self,
+        *,
+        db: AsyncSession,
+        paper_id: int,
+        page: int,
+        limit: int = 8,
+    ) -> Optional[Dict[str, Any]]:
+        stmt = (
+            select(PaperReaderPageCache)
+            .where(
+                and_(
+                    PaperReaderPageCache.paper_id == int(paper_id),
+                    PaperReaderPageCache.page == int(page),
+                )
+            )
+            .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
+            .limit(max(1, int(limit)))
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+        for row in rows:
+            payload = dict(getattr(row, "payload_json", {}) or {})
+            if not payload:
+                continue
+            if self._should_rebuild_cached_payload(payload):
+                continue
+            return payload
+        return None
+
+    async def _read_compatible_payload_from_db(
+        self,
+        *,
+        db: AsyncSession,
+        paper_id: int,
+        page: int,
+        source_signature: str,
+        limit: int = 8,
+    ) -> Optional[Dict[str, Any]]:
+        prefix = self._compatible_source_signature_prefix(source_signature)
+        if not prefix:
+            return None
+        stmt = (
+            select(PaperReaderPageCache)
+            .where(
+                and_(
+                    PaperReaderPageCache.paper_id == int(paper_id),
+                    PaperReaderPageCache.page == int(page),
+                    PaperReaderPageCache.source_signature.like(f"{prefix}%"),
+                )
+            )
+            .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
+            .limit(max(1, int(limit)))
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+        for row in rows:
+            if str(getattr(row, "source_signature", "") or "").strip() == str(source_signature or "").strip():
+                continue
+            payload = dict(getattr(row, "payload_json", {}) or {})
+            if not payload:
+                continue
+            if self._should_rebuild_cached_payload(payload):
+                continue
+            return payload
+        return None
+
+    async def _read_review_seed_payload_from_cache(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        source_signature: str,
+        pipeline_mode: str,
+        pipeline_version: str,
+    ) -> Optional[Dict[str, Any]]:
+        sig_hash = self._signature_hash(source_signature)
+        redis_key = self._cache_key(
+            user_id=int(user_id),
+            paper_id=int(paper.id),
+            page=int(page),
+            sig_hash=sig_hash,
+            pipeline_mode=pipeline_mode,
+            pipeline_version=pipeline_version,
+        )
+        cached_payload = await self._read_payload_from_redis(redis_key)
+        if isinstance(cached_payload, dict) and not self._should_rebuild_cached_payload(cached_payload):
+            logger.info(
+                "[ReaderComposeService] review session cloned exact redis cache "
+                f"paper={paper.id} page={page}"
+            )
+            cached_payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+            cached_payload = await self._apply_overlay_for_user(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper.id),
+                page=int(page),
+                source_signature=str(cached_payload.get("source_signature") or source_signature),
+                payload=cached_payload,
+            )
+            return self._ensure_payload_contract(page=int(page), payload=cached_payload)
+
+        cached_row = await self._read_payload_from_db(
+            db=db,
+            paper_id=int(paper.id),
+            page=int(page),
+            source_signature=source_signature,
+        )
+        if isinstance(cached_row, dict) and not self._should_rebuild_cached_payload(cached_row):
+            logger.info(
+                "[ReaderComposeService] review session cloned exact db cache "
+                f"paper={paper.id} page={page}"
+            )
+            await self._write_payload_to_redis(redis_key, cached_row)
+            cached_row = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
+            cached_row = await self._apply_overlay_for_user(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper.id),
+                page=int(page),
+                source_signature=str(cached_row.get("source_signature") or source_signature),
+                payload=cached_row,
+            )
+            return self._ensure_payload_contract(page=int(page), payload=cached_row)
+        return None
 
     async def _upsert_payload_to_db(
         self,

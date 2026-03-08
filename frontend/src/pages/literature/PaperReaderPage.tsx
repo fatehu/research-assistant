@@ -37,6 +37,8 @@ import {
   Typography,
 } from 'antd'
 import { Document as PdfDocument, Page as PdfPage, pdfjs } from 'react-pdf'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   AnnotationType,
   CommentFilter,
@@ -348,16 +350,56 @@ function collectPageResourceLinks(paper: Paper | null, pageText: string): PageRe
   return Array.from(linkMap.values()).slice(0, 12)
 }
 
+const READING_FLOW_COMPONENT_TYPES = new Set([
+  'SectionHeading',
+  'Separator',
+  'ParagraphProse',
+  'ListBlock',
+  'FigurePanel',
+  'TablePanel',
+  'EquationBlock',
+  'AbstractCard',
+  'MethodologyCard',
+  'CalloutBox',
+  'CompareInsightsCard',
+  'InsightClusterCard',
+  'SectionBridgeCard',
+  'InlineQuerySlot',
+  'AnswerCard',
+])
+
 const CONTEXT_ONLY_COMPONENT_TYPES = new Set([
   'PaperHeaderCard',
   'MetadataSidebarCard',
   'ContextRail',
   'SectionTOC',
   'CitationLinks',
+  'CitationCard',
+  'PdfSnippetCard',
+  'KeyTakeaways',
   'AnnotationRail',
   'QualityBadge',
   'QualityPanel',
 ])
+
+function getReaderNodePlacement(node: ReaderComponentNode): 'main' | 'context' {
+  const type = String(node.type || '').trim()
+  if (CONTEXT_ONLY_COMPONENT_TYPES.has(type)) return 'context'
+  if (READING_FLOW_COMPONENT_TYPES.has(type)) return 'main'
+
+  const zoneType = String(node.zone_type || '').trim().toLowerCase()
+  const columnId = String(node.column_id || '').trim().toLowerCase()
+  const region = String(node.region || '').trim().toLowerCase()
+  if (zoneType === 'side_context') return 'context'
+  if (columnId === 'sidebar' || region === 'sidebar') return 'context'
+
+  if (type === 'ParagraphProse' || type === 'ListBlock' || type === 'CalloutBox' || type === 'SectionHeading') {
+    const hints = collectReaderNodeTextHints(node)
+    if (hints.some((item) => isLikelyContextOnlyText(item))) return 'context'
+  }
+
+  return 'main'
+}
 
 function collectReaderNodeTextHints(node: ReaderComponentNode): string[] {
   const props = ((node.props && typeof node.props === 'object') ? node.props : {}) as Record<string, unknown>
@@ -414,21 +456,7 @@ function isLikelyContextOnlyText(raw: string): boolean {
 }
 
 function isContextOnlyReaderNode(node: ReaderComponentNode): boolean {
-  const type = String(node.type || '').trim()
-  if (CONTEXT_ONLY_COMPONENT_TYPES.has(type)) return true
-
-  const zoneType = String(node.zone_type || '').trim().toLowerCase()
-  const columnId = String(node.column_id || '').trim().toLowerCase()
-  const region = String(node.region || '').trim().toLowerCase()
-  if (zoneType === 'side_context') return true
-  if (columnId === 'sidebar' || region === 'sidebar') return true
-
-  if (type === 'ParagraphProse' || type === 'ListBlock' || type === 'CalloutBox' || type === 'SectionHeading') {
-    const hints = collectReaderNodeTextHints(node)
-    if (hints.some((item) => isLikelyContextOnlyText(item))) return true
-  }
-
-  return false
+  return getReaderNodePlacement(node) === 'context'
 }
 
 function isLikelyStandalonePageNumber(text: string): boolean {
@@ -713,10 +741,6 @@ function extractAcademicPageText(textContent: any): string {
   return output.join('\n').trim()
 }
 
-type AnswerSegment =
-  | { type: 'text'; value: string }
-  | { type: 'citation'; value: string; index: number }
-
 type PendingSectionJump = {
   sectionTitle: string
   expectedPage?: number
@@ -738,6 +762,7 @@ type AnchorPreviewState = {
   visible: boolean
   pinned: boolean
   loading: boolean
+  preview_key?: string
   page: number
   text: string
   title: string
@@ -750,33 +775,49 @@ type AnchorPreviewState = {
   fallback_used?: boolean
 }
 
-function splitAnswerByCitation(answer: string): AnswerSegment[] {
-  const value = String(answer || '')
-  if (!value) return [{ type: 'text', value: '' }]
-  const parts: AnswerSegment[] = []
-  const citationRegex = /\[(?:来源)?(\d{1,3})\]/g
-  let last = 0
-  let match: RegExpExecArray | null = citationRegex.exec(value)
-  while (match) {
-    const full = match[0]
-    const numText = match[1]
-    const start = match.index
-    if (start > last) {
-      parts.push({ type: 'text', value: value.slice(last, start) })
+type ReaderAnchorPreviewOptions = {
+  pinPreview?: boolean
+  segmentIndex?: number
+  sourceBlockIds?: string[]
+}
+
+type PageStructureBlockSpatialRow = {
+  blockId: string
+  text: string
+  bbox?: ReaderComponentSourceAnchor['bbox_hint']
+  polygon?: Array<{ x: number; y: number }>
+}
+
+type PageStructureSpatialDimensions = {
+  pageWidth?: number
+  pageHeight?: number
+}
+
+function normalizeAnswerMarkdown(answer: string): string {
+  const value = String(answer || '').replace(/\r\n?/g, '\n').trim()
+  if (!value) return ''
+
+  const normalizedLines: string[] = []
+  const lines = value.split('\n')
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+$/g, '')
+    const trimmed = line.trim()
+    const isHeading = /^#{1,6}\s+\S/.test(trimmed)
+    const isList = /^([-*+]|\d+\.)\s+\S/.test(trimmed)
+    if ((isHeading || isList) && normalizedLines.length > 0 && normalizedLines[normalizedLines.length - 1] !== '') {
+      normalizedLines.push('')
     }
-    const idx = Number(numText)
-    if (Number.isFinite(idx) && idx > 0) {
-      parts.push({ type: 'citation', value: full, index: idx })
-    } else {
-      parts.push({ type: 'text', value: full })
+    normalizedLines.push(line)
+    if (isHeading && normalizedLines[normalizedLines.length - 1] !== '') {
+      normalizedLines.push('')
     }
-    last = start + full.length
-    match = citationRegex.exec(value)
   }
-  if (last < value.length) {
-    parts.push({ type: 'text', value: value.slice(last) })
-  }
-  return parts
+
+  return normalizedLines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\[(?:来源)?(\d{1,3})\]/g, (_, indexText: string) => `[来源${indexText}](source://${indexText})`)
+    .trim()
 }
 
 function normalizeSectionKey(value: string | undefined): string {
@@ -1113,8 +1154,8 @@ function mergeAnchorsForPreview(
     page,
     start_char: startChar,
     end_char: Math.max(startChar + 1, endChar),
-    quote: undefined,
-    quote_text: undefined,
+    quote: cluster.length <= 1 ? primary.quote : undefined,
+    quote_text: cluster.length <= 1 ? primary.quote_text : undefined,
     anchor_confidence: confidence > 0 ? confidence : primary.anchor_confidence,
     segment_index: 0,
     segment_total: cluster.length,
@@ -1132,6 +1173,76 @@ function mergeAnchorsForPreview(
   }
 }
 
+function isTextLikeAnchor(anchor: ReaderComponentSourceAnchor): boolean {
+  const bbox = anchor.bbox_hint
+  if (!bbox) return false
+  const width = Math.max(0, Number(bbox.x1 || 0) - Number(bbox.x0 || 0))
+  const height = Math.max(0, Number(bbox.bottom || 0) - Number(bbox.top || 0))
+  if (width <= 0 || height <= 0) return false
+  return height <= 96 && width >= 48
+}
+
+function horizontalOverlapRatio(
+  left: ReaderComponentSourceAnchor,
+  right: ReaderComponentSourceAnchor,
+): number {
+  const leftBox = left.bbox_hint
+  const rightBox = right.bbox_hint
+  if (!leftBox || !rightBox) return 0
+  const leftWidth = Math.max(0, Number(leftBox.x1 || 0) - Number(leftBox.x0 || 0))
+  const rightWidth = Math.max(0, Number(rightBox.x1 || 0) - Number(rightBox.x0 || 0))
+  if (leftWidth <= 0 || rightWidth <= 0) return 0
+  const overlap = Math.max(0, Math.min(Number(leftBox.x1 || 0), Number(rightBox.x1 || 0)) - Math.max(Number(leftBox.x0 || 0), Number(rightBox.x0 || 0)))
+  return overlap / Math.max(1, Math.min(leftWidth, rightWidth))
+}
+
+function canClusterAdjacentTextAnchors(
+  left: ReaderComponentSourceAnchor,
+  right: ReaderComponentSourceAnchor,
+): boolean {
+  if (!isTextLikeAnchor(left) || !isTextLikeAnchor(right)) return false
+  if (Number(left.page || 0) !== Number(right.page || 0)) return false
+  const leftBox = left.bbox_hint!
+  const rightBox = right.bbox_hint!
+  const leftHeight = Math.max(1, Number(leftBox.bottom || 0) - Number(leftBox.top || 0))
+  const rightHeight = Math.max(1, Number(rightBox.bottom || 0) - Number(rightBox.top || 0))
+  const verticalGap = Math.max(0, Number(rightBox.top || 0) - Number(leftBox.bottom || 0))
+  const maxGap = Math.max(18, Math.max(leftHeight, rightHeight) * 1.8)
+  if (verticalGap > maxGap) return false
+  const overlap = horizontalOverlapRatio(left, right)
+  if (overlap >= 0.45) return true
+  const leftX0 = Number(leftBox.x0 || 0)
+  const rightX0 = Number(rightBox.x0 || 0)
+  return Math.abs(leftX0 - rightX0) <= Math.max(24, Math.min(leftHeight, rightHeight) * 3)
+}
+
+function clusterAdjacentTextAnchorsForPreview(
+  primary: ReaderComponentSourceAnchor,
+  anchors: ReaderComponentSourceAnchor[],
+): ReaderComponentSourceAnchor[] {
+  const sorted = [...anchors]
+    .filter((item) => Number(item.page || 0) === Number(primary.page || 0))
+    .sort((left, right) => {
+      const leftTop = Number(left.bbox_hint?.top || 0)
+      const rightTop = Number(right.bbox_hint?.top || 0)
+      if (leftTop !== rightTop) return leftTop - rightTop
+      return Number(left.start_char || 0) - Number(right.start_char || 0)
+    })
+  if (sorted.length <= 1 || !isTextLikeAnchor(primary)) return [primary]
+  const primaryKey = buildPreviewKey(primary)
+  const primaryIndex = sorted.findIndex((item) => buildPreviewKey(item) === primaryKey)
+  if (primaryIndex < 0) return [primary]
+  let start = primaryIndex
+  let end = primaryIndex
+  while (start > 0 && canClusterAdjacentTextAnchors(sorted[start - 1], sorted[start])) {
+    start -= 1
+  }
+  while (end < sorted.length - 1 && canClusterAdjacentTextAnchors(sorted[end], sorted[end + 1])) {
+    end += 1
+  }
+  return sorted.slice(start, end + 1)
+}
+
 function buildAnchorPreviewTarget(
   anchors: ReaderComponentSourceAnchor[],
   preferredPage?: number,
@@ -1141,8 +1252,24 @@ function buildAnchorPreviewTarget(
   const primary = pickPrimaryAnchor(orderedAnchors, preferredPage) || orderedAnchors[0]
   if (!primary) return null
   const page = Number(primary.page || preferredPage || 0)
+  const primaryCanonicalBlockId = String(
+    primary.canonical_block_id || primary.anchor_v2?.canonical_block_id || '',
+  ).trim()
   const pageAnchors = orderedAnchors.filter((item) => Number(item.page || 0) === page)
-  const previewAnchors = pageAnchors.length > 0 ? pageAnchors : [primary]
+  const sameBlockAnchors = primaryCanonicalBlockId
+    ? pageAnchors.filter((item) => {
+      const blockId = String(item.canonical_block_id || item.anchor_v2?.canonical_block_id || '').trim()
+      return blockId === primaryCanonicalBlockId
+    })
+    : []
+  const textClusterAnchors = clusterAdjacentTextAnchorsForPreview(primary, pageAnchors)
+  const previewAnchors = sameBlockAnchors.length > 1
+    ? sameBlockAnchors
+    : textClusterAnchors.length > 1
+      ? textClusterAnchors
+      : sameBlockAnchors.length > 0
+        ? sameBlockAnchors
+        : [primary]
   const previewAnchor = mergeAnchorsForPreview(primary, previewAnchors)
   return { previewAnchor, previewAnchors }
 }
@@ -1175,6 +1302,290 @@ function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
   ].join('|')
 }
 
+function normalizeSourceBlockIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function inferPageFromCanonicalBlockId(blockId: string): number | null {
+  const token = String(blockId || '').trim()
+  if (!token) return null
+  const match = token.match(/(?:^|_)p(\d+)(?:_|$)/i)
+  if (!match) return null
+  const value = Number(match[1] || 0)
+  return Number.isFinite(value) && value > 0 ? value : null
+}
+
+function canonicalizePageStructureBlockId(blockId: string): string {
+  const token = String(blockId || '').trim()
+  if (!token) return ''
+  if (/^p\d+_/i.test(token)) return token
+  const page = inferPageFromCanonicalBlockId(token)
+  if (page && !token.startsWith(`p${page}_`)) {
+    return `p${page}_${token}`
+  }
+  return token
+}
+
+function normalizeSpatialPolygon(value: unknown): Array<{ x: number; y: number }> {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => ({
+      x: Number((item as any)?.x || 0),
+      y: Number((item as any)?.y || 0),
+    }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+}
+
+function collectAnchorSpatialDimensions(
+  node: unknown,
+  state: { pageWidth: number; pageHeight: number },
+): void {
+  if (!node || typeof node !== 'object') return
+  const row = node as Record<string, unknown>
+  const anchors = Array.isArray(row.source_anchor_refs) ? row.source_anchor_refs : []
+  for (const rawAnchor of anchors) {
+    if (!rawAnchor || typeof rawAnchor !== 'object') continue
+    const anchor = rawAnchor as Record<string, unknown>
+    const bbox = (anchor.bbox_hint && typeof anchor.bbox_hint === 'object')
+      ? anchor.bbox_hint as Record<string, unknown>
+      : {}
+    const geometry = (anchor.geometry && typeof anchor.geometry === 'object')
+      ? anchor.geometry as Record<string, unknown>
+      : {}
+    const bboxWidth = Number(bbox.page_width || 0)
+    const bboxHeight = Number(bbox.page_height || 0)
+    const geometryWidth = Number(geometry.page_width || 0)
+    const geometryHeight = Number(geometry.page_height || 0)
+    if (Number.isFinite(bboxWidth) && bboxWidth > state.pageWidth) state.pageWidth = bboxWidth
+    if (Number.isFinite(bboxHeight) && bboxHeight > state.pageHeight) state.pageHeight = bboxHeight
+    if (Number.isFinite(geometryWidth) && geometryWidth > state.pageWidth) state.pageWidth = geometryWidth
+    if (Number.isFinite(geometryHeight) && geometryHeight > state.pageHeight) state.pageHeight = geometryHeight
+  }
+  const children = Array.isArray(row.children) ? row.children : []
+  for (const child of children) {
+    collectAnchorSpatialDimensions(child, state)
+  }
+}
+
+function inferPageStructureSpatialDimensions(
+  payload: Record<string, unknown> | null | undefined,
+): PageStructureSpatialDimensions {
+  const state = { pageWidth: 0, pageHeight: 0 }
+  const uiPlan = (payload?.ui_plan && typeof payload.ui_plan === 'object')
+    ? payload.ui_plan as Record<string, unknown>
+    : {}
+  const components = Array.isArray(uiPlan.components) ? uiPlan.components : []
+  for (const node of components) {
+    collectAnchorSpatialDimensions(node, state)
+  }
+  return {
+    pageWidth: state.pageWidth > 0 ? state.pageWidth : undefined,
+    pageHeight: state.pageHeight > 0 ? state.pageHeight : undefined,
+  }
+}
+
+function buildPageStructureSpatialIndex(
+  pageStructure: Record<string, unknown> | null | undefined,
+  spatialDimensions?: PageStructureSpatialDimensions,
+): {
+  pageWidth: number
+  pageHeight: number
+  blockMap: Record<string, PageStructureBlockSpatialRow>
+} {
+  const rows = Array.isArray(pageStructure?.block_groups) ? pageStructure!.block_groups : []
+  const blockMap: Record<string, PageStructureBlockSpatialRow> = {}
+  let pageWidth = 0
+  let pageHeight = 0
+  for (const raw of rows) {
+    if (!raw || typeof raw !== 'object') continue
+    const row = raw as Record<string, unknown>
+    const blockId = String(row.block_id || '').trim()
+    if (!blockId) continue
+    const layout = (row.layout_bbox_or_polygon && typeof row.layout_bbox_or_polygon === 'object')
+      ? row.layout_bbox_or_polygon as Record<string, unknown>
+      : {}
+    const bboxRaw = (layout.bbox && typeof layout.bbox === 'object') ? layout.bbox as Record<string, unknown> : {}
+    const x0 = Number(bboxRaw.x0 || 0)
+    const x1 = Number(bboxRaw.x1 || 0)
+    const top = Number(bboxRaw.top || 0)
+    const bottom = Number(bboxRaw.bottom || 0)
+    const bbox = Number.isFinite(x0) && Number.isFinite(x1) && Number.isFinite(top) && Number.isFinite(bottom) && x1 > x0 && bottom > top
+      ? {
+        x0,
+        x1,
+        top,
+        bottom,
+        page_width: undefined,
+        page_height: undefined,
+      }
+      : undefined
+    const polygon = normalizeSpatialPolygon(layout.polygon)
+    if (bbox) {
+      pageWidth = Math.max(pageWidth, Number(bbox.x1 || 0))
+      pageHeight = Math.max(pageHeight, Number(bbox.bottom || 0))
+    }
+    for (const point of polygon) {
+      pageWidth = Math.max(pageWidth, Number(point.x || 0))
+      pageHeight = Math.max(pageHeight, Number(point.y || 0))
+    }
+    const spatialRow: PageStructureBlockSpatialRow = {
+      blockId,
+      text: String(row.text || '').trim(),
+      bbox,
+      polygon: polygon.length >= 3 ? polygon : undefined,
+    }
+    blockMap[blockId] = spatialRow
+    const canonicalBlockId = canonicalizePageStructureBlockId(blockId)
+    if (canonicalBlockId && canonicalBlockId !== blockId) {
+      blockMap[canonicalBlockId] = spatialRow
+    }
+  }
+  const resolvedPageWidth = Number(spatialDimensions?.pageWidth || 0) > 0
+    ? Number(spatialDimensions?.pageWidth || 0)
+    : pageWidth
+  const resolvedPageHeight = Number(spatialDimensions?.pageHeight || 0) > 0
+    ? Number(spatialDimensions?.pageHeight || 0)
+    : pageHeight
+  if (resolvedPageWidth > 0 || resolvedPageHeight > 0) {
+    for (const row of Object.values(blockMap)) {
+      if (row.bbox) {
+        row.bbox = {
+          ...row.bbox,
+          page_width: resolvedPageWidth || undefined,
+          page_height: resolvedPageHeight || undefined,
+        }
+      }
+    }
+  }
+  return { pageWidth: resolvedPageWidth, pageHeight: resolvedPageHeight, blockMap }
+}
+
+function buildAnchorFromPageStructureBlocks(params: {
+  anchors: ReaderComponentSourceAnchor[]
+  sourceBlockIds?: string[]
+  preferredPage?: number
+  pageStructureIndex: {
+    pageWidth: number
+    pageHeight: number
+    blockMap: Record<string, PageStructureBlockSpatialRow>
+  }
+}): { previewAnchor: ReaderComponentSourceAnchor; previewAnchors: ReaderComponentSourceAnchor[] } | null {
+  const { anchors, sourceBlockIds, preferredPage, pageStructureIndex } = params
+  const blockMap = pageStructureIndex.blockMap || {}
+  const normalizedIds = [
+    ...normalizeSourceBlockIds(sourceBlockIds),
+    ...((Array.isArray(anchors) ? anchors : [])
+      .map((item) => String(item?.canonical_block_id || item?.anchor_v2?.canonical_block_id || '').trim())
+      .filter(Boolean)),
+  ]
+  const uniqueIds = Array.from(new Set(normalizedIds))
+  if (uniqueIds.length === 0) return null
+  const spatialRows = uniqueIds
+    .map((blockId) => blockMap[String(blockId || '').trim()])
+    .filter((item): item is PageStructureBlockSpatialRow => Boolean(item) && (!!item.bbox || !!item.polygon))
+  if (spatialRows.length === 0) return null
+
+  const page = (() => {
+    const preferred = Number(preferredPage || 0)
+    if (preferred > 0) return preferred
+    const anchorPage = Number((anchors || [])[0]?.page || 0)
+    if (anchorPage > 0) return anchorPage
+    for (const row of spatialRows) {
+      const inferred = inferPageFromCanonicalBlockId(row.blockId)
+      if (inferred) return inferred
+    }
+    return 1
+  })()
+
+  const bboxRows = spatialRows
+    .map((item) => item.bbox)
+    .filter((item): item is NonNullable<PageStructureBlockSpatialRow['bbox']> => Boolean(item))
+  const mergedBbox = bboxRows.length > 0
+    ? {
+      x0: Math.min(...bboxRows.map((item) => Number(item.x0 || 0))),
+      x1: Math.max(...bboxRows.map((item) => Number(item.x1 || 0))),
+      top: Math.min(...bboxRows.map((item) => Number(item.top || 0))),
+      bottom: Math.max(...bboxRows.map((item) => Number(item.bottom || 0))),
+      page_width: pageStructureIndex.pageWidth || bboxRows[0]?.page_width || undefined,
+      page_height: pageStructureIndex.pageHeight || bboxRows[0]?.page_height || undefined,
+    }
+    : undefined
+
+  const polygons = spatialRows.flatMap((item) => (
+    Array.isArray(item.polygon) && item.polygon.length >= 3
+      ? [{ points: item.polygon, source: 'page_structure_v3', component_id: item.blockId }]
+      : item.bbox
+        ? [{
+          points: [
+            { x: Number(item.bbox.x0 || 0), y: Number(item.bbox.top || 0) },
+            { x: Number(item.bbox.x1 || 0), y: Number(item.bbox.top || 0) },
+            { x: Number(item.bbox.x1 || 0), y: Number(item.bbox.bottom || 0) },
+            { x: Number(item.bbox.x0 || 0), y: Number(item.bbox.bottom || 0) },
+          ],
+          source: 'page_structure_v3',
+          component_id: item.blockId,
+        }]
+        : []
+  ))
+
+  const startChar = (Array.isArray(anchors) && anchors.length > 0)
+    ? Math.min(...anchors.map((item) => Number(item.start_char || 0)))
+    : 0
+  const endChar = (Array.isArray(anchors) && anchors.length > 0)
+    ? Math.max(...anchors.map((item) => Number(item.end_char || 0)))
+    : Math.max(startChar + 1, startChar + spatialRows.reduce((acc, item) => acc + Math.max(1, String(item.text || '').length), 0))
+  const quoteText = spatialRows
+    .map((item) => String(item.text || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const maxConfidence = Array.isArray(anchors) && anchors.length > 0
+    ? Math.max(...anchors.map((item) => Number(item.anchor_confidence || 0)), 0.92)
+    : 0.92
+
+  const previewAnchor: ReaderComponentSourceAnchor = {
+    ...(Array.isArray(anchors) && anchors.length > 0 ? anchors[0] : {
+      page,
+      start_char: startChar,
+      end_char: Math.max(startChar + 1, endChar),
+    }),
+    page,
+    start_char: startChar,
+    end_char: Math.max(startChar + 1, endChar),
+    canonical_block_id: uniqueIds[0],
+    quote: quoteText || undefined,
+    quote_text: quoteText || undefined,
+    anchor_id: `page_structure_v3:${uniqueIds.join(',')}`,
+    anchor_confidence: maxConfidence,
+    bbox_hint: mergedBbox,
+    geometry_version: polygons.length > 0 ? 'poly_v1' : undefined,
+    geometry: polygons.length > 0
+      ? {
+        polygons,
+        page_width: pageStructureIndex.pageWidth || undefined,
+        page_height: pageStructureIndex.pageHeight || undefined,
+      }
+      : undefined,
+    segment_index: 0,
+    segment_total: uniqueIds.length,
+    anchor_v2: {
+      coord_version: 'anchor_v2',
+      canonical_block_id: uniqueIds[0],
+      page,
+      start_char: startChar,
+      end_char: Math.max(startChar + 1, endChar),
+    },
+    source_word_ids: [],
+    source_char_ranges: [],
+  }
+  return {
+    previewAnchor,
+    previewAnchors: [previewAnchor],
+  }
+}
+
 function clampRect(
   rect: { x: number; y: number; width: number; height: number },
   canvasWidth: number,
@@ -1193,6 +1604,10 @@ function clampRect(
 type RenderPolygonPoint = { x: number; y: number }
 type RenderPolygon = { points: RenderPolygonPoint[] }
 
+function isPageStructurePreviewAnchor(anchor: ReaderComponentSourceAnchor): boolean {
+  return String(anchor.anchor_id || '').startsWith('page_structure_v3:')
+}
+
 function buildPolygonBounds(polygons: RenderPolygon[]): { x: number; y: number; width: number; height: number } | null {
   const points = polygons.flatMap((poly) => poly.points)
   if (points.length < 3) return null
@@ -1205,6 +1620,27 @@ function buildPolygonBounds(polygons: RenderPolygon[]): { x: number; y: number; 
   if (!Number.isFinite(x0) || !Number.isFinite(x1) || !Number.isFinite(y0) || !Number.isFinite(y1)) return null
   if (x1 <= x0 || y1 <= y0) return null
   return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+}
+
+function hasPlausibleSpatialBounds(
+  x0: number,
+  x1: number,
+  top: number,
+  bottom: number,
+  sourceWidth: number,
+  sourceHeight: number,
+): boolean {
+  if (![x0, x1, top, bottom].every((value) => Number.isFinite(value))) return false
+  if (x1 <= x0 || bottom <= top) return false
+  if (sourceWidth > 0) {
+    const toleranceX = Math.max(24, sourceWidth * 0.08)
+    if (x0 < -toleranceX || x1 > sourceWidth + toleranceX) return false
+  }
+  if (sourceHeight > 0) {
+    const toleranceY = Math.max(24, sourceHeight * 0.08)
+    if (top < -toleranceY || bottom > sourceHeight + toleranceY) return false
+  }
+  return true
 }
 
 function resolvePolygonsFromGeometry(
@@ -1223,6 +1659,17 @@ function resolvePolygonsFromGeometry(
 
   for (const poly of geometry.polygons) {
     const rawPoints = Array.isArray(poly?.points) ? poly.points : []
+    const rawXs = rawPoints.map((row) => Number((row as any)?.x || 0)).filter((value) => Number.isFinite(value))
+    const rawYs = rawPoints.map((row) => Number((row as any)?.y || 0)).filter((value) => Number.isFinite(value))
+    if (rawXs.length >= 3 && rawYs.length >= 3) {
+      const polyX0 = Math.min(...rawXs)
+      const polyX1 = Math.max(...rawXs)
+      const polyY0 = Math.min(...rawYs)
+      const polyY1 = Math.max(...rawYs)
+      if (!hasPlausibleSpatialBounds(polyX0, polyX1, polyY0, polyY1, sourceWidth, sourceHeight)) {
+        continue
+      }
+    }
     const points: RenderPolygonPoint[] = rawPoints
       .map((row) => ({ x: Number((row as any)?.x || 0) * scaleX, y: Number((row as any)?.y || 0) * scaleY }))
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
@@ -1257,6 +1704,7 @@ function resolveRectFromBboxHint(
   if (x1 <= x0 || bottom <= top) return null
   const sourceWidth = Number(hint.page_width || 0) > 0 ? Number(hint.page_width) : viewportWidth / renderScale
   const sourceHeight = Number(hint.page_height || 0) > 0 ? Number(hint.page_height) : viewportHeight / renderScale
+  if (!hasPlausibleSpatialBounds(x0, x1, top, bottom, sourceWidth, sourceHeight)) return null
   const scaleX = sourceWidth > 0 ? viewportWidth / sourceWidth : 1
   const scaleY = sourceHeight > 0 ? viewportHeight / sourceHeight : 1
   const rect = clampRect(
@@ -1530,14 +1978,22 @@ async function renderAnchorEvidenceImage(
   }
   await pageProxy.render({ canvasContext: ctx, viewport }).promise
 
-  const metrics = buildTextMetricsForAnchor(textItems, viewport, renderScale)
+  const strictPageStructurePreview = isPageStructurePreviewAnchor(anchor)
   const fromPolygons = resolvePolygonsFromGeometry(anchor, viewport.width, viewport.height, renderScale)
-  const fromText = resolveRectFromTextMetrics(anchor, metrics, viewport.width, viewport.height)
   const fromBbox = resolveRectFromBboxHint(anchor, viewport.width, viewport.height, renderScale)
+  const metrics = strictPageStructurePreview
+    ? null
+    : buildTextMetricsForAnchor(textItems, viewport, renderScale)
+  const fromText = strictPageStructurePreview || !metrics
+    ? null
+    : resolveRectFromTextMetrics(anchor, metrics, viewport.width, viewport.height)
   const pageArea = Math.max(1, viewport.width * viewport.height)
   const rawBboxCoverRatio = fromBbox ? (rectArea(fromBbox.rect) / pageArea) : 0
-  // Oversized bbox hints are usually wrong for paragraph-level evidence.
-  const effectiveBbox = rawBboxCoverRatio >= 0.56 ? null : fromBbox
+  const effectiveBbox = strictPageStructurePreview
+    ? fromBbox
+    : rawBboxCoverRatio >= 0.56
+      ? null
+      : fromBbox
   let polygonCandidate: RenderPolygon[] | null = fromPolygons?.polygons || null
   let rectCandidate = effectiveBbox
   let matchMethod: AnchorMatchMethod = 'fallback'
@@ -1581,14 +2037,24 @@ async function renderAnchorEvidenceImage(
 
   const fullRect = { x: 0, y: 0, width: viewport.width, height: viewport.height }
   const rect = rectCandidate?.rect || fullRect
-  const padX = Math.max(18, rect.width * 0.2)
-  const padY = Math.max(26, rect.height * 0.52)
-  const minCropWidth = Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
-  const minCropHeight = Math.min(viewport.height * 0.78, Math.max(rect.height + padY * 2, viewport.height * 0.28))
+  const padX = strictPageStructurePreview
+    ? Math.max(12, rect.width * 0.06)
+    : Math.max(18, rect.width * 0.2)
+  const padY = strictPageStructurePreview
+    ? Math.max(14, rect.height * 0.18)
+    : Math.max(26, rect.height * 0.52)
+  const minCropWidth = strictPageStructurePreview
+    ? Math.min(viewport.width * 0.98, Math.max(rect.width + padX * 2, viewport.width * 0.26))
+    : Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
+  const minCropHeight = strictPageStructurePreview
+    ? Math.min(viewport.height * 0.96, Math.max(rect.height + padY * 2, viewport.height * 0.14))
+    : Math.min(viewport.height * 0.78, Math.max(rect.height + padY * 2, viewport.height * 0.28))
   const targetWidth = Math.min(canvas.width, Math.max(1, minCropWidth))
   const targetHeight = Math.min(canvas.height, Math.max(1, minCropHeight))
   const centerX = rect.x + rect.width / 2
-  const centerY = rect.y + rect.height / 2 + Math.min(40, rect.height * 0.18)
+  const centerY = strictPageStructurePreview
+    ? rect.y + rect.height / 2
+    : rect.y + rect.height / 2 + Math.min(40, rect.height * 0.18)
   const cropRect = clampRect(
     {
       x: Math.max(0, Math.min(canvas.width - targetWidth, centerX - targetWidth / 2)),
@@ -1603,7 +2069,7 @@ async function renderAnchorEvidenceImage(
   const cropRatio = rectArea(cropRect) / pageArea
   let finalCropRect = cropRect
   let fallbackUsed = false
-  if (rectCandidate && cropRatio > 0.72 && confidence <= 0.72 && matchMethod !== 'bbox_hint') {
+  if (!strictPageStructurePreview && rectCandidate && cropRatio > 0.72 && confidence <= 0.72 && matchMethod !== 'bbox_hint') {
     finalCropRect = fullRect
     matchMethod = 'fallback'
     confidence = Math.max(0.42, confidence - 0.2)
@@ -1762,6 +2228,7 @@ export default function PaperReaderPage() {
     visible: false,
     pinned: false,
     loading: false,
+    preview_key: '',
     page: 0,
     text: '',
     title: '',
@@ -1984,6 +2451,13 @@ export default function PaperReaderPage() {
     ).trim(),
     [composedPayload],
   )
+  const composedPageStructureIndex = useMemo(
+    () => buildPageStructureSpatialIndex(
+      (composedPayload?.page_structure_v3 || {}) as Record<string, unknown>,
+      inferPageStructureSpatialDimensions((composedPayload || {}) as Record<string, unknown>),
+    ),
+    [composedPayload],
+  )
   const readerAutoSaveAtText = useMemo(() => {
     if (!readerAutoSaveAt) return '尚未同步'
     const ts = new Date(readerAutoSaveAt)
@@ -2165,6 +2639,13 @@ export default function PaperReaderPage() {
     }
   }
 
+  const refreshKnowledgeLinks = async () => {
+    if (!validPaperId) return []
+    const links = await literatureApi.getKnowledgeLinks(parsedPaperId)
+    setKnowledgeLinks(links)
+    return links
+  }
+
   const reloadCoreData = async () => {
     if (!validPaperId) return
     const [nextPaper, nextSession, nextAnnotations, nextComments, nextRating, nextLinks, kbList, collList] =
@@ -2308,6 +2789,9 @@ export default function PaperReaderPage() {
   const reloadCoreDataRef = useRef(reloadCoreData)
   reloadCoreDataRef.current = reloadCoreData
 
+  const refreshKnowledgeLinksRef = useRef(refreshKnowledgeLinks)
+  refreshKnowledgeLinksRef.current = refreshKnowledgeLinks
+
   const reloadAskSessionsRef = useRef(reloadAskSessions)
   reloadAskSessionsRef.current = reloadAskSessions
 
@@ -2332,6 +2816,20 @@ export default function PaperReaderPage() {
       mounted = false
     }
   }, [parsedPaperId, validPaperId])
+
+  useEffect(() => {
+    if (!validPaperId) return
+    refreshKnowledgeLinksRef.current().catch(() => {
+      // keep silent: status refresh should not block the page
+    })
+  }, [parsedPaperId, validPaperId])
+
+  useEffect(() => {
+    if (!validPaperId || workspaceTab !== 'rating') return
+    refreshKnowledgeLinksRef.current().catch(() => {
+      // keep silent: entering the rating panel should opportunistically resync status
+    })
+  }, [workspaceTab, parsedPaperId, validPaperId])
 
   useEffect(() => {
     return () => {
@@ -2920,6 +3418,7 @@ export default function PaperReaderPage() {
           const data = payload as PaperKnowledgeLinkStatusEventData
           const incomingLinkId = Number(data?.link_id || 0)
           if (!Number.isFinite(incomingLinkId) || incomingLinkId <= 0) return
+          const normalizedIncomingStatus = normalizeKnowledgeLinkStatus(data.status)
 
           setKnowledgeLinks((prev) => {
             let matched = false
@@ -2936,6 +3435,17 @@ export default function PaperReaderPage() {
             })
             return matched ? next : prev
           })
+
+          if (
+            normalizedIncomingStatus === 'completed'
+            || normalizedIncomingStatus === 'failed'
+            || normalizedIncomingStatus === 'timeout'
+            || normalizedIncomingStatus === 'cancelled'
+          ) {
+            void refreshKnowledgeLinksRef.current().catch(() => {
+              // keep silent: terminal status should reconcile against server truth
+            })
+          }
         },
         streamController,
       )
@@ -2958,8 +3468,7 @@ export default function PaperReaderPage() {
     if (!hasProcessing) return
 
     const timer = setInterval(() => {
-      literatureApi.getKnowledgeLinks(parsedPaperId)
-        .then((links) => setKnowledgeLinks(links))
+      refreshKnowledgeLinksRef.current()
         .catch(() => {
           // keep silent for fallback polling
         })
@@ -3148,8 +3657,7 @@ export default function PaperReaderPage() {
     }
     try {
       await literatureApi.addToKnowledge(parsedPaperId, selectedKbId)
-      const links = await literatureApi.getKnowledgeLinks(parsedPaperId)
-      setKnowledgeLinks(links)
+      await refreshKnowledgeLinksRef.current()
       message.success('已加入知识库，正在处理')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '加入知识库失败'
@@ -3463,9 +3971,14 @@ export default function PaperReaderPage() {
 
   const showAnchorPreview = (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { pinPreview?: boolean; segmentIndex?: number },
+    options?: ReaderAnchorPreviewOptions,
   ) => {
-    const target = buildAnchorPreviewTarget(anchors, readPage)
+    const target = buildAnchorFromPageStructureBlocks({
+      anchors,
+      sourceBlockIds: options?.sourceBlockIds,
+      preferredPage: readPage,
+      pageStructureIndex: composedPageStructureIndex,
+    }) || buildAnchorPreviewTarget(anchors, readPage)
     if (!target) return
     const anchor = target.previewAnchor
     const previewAnchors = target.previewAnchors
@@ -3479,6 +3992,7 @@ export default function PaperReaderPage() {
       visible: true,
       pinned: nextPinned,
       loading: !cached && !previewText,
+      preview_key: previewKey,
       page: Number(anchor.page || readPage),
       text: previewText || 'Loading evidence snippet...',
       title: `Evidence · Page ${Number(anchor.page || readPage)}`,
@@ -3525,8 +4039,7 @@ export default function PaperReaderPage() {
           }
           setAnchorPreview((prev) => {
             if (!prev.visible) return prev
-            if (Number(prev.page || 0) !== targetPage) return prev
-            if (Number(prev.anchor_index || 0) !== resolvedIndex) return prev
+            if (String(prev.preview_key || '') !== previewKey) return prev
             return {
               ...prev,
               loading: false,
@@ -3540,6 +4053,7 @@ export default function PaperReaderPage() {
         } catch {
           setAnchorPreview((prev) => {
             if (!prev.visible) return prev
+            if (String(prev.preview_key || '') !== previewKey) return prev
             return {
               ...prev,
               loading: false,
@@ -3554,9 +4068,14 @@ export default function PaperReaderPage() {
 
   const resolveAnchorPreviewImage = async (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number },
+    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[] },
   ): Promise<string | null> => {
-    const target = buildAnchorPreviewTarget(anchors, options?.preferredPage || readPage)
+    const target = buildAnchorFromPageStructureBlocks({
+      anchors,
+      sourceBlockIds: options?.sourceBlockIds,
+      preferredPage: options?.preferredPage || readPage,
+      pageStructureIndex: composedPageStructureIndex,
+    }) || buildAnchorPreviewTarget(anchors, options?.preferredPage || readPage)
     if (!target) return null
     const anchor = target.previewAnchor
 
@@ -3759,102 +4278,347 @@ export default function PaperReaderPage() {
   }
 
   const renderReaderSettingsContent = () => (
-    <Space direction="vertical" size={12} style={{ width: 280 }}>
-      <div>
-        <Text strong>阅读设置</Text>
+    <ConfigProvider
+      theme={{
+        algorithm: theme.defaultAlgorithm,
+        token: {
+          colorBgContainer: activeComposedStyle.panelBackground,
+          colorBgElevated: activeComposedStyle.overlayBackground,
+          colorBorder: activeComposedStyle.borderColor,
+          colorSplit: activeComposedStyle.borderColor,
+          colorText: activeComposedStyle.bodyColor,
+          colorTextHeading: activeComposedStyle.headingColor,
+          colorTextSecondary: activeComposedStyle.mutedColor,
+          colorFillAlter: activeComposedStyle.surfaceBackground,
+          colorPrimary: activeComposedStyle.headingColor,
+        },
+        components: {
+          Typography: {
+            colorText: activeComposedStyle.bodyColor,
+            colorTextHeading: activeComposedStyle.headingColor,
+            colorTextDescription: activeComposedStyle.mutedColor,
+          },
+          Select: {
+            selectorBg: activeComposedStyle.panelBackground,
+            colorText: activeComposedStyle.bodyColor,
+            colorTextPlaceholder: activeComposedStyle.mutedColor,
+            optionSelectedBg: 'rgba(67, 104, 191, 0.1)',
+            optionActiveBg: 'rgba(67, 104, 191, 0.06)',
+            optionSelectedColor: activeComposedStyle.headingColor,
+          },
+          Button: {
+            defaultColor: activeComposedStyle.bodyColor,
+            defaultBg: activeComposedStyle.panelBackground,
+            defaultBorderColor: activeComposedStyle.borderColor,
+            defaultHoverColor: activeComposedStyle.headingColor,
+            defaultHoverBg: activeComposedStyle.overlayBackground,
+            defaultHoverBorderColor: activeComposedStyle.headingColor,
+            colorPrimary: '#ffffff',
+            colorPrimaryHover: '#ffffff',
+            colorPrimaryActive: '#ffffff',
+          },
+        },
+      }}
+    >
+      <Space direction="vertical" size={12} style={{ width: 280 }}>
         <div>
-          <Text type="secondary">这些是低频调整项，收起后把阅读画布还给正文。</Text>
+          <Text strong>阅读设置</Text>
+          <div>
+            <Text type="secondary">这些是低频调整项，收起后把阅读画布还给正文。</Text>
+          </div>
         </div>
-      </div>
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        <Text type="secondary">主题</Text>
-        <Select
-          size="small"
-          style={{ width: '100%' }}
-          value={themeMode}
-          onChange={(value) => setThemeMode(value as ReaderThemeMode)}
-          options={[
-            { label: '浅色', value: 'light' },
-            { label: '深色', value: 'dark' },
-          ]}
-        />
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text type="secondary">主题</Text>
+          <Select
+            popupClassName="reader-composed-popover-select"
+            size="small"
+            style={{ width: '100%' }}
+            value={themeMode}
+            onChange={(value) => setThemeMode(value as ReaderThemeMode)}
+            options={[
+              { label: '浅色', value: 'light' },
+              { label: '深色', value: 'dark' },
+            ]}
+          />
+        </Space>
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text type="secondary">细节层级</Text>
+          <Select
+            popupClassName="reader-composed-popover-select"
+            size="small"
+            style={{ width: '100%' }}
+            value={detailLevel}
+            onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
+            options={[
+              { label: '简洁', value: 'concise' },
+              { label: '标准', value: 'standard' },
+              { label: '深入', value: 'deep' },
+            ]}
+          />
+        </Space>
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text type="secondary">阅读风格</Text>
+          <Select
+            popupClassName="reader-composed-popover-select"
+            size="small"
+            style={{ width: '100%' }}
+            value={generativeStyleKey}
+            onChange={(value) => {
+              const nextStyle = value as ReaderGenerativeStyleKey
+              setGenerativeStyleKey(nextStyle)
+              setGenerativeStyleTuning(
+                normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
+              )
+            }}
+            options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+          />
+        </Space>
+        <Space size={8} wrap>
+          <Button
+            size="small"
+            type={compareMode ? 'primary' : 'default'}
+            className="reader-settings-toggle-btn"
+            onClick={() => setCompareMode((prev) => !prev)}
+          >
+            对比模式
+          </Button>
+          <Button
+            size="small"
+            type={citationTldr ? 'primary' : 'default'}
+            className="reader-settings-toggle-btn"
+            onClick={() => setCitationTldr((prev) => !prev)}
+          >
+            引用 TL;DR
+          </Button>
+        </Space>
       </Space>
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        <Text type="secondary">细节层级</Text>
-        <Select
-          size="small"
-          style={{ width: '100%' }}
-          value={detailLevel}
-          onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
-          options={[
-            { label: '简洁', value: 'concise' },
-            { label: '标准', value: 'standard' },
-            { label: '深入', value: 'deep' },
-          ]}
-        />
-      </Space>
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        <Text type="secondary">阅读风格</Text>
-        <Select
-          size="small"
-          style={{ width: '100%' }}
-          value={generativeStyleKey}
-          onChange={(value) => {
-            const nextStyle = value as ReaderGenerativeStyleKey
-            setGenerativeStyleKey(nextStyle)
-            setGenerativeStyleTuning(
-              normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
-            )
-          }}
-          options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
-        />
-      </Space>
-      <Space size={8} wrap>
-        <Button
-          size="small"
-          type={compareMode ? 'primary' : 'default'}
-          onClick={() => setCompareMode((prev) => !prev)}
-        >
-          对比模式
-        </Button>
-        <Button
-          size="small"
-          type={citationTldr ? 'primary' : 'default'}
-          onClick={() => setCitationTldr((prev) => !prev)}
-        >
-          引用 TL;DR
-        </Button>
-      </Space>
-    </Space>
+    </ConfigProvider>
   )
 
   const renderAnswerWithCitations = () => {
     if (!askAnswer) {
-      return <Text>暂无回答</Text>
+      return <Text style={{ color: activeWorkspaceStyle.mutedColor }}>暂无回答</Text>
     }
-    const segments = splitAnswerByCitation(askAnswer)
+    const answerMarkdown = normalizeAnswerMarkdown(askAnswer)
     return (
-      <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.85 }}>
-        {segments.map((segment, idx) => {
-          if (segment.type === 'text') {
-            return <span key={`txt-${idx}`}>{segment.value}</span>
-          }
-          const targetSource = askSourcesByIndex.get(segment.index)
-          return (
-            <Button
-              key={`cite-${idx}`}
-              size="small"
-              type="link"
-              style={{ paddingInline: 2, height: 'auto' }}
-              disabled={!targetSource}
-              onClick={() => {
-                if (targetSource) void jumpToSource(targetSource)
-              }}
-            >
-              {segment.value}
-            </Button>
-          )
-        })}
+      <div
+        style={{
+          color: activeWorkspaceStyle.bodyColor,
+          fontSize: 15,
+          lineHeight: 1.85,
+          whiteSpace: 'normal',
+        }}
+      >
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            p: ({ children }) => (
+              <p style={{ margin: '0 0 14px', color: activeWorkspaceStyle.bodyColor, lineHeight: 1.85 }}>
+                {children}
+              </p>
+            ),
+            h1: ({ children }) => (
+              <h1 style={{ margin: '20px 0 10px', color: activeWorkspaceStyle.headingColor, fontSize: 26, fontWeight: 700 }}>
+                {children}
+              </h1>
+            ),
+            h2: ({ children }) => (
+              <h2 style={{ margin: '18px 0 10px', color: activeWorkspaceStyle.headingColor, fontSize: 22, fontWeight: 700 }}>
+                {children}
+              </h2>
+            ),
+            h3: ({ children }) => (
+              <h3 style={{ margin: '16px 0 8px', color: activeWorkspaceStyle.headingColor, fontSize: 18, fontWeight: 700 }}>
+                {children}
+              </h3>
+            ),
+            h4: ({ children }) => (
+              <h4 style={{ margin: '14px 0 8px', color: activeWorkspaceStyle.headingColor, fontSize: 16, fontWeight: 700 }}>
+                {children}
+              </h4>
+            ),
+            ul: ({ children }) => (
+              <ul style={{ margin: '0 0 14px 20px', color: activeWorkspaceStyle.bodyColor, paddingLeft: 0 }}>
+                {children}
+              </ul>
+            ),
+            ol: ({ children }) => (
+              <ol style={{ margin: '0 0 14px 20px', color: activeWorkspaceStyle.bodyColor, paddingLeft: 0 }}>
+                {children}
+              </ol>
+            ),
+            li: ({ children }) => (
+              <li style={{ marginBottom: 6, color: activeWorkspaceStyle.bodyColor, lineHeight: 1.8 }}>
+                {children}
+              </li>
+            ),
+            table: ({ children }) => (
+              <div style={{ margin: '0 0 14px', overflowX: 'auto' }}>
+                <table
+                  style={{
+                    width: '100%',
+                    borderCollapse: 'collapse',
+                    border: `1px solid ${activeWorkspaceStyle.borderColor}`,
+                    borderRadius: 10,
+                    overflow: 'hidden',
+                    background: activeWorkspaceStyle.panelBackground,
+                  }}
+                >
+                  {children}
+                </table>
+              </div>
+            ),
+            thead: ({ children }) => (
+              <thead style={{ background: activeWorkspaceStyle.surfaceBackground, color: activeWorkspaceStyle.headingColor }}>
+                {children}
+              </thead>
+            ),
+            th: ({ children }) => (
+              <th
+                style={{
+                  padding: '10px 12px',
+                  borderBottom: `1px solid ${activeWorkspaceStyle.borderColor}`,
+                  textAlign: 'left',
+                  fontWeight: 700,
+                }}
+              >
+                {children}
+              </th>
+            ),
+            td: ({ children }) => (
+              <td
+                style={{
+                  padding: '10px 12px',
+                  borderTop: `1px solid ${activeWorkspaceStyle.borderColor}`,
+                  color: activeWorkspaceStyle.bodyColor,
+                  verticalAlign: 'top',
+                }}
+              >
+                {children}
+              </td>
+            ),
+            strong: ({ children }) => (
+              <strong style={{ color: activeWorkspaceStyle.headingColor, fontWeight: 700 }}>{children}</strong>
+            ),
+            em: ({ children }) => (
+              <em style={{ color: activeWorkspaceStyle.bodyColor }}>{children}</em>
+            ),
+            del: ({ children }) => (
+              <del style={{ color: activeWorkspaceStyle.mutedColor }}>{children}</del>
+            ),
+            blockquote: ({ children }) => (
+              <blockquote
+                style={{
+                  margin: '0 0 14px',
+                  padding: '10px 14px',
+                  borderLeft: `4px solid ${activeWorkspaceStyle.headingColor}`,
+                  background: activeWorkspaceStyle.surfaceBackground,
+                  color: activeWorkspaceStyle.bodyColor,
+                  borderRadius: 8,
+                }}
+              >
+                {children}
+              </blockquote>
+            ),
+            code: ({ className, children }) => {
+              const codeText = Array.isArray(children) ? children.join('') : String(children ?? '')
+              const isInlineCode = !className && !codeText.includes('\n')
+              return isInlineCode ? (
+                <code
+                  style={{
+                    padding: '1px 6px',
+                    borderRadius: 6,
+                    background: activeWorkspaceStyle.surfaceBackground,
+                    color: activeWorkspaceStyle.headingColor,
+                    fontSize: 13,
+                  }}
+                >
+                  {children}
+                </code>
+              ) : (
+                <code>{children}</code>
+              )
+            },
+            hr: () => (
+              <hr
+                style={{
+                  margin: '18px 0',
+                  border: 0,
+                  borderTop: `1px solid ${activeWorkspaceStyle.borderColor}`,
+                }}
+              />
+            ),
+            input: ({ checked, disabled, type }) => {
+              if (type !== 'checkbox') return <input checked={checked} disabled={disabled} type={type} readOnly />
+              return (
+                <input
+                  checked={checked}
+                  disabled={disabled}
+                  type="checkbox"
+                  readOnly
+                  style={{
+                    marginRight: 8,
+                    accentColor: activeWorkspaceStyle.headingColor,
+                  }}
+                />
+              )
+            },
+            pre: ({ children }) => (
+              <pre
+                style={{
+                  margin: '0 0 14px',
+                  padding: '12px 14px',
+                  borderRadius: 10,
+                  overflowX: 'auto',
+                  border: `1px solid ${activeWorkspaceStyle.borderColor}`,
+                  background: activeWorkspaceStyle.surfaceBackground,
+                  color: activeWorkspaceStyle.bodyColor,
+                  lineHeight: 1.7,
+                }}
+              >
+                {children}
+              </pre>
+            ),
+            a: ({ href, children }) => {
+              const hrefText = String(href || '').trim()
+              const sourceMatch = hrefText.match(/^source:\/\/(\d{1,3})$/)
+              if (sourceMatch) {
+                const sourceIndex = Number(sourceMatch[1])
+                const targetSource = askSourcesByIndex.get(sourceIndex)
+                return (
+                  <Button
+                    size="small"
+                    type="link"
+                    style={{
+                      paddingInline: 2,
+                      height: 'auto',
+                      color: activeWorkspaceStyle.headingColor,
+                      fontWeight: 600,
+                    }}
+                    disabled={!targetSource}
+                    onClick={() => {
+                      if (targetSource) void jumpToSource(targetSource)
+                    }}
+                  >
+                    {`[来源${sourceIndex}]`}
+                  </Button>
+                )
+              }
+              return (
+                <a
+                  href={hrefText || '#'}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ color: activeWorkspaceStyle.headingColor, textDecoration: 'underline' }}
+                >
+                  {children}
+                </a>
+              )
+            },
+          }}
+        >
+          {answerMarkdown}
+        </ReactMarkdown>
       </div>
     )
   }
@@ -4100,7 +4864,7 @@ export default function PaperReaderPage() {
                               id: `manual-slot-${Date.now()}`,
                               type: 'InlineQuerySlot',
                               props: {
-                                placeholder: '请输入您关于上述段落的疑问...',
+                                placeholder: '请输入你对这段内容的追问（仅基于当前段落及邻近上下文）...',
                                 target_node_ref: String(nodeId),
                               },
                               children: [],
@@ -4111,7 +4875,7 @@ export default function PaperReaderPage() {
                           },
                         })
                       ) : (
-                        <Empty description="当前页正文已全部收纳到右侧 AI 上下文。" />
+                        <Empty description="当前页无可内联展示的阅读流内容，AI 资产已收纳到右侧栏。" />
                       )}
                     </div>
                   ) : null}
@@ -4581,7 +5345,7 @@ export default function PaperReaderPage() {
     const sectionItems = [
       ...(composedContextComponents.length > 0 ? [{
         key: 'page-context',
-        label: `页面上下文 · ${composedContextComponents.length}`,
+        label: `AI 资产 · ${composedContextComponents.length}`,
         children: (
           <div style={{ maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
             {renderReaderComponentTree(composedContextComponents, {
@@ -4936,6 +5700,7 @@ export default function PaperReaderPage() {
                 onChange={(key) => setWorkspaceTab(key)}
                 size="large"
                 tabBarGutter={28}
+                popupClassName="reader-workspace-tabs-popup"
                 tabBarStyle={{ marginBottom: 14, paddingInline: 2 }}
                 items={[
               ...(textMode ? [{

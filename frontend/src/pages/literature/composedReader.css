@@ -82,6 +82,16 @@
   background: var(--reader-workbench-overlay-bg, var(--reader-card-bg)) !important;
   border: 1px solid var(--reader-card-border) !important;
   box-shadow: 0 18px 42px rgba(15, 23, 42, 0.16) !important;
+  opacity: 1 !important;
+  backdrop-filter: none !important;
+}
+
+.reader-composed-popover {
+  z-index: 2200 !important;
+}
+
+.reader-node-action-popover {
+  z-index: 2300 !important;
 }
 
 .reader-composed-popover .ant-popover-arrow:before {
@@ -91,6 +101,123 @@
 .reader-composed-popover .ant-popover-inner-content,
 .reader-composed-popover .ant-typography {
   color: var(--reader-text) !important;
+}
+
+.reader-composed-popover .ant-btn-default,
+.reader-composed-popover .ant-btn-color-default {
+  color: var(--reader-text) !important;
+  border-color: var(--reader-card-border) !important;
+  background: var(--reader-card-bg) !important;
+}
+
+.reader-composed-popover .ant-btn-default:hover,
+.reader-composed-popover .ant-btn-color-default:hover {
+  color: var(--reader-heading) !important;
+  border-color: var(--reader-heading) !important;
+  background: var(--reader-workbench-overlay-bg, var(--reader-card-bg)) !important;
+}
+
+.reader-node-action-popover .ant-popover-inner {
+  background: #fffdf8 !important;
+  border: 1px solid rgba(94, 116, 158, 0.18) !important;
+  box-shadow: 0 20px 44px rgba(15, 23, 42, 0.18) !important;
+}
+
+.reader-node-action-popover .ant-popover-arrow:before {
+  background: #fffdf8 !important;
+}
+
+.reader-node-action-popover--dark .ant-popover-inner {
+  background: #152033 !important;
+  border-color: rgba(161, 186, 232, 0.18) !important;
+  box-shadow: 0 22px 48px rgba(2, 6, 23, 0.42) !important;
+}
+
+.reader-node-action-popover--dark .ant-popover-arrow:before {
+  background: #152033 !important;
+}
+
+.reader-node-action-popover .ant-popover-inner-content,
+.reader-node-action-popover .ant-typography {
+  color: #17233b !important;
+}
+
+.reader-node-action-popover--dark .ant-popover-inner-content,
+.reader-node-action-popover--dark .ant-typography {
+  color: #eef2ff !important;
+}
+
+.reader-node-action-popover .ant-btn-default,
+.reader-node-action-popover .ant-btn-color-default {
+  background: transparent !important;
+  border-color: transparent !important;
+  color: #17233b !important;
+}
+
+.reader-node-action-popover--dark .ant-btn-default,
+.reader-node-action-popover--dark .ant-btn-color-default {
+  color: #eef2ff !important;
+}
+
+.reader-node-action-popover .ant-btn-default:hover,
+.reader-node-action-popover .ant-btn-color-default:hover,
+.reader-node-action-popover .ant-btn-default:focus,
+.reader-node-action-popover .ant-btn-color-default:focus {
+  background: rgba(29, 78, 216, 0.08) !important;
+  border-color: transparent !important;
+  color: #0f2551 !important;
+}
+
+.reader-node-action-popover--dark .ant-btn-default:hover,
+.reader-node-action-popover--dark .ant-btn-color-default:hover,
+.reader-node-action-popover--dark .ant-btn-default:focus,
+.reader-node-action-popover--dark .ant-btn-color-default:focus {
+  background: rgba(129, 164, 255, 0.14) !important;
+  color: #ffffff !important;
+}
+
+.reader-composed-popover .reader-settings-toggle-btn.ant-btn-primary {
+  color: #fff !important;
+  border-color: var(--reader-heading) !important;
+  background: var(--reader-heading) !important;
+}
+
+.reader-composed-popover .reader-settings-toggle-btn.ant-btn-primary:hover {
+  filter: brightness(1.03);
+}
+
+.reader-composed-popover .ant-select-selector {
+  color: var(--reader-text) !important;
+  border-color: var(--reader-card-border) !important;
+  background: var(--reader-card-bg) !important;
+  box-shadow: none !important;
+}
+
+.reader-composed-popover .ant-select-selection-item,
+.reader-composed-popover .ant-select-selection-placeholder,
+.reader-composed-popover .ant-select-arrow {
+  color: var(--reader-text) !important;
+}
+
+.reader-composed-popover-select .ant-select-dropdown,
+.reader-composed-popover-select.ant-select-dropdown {
+  background: #fffaf1 !important;
+  border: 1px solid rgba(94, 116, 158, 0.18) !important;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16) !important;
+  z-index: 2600 !important;
+}
+
+.reader-composed-popover-select .ant-select-item {
+  color: #17233b !important;
+}
+
+.reader-composed-popover-select .ant-select-item-option-selected {
+  color: #102a50 !important;
+  background: rgba(67, 104, 191, 0.1) !important;
+}
+
+.reader-composed-popover-select .ant-select-item-option-active {
+  background: rgba(67, 104, 191, 0.06) !important;
 }
 
 .reader-composed-surface .ant-select .ant-select-selector,
@@ -191,6 +318,11 @@
   --reader-workspace-tab-text-active: #f5f8ff;
   --reader-workspace-tab-line: rgba(159, 183, 230, 0.18);
   --reader-workspace-tab-ink: #5b8dff;
+  position: sticky;
+  top: 14px;
+  align-self: flex-start;
+  max-height: calc(100vh - 28px);
+  overflow: auto;
 }
 
 .reader-workspace-sidebar .reader-workspace-tabs .ant-tabs-nav::before {
@@ -217,8 +349,41 @@
   color: inherit;
 }
 
+.reader-workspace-sidebar .reader-workspace-tabs .ant-tabs-nav-more {
+  color: var(--reader-workspace-tab-text-active) !important;
+  border: 1px solid rgba(166, 189, 233, 0.22) !important;
+  background: rgba(250, 252, 255, 0.08) !important;
+  border-radius: 12px !important;
+}
+
+.reader-workspace-sidebar .reader-workspace-tabs .ant-tabs-nav-more:hover {
+  color: #ffffff !important;
+  background: rgba(250, 252, 255, 0.14) !important;
+}
+
 .reader-workspace-sidebar--light .reader-workspace-tabs .ant-tabs-nav::before {
   border-bottom-color: var(--reader-workspace-tab-line);
+}
+
+.reader-workspace-tabs-popup .ant-dropdown-menu,
+.reader-workspace-tabs-popup.ant-dropdown .ant-dropdown-menu {
+  background: #fffaf1 !important;
+  border: 1px solid rgba(94, 116, 158, 0.18) !important;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.16) !important;
+  padding: 8px !important;
+  border-radius: 14px !important;
+}
+
+.reader-workspace-tabs-popup .ant-dropdown-menu-item,
+.reader-workspace-tabs-popup .ant-dropdown-menu-title-content {
+  color: #17233b !important;
+}
+
+.reader-workspace-tabs-popup .ant-dropdown-menu-item:hover,
+.reader-workspace-tabs-popup .ant-dropdown-menu-item-active,
+.reader-workspace-tabs-popup .ant-dropdown-menu-item-selected {
+  background: rgba(67, 104, 191, 0.08) !important;
+  color: #102a50 !important;
 }
 
 .reader-layout-single {
@@ -534,12 +699,22 @@
 
 .reader-node-shell {
   position: relative;
+  overflow: visible;
+}
+
+.reader-node-hover-bridge {
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  left: calc(-1 * clamp(44px, 3.6vw, 56px));
+  width: clamp(56px, 4vw, 68px);
+  z-index: 8;
 }
 
 .reader-action-bar {
   position: absolute;
   top: 10px;
-  right: 10px;
+  right: 6px;
   z-index: 16;
   opacity: 0;
   transform: translateY(-4px);
@@ -547,8 +722,21 @@
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
 
+.reader-action-bar--outer-left {
+  left: calc(-1 * clamp(34px, 3vw, 42px));
+  right: auto;
+  top: 6px;
+}
+
+.reader-action-bar--open {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
 .reader-node-shell:hover .reader-action-bar,
-.reader-node-shell:focus-within .reader-action-bar {
+.reader-node-shell:focus-within .reader-action-bar,
+.reader-node-hover-bridge:hover ~ .reader-action-bar {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
@@ -559,24 +747,53 @@
   border-color: var(--reader-card-border) !important;
   color: var(--reader-text) !important;
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.12);
+  width: 26px !important;
+  min-width: 26px !important;
+  height: 26px !important;
+  padding: 0 !important;
+  opacity: 0.86;
 }
 
 .reader-action-menu {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  min-width: 180px;
+  gap: 4px;
+  min-width: 132px;
+  padding: 2px 0;
 }
 
 .reader-action-menu .ant-btn {
   width: 100%;
   justify-content: flex-start;
+  min-height: 30px;
+  padding-inline: 10px !important;
+  border-radius: 10px !important;
+  border-color: transparent !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.reader-action-menu .ant-btn:hover,
+.reader-action-menu .ant-btn:focus {
+  background: rgba(29, 78, 216, 0.08) !important;
+  border-color: transparent !important;
 }
 
 .reader-action-menu > div {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
+}
+
+@media (max-width: 980px) {
+  .reader-action-bar--outer-left {
+    left: auto;
+    right: 6px;
+  }
+
+  .reader-node-hover-bridge {
+    display: none;
+  }
 }
 
 @media (max-width: 1180px) {

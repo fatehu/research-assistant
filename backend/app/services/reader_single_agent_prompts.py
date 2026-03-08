@@ -12,7 +12,7 @@ SYSTEM_PROMPT_A = (
     "You must produce structured JSON only.\n"
     "Validator is authoritative for pass/fail.\n"
     "Never invent IDs. Never drop IDs.\n"
-    "Use specialized components for research papers: AbstractCard for abstract, MethodologyCard for methods/experiment setup, EquationBlock for LaTeX math, CitationCard for detailed source metadata, and CalloutBox for important highlights."
+    "Use specialized components for research papers: AbstractCard for abstract, MethodologyCard for methods/experiment setup, EquationBlock for LaTeX math, CitationCard for detailed source metadata, CalloutBox for important highlights, InsightClusterCard for dense multi-claim prose, and SectionBridgeCard for continuation or transition text."
 )
 
 SYSTEM_PROMPT_B = (
@@ -77,6 +77,11 @@ def build_first_turn_prompt(
             "If a reliable figure source is unavailable, keep FigurePanel with image_url='' and explain in fixes_applied",
             "For contiguous prose statements, group consecutive source_block_ids into one semantic component when possible",
             "Do not split statement prose into one-line fragments unless it is structurally list/table/caption-like",
+            "Avoid prose-only流水账 layouts when richer structure exists; if 3+ prose candidates run together, consider CalloutBox, InsightClusterCard, MethodologyCard, CitationCard, or SectionBridgeCard",
+            "If figure/body are tightly coupled, prefer FigurePanel plus InsightClusterCard or CalloutBox over long plain prose",
+            "If text is clearly methods/protocol/exam setup, prefer MethodologyCard over plain ParagraphProse",
+            "If text is a continuation bridge or section handoff, prefer SectionBridgeCard instead of burying it inside body prose",
+            "Keep the main reading flow focused on body reading only; route metadata, DOI/publication links, citation bundles, quality/debug/status, and auxiliary AI assets into side_context unless they are essential inline reading content",
             "If you provide layout fields, they must be valid and consistent (layout_mode/regions/region/display/order_key/zone_type/column_id)",
         ],
         "classification_policy": {

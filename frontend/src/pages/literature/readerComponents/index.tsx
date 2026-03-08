@@ -20,15 +20,21 @@ export type ReaderComponentRenderContext = {
   inlineQueryLoadingNodeId?: string | null
   resolveFigureImageUrl?: (imageUrl: string, node?: ReaderComponentNode) => string
   isActionableAnchor?: (anchor: ReaderComponentSourceAnchor) => boolean
-  onJumpAnchor?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
-  onPreviewAnchors?: (anchors: ReaderComponentSourceAnchor[], options?: { pinPreview?: boolean }) => void
+  onJumpAnchor?: (
+    anchors: ReaderComponentSourceAnchor[],
+    options?: { pinPreview?: boolean; sourceBlockIds?: string[] },
+  ) => void
+  onPreviewAnchors?: (
+    anchors: ReaderComponentSourceAnchor[],
+    options?: { pinPreview?: boolean; sourceBlockIds?: string[] },
+  ) => void
   onHidePreview?: () => void
   onInlineQuery?: (node: ReaderComponentNode, question: string) => Promise<void> | void
   onDropMarkdown?: (markdown: string, node?: ReaderComponentNode) => void
   onManualInsertSlot?: (nodeId: string) => void
   resolveAnchorPreviewImage?: (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number },
+    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[] },
   ) => Promise<string | null>
 }
 
@@ -198,6 +204,37 @@ function isDarkTheme(ctx?: ReaderComponentRenderContext): boolean {
   return Boolean(ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44'))
 }
 
+function cardSurfaceStyles(
+  ctx?: ReaderComponentRenderContext,
+  options?: { bodyPadding?: number | string; headerPadding?: number | string; emphasis?: 'default' | 'muted' },
+): { header: CSSProperties; body: CSSProperties } {
+  const dark = isDarkTheme(ctx)
+  const emphasis = options?.emphasis || 'default'
+  const headerPadding = options?.headerPadding ?? '14px 18px'
+  const bodyPadding = options?.bodyPadding ?? '18px 18px'
+  const borderColor = ctx?.themeStyle?.borderColor || (dark ? 'rgba(226, 232, 240, 0.14)' : 'rgba(9, 30, 66, 0.08)')
+  const headerBg = dark
+    ? (emphasis === 'muted' ? 'rgba(255, 255, 255, 0.03)' : 'rgba(10, 18, 34, 0.9)')
+    : (emphasis === 'muted' ? 'rgba(15, 23, 42, 0.025)' : 'rgba(255, 255, 255, 0.96)')
+  const bodyBg = dark
+    ? (emphasis === 'muted' ? 'rgba(255, 255, 255, 0.02)' : 'rgba(11, 20, 38, 0.86)')
+    : '#ffffff'
+  return {
+    header: {
+      padding: headerPadding,
+      minHeight: 0,
+      borderBottom: `1px solid ${borderColor}`,
+      background: headerBg,
+      color: ctx?.themeStyle?.headingColor || (dark ? '#f5f8ff' : '#17263c'),
+    },
+    body: {
+      padding: bodyPadding,
+      background: bodyBg,
+      color: ctx?.themeStyle?.bodyColor || (dark ? '#eef2ff' : '#17263c'),
+    },
+  }
+}
+
 export function componentToMarkdown(node: ReaderComponentNode): string {
   const props = node.props || {}
   const text = (key: string) => asString((props as Record<string, unknown>)[key])
@@ -234,6 +271,13 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
   }
   if (node.type === 'AnswerCard') {
     return [`### 问答`, `- 问题：${text('question')}`, `- 回答：${text('answer')}`].join('\n')
+  }
+  if (node.type === 'InsightClusterCard') {
+    const items = asStringArray((props as Record<string, unknown>).items)
+    return [`### ${text('title') || '关键洞察'}`, ...items.map((item) => `- ${item}`)].join('\n')
+  }
+  if (node.type === 'SectionBridgeCard') {
+    return [`### ${text('title') || '章节承接'}`, text('text')].filter(Boolean).join('\n')
   }
   if (node.type === 'ContextRail') {
     const rows = asRecordArray((props as Record<string, unknown>).items)
@@ -338,8 +382,10 @@ function ActionBar(props: {
   node: ReaderComponentNode
   ctx: ReaderComponentRenderContext
   extraActions?: ReactNode
+  placement?: 'default' | 'outer-left'
 }): ReactNode {
-  const { node, ctx, extraActions } = props
+  const { node, ctx, extraActions, placement = 'default' } = props
+  const [open, setOpen] = useState(false)
   if (ctx.readOnly) return null
   const markdown = componentToMarkdown(node)
   const nodeGatePassed = isNodeGatePassed(node)
@@ -363,11 +409,24 @@ function ActionBar(props: {
     event.dataTransfer.setData('text/plain', markdown)
   }
   if (actionRows.length === 0 && !extraActions) return null
+  const sourceBlockIds = Array.isArray(node.source_block_ids)
+    ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
+  const compactActionLabel = (key: string, fallback: string): string => {
+    const normalized = canonicalActionKey(key)
+    if (normalized === 'repair') return '修复'
+    if (normalized === 'degrade') return '降级'
+    if (normalized === 'copy') return '复制'
+    if (normalized === 'jump_anchor') return '证据'
+    if (normalized === 'preview_anchor') return '预览'
+    if (normalized === 'open' || normalized === 'open_link') return '打开链接'
+    return fallback
+  }
   const actionMenu = (
     <div className="reader-action-menu">
       {actionRows.map((row, idx) => {
         const key = canonicalActionKey(asString(row.key))
-        const label = asString(row.label) || key || `action-${idx + 1}`
+        const label = compactActionLabel(key, asString(row.label) || key || `action-${idx + 1}`)
         const payload = (row.payload && typeof row.payload === 'object')
           ? row.payload as Record<string, unknown>
           : {}
@@ -380,7 +439,7 @@ function ActionBar(props: {
               icon={<LinkOutlined />}
               style={actionBtnStyle}
               disabled={!canJump}
-              onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true })}
+              onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true, sourceBlockIds })}
             >
               {label}
             </Button>
@@ -405,7 +464,7 @@ function ActionBar(props: {
               size="small"
               style={actionBtnStyle}
               disabled={!canJump}
-              onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true })}
+              onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true, sourceBlockIds })}
             >
               {label}
             </Button>
@@ -433,18 +492,25 @@ function ActionBar(props: {
           icon={<DragOutlined />}
           style={actionBtnStyle}
         >
-          拖拽Markdown
+          拖拽
         </Button>
       </span>
       {extraActions ? <div>{extraActions}</div> : null}
     </div>
   )
+  const actionOverlayClassName = [
+    'reader-composed-popover',
+    'reader-node-action-popover',
+    isDarkTheme(ctx) ? 'reader-node-action-popover--dark' : 'reader-node-action-popover--light',
+  ].join(' ')
   return (
-    <div className="reader-action-bar">
+    <div className={`reader-action-bar${placement === 'outer-left' ? ' reader-action-bar--outer-left' : ''}${open ? ' reader-action-bar--open' : ''}`}>
       <Popover
         trigger="click"
-        placement="bottomRight"
-        overlayClassName="reader-composed-popover"
+        placement={placement === 'outer-left' ? 'rightTop' : 'rightTop'}
+        overlayClassName={actionOverlayClassName}
+        open={open}
+        onOpenChange={setOpen}
         content={actionMenu}
       >
         <Button
@@ -483,7 +549,7 @@ function InlineQuerySlotNode(props: {
     <Card size="small" style={{ ...baseCardStyle(ctx), margin: '8px 0' }}>
       {!expanded ? (
         <Button size="small" type="dashed" icon={<DownOutlined />} onClick={() => setExpanded(true)}>
-          + 在这里提问
+          + 段落追问
         </Button>
       ) : (
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
@@ -554,24 +620,23 @@ function ParagraphProseNode(props: {
       onMouseLeave={() => setHovered(false)}
       style={{ position: 'relative', marginBottom: 14 }}
     >
+      <span className="reader-node-hover-bridge" aria-hidden="true" />
+      <ActionBar node={node} ctx={ctx} placement="outer-left" />
       <DraggableContainer node={node}>
-        <div>
-          <ActionBar node={node} ctx={ctx} />
-          <div>
-            {paragraphRows.map((item, idx) => (
-              <p
-                key={`${node.id}-p-${idx}`}
-                style={{
-                  ...paragraphStyle,
-                  margin: idx === 0 ? 0 : '10px 0 0 0',
-                }}
-              >
-                {item.text}
-              </p>
-            ))}
-            {renderChildren(node.children || [], ctx)}
-          </div>
-        </div>
+        <>
+          {paragraphRows.map((item, idx) => (
+            <p
+              key={`${node.id}-p-${idx}`}
+              style={{
+                ...paragraphStyle,
+                margin: idx === 0 ? 0 : '10px 0 0 0',
+              }}
+            >
+              {item.text}
+            </p>
+          ))}
+          {renderChildren(node.children || [], ctx)}
+        </>
       </DraggableContainer>
 
       {!ctx.readOnly ? (
@@ -593,7 +658,7 @@ function ParagraphProseNode(props: {
             size="small"
             icon={<PlusOutlined />}
             onClick={() => ctx.onManualInsertSlot?.(String(node.id))}
-            title="在此段落后插入提问"
+            title="在此段落后插入段落追问"
             style={{ boxShadow: '0 4px 12px rgba(22, 119, 255, 0.35)' }}
           />
         </div>
@@ -630,9 +695,15 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     .filter((row) => nodeGatePassed && isJumpableAnchor(row, ctx?.isActionableAnchor))
 
   const layoutStyle: React.CSSProperties = {}
-  if (node.layout_slot?.reserved_height) {
+  const minHeightOnlyNodeTypes = new Set([
+    'FigurePanel',
+    'TablePanel',
+    'PdfSnippetCard',
+  ])
+  const currentNodeType = String(node.type || '').trim()
+  if (node.layout_slot?.reserved_height && minHeightOnlyNodeTypes.has(currentNodeType)) {
     layoutStyle.minHeight = node.layout_slot.reserved_height
-    if (node.layout_slot.lock_height) {
+    if (node.layout_slot.lock_height && currentNodeType !== 'FigurePanel') {
       layoutStyle.height = node.layout_slot.reserved_height
       layoutStyle.overflow = 'hidden'
     }
@@ -641,10 +712,16 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
   const withAnchorPreview = (child: ReactNode): ReactNode => (
     <div
       className="reader-node-shell"
+      data-reader-node-type={String(node.type || '')}
       style={layoutStyle}
       onMouseEnter={() => {
         if (anchorRefs.length > 0) {
-          ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: false })
+          ctx.onPreviewAnchors?.(anchorRefs, {
+            pinPreview: false,
+            sourceBlockIds: Array.isArray(node.source_block_ids)
+              ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
+              : [],
+          })
         } else {
           ctx.onHidePreview?.()
         }
@@ -679,7 +756,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'MetadataSidebarCard': {
       const items = asRecordArray(props.items)
       return (
-        <Card size="small" title="元数据" style={baseCardStyle(ctx)}>
+        <Card size="small" title="元数据" style={baseCardStyle(ctx)} styles={cardSurfaceStyles(ctx, { bodyPadding: '16px 18px', emphasis: 'muted' })}>
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             {items.map((item, idx) => (
               <div key={`meta-${idx}`}>
@@ -705,7 +782,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
         .filter((item) => item.text)
       const defaultCollapsed = props.default_collapsed !== false
       return (
-        <Card size="small" title={title} style={baseCardStyle(ctx)}>
+        <Card size="small" title={title} style={baseCardStyle(ctx)} styles={cardSurfaceStyles(ctx, { bodyPadding: '14px 16px', emphasis: 'muted' })}>
           <details open={!defaultCollapsed}>
             <summary style={{ cursor: 'pointer', marginBottom: 10, color: ctx.themeStyle?.bodyColor }}>
               点击展开/收起侧栏上下文
@@ -719,9 +796,17 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                     <Text style={{ color: ctx.themeStyle?.bodyColor }}>{item.text}</Text>
                     {item.anchor.length > 0 ? (
                       <Button
-                        type="link"
+                        type="default"
                         size="small"
                         onClick={() => ctx.onJumpAnchor?.(item.anchor, { pinPreview: true })}
+                        style={{
+                          alignSelf: 'flex-start',
+                          borderRadius: 999,
+                          paddingInline: 10,
+                          borderColor: isDarkTheme(ctx) ? 'rgba(149, 177, 255, 0.28)' : 'rgba(29, 78, 216, 0.18)',
+                          background: isDarkTheme(ctx) ? 'rgba(88, 130, 255, 0.14)' : 'rgba(29, 78, 216, 0.06)',
+                          color: isDarkTheme(ctx) ? '#e7efff' : '#1d4ed8',
+                        }}
                       >
                         定位到证据
                       </Button>
@@ -746,8 +831,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const level = Math.max(1, Math.min(4, asNumber(props.level, 2)))
       const levelToSize = { 1: 34, 2: 30, 3: 24, 4: 20 }
       return withAnchorPreview(
-        <div style={{ margin: '20px 0 8px' }}>
-          <ActionBar node={node} ctx={ctx} />
+        <div style={{ margin: '20px 0 8px', position: 'relative' }}>
+          <span className="reader-node-hover-bridge" aria-hidden="true" />
+          <ActionBar node={node} ctx={ctx} placement="outer-left" />
           <Title
             level={Math.min(5, level + 1) as 1 | 2 | 3 | 4 | 5}
             style={{
@@ -812,19 +898,22 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const items = asStringArray(props.items)
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <ActionBar node={node} ctx={ctx} />
-          <ul
-            style={{
-              marginBottom: 14,
-              paddingInlineStart: 24,
-              lineHeight: 1.9,
-              color: ctx.themeStyle?.bodyColor,
-              fontFamily: ctx.themeStyle?.bodyFontFamily,
-            }}
-          >
-            {items.map((item, idx) => <li key={`li-${idx}`}>{item}</li>)}
-            {renderChildren(node.children || [], ctx)}
-          </ul>
+          <div style={{ position: 'relative' }}>
+            <span className="reader-node-hover-bridge" aria-hidden="true" />
+            <ActionBar node={node} ctx={ctx} placement="outer-left" />
+            <ul
+              style={{
+                marginBottom: 14,
+                paddingInlineStart: 24,
+                lineHeight: 1.9,
+                color: ctx.themeStyle?.bodyColor,
+                fontFamily: ctx.themeStyle?.bodyFontFamily,
+              }}
+            >
+              {items.map((item, idx) => <li key={`li-${idx}`}>{item}</li>)}
+              {renderChildren(node.children || [], ctx)}
+            </ul>
+          </div>
         </DraggableContainer>,
       )
     }
@@ -837,12 +926,13 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
           ? ctx.resolveFigureImageUrl(rawImageUrl, node)
           : rawImageUrl,
       )
-      const preferContain = rawImageUrl.startsWith('asset:') || /^https?:\/\/(?:dx\.)?doi\.org\//i.test(rawImageUrl)
+      const imageFit = asString(props.image_fit).toLowerCase() === 'cover' ? 'cover' : 'contain'
+      const preferContain = imageFit !== 'cover'
       const sourceLabel = deriveFigureSourceLabel(caption, asString(props.source_label))
       const aiInsight = asString(props.ai_insight)
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <Card size="small" style={{ ...baseCardStyle(ctx), marginBottom: 14 }}>
+          <Card size="small" style={{ ...baseCardStyle(ctx), marginBottom: 14 }} styles={cardSurfaceStyles(ctx, { bodyPadding: '16px 16px' })}>
             <ActionBar
               node={node}
               ctx={ctx}
@@ -875,11 +965,13 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                   src={imageUrl}
                   alt={caption || 'figure'}
                   style={{
-                    width: '100%',
-                    maxHeight: 520,
-                    objectFit: preferContain ? 'contain' : 'cover',
+                    width: preferContain ? 'auto' : '100%',
+                    maxWidth: '100%',
+                    height: 'auto',
+                    objectFit: imageFit,
                     borderRadius: 10,
                     display: 'block',
+                    margin: preferContain ? '0 auto' : undefined,
                   }}
                 />
               </div>
@@ -983,7 +1075,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'CitationLinks': {
       const links = asRecordArray(props.links)
       return (
-        <Card size="small" title="文献资源链接" style={baseCardStyle(ctx)}>
+        <Card size="small" title="文献资源链接" style={baseCardStyle(ctx)} styles={cardSurfaceStyles(ctx, { bodyPadding: '14px 16px', emphasis: 'muted' })}>
           <Space direction="vertical" size={10} style={{ width: '100%' }}>
             {links.map((link, idx) => {
               const href = asString(link.href)
@@ -1021,16 +1113,18 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                     href={href}
                     target="_blank"
                     rel="noreferrer"
-                    style={{
+                  style={{
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: 4,
-                      padding: '4px 8px',
+                      padding: '6px 10px',
                       background: isDarkTheme(ctx) ? 'rgba(98, 170, 255, 0.14)' : 'rgba(22, 119, 255, 0.08)',
-                      borderRadius: 6,
+                      borderRadius: 999,
                       border: isDarkTheme(ctx) ? '1px solid rgba(131, 188, 255, 0.35)' : '1px solid rgba(22, 119, 255, 0.2)',
-                      color: '#1677ff',
-                      fontWeight: 500,
+                      color: isDarkTheme(ctx) ? '#e6eeff' : '#1858d0',
+                      fontWeight: 600,
+                      lineHeight: 1.3,
+                      textDecoration: 'none',
                     }}
                   >
                     <LinkOutlined /> {label}
@@ -1140,18 +1234,106 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
 
     case 'CompareInsightsCard': {
       const items = asRecordArray(props.items)
-      return (
-        <Card size="small" title="跨论文对比洞察" style={baseCardStyle(ctx)}>
-          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+      return withAnchorPreview(
+        <Card size="small" title="跨论文对比洞察" style={baseCardStyle(ctx)} styles={cardSurfaceStyles(ctx, { bodyPadding: '16px 18px', emphasis: 'muted' })}>
+          <ActionBar node={node} ctx={ctx} />
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
             {items.map((item, idx) => (
-              <div key={`cmp-${idx}`}>
-                <Text strong>{asString(item.title || `洞察${idx + 1}`)}：</Text>
+              <div
+                key={`cmp-${idx}`}
+                style={{
+                  padding: '10px 12px',
+                  borderRadius: 12,
+                  background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.035)',
+                }}
+              >
+                <Text strong style={{ display: 'block', marginBottom: 4 }}>{asString(item.title || `洞察${idx + 1}`)}</Text>
                 <Text>{asString(item.content)}</Text>
               </div>
             ))}
           </Space>
           <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
-        </Card>
+        </Card>,
+      )
+    }
+
+    case 'InsightClusterCard': {
+      const title = asString(props.title) || 'Key insight cluster'
+      const tone = asString(props.tone).toLowerCase()
+      const items = asStringArray(props.items)
+      const toneAccent = {
+        finding: { border: '#1677ff', bg: isDarkTheme(ctx) ? 'rgba(22, 119, 255, 0.08)' : '#f0f7ff', tag: '洞察' },
+        claim: { border: '#722ed1', bg: isDarkTheme(ctx) ? 'rgba(114, 46, 209, 0.08)' : '#f7f1ff', tag: '论点' },
+        implication: { border: '#08979c', bg: isDarkTheme(ctx) ? 'rgba(8, 151, 156, 0.08)' : '#eefbfb', tag: '启示' },
+      }[tone as 'finding' | 'claim' | 'implication'] || { border: '#1677ff', bg: isDarkTheme(ctx) ? 'rgba(22, 119, 255, 0.08)' : '#f0f7ff', tag: '洞察' }
+
+      return withAnchorPreview(
+        <Card
+          size="small"
+          style={{
+            ...baseCardStyle(ctx),
+            borderLeft: `4px solid ${toneAccent.border}`,
+            background: toneAccent.bg,
+            marginBottom: 16,
+          }}
+          styles={cardSurfaceStyles(ctx, { bodyPadding: '16px 18px', emphasis: 'muted' })}
+          title={(
+            <Space size={8}>
+              <Tag color="blue">{toneAccent.tag}</Tag>
+              <Text strong>{title}</Text>
+            </Space>
+          )}
+        >
+          <ActionBar node={node} ctx={ctx} />
+          <List
+            size="small"
+            dataSource={items}
+            renderItem={(item) => (
+              <List.Item style={{ border: 'none', padding: '6px 0' }}>
+                <Space align="start" size={8}>
+                  <span style={{ color: toneAccent.border, fontSize: 16, lineHeight: 1 }}>•</span>
+                  <Text style={{ fontSize: 14, lineHeight: 1.7 }}>{item}</Text>
+                </Space>
+              </List.Item>
+            )}
+          />
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
+        </Card>,
+      )
+    }
+
+    case 'SectionBridgeCard': {
+      const title = asString(props.title) || '章节承接'
+      const text = asString(props.text)
+      return withAnchorPreview(
+        <div
+          style={{
+            margin: '18px 0',
+            padding: '14px 18px',
+            borderRadius: 14,
+            border: `1px solid ${ctx.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+            background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.03)' : 'rgba(8, 15, 30, 0.025)',
+          }}
+        >
+          <ActionBar node={node} ctx={ctx} />
+          <Text
+            strong
+            style={{
+              display: 'block',
+              fontSize: 12,
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              color: ctx.themeStyle?.mutedColor,
+              marginBottom: 8,
+            }}
+          >
+            {title}
+          </Text>
+          <Paragraph style={{ marginBottom: 0, fontSize: 14, lineHeight: 1.75, color: ctx.themeStyle?.bodyColor }}>
+            {text}
+          </Paragraph>
+          <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
+        </div>,
       )
     }
 
@@ -1494,10 +1676,12 @@ export function renderReaderComponentTree(
       case 'MethodologyCard':
       case 'CitationCard':
       case 'CompareInsightsCard':
+      case 'InsightClusterCard':
       case 'KeyTakeaways':
       case 'EquationBlock':
         return 'feature'
       case 'CalloutBox':
+      case 'SectionBridgeCard':
       case 'AnnotationRail':
       case 'QualityPanel':
       case 'QualityBadge':

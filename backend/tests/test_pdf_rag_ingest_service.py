@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import pytest
+
+from app.services.pdf_rag_ingest_service import (
+    PdfLineRecord,
+    PdfRagIngestService,
+    ProcessedPdfLine,
+)
+import app.services.pdf_rag_ingest_service as pdf_rag_module
+
+
+def _line(
+    *,
+    order: int,
+    page: int,
+    text: str,
+    start: int,
+    end: int,
+) -> PdfLineRecord:
+    return PdfLineRecord(
+        source_order=order,
+        page=page,
+        page_line_index=order,
+        line_id=f"p{page}_l{order:03d}_main",
+        line_uid=f"uid-{page}-{order}",
+        raw_text=text,
+        source_text=text,
+        bbox={"x0": 10.0, "top": 20.0 + order, "x1": 200.0, "bottom": 30.0 + order},
+        column_slot="main",
+        raw_doc_start=start,
+        raw_doc_end=end,
+    )
+
+
+class _FakeRuntime:
+    load_error = None
+
+    def available(self) -> bool:
+        return True
+
+    def classify_action(self, text: str) -> str:
+        if "split words" in text:
+            return "REPAIR"
+        return "KEEP"
+
+    def clean_line(self, text: str) -> str:
+        return text.replace("split words", "split-words fixed")
+
+    def classify_chunk(self, prev_line: str, curr_line: str) -> str:
+        if curr_line.startswith("Methods"):
+            return "NEW_CHUNK"
+        return "JOIN_PREV"
+
+
+class _UnavailableRuntime:
+    load_error = "missing peft"
+
+    def available(self) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_builds_line_chunks_with_raw_and_normalized_metadata(monkeypatch):
+    service = PdfRagIngestService()
+    lines = [
+        _line(order=0, page=1, text="Introduction", start=0, end=12),
+        _line(order=1, page=1, text="This line has split words", start=13, end=38),
+        _line(order=2, page=1, text="Methods", start=39, end=46),
+        _line(order=3, page=1, text="We evaluated the system", start=47, end=70),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_extract_lines",
+        lambda _file_path: (lines, "\n".join(item.raw_text for item in lines)),
+    )
+    monkeypatch.setattr(pdf_rag_module, "_runtime", _FakeRuntime())
+
+    result = await service.ingest_pdf(file_path="dummy.pdf", document_name="paper.pdf")
+
+    assert result["applied"] is True
+    assert result["report"]["line_count"] == 4
+    assert result["report"]["accepted_line_count"] == 4
+    assert result["report"]["chunk_count"] == 2
+    assert result["report"]["coverage"]["missing_line_count"] == 0
+
+    first_chunk = result["chunks"][0]
+    first_meta = first_chunk["metadata"]["extra"]
+    assert "split-words fixed" in first_chunk["content"]
+    assert "This line has split words" in first_meta["raw_text"]
+    assert first_meta["line_ids"] == ["p1_l000_main", "p1_l001_main"]
+
+    second_chunk = result["chunks"][1]
+    second_meta = second_chunk["metadata"]["extra"]
+    assert second_meta["line_ids"] == ["p1_l002_main", "p1_l003_main"]
+    assert second_meta["pages"] == [1]
+
+
+def test_validate_and_fill_coverage_adds_missing_lines_as_single_chunks():
+    service = PdfRagIngestService()
+    accepted = [
+        ProcessedPdfLine(source=_line(order=0, page=1, text="Intro", start=0, end=5), final_action="KEEP", normalized_text="Intro"),
+        ProcessedPdfLine(source=_line(order=1, page=1, text="Body", start=6, end=10), final_action="KEEP", normalized_text="Body"),
+        ProcessedPdfLine(source=_line(order=2, page=1, text="Tail", start=11, end=15), final_action="KEEP", normalized_text="Tail"),
+    ]
+    chunks = [service._build_chunk_from_group(accepted[:2], total_lines=len(accepted))]
+
+    final_chunks, report = service._validate_and_fill_coverage(chunks, accepted)
+
+    assert report["missing_line_count"] == 1
+    assert report["missing_line_ids"] == ["p1_l002_main"]
+    assert len(final_chunks) == 2
+    assert final_chunks[1]["metadata"]["extra"]["line_ids"] == ["p1_l002_main"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_returns_unapplied_when_runtime_unavailable(monkeypatch):
+    service = PdfRagIngestService()
+    lines = [_line(order=0, page=1, text="Only line", start=0, end=9)]
+    monkeypatch.setattr(
+        service,
+        "_extract_lines",
+        lambda _file_path: (lines, "Only line"),
+    )
+    monkeypatch.setattr(pdf_rag_module, "_runtime", _UnavailableRuntime())
+
+    result = await service.ingest_pdf(file_path="dummy.pdf")
+
+    assert result["applied"] is False
+    assert str(result["failure_reason"]).startswith("qwen_runtime_unavailable:")
+    assert result["report"]["line_count"] == 1

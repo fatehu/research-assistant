@@ -158,6 +158,52 @@ def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
     assert should_not_rebuild is False
 
 
+def test_should_not_rebuild_cached_payload_for_simplified_fallback_with_meaningful_reading_flow():
+    service = LiteratureReaderComposeService()
+    should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
+        {
+            "status": "fallback",
+            "degraded_reason": "simplified_pipeline",
+            "build_mode": "compose_agent_simplified",
+            "minimal_gate_report": {
+                "used_atom_count": 0,
+                "usable_atom_count": 20,
+            },
+            "ui_plan": {
+                "components": [
+                    {
+                        "id": "fig-1",
+                        "type": "FigurePanel",
+                        "props": {
+                            "image_url": "/api/v1/literature/papers/78/assets/figure.jpg",
+                            "caption": "Fig 3. Concordance and insight of ChatGPT on USMLE.",
+                        },
+                    },
+                    {
+                        "id": "p-1",
+                        "type": "ParagraphProse",
+                        "props": {
+                            "text": "We first examined the frequency (prevalence) of insight.",
+                        },
+                    },
+                ]
+            },
+        }
+    )
+    assert should_rebuild is False
+
+
+def test_compatible_source_signature_prefix_should_strip_hash_only():
+    service = LiteratureReaderComposeService()
+    prefix = service._compatible_source_signature_prefix(  # pylint: disable=protected-access
+        "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|pv:simplified_v2|mode:auto/light/standard/0/0|h:b9aa9b19b36c5d3f66f039c0"
+    )
+    assert prefix == (
+        "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|pv:simplified_v2|"
+        "mode:auto/light/standard/0/0|h:"
+    )
+
+
 def test_sanitize_components_for_runtime_should_override_single_paragraph_with_pdf_geometry_split():
     service = LiteratureReaderComposeService()
     nodes = [
@@ -440,6 +486,128 @@ def test_sanitize_components_for_runtime_should_rebuild_full_figure_caption_from
     assert str(props.get("source_label") or "") == "Fig 3"
 
 
+def test_sanitize_components_for_runtime_should_merge_line_level_runs_and_attach_caption_to_figure():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "cap_1",
+            "type": "ParagraphProse",
+            "props": {"text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3,"},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_fig_cap1"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "id": "cap_2",
+            "type": "ParagraphProse",
+            "props": {"text": "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams."},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_fig_cap2"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        },
+        {
+            "id": "body_1",
+            "type": "ParagraphProse",
+            "props": {"text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at"},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_body_1"],
+            "zone_type": "main_body",
+            "column_id": "main_right",
+        },
+        {
+            "id": "body_2",
+            "type": "ParagraphProse",
+            "props": {"text": "least one significant insight in 88.9% of all responses."},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_body_2"],
+            "zone_type": "main_body",
+            "column_id": "main_right",
+        },
+        {
+            "id": "n_fig",
+            "type": "FigurePanel",
+            "props": {
+                "caption": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup",
+                "image_url": "asset:layout_fig",
+            },
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p7_fig_img"],
+            "zone_type": "figure_meta",
+            "column_id": "main",
+        },
+    ]
+    payload = {
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_fig_img",
+                    "text": "A B Answer-Explanation Concordance",
+                    "layout_type": "figure",
+                    "layout_sub_type": "picture",
+                    "layout_unique_id": "layout_fig",
+                    "layout_bbox_or_polygon": {"bbox": {"x0": 80, "x1": 500, "top": 200, "bottom": 700}},
+                },
+                {
+                    "block_id": "p7_fig_cap1",
+                    "text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3,",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_fig_caption",
+                    "layout_bbox_or_polygon": {"bbox": {"x0": 80, "x1": 500, "top": 710, "bottom": 730}},
+                },
+                {
+                    "block_id": "p7_fig_cap2",
+                    "text": "AI outputs were adjudicated on concordance and density of insight (DOI) across all exams.",
+                    "layout_type": "figure_name",
+                    "layout_sub_type": "caption",
+                    "layout_unique_id": "layout_fig_caption",
+                    "layout_bbox_or_polygon": {"bbox": {"x0": 80, "x1": 500, "top": 735, "bottom": 755}},
+                },
+                {
+                    "block_id": "p7_body_1",
+                    "text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_body_para",
+                    "layout_bbox_or_polygon": {"bbox": {"x0": 520, "x1": 1200, "top": 780, "bottom": 805}},
+                },
+                {
+                    "block_id": "p7_body_2",
+                    "text": "least one significant insight in 88.9% of all responses.",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "layout_unique_id": "layout_body_para",
+                    "layout_bbox_or_polygon": {"bbox": {"x0": 520, "x1": 1200, "top": 810, "bottom": 835}},
+                },
+            ]
+        }
+    }
+
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        nodes=nodes,
+    )
+
+    assert [str(item.get("type") or "") for item in sanitized] == ["FigurePanel", "ParagraphProse"]
+    figure_props = dict((sanitized[0] or {}).get("props") or {})
+    body_props = dict((sanitized[1] or {}).get("props") or {})
+
+    assert str(figure_props.get("caption") or "").startswith("Fig 3. Concordance and insight of ChatGPT on USMLE.")
+    assert str(figure_props.get("source_label") or "") == "Fig 3"
+    assert str(body_props.get("text") or "") == (
+        "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at "
+        "least one significant insight in 88.9% of all responses."
+    )
+
+
 def test_enforce_no_drop_blocks_fallback_should_ignore_intentional_omissions():
     service = LiteratureReaderComposeService()
     payload = {
@@ -605,6 +773,224 @@ async def test_apply_review_patch_should_create_next_snapshot_with_local_ui_ops(
     assert updated["omission_decisions"][0]["decision"] == "collapse"
     assert updated["ui_plan"]["trace_meta"]["review_note"] == "review round 2"
     assert service._review_sessions["sess_demo"]["latest_snapshot_id"] == updated["snapshot_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_review_session_should_clone_exact_cache_without_recompute(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    cached_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "done",
+        "source_signature": "sig-exact",
+        "build_mode": "compose_agent_single_agent_v2",
+        "ui_plan": {
+            "plan_id": "plan_cached",
+            "components": [
+                {
+                    "id": "n1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Cached paragraph"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.91, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack"},
+        "decision_log": ["cached compose"],
+        "omission_decisions": [],
+        "page_structure_v3": {"block_groups": []},
+    }
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-exact"
+
+    async def _read_payload_from_redis(_key):
+        return dict(cached_payload)
+
+    async def _read_payload_from_db(**_kwargs):
+        raise AssertionError("db cache should not be used when exact redis cache exists")
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _should_not_build(**_kwargs):
+        raise AssertionError("full compose should not run when cloning exact cache for review")
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "build_or_get_composed_payload", _should_not_build)
+
+    snapshot = await service.create_review_session(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78),
+        page=7,
+        selected_kb_id=84,
+        force_refresh=False,
+        regenerate=False,
+        latency_budget_ms=None,
+        quality_target=None,
+        max_iterations=None,
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        citation_tldr=False,
+        snapshot_label="snapshot_cached",
+    )
+
+    assert snapshot["snapshot_id"] == "snapshot_cached"
+    assert snapshot["source_signature"] == "sig-exact"
+    assert snapshot["ui_plan"]["components"][0]["props"]["text"] == "Cached paragraph"
+
+
+@pytest.mark.asyncio
+async def test_create_review_session_should_fallback_to_latest_db_cache_before_recompute(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    latest_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "done",
+        "source_signature": "sig-latest",
+        "build_mode": "compose_agent_single_agent_v2",
+        "ui_plan": {
+            "plan_id": "plan_latest",
+            "components": [
+                {
+                    "id": "n_latest",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Latest cached paragraph"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b010"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.88, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack"},
+        "decision_log": ["latest compose"],
+        "omission_decisions": [],
+        "page_structure_v3": {"block_groups": []},
+    }
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-requested"
+
+    async def _read_payload_from_redis(_key):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_latest_payload_from_db(**_kwargs):
+        return dict(latest_payload)
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _should_not_build(**_kwargs):
+        raise AssertionError("full compose should not run when latest page cache can seed review session")
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_read_latest_payload_from_db", _read_latest_payload_from_db)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "build_or_get_composed_payload", _should_not_build)
+
+    snapshot = await service.create_review_session(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78),
+        page=7,
+        selected_kb_id=84,
+        force_refresh=False,
+        regenerate=False,
+        latency_budget_ms=None,
+        quality_target=None,
+        max_iterations=None,
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        citation_tldr=False,
+        snapshot_label="snapshot_latest",
+    )
+
+    assert snapshot["snapshot_id"] == "snapshot_latest"
+    assert snapshot["source_signature"] == "sig-latest"
+    assert snapshot["ui_plan"]["components"][0]["id"] == "n_latest"
+
+
+@pytest.mark.asyncio
+async def test_create_review_session_from_payload_should_import_without_recompute(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(service, "_get_redis_client", lambda: None)
+
+    imported_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "done",
+        "source_signature": "sig-import",
+        "build_mode": "manual_import",
+        "ui_plan": {
+            "plan_id": "plan_import",
+            "components": [
+                {
+                    "id": "n_import",
+                    "type": "CalloutBox",
+                    "props": {"type": "info", "title": "Imported", "content": "Manual payload"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_dm_p7_b001"],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "assets": [],
+        "quality_report": {"overall": 0.95, "validation_errors": []},
+        "scheme_choice": {"scheme_id": "reading_flow_stack"},
+        "decision_log": ["imported payload"],
+        "omission_decisions": [],
+        "page_structure_v3": {"block_groups": []},
+    }
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+
+    snapshot = await service.create_review_session_from_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78),
+        payload=imported_payload,
+        snapshot_label="snapshot_import",
+    )
+
+    assert snapshot["snapshot_id"] == "snapshot_import"
+    assert snapshot["source_signature"] == "sig-import"
+    assert snapshot["ui_plan"]["components"][0]["type"] == "CalloutBox"
+    assert snapshot["decision_log"] == ["imported payload"]
 
 
 @pytest.mark.asyncio
@@ -1156,6 +1542,9 @@ async def test_reader_panel_plan_agent_should_prefer_dashscope_local_image(monke
         return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(compose_module.settings, "aliyun_api_key", "test-key")
+    monkeypatch.setattr(compose_module.settings, "aliyun_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setattr(compose_module.settings, "reader_agent_model", "qwen-3.5-plus")
     monkeypatch.setattr(service, "_call_dashscope_json", _fake_dashscope)
     monkeypatch.setattr(service, "_call_tool", _fake_tool)
     monkeypatch.setattr(
@@ -1722,6 +2111,110 @@ async def test_cached_simplified_fallback_should_bypass_cache_and_rebuild(monkey
     assert rebuild_calls["count"] == 1
     assert str(payload.get("status") or "") == "done"
     assert str(payload.get("build_mode") or "") == "compose_agent_single_agent_v2"
+
+
+@pytest.mark.asyncio
+async def test_build_or_get_composed_payload_should_reuse_compatible_db_cache_before_rebuild(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "simplified_v2")
+
+    compatible_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "fallback",
+        "degraded_reason": "simplified_pipeline",
+        "build_mode": "compose_agent_simplified",
+        "source_signature": (
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:simplified_v2|mode:auto/light/standard/0/0|h:oldhashvalue123456789012"
+        ),
+        "minimal_gate_report": {
+            "used_atom_count": 0,
+            "usable_atom_count": 20,
+        },
+        "ui_plan": {
+            "plan_id": "plan_cached",
+            "components": [
+                {
+                    "id": "fig-1",
+                    "type": "FigurePanel",
+                    "props": {"image_url": "/fig.png", "caption": "Fig 3"},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["b_fig"],
+                },
+                {
+                    "id": "p-1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "We first examined the frequency of insight."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["b_text"],
+                },
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.88, "validation_errors": []},
+        "assets": [],
+        "page_structure_v3": {"block_groups": []},
+    }
+    writes = {"redis": 0}
+
+    async def _build_source_signature(**_kwargs):
+        return (
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:simplified_v2|mode:auto/light/standard/0/0|h:newhashvalue123456789012"
+        )
+
+    async def _read_payload_from_redis(_key):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_compatible_payload_from_db(**_kwargs):
+        return dict(compatible_payload)
+
+    async def _write_payload_to_redis(_key, _payload):
+        writes["redis"] += 1
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _should_not_acquire_lock(_key):
+        raise AssertionError("compatible db cache should avoid rebuild lock path")
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_read_compatible_payload_from_db", _read_compatible_payload_from_db)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _write_payload_to_redis)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "_acquire_lock", _should_not_acquire_lock)
+
+    payload, meta = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=78, user_id=1, title="demo", pdf_path=""),
+        page=7,
+        selected_kb_id=84,
+        force_refresh=False,
+        regenerate=False,
+        style_intent="auto",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+        citation_tldr=False,
+    )
+
+    assert writes["redis"] == 1
+    assert meta.cache_hit is True
+    assert meta.cache_layer == "db_compatible"
+    assert payload["source_signature"].endswith("h:newhashvalue123456789012")
+    assert len(payload["ui_plan"]["components"]) == 2
 
 
 @pytest.mark.asyncio
@@ -3614,6 +4107,262 @@ def test_reader_compose_bbox_hint_should_union_multi_line_rows():
     assert float(bbox.get("bottom") or 0) >= 258
 
 
+def test_reader_compose_bbox_hint_should_prefer_line_layout_coordinate_space_when_style_dims_mismatch():
+    service = LiteratureReaderComposeService()
+    bbox = service._build_bbox_hint(
+        style_cues={
+            "page_width": 612,
+            "page_height": 792,
+            "line_layout": [
+                {"text": "We first examined the frequency", "x0": 510, "x1": 1356, "top": 1396, "bottom": 1425, "column_label": "main"},
+                {"text": "of insight overall", "x0": 479, "x1": 1394, "top": 1681, "bottom": 1709, "column_label": "main"},
+            ],
+        },
+        quote_text="We first examined the frequency of insight overall",
+        source_anchor={"page": 7, "start_char": 0, "end_char": 120},
+    )
+
+    assert isinstance(bbox, dict)
+    assert float(bbox.get("x1") or 0) == pytest.approx(1394.0)
+    assert float(bbox.get("page_width") or 0) >= 1394.0
+    assert float(bbox.get("page_height") or 0) >= 1709.0
+
+
+def test_reader_compose_node_gate_should_rebuild_implausible_anchor_bbox_from_style_cues():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "components": [
+            {
+                "id": "paragraph_17",
+                "type": "ParagraphProse",
+                "props": {
+                    "text": (
+                        "We first examined the frequency (prevalence) of insight. "
+                        "Overall, ChatGPT produced at least one significant insight."
+                    )
+                },
+                "source_block_ids": ["p7_dm_p7_l010_b001"],
+                "source_anchor_refs": [
+                    {
+                        "anchor_id": "bad_anchor_1",
+                        "canonical_block_id": "p7_dm_p7_l010_b001",
+                        "page": 7,
+                        "start_char": 0,
+                        "end_char": 128,
+                        "quote_text": "We first examined the frequency (prevalence) of insight.",
+                        "bbox_hint": {
+                            "x0": 510.0,
+                            "x1": 1356.0,
+                            "top": 1396.0,
+                            "bottom": 1425.0,
+                            "page_width": 612.0,
+                            "page_height": 792.0,
+                        },
+                        "geometry": {
+                            "page_width": 612.0,
+                            "page_height": 792.0,
+                            "polygons": [
+                                {
+                                    "points": [
+                                        {"x": 510.0, "y": 1396.0},
+                                        {"x": 1356.0, "y": 1396.0},
+                                        {"x": 1356.0, "y": 1425.0},
+                                        {"x": 510.0, "y": 1425.0},
+                                    ]
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    base_payload = {
+        "blocks": [
+            {
+                "id": "dm_p7_l010_b001",
+                "source_anchor": {"canonical_block_id": "p7_dm_p7_l010_b001"},
+            }
+        ],
+        "style_cues": {
+            "page_width": 612.0,
+            "page_height": 792.0,
+            "line_layout": [
+                {
+                    "text": "We first examined the frequency (prevalence) of insight.",
+                    "x0": 211.97,
+                    "x1": 559.42,
+                    "top": 577.04,
+                    "bottom": 587.04,
+                },
+                {
+                    "text": "Overall, ChatGPT produced at least one significant insight.",
+                    "x0": 200.01,
+                    "x1": 573.88,
+                    "top": 592.00,
+                    "bottom": 606.00,
+                },
+            ],
+        },
+    }
+
+    gated = service._apply_node_level_anchor_gate(ui_plan=ui_plan, base_payload=base_payload, page=7)
+    refs = gated["ui_plan"]["components"][0]["source_anchor_refs"]
+    assert len(refs) == 1
+    bbox = refs[0]["bbox_hint"]
+    assert float(bbox["x0"]) == pytest.approx(211.97)
+    assert float(bbox["x1"]) == pytest.approx(559.42)
+    assert float(bbox["top"]) == pytest.approx(577.04)
+    assert float(bbox["bottom"]) == pytest.approx(587.04)
+    geometry = refs[0]["geometry"]
+    assert float(geometry["page_width"]) == pytest.approx(612.0)
+    assert float(geometry["page_height"]) == pytest.approx(792.0)
+    assert float(geometry["polygons"][0]["points"][0]["x"]) == pytest.approx(211.97)
+
+
+def test_sanitize_ui_plan_anchors_should_rebuild_implausible_spatial_hints():
+    service = LiteratureReaderComposeService()
+    ui_plan = {
+        "components": [
+            {
+                "id": "paragraph_17",
+                "type": "ParagraphProse",
+                "props": {"text": "We first examined the frequency (prevalence) of insight."},
+                "children": [],
+                "source_block_ids": ["p7_dm_p7_l010_b001"],
+                "source_anchor_refs": [
+                    {
+                        "anchor_id": "bad_anchor_1",
+                        "canonical_block_id": "p7_dm_p7_l010_b001",
+                        "page": 7,
+                        "start_char": 0,
+                        "end_char": 85,
+                        "quote_text": "We first examined the frequency (prevalence) of insight.",
+                        "bbox_hint": {
+                            "x0": 510.0,
+                            "x1": 1356.0,
+                            "top": 1396.0,
+                            "bottom": 1425.0,
+                            "page_width": 612.0,
+                            "page_height": 792.0,
+                        },
+                        "geometry": {
+                            "page_width": 612.0,
+                            "page_height": 792.0,
+                            "polygons": [
+                                {
+                                    "points": [
+                                        {"x": 510.0, "y": 1396.0},
+                                        {"x": 1356.0, "y": 1396.0},
+                                        {"x": 1356.0, "y": 1425.0},
+                                        {"x": 510.0, "y": 1425.0},
+                                    ]
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    base_payload = {
+        "blocks": [{"id": "dm_p7_l010_b001", "source_anchor": {"canonical_block_id": "p7_dm_p7_l010_b001"}}],
+        "style_cues": {
+            "page_width": 612.0,
+            "page_height": 792.0,
+            "line_layout": [
+                {
+                    "text": "We first examined the frequency (prevalence) of insight.",
+                    "x0": 211.97,
+                    "x1": 559.42,
+                    "top": 577.04,
+                    "bottom": 587.04,
+                }
+            ],
+        },
+    }
+
+    sanitized = service._sanitize_ui_plan_anchors(ui_plan, page=7, base_payload=base_payload)
+    refs = sanitized["components"][0]["source_anchor_refs"]
+    assert len(refs) == 1
+    bbox = refs[0]["bbox_hint"]
+    assert float(bbox["x0"]) == pytest.approx(211.97)
+    assert float(bbox["x1"]) == pytest.approx(559.42)
+    assert float(bbox["top"]) == pytest.approx(577.04)
+    assert float(bbox["bottom"]) == pytest.approx(587.04)
+
+
+def test_ensure_payload_contract_should_rebuild_implausible_runtime_spatial_hints():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "style_cues": {
+            "page_width": 612.0,
+            "page_height": 792.0,
+            "line_layout": [
+                {
+                    "text": "We first examined the frequency (prevalence) of insight.",
+                    "x0": 211.97,
+                    "x1": 559.42,
+                    "top": 577.04,
+                    "bottom": 587.04,
+                }
+            ],
+        },
+        "ui_plan": {
+            "components": [
+                {
+                    "id": "paragraph_17",
+                    "type": "ParagraphProse",
+                    "props": {"text": "We first examined the frequency (prevalence) of insight."},
+                    "children": [],
+                    "source_block_ids": ["p7_dm_p7_l010_b001"],
+                    "source_anchor_refs": [
+                        {
+                            "anchor_id": "bad_anchor_1",
+                            "canonical_block_id": "p7_dm_p7_l010_b001",
+                            "page": 7,
+                            "start_char": 0,
+                            "end_char": 85,
+                            "quote_text": "We first examined the frequency (prevalence) of insight.",
+                            "bbox_hint": {
+                                "x0": 510.0,
+                                "x1": 1356.0,
+                                "top": 1396.0,
+                                "bottom": 1425.0,
+                                "page_width": 612.0,
+                                "page_height": 792.0,
+                            },
+                            "geometry": {
+                                "page_width": 612.0,
+                                "page_height": 792.0,
+                                "polygons": [
+                                    {
+                                        "points": [
+                                            {"x": 510.0, "y": 1396.0},
+                                            {"x": 1356.0, "y": 1396.0},
+                                            {"x": 1356.0, "y": 1425.0},
+                                            {"x": 510.0, "y": 1425.0},
+                                        ]
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+
+    sanitized = service._ensure_payload_contract(page=7, payload=payload)
+    refs = sanitized["ui_plan"]["components"][0]["source_anchor_refs"]
+    assert len(refs) == 1
+    bbox = refs[0]["bbox_hint"]
+    assert float(bbox["x0"]) == pytest.approx(211.97)
+    assert float(bbox["x1"]) == pytest.approx(559.42)
+    assert float(bbox["top"]) == pytest.approx(577.04)
+    assert float(bbox["bottom"]) == pytest.approx(587.04)
+
+
 def test_sanitize_ui_plan_should_keep_only_actionable_anchor_refs():
     service = LiteratureReaderComposeService()
     raw_plan = {
@@ -4490,6 +5239,34 @@ def test_reader_component_contract_service_rejects_invalid_ui_ops():
     assert len(errors) >= 3
 
 
+def test_reader_component_contract_service_accepts_new_structured_cards():
+    service = ReaderComponentContractService()
+
+    ok_cluster, err_cluster = service.validate_component(
+        {
+            "id": "c1",
+            "type": "InsightClusterCard",
+            "props": {"title": "Key findings", "items": ["Finding A", "Finding B"], "tone": "finding"},
+            "source_block_ids": ["b1"],
+        },
+        valid_block_ids={"b1", "b2"},
+    )
+    ok_bridge, err_bridge = service.validate_component(
+        {
+            "id": "c2",
+            "type": "SectionBridgeCard",
+            "props": {"title": "Transition", "text": "This page continues the earlier adjudicator setup."},
+            "source_block_ids": ["b2"],
+        },
+        valid_block_ids={"b1", "b2"},
+    )
+
+    assert ok_cluster is True
+    assert err_cluster is None
+    assert ok_bridge is True
+    assert err_bridge is None
+
+
 @pytest.mark.asyncio
 async def test_apply_multimodal_layout_assist_should_fail_loud_when_not_docmind_source():
     service = LiteratureReaderComposeService()
@@ -4510,6 +5287,7 @@ async def test_apply_multimodal_layout_assist_should_fail_loud_when_not_docmind_
 async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monkeypatch):
     service = LiteratureReaderComposeService()
     paper = SimpleNamespace(id=78, user_id=1, title="Demo", pdf_path="demo.pdf")
+    captured: dict[str, list[str]] = {}
 
     async def _should_not_call_parser(**_kwargs):
         raise AssertionError("build_line_parse_advice should be skipped when docmind structure exists")
@@ -4537,7 +5315,8 @@ async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monk
             {"used": True, "model": "qwen3-vl-flash", "fallback_used": False},
         )
 
-    async def _stage2(**_kwargs):
+    async def _stage2(**kwargs):
+        captured["allowed_components"] = list(kwargs.get("allowed_components") or [])
         return (
             {
                 "page_layout": [
@@ -4602,6 +5381,89 @@ async def test_compose_should_skip_vl_parser_when_docmind_structure_present(monk
     assert bool((output.get("mm_assist_meta") or {}).get("used")) is True
     assert len(list((output.get("stage1_structural_annotations") or {}).get("blocks") or [])) == 1
     assert len(list((output.get("stage2_design_layout") or {}).get("page_layout") or [])) == 1
+    assert "CompareInsightsCard" in captured["allowed_components"]
+    assert "InsightClusterCard" in captured["allowed_components"]
+    assert "SectionBridgeCard" in captured["allowed_components"]
+
+
+def test_ensure_payload_contract_should_mark_layout_monotony_for_prose_heavy_structured_page():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 78,
+        "page": 7,
+        "ui_plan": {
+            "components": [
+                {
+                    "id": "h1",
+                    "type": "SectionHeading",
+                    "props": {"text": "Results", "level": 2},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_h1"],
+                    "region": "main",
+                    "display": "default",
+                },
+                {
+                    "id": "p1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Paragraph one."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_b1"],
+                    "region": "main",
+                    "display": "default",
+                },
+                {
+                    "id": "p2",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Paragraph two."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_b2"],
+                    "region": "main",
+                    "display": "default",
+                },
+                {
+                    "id": "p3",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Paragraph three."},
+                    "children": [],
+                    "source_anchor_refs": [],
+                    "source_block_ids": ["p7_b3"],
+                    "region": "main",
+                    "display": "default",
+                },
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {"block_id": "p7_h1", "kind": "heading", "layout_unique_id": "l_h1", "text": "Results"},
+                {"block_id": "p7_b1", "kind": "paragraph", "layout_unique_id": "l_b1", "text": "Paragraph one."},
+                {"block_id": "p7_b2", "kind": "paragraph", "layout_unique_id": "l_b2", "text": "Paragraph two."},
+                {"block_id": "p7_b3", "kind": "paragraph", "layout_unique_id": "l_b3", "text": "Paragraph three."},
+                {"block_id": "p7_fig", "kind": "figure_meta", "layout_unique_id": "l_fig", "text": "Fig 3. Comparison plot."},
+            ]
+        },
+        "omission_decisions": [
+            {
+                "decision_id": "omit_fig",
+                "target_block_ids": ["p7_fig"],
+                "reason": "Figure metadata routed to AI context.",
+            }
+        ],
+        "quality_report": {"overall": 0.91, "validation_errors": []},
+    }
+
+    ensured = service._ensure_payload_contract(page=7, payload=payload)  # pylint: disable=protected-access
+    quality = dict(ensured.get("quality_report") or {})
+
+    assert quality["layout_monotony"] is True
+    assert quality["flowy_layout_detected"] is True
+    assert int(quality["max_consecutive_prose_nodes"]) == 3
+    assert "flowy_layout_detected" in list(quality.get("warnings") or [])
 
 
 def test_layout_plan_prompt_should_include_all_block_ids_without_truncation():

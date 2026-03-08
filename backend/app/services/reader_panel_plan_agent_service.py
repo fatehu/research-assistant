@@ -81,6 +81,9 @@ class ReaderPanelPlanAgentService:
             {"name": "KeyTakeaways", "props": {"items": "object[]"}},
             {"name": "AbstractCard", "props": {"text": "string"}},
             {"name": "CitationCard", "props": {"title": "string", "authors": "string[]"}},
+            {"name": "CompareInsightsCard", "props": {"items": "object[]"}},
+            {"name": "InsightClusterCard", "props": {"title": "string", "items": "string[]", "tone": "string"}},
+            {"name": "SectionBridgeCard", "props": {"title": "string", "text": "string"}},
             {"name": "EquationBlock", "props": {"latex": "string"}},
             {"name": "MethodologyCard", "props": {"steps": "string[]"}},
         ]
@@ -788,6 +791,11 @@ class ReaderPanelPlanAgentService:
             "10) Prefer flat nodes inside a panel. Do not use nested children unless absolutely necessary.\n"
             "11) Do not summarize, rename, or rewrite source text beyond minor whitespace cleanup.\n"
             "12) Choose one scheme_id from scheme_catalog and store it in style_plan.scheme_id.\n"
+            "13) Avoid long prose-only layouts when richer structure exists on the page.\n"
+            "14) If 3+ prose-like blocks would appear in a row, prefer inserting one structure block such as InsightClusterCard, CalloutBox, MethodologyCard, CitationCard, CompareInsightsCard, or SectionBridgeCard.\n"
+            "15) Figure + analysis usually works better as FigurePanel plus InsightClusterCard or CalloutBox.\n"
+            "16) Methods/protocol/exam setup should prefer MethodologyCard; cross-page continuation or section handoff should prefer SectionBridgeCard.\n"
+            "17) Keep the main reading stack focused on reading flow only: headings, body prose, figures, captions, equations, and a small number of structural cards. Metadata, DOI links, publication info, citation bundles, quality/debug panels, and other auxiliary AI assets should be routed to side context.\n"
             "Paragraph rule: for ParagraphProse, keep source_layout_ids ownership stable, and use props.paragraphs=[{text}] for paragraph breaks inside one node.\n"
             "Use the provided page image as evidence for segmentation, especially indentation, vertical gap, figure/caption split, and obvious paragraph breaks.\n"
             "If image evidence is unclear, keep one paragraph instead of hallucinating.\n"
@@ -881,6 +889,9 @@ class ReaderPanelPlanAgentService:
                 "3) _delete=true removes target panel/node.\n"
                 "4) decision_log_append[] appends notes.\n"
                 "Rules: keep source_layout_ids ownership stable; do not invent IDs; do not replace panel objects with node objects; use props.paragraphs for ParagraphProse segmentation if needed; keep style_plan.scheme_id aligned with scheme_catalog.\n"
+                "Prefer revising when the current plan degenerates into a long ParagraphProse stack despite available figure/method/citation/transition structure.\n"
+                "If 3+ ParagraphProse nodes appear consecutively, treat that as a quality problem unless the page is genuinely plain prose.\n"
+                "Keep non-body AI assets out of the main reading stack whenever possible: DOI links, publication metadata, citation bundles, quality/debug/status panels, and support context belong in side context.\n"
                 f"validation_report={_compact_json(report)}\n"
                 f"scheme_catalog={_compact_json(scheme_catalog)}\n"
                 f"ui_preview_markdown={ui_preview}\n"

@@ -358,6 +358,45 @@ def test_validator_accepts_citation_card_year_as_number():
     assert result["passed"] is True
 
 
+def test_validator_rejects_invalid_insight_cluster_and_section_bridge_props():
+    validator = ReaderSingleAgentValidator()
+    invalid = _valid_step_result()
+    invalid["ui_plan_draft"]["components"] = [
+        {
+            "component": "InsightClusterCard",
+            "source_block_ids": ["l_para"],
+            "props": {"items": ["good", ""], "tone": "unknown"},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 1,
+        },
+        {
+            "component": "SectionBridgeCard",
+            "source_block_ids": ["l_title"],
+            "props": {"text": ""},
+            "zone_type": "main_body",
+            "column_id": "main",
+            "region": "main",
+            "display": "default",
+            "order_key": 2,
+        },
+    ]
+
+    result = validator.validate(
+        step_result=invalid,
+        docmind_blocks=DOCMIND_BLOCKS,
+        component_whitelist=["SectionHeading", "ParagraphProse", "InsightClusterCard", "SectionBridgeCard"],
+    )
+
+    assert result["passed"] is False
+    errors = list(result["gates"]["whitelist_only"]["errors"] or [])
+    assert any("component_props_invalid:InsightClusterCard:items.1:string_required" in str(item) for item in errors)
+    assert any("component_props_invalid:InsightClusterCard:tone:enum_required" in str(item) for item in errors)
+    assert any("component_props_invalid:SectionBridgeCard:text:string_required" in str(item) for item in errors)
+
+
 def test_validator_accepts_valid_layout_contract_fields():
     validator = ReaderSingleAgentValidator()
     valid = _valid_step_result()

@@ -471,6 +471,15 @@ Input JSON:
         gate_error_count = 0
 
         llm_ready = self._llm_available()
+        logger.info(
+            "[ChunkGate] 开始检查: "
+            f"input={len(copied_chunks)}, "
+            f"checked={len(checked)}, "
+            f"tail={len(tail)}, "
+            f"llm_ready={llm_ready}, "
+            f"fail_open={fail_open}, "
+            f"repair_enabled={bool(settings.chunk_repair_enabled)}"
+        )
         for idx, chunk in enumerate(checked):
             chunk_id = str(chunk.get("id") or f"chunk_{idx}")
             content = self._clean_obvious_noise(str(chunk.get("content") or ""))
@@ -610,6 +619,17 @@ Input JSON:
 
             meta["quality_gate"] = gate_meta
             chunk["metadata"] = meta
+
+            checked_so_far = idx + 1
+            if checked_so_far == 1 or checked_so_far == len(checked) or checked_so_far % 25 == 0:
+                logger.info(
+                    "[ChunkGate] 进度: "
+                    f"{checked_so_far}/{len(checked)}, "
+                    f"bad={bad_count}, suspect={suspect_count}, "
+                    f"repaired={repaired_count}, "
+                    f"unrepaired_bad={unrepaired_bad_count}, "
+                    f"errors={gate_error_count}"
+                )
 
         for offset, chunk in enumerate(tail, start=max_chunks):
             meta = dict(chunk.get("metadata") or {})

@@ -21,6 +21,7 @@ from app.core.database import async_session_factory, get_db
 from app.core.security import get_current_user, get_current_user_for_stream
 from app.models.user import User
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk, DocumentStatus
+from app.models.literature import Paper
 from app.schemas.knowledge import (
     KnowledgeBaseCreate,
     KnowledgeBaseUpdate,
@@ -65,6 +66,7 @@ from app.services.document_status_guard_service import (
 from app.services.embedding_dimension_policy_service import get_embedding_dimension_policy_service
 from app.services.dimension_rebuild_service import get_dimension_rebuild_service
 from app.services.chunk_quality_gate_service import get_chunk_quality_gate_service
+from app.services.pdf_rag_ingest_service import get_pdf_rag_ingest_service
 from app.services.smart_chunking_service import (
     SmartChunkingService,
     ChunkConfig,
@@ -145,6 +147,26 @@ def _safe_remove_file(path: Optional[str], *, context: str) -> None:
         os.remove(path)
     except OSError as exc:
         logger.warning(f"[Knowledge API] 文件删除失败 context={context} path={path}: {exc}")
+
+
+async def _document_file_has_other_references(db: AsyncSession, doc: Document) -> bool:
+    file_path = str(doc.file_path or "").strip()
+    if not file_path:
+        return False
+
+    other_doc_count = await db.scalar(
+        select(func.count(Document.id)).where(
+            Document.id != doc.id,
+            Document.file_path == file_path,
+        )
+    )
+    if int(other_doc_count or 0) > 0:
+        return True
+
+    linked_paper_count = await db.scalar(
+        select(func.count(Paper.id)).where(Paper.pdf_path == file_path)
+    )
+    return int(linked_paper_count or 0) > 0
 
 
 # ========== 可用嵌入模型注册表 ==========
@@ -805,33 +827,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 f"[doc:{task_trace_id}] 文档开始处理，嵌入维度将按规模自适应, "
                 f"elapsed={_task_elapsed_ms():.2f}ms"
             )
-            
-            # 提取文本
-            extract_started_at = time.perf_counter()
-            logger.info(f"[doc:{task_trace_id}] 开始提取文档文本: {doc_id}")
-            text = await processor.extract_text(doc.file_path, doc.file_type)
-            logger.info(
-                f"[doc:{task_trace_id}] 文本提取完成: chars={len(text)}, "
-                f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
-                f"elapsed={_task_elapsed_ms():.2f}ms"
-            )
-            
-            if not text.strip():
-                doc.status = DocumentStatus.FAILED.value
-                doc.error_message = "文档内容为空"
-                await db.commit()
-                await _emit_status()
-                return
-            
-            doc.content = text
-            doc.content_hash = processor.compute_hash(text)
-            doc.char_count = len(text)
-            doc.token_count = processor.estimate_tokens(text)
-            if doc.file_type.lower() == "pdf" and processor.last_pdf_extractor:
-                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
-                current_metadata["pdf_extractor"] = processor.last_pdf_extractor
-                doc.metadata_ = current_metadata
-            
+
             # 获取知识库以读取分块配置
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
             if not kb:
@@ -842,83 +838,147 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 await _emit_status()
                 return
 
-            # 分片
-            chunk_started_at = time.perf_counter()
-            logger.info(f"[doc:{task_trace_id}] 开始智能分块: {doc_id}")
-            
-            # 准备配置
             kb_config = kb.chunking_config
-            chunk_config = ChunkConfig(
-                strategy=ChunkingStrategy(kb_config.get("strategy", "hybrid")),
-                base_chunk_size=kb.chunk_size,
-                chunk_overlap=kb.chunk_overlap,
-                breakpoint_percentile=kb_config.get("breakpoint_percentile", 95.0),
-                semantic_threshold=kb_config.get("semantic_threshold", 0.75),
-                min_semantic_chunk=kb_config.get("min_semantic_chunk", 100),
-                max_semantic_chunk=kb_config.get("max_semantic_chunk", 1500),
-                enable_hierarchical=kb_config.get("enable_hierarchical", True),
-                detect_academic_structure=kb_config.get("detect_academic_structure", True),
-                preserve_citations=kb_config.get("preserve_citations", True),
-                
-                # ===== V3 Token 计量 =====
-                use_token_based=kb_config.get("use_token_based", True),
-                base_chunk_tokens=kb_config.get("base_chunk_tokens", 128),
-                overlap_tokens=kb_config.get("overlap_tokens", 16),
-                min_semantic_tokens=kb_config.get("min_semantic_tokens", 32),
-                max_semantic_tokens=kb_config.get("max_semantic_tokens", 384),
-            )
-            
-            if "hierarchy_levels" in kb_config:
-                 chunk_config.hierarchy_levels = [ChunkLevel(l) for l in kb_config["hierarchy_levels"]]
+            text = ""
+            primary_chunks = []
+            context_chunks = []
 
-            # 执行分块
-            smart_service = SmartChunkingService()
-            result = await smart_service.chunk_document(text, chunk_config, doc.file_type)
-            logger.info(
-                f"[doc:{task_trace_id}] 智能分块完成: 层级分块={'是' if result.get('hierarchy') else '否'}, "
-                f"stage_ms={(time.perf_counter() - chunk_started_at) * 1000:.2f}, "
-                f"elapsed={_task_elapsed_ms():.2f}ms"
-            )
-            
-            # ===== [Fix 1] 收集分块 =====
-            # 核心原则：paragraph 级作为检索单元（生成 embedding）
-            #          section/document 级作为上下文参考（不生成 embedding，存入文档 metadata）
-            
-            primary_chunks = []   # paragraph 级，用于检索
-            context_chunks = []   # section/document 级，仅存元数据
-            
-            if result.get("hierarchy"):
-                hierarchy = result["hierarchy"]
-                for level, level_chunks in hierarchy.items():
-                    for chunk_data in level_chunks:
-                        # 确保 chunk_data 是 dict 格式
-                        if not isinstance(chunk_data, dict):
-                            chunk_data = smart_service._chunk_to_dict(chunk_data) if hasattr(chunk_data, 'metadata') else chunk_data
-                        
-                        chunk_level = chunk_data.get("metadata", {}).get("level", "paragraph")
-                        if chunk_level == "paragraph":
-                            primary_chunks.append(chunk_data)
-                        else:
-                            context_chunks.append(chunk_data)
-            else:
-                # result["chunks"] 是 SmartChunk 对象，转为 dict
-                for val in result.get("chunks", []):
-                    primary_chunks.append({
-                        "id": val.id,
-                        "content": val.content,
-                        "start_char": val.start_char,
-                        "end_char": val.end_char,
-                        "metadata": {
-                            "level": val.metadata.level.value if val.metadata.level else "paragraph",
-                            "section_type": val.metadata.section_type,
-                            "section_title": val.metadata.section_title,
-                            "parent_id": val.metadata.parent_id,
-                            "child_ids": val.metadata.child_ids,
-                            "has_citations": val.metadata.has_citations,
-                            "position_ratio": val.metadata.position_ratio,
-                            "keywords": val.metadata.keywords,
-                        }
-                    })
+            if doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
+                extract_started_at = time.perf_counter()
+                logger.info(f"[doc:{task_trace_id}] 开始 PDF 行级 RAG 入库链路: {doc_id}")
+                pdf_rag_service = get_pdf_rag_ingest_service()
+                pdf_result = await pdf_rag_service.ingest_pdf(
+                    file_path=doc.file_path,
+                    document_name=doc.original_filename or doc.filename or "",
+                )
+                text = str(pdf_result.get("document_text") or "")
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["pdf_rag_ingest"] = dict(pdf_result.get("report") or {})
+                if pdf_result.get("extractor"):
+                    current_metadata["pdf_extractor"] = pdf_result.get("extractor")
+                doc.metadata_ = current_metadata
+                if bool(pdf_result.get("applied")):
+                    primary_chunks = list(pdf_result.get("chunks") or [])
+                    logger.info(
+                        f"[doc:{task_trace_id}] PDF 行级 RAG 链路完成: chars={len(text)}, chunks={len(primary_chunks)}, "
+                        f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
+                        f"elapsed={_task_elapsed_ms():.2f}ms"
+                    )
+                else:
+                    logger.warning(
+                        f"[doc:{task_trace_id}] PDF 行级 RAG 链路未启用成功，回退旧链路: "
+                        f"reason={pdf_result.get('failure_reason')}, elapsed={_task_elapsed_ms():.2f}ms"
+                    )
+
+            if not primary_chunks:
+                # 提取文本
+                extract_started_at = time.perf_counter()
+                logger.info(f"[doc:{task_trace_id}] 开始提取文档文本: {doc_id}")
+                text = await processor.extract_text(doc.file_path, doc.file_type)
+                logger.info(
+                    f"[doc:{task_trace_id}] 文本提取完成: chars={len(text)}, "
+                    f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+
+                if not text.strip():
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = "文档内容为空"
+                    await db.commit()
+                    await _emit_status()
+                    return
+
+                if doc.file_type.lower() == "pdf" and processor.last_pdf_extractor:
+                    current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                    current_metadata["pdf_extractor"] = processor.last_pdf_extractor
+                    doc.metadata_ = current_metadata
+
+                # 分片
+                chunk_started_at = time.perf_counter()
+                logger.info(f"[doc:{task_trace_id}] 开始智能分块: {doc_id}")
+
+                # 准备配置
+                chunk_config = ChunkConfig(
+                    strategy=ChunkingStrategy(kb_config.get("strategy", "hybrid")),
+                    base_chunk_size=kb.chunk_size,
+                    chunk_overlap=kb.chunk_overlap,
+                    breakpoint_percentile=kb_config.get("breakpoint_percentile", 95.0),
+                    semantic_threshold=kb_config.get("semantic_threshold", 0.75),
+                    min_semantic_chunk=kb_config.get("min_semantic_chunk", 100),
+                    max_semantic_chunk=kb_config.get("max_semantic_chunk", 1500),
+                    enable_hierarchical=kb_config.get("enable_hierarchical", True),
+                    detect_academic_structure=kb_config.get("detect_academic_structure", True),
+                    preserve_citations=kb_config.get("preserve_citations", True),
+
+                    # ===== V3 Token 计量 =====
+                    use_token_based=kb_config.get("use_token_based", True),
+                    base_chunk_tokens=kb_config.get("base_chunk_tokens", 128),
+                    overlap_tokens=kb_config.get("overlap_tokens", 16),
+                    min_semantic_tokens=kb_config.get("min_semantic_tokens", 32),
+                    max_semantic_tokens=kb_config.get("max_semantic_tokens", 384),
+                )
+
+                if "hierarchy_levels" in kb_config:
+                    chunk_config.hierarchy_levels = [ChunkLevel(l) for l in kb_config["hierarchy_levels"]]
+
+                # 执行分块
+                smart_service = SmartChunkingService()
+                result = await smart_service.chunk_document(text, chunk_config, doc.file_type)
+                logger.info(
+                    f"[doc:{task_trace_id}] 智能分块完成: 层级分块={'是' if result.get('hierarchy') else '否'}, "
+                    f"stage_ms={(time.perf_counter() - chunk_started_at) * 1000:.2f}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+
+                # ===== [Fix 1] 收集分块 =====
+                # 核心原则：paragraph 级作为检索单元（生成 embedding）
+                #          section/document 级作为上下文参考（不生成 embedding，存入文档 metadata）
+                if result.get("hierarchy"):
+                    hierarchy = result["hierarchy"]
+                    for level, level_chunks in hierarchy.items():
+                        for chunk_data in level_chunks:
+                            if not isinstance(chunk_data, dict):
+                                chunk_data = (
+                                    smart_service._chunk_to_dict(chunk_data)
+                                    if hasattr(chunk_data, "metadata")
+                                    else chunk_data
+                                )
+
+                            chunk_level = chunk_data.get("metadata", {}).get("level", "paragraph")
+                            if chunk_level == "paragraph":
+                                primary_chunks.append(chunk_data)
+                            else:
+                                context_chunks.append(chunk_data)
+                else:
+                    for val in result.get("chunks", []):
+                        primary_chunks.append({
+                            "id": val.id,
+                            "content": val.content,
+                            "start_char": val.start_char,
+                            "end_char": val.end_char,
+                            "metadata": {
+                                "level": val.metadata.level.value if val.metadata.level else "paragraph",
+                                "section_type": val.metadata.section_type,
+                                "section_title": val.metadata.section_title,
+                                "parent_id": val.metadata.parent_id,
+                                "child_ids": val.metadata.child_ids,
+                                "has_citations": val.metadata.has_citations,
+                                "position_ratio": val.metadata.position_ratio,
+                                "keywords": val.metadata.keywords,
+                            }
+                        })
+
+            if not text.strip():
+                doc.status = DocumentStatus.FAILED.value
+                doc.error_message = "文档内容为空"
+                await db.commit()
+                await _emit_status()
+                return
+
+            doc.content = text
+            doc.content_hash = processor.compute_hash(text)
+            doc.char_count = len(text)
+            doc.token_count = processor.estimate_tokens(text)
             
             chunks_to_save = primary_chunks
             
@@ -942,6 +1002,13 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             if settings.chunk_quality_gate_enabled:
                 gate_started_at = time.perf_counter()
                 gate_service = get_chunk_quality_gate_service()
+                logger.info(
+                    f"[doc:{task_trace_id}] 开始 chunk quality gate: "
+                    f"input_chunks={len(chunks_to_save)}, "
+                    f"max_checked={max(1, int(settings.chunk_quality_gate_max_chunks or 300))}, "
+                    f"repair_enabled={bool(settings.chunk_repair_enabled)}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
                 gate_result = await gate_service.gate_chunks(
                     chunks_to_save,
                     document_name=doc.original_filename or doc.filename or "",
@@ -1036,6 +1103,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             
             for i, chunk_data in enumerate(chunks_to_save):
                 meta = chunk_data["metadata"]
+                extra_meta = dict(meta.get("extra") or {})
                 chunk_embedding = embeddings[i] if i < len(embeddings) else None
                 chunk_embedding_dimension = (
                     len(chunk_embedding) if chunk_embedding is not None else embedding_svc.get_dimension()
@@ -1064,8 +1132,9 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     metadata_={
                         "position_ratio": meta.get("position_ratio"),
                         "keywords": meta.get("keywords"),
-                        "original_id": chunk_data["id"] 
-                    }
+                        "original_id": chunk_data["id"],
+                        **extra_meta,
+                    },
                 )
                 db.add(chunk)
                 smart_id_map[chunk_data["id"]] = chunk
@@ -1074,6 +1143,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 这样可以在 search 时通过 parent_id 回溯到父级 chunk
             for chunk_data in context_chunks:
                 meta = chunk_data["metadata"]
+                extra_meta = dict(meta.get("extra") or {})
                 # 为 context chunk 分配 index，接在 primary 后面
                 # 注意：这里 index 可能不连续，但对检索影响不大
                 
@@ -1106,8 +1176,9 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     metadata_={
                         "position_ratio": meta.get("position_ratio"),
                         "keywords": meta.get("keywords"),
-                        "original_id": chunk_data["id"] 
-                    }
+                        "original_id": chunk_data["id"],
+                        **extra_meta,
+                    },
                 )
                 db.add(chunk)
                 smart_id_map[chunk_data["id"]] = chunk
@@ -1283,8 +1354,11 @@ async def delete_document(
         raise HTTPException(status_code=404, detail="文档不存在")
     
     # 删除文件
-    if doc.file_path and os.path.exists(doc.file_path):
+    preserve_file = await _document_file_has_other_references(db, doc)
+    if doc.file_path and os.path.exists(doc.file_path) and not preserve_file:
         _safe_remove_file(doc.file_path, context=f"delete_doc:{doc_id}")
+    elif preserve_file:
+        logger.info(f"[Knowledge API] 保留共享文件: doc={doc_id}, path={doc.file_path}")
     
     # 更新知识库统计
     kb.document_count = max(0, (kb.document_count or 0) - 1)

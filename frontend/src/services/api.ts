@@ -78,6 +78,7 @@ export const normalizeTaskStatus = (
   status: string | undefined | null,
 ): TaskStatus => {
   const normalized = String(status || '').trim().toLowerCase()
+  if (normalized === 'completed' || normalized === 'complete') return 'completed'
   if (normalized === 'processing' || normalized === 'running') return 'running'
   if (normalized === 'ready' || normalized === 'success' || normalized === 'done') return 'completed'
   if (normalized === 'timeout') return 'timeout'

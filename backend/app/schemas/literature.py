@@ -644,6 +644,13 @@ class ReaderComposePrefetchResponse(BaseModel):
 
 class ReaderComposeReviewSessionRequest(ReaderComposeRequest):
     snapshot_label: Optional[str] = None
+    prefer_cache_clone: bool = True
+    allow_recompute_on_cache_miss: bool = True
+
+
+class ReaderComposeReviewImportRequest(BaseModel):
+    snapshot_label: Optional[str] = None
+    payload: ReaderComposePayload
 
 
 class ReaderComposeReviewPatchRequest(BaseModel):
