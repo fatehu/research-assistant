@@ -25,6 +25,9 @@ jobs:
       API_RATE_LIMIT_CODELAB_PER_MINUTE: "120"
       DEEPSEEK_API_KEY: dummy
       SERPER_API_KEY: dummy
+      EMBEDDING_PROVIDER: mock
+      MOCK_EMBEDDING_MODEL: mock/deterministic
+      MOCK_EMBEDDING_DIMENSION: "256"
       VITE_API_BASE_URL: http://localhost:8888
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
