@@ -9,7 +9,7 @@ import time
 import uuid
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,11 +62,16 @@ from app.schemas.literature import (
     PaperCommentResponse,
     PaperCommentUpdate,
     PaperCreate,
+    ReaderGenerativePlanRequest,
+    ReaderGenerativePlanResponse,
+    ReaderExperiencePlanRequest,
+    ReaderExperiencePlanResponse,
     ReaderGenerativePrefetchRequest,
     ReaderGenerativePrefetchResponse,
     ReaderGenerativeRequest,
     ReaderComposePrefetchRequest,
     ReaderComposePrefetchResponse,
+    ReaderComposeFetchResponse,
     ReaderComposeRequest,
     ReaderComposeReviewAutoPatchRequest,
     ReaderComposeReviewAutoPatchResponse,
@@ -96,6 +101,8 @@ from app.schemas.literature import (
 )
 from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.contextual_compression_service import CompressionInput
+from app.services.dashscope_multimodal_service import DashScopeMultimodalService
+from app.services.generative_reader_agent_runtime import get_generative_reader_agent_runtime
 from app.services.literature_service import PaperResult, get_literature_service
 from app.services.literature_reader_compose_service import get_literature_reader_compose_service
 from app.services.literature_reader_service import get_literature_reader_service
@@ -324,6 +331,10 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
 ASK_CACHE_TTL_SECONDS = 600
 _ask_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ask_redis_client = None
+GENERATIVE_PLAN_CACHE_TTL_SECONDS = 3600
+_generative_plan_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
+EXPERIENCE_PLAN_CACHE_TTL_SECONDS = 3600
+_experience_plan_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 PAGE_COUNT_CACHE_TTL_SECONDS = 3600
 _pdf_page_count_cache: Dict[str, tuple[float, int]] = {}
 
@@ -711,6 +722,114 @@ async def _get_pdf_page_count(file_path: Optional[str]) -> Optional[int]:
     return None
 
 
+async def _extract_adjacent_page_reference_text(
+    *,
+    image_path: str,
+    relation: str,
+    page: int,
+) -> Optional[Dict[str, Any]]:
+    if not str(image_path or "").strip() or not os.path.exists(str(image_path or "").strip()):
+        return None
+    if not DashScopeMultimodalService.is_available():
+        return None
+
+    api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
+    base_url = str(getattr(settings, "aliyun_dashscope_api_base", "") or getattr(settings, "aliyun_base_url", "") or "").strip()
+    model = str(getattr(settings, "reader_mm_parser_model", "qwen3-vl-flash") or "qwen3-vl-flash").strip()
+    if not api_key or not base_url or not model:
+        return None
+
+    prompt = (
+        "You are extracting reference-only continuity text from a neighboring PDF page image.\n"
+        "Return JSON only.\n"
+        "Focus on readable body text, headings, captions, and section carry-over cues.\n"
+        "Ignore decorative labels, chart axis ticks, legends, page chrome, and obvious OCR garbage.\n"
+        "Do not summarize or explain; extract short reference text only.\n"
+        "Return shape: "
+        '{"page": 0, "relation": "previous_page|next_page", "reference_only": true, "text": "..."}.'
+    )
+    user_prompt = (
+        f"target_page={int(page)}\n"
+        f"relation={relation}\n"
+        "This content is reference-only for the CURRENT page and must not override current-page evidence.\n"
+        "Extract at most 1200 Chinese/English characters of useful continuity text."
+    )
+    try:
+        result = await DashScopeMultimodalService.chat_json(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            system_prompt=prompt,
+            user_prompt=user_prompt,
+            image_paths=[str(image_path)],
+            max_tokens=900,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.warning(f"[Literature Experience] adjacent page OCR failed page={page} relation={relation}: {exc}")
+        return None
+
+    parsed = dict(result.get("parsed") or {}) if isinstance(result, dict) else {}
+    text = str(parsed.get("text") or result.get("raw_text") or "").strip()
+    if not text:
+        return None
+    return {
+        "page": int(parsed.get("page") or page),
+        "relation": str(parsed.get("relation") or relation).strip() or relation,
+        "reference_only": True,
+        "source": "vlflash_page_ocr",
+        "text": text[:1200],
+    }
+
+
+async def _build_experience_adjacent_page_context(
+    *,
+    compose_service: Any,
+    paper: Paper,
+    focus_page: int,
+) -> List[Dict[str, Any]]:
+    pdf_path = compose_service._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+        user_id=int(paper.user_id),
+        paper_id=int(paper.id),
+        paper_title=paper.title,
+        paper_pdf_path=paper.pdf_path,
+    )
+    if not pdf_path or not os.path.exists(pdf_path):
+        return []
+
+    max_page = await _get_pdf_page_count(pdf_path)
+    if not max_page or max_page <= 1:
+        return []
+
+    refs: List[Dict[str, Any]] = []
+    for relation, page_num in (("previous_page", int(focus_page) - 1), ("next_page", int(focus_page) + 1)):
+        if page_num < 1 or page_num > int(max_page):
+            continue
+        try:
+            await compose_service.ensure_page_render_asset(
+                paper_id=int(paper.id),
+                page=int(page_num),
+                pdf_path=str(pdf_path),
+            )
+            image_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+                paper_id=int(paper.id),
+                page=int(page_num),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Literature Experience] adjacent page render failed paper={paper.id} page={page_num} relation={relation}: {exc}"
+            )
+            continue
+        item = await _extract_adjacent_page_reference_text(
+            image_path=str(image_path or ""),
+            relation=relation,
+            page=int(page_num),
+        )
+        if item:
+            refs.append(item)
+    return refs
+
+
 def _ask_cache_key(user_id: int, kb_id: int, scope: str, target_id: int, question: str, mode: str) -> str:
     q_hash = hashlib.sha256(question.strip().encode("utf-8")).hexdigest()
     normalized_mode = (mode or "classic").strip().lower()
@@ -771,6 +890,137 @@ async def _ask_cache_set(cache_key: str, payload: Dict[str, Any], ttl_seconds: i
             logger.warning(f"[Literature Ask] Redis写入失败，降级内存缓存: {exc}")
 
     _ask_cache_memory[cache_key] = (time.time() + max(1, int(ttl_seconds)), payload)
+
+
+def _generative_plan_cache_key(
+    *,
+    user_id: int,
+    paper_id: int,
+    page: int,
+    selected_kb_id: int,
+    compose_source_signature: str,
+    user_intent: str,
+) -> str:
+    intent_hash = hashlib.sha256(str(user_intent or "").strip().encode("utf-8")).hexdigest()[:16]
+    sig_hash = hashlib.sha256(str(compose_source_signature or "").strip().encode("utf-8")).hexdigest()[:16]
+    model_token = str(getattr(settings, "generative_reader_agent_model", "") or getattr(settings, "reader_agent_model", "") or "").strip()
+    provider_token = str(getattr(settings, "generative_reader_agent_provider", "") or getattr(settings, "reader_agent_provider", "") or "").strip()
+    model_hash = hashlib.sha256(f"{provider_token}:{model_token}".encode("utf-8")).hexdigest()[:12]
+    return f"lit:genplan:v14:{int(user_id)}:{int(paper_id)}:{int(page)}:{int(selected_kb_id)}:{sig_hash}:{intent_hash}:{model_hash}"
+
+
+def _experience_plan_cache_key(
+    *,
+    user_id: int,
+    paper_id: int,
+    focus_page: int,
+    selected_kb_id: int,
+    compose_source_signature: str,
+    generative_plan_signature: str,
+    user_intent: str,
+    reader_profile: str,
+    focus_section_ids: Sequence[str],
+) -> str:
+    intent_hash = hashlib.sha256(str(user_intent or "").strip().encode("utf-8")).hexdigest()[:16]
+    sig_hash = hashlib.sha256(str(compose_source_signature or "").strip().encode("utf-8")).hexdigest()[:16]
+    plan_hash = hashlib.sha256(str(generative_plan_signature or "").strip().encode("utf-8")).hexdigest()[:16]
+    profile_hash = hashlib.sha256(str(reader_profile or "").strip().encode("utf-8")).hexdigest()[:12]
+    sections_hash = hashlib.sha256(
+        "|".join(sorted(str(item).strip() for item in list(focus_section_ids or []) if str(item).strip())).encode("utf-8")
+    ).hexdigest()[:12]
+    model_token = str(getattr(settings, "generative_reader_agent_model", "") or getattr(settings, "reader_agent_model", "") or "").strip()
+    provider_token = str(getattr(settings, "generative_reader_agent_provider", "") or getattr(settings, "reader_agent_provider", "") or "").strip()
+    model_hash = hashlib.sha256(f"{provider_token}:{model_token}".encode("utf-8")).hexdigest()[:12]
+    return (
+        f"lit:experience:v15:{int(user_id)}:{int(paper_id)}:{int(focus_page)}:{int(selected_kb_id)}:"
+        f"{sig_hash}:{plan_hash}:{intent_hash}:{profile_hash}:{sections_hash}:{model_hash}"
+    )
+
+
+def _plan_signature(payload: Mapping[str, Any]) -> str:
+    try:
+        normalized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        normalized = str(payload or "")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+async def _generative_plan_cache_get(cache_key: str) -> tuple[Optional[Dict[str, Any]], str]:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            payload = await redis_client.get(cache_key)
+            if payload:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data, "redis"
+        except Exception as exc:
+            logger.warning(f"[Literature GenerativePlan] Redis读取失败，降级内存缓存: {exc}")
+
+    now_ts = time.time()
+    item = _generative_plan_cache_memory.get(cache_key)
+    if not item:
+        return None, "none"
+    expire_at, payload = item
+    if expire_at <= now_ts:
+        _generative_plan_cache_memory.pop(cache_key, None)
+        return None, "none"
+    return payload, "memory"
+
+
+async def _generative_plan_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = GENERATIVE_PLAN_CACHE_TTL_SECONDS,
+) -> None:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            await redis_client.set(cache_key, json.dumps(payload, ensure_ascii=False), ex=max(1, int(ttl_seconds)))
+            return
+        except Exception as exc:
+            logger.warning(f"[Literature GenerativePlan] Redis写入失败，降级内存缓存: {exc}")
+
+    _generative_plan_cache_memory[cache_key] = (time.time() + max(1, int(ttl_seconds)), payload)
+
+
+async def _experience_plan_cache_get(cache_key: str) -> tuple[Optional[Dict[str, Any]], str]:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            payload = await redis_client.get(cache_key)
+            if payload:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data, "redis"
+        except Exception as exc:
+            logger.warning(f"[Literature ExperiencePlan] Redis读取失败，降级内存缓存: {exc}")
+
+    now_ts = time.time()
+    item = _experience_plan_cache_memory.get(cache_key)
+    if not item:
+        return None, "none"
+    expire_at, payload = item
+    if expire_at <= now_ts:
+        _experience_plan_cache_memory.pop(cache_key, None)
+        return None, "none"
+    return payload, "memory"
+
+
+async def _experience_plan_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = EXPERIENCE_PLAN_CACHE_TTL_SECONDS,
+) -> None:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            await redis_client.set(cache_key, json.dumps(payload, ensure_ascii=False), ex=max(1, int(ttl_seconds)))
+            return
+        except Exception as exc:
+            logger.warning(f"[Literature ExperiencePlan] Redis写入失败，降级内存缓存: {exc}")
+
+    _experience_plan_cache_memory[cache_key] = (time.time() + max(1, int(ttl_seconds)), payload)
 
 
 async def _ask_cache_invalidate_prefix(prefix: str) -> None:
@@ -1836,6 +2086,95 @@ async def _build_literature_agent_tool_registry(
         if isinstance(item, dict)
     }
     return registry, {name for name in allowed_tool_names if name}
+
+
+async def _build_generative_reader_agent_tool_registry_for_paper(
+    *,
+    db: AsyncSession,
+    current_user: User,
+    paper: Paper,
+    selected_kb_id: Optional[int],
+) -> tuple[Optional[ToolRegistry], Set[str]]:
+    semantic_tool_names = {"paper_read", "knowledge_search", "web_search", "web_scrape"}
+    paper_pdf_path = _resolve_local_pdf_path(int(current_user.id), paper)
+    resolved_kb_id = int(selected_kb_id or getattr(paper, "knowledge_base_id", 0) or 0)
+
+    if resolved_kb_id > 0:
+        kb = await _get_owned_kb_or_404(db, current_user, int(resolved_kb_id))
+        ready_links, _ = await _retrieve_scope_ready_links(
+            db,
+            user_id=int(current_user.id),
+            kb_id=int(kb.id),
+            paper_ids=[int(paper.id)],
+        )
+        document_ids = sorted({int(link.document_id) for link in ready_links if getattr(link, "document_id", None)})
+        registry, allowed = await _build_literature_agent_tool_registry(
+            db=db,
+            user_id=int(current_user.id),
+            knowledge_base_id=int(kb.id),
+            knowledge_base_name=str(kb.name or f"KB#{kb.id}"),
+            document_ids=document_ids,
+            paper_id=int(paper.id),
+            paper_title=str(getattr(paper, "title", None) or f"paper_{paper.id}"),
+            paper_pdf_path=paper_pdf_path,
+        )
+        return registry, {name for name in allowed if name in semantic_tool_names}
+
+    if not paper_pdf_path or not os.path.exists(str(paper_pdf_path)):
+        return None, set()
+
+    registry = ToolRegistry(
+        db=db,
+        db_session_factory=async_session_factory,
+        user_id=int(current_user.id),
+    )
+    registry.register(
+        LiteratureDirectPaperReadTool(
+            paper_id=int(paper.id),
+            paper_title=str(getattr(paper, "title", None) or f"paper_{paper.id}"),
+            pdf_path=str(paper_pdf_path),
+            source_index_allocator=LiteratureSourceIndexAllocator(),
+        )
+    )
+
+    def _is_allowed_tool_name(name: str) -> bool:
+        normalized = str(name or "").strip().lower()
+        if normalized in {"paper_read", "web_search", "web_scrape"}:
+            return True
+        return _is_web_mcp_tool_name(normalized)
+
+    refresh_mcp_tools = getattr(registry, "refresh_mcp_tools", None)
+    if callable(refresh_mcp_tools):
+        try:
+            maybe_awaitable = refresh_mcp_tools(force_refresh=False)
+            if hasattr(maybe_awaitable, "__await__"):
+                await maybe_awaitable
+        except Exception as exc:
+            logger.warning(f"[GenerativeReader] MCP 工具刷新失败，继续使用本地工具: {exc}")
+
+    registry._tools = {name: tool for name, tool in registry._tools.items() if _is_allowed_tool_name(name)}  # type: ignore[attr-defined]
+    registry._mcp_tools = {name: tool for name, tool in registry._mcp_tools.items() if _is_allowed_tool_name(name)}  # type: ignore[attr-defined]
+
+    refresh_method = getattr(registry, "refresh_mcp_tools", None)
+    if callable(refresh_method):
+        original_refresh = refresh_method
+
+        async def _refresh_filtered(force_refresh: bool = False) -> None:
+            maybe = original_refresh(force_refresh=force_refresh)
+            if hasattr(maybe, "__await__"):
+                await maybe
+            registry._mcp_tools = {  # type: ignore[attr-defined]
+                name: tool for name, tool in registry._mcp_tools.items() if _is_allowed_tool_name(name)  # type: ignore[attr-defined]
+            }
+
+        registry.refresh_mcp_tools = _refresh_filtered  # type: ignore[assignment]
+
+    allowed_tool_names = {
+        str(item.get("function", {}).get("name"))
+        for item in registry.list_tools()
+        if isinstance(item, dict)
+    }
+    return registry, {name for name in allowed_tool_names if name in semantic_tool_names}
 
 
 def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Optional[str], Optional[int]]:
@@ -3424,6 +3763,508 @@ async def prefetch_reader_generative_pages(
 
 
 # ============ Reader Composed ============
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/generative-plan",
+    response_model=ReaderGenerativePlanResponse,
+)
+async def get_reader_composed_generative_plan(
+    paper_id: int,
+    payload: ReaderGenerativePlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    compose_service = get_literature_reader_compose_service()
+    runtime = get_generative_reader_agent_runtime()
+    page_num = max(1, int(payload.page))
+
+    composed_payload, meta = await compose_service.build_or_get_composed_payload(
+        db=db,
+        user_id=int(current_user.id),
+        paper=paper,
+        page=page_num,
+        selected_kb_id=payload.selected_kb_id,
+        force_refresh=bool(payload.force_refresh),
+        regenerate=bool(payload.regenerate),
+        latency_budget_ms=payload.latency_budget_ms,
+        quality_target=payload.quality_target,
+        max_iterations=getattr(payload, "max_iterations", None),
+        style_intent=payload.style_intent,
+        theme_mode=getattr(payload, "theme_mode", None),
+        detail_level=getattr(payload, "detail_level", None),
+        compare_mode=getattr(payload, "compare_mode", None),
+        citation_tldr=getattr(payload, "citation_tldr", None),
+        publish_ready_event_enabled=False,
+    )
+    compose_status = "fallback" if str(composed_payload.get("status") or "").strip() == "fallback" else "done"
+    compose_build_mode = str(composed_payload.get("build_mode") or meta.build_mode or "")
+    compose_source_signature = str(composed_payload.get("source_signature") or meta.source_signature or "")
+    source_sig_hash = str(meta.source_sig_hash or "")
+    plan_cache_hit = False
+    plan_cache_layer = "none"
+    cache_key = _generative_plan_cache_key(
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        page=page_num,
+        selected_kb_id=int(payload.selected_kb_id or 0),
+        compose_source_signature=compose_source_signature,
+        user_intent=str(payload.user_intent or "").strip(),
+    )
+    if not bool(payload.force_refresh) and not bool(payload.regenerate):
+        cached_plan, cache_layer = await _generative_plan_cache_get(cache_key)
+        if isinstance(cached_plan, dict):
+            plan_cache_hit = True
+            plan_cache_layer = cache_layer
+            return ReaderGenerativePlanResponse(
+                page=page_num,
+                plan=cached_plan,
+                enrichment_bundle=dict(composed_payload.get("enrichment_bundle") or {}),
+                scheme_choice=dict(composed_payload.get("scheme_choice") or {}),
+                compose_status=compose_status,
+                compose_build_mode=compose_build_mode,
+                compose_source_signature=compose_source_signature,
+                source_sig_hash=source_sig_hash,
+                cache_hit=bool(meta.cache_hit),
+                cache_layer=str(meta.cache_layer or "none"),
+                plan_cache_hit=plan_cache_hit,
+                plan_cache_layer=plan_cache_layer,
+            )
+    tool_registry, allowed_tool_names = await _build_generative_reader_agent_tool_registry_for_paper(
+        db=db,
+        current_user=current_user,
+        paper=paper,
+        selected_kb_id=payload.selected_kb_id,
+    )
+    adjacent_page_context = await _build_experience_adjacent_page_context(
+        compose_service=compose_service,
+        paper=paper,
+        focus_page=page_num,
+    )
+    plan = await runtime.build_plan(
+        user_id=int(current_user.id),
+        page=page_num,
+        user_intent=str(payload.user_intent or "").strip(),
+        compose_payload=composed_payload,
+        tool_registry=tool_registry,
+        allowed_tool_names=sorted(list(allowed_tool_names)),
+        adjacent_page_context=adjacent_page_context,
+    )
+    plan_payload = plan if isinstance(plan, dict) else json.loads(json.dumps(plan, ensure_ascii=False, default=str))
+    await _generative_plan_cache_set(cache_key, plan_payload)
+    return ReaderGenerativePlanResponse(
+        page=page_num,
+        plan=plan_payload,
+        enrichment_bundle=dict(composed_payload.get("enrichment_bundle") or {}),
+        scheme_choice=dict(composed_payload.get("scheme_choice") or {}),
+        compose_status=compose_status,
+        compose_build_mode=compose_build_mode,
+        compose_source_signature=compose_source_signature,
+        source_sig_hash=source_sig_hash,
+        cache_hit=bool(meta.cache_hit),
+        cache_layer=str(meta.cache_layer or "none"),
+        plan_cache_hit=plan_cache_hit,
+        plan_cache_layer=plan_cache_layer,
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/experience/plan/cached",
+    response_model=ReaderExperiencePlanResponse,
+)
+async def get_reader_experience_plan_cached(
+    paper_id: int,
+    payload: ReaderExperiencePlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    compose_service = get_literature_reader_compose_service()
+    runtime = get_generative_reader_agent_runtime()
+    focus_page = max(1, int(payload.focus_page or payload.page or 1))
+
+    composed_payload = await compose_service.get_latest_cached_payload_only(
+        db=db,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        page=focus_page,
+    )
+    if not isinstance(composed_payload, dict):
+        raise HTTPException(status_code=404, detail="No cached reader payload available for this page")
+
+    compose_status = "fallback" if str(composed_payload.get("status") or "").strip() == "fallback" else "done"
+    compose_build_mode = str(composed_payload.get("build_mode") or "compose_cache")
+    compose_source_signature = str(composed_payload.get("source_signature") or "")
+    source_sig_hash = ""
+
+    generative_cache_hit = False
+    generative_cache_layer = "none"
+    plan_cache_key = _generative_plan_cache_key(
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        page=focus_page,
+        selected_kb_id=int(payload.selected_kb_id or 0),
+        compose_source_signature=compose_source_signature,
+        user_intent=str(payload.user_intent or "").strip(),
+    )
+    cached_plan, cached_layer = await _generative_plan_cache_get(plan_cache_key)
+    if isinstance(cached_plan, dict):
+        generative_plan_payload = cached_plan
+        generative_cache_hit = True
+        generative_cache_layer = cached_layer
+    else:
+        generative_plan_payload = {
+            "version": "v1",
+            "status": "draft",
+            "shell_mode": "resource_augmented_reader",
+            "meta": {"cache_miss": True},
+        }
+    generative_plan_signature = _plan_signature(generative_plan_payload)
+
+    experience_cache_hit = False
+    experience_cache_layer = "none"
+    experience_cache_key = _experience_plan_cache_key(
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=int(payload.selected_kb_id or 0),
+        compose_source_signature=compose_source_signature,
+        generative_plan_signature=generative_plan_signature,
+        user_intent=str(payload.user_intent or "").strip(),
+        reader_profile=str(payload.reader_profile or "").strip(),
+        focus_section_ids=list(payload.focus_section_ids or []),
+    )
+    cached_experience, cached_exp_layer = await _experience_plan_cache_get(experience_cache_key)
+    if isinstance(cached_experience, dict):
+        experience_plan_payload = cached_experience
+        experience_cache_hit = True
+        experience_cache_layer = cached_exp_layer
+    else:
+        can_derive_experience = isinstance(generative_plan_payload, dict) and str(generative_plan_payload.get("status") or "").strip() not in {"", "draft"}
+        if can_derive_experience:
+            built_experience = runtime.build_experience_plan(
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                user_intent=str(payload.user_intent or "").strip(),
+                reader_profile=str(payload.reader_profile or "").strip() or "curious_generalist",
+                focus_section_ids=list(payload.focus_section_ids or []),
+                compose_payload=composed_payload,
+                generative_plan=generative_plan_payload,
+            )
+            experience_plan_payload = (
+                built_experience
+                if isinstance(built_experience, dict)
+                else json.loads(json.dumps(built_experience, ensure_ascii=False, default=str))
+            )
+            await _experience_plan_cache_set(experience_cache_key, experience_plan_payload)
+            experience_cache_hit = True
+            experience_cache_layer = "derived"
+        else:
+            seed_plan = runtime.build_seed_plan(
+                page=focus_page,
+                user_intent=str(payload.user_intent or "").strip(),
+                compose_payload=composed_payload,
+            )
+            built_experience = runtime.build_experience_plan(
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                user_intent=str(payload.user_intent or "").strip(),
+                reader_profile=str(payload.reader_profile or "").strip() or "curious_generalist",
+                focus_section_ids=list(payload.focus_section_ids or []),
+                compose_payload=composed_payload,
+                generative_plan=seed_plan,
+            )
+            experience_plan_payload = (
+                built_experience
+                if isinstance(built_experience, dict)
+                else json.loads(json.dumps(built_experience, ensure_ascii=False, default=str))
+            )
+            experience_meta = dict(experience_plan_payload.get("meta") or {})
+            experience_meta["seed_plan"] = True
+            experience_meta["cache_miss"] = True
+            experience_plan_payload["meta"] = experience_meta
+            await _experience_plan_cache_set(experience_cache_key, experience_plan_payload)
+            experience_cache_hit = True
+            experience_cache_layer = "derived_seed"
+
+    return ReaderExperiencePlanResponse(
+        focus_page=focus_page,
+        plan=experience_plan_payload,
+        generative_plan=generative_plan_payload,
+        compose_payload=composed_payload,
+        enrichment_bundle=dict(composed_payload.get("enrichment_bundle") or {}),
+        compose_status=compose_status,
+        compose_build_mode=compose_build_mode,
+        compose_source_signature=compose_source_signature,
+        source_sig_hash=source_sig_hash,
+        cache_hit=bool(composed_payload.get("cache_hit")),
+        cache_layer=str(composed_payload.get("cache_layer") or "db_latest"),
+        generative_plan_cache_hit=generative_cache_hit,
+        generative_plan_cache_layer=generative_cache_layer,
+        experience_cache_hit=experience_cache_hit,
+        experience_cache_layer=experience_cache_layer,
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/experience/plan",
+    response_model=ReaderExperiencePlanResponse,
+)
+async def get_reader_experience_plan(
+    paper_id: int,
+    payload: ReaderExperiencePlanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    compose_service = get_literature_reader_compose_service()
+    runtime = get_generative_reader_agent_runtime()
+    focus_page = max(1, int(payload.focus_page or payload.page or 1))
+
+    composed_payload, meta = await compose_service.build_or_get_composed_payload(
+        db=db,
+        user_id=int(current_user.id),
+        paper=paper,
+        page=focus_page,
+        selected_kb_id=payload.selected_kb_id,
+        force_refresh=bool(payload.force_refresh),
+        regenerate=bool(payload.regenerate),
+        latency_budget_ms=payload.latency_budget_ms,
+        quality_target=payload.quality_target,
+        max_iterations=getattr(payload, "max_iterations", None),
+        style_intent=payload.style_intent,
+        theme_mode=getattr(payload, "theme_mode", None),
+        detail_level=getattr(payload, "detail_level", None),
+        compare_mode=getattr(payload, "compare_mode", None),
+        citation_tldr=getattr(payload, "citation_tldr", None),
+        publish_ready_event_enabled=False,
+    )
+    compose_status = "fallback" if str(composed_payload.get("status") or "").strip() == "fallback" else "done"
+    compose_build_mode = str(composed_payload.get("build_mode") or meta.build_mode or "")
+    compose_source_signature = str(composed_payload.get("source_signature") or meta.source_signature or "")
+    source_sig_hash = str(meta.source_sig_hash or "")
+    adjacent_page_context = await _build_experience_adjacent_page_context(
+        compose_service=compose_service,
+        paper=paper,
+        focus_page=focus_page,
+    )
+
+    generative_cache_hit = False
+    generative_cache_layer = "none"
+    plan_cache_key = _generative_plan_cache_key(
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        page=focus_page,
+        selected_kb_id=int(payload.selected_kb_id or 0),
+        compose_source_signature=compose_source_signature,
+        user_intent=str(payload.user_intent or "").strip(),
+    )
+    generative_plan_payload: Dict[str, Any]
+    if not bool(payload.force_refresh) and not bool(payload.regenerate):
+        cached_plan, cached_layer = await _generative_plan_cache_get(plan_cache_key)
+        if isinstance(cached_plan, dict):
+            generative_plan_payload = cached_plan
+            generative_cache_hit = True
+            generative_cache_layer = cached_layer
+        else:
+            tool_registry, allowed_tool_names = await _build_generative_reader_agent_tool_registry_for_paper(
+                db=db,
+                current_user=current_user,
+                paper=paper,
+                selected_kb_id=payload.selected_kb_id,
+            )
+            generated_plan = await runtime.build_plan(
+                user_id=int(current_user.id),
+                page=focus_page,
+                user_intent=str(payload.user_intent or "").strip(),
+                compose_payload=composed_payload,
+                tool_registry=tool_registry,
+                allowed_tool_names=sorted(list(allowed_tool_names)),
+                adjacent_page_context=adjacent_page_context,
+            )
+            generative_plan_payload = (
+                generated_plan
+                if isinstance(generated_plan, dict)
+                else json.loads(json.dumps(generated_plan, ensure_ascii=False, default=str))
+            )
+            await _generative_plan_cache_set(plan_cache_key, generative_plan_payload)
+    else:
+        tool_registry, allowed_tool_names = await _build_generative_reader_agent_tool_registry_for_paper(
+            db=db,
+            current_user=current_user,
+            paper=paper,
+            selected_kb_id=payload.selected_kb_id,
+        )
+        generated_plan = await runtime.build_plan(
+            user_id=int(current_user.id),
+            page=focus_page,
+            user_intent=str(payload.user_intent or "").strip(),
+            compose_payload=composed_payload,
+            tool_registry=tool_registry,
+            allowed_tool_names=sorted(list(allowed_tool_names)),
+            adjacent_page_context=adjacent_page_context,
+        )
+        generative_plan_payload = (
+            generated_plan
+            if isinstance(generated_plan, dict)
+            else json.loads(json.dumps(generated_plan, ensure_ascii=False, default=str))
+        )
+        await _generative_plan_cache_set(plan_cache_key, generative_plan_payload)
+    generative_plan_signature = _plan_signature(generative_plan_payload)
+
+    experience_cache_hit = False
+    experience_cache_layer = "none"
+    experience_cache_key = _experience_plan_cache_key(
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=int(payload.selected_kb_id or 0),
+        compose_source_signature=compose_source_signature,
+        generative_plan_signature=generative_plan_signature,
+        user_intent=str(payload.user_intent or "").strip(),
+        reader_profile=str(payload.reader_profile or "").strip(),
+        focus_section_ids=list(payload.focus_section_ids or []),
+    )
+    experience_plan_payload: Dict[str, Any]
+    if not bool(payload.force_refresh) and not bool(payload.regenerate):
+        cached_experience, cached_layer = await _experience_plan_cache_get(experience_cache_key)
+        if isinstance(cached_experience, dict):
+            experience_plan_payload = cached_experience
+            experience_cache_hit = True
+            experience_cache_layer = cached_layer
+        else:
+            built_experience = runtime.build_experience_plan(
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                user_intent=str(payload.user_intent or "").strip(),
+                reader_profile=str(payload.reader_profile or "").strip() or "curious_generalist",
+                focus_section_ids=list(payload.focus_section_ids or []),
+                compose_payload=composed_payload,
+                generative_plan=generative_plan_payload,
+            )
+            experience_plan_payload = (
+                built_experience
+                if isinstance(built_experience, dict)
+                else json.loads(json.dumps(built_experience, ensure_ascii=False, default=str))
+            )
+            await _experience_plan_cache_set(experience_cache_key, experience_plan_payload)
+    else:
+        built_experience = runtime.build_experience_plan(
+            paper_id=int(paper.id),
+            focus_page=focus_page,
+            user_intent=str(payload.user_intent or "").strip(),
+            reader_profile=str(payload.reader_profile or "").strip() or "curious_generalist",
+            focus_section_ids=list(payload.focus_section_ids or []),
+            compose_payload=composed_payload,
+            generative_plan=generative_plan_payload,
+        )
+        experience_plan_payload = (
+            built_experience
+            if isinstance(built_experience, dict)
+            else json.loads(json.dumps(built_experience, ensure_ascii=False, default=str))
+        )
+        await _experience_plan_cache_set(experience_cache_key, experience_plan_payload)
+
+    return ReaderExperiencePlanResponse(
+        focus_page=focus_page,
+        plan=experience_plan_payload,
+        generative_plan=generative_plan_payload,
+        compose_payload=composed_payload,
+        enrichment_bundle=dict(composed_payload.get("enrichment_bundle") or {}),
+        compose_status=compose_status,
+        compose_build_mode=compose_build_mode,
+        compose_source_signature=compose_source_signature,
+        source_sig_hash=source_sig_hash,
+        cache_hit=bool(meta.cache_hit),
+        cache_layer=str(meta.cache_layer or "none"),
+        generative_plan_cache_hit=generative_cache_hit,
+        generative_plan_cache_layer=generative_cache_layer,
+        experience_cache_hit=experience_cache_hit,
+        experience_cache_layer=experience_cache_layer,
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed/cached",
+    response_model=ReaderComposeFetchResponse,
+)
+async def get_reader_composed_page_cached(
+    paper_id: int,
+    payload: ReaderComposeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    compose_service = get_literature_reader_compose_service()
+    page_num = max(1, int(payload.page))
+
+    composed_payload = await compose_service.get_latest_cached_payload_only(
+        db=db,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        page=page_num,
+    )
+    if not isinstance(composed_payload, dict):
+        raise HTTPException(status_code=404, detail="No cached reader payload available for this page")
+    payload_for_response = dict(composed_payload)
+    cache_layer_value = str(payload_for_response.get("cache_layer") or "").strip().lower()
+    if cache_layer_value not in {"redis", "db", "none"}:
+        payload_for_response["cache_layer"] = "db"
+
+    return ReaderComposeFetchResponse(
+        payload=payload_for_response,
+        cache_meta={
+            "cache_hit": True,
+            "cache_layer": "db",
+            "build_mode": str(payload_for_response.get("build_mode") or ""),
+            "source_signature": str(payload_for_response.get("source_signature") or ""),
+            "source_sig_hash": "",
+        },
+    )
+
+
+@router.post(
+    "/papers/{paper_id}/reader/composed",
+    response_model=ReaderComposeFetchResponse,
+)
+async def get_reader_composed_page(
+    paper_id: int,
+    payload: ReaderComposeRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    compose_service = get_literature_reader_compose_service()
+    page_num = max(1, int(payload.page))
+
+    composed_payload, meta = await compose_service.build_or_get_composed_payload(
+        db=db,
+        user_id=int(current_user.id),
+        paper=paper,
+        page=page_num,
+        selected_kb_id=payload.selected_kb_id,
+        force_refresh=bool(payload.force_refresh),
+        regenerate=bool(payload.regenerate),
+        latency_budget_ms=payload.latency_budget_ms,
+        quality_target=payload.quality_target,
+        max_iterations=getattr(payload, "max_iterations", None),
+        style_intent=payload.style_intent,
+        theme_mode=getattr(payload, "theme_mode", None),
+        detail_level=getattr(payload, "detail_level", None),
+        compare_mode=getattr(payload, "compare_mode", None),
+        citation_tldr=getattr(payload, "citation_tldr", None),
+        publish_ready_event_enabled=False,
+    )
+    return ReaderComposeFetchResponse(
+        payload=composed_payload,
+        cache_meta={
+            "cache_hit": bool(meta.cache_hit),
+            "cache_layer": str(meta.cache_layer or "none"),
+            "build_mode": str(meta.build_mode or ""),
+            "source_signature": str(meta.source_signature or ""),
+            "source_sig_hash": str(meta.source_sig_hash or ""),
+        },
+    )
 
 @router.post("/papers/{paper_id}/reader/composed/stream")
 async def stream_reader_composed_page(

@@ -343,6 +343,10 @@ class ReaderComposeRequest(BaseModel):
     citation_tldr: Optional[bool] = None
 
 
+class ReaderGenerativePlanRequest(ReaderComposeRequest):
+    user_intent: Optional[str] = None
+
+
 class ReaderComposeSchemeChoice(BaseModel):
     scheme_id: str = ""
     label: str = ""
@@ -571,6 +575,250 @@ class ReaderComposeAsset(BaseModel):
     tldr: Optional[str] = None
 
 
+class ReaderEnrichmentTarget(BaseModel):
+    target_id: str
+    node_id: str
+    target_kind: Literal["section", "paragraph", "figure", "table", "equation", "structure"]
+    component_type: str
+    title: str = ""
+    excerpt: str = ""
+    source_block_ids: List[str] = Field(default_factory=list)
+    source_atom_ids: List[str] = Field(default_factory=list)
+    section_label: str = ""
+    figure_label: str = ""
+    suggested_resource_types: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderEnrichmentBundle(BaseModel):
+    version: str = "v1"
+    targets: List[ReaderEnrichmentTarget] = Field(default_factory=list)
+    resource_modules: List[Dict[str, Any]] = Field(default_factory=list)
+    interaction_modules: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderStoryClaim(BaseModel):
+    claim_id: str
+    text: str = ""
+    display_text: str = ""
+    source_target_ids: List[str] = Field(default_factory=list)
+    strength: Literal["primary", "supporting"] = "supporting"
+
+
+class ReaderStoryEvidenceUnit(BaseModel):
+    evidence_id: str
+    kind: Literal["figure", "paragraph", "table", "equation", "section"] = "paragraph"
+    role: str = ""
+    title: str = ""
+    source_target_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderStoryTermGap(BaseModel):
+    term: str
+    reason: str = ""
+    source_target_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderStoryBackgroundGap(BaseModel):
+    topic: str
+    reason: str = ""
+    suggested_resource_type: str = ""
+
+
+class ReaderStoryNarrativeTurn(BaseModel):
+    turn_id: str
+    kind: str
+    label: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderStorySubstrate(BaseModel):
+    version: str = "v1"
+    page_id: str = ""
+    main_claims: List[ReaderStoryClaim] = Field(default_factory=list)
+    evidence_units: List[ReaderStoryEvidenceUnit] = Field(default_factory=list)
+    terms_to_explain: List[ReaderStoryTermGap] = Field(default_factory=list)
+    background_gaps: List[ReaderStoryBackgroundGap] = Field(default_factory=list)
+    narrative_turns: List[ReaderStoryNarrativeTurn] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderPageBrief(BaseModel):
+    version: str = "v1"
+    page_goal: str = ""
+    reader_type: str = "curious_generalist"
+    page_archetype: Literal[
+        "figure_explainer",
+        "finding_digest",
+        "methods_decoder",
+        "concept_decoder",
+        "context_builder",
+    ] = "finding_digest"
+    hero_angle: str = ""
+    primary_focus_target_id: str = ""
+    secondary_support_target_ids: List[str] = Field(default_factory=list)
+    reading_path: List[str] = Field(default_factory=list)
+    interaction_opportunities: List[str] = Field(default_factory=list)
+    resource_gaps: List[str] = Field(default_factory=list)
+    experience_hooks: List[str] = Field(default_factory=list)
+    resource_strategy: str = ""
+    storyboard: List[Dict[str, Any]] = Field(default_factory=list)
+    content_budget: Dict[str, int] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativeResourceModule(BaseModel):
+    module_id: str
+    module_type: str
+    target_ids: List[str] = Field(default_factory=list)
+    title: str = ""
+    display_title: str = ""
+    summary: str = ""
+    display_summary: str = ""
+    links: List[Dict[str, Any]] = Field(default_factory=list)
+    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata"] = "agent"
+    interaction_mode: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativeInteractionModule(BaseModel):
+    module_id: str
+    module_type: str
+    target_ids: List[str] = Field(default_factory=list)
+    title: str = ""
+    display_title: str = ""
+    display_summary: str = ""
+    props: Dict[str, Any] = Field(default_factory=dict)
+    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata"] = "agent"
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativeJsWidgetPlan(BaseModel):
+    widget_id: str
+    widget_type: str
+    target_ids: List[str] = Field(default_factory=list)
+    title: str = ""
+    display_title: str = ""
+    display_summary: str = ""
+    data_requirements: List[str] = Field(default_factory=list)
+    props: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativePlan(BaseModel):
+    version: str = "v1"
+    status: Literal["draft", "done", "fallback"] = "draft"
+    shell_mode: str = "resource_augmented_reader"
+    story_substrate: ReaderStorySubstrate = Field(default_factory=ReaderStorySubstrate)
+    page_brief: ReaderPageBrief = Field(default_factory=ReaderPageBrief)
+    rationale: List[str] = Field(default_factory=list)
+    resource_modules: List[ReaderGenerativeResourceModule] = Field(default_factory=list)
+    interaction_modules: List[ReaderGenerativeInteractionModule] = Field(default_factory=list)
+    js_widgets: List[ReaderGenerativeJsWidgetPlan] = Field(default_factory=list)
+    used_tools: List[str] = Field(default_factory=list)
+    tool_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceHero(BaseModel):
+    title: str = ""
+    display_title: str = ""
+    subtitle: str = ""
+    display_subtitle: str = ""
+    summary: str = ""
+    display_summary: str = ""
+    focus_label: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    claim_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceUiAction(BaseModel):
+    action_id: str
+    action_type: str
+    label: str = ""
+    target_ref: str = ""
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    event_name: str = ""
+    agent_handoff: bool = False
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceEventBinding(BaseModel):
+    event_id: str
+    event_name: str
+    event_source: Literal["user", "agent", "system"] = "user"
+    event_type: str = ""
+    action_ids: List[str] = Field(default_factory=list)
+    target_ref: str = ""
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceBlockRef(BaseModel):
+    block_id: str
+    block_type: Literal["resource_module", "interaction_module", "widget"]
+    version: str = "block_ref_v1"
+    ref_id: str = ""
+    variant: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    priority: int = 0
+    state: Literal["ready", "empty", "loading", "partial", "error"] = "ready"
+    data_requirements: List[str] = Field(default_factory=list)
+    fallback_policy: str = "omit"
+    user_actions: List[str] = Field(default_factory=list)
+    agent_actions: List[str] = Field(default_factory=list)
+    ui_actions: List[ReaderExperienceUiAction] = Field(default_factory=list)
+    event_bindings: List[ReaderExperienceEventBinding] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceSection(BaseModel):
+    section_id: str
+    section_type: Literal[
+        "hero",
+        "focus_stage",
+        "reading_flow",
+        "explainer_cluster",
+        "supporting_resources",
+        "question_lab",
+        "story_map",
+    ]
+    title: str = ""
+    display_title: str = ""
+    summary: str = ""
+    display_summary: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    section_region: Literal["main", "sidebar", "footer"] = "main"
+    layout_variant: str = ""
+    blocks: List[ReaderExperienceBlockRef] = Field(default_factory=list)
+    resource_module_ids: List[str] = Field(default_factory=list)
+    interaction_module_ids: List[str] = Field(default_factory=list)
+    widget_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperiencePlan(BaseModel):
+    version: str = "v1"
+    status: Literal["draft", "done", "fallback"] = "draft"
+    scope: Literal["paper", "section", "page_focus"] = "paper"
+    focus_page: int = Field(default=1, ge=1)
+    reader_profile: str = "curious_generalist"
+    layout_variant: str = "resource_augmented_reader"
+    page_story_title: str = ""
+    page_story_subtitle: str = ""
+    narrative_goal: str = ""
+    hero: ReaderExperienceHero = Field(default_factory=ReaderExperienceHero)
+    main_sections: List[ReaderExperienceSection] = Field(default_factory=list)
+    supporting_resources: List[ReaderGenerativeResourceModule] = Field(default_factory=list)
+    interactive_blocks: List[ReaderGenerativeInteractionModule] = Field(default_factory=list)
+    widget_blocks: List[ReaderGenerativeJsWidgetPlan] = Field(default_factory=list)
+    reading_path: List[str] = Field(default_factory=list)
+    used_tools: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ReaderComposePayload(BaseModel):
     paper_id: int
     page: int
@@ -617,11 +865,57 @@ class ReaderComposePayload(BaseModel):
     toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     phase1_compact_input: Dict[str, Any] = Field(default_factory=dict)
     review_route_meta: Dict[str, Any] = Field(default_factory=dict)
+    enrichment_bundle: ReaderEnrichmentBundle = Field(default_factory=ReaderEnrichmentBundle)
+    generative_reader_plan: ReaderGenerativePlan = Field(default_factory=ReaderGenerativePlan)
     generated_at: datetime
     cache_hit: bool = False
     cache_layer: Optional[Literal["redis", "db", "none"]] = None
     overlay_applied: bool = False
     overlay_count: int = 0
+
+
+class ReaderComposeFetchResponse(BaseModel):
+    payload: ReaderComposePayload
+    cache_meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGenerativePlanResponse(BaseModel):
+    page: int = Field(..., ge=1)
+    plan: ReaderGenerativePlan = Field(default_factory=ReaderGenerativePlan)
+    enrichment_bundle: ReaderEnrichmentBundle = Field(default_factory=ReaderEnrichmentBundle)
+    scheme_choice: ReaderComposeSchemeChoice = Field(default_factory=ReaderComposeSchemeChoice)
+    compose_status: Literal["done", "fallback"] = "done"
+    compose_build_mode: str = ""
+    compose_source_signature: str = ""
+    source_sig_hash: str = ""
+    cache_hit: bool = False
+    cache_layer: str = "none"
+    plan_cache_hit: bool = False
+    plan_cache_layer: str = "none"
+
+
+class ReaderExperiencePlanRequest(ReaderGenerativePlanRequest):
+    focus_page: Optional[int] = Field(default=None, ge=1)
+    focus_section_ids: List[str] = Field(default_factory=list, max_length=12)
+    reader_profile: str = "curious_generalist"
+
+
+class ReaderExperiencePlanResponse(BaseModel):
+    focus_page: int = Field(..., ge=1)
+    plan: ReaderExperiencePlan = Field(default_factory=ReaderExperiencePlan)
+    generative_plan: ReaderGenerativePlan = Field(default_factory=ReaderGenerativePlan)
+    compose_payload: Dict[str, Any] = Field(default_factory=dict)
+    enrichment_bundle: ReaderEnrichmentBundle = Field(default_factory=ReaderEnrichmentBundle)
+    compose_status: Literal["done", "fallback"] = "done"
+    compose_build_mode: str = ""
+    compose_source_signature: str = ""
+    source_sig_hash: str = ""
+    cache_hit: bool = False
+    cache_layer: str = "none"
+    generative_plan_cache_hit: bool = False
+    generative_plan_cache_layer: str = "none"
+    experience_cache_hit: bool = False
+    experience_cache_layer: str = "none"
 
 
 class ReaderComposePrefetchRequest(BaseModel):
@@ -697,6 +991,8 @@ class ReaderComposeReviewSnapshot(BaseModel):
     omission_decisions: List[ReaderComposeOmissionDecision] = Field(default_factory=list)
     diagnostics: List[ReaderComposeReviewDiagnostic] = Field(default_factory=list)
     phase1_compact_input: Dict[str, Any] = Field(default_factory=dict)
+    enrichment_bundle: ReaderEnrichmentBundle = Field(default_factory=ReaderEnrichmentBundle)
+    generative_reader_plan: ReaderGenerativePlan = Field(default_factory=ReaderGenerativePlan)
     render_route: str = ""
     render_image_url: str = ""
     observation_note: str = ""

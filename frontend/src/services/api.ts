@@ -4,6 +4,7 @@ import axios, { AxiosError } from 'axios'
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
+const LONG_RUNNING_READER_TIMEOUT_MS = 180000
 
 export interface ApiErrorContract {
   code?: string
@@ -986,6 +987,16 @@ export interface ReaderComposeRequest {
   citation_tldr?: boolean
 }
 
+export interface ReaderGenerativePlanRequest extends ReaderComposeRequest {
+  user_intent?: string
+}
+
+export interface ReaderExperiencePlanRequest extends ReaderGenerativePlanRequest {
+  focus_page?: number
+  focus_section_ids?: string[]
+  reader_profile?: string
+}
+
 export interface ReaderComposeSchemeChoice {
   scheme_id: string
   label: string
@@ -1280,6 +1291,236 @@ export interface ReaderComposeAsset {
   tldr?: string | null
 }
 
+export interface ReaderEnrichmentTarget {
+  target_id: string
+  node_id: string
+  target_kind: 'section' | 'paragraph' | 'figure' | 'table' | 'equation' | 'structure'
+  component_type: string
+  title: string
+  excerpt: string
+  source_block_ids: string[]
+  source_atom_ids?: string[]
+  section_label?: string
+  figure_label?: string
+  suggested_resource_types?: string[]
+  meta?: Record<string, unknown>
+}
+
+export interface ReaderEnrichmentBundle {
+  version: string
+  targets: ReaderEnrichmentTarget[]
+  resource_modules: Array<Record<string, unknown>>
+  interaction_modules: Array<Record<string, unknown>>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderStoryClaim {
+  claim_id: string
+  text: string
+  display_text: string
+  source_target_ids: string[]
+  strength: 'primary' | 'supporting'
+}
+
+export interface ReaderStoryEvidenceUnit {
+  evidence_id: string
+  kind: 'figure' | 'paragraph' | 'table' | 'equation' | 'section'
+  role: string
+  title: string
+  source_target_ids: string[]
+}
+
+export interface ReaderStoryTermGap {
+  term: string
+  reason: string
+  source_target_ids: string[]
+}
+
+export interface ReaderStoryBackgroundGap {
+  topic: string
+  reason: string
+  suggested_resource_type: string
+}
+
+export interface ReaderStoryNarrativeTurn {
+  turn_id: string
+  kind: string
+  label: string
+  target_ids: string[]
+}
+
+export interface ReaderStorySubstrate {
+  version: string
+  page_id: string
+  main_claims: ReaderStoryClaim[]
+  evidence_units: ReaderStoryEvidenceUnit[]
+  terms_to_explain: ReaderStoryTermGap[]
+  background_gaps: ReaderStoryBackgroundGap[]
+  narrative_turns: ReaderStoryNarrativeTurn[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderPageBrief {
+  version: string
+  page_goal: string
+  reader_type: string
+  page_archetype: 'figure_explainer' | 'finding_digest' | 'methods_decoder' | 'concept_decoder' | 'context_builder'
+  hero_angle: string
+  primary_focus_target_id: string
+  secondary_support_target_ids: string[]
+  reading_path: string[]
+  interaction_opportunities: string[]
+  resource_gaps: string[]
+  experience_hooks: string[]
+  resource_strategy: string
+  storyboard: Array<Record<string, unknown>>
+  content_budget: Record<string, number>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeResourceModule {
+  module_id: string
+  module_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  links: Array<Record<string, unknown>>
+  source: 'agent' | 'paper_read' | 'knowledge_search' | 'web' | 'mcp' | 'fallback'
+  interaction_mode: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeInteractionModule {
+  module_id: string
+  module_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  display_summary: string
+  props: Record<string, unknown>
+  source: 'agent' | 'paper_read' | 'knowledge_search' | 'web' | 'mcp' | 'fallback'
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeJsWidgetPlan {
+  widget_id: string
+  widget_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  display_summary: string
+  data_requirements: string[]
+  props: Record<string, unknown>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativePlan {
+  version: string
+  status: 'draft' | 'done' | 'fallback'
+  shell_mode: string
+  story_substrate: ReaderStorySubstrate
+  page_brief: ReaderPageBrief
+  rationale: string[]
+  resource_modules: ReaderGenerativeResourceModule[]
+  interaction_modules: ReaderGenerativeInteractionModule[]
+  js_widgets: ReaderGenerativeJsWidgetPlan[]
+  used_tools: string[]
+  tool_trace: Array<Record<string, unknown>>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceHero {
+  title: string
+  display_title: string
+  subtitle: string
+  display_subtitle: string
+  summary: string
+  display_summary: string
+  focus_label: string
+  target_ids: string[]
+  claim_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceUiAction {
+  action_id: string
+  action_type: string
+  label: string
+  target_ref: string
+  payload: Record<string, unknown>
+  event_name: string
+  agent_handoff: boolean
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceEventBinding {
+  event_id: string
+  event_name: string
+  event_source: 'user' | 'agent' | 'system'
+  event_type: string
+  action_ids: string[]
+  target_ref: string
+  payload: Record<string, unknown>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceBlockRef {
+  block_id: string
+  block_type: 'resource_module' | 'interaction_module' | 'widget'
+  version: string
+  ref_id: string
+  variant: string
+  target_ids: string[]
+  priority: number
+  state: 'ready' | 'empty' | 'loading' | 'partial' | 'error'
+  data_requirements: string[]
+  fallback_policy: string
+  user_actions: string[]
+  agent_actions: string[]
+  ui_actions: ReaderExperienceUiAction[]
+  event_bindings: ReaderExperienceEventBinding[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceSection {
+  section_id: string
+  section_type: 'hero' | 'focus_stage' | 'reading_flow' | 'explainer_cluster' | 'supporting_resources' | 'question_lab' | 'story_map'
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  target_ids: string[]
+  section_region: 'main' | 'sidebar' | 'footer'
+  layout_variant: string
+  blocks: ReaderExperienceBlockRef[]
+  resource_module_ids: string[]
+  interaction_module_ids: string[]
+  widget_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperiencePlan {
+  version: string
+  status: 'draft' | 'done' | 'fallback'
+  scope: 'paper' | 'section' | 'page_focus'
+  focus_page: number
+  reader_profile: string
+  layout_variant: string
+  page_story_title: string
+  page_story_subtitle: string
+  narrative_goal: string
+  hero: ReaderExperienceHero
+  main_sections: ReaderExperienceSection[]
+  supporting_resources: ReaderGenerativeResourceModule[]
+  interactive_blocks: ReaderGenerativeInteractionModule[]
+  widget_blocks: ReaderGenerativeJsWidgetPlan[]
+  reading_path: string[]
+  used_tools: string[]
+  meta: Record<string, unknown>
+}
+
 export interface ReaderComposePayload {
   paper_id: number
   page: number
@@ -1326,6 +1567,8 @@ export interface ReaderComposePayload {
   toc_quality?: number
   phase1_compact_input?: Record<string, unknown>
   review_route_meta?: Record<string, unknown>
+  enrichment_bundle?: ReaderEnrichmentBundle
+  generative_reader_plan?: ReaderGenerativePlan
   generated_at: string
   cache_hit?: boolean
   cache_layer?: 'redis' | 'db' | 'none' | string
@@ -1349,6 +1592,8 @@ export interface ReaderComposeReviewSnapshot {
   omission_decisions: ReaderComposeOmissionDecision[]
   diagnostics: ReaderComposeReviewDiagnostic[]
   phase1_compact_input?: Record<string, unknown>
+  enrichment_bundle?: ReaderEnrichmentBundle
+  generative_reader_plan?: ReaderGenerativePlan
   render_route: string
   render_image_url?: string
   observation_note?: string
@@ -1481,6 +1726,39 @@ export type ReaderComposeStreamEvent = keyof ReaderComposeStreamEventMap
 export interface ReaderComposeFetchResponse {
   payload: ReaderComposePayload
   cache_meta?: Record<string, unknown>
+}
+
+export interface ReaderGenerativePlanResponse {
+  page: number
+  plan: ReaderGenerativePlan
+  enrichment_bundle: ReaderEnrichmentBundle
+  scheme_choice: ReaderComposeSchemeChoice
+  compose_status: 'done' | 'fallback'
+  compose_build_mode: string
+  compose_source_signature: string
+  source_sig_hash: string
+  cache_hit: boolean
+  cache_layer: string
+  plan_cache_hit: boolean
+  plan_cache_layer: string
+}
+
+export interface ReaderExperiencePlanResponse {
+  focus_page: number
+  plan: ReaderExperiencePlan
+  generative_plan: ReaderGenerativePlan
+  compose_payload?: ReaderComposePayload | null
+  enrichment_bundle: ReaderEnrichmentBundle
+  compose_status: 'done' | 'fallback'
+  compose_build_mode: string
+  compose_source_signature: string
+  source_sig_hash: string
+  cache_hit: boolean
+  cache_layer: string
+  generative_plan_cache_hit: boolean
+  generative_plan_cache_layer: string
+  experience_cache_hit: boolean
+  experience_cache_layer: string
 }
 
 export interface ReaderNodeActionRequest {
@@ -2031,7 +2309,47 @@ export const literatureApi = {
     paperId: number,
     payload: ReaderComposeRequest,
   ): Promise<ReaderComposeFetchResponse> => {
-    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed`, payload)
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/reader/composed/cached`,
+      payload,
+      { timeout: 30000 },
+    )
+    return response.data
+  },
+
+  getReaderGenerativePlan: async (
+    paperId: number,
+    payload: ReaderGenerativePlanRequest,
+  ): Promise<ReaderGenerativePlanResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/reader/composed/generative-plan`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getReaderExperiencePlan: async (
+    paperId: number,
+    payload: ReaderExperiencePlanRequest,
+  ): Promise<ReaderExperiencePlanResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/experience/plan`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getCachedReaderExperiencePlan: async (
+    paperId: number,
+    payload: ReaderExperiencePlanRequest,
+  ): Promise<ReaderExperiencePlanResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
+      payload,
+      { timeout: 30000 },
+    )
     return response.data
   },
 

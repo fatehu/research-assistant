@@ -228,6 +228,48 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
     })
   }
 
+  const renderBlockState = (
+    block: ReaderExperienceBlockRef | null,
+    content: ReactNode,
+    emptyLabel: string,
+  ) => {
+    const state = String(block?.state || 'ready').trim().toLowerCase()
+    const fallbackPolicy = String(block?.fallback_policy || 'omit').trim().toLowerCase()
+    if (state === 'loading') {
+      return (
+        <Card size="small" className="reader-experience-page__module-card reader-experience-page__module-card--soft">
+          <div className="reader-experience-page__loading"><Spin /></div>
+        </Card>
+      )
+    }
+    if (state === 'error') {
+      return (
+        <Card size="small" className="reader-experience-page__module-card reader-experience-page__module-card--soft">
+          <Empty description={emptyLabel || '该模块暂时不可用'} />
+        </Card>
+      )
+    }
+    if (state === 'empty') {
+      if (fallbackPolicy === 'omit') return null
+      return (
+        <Card size="small" className="reader-experience-page__module-card reader-experience-page__module-card--soft">
+          <Empty description={emptyLabel || '暂无内容'} />
+        </Card>
+      )
+    }
+    if (state === 'partial') {
+      return (
+        <div className="reader-experience-page__block-state-shell reader-experience-page__block-state-shell--partial">
+          <div className="reader-experience-page__block-state-banner">
+            <Tag color="gold">部分生成</Tag>
+          </div>
+          {content}
+        </div>
+      )
+    }
+    return content
+  }
+
   const renderExperienceSection = (section: ReaderExperiencePlan['main_sections'][number]) => {
     const sectionType = String(section.section_type || '').trim()
     const sectionTitle = preferDisplayCopy(section.display_title, section.title)
@@ -264,9 +306,18 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
                   <Paragraph className="reader-experience-page__summary">{preferDisplayCopy(hero?.display_summary, hero?.summary)}</Paragraph>
                 </Card>
               ) : null}
-              {sectionExplainerModules.length ? sectionExplainerModules.map((module) => renderInteractionModule(module, interactionBlockLookup.get(String(module.module_id || '').trim()) || null)) : null}
-              {sectionWidgets.length ? sectionWidgets.map((widget) => renderWidget(widget, widgetBlockLookup.get(String(widget.widget_id || '').trim()) || null)) : null}
-              {sectionResourceModules.length ? sectionResourceModules.map((module) => renderResourceModule(module, resourceBlockLookup.get(String(module.module_id || '').trim()) || null)) : null}
+              {sectionExplainerModules.length ? sectionExplainerModules.map((module) => {
+                const block = interactionBlockLookup.get(String(module.module_id || '').trim()) || null
+                return renderBlockState(block, renderInteractionModule(module, block), '术语解释暂未准备好')
+              }) : null}
+              {sectionWidgets.length ? sectionWidgets.map((widget) => {
+                const block = widgetBlockLookup.get(String(widget.widget_id || '').trim()) || null
+                return renderBlockState(block, renderWidget(widget, block), '图解控件暂未准备好')
+              }) : null}
+              {sectionResourceModules.length ? sectionResourceModules.map((module) => {
+                const block = resourceBlockLookup.get(String(module.module_id || '').trim()) || null
+                return renderBlockState(block, renderResourceModule(module, block), '延伸资源暂未准备好')
+              }) : null}
               {!sectionExplainerModules.length && !sectionWidgets.length && !sectionResourceModules.length ? (
                 backgroundRefreshing ? <div className="reader-experience-page__loading"><Spin /></div> : <Empty description="暂无聚焦增强内容" />
               ) : null}
@@ -299,7 +350,10 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
             <div className="reader-experience-page__loading"><Spin /></div>
           ) : sectionExplainerModules.length ? (
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
-              {sectionExplainerModules.map((module) => renderInteractionModule(module, interactionBlockLookup.get(String(module.module_id || '').trim()) || null))}
+              {sectionExplainerModules.map((module) => {
+                const block = interactionBlockLookup.get(String(module.module_id || '').trim()) || null
+                return renderBlockState(block, renderInteractionModule(module, block), '解释模块暂未准备好')
+              })}
             </Space>
           ) : (
             <Empty description="暂无解释模块" />
@@ -315,7 +369,10 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
             <div className="reader-experience-page__loading"><Spin /></div>
           ) : sectionResourceModules.length ? (
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
-              {sectionResourceModules.map((module) => renderResourceModule(module, resourceBlockLookup.get(String(module.module_id || '').trim()) || null))}
+              {sectionResourceModules.map((module) => {
+                const block = resourceBlockLookup.get(String(module.module_id || '').trim()) || null
+                return renderBlockState(block, renderResourceModule(module, block), '资源模块暂未准备好')
+              })}
             </Space>
           ) : (
             <Empty description="暂无延伸资源" />
@@ -329,7 +386,10 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
           {sectionSummary ? <Paragraph className="reader-experience-page__summary reader-experience-page__section-summary">{sectionSummary}</Paragraph> : null}
           {sectionQuestionModules.length ? (
             <div className="reader-experience-page__question-grid">
-              {sectionQuestionModules.map((module) => renderInteractionModule(module, interactionBlockLookup.get(String(module.module_id || '').trim()) || null))}
+              {sectionQuestionModules.map((module) => {
+                const block = interactionBlockLookup.get(String(module.module_id || '').trim()) || null
+                return renderBlockState(block, renderInteractionModule(module, block), '引导问题暂未准备好')
+              })}
             </div>
           ) : fallbackQuestionAnswers.length ? (
             <Card size="small" className="reader-experience-page__module-card">
@@ -349,7 +409,10 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
           )}
           {sectionWidgets.length ? (
             <Space direction="vertical" size={12} style={{ width: '100%', marginTop: 16 }}>
-              {sectionWidgets.map((widget) => renderWidget(widget, widgetBlockLookup.get(String(widget.widget_id || '').trim()) || null))}
+              {sectionWidgets.map((widget) => {
+                const block = widgetBlockLookup.get(String(widget.widget_id || '').trim()) || null
+                return renderBlockState(block, renderWidget(widget, block), '控件暂未准备好')
+              })}
             </Space>
           ) : null}
         </Card>
