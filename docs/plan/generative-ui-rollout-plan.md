@@ -185,3 +185,5 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `/experience` no longer keeps action dispatch inline only; focus switching and last-event feedback now live behind a dedicated hook that can be promoted into a shared renderer/event-bus layer.
 - [x] Extract `/experience` section/layout/block execution into `GenerativeExperienceRenderer`:
   `PaperReaderExperiencePage` now focuses on route state, loader state, alerts, params, and details while the renderer executes section `blocks`, layout regions, focus rendering, and action feedback.
+- [x] Add the first renderer-side block registry:
+  `experienceBlockRegistry.tsx` now holds registered resource / interaction / widget definitions so the renderer stops hardcoding every block family inline.

@@ -573,3 +573,46 @@ npm --prefix frontend run build
 - [ ] `http://localhost:3000/literature/78/experience?page=7` 是否继续稳定打开，没有因为 renderer 抽离出现空白或异常区块
 - [ ] 页面是否仍然像“plan 驱动的展开阅读页”，而不是抽离后退回普通模板
 - [ ] 如果你点击图解/资源/问题卡，交互反馈是否仍然正常
+
+## 2026-03-11 Iteration 16
+
+范围：
+
+- `/literature/78/experience?page=7`
+- 目标：把 renderer 里的 block family 分支继续收敛成 registry，而不是让 renderer 再次膨胀成模板分支中心
+
+自动化结果：
+
+- [x] `cd frontend && ./node_modules/.bin/eslint src/pages/literature/PaperReaderExperiencePage.tsx src/pages/literature/GenerativeExperienceRenderer.tsx src/pages/literature/useExperienceActionBus.ts src/pages/literature/experienceBlockRegistry.tsx`
+  结果：退出码 `0`
+- [x] `cd frontend && ./node_modules/.bin/tsc -p tsconfig.json --noEmit`
+  结果：退出码 `0`
+- [x] `cmd.exe /c curl -I "http://localhost:3000/literature/78/experience?page=7"`
+  结果：`HTTP/1.1 200 OK`
+
+浏览器结果：
+
+- [x] Playwright 复用已有登录会话检查 `/literature/78/experience?page=7`
+- [x] 页面截图仍然正常渲染
+- [ ] 当前开发态会话里捕获到一次 Vite HMR 404：
+  `GenerativeExperienceRenderer.tsx?t=...`
+
+本轮代码结果：
+
+- [x] 新增 `frontend/src/pages/literature/experienceBlockRegistry.tsx`
+- [x] `GenerativeExperienceRenderer` 已改为通过 registry 获取 block definition
+- [x] renderer 不再直接硬编码资源/交互/widget family 的全部细节渲染逻辑
+- [x] `GlossaryPanel / QuestionStarterPanel / FigureExplainPanel / RelatedResourceCard / figure-focus-accordion` 已有注册定义
+- [x] 本轮设计记录已落 `docs/skills`
+- [x] 本轮测试记录已落 `docs/tests`
+
+问题记录：
+
+- [x] 浏览器层发现的是开发态 HMR 抖动，不是页面业务逻辑报错
+- [x] 该问题已记录在 `docs/tests`
+- [x] 已执行 `docker compose restart frontend`，宿主机路由仍返回 `HTTP/1.1 200 OK`
+
+本轮待你手工确认：
+
+- [ ] 你刷新页面后，`/experience` 是否继续稳定显示，不再看到明显的模块缺失
+- [ ] 页面看起来是否更像“由注册 block 驱动的执行层”，而不是 renderer 文件里继续堆越来越多模板分支

@@ -1,6 +1,5 @@
 import { useMemo, type ReactNode } from 'react'
 import {
-  Button,
   Card,
   Collapse,
   Empty,
@@ -21,7 +20,15 @@ import type {
   ReaderStoryClaim,
 } from '@/services/api'
 import { renderReaderComponentTree, type ReaderComponentRenderContext } from './readerComponents'
-import type { ExperienceUiEvent, ReaderExperienceUiActionRef } from './useExperienceActionBus'
+import {
+  getInteractionModuleDefinition,
+  getResourceModuleDefinition,
+  getWidgetDefinition,
+  isQuestionStarterModule,
+  type ExperienceBlockActionHandler,
+  type ExperienceBlockActionResolver,
+} from './experienceBlockRegistry'
+import type { ExperienceUiEvent } from './useExperienceActionBus'
 
 const { Title, Text, Paragraph } = Typography
 
@@ -46,35 +53,6 @@ function preferDisplayCopy(primary: unknown, fallback: unknown): string {
   const primaryText = String(primary || '').trim()
   if (primaryText) return primaryText
   return String(fallback || '').trim()
-}
-
-function resolveResourceModuleEyebrow(moduleType: string): string {
-  const type = String(moduleType || '').trim()
-  if (type === 'FigureExplainPanel') return '图解导读'
-  if (type === 'RelatedResourceCard') return '延伸阅读'
-  return '资源模块'
-}
-
-function resolveInteractionModuleEyebrow(moduleType: string): string {
-  const type = String(moduleType || '').trim()
-  if (type === 'GlossaryPanel') return '概念解释'
-  if (type === 'QuestionStarterPanel') return '继续探索'
-  return '交互模块'
-}
-
-function resolveWidgetEyebrow(widgetType: string): string {
-  const type = String(widgetType || '').trim()
-  if (type === 'figure-focus-accordion') return '交互图解'
-  return '交互区块'
-}
-
-function extractLinkDomain(href: string): string {
-  try {
-    const url = new URL(String(href || '').trim())
-    return String(url.hostname || '').replace(/^www\./i, '')
-  } catch {
-    return ''
-  }
 }
 
 function buildIdLookup<T extends { module_id?: string; widget_id?: string }>(
@@ -106,8 +84,8 @@ type GenerativeExperienceRendererProps = {
   resourceModules: ReaderGenerativeResourceModule[]
   interactionModules: ReaderGenerativeInteractionModule[]
   widgetBlocks: ReaderGenerativeJsWidgetPlan[]
-  getBlockUiAction: (block: ReaderExperienceBlockRef | null | undefined, actionType: string) => ReaderExperienceUiActionRef
-  dispatchBlockAction: (block: ReaderExperienceBlockRef, actionType: string, targetRefOverride?: string) => void
+  getBlockUiAction: ExperienceBlockActionResolver
+  dispatchBlockAction: ExperienceBlockActionHandler
   lastUiEvent: ExperienceUiEvent
   topStatusText: string
 }
@@ -218,197 +196,36 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
   }
 
   const renderResourceModule = (module: ReaderGenerativeResourceModule, block: ReaderExperienceBlockRef | null) => {
-    const links = Array.isArray(module.links) ? module.links : []
-    const eyebrow = resolveResourceModuleEyebrow(module.module_type)
-    const primaryDomain = links.length ? extractLinkDomain(String((links[0] as Record<string, unknown>).href || '')) : ''
-    const title = preferDisplayCopy(module.display_title, module.title)
-    const summary = preferDisplayCopy(module.display_summary, module.summary)
-    const inspectSourceAction = getBlockUiAction(block, 'inspect_source')
-    return (
-      <Card key={module.module_id} size="small" className="reader-experience-page__module-card reader-experience-page__resource-card">
-        <Space direction="vertical" size={10} style={{ width: '100%' }}>
-          <div className="reader-experience-page__module-head">
-            <Text className="reader-experience-page__eyebrow">{eyebrow}</Text>
-            {primaryDomain ? <Tag bordered={false} className="reader-experience-page__domain-chip">{primaryDomain}</Tag> : null}
-          </div>
-          <Title level={4} style={{ margin: 0 }}>{title}</Title>
-          {summary ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
-          {links.length ? (
-            <div className="reader-experience-page__resource-links">
-              {links.map((item, index) => {
-                const row = item as Record<string, unknown>
-                const href = String(row.href || '').trim()
-                const label = String(row.label || href || 'Link').trim()
-                const domain = extractLinkDomain(href)
-                const snippet = String(row.snippet || '').trim()
-                if (!href) return null
-                return (
-                  <a
-                    key={`${module.module_id}-link-${index}`}
-                    href={href}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="reader-experience-page__resource-link"
-                    onClick={() => {
-                      if (block) dispatchBlockAction(block, 'open_resource')
-                    }}
-                  >
-                    <span className="reader-experience-page__resource-link-title">{label}</span>
-                    {snippet ? <span className="reader-experience-page__resource-link-snippet">{snippet}</span> : null}
-                    <span className="reader-experience-page__resource-link-meta">
-                      <span>{domain || '外部来源'}</span>
-                      <span aria-hidden="true">↗</span>
-                    </span>
-                  </a>
-                )
-              })}
-            </div>
-          ) : null}
-          {block && inspectSourceAction ? (
-            <Button size="small" type="text" className="reader-experience-page__inline-action" onClick={() => dispatchBlockAction(block, 'inspect_source')}>
-              {inspectSourceAction.label || '查看来源'}
-            </Button>
-          ) : null}
-        </Space>
-      </Card>
-    )
+    const definition = getResourceModuleDefinition(module.module_type)
+    return definition.render({
+      module,
+      block,
+      getBlockUiAction,
+      dispatchBlockAction,
+      eyebrow: definition.eyebrow,
+    })
   }
 
   const renderInteractionModule = (module: ReaderGenerativeInteractionModule, block: ReaderExperienceBlockRef | null) => {
-    const props = module.props || {}
-    const terms = Array.isArray(props.terms) ? props.terms : []
-    const questions = Array.isArray(props.questions) ? props.questions : []
-    const qaPairs = Array.isArray(props.qa_pairs) ? props.qa_pairs : []
-    const eyebrow = resolveInteractionModuleEyebrow(module.module_type)
-    const title = preferDisplayCopy(module.display_title, module.title)
-    const summary = preferDisplayCopy(module.display_summary, '')
-    const expandDefinitionAction = getBlockUiAction(block, 'expand_definition')
-    const returnToReaderAction = getBlockUiAction(block, 'return_to_reader')
-    const startFollowupAction = getBlockUiAction(block, 'start_followup')
-    return (
-      <Card key={module.module_id} size="small" className="reader-experience-page__module-card">
-        <Space direction="vertical" size={10} style={{ width: '100%' }}>
-          <div className="reader-experience-page__module-head">
-            <Text className="reader-experience-page__eyebrow">{eyebrow}</Text>
-          </div>
-          <Title level={4} style={{ margin: 0 }}>{title}</Title>
-          {summary ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
-          {terms.length ? (
-            <div className="reader-experience-page__term-list">
-              {terms.map((item, index) => {
-                if (!item || typeof item !== 'object') return null
-                const row = item as Record<string, unknown>
-                const term = String(row.term || '').trim()
-                const definition = String(row.definition || '').trim()
-                if (!term && !definition) return null
-                return (
-                  <div key={`${module.module_id}-term-${index}`} className="reader-experience-page__term-card">
-                    <Text strong>{term || `术语 ${index + 1}`}</Text>
-                    {definition ? <Paragraph className="reader-experience-page__summary">{definition}</Paragraph> : null}
-                    {block && expandDefinitionAction ? (
-                      <Button size="small" type="text" className="reader-experience-page__inline-action" onClick={() => dispatchBlockAction(block, 'expand_definition')}>
-                        {expandDefinitionAction.label || '展开术语解释'}
-                      </Button>
-                    ) : null}
-                  </div>
-                )
-              })}
-            </div>
-          ) : qaPairs.length ? (
-            <Collapse
-              bordered={false}
-              className="reader-experience-page__qa-collapse"
-              items={qaPairs.map((item, index) => {
-                const row = (item && typeof item === 'object') ? item as Record<string, unknown> : {}
-                const question = String(row.question || `问题 ${index + 1}`).trim()
-                const answer = String(row.answer || '').trim()
-                const confidence = String(row.confidence || '').trim()
-                return {
-                  key: `${module.module_id}-qa-${index}`,
-                  label: question,
-                  children: (
-                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                      <Paragraph className="reader-experience-page__summary">{answer || '回答生成中。'}</Paragraph>
-                      {confidence ? <Tag bordered={false} className="reader-experience-page__domain-chip">{confidence}</Tag> : null}
-                    </Space>
-                  ),
-                }
-              })}
-            />
-          ) : questions.length ? (
-            <List
-              size="small"
-              className="reader-experience-page__question-list"
-              dataSource={questions.map((item) => String(item || '').trim()).filter(Boolean)}
-              renderItem={(item) => (
-                <List.Item className="reader-experience-page__question-item" onClick={() => { if (block) dispatchBlockAction(block, 'start_followup') }}>
-                  <Text>{item}</Text>
-                </List.Item>
-              )}
-            />
-          ) : (
-            <Paragraph className="reader-experience-page__summary">暂无交互细节。</Paragraph>
-          )}
-          {block && returnToReaderAction ? (
-            <Button size="small" type="text" className="reader-experience-page__inline-action" onClick={() => dispatchBlockAction(block, 'return_to_reader')}>
-              {returnToReaderAction.label || '回到正文'}
-            </Button>
-          ) : null}
-          {block && startFollowupAction ? (
-            <Button size="small" type="default" className="reader-experience-page__inline-action" onClick={() => dispatchBlockAction(block, 'start_followup')}>
-              {startFollowupAction.label || '继续追问'}
-            </Button>
-          ) : null}
-        </Space>
-      </Card>
-    )
+    const definition = getInteractionModuleDefinition(module.module_type)
+    return definition.render({
+      module,
+      block,
+      getBlockUiAction,
+      dispatchBlockAction,
+      eyebrow: definition.eyebrow,
+    })
   }
 
   const renderWidget = (widget: ReaderGenerativeJsWidgetPlan, block: ReaderExperienceBlockRef | null) => {
-    const panels = Array.isArray(widget.props?.panels) ? widget.props.panels : []
-    const eyebrow = resolveWidgetEyebrow(widget.widget_type)
-    const title = preferDisplayCopy(widget.display_title, widget.title)
-    const summary = preferDisplayCopy(widget.display_summary, '')
-    const expandPanelAction = getBlockUiAction(block, 'expand_panel')
-    const focusTargetAction = getBlockUiAction(block, 'focus_target')
-    return (
-      <Card key={widget.widget_id} size="small" className="reader-experience-page__module-card reader-experience-page__widget-card">
-        <Space direction="vertical" size={10} style={{ width: '100%' }}>
-          <div className="reader-experience-page__module-head">
-            <Text className="reader-experience-page__eyebrow">{eyebrow}</Text>
-          </div>
-          <Title level={4} style={{ margin: 0 }}>{title}</Title>
-          {summary ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
-          {panels.length ? (
-            <div className="reader-experience-page__widget-panels">
-              {panels.map((item, index) => {
-                if (!item || typeof item !== 'object') return null
-                const row = item as Record<string, unknown>
-                const label = preferDisplayCopy(row.display_label, row.label || `Panel ${index + 1}`)
-                const panelSummary = preferDisplayCopy(row.display_summary, row.summary || '')
-                return (
-                  <div
-                    key={`${widget.widget_id}-panel-${index}`}
-                    className="reader-experience-page__widget-panel"
-                    onClick={() => {
-                      if (!block) return
-                      if (expandPanelAction) dispatchBlockAction(block, 'expand_panel')
-                      const focusRef = String(row.focus_target_id || row.target_id || block.target_ids?.[0] || '').trim()
-                      if (focusTargetAction) dispatchBlockAction(block, 'focus_target', focusRef)
-                    }}
-                  >
-                    <Text strong>{label}</Text>
-                    <Paragraph className="reader-experience-page__summary">{panelSummary || '焦点说明生成中。'}</Paragraph>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <Paragraph className="reader-experience-page__summary">暂无交互细节。</Paragraph>
-          )}
-        </Space>
-      </Card>
-    )
+    const definition = getWidgetDefinition(widget.widget_type)
+    return definition.render({
+      widget,
+      block,
+      getBlockUiAction,
+      dispatchBlockAction,
+      eyebrow: definition.eyebrow,
+    })
   }
 
   const renderExperienceSection = (section: ReaderExperiencePlan['main_sections'][number]) => {
@@ -422,8 +239,9 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
     const resourceBlockLookup = new Map(sectionBlocks.filter((block) => String(block.block_type || '').trim() === 'resource_module').map((block) => [String(block.ref_id || '').trim(), block]))
     const interactionBlockLookup = new Map(sectionBlocks.filter((block) => String(block.block_type || '').trim() === 'interaction_module').map((block) => [String(block.ref_id || '').trim(), block]))
     const widgetBlockLookup = new Map(sectionBlocks.filter((block) => String(block.block_type || '').trim() === 'widget').map((block) => [String(block.ref_id || '').trim(), block]))
-    const sectionQuestionModules = sectionInteractionModules.filter((module) => String(module.module_type || '').trim() === 'QuestionStarterPanel')
-    const sectionExplainerModules = sectionInteractionModules.filter((module) => String(module.module_type || '').trim() !== 'QuestionStarterPanel')
+    const sectionQuestionModules = sectionInteractionModules.filter((module) => isQuestionStarterModule(module))
+    const sectionExplainerModules = sectionInteractionModules.filter((module) => !isQuestionStarterModule(module))
+
     if (sectionType === 'hero' || sectionType === 'story_map') return null
     if (sectionType === 'focus_stage') {
       return (
