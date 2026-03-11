@@ -84,10 +84,10 @@ The system should stay grounded in deterministic reader extraction, and use gene
 ## Phase 3: Converge Frontend Runtime
 
 - [x] Build a single `GenerativeExperienceRenderer`.
-- [ ] Eliminate duplicated rendering logic across workbench and experience pages.
-- [ ] Create a block registry so the model can only select known block types.
-- [ ] Move Figure, Glossary, Question, Resource, and future blocks into the registry.
-- [ ] Support block-level loading, partial, empty, and error states.
+- [x] Eliminate duplicated rendering logic across workbench and experience pages.
+- [x] Create a block registry so the model can only select known block types.
+- [x] Move Figure, Glossary, Question, Resource, and the current widget families into the registry.
+- [x] Support block-level loading, partial, empty, and error states.
 - [ ] Support incremental block patching instead of full-page refresh.
 - [ ] Add runtime telemetry for render failures, durations, and engagement.
 - [x] Turn workbench into a debug/inspection surface instead of a second product path.
@@ -121,13 +121,13 @@ The system should stay grounded in deterministic reader extraction, and use gene
 ## Phase 6: Build Evaluation and Review
 
 - [ ] Create a fixed golden set of literature pages.
-- [ ] Cover at least:
+- [x] Cover at least:
   figure-heavy, methods-heavy, concept-heavy pages.
 - [ ] Label each golden page with:
   main claim, key evidence, required terms, required background, trusted external links.
 - [ ] Evaluate:
   factuality, anchor correctness, link quality, interaction usefulness, latency, fallback rate.
-- [ ] Add snapshot tests for generative plans and experience plans.
+- [x] Add snapshot tests for generative plans and experience plans.
 - [ ] Track:
   cache hit rate, tool success rate, timeout rate, block engagement.
 - [ ] Create a review workflow that feeds bad outputs back into regression cases.
@@ -187,3 +187,9 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `PaperReaderExperiencePage` now focuses on route state, loader state, alerts, params, and details while the renderer executes section `blocks`, layout regions, focus rendering, and action feedback.
 - [x] Add the first renderer-side block registry:
   `experienceBlockRegistry.tsx` now holds registered resource / interaction / widget definitions so the renderer stops hardcoding every block family inline.
+- [x] Converge `/workbench` onto the shared renderer/runtime path:
+  `PaperReaderWorkbenchPage.tsx` now reuses the same surface loader, action bus, renderer, and block registry, with debug panels layered on top instead of keeping a second page implementation.
+- [x] Add block-level runtime states to the contract and renderer execution path:
+  section `blocks` can now surface `ready / loading / partial / empty / error`, and the renderer degrades each block without collapsing the whole section.
+- [x] Seed Phase 6 evaluation assets with a hybrid golden set and snapshot guards:
+  add one real paper-page golden plus contract fixtures for methods-heavy and concept-heavy coverage, alongside generative/experience snapshot tests and an eval asset guard.

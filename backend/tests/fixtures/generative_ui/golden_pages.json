@@ -1,0 +1,49 @@
+{
+  "version": "phase6_v1",
+  "goldens": [
+    {
+      "golden_id": "paper78_page7_figure",
+      "source_kind": "paper_page",
+      "paper_id": 78,
+      "page": 7,
+      "category": "figure-heavy",
+      "reader_profile": "curious_generalist",
+      "required_labels": {
+        "main_claim": "Fig 3承载了这一页最值得先看的关键结果。",
+        "key_evidence_targets": ["p7:fig-1", "p7:p-1"],
+        "required_terms": ["Concordance"],
+        "required_background": ["USMLE structure"],
+        "trusted_domains": ["usmle.org", "pubmed.ncbi.nlm.nih.gov"]
+      },
+      "notes": "当前唯一接入真实页面的 golden 样本，持续用于 experience / workbench 的结构和中文展示回归。"
+    },
+    {
+      "golden_id": "fixture_methods_decoder_contract",
+      "source_kind": "contract_fixture",
+      "scenario": "methods_decoder",
+      "category": "methods-heavy",
+      "reader_profile": "curious_generalist",
+      "required_labels": {
+        "main_claim": "方法页面应先说明设置，再回到步骤化正文。",
+        "expected_layout_variant": "guided_story_stack",
+        "required_sections": ["focus_stage", "reading_flow", "explainer_cluster"],
+        "forbidden_regions": ["sidebar"]
+      },
+      "notes": "先用 contract fixture 覆盖方法型页面的布局与 section 选择，后续再替换为真实论文页。"
+    },
+    {
+      "golden_id": "fixture_concept_decoder_contract",
+      "source_kind": "contract_fixture",
+      "scenario": "concept_decoder",
+      "category": "concept-heavy",
+      "reader_profile": "curious_generalist",
+      "required_labels": {
+        "main_claim": "概念页面应先解释概念，再决定是否补外部背景。",
+        "expected_layout_variant": "explainer_first",
+        "required_sections": ["focus_stage", "explainer_cluster", "supporting_resources"],
+        "sidebar_sections": ["supporting_resources"]
+      },
+      "notes": "先用 contract fixture 覆盖概念型页面，保证 renderer 和 experience plan 不被 figure-only 样本绑死。"
+    }
+  ]
+}

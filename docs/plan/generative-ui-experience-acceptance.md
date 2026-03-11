@@ -616,3 +616,66 @@ npm --prefix frontend run build
 
 - [ ] 你刷新页面后，`/experience` 是否继续稳定显示，不再看到明显的模块缺失
 - [ ] 页面看起来是否更像“由注册 block 驱动的执行层”，而不是 renderer 文件里继续堆越来越多模板分支
+
+## 2026-03-12 Iteration 17
+
+范围：
+
+- `/literature/78/experience?page=7&reader=curious_generalist`
+- `/literature/78/read/workbench?page=7&reader=curious_generalist`
+- 目标：继续收 Phase 3，把 `/workbench` 收敛到 shared renderer/runtime；同时为 Phase 6 落第一版评测骨架，而不是停留在手工观感验收
+
+自动化结果：
+
+- [x] `backend/.venv-incremental/bin/python -m pytest backend/tests/test_generative_reader_agent_runtime.py -q`
+  结果：`32 passed`
+- [x] `backend/.venv-incremental/bin/python -m pytest backend/tests/test_generative_ui_evaluation.py -q`
+  结果：`3 passed`
+- [x] `backend/.venv-incremental/bin/python backend/checks/check_generative_ui_eval_assets.py`
+  结果：`Generative UI eval asset guard passed.`
+- [x] `backend/.venv-incremental/bin/python backend/checks/check_contract_alignment.py`
+  结果：`Contract alignment guard passed.`
+- [x] `backend/.venv-incremental/bin/python backend/checks/check_no_new_broad_excepts.py`
+  结果：`Broad exception guard passed.`
+- [x] `npm --prefix frontend run lint`
+  结果：`0 error / 1 warning`
+- [ ] `npm --prefix frontend run build`
+  结果：`timeout 240s` 后在 `vite build` 阶段超时退出，退出码 `124`；构建已进入 `vite v5.4.21 building for production... transforming...`，当前仍视为 Docker/WSL bind mount 下的慢构建问题，不能记为通过
+
+浏览器结果：
+
+- [x] `cmd.exe /c curl -I "http://localhost:3000/literature/78/experience?page=7"`
+  结果：`HTTP/1.1 200 OK`
+- [x] `cmd.exe /c curl -I "http://localhost:3000/literature/78/read/workbench?page=7"`
+  结果：`HTTP/1.1 200 OK`
+- [x] Playwright 登录态下打开 `/experience?page=7&reader=curious_generalist`
+- [x] Playwright 登录态下打开 `/read/workbench?page=7&reader=curious_generalist`
+- [x] `/experience` 页面状态为“已就绪”，hero、reading path、resources、glossary 等 block 正常显示
+- [x] `/workbench` 现在在同一份 experience 预览下挂载 story map / plan meta / targets / enhancement outline 等 debug 信息，不再是第二套产品页实现
+
+本轮代码结果：
+
+- [x] `PaperReaderWorkbenchPage.tsx` 改为复用 shared surface loader、action bus、renderer、block registry
+- [x] `/workbench` 继续保留 debug 面板，但 experience 内容预览已经来自同一套 plan/runtime/rendering 路径
+- [x] `ReaderExperienceBlockRef.state` 扩展为：
+  `ready / loading / partial / empty / error`
+- [x] `GenerativeExperienceRenderer` 增加 block-level loading / partial / empty / error 降级显示，而不是只依赖 section 级空态
+- [x] 新增 Phase 6 评测骨架：
+  `golden_pages.json`、generative/experience snapshot fixtures、`test_generative_ui_evaluation.py`、`check_generative_ui_eval_assets.py`
+- [x] 新增 runtime 回归：
+  `test_build_experience_plan_should_preserve_block_state_contract`
+- [x] 修复 runtime 真实问题：
+  `_is_generic_figure_focus_panel` 中错误使用 `self` 的静态方法 bug
+
+问题记录：
+
+- [x] Phase 6 的 golden set 目前是“混合种子集”：
+  1 个真实 paper page + 2 个 contract fixture；这足够搭起评测骨架，但还不等于完整的固定真实样本集
+- [x] 前端 lint 仅剩 1 个旧 warning，在 `PaperReaderPage.tsx`
+- [x] `frontend build` 仍需拿到稳定退出结果，当前不能把它写成通过
+
+本轮待你手工确认：
+
+- [ ] `http://localhost:3000/literature/78/experience?page=7&reader=curious_generalist` 是否继续稳定显示，不因为 block 状态契约或 renderer 收敛而出现新异常
+- [ ] `http://localhost:3000/literature/78/read/workbench?page=7&reader=curious_generalist` 是否明显更像 debug shell，而不是另一套产品页模板
+- [ ] `/experience` 的 block 在内容不足时，是否更像“局部 loading / partial / empty / error 降级”，而不是整页坏掉
