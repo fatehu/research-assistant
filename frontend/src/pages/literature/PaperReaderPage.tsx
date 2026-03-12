@@ -4231,6 +4231,17 @@ export default function PaperReaderPage() {
     return ''
   }
 
+  const renderPreviewForAnchor = async (anchor: ReaderComponentSourceAnchor) => {
+    const targetPage = Number(anchor.page || 0)
+    if (!pdfDoc || targetPage <= 0) {
+      return { imageDataUrl: null, matchMethod: 'fallback' as AnchorMatchMethod, confidence: 0.3, fallbackUsed: true }
+    }
+    const pageProxy = await pdfDoc.getPage(targetPage)
+    const textContent = await pageProxy.getTextContent()
+    const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
+    return renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+  }
+
   const showAnchorPreview = (
     anchors: ReaderComponentSourceAnchor[],
     options?: ReaderAnchorPreviewOptions,
@@ -4271,24 +4282,26 @@ export default function PaperReaderPage() {
       setReadPage(Number(anchor.page))
     }
 
-    if (pdfDoc && Number(anchor.page || 0) > 0 && !cached) {
+    if (Number(anchor.page || 0) > 0 && !cached) {
       const targetPage = Number(anchor.page)
       void (async () => {
         try {
-          const pageProxy = await pdfDoc.getPage(targetPage)
-          const textContent = await pageProxy.getTextContent()
-          const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
-          const extracted = extractAcademicPageText(textContent)
-          const fallback = Array.isArray(textContent?.items)
-            ? textContent.items
-              .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
-              .join(' ')
-              .replace(/\s+/g, ' ')
-              .trim()
-            : ''
-          const source = extracted || fallback
-          const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
-          const rendered = await renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+          let resolvedText = buildPreviewTextFromAnchor(anchor)
+          if (!resolvedText && pdfDoc && targetPage > 0) {
+            const pageProxy = await pdfDoc.getPage(targetPage)
+            const textContent = await pageProxy.getTextContent()
+            const extracted = extractAcademicPageText(textContent)
+            const fallback = Array.isArray(textContent?.items)
+              ? textContent.items
+                .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+              : ''
+            const source = extracted || fallback
+            resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
+          }
+          const rendered = await renderPreviewForAnchor(anchor)
           anchorPreviewCacheRef.current.set(previewKey, {
             text: resolvedText,
             imageDataUrl: rendered.imageDataUrl,
@@ -4346,24 +4359,24 @@ export default function PaperReaderPage() {
     const previewKey = buildPreviewKey(anchor)
     const cached = anchorPreviewCacheRef.current.get(previewKey)
     if (cached?.imageDataUrl) return cached.imageDataUrl
-    if (!pdfDoc || Number(anchor.page || 0) <= 0) return null
-
     try {
-      const targetPage = Number(anchor.page)
-      const pageProxy = await pdfDoc.getPage(targetPage)
-      const textContent = await pageProxy.getTextContent()
-      const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
-      const extracted = extractAcademicPageText(textContent)
-      const fallback = Array.isArray(textContent?.items)
-        ? textContent.items
-          .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-        : ''
-      const source = extracted || fallback
-      const resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
-      const rendered = await renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+      const targetPage = Number(anchor.page || 0)
+      let resolvedText = buildPreviewTextFromAnchor(anchor)
+      if (!resolvedText && pdfDoc && targetPage > 0) {
+        const pageProxy = await pdfDoc.getPage(targetPage)
+        const textContent = await pageProxy.getTextContent()
+        const extracted = extractAcademicPageText(textContent)
+        const fallback = Array.isArray(textContent?.items)
+          ? textContent.items
+            .map((item: PdfTextItemLike) => (typeof item?.str === 'string' ? item.str : ''))
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+          : ''
+        const source = extracted || fallback
+        resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
+      }
+      const rendered = await renderPreviewForAnchor(anchor)
       anchorPreviewCacheRef.current.set(previewKey, {
         text: resolvedText,
         imageDataUrl: rendered.imageDataUrl,
