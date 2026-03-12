@@ -160,6 +160,25 @@ function buildEquationMarkdown(value: string): string {
   return ['$$', latex, '$$'].join('\n')
 }
 
+function splitTableCaptionLabel(value: string): { label: string; caption: string } {
+  const caption = asString(value)
+  if (!caption) return { label: '', caption: '' }
+  const matched = caption.match(/^(Table\s*\d+[A-Za-z]?)(?:[\s:.-]+(.*))?$/i)
+  if (!matched) return { label: '', caption }
+  return {
+    label: asString(matched[1]),
+    caption,
+  }
+}
+
+function looksNumericTableCell(value: string): boolean {
+  const text = asString(value).replace(/\s+/g, '')
+  if (!text || text === '—' || text === '-') return false
+  return /^[-+±]?\d+(?:\.\d+)?%?$/.test(text)
+    || /^\(±?\d+(?:\.\d+)?\)$/.test(text)
+    || /^\(0\.\d+\)$/.test(text)
+}
+
 type ParagraphSegment = {
   text: string
   source_char_ranges?: Array<{ start_char_id: string; end_char_id: string }>
@@ -1291,9 +1310,31 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
           .filter((cell) => cell.rowStart === rowIndex)
           .sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId),
       })).filter((entry) => entry.cells.length > 0)
+      const { label: tableLabel, caption: fullCaption } = splitTableCaptionLabel(caption || title)
+      const displayTitle = tableLabel || (title && title !== caption ? title : '表格')
+      const effectiveCaption = fullCaption || (caption && caption !== displayTitle ? caption : '')
+      const inferredColumnCount = structuredRows.length > 0
+        ? Math.max(...tableCells.map((cell) => cell.colEnd + 1), 0)
+        : columnCount
+      const bodyRowsForAlignment = structuredRows.length > 0
+        ? structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount)
+        : paddedMatrix.slice(effectiveHeaderRowCount).map((row, rowIndex) => ({
+          rowIndex: rowIndex + effectiveHeaderRowCount,
+          cells: row.map((text, colStart) => ({ text, colStart })),
+        }))
+      const centeredColumns = new Set<number>()
+      for (let columnIndex = 1; columnIndex < inferredColumnCount; columnIndex += 1) {
+        const values = bodyRowsForAlignment
+          .map((entry) => entry.cells.find((cell) => cell.colStart === columnIndex))
+          .map((cell) => asString((cell as any)?.text))
+          .filter(Boolean)
+        if (values.length > 0 && values.filter(looksNumericTableCell).length >= Math.ceil(values.length * 0.55)) {
+          centeredColumns.add(columnIndex)
+        }
+      }
       return withAnchorPreview(
         <DraggableContainer node={node}>
-          <Card size="small" title={title || '表格'} style={baseCardStyle(ctx)}>
+          <Card size="small" title={displayTitle || '表格'} style={baseCardStyle(ctx)}>
             <ActionBar
               node={node}
               ctx={ctx}
@@ -1347,7 +1388,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                     </Text>
                   </div>
                 ) : null}
-                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, (structuredRows.length > 0 ? Math.max(...tableCells.map((cell) => cell.colEnd + 1), 0) : columnCount) * 140)}px` }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, inferredColumnCount * 140)}px`, borderTop: '2px solid rgba(17, 24, 39, 0.55)', borderBottom: '2px solid rgba(17, 24, 39, 0.55)' }}>
                   {structuredRows.length > 0 ? (
                     <>
                       {structuredRows.some((entry) => entry.rowIndex < effectiveHeaderRowCount) ? (
@@ -1377,11 +1418,11 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                                     scope="col"
                                     style={{
                                       padding: '10px 12px',
-                                      textAlign: 'left',
+                                      textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
                                       fontWeight: 700,
                                       fontSize: 13,
                                       color: ctx?.themeStyle?.headingColor,
-                                      background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+                                      background: 'transparent',
                                       borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                     }}
                                   >
@@ -1429,6 +1470,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                                     fontSize: 13,
                                     lineHeight: 1.55,
                                     whiteSpace: 'pre-wrap',
+                                    textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
                                   }}
                                 >
                                   {cell.text || '—'}
@@ -1465,11 +1507,11 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                                     key={`thead-${rowIndex}-${cellIndex}`}
                                     style={{
                                       padding: '10px 12px',
-                                      textAlign: 'left',
+                                      textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
                                       fontWeight: 700,
                                       fontSize: 13,
                                       color: ctx?.themeStyle?.headingColor,
-                                      background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+                                      background: 'transparent',
                                       borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                     }}
                                   >
@@ -1516,6 +1558,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                                     fontSize: 13,
                                     lineHeight: 1.55,
                                     whiteSpace: 'pre-wrap',
+                                    textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
                                   }}
                                 >
                                   {cell || '—'}
@@ -1544,9 +1587,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 )}
               />
             )}
-            {caption ? (
+            {effectiveCaption ? (
               <Paragraph style={{ marginTop: 12, marginBottom: 0, color: ctx?.themeStyle?.bodyColor, opacity: 0.82, lineHeight: 1.65 }}>
-                {caption}
+                {effectiveCaption}
               </Paragraph>
             ) : null}
             {notes.length > 0 ? (
