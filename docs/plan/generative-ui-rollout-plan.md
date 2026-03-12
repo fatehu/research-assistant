@@ -240,5 +240,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `/read` table materialization now prefers cell truth over flattened markdown rows, keeps table captions coalesced with table bundles, and emits `row_evidence` anchors so hovering/clicking a table row can preview and jump to evidence instead of only highlighting the whole table.
 - [x] Fix `/read` table evidence and equation rendering regressions:
   row-level table anchors no longer use row-local pseudo page dimensions, `TablePanel` keeps `table_cells` through contract normalization and exposes direct `证据 / 预览` controls again, and `EquationBlock` now renders KaTeX plus the original evidence image while splitting trailing `where ...` prose into description text.
+- [x] Seal `/read` table cell truth through API/runtime:
+  `ReaderComposePayload` now preserves `page_grounding_v1.layout_atoms[].table_cells` and `page_grounding_v1.evidence_map[].table_cells` through schema serialization, and `reader_compose_v7` invalidates stale table caches so runtime responses carry `cell_evidence` and body-only `source_atom_ids`.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.api import literature as literature_api
 from app.config import settings
+from app.schemas.literature import ReaderComposePayload
 from app.services import literature_reader_compose_service as compose_module
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
@@ -6009,6 +6010,105 @@ def test_ensure_payload_contract_should_preserve_docmind_table_cells_in_page_gro
     assert len(list((evidence_map[0] or {}).get("table_cells") or [])) == 2
 
 
+def test_reader_compose_payload_schema_should_keep_grounding_table_cells():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 7,
+        "ui_plan": {
+            "plan_id": "plan_grounding_table_cells_schema",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 2,
+                    "uniqueId": "table_layout_schema_1",
+                    "type": "table",
+                    "subType": "none",
+                    "text": "| Model | Score |",
+                    "pos": [
+                        {"x": 248, "y": 583},
+                        {"x": 1239, "y": 583},
+                        {"x": 1239, "y": 1302},
+                        {"x": 248, "y": 1302},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 248, "y": 583},
+                                {"x": 1239, "y": 583},
+                                {"x": 1239, "y": 1302},
+                                {"x": 248, "y": 1302},
+                            ],
+                            "styleId": 0,
+                            "text": "| Model | Score |",
+                        }
+                    ],
+                    "cells": [
+                        {
+                            "cellId": 0,
+                            "xsc": 0,
+                            "xec": 0,
+                            "ysc": 0,
+                            "yec": 0,
+                            "pos": [[100, 100, 220, 100, 220, 124, 100, 124]],
+                            "layouts": [
+                                {
+                                    "uniqueId": "table_layout_schema_1_r0c0",
+                                    "text": "Model\n",
+                                    "pos": [
+                                        {"x": 100, "y": 100},
+                                        {"x": 220, "y": 100},
+                                        {"x": 220, "y": 124},
+                                        {"x": 100, "y": 124},
+                                    ],
+                                    "blocks": [
+                                        {
+                                            "pos": [
+                                                {"x": 100, "y": 100},
+                                                {"x": 220, "y": 100},
+                                                {"x": 220, "y": 124},
+                                                {"x": 100, "y": 124},
+                                            ],
+                                            "text": "Model",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_l003_b001",
+                    "layout_unique_id": "table_layout_schema_1",
+                    "kind": "table",
+                    "zone_type": "main_body",
+                    "text": "| Model | Score |",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=7, payload=payload)  # pylint: disable=protected-access
+    serialized = ReaderComposePayload.model_validate(ensured).model_dump(mode="python")
+    grounding = dict(serialized.get("page_grounding_v1") or {})
+    table_atom = dict((grounding.get("layout_atoms") or [])[0] or {})
+    evidence_row = dict((grounding.get("evidence_map") or [])[0] or {})
+
+    assert len(list(table_atom.get("table_cells") or [])) == 1
+    assert len(list(evidence_row.get("table_cells") or [])) == 1
+
+
 def test_pipeline_version_should_default_to_layout_uid_v1_when_unset(monkeypatch):
     service = LiteratureReaderComposeService()
     monkeypatch.setattr(settings, "reader_pipeline_version", "")
@@ -6446,10 +6546,14 @@ def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equati
     assert list(table_props.get("rows") or [])[0]["col_1"] == "Q8_0"
     assert str(table_props.get("caption") or "") == "Table 2. Quantization comparison across evaluation suites"
     row_evidence = list(table_props.get("row_evidence") or [])
+    cell_evidence = list(table_props.get("cell_evidence") or [])
     assert len(row_evidence) == 3
+    assert len(cell_evidence) == 6
     assert str((((row_evidence[1] or {}).get("anchor") or {}).get("anchor_id") or "")) == "layout_uid_v1:table_body_1:row:2"
     assert (((row_evidence[1] or {}).get("anchor") or {}).get("geometry") or {}).get("page_width") is None
     assert (((row_evidence[1] or {}).get("anchor") or {}).get("bbox_hint") or {}).get("page_width") is None
+    assert str((((cell_evidence[1] or {}).get("anchor") or {}).get("source_layout_id") or "")) == "table_r0c1"
+    assert list(table_node.get("source_layout_ids") or []) == ["table_body_1"]
 
     assert str(equation_node.get("component") or "") == "EquationBlock"
     equation_props = dict(equation_node.get("props") or {})

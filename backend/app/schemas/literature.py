@@ -107,6 +107,7 @@ class PaperSearchResponse(BaseModel):
     """搜索响应"""
     total: int
     offset: int = 0
+    has_more: bool = False
     papers: List[PaperSearchResult]
     query: str
     source: str
@@ -210,6 +211,20 @@ class SavePaperFromSearchRequest(BaseModel):
     fields_of_study: List[str] = []
     raw_data: Dict[str, Any] = {}
     collection_ids: List[int] = []  # 可选：直接添加到收藏夹
+
+
+class ImportPaperByLinkRequest(BaseModel):
+    """通过链接导入论文"""
+    link: str = Field(..., min_length=3)
+    collection_ids: List[int] = Field(default_factory=list)
+
+
+class ImportPaperByLinkResponse(BaseModel):
+    """通过链接导入论文的响应"""
+    paper: PaperResponse
+    already_exists: bool = False
+    resolved_source: str
+    normalized_link: str
 
 
 class DownloadPdfRequest(BaseModel):
@@ -331,6 +346,7 @@ class ReaderGenerativePrefetchResponse(BaseModel):
 class ReaderComposeRequest(BaseModel):
     page: int = Field(..., ge=1)
     selected_kb_id: Optional[int] = None
+    pipeline_version: Optional[str] = None
     force_refresh: bool = False
     regenerate: bool = False
     latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=600000)
@@ -418,6 +434,7 @@ class ReaderComponentSourceAnchor(BaseModel):
     segment_total: Optional[int] = Field(default=None, ge=1)
     bbox_hint: Optional[ReaderComponentBBoxHint] = None
     canonical_block_id: Optional[str] = None
+    source_layout_id: Optional[str] = None
     coord_version: Optional[str] = None
     anchor_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     anchor_v2: Optional[ReaderComponentAnchorV2] = None
@@ -819,6 +836,87 @@ class ReaderExperiencePlan(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ReaderGroundingPoint(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+
+
+class ReaderGroundingBlock(BaseModel):
+    block_index: int = 0
+    text: str = ""
+    pos: List[ReaderGroundingPoint] = Field(default_factory=list)
+
+
+class ReaderGroundingTableCell(BaseModel):
+    cell_id: int = 0
+    row_start: int = 0
+    row_end: int = 0
+    col_start: int = 0
+    col_end: int = 0
+    text: str = ""
+    layout_ids: List[str] = Field(default_factory=list)
+    polygons: List[List[ReaderGroundingPoint]] = Field(default_factory=list)
+
+
+class ReaderGroundingLayoutAtom(BaseModel):
+    layout_id: str = ""
+    reading_order: int = 0
+    layout_type: str = ""
+    layout_sub_type: str = ""
+    raw_text: str = ""
+    clean_text: str = ""
+    layout_pos: List[ReaderGroundingPoint] = Field(default_factory=list)
+    blocks: List[ReaderGroundingBlock] = Field(default_factory=list)
+    table_cells: List[ReaderGroundingTableCell] = Field(default_factory=list)
+    canonical_block_ids: List[str] = Field(default_factory=list)
+    node_kind: str = ""
+    include_in_main_flow: bool = True
+    region_hint: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGroundingReadingNode(BaseModel):
+    node_id: str = ""
+    node_kind: str = ""
+    raw_text: str = ""
+    clean_text: str = ""
+    source_layout_ids: List[str] = Field(default_factory=list)
+    source_block_ids: List[str] = Field(default_factory=list)
+    include_in_main_flow: bool = True
+    region_hint: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGroundingEvidenceEntry(BaseModel):
+    evidence_id: str = ""
+    source_layout_id: str = ""
+    source_block_ids: List[str] = Field(default_factory=list)
+    layout_pos: List[ReaderGroundingPoint] = Field(default_factory=list)
+    block_positions: List[List[ReaderGroundingPoint]] = Field(default_factory=list)
+    table_cells: List[ReaderGroundingTableCell] = Field(default_factory=list)
+    geometry_source: str = "docmind_layout_blocks"
+    highlight_strategy: str = "layout_block_union"
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderGroundingPageImage(BaseModel):
+    url: str = ""
+    path: str = ""
+    width: Optional[int] = None
+    height: Optional[int] = None
+    source: str = ""
+
+
+class ReaderPageGrounding(BaseModel):
+    version: str = "page_grounding_v1"
+    page: int = Field(default=1, ge=1)
+    layout_atoms: List[ReaderGroundingLayoutAtom] = Field(default_factory=list)
+    reading_nodes: List[ReaderGroundingReadingNode] = Field(default_factory=list)
+    evidence_map: List[ReaderGroundingEvidenceEntry] = Field(default_factory=list)
+    page_image: ReaderGroundingPageImage = Field(default_factory=ReaderGroundingPageImage)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ReaderComposePayload(BaseModel):
     paper_id: int
     page: int
@@ -865,6 +963,7 @@ class ReaderComposePayload(BaseModel):
     toc_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     phase1_compact_input: Dict[str, Any] = Field(default_factory=dict)
     review_route_meta: Dict[str, Any] = Field(default_factory=dict)
+    page_grounding_v1: ReaderPageGrounding = Field(default_factory=ReaderPageGrounding)
     enrichment_bundle: ReaderEnrichmentBundle = Field(default_factory=ReaderEnrichmentBundle)
     generative_reader_plan: ReaderGenerativePlan = Field(default_factory=ReaderGenerativePlan)
     generated_at: datetime
@@ -921,6 +1020,7 @@ class ReaderExperiencePlanResponse(BaseModel):
 class ReaderComposePrefetchRequest(BaseModel):
     pages: List[int] = Field(default_factory=list, max_length=16)
     selected_kb_id: Optional[int] = None
+    pipeline_version: Optional[str] = None
     style_intent: Optional[str] = None
     latency_budget_ms: Optional[int] = Field(default=None, ge=1200, le=600000)
     quality_target: Optional[float] = Field(default=None, ge=0.6, le=0.97)

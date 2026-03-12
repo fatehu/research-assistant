@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v6"
+COMPOSE_ENGINE_VERSION = "reader_compose_v7"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -1240,6 +1240,7 @@ class LiteratureReaderComposeService:
         header_row_count = 0
         raw_markdown = "\n".join(markdown_lines).strip()
         row_evidence: List[Dict[str, Any]] = []
+        cell_evidence: List[Dict[str, Any]] = []
 
         def _build_row_anchor(*, row_index: int, row_cells: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
             polygons: List[Dict[str, Any]] = []
@@ -1322,6 +1323,77 @@ class LiteratureReaderComposeService:
                 "anchor": anchor,
             }
 
+        def _build_cell_anchor(*, cell: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+            points_sets = [self._normalize_grounding_points(poly) for poly in list(cell.get("polygons") or [])]
+            points_sets = [points for points in points_sets if len(points) >= 3]
+            if not points_sets:
+                return None
+            all_points = [point for points in points_sets for point in points]
+            xs = [float(point.get("x") or 0.0) for point in all_points]
+            ys = [float(point.get("y") or 0.0) for point in all_points]
+            if not xs or not ys:
+                return None
+            quote_text = self._normalize_spaces(str(cell.get("text") or ""))
+            source_layout_ids = [
+                str(layout_id or "").strip()
+                for layout_id in list(cell.get("layout_ids") or [])
+                if str(layout_id or "").strip()
+            ]
+            source_layout_id = source_layout_ids[0] if source_layout_ids else ""
+            polygons = [
+                {
+                    "points": points,
+                    "source": "page_grounding_v1",
+                    "component_id": f"{source_layout_id or 'table_cell'}:{index + 1}",
+                }
+                for index, points in enumerate(points_sets)
+            ]
+            anchor = {
+                "page": int(page),
+                "start_char": 0,
+                "end_char": max(1, len(quote_text) or len(polygons)),
+                "quote": quote_text or None,
+                "quote_text": quote_text or None,
+                "anchor_id": f"layout_uid_v1:{source_layout_id or 'table_cell'}:cell:{int(cell.get('cell_id') or 0)}",
+                "canonical_block_id": "",
+                "source_layout_id": source_layout_id or None,
+                "coord_version": "layout_uid_v1",
+                "anchor_confidence": 0.99,
+                "bbox_hint": {
+                    "x0": min(xs),
+                    "x1": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "geometry_version": "poly_v1",
+                "geometry": {
+                    "polygons": polygons,
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "anchor_v2": {
+                    "page": int(page),
+                    "start_char": 0,
+                    "end_char": max(1, len(quote_text) or len(polygons)),
+                    "coord_version": "layout_uid_v1",
+                    "canonical_block_id": "",
+                },
+                "segment_index": 0,
+                "segment_total": 1,
+                "source_word_ids": [],
+                "source_char_ranges": [],
+            }
+            return {
+                "cell_id": int(cell.get("cell_id") or 0),
+                "row_start": int(cell.get("row_start") or 0),
+                "col_start": int(cell.get("col_start") or 0),
+                "label": quote_text or "Cell",
+                "source_atom_ids": source_layout_ids,
+                "anchor": anchor,
+            }
+
         normalized_cells: List[Dict[str, Any]] = []
 
         if table_cells:
@@ -1355,6 +1427,9 @@ class LiteratureReaderComposeService:
                         "layout_ids": list(cell.get("layout_ids") or []),
                     }
                 )
+                cell_anchor = _build_cell_anchor(cell=cell)
+                if cell_anchor:
+                    cell_evidence.append(cell_anchor)
                 for row_index in range(row_start, row_end + 1):
                     row_cells_map.setdefault(row_index, [])
                     if cell not in row_cells_map[row_index]:
@@ -1491,6 +1566,7 @@ class LiteratureReaderComposeService:
             "notes": note_texts,
             "raw_markdown": raw_markdown,
             "row_evidence": row_evidence,
+            "cell_evidence": cell_evidence,
             "ai_insight": "",
         }
 
@@ -1935,11 +2011,20 @@ class LiteratureReaderComposeService:
                 merged_text = "\n\n".join(text for text in clean_texts if text).strip()
                 component = "ParagraphProse"
                 props = {"text": merged_text or "[empty]", "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}]}
+            node_source_layout_ids = source_layout_ids
+            if group_kind == "table":
+                body_only_layout_ids = [
+                    layout_id
+                    for layout_id in source_layout_ids
+                    if str((layout_index.get(layout_id) or {}).get("node_kind") or "").strip().lower() == "table"
+                ]
+                if body_only_layout_ids:
+                    node_source_layout_ids = body_only_layout_ids
             nodes.append(
                 {
                     "node_id": str(group.get("group_id") or f"group_{order_key}").strip() or f"group_{order_key}",
                     "component": component,
-                    "source_layout_ids": source_layout_ids,
+                    "source_layout_ids": node_source_layout_ids,
                     "props": props,
                     "display": "default",
                     "order_key": float(order_key),
@@ -3710,6 +3795,7 @@ class LiteratureReaderComposeService:
                 table_cells = props.get("table_cells")
                 notes = props.get("notes")
                 row_evidence = props.get("row_evidence")
+                cell_evidence = props.get("cell_evidence")
                 return {
                     "title": str(props.get("title") or fb_text or "Table").strip(),
                     "rows": rows if isinstance(rows, list) else [],
@@ -3721,6 +3807,7 @@ class LiteratureReaderComposeService:
                     "notes": notes if isinstance(notes, list) else [],
                     "raw_markdown": str(props.get("raw_markdown") or "").strip(),
                     "row_evidence": row_evidence if isinstance(row_evidence, list) else [],
+                    "cell_evidence": cell_evidence if isinstance(cell_evidence, list) else [],
                     "ai_insight": str(props.get("ai_insight") or "").strip(),
                 }
             return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}

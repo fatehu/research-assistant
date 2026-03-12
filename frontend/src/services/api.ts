@@ -827,9 +827,17 @@ export interface PaperSearchResult {
 export interface PaperSearchResponse {
   total: number
   offset: number
+  has_more: boolean
   papers: PaperSearchResult[]
   query: string
   source: string
+}
+
+export interface ImportPaperByLinkResponse {
+  paper: Paper
+  already_exists: boolean
+  resolved_source: string
+  normalized_link: string
 }
 
 export interface PaperCollection {
@@ -975,6 +983,7 @@ export interface ReaderGenerativePrefetchResponse {
 export interface ReaderComposeRequest {
   page: number
   selected_kb_id?: number
+  pipeline_version?: string
   force_refresh?: boolean
   regenerate?: boolean
   latency_budget_ms?: number
@@ -1109,6 +1118,7 @@ export interface ReaderComponentSourceAnchor {
   segment_total?: number | null
   bbox_hint?: ReaderComponentBBoxHint | null
   canonical_block_id?: string | null
+  source_layout_id?: string | null
   coord_version?: 'anchor_v2' | string | null
   anchor_confidence?: number | null
   anchor_v2?: ReaderComponentAnchorV2 | null
@@ -1521,6 +1531,87 @@ export interface ReaderExperiencePlan {
   meta: Record<string, unknown>
 }
 
+export interface ReaderGroundingPoint {
+  x: number
+  y: number
+}
+
+export interface ReaderGroundingBlock {
+  block_index: number
+  text: string
+  pos: ReaderGroundingPoint[]
+}
+
+export interface ReaderGroundingTableCell {
+  cell_id: number
+  row_start: number
+  row_end: number
+  col_start: number
+  col_end: number
+  text: string
+  layout_ids: string[]
+  polygons: ReaderGroundingPoint[][]
+}
+
+export interface ReaderGroundingLayoutAtom {
+  layout_id: string
+  reading_order: number
+  layout_type: string
+  layout_sub_type: string
+  raw_text: string
+  clean_text: string
+  layout_pos: ReaderGroundingPoint[]
+  blocks: ReaderGroundingBlock[]
+  table_cells: ReaderGroundingTableCell[]
+  canonical_block_ids: string[]
+  node_kind: string
+  include_in_main_flow: boolean
+  region_hint: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingReadingNode {
+  node_id: string
+  node_kind: string
+  raw_text: string
+  clean_text: string
+  source_layout_ids: string[]
+  source_block_ids: string[]
+  include_in_main_flow: boolean
+  region_hint: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingEvidenceEntry {
+  evidence_id: string
+  source_layout_id: string
+  source_block_ids: string[]
+  layout_pos: ReaderGroundingPoint[]
+  block_positions: ReaderGroundingPoint[][]
+  table_cells: ReaderGroundingTableCell[]
+  geometry_source: string
+  highlight_strategy: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingPageImage {
+  url: string
+  path: string
+  width?: number | null
+  height?: number | null
+  source: string
+}
+
+export interface ReaderPageGrounding {
+  version: string
+  page: number
+  layout_atoms: ReaderGroundingLayoutAtom[]
+  reading_nodes: ReaderGroundingReadingNode[]
+  evidence_map: ReaderGroundingEvidenceEntry[]
+  page_image: ReaderGroundingPageImage
+  meta: Record<string, unknown>
+}
+
 export interface ReaderComposePayload {
   paper_id: number
   page: number
@@ -1567,6 +1658,7 @@ export interface ReaderComposePayload {
   toc_quality?: number
   phase1_compact_input?: Record<string, unknown>
   review_route_meta?: Record<string, unknown>
+  page_grounding_v1?: ReaderPageGrounding
   enrichment_bundle?: ReaderEnrichmentBundle
   generative_reader_plan?: ReaderGenerativePlan
   generated_at: string
@@ -1622,6 +1714,7 @@ export interface ReaderComposeReviewAutoPatchResponse {
 export interface ReaderComposePrefetchRequest {
   pages: number[]
   selected_kb_id?: number
+  pipeline_version?: string
   style_intent?: string
   latency_budget_ms?: number
   quality_target?: number
@@ -2084,6 +2177,14 @@ export const literatureApi = {
     collection_ids?: number[]
   }): Promise<Paper> => {
     const response = await api.post('/api/v1/literature/papers', data)
+    return response.data
+  },
+
+  importPaperByLink: async (data: {
+    link: string
+    collection_ids?: number[]
+  }): Promise<ImportPaperByLinkResponse> => {
+    const response = await api.post('/api/v1/literature/papers/import-link', data)
     return response.data
   },
 
@@ -4298,7 +4399,3 @@ export const chunkingApi = {
     return response.data
   },
 }
-
-
-
-
