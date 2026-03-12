@@ -244,5 +244,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `ReaderComposePayload` now preserves `page_grounding_v1.layout_atoms[].table_cells` and `page_grounding_v1.evidence_map[].table_cells` through schema serialization, and `reader_compose_v7` invalidates stale table caches so runtime responses carry `cell_evidence` and body-only `source_atom_ids`.
 - [x] Restore `layout_uid_v1` evidence on auto-injected no-drop fallback nodes:
   recovered prose nodes now rebuild `layout_uid_v1` anchors from `page_grounding_v1 + layout_unique_id`, keep `source_atom_ids/source_layout_ids`, and no longer lose the `证据` action just because they were injected by the no-drop safety layer.
+- [x] Remove the global `/read` evidence gate regression on new pages:
+  `PaperReaderPage.tsx` no longer rejects all `layout_uid_v1` anchors at the page level, so hover preview, jump-to-evidence, and pinned evidence work again on newly generated `/read` pages instead of only on legacy `anchor_v2` payloads.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

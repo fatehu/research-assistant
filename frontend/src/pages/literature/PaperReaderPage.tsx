@@ -1,5 +1,5 @@
 import { type CSSProperties, type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowLeftOutlined,
   LeftOutlined,
@@ -75,6 +75,7 @@ import {
   ReaderGenerativeSection,
   ReaderGenerativeStyleKey,
   ReaderGenerativeStyleTuning,
+  ReaderPageGrounding,
   ReaderPageReadyEventData,
   ReaderSession,
 } from '@/services/api'
@@ -108,6 +109,17 @@ function parseZoomPercent(zoom: string | undefined): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
+}
+
+function parsePositiveSearchParam(value: string | null): number | undefined {
+  const parsed = Number(value || 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined
+}
+
+function normalizeComposePipelineVersion(value: string | null): string | undefined {
+  const token = String(value || '').trim().toLowerCase()
+  if (token === 'layout_uid_v1') return 'layout_uid_v1'
+  return undefined
 }
 
 function readJsonCache<T>(key: string | undefined): T | null {
@@ -779,6 +791,7 @@ type ReaderAnchorPreviewOptions = {
   pinPreview?: boolean
   segmentIndex?: number
   sourceBlockIds?: string[]
+  sourceAtomIds?: string[]
 }
 
 type PageStructureBlockSpatialRow = {
@@ -786,6 +799,13 @@ type PageStructureBlockSpatialRow = {
   text: string
   bbox?: ReaderComponentSourceAnchor['bbox_hint']
   polygon?: Array<{ x: number; y: number }>
+}
+
+type PageStructureLayoutSpatialRow = {
+  layoutId: string
+  text: string
+  bbox?: ReaderComponentSourceAnchor['bbox_hint']
+  polygons?: Array<Array<{ x: number; y: number }>>
 }
 
 type PageStructureSpatialDimensions = {
@@ -1052,9 +1072,16 @@ function isActionableAnchor(anchor: ReaderComponentSourceAnchor): boolean {
   const end = Number(anchor.end_char || 0)
   if (end <= start) return false
   const canonicalBlockId = String(anchor.canonical_block_id || '').trim()
-  if (!canonicalBlockId) return false
+  const sourceLayoutId = String(anchor.source_layout_id || '').trim()
   const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
-  if (coordVersion !== 'anchor_v2') return false
+  const hasGeometryPolygons = Array.isArray(anchor.geometry?.polygons) && anchor.geometry.polygons.length > 0
+  if (coordVersion === 'layout_uid_v1') {
+    if (!sourceLayoutId && !hasGeometryPolygons) return false
+  } else if (coordVersion === 'anchor_v2') {
+    if (!canonicalBlockId) return false
+  } else if (coordVersion !== 'anchor_v2') {
+    return false
+  }
   const confidence = Number(anchor.anchor_confidence || 0)
   if (confidence > 0 && confidence < ACTIONABLE_ANCHOR_MIN_CONFIDENCE) return false
   return true
@@ -1388,13 +1415,16 @@ function inferPageStructureSpatialDimensions(
 function buildPageStructureSpatialIndex(
   pageStructure: Record<string, unknown> | null | undefined,
   spatialDimensions?: PageStructureSpatialDimensions,
+  grounding?: ReaderPageGrounding | null,
 ): {
   pageWidth: number
   pageHeight: number
   blockMap: Record<string, PageStructureBlockSpatialRow>
+  layoutMap: Record<string, PageStructureLayoutSpatialRow>
 } {
   const rows = Array.isArray(pageStructure?.block_groups) ? pageStructure!.block_groups : []
   const blockMap: Record<string, PageStructureBlockSpatialRow> = {}
+  const layoutMap: Record<string, PageStructureLayoutSpatialRow> = {}
   let pageWidth = 0
   let pageHeight = 0
   for (const raw of rows) {
@@ -1441,6 +1471,68 @@ function buildPageStructureSpatialIndex(
       blockMap[canonicalBlockId] = spatialRow
     }
   }
+  const groundingEvidenceRows = Array.isArray(grounding?.evidence_map) ? grounding.evidence_map : []
+  const groundingAtomRows = Array.isArray(grounding?.layout_atoms) ? grounding.layout_atoms : []
+  const atomTextMap: Record<string, string> = {}
+  for (const atom of groundingAtomRows) {
+    const layoutId = String(atom?.layout_id || '').trim()
+    if (!layoutId) continue
+    atomTextMap[layoutId] = String(atom?.clean_text || atom?.raw_text || '').trim()
+  }
+  for (const entry of groundingEvidenceRows) {
+    const layoutId = String(entry?.source_layout_id || '').trim()
+    if (!layoutId) continue
+    const polygons = Array.isArray(entry?.block_positions)
+      ? entry.block_positions
+        .map((poly) => normalizeSpatialPolygon(poly))
+        .filter((poly) => poly.length >= 3)
+      : []
+    let bbox: PageStructureLayoutSpatialRow['bbox']
+    if (polygons.length > 0) {
+      const flat = polygons.flatMap((poly) => poly)
+      const xs = flat.map((point) => Number(point.x || 0))
+      const ys = flat.map((point) => Number(point.y || 0))
+      const x0 = Math.min(...xs)
+      const x1 = Math.max(...xs)
+      const top = Math.min(...ys)
+      const bottom = Math.max(...ys)
+      if (Number.isFinite(x0) && Number.isFinite(x1) && Number.isFinite(top) && Number.isFinite(bottom) && x1 > x0 && bottom > top) {
+        bbox = { x0, x1, top, bottom, page_width: undefined, page_height: undefined }
+      }
+      for (const point of flat) {
+        pageWidth = Math.max(pageWidth, Number(point.x || 0))
+        pageHeight = Math.max(pageHeight, Number(point.y || 0))
+      }
+    } else {
+      const layoutPolygon = normalizeSpatialPolygon(entry?.layout_pos)
+      if (layoutPolygon.length >= 3) {
+        const xs = layoutPolygon.map((point) => Number(point.x || 0))
+        const ys = layoutPolygon.map((point) => Number(point.y || 0))
+        const x0 = Math.min(...xs)
+        const x1 = Math.max(...xs)
+        const top = Math.min(...ys)
+        const bottom = Math.max(...ys)
+        if (Number.isFinite(x0) && Number.isFinite(x1) && Number.isFinite(top) && Number.isFinite(bottom) && x1 > x0 && bottom > top) {
+          bbox = { x0, x1, top, bottom, page_width: undefined, page_height: undefined }
+        }
+        for (const point of layoutPolygon) {
+          pageWidth = Math.max(pageWidth, Number(point.x || 0))
+          pageHeight = Math.max(pageHeight, Number(point.y || 0))
+        }
+      }
+    }
+    layoutMap[layoutId] = {
+      layoutId,
+      text: atomTextMap[layoutId] || '',
+      bbox,
+      polygons: polygons.length > 0
+        ? polygons
+        : (() => {
+          const layoutPolygon = normalizeSpatialPolygon(entry?.layout_pos)
+          return layoutPolygon.length >= 3 ? [layoutPolygon] : []
+        })(),
+    }
+  }
   const resolvedPageWidth = Number(spatialDimensions?.pageWidth || 0) > 0
     ? Number(spatialDimensions?.pageWidth || 0)
     : pageWidth
@@ -1457,22 +1549,45 @@ function buildPageStructureSpatialIndex(
         }
       }
     }
+    for (const row of Object.values(layoutMap)) {
+      if (row.bbox) {
+        row.bbox = {
+          ...row.bbox,
+          page_width: resolvedPageWidth || undefined,
+          page_height: resolvedPageHeight || undefined,
+        }
+      }
+    }
   }
-  return { pageWidth: resolvedPageWidth, pageHeight: resolvedPageHeight, blockMap }
+  return { pageWidth: resolvedPageWidth, pageHeight: resolvedPageHeight, blockMap, layoutMap }
 }
 
 function buildAnchorFromPageStructureBlocks(params: {
   anchors: ReaderComponentSourceAnchor[]
   sourceBlockIds?: string[]
+  sourceAtomIds?: string[]
   preferredPage?: number
   pageStructureIndex: {
     pageWidth: number
     pageHeight: number
     blockMap: Record<string, PageStructureBlockSpatialRow>
+    layoutMap: Record<string, PageStructureLayoutSpatialRow>
   }
 }): { previewAnchor: ReaderComponentSourceAnchor; previewAnchors: ReaderComponentSourceAnchor[] } | null {
-  const { anchors, sourceBlockIds, preferredPage, pageStructureIndex } = params
+  const { anchors, sourceBlockIds, sourceAtomIds, preferredPage, pageStructureIndex } = params
   const blockMap = pageStructureIndex.blockMap || {}
+  const layoutMap = pageStructureIndex.layoutMap || {}
+  const normalizedLayoutIds = [
+    ...((Array.isArray(sourceAtomIds) ? sourceAtomIds : []).map((item) => String(item || '').trim()).filter(Boolean)),
+    ...((Array.isArray(anchors) ? anchors : [])
+      .map((item) => String(item?.source_layout_id || '').trim())
+      .filter(Boolean)),
+  ]
+  const uniqueLayoutIds = Array.from(new Set(normalizedLayoutIds))
+  const layoutRows = uniqueLayoutIds
+    .map((layoutId) => layoutMap[String(layoutId || '').trim()])
+    .filter((item): item is PageStructureLayoutSpatialRow => Boolean(item) && (!!item.bbox || (Array.isArray(item.polygons) && item.polygons.length > 0)))
+
   const normalizedIds = [
     ...normalizeSourceBlockIds(sourceBlockIds),
     ...((Array.isArray(anchors) ? anchors : [])
@@ -1480,23 +1595,108 @@ function buildAnchorFromPageStructureBlocks(params: {
       .filter(Boolean)),
   ]
   const uniqueIds = Array.from(new Set(normalizedIds))
-  if (uniqueIds.length === 0) return null
   const spatialRows = uniqueIds
     .map((blockId) => blockMap[String(blockId || '').trim()])
     .filter((item): item is PageStructureBlockSpatialRow => Boolean(item) && (!!item.bbox || !!item.polygon))
-  if (spatialRows.length === 0) return null
+  if (layoutRows.length === 0 && spatialRows.length === 0) return null
 
   const page = (() => {
     const preferred = Number(preferredPage || 0)
     if (preferred > 0) return preferred
     const anchorPage = Number((anchors || [])[0]?.page || 0)
     if (anchorPage > 0) return anchorPage
+    if (layoutRows.length > 0) return 1
     for (const row of spatialRows) {
       const inferred = inferPageFromCanonicalBlockId(row.blockId)
       if (inferred) return inferred
     }
     return 1
   })()
+
+  if (layoutRows.length > 0) {
+    const bboxRows = layoutRows
+      .map((item) => item.bbox)
+      .filter((item): item is NonNullable<PageStructureLayoutSpatialRow['bbox']> => Boolean(item))
+    const mergedBbox = bboxRows.length > 0
+      ? {
+        x0: Math.min(...bboxRows.map((item) => Number(item.x0 || 0))),
+        x1: Math.max(...bboxRows.map((item) => Number(item.x1 || 0))),
+        top: Math.min(...bboxRows.map((item) => Number(item.top || 0))),
+        bottom: Math.max(...bboxRows.map((item) => Number(item.bottom || 0))),
+        page_width: pageStructureIndex.pageWidth || bboxRows[0]?.page_width || undefined,
+        page_height: pageStructureIndex.pageHeight || bboxRows[0]?.page_height || undefined,
+      }
+      : undefined
+    const polygons = layoutRows.flatMap((item) => (
+      Array.isArray(item.polygons) && item.polygons.length > 0
+        ? item.polygons
+          .filter((poly) => Array.isArray(poly) && poly.length >= 3)
+          .map((poly, idx) => ({ points: poly, source: 'page_grounding_v1', component_id: `${item.layoutId}:${idx + 1}` }))
+        : item.bbox
+          ? [{
+            points: [
+              { x: Number(item.bbox.x0 || 0), y: Number(item.bbox.top || 0) },
+              { x: Number(item.bbox.x1 || 0), y: Number(item.bbox.top || 0) },
+              { x: Number(item.bbox.x1 || 0), y: Number(item.bbox.bottom || 0) },
+              { x: Number(item.bbox.x0 || 0), y: Number(item.bbox.bottom || 0) },
+            ],
+            source: 'page_grounding_v1',
+            component_id: item.layoutId,
+          }]
+          : []
+    ))
+    const quoteText = layoutRows
+      .map((item) => String(item.text || '').trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const startChar = 0
+    const endChar = Math.max(startChar + 1, quoteText.length || uniqueLayoutIds.length)
+    const maxConfidence = Array.isArray(anchors) && anchors.length > 0
+      ? Math.max(...anchors.map((item) => Number(item.anchor_confidence || 0)), 0.98)
+      : 0.98
+    const previewAnchor: ReaderComponentSourceAnchor = {
+      ...(Array.isArray(anchors) && anchors.length > 0 ? anchors[0] : {
+        page,
+        start_char: startChar,
+        end_char: endChar,
+      }),
+      page,
+      start_char: startChar,
+      end_char: endChar,
+      canonical_block_id: String((Array.isArray(anchors) && anchors[0]?.canonical_block_id) || ''),
+      source_layout_id: uniqueLayoutIds[0],
+      quote: quoteText || undefined,
+      quote_text: quoteText || undefined,
+      anchor_id: `page_grounding_v1:${uniqueLayoutIds.join(',')}`,
+      anchor_confidence: maxConfidence,
+      bbox_hint: mergedBbox,
+      geometry_version: polygons.length > 0 ? 'poly_v1' : undefined,
+      geometry: polygons.length > 0
+        ? {
+          polygons,
+          page_width: pageStructureIndex.pageWidth || undefined,
+          page_height: pageStructureIndex.pageHeight || undefined,
+        }
+        : undefined,
+      segment_index: 0,
+      segment_total: uniqueLayoutIds.length,
+      anchor_v2: {
+        coord_version: 'layout_uid_v1',
+        canonical_block_id: String((Array.isArray(anchors) && anchors[0]?.canonical_block_id) || uniqueLayoutIds[0] || ''),
+        page,
+        start_char: startChar,
+        end_char: endChar,
+      },
+      source_word_ids: [],
+      source_char_ranges: [],
+    }
+    return {
+      previewAnchor,
+      previewAnchors: [previewAnchor],
+    }
+  }
 
   const bboxRows = spatialRows
     .map((item) => item.bbox)
@@ -2142,9 +2342,14 @@ async function renderAnchorEvidenceImage(
 
 export default function PaperReaderPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { paperId } = useParams<{ paperId: string }>()
   const parsedPaperId = Number(paperId)
   const validPaperId = Number.isFinite(parsedPaperId) && parsedPaperId > 0
+  const requestedPage = parsePositiveSearchParam(searchParams.get('page'))
+  const requestedKbId = parsePositiveSearchParam(searchParams.get('kb'))
+  const requestedComposePipelineVersion = normalizeComposePipelineVersion(searchParams.get('compose'))
+  const effectiveComposePipelineVersion = requestedComposePipelineVersion || 'layout_uid_v1'
 
   const [loading, setLoading] = useState<boolean>(true)
   const [paper, setPaper] = useState<Paper | null>(null)
@@ -2270,6 +2475,7 @@ export default function PaperReaderPage() {
   const prefetchInFlightPagesRef = useRef<Set<number>>(new Set())
   const [viewerWidth, setViewerWidth] = useState<number>(860)
   const pdfObjectUrlRef = useRef<string | null>(null)
+  const lastUrlSyncedReadPageRef = useRef<number | undefined>(undefined)
   const readerSessionHydratedRef = useRef<boolean>(false)
   const lastSavedReaderSignatureRef = useRef<string>('')
   const currentUserId = useMemo(() => getCurrentUserIdFromAuthStorage(), [])
@@ -2393,6 +2599,13 @@ export default function PaperReaderPage() {
     () => composedPlan || composedPayload?.ui_plan || null,
     [composedPlan, composedPayload],
   )
+  const composedHasDedicatedHeaderCard = useMemo(
+    () => Boolean(
+      Array.isArray(activeComposedPlan?.components)
+      && activeComposedPlan.components.some((node) => String(node?.type || '').trim() === 'PaperHeaderCard'),
+    ),
+    [activeComposedPlan],
+  )
   const hasComposedPlan = Boolean(activeComposedPlan?.components?.length)
   const composedMainComponents = useMemo(
     () => (Array.isArray(activeComposedPlan?.components)
@@ -2402,10 +2615,11 @@ export default function PaperReaderPage() {
           .map((item) => normalizeAcademicArtifacts(item).toLowerCase())
           .filter(Boolean)
         const duplicatesPageTitle = Boolean(normalizedPaperTitle) && titleHints.includes(normalizedPaperTitle)
-        return !isContextOnlyReaderNode(node) && !duplicatesPageTitle
+        const demoteToContext = duplicatesPageTitle && composedHasDedicatedHeaderCard
+        return !isContextOnlyReaderNode(node) && !demoteToContext
       })
       : []),
-    [activeComposedPlan, paper],
+    [activeComposedPlan, composedHasDedicatedHeaderCard, paper],
   )
   const composedContextComponents = useMemo(
     () => (Array.isArray(activeComposedPlan?.components)
@@ -2415,10 +2629,11 @@ export default function PaperReaderPage() {
           .map((item) => normalizeAcademicArtifacts(item).toLowerCase())
           .filter(Boolean)
         const duplicatesPageTitle = Boolean(normalizedPaperTitle) && titleHints.includes(normalizedPaperTitle)
-        return isContextOnlyReaderNode(node) || duplicatesPageTitle
+        const demoteToContext = duplicatesPageTitle && composedHasDedicatedHeaderCard
+        return isContextOnlyReaderNode(node) || demoteToContext
       })
       : []),
-    [activeComposedPlan, paper],
+    [activeComposedPlan, composedHasDedicatedHeaderCard, paper],
   )
   const composedLayout = useMemo(
     () => ((activeComposedPlan?.layout || {}) as Record<string, unknown>),
@@ -2455,6 +2670,7 @@ export default function PaperReaderPage() {
     () => buildPageStructureSpatialIndex(
       (composedPayload?.page_structure_v3 || {}) as Record<string, unknown>,
       inferPageStructureSpatialDimensions((composedPayload || {}) as Record<string, unknown>),
+      composedPayload?.page_grounding_v1 || null,
     ),
     [composedPayload],
   )
@@ -2672,7 +2888,10 @@ export default function PaperReaderPage() {
 
     setPaper(nextPaper)
     setReaderSession(nextSession)
-    const restoredPage = Math.max(1, Number(cachedReader?.page || 0) || Number(nextSession.page || 1))
+    const restoredPage = Math.max(
+      1,
+      requestedPage || Number(cachedReader?.page || 0) || Number(nextSession.page || 1),
+    )
     const restoredZoom = parseZoomPercent(String(cachedReader?.zoom || nextSession.zoom || '120%'))
     const sessionAnchor = (
       (cachedReader?.last_anchor as Record<string, unknown> | undefined) ||
@@ -2722,7 +2941,11 @@ export default function PaperReaderPage() {
     setCollections(collList)
 
     const fallbackKbCandidate = Number(
-      cachedReader?.selected_kb_id || nextSession.selected_kb_id || nextPaper.knowledge_base_id || kbList[0]?.id,
+      requestedKbId ||
+        cachedReader?.selected_kb_id ||
+        nextSession.selected_kb_id ||
+        nextPaper.knowledge_base_id ||
+        kbList[0]?.id,
     )
     const fallbackKb =
       Number.isFinite(fallbackKbCandidate) && fallbackKbCandidate > 0 ? fallbackKbCandidate : undefined
@@ -2816,6 +3039,35 @@ export default function PaperReaderPage() {
       mounted = false
     }
   }, [parsedPaperId, validPaperId])
+
+  useEffect(() => {
+    if (
+      !validPaperId ||
+      !requestedPage ||
+      requestedPage === readPage ||
+      requestedPage === lastUrlSyncedReadPageRef.current
+    ) return
+    setReadPage(requestedPage)
+  }, [readPage, requestedPage, validPaperId])
+
+  useEffect(() => {
+    if (!validPaperId || !searchParams.has('kb') || requestedKbId === selectedKbId) return
+    setSelectedKbId(requestedKbId)
+  }, [requestedKbId, searchParams, selectedKbId, validPaperId])
+
+  useEffect(() => {
+    if (!validPaperId) return
+    lastUrlSyncedReadPageRef.current = readPage
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('page', String(readPage))
+      if (selectedKbId && selectedKbId > 0) next.set('kb', String(selectedKbId))
+      else next.delete('kb')
+      if (requestedComposePipelineVersion) next.set('compose', requestedComposePipelineVersion)
+      else next.delete('compose')
+      return next
+    }, { replace: true })
+  }, [readPage, requestedComposePipelineVersion, selectedKbId, setSearchParams, validPaperId])
 
   useEffect(() => {
     if (!validPaperId) return
@@ -3022,6 +3274,7 @@ export default function PaperReaderPage() {
         const recovered = await literatureApi.getCachedReaderComposed(parsedPaperId, {
           page: readPage,
           selected_kb_id: selectedKbId,
+          pipeline_version: effectiveComposePipelineVersion,
           force_refresh: false,
           regenerate: false,
           detail_level: appliedOptions.detailLevel,
@@ -3050,6 +3303,7 @@ export default function PaperReaderPage() {
         {
           page: readPage,
           selected_kb_id: selectedKbId,
+          pipeline_version: effectiveComposePipelineVersion,
           force_refresh: false,
           regenerate: runOptions.regenerate,
           detail_level: appliedOptions.detailLevel,
@@ -3199,6 +3453,10 @@ export default function PaperReaderPage() {
     textMode,
     readPage,
     selectedKbId,
+    effectiveComposePipelineVersion,
+    detailLevel,
+    compareMode,
+    citationTldr,
     composeMaxIterations,
     composedRunSeed,
   ])
@@ -3219,6 +3477,7 @@ export default function PaperReaderPage() {
       .prefetchReaderComposed(parsedPaperId, {
         pages: queuedCandidates,
         selected_kb_id: selectedKbId,
+        pipeline_version: effectiveComposePipelineVersion,
         detail_level: appliedOptions.detailLevel,
         compare_mode: appliedOptions.compareMode,
         citation_tldr: appliedOptions.citationTldr,
@@ -3244,6 +3503,7 @@ export default function PaperReaderPage() {
     readPage,
     pdfNumPages,
     selectedKbId,
+    effectiveComposePipelineVersion,
     composeMaxIterations,
     composedLoading,
     composedPayload,
@@ -3921,6 +4181,7 @@ export default function PaperReaderPage() {
               },
               children: [],
               source_block_ids: Array.isArray(node.source_block_ids) ? node.source_block_ids : [],
+              source_atom_ids: Array.isArray(node.source_atom_ids) ? node.source_atom_ids : [],
               source_anchor_refs: sourceAnchors,
             }
             const answerNode = doneData.node?.id ? doneData.node : fallbackNode
@@ -3949,6 +4210,7 @@ export default function PaperReaderPage() {
           },
           children: [],
           source_block_ids: Array.isArray(node.source_block_ids) ? node.source_block_ids : [],
+          source_atom_ids: Array.isArray(node.source_atom_ids) ? node.source_atom_ids : [],
           source_anchor_refs: toAnchorList(sourceRows),
         }
         applyNodeInsertToComposeState(String(node.id), fallbackNode)
@@ -3976,6 +4238,7 @@ export default function PaperReaderPage() {
     const target = buildAnchorFromPageStructureBlocks({
       anchors,
       sourceBlockIds: options?.sourceBlockIds,
+      sourceAtomIds: options?.sourceAtomIds,
       preferredPage: readPage,
       pageStructureIndex: composedPageStructureIndex,
     }) || buildAnchorPreviewTarget(anchors, readPage)
@@ -4068,11 +4331,12 @@ export default function PaperReaderPage() {
 
   const resolveAnchorPreviewImage = async (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[] },
+    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
   ): Promise<string | null> => {
     const target = buildAnchorFromPageStructureBlocks({
       anchors,
       sourceBlockIds: options?.sourceBlockIds,
+      sourceAtomIds: options?.sourceAtomIds,
       preferredPage: options?.preferredPage || readPage,
       pageStructureIndex: composedPageStructureIndex,
     }) || buildAnchorPreviewTarget(anchors, options?.preferredPage || readPage)
@@ -4122,6 +4386,14 @@ export default function PaperReaderPage() {
       if (prev.pinned) return prev
       return { ...prev, visible: false, loading: false }
     })
+  }
+
+  const handleOpenExperiencePage = () => {
+    if (!validPaperId) return
+    const params = new URLSearchParams()
+    params.set('page', String(readPage))
+    if (selectedKbId && selectedKbId > 0) params.set('kb', String(selectedKbId))
+    navigate(`/literature/${parsedPaperId}/experience?${params.toString()}`)
   }
   const appendMarkdownToAnnotation = (markdown: string) => {
     const text = String(markdown || '').trim()
@@ -4759,6 +5031,7 @@ export default function PaperReaderPage() {
                 <div className="reader-workbench__eyebrow">
                   <Tag color="blue">AI Reader</Tag>
                   <Tag color="geekblue">第 {readPage} 页</Tag>
+                  {effectiveComposePipelineVersion ? <Tag color="purple">{effectiveComposePipelineVersion}</Tag> : null}
                   {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
                 </div>
                 <Title level={3} className="reader-workbench__title">
@@ -4860,6 +5133,9 @@ export default function PaperReaderPage() {
                             const inheritedAnchors = Array.isArray(targetNode?.source_anchor_refs)
                               ? targetNode.source_anchor_refs
                               : []
+                            const inheritedAtomIds = Array.isArray(targetNode?.source_atom_ids)
+                              ? targetNode.source_atom_ids
+                              : []
                             const slotNode: ReaderComponentNode = {
                               id: `manual-slot-${Date.now()}`,
                               type: 'InlineQuerySlot',
@@ -4869,6 +5145,7 @@ export default function PaperReaderPage() {
                               },
                               children: [],
                               source_block_ids: inheritedBlockIds,
+                              source_atom_ids: inheritedAtomIds,
                               source_anchor_refs: inheritedAnchors,
                             }
                             applyNodeInsertToComposeState(nodeId, slotNode)
@@ -5509,6 +5786,7 @@ export default function PaperReaderPage() {
       <Space wrap size={8}>
         <Tag color="blue">第 {readPage} 页</Tag>
         <Tag>{pageWordCount} 词</Tag>
+        {effectiveComposePipelineVersion ? <Tag color="purple">{effectiveComposePipelineVersion}</Tag> : null}
         {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
       </Space>,
       <Space direction="vertical" size={12} style={{ width: '100%' }}>
@@ -5587,6 +5865,9 @@ export default function PaperReaderPage() {
                   </Button>
                   <Button onClick={() => setTextMode((prev) => !prev)}>
                     {textMode ? '切到PDF' : '切到AI阅读'}
+                  </Button>
+                  <Button icon={<LinkOutlined />} onClick={handleOpenExperiencePage}>
+                    展开页面
                   </Button>
                   <Tag color={readerAutoSaveTag.color}>{readerAutoSaveTag.label}</Tag>
                 </Space>
