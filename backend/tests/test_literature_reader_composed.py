@@ -5875,6 +5875,96 @@ def test_ensure_payload_contract_should_keep_doi_layout_outside_main_flow_in_pag
     assert str(reading_nodes[0].get("region_hint") or "") == "side_context"
 
 
+def test_build_no_drop_fallback_node_should_preserve_layout_uid_evidence():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "blocks": [
+            {
+                "id": "p7_dm_p7_l004_b001",
+                "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                "source_anchor": None,
+            }
+        ],
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_l004_b001",
+                    "layout_unique_id": "layout_list_1",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                }
+            ]
+        },
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_list_1",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                    "canonical_block_ids": ["p7_dm_p7_l004_b001"],
+                    "layout_pos": [
+                        {"x": 120, "y": 200},
+                        {"x": 640, "y": 200},
+                        {"x": 640, "y": 248},
+                        {"x": 120, "y": 248},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                            "pos": [
+                                {"x": 122, "y": 202},
+                                {"x": 638, "y": 202},
+                                {"x": 638, "y": 246},
+                                {"x": 122, "y": 246},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "evidence_map": [
+                {
+                    "source_layout_id": "layout_list_1",
+                    "source_block_ids": ["p7_dm_p7_l004_b001"],
+                    "layout_pos": [
+                        {"x": 120, "y": 200},
+                        {"x": 640, "y": 200},
+                        {"x": 640, "y": 248},
+                        {"x": 120, "y": 248},
+                    ],
+                    "block_positions": [[
+                        {"x": 122, "y": 202},
+                        {"x": 638, "y": 202},
+                        {"x": 638, "y": 246},
+                        {"x": 122, "y": 246},
+                    ]],
+                }
+            ],
+            "page_image": {
+                "width": 800,
+                "height": 1200,
+            },
+        },
+    }
+
+    node = service._build_no_drop_fallback_node(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        canonical_block_id="p7_dm_p7_l004_b001",
+        seq=1,
+        existing_node_ids=set(),
+    )
+
+    assert list(node.get("source_atom_ids") or []) == ["layout_list_1"]
+    assert list(node.get("source_layout_ids") or []) == ["layout_list_1"]
+    anchors = list(node.get("source_anchor_refs") or [])
+    assert len(anchors) == 1
+    assert str(anchors[0].get("coord_version") or "") == "layout_uid_v1"
+    assert str(anchors[0].get("source_layout_id") or "") == "layout_list_1"
+    assert "jump_anchor" in list(node.get("capabilities") or [])
+
+
 def test_ensure_payload_contract_should_preserve_docmind_table_cells_in_page_grounding():
     service = LiteratureReaderComposeService()
     payload = {

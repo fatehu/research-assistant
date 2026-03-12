@@ -12308,6 +12308,7 @@ class LiteratureReaderComposeService:
         column_id = str(block_row.get("column_id") or group_row.get("column_id") or "").strip()
         if not column_id:
             column_id = "sidebar" if zone_type == "side_context" else "main"
+        layout_uid = str(group_row.get("layout_unique_id") or "").strip()
 
         fallback_title = "Recovered block"
         if zone_type == "side_context":
@@ -12315,12 +12316,20 @@ class LiteratureReaderComposeService:
         elif zone_type == "figure_meta":
             fallback_title = "Recovered figure metadata"
 
-        anchor = self._normalize_anchor_ref(
-            anchor=block_row.get("source_anchor"),
+        anchor = self._build_layout_uid_anchor_from_grounding(
             page=page,
+            payload=payload,
+            layout_id=layout_uid,
             quote_text=source_text,
-            source_block_id=canonical_block_id,
+            canonical_block_ids=[canonical_block_id],
         )
+        if not isinstance(anchor, dict):
+            anchor = self._normalize_anchor_ref(
+                anchor=block_row.get("source_anchor"),
+                page=page,
+                quote_text=source_text,
+                source_block_id=canonical_block_id,
+            )
         anchor_rows = [anchor] if anchor else []
 
         base_id = re.sub(r"[^0-9a-zA-Z_]+", "_", str(canonical_block_id)).strip("_") or f"b{int(seq)}"
@@ -12347,6 +12356,8 @@ class LiteratureReaderComposeService:
             "children": [],
             "source_anchor_refs": anchor_rows,
             "source_block_ids": [canonical_block_id],
+            "source_atom_ids": [layout_uid] if layout_uid else [],
+            "source_layout_ids": [layout_uid] if layout_uid else [],
             "zone_type": zone_type,
             "column_id": column_id,
             "display": "collapsed",
@@ -14265,6 +14276,169 @@ class LiteratureReaderComposeService:
                 if numeric_points:
                     polygons.append(numeric_points)
         return [poly for poly in polygons if len(poly) >= 3]
+
+    @staticmethod
+    def _grounding_points_bbox(points: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+        xs: List[float] = []
+        ys: List[float] = []
+        for row in list(points or []):
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                xs.append(float(row.get("x") or 0.0))
+                ys.append(float(row.get("y") or 0.0))
+            except Exception:
+                continue
+        if not xs or not ys:
+            return None
+        x0 = min(xs)
+        x1 = max(xs)
+        top = min(ys)
+        bottom = max(ys)
+        if x1 <= x0 or bottom <= top:
+            return None
+        return {
+            "x0": round(x0, 2),
+            "x1": round(x1, 2),
+            "top": round(top, 2),
+            "bottom": round(bottom, 2),
+        }
+
+    def _grounding_page_dimensions(
+        self,
+        *,
+        grounding_layout_map: Mapping[str, Mapping[str, Any]],
+        grounding_evidence_map: Mapping[str, Mapping[str, Any]],
+        page_image: Mapping[str, Any],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        width = float(page_image.get("width") or 0.0) or 0.0
+        height = float(page_image.get("height") or 0.0) or 0.0
+        if width > 0 and height > 0:
+            return width, height
+        for atom in list(grounding_layout_map.values()):
+            for point in self._normalize_grounding_points(atom.get("layout_pos")):
+                width = max(width, float(point.get("x") or 0.0))
+                height = max(height, float(point.get("y") or 0.0))
+            for block in list(atom.get("blocks") or []):
+                if not isinstance(block, Mapping):
+                    continue
+                for point in self._normalize_grounding_points(block.get("pos")):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+        for evidence in list(grounding_evidence_map.values()):
+            for point in self._normalize_grounding_points(evidence.get("layout_pos")):
+                width = max(width, float(point.get("x") or 0.0))
+                height = max(height, float(point.get("y") or 0.0))
+            for polygon in list(evidence.get("block_positions") or []):
+                for point in self._normalize_grounding_points(polygon):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+        return (width or None), (height or None)
+
+    def _build_layout_uid_anchor_from_grounding(
+        self,
+        *,
+        page: int,
+        payload: Mapping[str, Any],
+        layout_id: str,
+        quote_text: str = "",
+        canonical_block_ids: Optional[Sequence[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        token = str(layout_id or "").strip()
+        if not token:
+            return None
+        grounding = dict((payload or {}).get("page_grounding_v1") or {})
+        grounding_layout_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        grounding_evidence_map = {
+            str(row.get("source_layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("evidence_map") or [])
+            if isinstance(row, Mapping) and str(row.get("source_layout_id") or "").strip()
+        }
+        atom = grounding_layout_map.get(token) or {}
+        evidence = grounding_evidence_map.get(token) or {}
+        if not atom and not evidence:
+            return None
+        page_image = dict(grounding.get("page_image") or {})
+        grounding_page_width, grounding_page_height = self._grounding_page_dimensions(
+            grounding_layout_map=grounding_layout_map,
+            grounding_evidence_map=grounding_evidence_map,
+            page_image=page_image,
+        )
+        normalized_quote = self._normalize_spaces(
+            str(quote_text or atom.get("clean_text") or atom.get("raw_text") or "")
+        )
+        normalized_block_ids = [
+            self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            for item in list(canonical_block_ids or atom.get("canonical_block_ids") or evidence.get("source_block_ids") or [])
+        ]
+        normalized_block_ids = [item for item in normalized_block_ids if item]
+        polygon_sets = [
+            self._normalize_grounding_points(item)
+            for item in list(evidence.get("block_positions") or [])
+            if len(self._normalize_grounding_points(item)) >= 3
+        ]
+        if not polygon_sets:
+            atom_blocks = [row for row in list(atom.get("blocks") or []) if isinstance(row, Mapping)]
+            polygon_sets = [
+                self._normalize_grounding_points(block.get("pos"))
+                for block in atom_blocks
+                if len(self._normalize_grounding_points(block.get("pos"))) >= 3
+            ]
+        if not polygon_sets:
+            layout_points = self._normalize_grounding_points(evidence.get("layout_pos") or atom.get("layout_pos"))
+            if len(layout_points) >= 3:
+                polygon_sets = [layout_points]
+        if not polygon_sets:
+            return None
+        all_points = [point for polygon in polygon_sets for point in polygon]
+        bbox = self._grounding_points_bbox(all_points)
+        geometry = {
+            "polygons": [
+                {
+                    "points": polygon,
+                    "source": "page_grounding_v1",
+                    "component_id": f"{token}:{idx}",
+                }
+                for idx, polygon in enumerate(polygon_sets, start=1)
+            ],
+            "page_width": grounding_page_width,
+            "page_height": grounding_page_height,
+        }
+        quote_length = max(1, len(normalized_quote or token))
+        return {
+            "page": int(page),
+            "start_char": 0,
+            "end_char": int(quote_length),
+            "quote": normalized_quote or None,
+            "quote_text": normalized_quote or None,
+            "anchor_id": f"layout_uid_v1:{token}",
+            "segment_index": 1,
+            "segment_total": 1,
+            "bbox_hint": {
+                **dict(bbox or {}),
+                "page_width": grounding_page_width,
+                "page_height": grounding_page_height,
+            } if isinstance(bbox, dict) else None,
+            "canonical_block_id": normalized_block_ids[0] if normalized_block_ids else None,
+            "source_layout_id": token,
+            "coord_version": "layout_uid_v1",
+            "anchor_confidence": 0.98,
+            "anchor_v2": {
+                "coord_version": "layout_uid_v1",
+                "canonical_block_id": normalized_block_ids[0] if normalized_block_ids else token,
+                "page": int(page),
+                "start_char": 0,
+                "end_char": int(quote_length),
+            },
+            "geometry_version": "poly_v1",
+            "geometry": geometry,
+            "source_word_ids": [],
+            "source_char_ranges": [],
+        }
 
     def _extract_docmind_table_cells(self, row: Mapping[str, Any]) -> List[Dict[str, Any]]:
         output: List[Dict[str, Any]] = []

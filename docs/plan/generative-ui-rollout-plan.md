@@ -242,5 +242,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
   row-level table anchors no longer use row-local pseudo page dimensions, `TablePanel` keeps `table_cells` through contract normalization and exposes direct `证据 / 预览` controls again, and `EquationBlock` now renders KaTeX plus the original evidence image while splitting trailing `where ...` prose into description text.
 - [x] Seal `/read` table cell truth through API/runtime:
   `ReaderComposePayload` now preserves `page_grounding_v1.layout_atoms[].table_cells` and `page_grounding_v1.evidence_map[].table_cells` through schema serialization, and `reader_compose_v7` invalidates stale table caches so runtime responses carry `cell_evidence` and body-only `source_atom_ids`.
+- [x] Restore `layout_uid_v1` evidence on auto-injected no-drop fallback nodes:
+  recovered prose nodes now rebuild `layout_uid_v1` anchors from `page_grounding_v1 + layout_unique_id`, keep `source_atom_ids/source_layout_ids`, and no longer lose the `证据` action just because they were injected by the no-drop safety layer.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.
