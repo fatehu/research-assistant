@@ -1140,6 +1140,172 @@ class LiteratureReaderComposeService:
         )
 
     @staticmethod
+    def _layout_uid_table_logical_row_system_prompt() -> str:
+        return (
+            "You refine a single table for the /read reader. "
+            "DocMind already provides geometry truth and physical rows. "
+            "Your job is ONLY to group physical rows into logical rows. "
+            "Never rewrite cell text, never invent cells, never modify geometry, and never invent row indices. "
+            "Use the attached page image only as visual reference for whether adjacent physical rows belong to the same logical benchmark row. "
+            "Each physical row index must be assigned exactly once. "
+            "Return JSON with status and step_result. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"logical_rows\":["
+            "{\"logical_row_id\":\"lr1\",\"row_role\":\"header\",\"source_row_indices\":[0,1],\"rationale\":\"multi_line_header\"}"
+            "],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _build_layout_uid_table_physical_rows(
+        table_cells: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        rows_map: Dict[int, List[Dict[str, Any]]] = {}
+        for raw_cell in list(table_cells or []):
+            if not isinstance(raw_cell, Mapping):
+                continue
+            row_start = max(0, int(raw_cell.get("row_start") or 0))
+            cell = {
+                "cell_id": int(raw_cell.get("cell_id") or 0),
+                "row_start": row_start,
+                "row_end": max(row_start, int(raw_cell.get("row_end") or row_start)),
+                "col_start": max(0, int(raw_cell.get("col_start") or 0)),
+                "col_end": max(0, int(raw_cell.get("col_end") or raw_cell.get("col_start") or 0)),
+                "text": LiteratureReaderComposeService._normalize_spaces(str(raw_cell.get("text") or "")),
+                "layout_ids": [
+                    str(item).strip()
+                    for item in list(raw_cell.get("layout_ids") or [])
+                    if str(item).strip()
+                ],
+            }
+            rows_map.setdefault(row_start, []).append(cell)
+        physical_rows: List[Dict[str, Any]] = []
+        for row_index in sorted(rows_map.keys()):
+            cells = sorted(
+                rows_map[row_index],
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            physical_rows.append(
+                {
+                    "row_index": int(row_index),
+                    "cells": cells,
+                }
+            )
+        return physical_rows
+
+    def _build_layout_uid_table_logical_row_prompt_payload(
+        self,
+        *,
+        page: int,
+        title: str,
+        caption: str,
+        table_cells: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        physical_rows = self._build_layout_uid_table_physical_rows(table_cells)
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_table_logical_rows",
+            },
+            "table_meta": {
+                "title": str(title or "").strip(),
+                "caption": str(caption or "").strip(),
+                "cell_count": len(list(table_cells or [])),
+                "physical_row_count": len(physical_rows),
+            },
+            "physical_rows": physical_rows,
+            "rules": {
+                "task": "group_physical_rows_into_logical_rows",
+                "preserve_row_order": True,
+                "exactly_once_assignment": True,
+                "forbid_text_rewrite": True,
+                "forbid_geometry_mutation": True,
+                "allowed_row_roles": ["header", "data", "note"],
+            },
+        }
+
+    def _normalize_layout_uid_table_logical_row_plan(
+        self,
+        *,
+        physical_rows: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        known_indices = [int(row.get("row_index") or 0) for row in list(physical_rows or []) if isinstance(row, Mapping)]
+        known_set = set(known_indices)
+        normalized_rows: List[Dict[str, Any]] = []
+        used_indices: List[int] = []
+        errors: List[str] = []
+        for raw_row in list((step_result or {}).get("logical_rows") or (step_result or {}).get("rows") or []):
+            if not isinstance(raw_row, Mapping):
+                continue
+            source_row_indices = []
+            for item in list(raw_row.get("source_row_indices") or []):
+                try:
+                    source_row_indices.append(int(item))
+                except Exception:
+                    continue
+            source_row_indices = list(dict.fromkeys(source_row_indices))
+            if not source_row_indices:
+                continue
+            unknown = [row_index for row_index in source_row_indices if row_index not in known_set]
+            if unknown:
+                errors.extend([f"unknown_physical_row:{row_index}" for row_index in unknown])
+                continue
+            row_role = str(raw_row.get("row_role") or raw_row.get("role") or "").strip().lower() or "data"
+            if row_role not in {"header", "data", "note"}:
+                errors.append(f"invalid_row_role:{row_role}")
+                row_role = "data"
+            normalized_rows.append(
+                {
+                    "logical_row_id": str(raw_row.get("logical_row_id") or f"lr{len(normalized_rows) + 1}").strip()
+                    or f"lr{len(normalized_rows) + 1}",
+                    "row_role": row_role,
+                    "source_row_indices": sorted(source_row_indices),
+                    "rationale": str(raw_row.get("rationale") or "").strip(),
+                }
+            )
+            used_indices.extend(source_row_indices)
+        duplicates = sorted({row_index for row_index in used_indices if used_indices.count(row_index) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_physical_row:{row_index}" for row_index in duplicates])
+        missing = [row_index for row_index in known_indices if row_index not in set(used_indices)]
+        if missing:
+            errors.extend([f"missing_physical_row:{row_index}" for row_index in missing])
+        if errors or not normalized_rows:
+            fallback_rows = [
+                {
+                    "logical_row_id": f"lr{index + 1}",
+                    "row_role": "data",
+                    "source_row_indices": [int(row_index)],
+                    "rationale": "deterministic_physical_row_fallback",
+                }
+                for index, row_index in enumerate(sorted(known_indices))
+            ]
+            return {
+                "logical_rows": fallback_rows,
+                "notes": ["deterministic_table_logical_row_fallback"],
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_logical_rows"],
+                "fallback_used": True,
+            }
+        normalized_rows = sorted(
+            normalized_rows,
+            key=lambda row: min(int(item) for item in list(row.get("source_row_indices") or [10**9])),
+        )
+        return {
+            "logical_rows": normalized_rows,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    @staticmethod
     def _looks_like_table_caption_text(text: str) -> bool:
         normalized = str(text or "").strip()
         if not normalized:
@@ -1181,11 +1347,130 @@ class LiteratureReaderComposeService:
             return True
         return False
 
+    @staticmethod
+    def _merge_layout_uid_table_cell_text(base: str, extra: str) -> str:
+        lines = [
+            *[item.strip() for item in str(base or "").split("\n") if item.strip()],
+            *[item.strip() for item in str(extra or "").split("\n") if item.strip()],
+        ]
+        if not lines:
+            return ""
+        return "\n".join(list(dict.fromkeys(lines)))
+
+    def _materialize_layout_uid_logical_table_rows(
+        self,
+        *,
+        normalized_cells: Sequence[Mapping[str, Any]],
+        logical_row_plan: Mapping[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        physical_rows: Dict[int, List[Dict[str, Any]]] = {}
+        for raw_cell in list(normalized_cells or []):
+            if not isinstance(raw_cell, Mapping):
+                continue
+            row_start = max(0, int(raw_cell.get("row_start") or 0))
+            physical_rows.setdefault(row_start, []).append(dict(raw_cell))
+
+        physical_to_logical: Dict[int, int] = {}
+        logical_rows: List[Dict[str, Any]] = []
+        for logical_index, raw_row in enumerate(list((logical_row_plan or {}).get("logical_rows") or [])):
+            if not isinstance(raw_row, Mapping):
+                continue
+            source_row_indices = [
+                int(item)
+                for item in list(raw_row.get("source_row_indices") or [])
+                if isinstance(item, int) or str(item).strip().isdigit()
+            ]
+            merged_cells: List[Dict[str, Any]] = []
+            for row_index in source_row_indices:
+                physical_to_logical[int(row_index)] = logical_index
+                row_cells = sorted(
+                    [dict(cell) for cell in list(physical_rows.get(int(row_index)) or [])],
+                    key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+                )
+                for cell in row_cells:
+                    existing = next(
+                        (
+                            item
+                            for item in merged_cells
+                            if int(item.get("col_start") or 0) == int(cell.get("col_start") or 0)
+                            and int(item.get("col_end") or 0) == int(cell.get("col_end") or 0)
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        merged_cells.append(dict(cell))
+                        continue
+                    existing["text"] = self._merge_layout_uid_table_cell_text(
+                        str(existing.get("text") or ""),
+                        str(cell.get("text") or ""),
+                    )
+                    existing["layout_ids"] = list(
+                        dict.fromkeys(
+                            [
+                                *[str(item).strip() for item in list(existing.get("layout_ids") or []) if str(item).strip()],
+                                *[str(item).strip() for item in list(cell.get("layout_ids") or []) if str(item).strip()],
+                            ]
+                        )
+                    )
+                    existing["row_end"] = max(
+                        int(existing.get("row_end") or existing.get("row_start") or 0),
+                        int(cell.get("row_end") or cell.get("row_start") or 0),
+                    )
+                    existing["rowspan"] = max(
+                        int(existing.get("rowspan") or 1),
+                        int(cell.get("rowspan") or 1),
+                    )
+                    for key in ("x0", "y0"):
+                        existing_value = existing.get(key)
+                        new_value = cell.get(key)
+                        if existing_value is None:
+                            existing[key] = new_value
+                        elif new_value is not None:
+                            existing[key] = min(float(existing_value), float(new_value))
+                    for key in ("x1", "y1"):
+                        existing_value = existing.get(key)
+                        new_value = cell.get(key)
+                        if existing_value is None:
+                            existing[key] = new_value
+                        elif new_value is not None:
+                            existing[key] = max(float(existing_value), float(new_value))
+            merged_cells = sorted(
+                merged_cells,
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            logical_rows.append(
+                {
+                    "row_index": int(logical_index),
+                    "row_role": str(raw_row.get("row_role") or "data").strip() or "data",
+                    "source_row_indices": source_row_indices,
+                    "cells": merged_cells,
+                }
+            )
+
+        for logical_index, logical_row in enumerate(logical_rows):
+            for cell in list(logical_row.get("cells") or []):
+                physical_row_start = int(cell.get("row_start") or 0)
+                physical_row_end = int(cell.get("row_end") or physical_row_start)
+                logical_row_start = physical_to_logical.get(physical_row_start, logical_index)
+                logical_row_end = physical_to_logical.get(physical_row_end, logical_row_start)
+                cell["row_start"] = int(logical_row_start)
+                cell["row_end"] = int(logical_row_end)
+                cell["rowspan"] = max(1, int(logical_row_end) - int(logical_row_start) + 1)
+
+        logical_header_row_count = 0
+        for row in logical_rows:
+            if str(row.get("row_role") or "").strip().lower() == "header":
+                logical_header_row_count += 1
+            else:
+                break
+        return logical_rows, int(logical_header_row_count)
+
     def _build_layout_uid_table_props(
         self,
         *,
         page: int,
         atoms: Sequence[Mapping[str, Any]],
+        logical_row_plan: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         caption_texts: List[str] = []
         note_texts: List[str] = []
@@ -1402,6 +1687,7 @@ class LiteratureReaderComposeService:
             }
 
         normalized_cells: List[Dict[str, Any]] = []
+        column_widths: List[float] = []
 
         if table_cells:
             max_row = max(
@@ -1419,6 +1705,29 @@ class LiteratureReaderComposeService:
                 row_end = max(row_start, int(cell.get("row_end") or row_start))
                 col_start = max(0, int(cell.get("col_start") or 0))
                 cell_text = self._normalize_spaces(str(cell.get("text") or ""))
+                cell_x0 = cell.get("x0")
+                cell_x1 = cell.get("x1")
+                cell_y0 = cell.get("y0")
+                cell_y1 = cell.get("y1")
+                if (
+                    cell_x0 is None
+                    or cell_x1 is None
+                    or cell_y0 is None
+                    or cell_y1 is None
+                ):
+                    points = [
+                        point
+                        for poly in list(cell.get("polygons") or [])
+                        for point in self._normalize_grounding_points(poly)
+                        if isinstance(point, Mapping)
+                    ]
+                    xs = [float(point.get("x") or 0.0) for point in points]
+                    ys = [float(point.get("y") or 0.0) for point in points]
+                    if xs and ys:
+                        cell_x0 = min(xs)
+                        cell_x1 = max(xs)
+                        cell_y0 = min(ys)
+                        cell_y1 = max(ys)
                 if cell_text:
                     matrix[row_start][col_start] = cell_text
                 normalized_cells.append(
@@ -1432,6 +1741,11 @@ class LiteratureReaderComposeService:
                         "colspan": int(max(1, int(max(col_start, int(cell.get("col_end") or col_start))) - col_start + 1)),
                         "text": cell_text,
                         "layout_ids": list(cell.get("layout_ids") or []),
+                        "x0": cell_x0,
+                        "x1": cell_x1,
+                        "y0": cell_y0,
+                        "y1": cell_y1,
+                        "polygons": list(cell.get("polygons") or []),
                     }
                 )
                 cell_anchor = _build_cell_anchor(cell=cell)
@@ -1443,6 +1757,61 @@ class LiteratureReaderComposeService:
                         row_cells_map[row_index].append(dict(cell))
 
             matrix = [row for row in matrix if any(self._normalize_spaces(cell) for cell in row)]
+
+            if normalized_cells and max_col >= 0:
+                column_bounds: List[Optional[Tuple[float, float]]] = [None] * (max_col + 1)
+                global_x0: Optional[float] = None
+                global_x1: Optional[float] = None
+                for cell in normalized_cells:
+                    x0 = None
+                    x1 = None
+                    try:
+                        x0 = float(cell.get("x0")) if cell.get("x0") is not None else None
+                        x1 = float(cell.get("x1")) if cell.get("x1") is not None else None
+                    except Exception:
+                        x0 = None
+                        x1 = None
+                    if x0 is None or x1 is None or x1 <= x0:
+                        points = [
+                            point
+                            for poly in list(cell.get("polygons") or [])
+                            for point in self._normalize_grounding_points(poly)
+                            if isinstance(point, Mapping)
+                        ]
+                        xs = [float(point.get("x") or 0.0) for point in points]
+                        if xs:
+                            x0 = min(xs)
+                            x1 = max(xs)
+                    if x0 is None or x1 is None or x1 <= x0:
+                        continue
+                    global_x0 = x0 if global_x0 is None else min(global_x0, x0)
+                    global_x1 = x1 if global_x1 is None else max(global_x1, x1)
+                    col_start = int(cell.get("col_start") or 0)
+                    col_end = int(cell.get("col_end") or col_start)
+                    span = max(1, col_end - col_start + 1)
+                    segment_width = (x1 - x0) / span
+                    for offset, column_index in enumerate(range(col_start, col_end + 1)):
+                        seg_x0 = x0 + segment_width * offset
+                        seg_x1 = x0 + segment_width * (offset + 1)
+                        existing = column_bounds[column_index]
+                        if existing is None:
+                            column_bounds[column_index] = (seg_x0, seg_x1)
+                        else:
+                            column_bounds[column_index] = (
+                                min(existing[0], seg_x0),
+                                max(existing[1], seg_x1),
+                            )
+                if global_x0 is not None and global_x1 is not None and global_x1 > global_x0:
+                    total_width = max(1e-6, global_x1 - global_x0)
+                    raw_widths: List[float] = []
+                    for item in column_bounds:
+                        if item is None:
+                            raw_widths.append(0.0)
+                        else:
+                            raw_widths.append(max(0.0, (item[1] - item[0]) / total_width))
+                    raw_sum = sum(raw_widths)
+                    if raw_sum > 0:
+                        column_widths = [value / raw_sum for value in raw_widths]
 
             def _looks_like_header_row(cells: Sequence[str]) -> bool:
                 values = [self._normalize_spaces(cell) for cell in list(cells or []) if self._normalize_spaces(cell)]
@@ -1560,20 +1929,41 @@ class LiteratureReaderComposeService:
             for row in body_rows
         ] if column_count > 0 else []
 
+        logical_rows: List[Dict[str, Any]] = []
+        logical_header_row_count = 0
+        reconstruction_mode = "deterministic"
+        reconstruction_notes: List[str] = []
+        if isinstance(logical_row_plan, Mapping) and list(logical_row_plan.get("logical_rows") or []):
+            logical_rows, logical_header_row_count = self._materialize_layout_uid_logical_table_rows(
+                normalized_cells=normalized_cells,
+                logical_row_plan=logical_row_plan,
+            )
+            reconstruction_mode = "ai_logical_rows"
+            reconstruction_notes = [
+                str(item).strip()
+                for item in list(logical_row_plan.get("notes") or [])
+                if str(item).strip()
+            ]
+
         caption = " ".join(text for text in caption_texts if text).strip()
         title = caption or f"Table · Page {int(page)}"
         return {
             "title": title,
             "headers": headers,
             "header_row_count": int(header_row_count),
+            "column_widths": column_widths,
             "matrix": matrix,
             "table_cells": normalized_cells,
+            "logical_rows": logical_rows,
+            "logical_header_row_count": int(logical_header_row_count),
             "rows": rows,
             "caption": caption,
             "notes": note_texts,
             "raw_markdown": raw_markdown,
             "row_evidence": row_evidence,
             "cell_evidence": cell_evidence,
+            "reconstruction_mode": reconstruction_mode,
+            "reconstruction_notes": reconstruction_notes,
             "ai_insight": "",
         }
 
@@ -1588,7 +1978,8 @@ class LiteratureReaderComposeService:
             if isinstance(atom, Mapping)
         ]
         clean_texts = [text for text in clean_texts if text]
-        merged = " ".join(clean_texts).strip() or "x = y"
+        transcript = " ".join(clean_texts).strip() or "x = y"
+        merged = transcript
         label = ""
         match = re.match(
             r"^\s*((?:eq(?:uation)?\.?\s*\(?\d+[A-Za-z]?\)?))\s*[:.\-]?\s*(.+)$",
@@ -1614,6 +2005,8 @@ class LiteratureReaderComposeService:
             "latex": latex or "x = y",
             "label": label,
             "description": description,
+            "render_mode": "image_first",
+            "transcript": transcript,
         }
 
     def _build_layout_uid_fallback_group_plan(
@@ -1897,12 +2290,79 @@ class LiteratureReaderComposeService:
             "fallback_used": False,
         }
 
+    async def _build_layout_uid_table_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "table":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            draft_table_props = self._build_layout_uid_table_props(page=page, atoms=atoms)
+            table_cells = [
+                dict(row)
+                for row in list(draft_table_props.get("table_cells") or [])
+                if isinstance(row, Mapping)
+            ]
+            physical_rows = self._build_layout_uid_table_physical_rows(table_cells)
+            if len(physical_rows) < 3:
+                continue
+            prompt_payload = self._build_layout_uid_table_logical_row_prompt_payload(
+                page=page,
+                title=str(draft_table_props.get("title") or ""),
+                caption=str(draft_table_props.get("caption") or ""),
+                table_cells=table_cells,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_table_logical_row_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_table_logical_rows:{group_id}",
+            )
+            normalized_plan, validation = self._normalize_layout_uid_table_logical_row_plan(
+                physical_rows=physical_rows,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "logical_row_plan": normalized_plan,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
     def _layout_uid_group_plan_to_panel_plan(
         self,
         *,
         page: int,
         grouping_plan: Mapping[str, Any],
         grounding: Mapping[str, Any],
+        table_refinements: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         layout_index = {
             str(row.get("layout_id") or "").strip(): dict(row)
@@ -2001,7 +2461,12 @@ class LiteratureReaderComposeService:
                 }
             elif group_kind == "table":
                 component = "TablePanel"
-                props = self._build_layout_uid_table_props(page=page, atoms=atoms)
+                refinement = dict((table_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                props = self._build_layout_uid_table_props(
+                    page=page,
+                    atoms=atoms,
+                    logical_row_plan=dict(refinement.get("logical_row_plan") or {}) if refinement else None,
+                )
             elif group_kind == "table_caption":
                 paragraphs = [{"text": text} for text in clean_texts if text]
                 merged_text = "\n\n".join(text for text in clean_texts if text).strip()
@@ -2110,10 +2575,18 @@ class LiteratureReaderComposeService:
             grounding=grounding,
             step_result=dict(model_result.get("step_result") or {}),
         )
+        table_refinement_map = await self._build_layout_uid_table_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
         panel_plan = self._layout_uid_group_plan_to_panel_plan(
             page=page,
             grouping_plan=normalized_grouping_plan,
             grounding=grounding,
+            table_refinements=table_refinement_map,
         )
         docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
             page=page,
@@ -2192,6 +2665,7 @@ class LiteratureReaderComposeService:
             "ordered_block_ids": used_layout_ids,
             "suggested_components": component_hints,
             "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
+            "table_refinements": table_refinement_map,
             "visual_hints": [],
             "notes": list(decision_log),
             "omitted_layout_ids": [str(row.get("layout_id") or "").strip() for row in omissions],
@@ -3780,6 +4254,8 @@ class LiteratureReaderComposeService:
                     "latex": str(props.get("latex") or props.get("text") or fb_text).strip() or "x = y",
                     "label": str(props.get("label") or "").strip(),
                     "description": str(props.get("description") or "").strip(),
+                    "render_mode": str(props.get("render_mode") or "image_first").strip() or "image_first",
+                    "transcript": str(props.get("transcript") or props.get("text") or fb_text).strip(),
                 }
             if component == "MethodologyCard":
                 steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
@@ -3790,6 +4266,7 @@ class LiteratureReaderComposeService:
                 rows = props.get("rows")
                 matrix = props.get("matrix")
                 headers = props.get("headers")
+                column_widths = props.get("column_widths")
                 table_cells = props.get("table_cells")
                 notes = props.get("notes")
                 row_evidence = props.get("row_evidence")
@@ -3799,6 +4276,7 @@ class LiteratureReaderComposeService:
                     "rows": rows if isinstance(rows, list) else [],
                     "matrix": matrix if isinstance(matrix, list) else [],
                     "headers": headers if isinstance(headers, list) else [],
+                    "column_widths": column_widths if isinstance(column_widths, list) else [],
                     "table_cells": table_cells if isinstance(table_cells, list) else [],
                     "header_row_count": int(props.get("header_row_count") or 0),
                     "caption": str(props.get("caption") or "").strip(),
@@ -14506,6 +14984,17 @@ class LiteratureReaderComposeService:
                 polygons = list(cell_block_positions)
             if not polygons:
                 continue
+            xs: List[float] = []
+            ys: List[float] = []
+            for poly in polygons:
+                for point in list(poly or []):
+                    if not isinstance(point, Mapping):
+                        continue
+                    try:
+                        xs.append(float(point.get("x") or 0.0))
+                        ys.append(float(point.get("y") or 0.0))
+                    except Exception:
+                        continue
             text = self._merge_source_text_fragments(cell_text_fragments)
             output.append(
                 {
@@ -14517,6 +15006,10 @@ class LiteratureReaderComposeService:
                     "text": text,
                     "layout_ids": cell_layout_ids,
                     "polygons": polygons,
+                    "x0": min(xs) if xs else None,
+                    "x1": max(xs) if xs else None,
+                    "y0": min(ys) if ys else None,
+                    "y1": max(ys) if ys else None,
                 }
             )
         return output

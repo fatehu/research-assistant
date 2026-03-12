@@ -6788,9 +6788,14 @@ def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equati
     assert str(table_props.get("title") or "") == "Table 2. Quantization comparison across evaluation suites"
     assert int(table_props.get("header_row_count") or 0) == 1
     assert list(table_props.get("headers") or []) == ["Model", "Score"]
+    column_widths = list(table_props.get("column_widths") or [])
+    assert len(column_widths) == 2
+    assert abs(sum(float(item or 0.0) for item in column_widths) - 1.0) < 1e-6
     assert list(table_props.get("matrix") or [])[0] == ["Model", "Score"]
     assert list(table_props.get("matrix") or [])[1] == ["Q8_0", "71.68"]
     assert len(list(table_props.get("table_cells") or [])) == 6
+    assert float((table_props.get("table_cells") or [])[0].get("x0") or 0.0) == 100.0
+    assert float((table_props.get("table_cells") or [])[1].get("x1") or 0.0) == 390.0
     assert list(table_props.get("rows") or [])[0]["col_1"] == "Q8_0"
     assert str(table_props.get("caption") or "") == "Table 2. Quantization comparison across evaluation suites"
     row_evidence = list(table_props.get("row_evidence") or [])
@@ -6806,6 +6811,8 @@ def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equati
     assert str(equation_node.get("component") or "") == "EquationBlock"
     equation_props = dict(equation_node.get("props") or {})
     assert str(equation_props.get("latex") or "") == "y = mx^2 + b"
+    assert str(equation_props.get("render_mode") or "") == "image_first"
+    assert str(equation_props.get("transcript") or "") == "y = mx^2 + b"
 
 
 def test_build_layout_uid_equation_props_should_split_where_clause_into_description():
@@ -6822,6 +6829,102 @@ def test_build_layout_uid_equation_props_should_split_where_clause_into_descript
     assert str(props.get("label") or "") == "Eq. (1)"
     assert str(props.get("latex") or "") == r"\min_x D_{\mathrm{calib}}(x) - f_{\mathrm{quant}}(x)"
     assert str(props.get("description") or "") == "where D_{\\mathrm{calib}} denotes the calibration dataset"
+    assert str(props.get("render_mode") or "") == "image_first"
+    assert str(props.get("transcript") or "") == r"Eq. (1) \min_x D_{\mathrm{calib}}(x) - f_{\mathrm{quant}}(x) where D_{\mathrm{calib}} denotes the calibration dataset"
+
+
+def test_normalize_layout_uid_table_logical_row_plan_should_require_exact_once_coverage():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_table_logical_row_plan(  # pylint: disable=protected-access
+        physical_rows=[
+            {"row_index": 0, "cells": [{"col_start": 0, "text": "Header"}]},
+            {"row_index": 1, "cells": [{"col_start": 0, "text": "AIME 2024"}]},
+            {"row_index": 2, "cells": [{"col_start": 0, "text": "72.6"}]},
+        ],
+        step_result={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "header", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1, 1]},
+            ],
+            "notes": ["bad_plan"],
+        },
+    )
+
+    assert validation["passed"] is False
+    assert validation["fallback_used"] is True
+    assert "missing_physical_row:2" in list(validation.get("errors") or [])
+    assert list((normalized.get("logical_rows") or [])[0].get("source_row_indices") or []) == [0]
+    assert list((normalized.get("logical_rows") or [])[1].get("source_row_indices") or []) == [1]
+    assert list((normalized.get("logical_rows") or [])[2].get("source_row_indices") or []) == [2]
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_apply_ai_table_logical_rows():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=7,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "table_group_1",
+                    "group_kind": "table",
+                    "source_layout_ids": ["table_body_1", "table_caption_1"],
+                    "rationale": "test_table_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "table_body_1",
+                    "node_kind": "table",
+                    "clean_text": "Model Score",
+                    "raw_text": "Model Score",
+                    "canonical_block_ids": ["p7_dm_p7_l003_b001"],
+                    "table_cells": [
+                        {"cell_id": 0, "row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0, "text": "DeepSeek-R1", "layout_ids": ["table_r0c0"], "polygons": [[{"x": 100, "y": 100}, {"x": 220, "y": 100}, {"x": 220, "y": 124}, {"x": 100, "y": 124}]]},
+                        {"cell_id": 1, "row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0, "text": "distill-Qwen-32B", "layout_ids": ["table_r1c0"], "polygons": [[{"x": 100, "y": 125}, {"x": 220, "y": 125}, {"x": 220, "y": 148}, {"x": 100, "y": 148}]]},
+                        {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 1, "col_end": 1, "text": "BF16", "layout_ids": ["table_r0c1"], "polygons": [[{"x": 260, "y": 100}, {"x": 360, "y": 100}, {"x": 360, "y": 124}, {"x": 260, "y": 124}]]},
+                        {"cell_id": 3, "row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1, "text": "(Reported)", "layout_ids": ["table_r1c1"], "polygons": [[{"x": 260, "y": 125}, {"x": 360, "y": 125}, {"x": 360, "y": 148}, {"x": 260, "y": 148}]]},
+                        {"cell_id": 4, "row_start": 2, "row_end": 2, "col_start": 0, "col_end": 0, "text": "AIME 2024", "layout_ids": ["table_r2c0"], "polygons": [[{"x": 100, "y": 160}, {"x": 220, "y": 160}, {"x": 220, "y": 184}, {"x": 100, "y": 184}]]},
+                        {"cell_id": 5, "row_start": 2, "row_end": 2, "col_start": 1, "col_end": 1, "text": "72.6", "layout_ids": ["table_r2c1"], "polygons": [[{"x": 260, "y": 160}, {"x": 360, "y": 160}, {"x": 360, "y": 184}, {"x": 260, "y": 184}]]},
+                        {"cell_id": 6, "row_start": 3, "row_end": 3, "col_start": 1, "col_end": 1, "text": "(±2.75)", "layout_ids": ["table_r3c1"], "polygons": [[{"x": 260, "y": 188}, {"x": 360, "y": 188}, {"x": 360, "y": 212}, {"x": 260, "y": 212}]]},
+                    ],
+                    "blocks": [],
+                },
+                {
+                    "layout_id": "table_caption_1",
+                    "node_kind": "table_caption",
+                    "clean_text": "Table 2. Quantization comparison across evaluation suites",
+                    "raw_text": "Table 2. Quantization comparison across evaluation suites",
+                    "blocks": [],
+                },
+            ]
+        },
+        table_refinements={
+            "table_group_1": {
+                "logical_row_plan": {
+                    "logical_rows": [
+                        {"logical_row_id": "lr1", "row_role": "header", "source_row_indices": [0, 1], "rationale": "multi_line_header"},
+                        {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [2, 3], "rationale": "value_plus_uncertainty"},
+                    ],
+                    "notes": ["ai_table_logical_rows"],
+                }
+            }
+        },
+    )
+
+    table_node = dict(((panel_plan.get("panels") or [])[0].get("nodes") or [])[0] or {})
+    table_props = dict(table_node.get("props") or {})
+    logical_rows = list(table_props.get("logical_rows") or [])
+    assert str(table_props.get("reconstruction_mode") or "") == "ai_logical_rows"
+    assert int(table_props.get("logical_header_row_count") or 0) == 1
+    assert len(logical_rows) == 2
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((((logical_rows[0] or {}).get("cells") or [])[0].get("text") or "")) == "DeepSeek-R1\ndistill-Qwen-32B"
+    assert list((logical_rows[1] or {}).get("source_row_indices") or []) == [2, 3]
+    assert str((((logical_rows[1] or {}).get("cells") or [])[1].get("text") or "")) == "72.6\n(±2.75)"
 
 
 @pytest.mark.asyncio

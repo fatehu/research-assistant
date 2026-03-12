@@ -122,6 +122,7 @@ type StructuredTableRowShape = {
 type LogicalTableRowShape = {
   rowIndex: number
   sourceRowIndices: number[]
+  rowRole?: string
   cells: TableCellShape[]
 }
 
@@ -306,6 +307,30 @@ function buildLogicalTableRows(rows: StructuredTableRowShape[]): LogicalTableRow
     }
   }
   return logicalRows
+}
+
+function asLogicalTableRows(value: unknown): LogicalTableRowShape[] {
+  if (!Array.isArray(value)) return []
+  const rows: LogicalTableRowShape[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const rowIndex = asNumber(row.row_index, rows.length)
+    const sourceRowIndices = Array.isArray(row.source_row_indices)
+      ? row.source_row_indices
+          .map((entry) => asNumber(entry, -1))
+          .filter((entry) => entry >= 0)
+      : [rowIndex]
+    const cells = asTableCells(row.cells)
+    if (cells.length === 0) continue
+    rows.push({
+      rowIndex,
+      sourceRowIndices,
+      rowRole: asString(row.row_role),
+      cells,
+    })
+  }
+  return rows
 }
 
 function buildRenderedTableRowSlots(
@@ -1487,7 +1512,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const columnWidths = asNumberArray(props.column_widths)
       const matrix = asStringMatrix(props.matrix)
       const tableCells = asTableCells(props.table_cells)
+      const providedLogicalRows = asLogicalTableRows(props.logical_rows)
       const headerRowCount = asNumber(props.header_row_count, 0)
+      const logicalHeaderRowCountProp = asNumber(props.logical_header_row_count, 0)
       const rows = asRecordArray(props.rows)
       const caption = asString(props.caption)
       const notes = asStringArray(props.notes)
@@ -1513,7 +1540,11 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
           .filter((cell) => cell.rowStart === rowIndex)
           .sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId),
       })).filter((entry) => entry.cells.length > 0)
-      const logicalStructuredRows = structuredRows.length > 0 ? buildLogicalTableRows(structuredRows) : []
+      const logicalStructuredRows = providedLogicalRows.length > 0
+        ? providedLogicalRows
+        : structuredRows.length > 0
+          ? buildLogicalTableRows(structuredRows)
+          : []
       const { label: tableLabel, caption: fullCaption } = splitTableCaptionLabel(caption || title)
       const displayTitle = tableLabel || (title && title !== caption ? title : '表格')
       const effectiveCaption = fullCaption || (caption && caption !== displayTitle ? caption : '')
@@ -1523,12 +1554,14 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const effectiveColumnWidths = columnWidths.length === inferredColumnCount
         ? columnWidths
         : deriveColumnWidthRatios(tableCells, inferredColumnCount)
-      let logicalHeaderRowCount = 0
-      for (const row of logicalStructuredRows) {
-        if (row.sourceRowIndices.some((rowIndex) => rowIndex < effectiveHeaderRowCount)) {
-          logicalHeaderRowCount += 1
-        } else {
-          break
+      let logicalHeaderRowCount = providedLogicalRows.length > 0 ? logicalHeaderRowCountProp : 0
+      if (!providedLogicalRows.length) {
+        for (const row of logicalStructuredRows) {
+          if (row.sourceRowIndices.some((rowIndex) => rowIndex < effectiveHeaderRowCount)) {
+            logicalHeaderRowCount += 1
+          } else {
+            break
+          }
         }
       }
       const renderedHeaders = headers.length === inferredColumnCount

@@ -254,5 +254,11 @@ The system should stay grounded in deterministic reader extraction, and use gene
   old `reader_compose_v7/v6` payloads are now treated as stale, and compatible cache reuse is constrained to the same pipeline version so `layout_uid_v1` no longer keeps reviving pre-fix table evidence behavior.
 - [x] Restore `layout_uid_v1` anchor scaling to real DocMind page dimensions:
   when `page_grounding_v1.page_image.width/height` are missing, `/read` now resolves the true DocMind page image size instead of inferring page size from the largest content `x/y`; `reader_compose_v9` therefore emits `geometry.page_width/page_height` and `bbox_hint.page_width/page_height` that match the real page image, which removes the shared right/down scaling drift.
+- [x] Codify `/read` evidence-chain invariants in repo docs:
+  `/read` evidence/highlight changes must now follow explicit rules in `docs/TESTING_GUIDE.md` and `docs/LITERATURE_TEST_GUIDE.md`, including DocMind-only geometry truth, no global preview-path changes for local table/formula fixes, and mandatory prose-heavy plus table-heavy regression pages before merging evidence-chain changes.
+- [x] Move `/read` formulas to an image-first display contract:
+  `EquationBlock` now carries `render_mode=image_first` plus `transcript`, the body view prefers the original formula crop instead of forcing low-quality OCR into KaTeX, and OCR text is demoted to an optional transcript fallback.
+- [ ] Add an AI-assisted logical-row reconstruction pass for `/read` tables:
+  keep DocMind `cells[]` and `uniqueId -> blocks[].pos` as geometry truth, use current-page render plus raw physical rows only to group physical rows into logical rows, and require strict exact-once fallback-safe validation before any table plan can override the current deterministic materializer.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.
