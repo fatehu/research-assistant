@@ -159,6 +159,18 @@ def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
     assert should_not_rebuild is False
 
 
+def test_should_rebuild_cached_payload_for_stale_engine_version():
+    service = LiteratureReaderComposeService()
+    should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
+        {
+            "status": "done",
+            "build_mode": "compose_agent_layout_uid_v1",
+            "engine_version": "reader_compose_v7",
+        }
+    )
+    assert should_rebuild is True
+
+
 def test_should_not_rebuild_cached_payload_for_simplified_fallback_with_meaningful_reading_flow():
     service = LiteratureReaderComposeService()
     should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
@@ -2463,6 +2475,58 @@ async def test_build_or_get_composed_payload_should_reuse_compatible_db_cache_be
     assert meta.cache_layer == "db_compatible"
     assert payload["source_signature"].endswith("h:newhashvalue123456789012")
     assert len(payload["ui_plan"]["components"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_read_compatible_payload_from_db_should_ignore_other_pipeline_version(monkeypatch):
+    service = LiteratureReaderComposeService()
+    compatible_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "done",
+        "build_mode": "compose_agent_simplified",
+        "engine_version": "reader_compose_v8",
+        "pipeline_version": "simplified_v2",
+        "source_signature": (
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:simplified_v2|mode:auto/light/standard/0/0|h:oldhashvalue123456789012"
+        ),
+        "ui_plan": {"plan_id": "plan_cached", "components": []},
+    }
+
+    class _Rows:
+        def __init__(self, items):
+            self._items = items
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._items)
+
+    class _Db:
+        async def execute(self, _stmt):
+            return _Rows(
+                [
+                    SimpleNamespace(
+                        source_signature=str(compatible_payload.get("source_signature") or ""),
+                        payload_json=dict(compatible_payload),
+                    )
+                ]
+            )
+
+    payload = await service._read_compatible_payload_from_db(  # pylint: disable=protected-access
+        db=_Db(),
+        paper_id=78,
+        page=7,
+        source_signature=(
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:layout_uid_v1|mode:auto/light/standard/0/0|h:newhashvalue123456789012"
+        ),
+        pipeline_version="layout_uid_v1",
+    )
+
+    assert payload is None
 
 
 @pytest.mark.asyncio

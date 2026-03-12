@@ -436,6 +436,9 @@ class LiteratureReaderComposeService:
     def _should_rebuild_cached_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
+        payload_engine_version = str(payload.get("engine_version") or "").strip()
+        if payload_engine_version and payload_engine_version != COMPOSE_ENGINE_VERSION:
+            return True
         status_value = str(payload.get("status") or "").strip().lower()
         if status_value != "fallback":
             return False
@@ -545,8 +548,8 @@ class LiteratureReaderComposeService:
             if isinstance(cached_payload, dict):
                 if self._should_rebuild_cached_payload(cached_payload):
                     logger.info(
-                        "[ReaderComposeService] skip stale fallback redis cache and rebuild "
-                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                        "[ReaderComposeService] skip stale redis compose cache and rebuild "
+                        f"paper={paper.id} page={page_num}"
                     )
                     await self._delete_payload_from_redis(redis_key)
                 else:
@@ -581,8 +584,8 @@ class LiteratureReaderComposeService:
             if isinstance(cached_row, dict):
                 if self._should_rebuild_cached_payload(cached_row):
                     logger.info(
-                        "[ReaderComposeService] skip stale fallback db cache and rebuild "
-                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                        "[ReaderComposeService] skip stale db compose cache and rebuild "
+                        f"paper={paper.id} page={page_num}"
                     )
                 else:
                     await self._write_payload_to_redis(redis_key, cached_row)
@@ -613,6 +616,7 @@ class LiteratureReaderComposeService:
                 paper_id=int(paper.id),
                 page=page_num,
                 source_signature=source_signature,
+                pipeline_version=pipeline_version,
             )
             if isinstance(compatible_cached_row, dict):
                 logger.info(
@@ -15049,11 +15053,13 @@ class LiteratureReaderComposeService:
         paper_id: int,
         page: int,
         source_signature: str,
+        pipeline_version: Optional[str] = None,
         limit: int = 8,
     ) -> Optional[Dict[str, Any]]:
         prefix = self._compatible_source_signature_prefix(source_signature)
         if not prefix:
             return None
+        requested_pipeline_version = self._pipeline_version(pipeline_version)
         stmt = (
             select(PaperReaderPageCache)
             .where(
@@ -15072,6 +15078,9 @@ class LiteratureReaderComposeService:
                 continue
             payload = dict(getattr(row, "payload_json", {}) or {})
             if not payload:
+                continue
+            payload_pipeline_version = self._pipeline_version(str(payload.get("pipeline_version") or "").strip())
+            if payload_pipeline_version != requested_pipeline_version:
                 continue
             if self._should_rebuild_cached_payload(payload):
                 continue

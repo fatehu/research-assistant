@@ -250,5 +250,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `layout_uid_v1` polygons now render on top of a DocMind page-image proxy route instead of PDF.js viewport pixels, which removes the shared right/down offset caused by mismatched `1483x1920` DocMind image geometry vs `1468.8x1900.8` PDF.js page rendering.
 - [x] Restore `/read` table evidence to the pre-reconstruction whole-table path:
   `TablePanel` no longer overrides evidence with row/cell-local hover/click handlers, table bundles again keep their full `source_layout_ids`, and `/read` table preview/jump flows go back to the generic node-level `uniqueId -> blocks[].pos` chain.
+- [x] Stop stale table-era compose caches from masking `/read` evidence fixes:
+  old `reader_compose_v7/v6` payloads are now treated as stale, and compatible cache reuse is constrained to the same pipeline version so `layout_uid_v1` no longer keeps reviving pre-fix table evidence behavior.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.
