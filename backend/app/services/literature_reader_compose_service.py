@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+from io import BytesIO
 import json
 import os
 import re
@@ -19,9 +20,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from loguru import logger
 from openai import AsyncOpenAI
+from PIL import Image
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,7 +62,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v8"
+COMPOSE_ENGINE_VERSION = "reader_compose_v9"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -14330,6 +14333,36 @@ class LiteratureReaderComposeService:
                     height = max(height, float(point.get("y") or 0.0))
         return (width or None), (height or None)
 
+    def _resolve_grounding_page_image_size(
+        self,
+        *,
+        page_image_url: str,
+        page_image_path: str,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        local_path = str(page_image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            try:
+                with Image.open(local_path) as image:
+                    width, height = image.size
+                if width > 0 and height > 0:
+                    return int(width), int(height)
+            except Exception as exc:
+                logger.debug(f"[ReaderComposeService] failed to read local grounding page image size: {exc}")
+
+        remote_url = str(page_image_url or "").strip()
+        if remote_url and urlparse(remote_url).scheme in {"http", "https"}:
+            try:
+                with urlopen(remote_url, timeout=12) as response:  # nosec B310 - trusted DocMind image URL
+                    data = response.read()
+                with Image.open(BytesIO(data)) as image:
+                    width, height = image.size
+                if width > 0 and height > 0:
+                    return int(width), int(height)
+            except Exception as exc:
+                logger.debug(f"[ReaderComposeService] failed to fetch grounding page image size: {exc}")
+
+        return None, None
+
     def _build_layout_uid_anchor_from_grounding(
         self,
         *,
@@ -14793,6 +14826,15 @@ class LiteratureReaderComposeService:
 
         page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
         page_image_path = str(docmind_structure.get("page_image_path") or "").strip()
+        page_image_width = int(docmind_structure.get("page_image_width") or 0) or None
+        page_image_height = int(docmind_structure.get("page_image_height") or 0) or None
+        if not page_image_width or not page_image_height:
+            resolved_width, resolved_height = self._resolve_grounding_page_image_size(
+                page_image_url=page_image_url,
+                page_image_path=page_image_path,
+            )
+            page_image_width = page_image_width or resolved_width
+            page_image_height = page_image_height or resolved_height
         counts_by_kind: Dict[str, int] = {}
         for row in reading_nodes:
             kind = str(row.get("node_kind") or "").strip() or "unknown"
@@ -14807,8 +14849,8 @@ class LiteratureReaderComposeService:
             "page_image": {
                 "url": page_image_url,
                 "path": page_image_path,
-                "width": int(docmind_structure.get("page_image_width") or 0) or None,
-                "height": int(docmind_structure.get("page_image_height") or 0) or None,
+                "width": page_image_width,
+                "height": page_image_height,
                 "source": "docmind_page_image" if (page_image_url or page_image_path) else "",
             },
             "meta": {

@@ -5873,6 +5873,100 @@ def test_ensure_payload_contract_should_build_page_grounding_v1_from_layout_uniq
     assert str((grounding.get("page_image") or {}).get("url") or "") == "https://example.com/page-1.png"
 
 
+def test_ensure_payload_contract_should_resolve_page_grounding_image_dimensions_when_missing(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(
+        service,
+        "_resolve_grounding_page_image_size",
+        lambda **_kwargs: (1483, 1920),
+    )
+    payload = {
+        "paper_id": 85,
+        "page": 3,
+        "ui_plan": {
+            "plan_id": "plan_grounding_image_dims",
+            "components": [
+                {
+                    "id": "p3_g1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Knowledge distillation paragraph."},
+                    "children": [],
+                    "source_block_ids": ["p3_dm_p3_l001_b001"],
+                    "source_anchor_refs": [],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-3.png",
+            "layouts": [
+                {
+                    "index": 1,
+                    "uniqueId": "layout_para_1",
+                    "type": "text",
+                    "subType": "para",
+                    "text": "Knowledge distillation paragraph.\n",
+                    "pos": [
+                        {"x": 256, "y": 254},
+                        {"x": 1220, "y": 254},
+                        {"x": 1220, "y": 286},
+                        {"x": 256, "y": 286},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 256, "y": 254},
+                                {"x": 1220, "y": 254},
+                                {"x": 1220, "y": 286},
+                                {"x": 256, "y": 286},
+                            ],
+                            "text": "Knowledge distillation paragraph.",
+                        }
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p3_dm_p3_l001_b001",
+                    "layout_unique_id": "layout_para_1",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "Knowledge distillation paragraph.",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=3, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    assert dict(grounding.get("page_image") or {}) == {
+        "url": "https://example.com/page-3.png",
+        "path": "",
+        "width": 1483,
+        "height": 1920,
+        "source": "docmind_page_image",
+    }
+
+    anchor = service._build_layout_uid_anchor_from_grounding(  # pylint: disable=protected-access
+        page=3,
+        payload=ensured,
+        layout_id="layout_para_1",
+        quote_text="Knowledge distillation paragraph.",
+        canonical_block_ids=["p3_dm_p3_l001_b001"],
+    )
+    assert isinstance(anchor, dict)
+    assert int((((anchor or {}).get("geometry") or {}).get("page_width") or 0)) == 1483
+    assert int((((anchor or {}).get("geometry") or {}).get("page_height") or 0)) == 1920
+    assert int((((anchor or {}).get("bbox_hint") or {}).get("page_width") or 0)) == 1483
+    assert int((((anchor or {}).get("bbox_hint") or {}).get("page_height") or 0)) == 1920
+
+
 def test_ensure_payload_contract_should_keep_doi_layout_outside_main_flow_in_page_grounding():
     service = LiteratureReaderComposeService()
     payload = {
