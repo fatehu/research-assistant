@@ -246,5 +246,9 @@ The system should stay grounded in deterministic reader extraction, and use gene
   recovered prose nodes now rebuild `layout_uid_v1` anchors from `page_grounding_v1 + layout_unique_id`, keep `source_atom_ids/source_layout_ids`, and no longer lose the `证据` action just because they were injected by the no-drop safety layer.
 - [x] Remove the global `/read` evidence gate regression on new pages:
   `PaperReaderPage.tsx` no longer rejects all `layout_uid_v1` anchors at the page level, so hover preview, jump-to-evidence, and pinned evidence work again on newly generated `/read` pages instead of only on legacy `anchor_v2` payloads.
+- [x] Align `layout_uid_v1` evidence previews to the correct coordinate system:
+  `layout_uid_v1` polygons now render on top of a DocMind page-image proxy route instead of PDF.js viewport pixels, which removes the shared right/down offset caused by mismatched `1483x1920` DocMind image geometry vs `1468.8x1900.8` PDF.js page rendering.
+- [x] Restore `/read` table evidence to the pre-reconstruction whole-table path:
+  `TablePanel` no longer overrides evidence with row/cell-local hover/click handlers, table bundles again keep their full `source_layout_ids`, and `/read` table preview/jump flows go back to the generic node-level `uniqueId -> blocks[].pos` chain.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

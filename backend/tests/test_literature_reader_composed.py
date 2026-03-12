@@ -6643,7 +6643,7 @@ def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equati
     assert (((row_evidence[1] or {}).get("anchor") or {}).get("geometry") or {}).get("page_width") is None
     assert (((row_evidence[1] or {}).get("anchor") or {}).get("bbox_hint") or {}).get("page_width") is None
     assert str((((cell_evidence[1] or {}).get("anchor") or {}).get("source_layout_id") or "")) == "table_r0c1"
-    assert list(table_node.get("source_layout_ids") or []) == ["table_body_1"]
+    assert list(table_node.get("source_layout_ids") or []) == ["table_body_1", "table_caption_1"]
 
     assert str(equation_node.get("component") or "") == "EquationBlock"
     equation_props = dict(equation_node.get("props") or {})

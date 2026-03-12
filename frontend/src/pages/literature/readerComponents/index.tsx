@@ -85,13 +85,6 @@ function asStringMatrix(value: unknown): string[][] {
     .filter((row) => row.length > 0)
 }
 
-type TableRowEvidence = {
-  rowIndex: number
-  label: string
-  sourceAtomIds: string[]
-  anchor: ReaderComponentSourceAnchor | null
-}
-
 type TableCellShape = {
   cellId: number
   rowStart: number
@@ -102,33 +95,6 @@ type TableCellShape = {
   colspan: number
   text: string
   layoutIds: string[]
-}
-
-type TableCellEvidence = {
-  cellId: number
-  rowStart: number
-  colStart: number
-  label: string
-  sourceAtomIds: string[]
-  anchor: ReaderComponentSourceAnchor | null
-}
-
-function asTableRowEvidence(value: unknown): TableRowEvidence[] {
-  if (!Array.isArray(value)) return []
-  const rows: TableRowEvidence[] = []
-  for (const item of value) {
-    if (!item || typeof item !== 'object') continue
-    const row = item as Record<string, unknown>
-    const rowIndex = asNumber(row.row_index, -1)
-    if (rowIndex < 0) continue
-    rows.push({
-      rowIndex,
-      label: asString(row.label) || `Row ${rowIndex + 1}`,
-      sourceAtomIds: asStringArray(row.source_atom_ids),
-      anchor: row.anchor && typeof row.anchor === 'object' ? (row.anchor as ReaderComponentSourceAnchor) : null,
-    })
-  }
-  return rows
 }
 
 function asTableCells(value: unknown): TableCellShape[] {
@@ -152,27 +118,6 @@ function asTableCells(value: unknown): TableCellShape[] {
       colspan: Math.max(1, asNumber(row.colspan, Math.max(1, colEnd - colStart + 1))),
       text: asString(row.text),
       layoutIds: asStringArray(row.layout_ids),
-    })
-  }
-  return cells
-}
-
-function asTableCellEvidence(value: unknown): TableCellEvidence[] {
-  if (!Array.isArray(value)) return []
-  const cells: TableCellEvidence[] = []
-  for (const item of value) {
-    if (!item || typeof item !== 'object') continue
-    const row = item as Record<string, unknown>
-    const rowStart = asNumber(row.row_start, -1)
-    const colStart = asNumber(row.col_start, -1)
-    if (rowStart < 0 || colStart < 0) continue
-    cells.push({
-      cellId: asNumber(row.cell_id, cells.length),
-      rowStart,
-      colStart,
-      label: asString(row.label),
-      sourceAtomIds: asStringArray(row.source_atom_ids),
-      anchor: row.anchor && typeof row.anchor === 'object' ? (row.anchor as ReaderComponentSourceAnchor) : null,
     })
   }
   return cells
@@ -1315,16 +1260,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const caption = asString(props.caption)
       const notes = asStringArray(props.notes)
       const rawMarkdown = asString(props.raw_markdown)
-      const rowEvidence = asTableRowEvidence(props.row_evidence)
-      const cellEvidence = asTableCellEvidence(props.cell_evidence)
       const aiInsight = asString(props.ai_insight)
-      const nodeAnchorRefs = normalizeAnchorRows(node.source_anchor_refs)
-      const nodeSourceBlockIds = Array.isArray(node.source_block_ids)
-        ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
-        : []
-      const nodeSourceAtomIds = Array.isArray(node.source_atom_ids)
-        ? node.source_atom_ids.map((item) => String(item || '').trim()).filter(Boolean)
-        : []
       const fallbackMatrix = rows.length
         ? [
             headers.length ? headers : Object.keys(rows[0] || {}),
@@ -1338,8 +1274,6 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const effectiveHeaderRowCount = matrix.length > 0 ? Math.max(0, Math.min(headerRowCount, matrix.length - 1)) : (headers.length ? 1 : 0)
       const columnCount = effectiveMatrix.reduce((max, row) => Math.max(max, row.length), 0)
       const paddedMatrix = effectiveMatrix.map((row) => [...row, ...Array(Math.max(0, columnCount - row.length)).fill('')])
-      const rowEvidenceMap = new Map(rowEvidence.map((item) => [item.rowIndex, item]))
-      const cellEvidenceMap = new Map(cellEvidence.map((item) => [`${item.rowStart}:${item.colStart}`, item]))
       const maxStructuredRow = tableCells.reduce((max, cell) => Math.max(max, cell.rowEnd), -1)
       const structuredRows = Array.from({ length: maxStructuredRow + 1 }, (_, rowIndex) => ({
         rowIndex,
@@ -1379,28 +1313,6 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 <Space wrap size={8}>
                   <Button
                     size="small"
-                    disabled={nodeAnchorRefs.length === 0}
-                    onClick={() => ctx.onJumpAnchor?.(nodeAnchorRefs, {
-                      pinPreview: true,
-                      sourceBlockIds: nodeSourceBlockIds,
-                      sourceAtomIds: nodeSourceAtomIds,
-                    })}
-                  >
-                    证据
-                  </Button>
-                  <Button
-                    size="small"
-                    disabled={nodeAnchorRefs.length === 0}
-                    onClick={() => ctx.onPreviewAnchors?.(nodeAnchorRefs, {
-                      pinPreview: true,
-                      sourceBlockIds: nodeSourceBlockIds,
-                      sourceAtomIds: nodeSourceAtomIds,
-                    })}
-                  >
-                    预览
-                  </Button>
-                  <Button
-                    size="small"
                     onClick={async () => {
                       const markdown = componentToMarkdown(node)
                       try {
@@ -1418,224 +1330,110 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             />
             {structuredRows.length > 0 || paddedMatrix.length > 0 ? (
               <div style={{ overflowX: 'auto', borderRadius: 10, border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}` }}>
-                {rowEvidence.length > 0 ? (
-                  <div style={{ padding: '10px 12px', borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`, background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.02)' : 'rgba(15, 23, 42, 0.025)' }}>
-                    <Text style={{ fontSize: 12, color: ctx?.themeStyle?.bodyColor, opacity: 0.72 }}>
-                      悬停表格行可预览证据，点击行可定位到 PDF 高光。
-                    </Text>
-                  </div>
-                ) : null}
                 <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, inferredColumnCount * 140)}px`, borderTop: '2px solid rgba(17, 24, 39, 0.55)', borderBottom: '2px solid rgba(17, 24, 39, 0.55)' }}>
                   {structuredRows.length > 0 ? (
                     <>
                       {structuredRows.some((entry) => entry.rowIndex < effectiveHeaderRowCount) ? (
                         <thead>
-                          {structuredRows.filter((entry) => entry.rowIndex < effectiveHeaderRowCount).map((entry) => {
-                            const evidence = rowEvidenceMap.get(entry.rowIndex)
-                            return (
-                              <tr
-                                key={`thead-structured-${entry.rowIndex}`}
-                                onMouseEnter={() => {
-                                  if (evidence?.anchor) {
-                                    ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                  }
-                                }}
-                                onClick={() => {
-                                  if (evidence?.anchor) {
-                                    ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                  }
-                                }}
-                                style={{ cursor: evidence?.anchor ? 'pointer' : 'default' }}
-                              >
-                                {entry.cells.map((cell) => (
-                                  (() => {
-                                    const evidence = cellEvidenceMap.get(`${entry.rowIndex}:${cell.colStart}`)
-                                    return (
-                                      <th
-                                        key={`thead-structured-${entry.rowIndex}-${cell.cellId}`}
-                                        rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
-                                        colSpan={cell.colspan > 1 ? cell.colspan : undefined}
-                                        scope="col"
-                                        onMouseEnter={() => {
-                                          if (evidence?.anchor) {
-                                            ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                          }
-                                        }}
-                                        onClick={(event) => {
-                                          if (!evidence?.anchor) return
-                                          event.stopPropagation()
-                                          ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                        }}
-                                        style={{
-                                          padding: '10px 12px',
-                                          textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
-                                          fontWeight: 700,
-                                          fontSize: 13,
-                                          color: ctx?.themeStyle?.headingColor,
-                                          background: 'transparent',
-                                          borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
-                                          cursor: evidence?.anchor ? 'pointer' : 'inherit',
-                                        }}
-                                      >
-                                        {cell.text || '—'}
-                                      </th>
-                                    )
-                                  })()
-                                ))}
-                              </tr>
-                            )
-                          })}
+                          {structuredRows.filter((entry) => entry.rowIndex < effectiveHeaderRowCount).map((entry) => (
+                            <tr key={`thead-structured-${entry.rowIndex}`}>
+                              {entry.cells.map((cell) => (
+                                <th
+                                  key={`thead-structured-${entry.rowIndex}-${cell.cellId}`}
+                                  rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
+                                  colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                  scope="col"
+                                  style={{
+                                    padding: '10px 12px',
+                                    textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
+                                    fontWeight: 700,
+                                    fontSize: 13,
+                                    color: ctx?.themeStyle?.headingColor,
+                                    background: 'transparent',
+                                    borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                  }}
+                                >
+                                  {cell.text || '—'}
+                                </th>
+                              ))}
+                            </tr>
+                          ))}
                         </thead>
                       ) : null}
                       <tbody>
-                        {structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount).map((entry) => {
-                          const evidence = rowEvidenceMap.get(entry.rowIndex)
-                          return (
-                            <tr
-                              key={`tbody-structured-${entry.rowIndex}`}
-                              onMouseEnter={() => {
-                                if (evidence?.anchor) {
-                                  ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                }
-                              }}
-                              onClick={() => {
-                                if (evidence?.anchor) {
-                                  ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                }
-                              }}
-                              style={{
-                                cursor: evidence?.anchor ? 'pointer' : 'default',
-                                background: evidence?.anchor
-                                  ? (ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.015)' : 'rgba(15, 23, 42, 0.015)')
-                                  : undefined,
-                              }}
-                            >
-                              {entry.cells.map((cell) => (
-                                (() => {
-                                  const evidence = cellEvidenceMap.get(`${entry.rowIndex}:${cell.colStart}`)
-                                  return (
-                                    <td
-                                      key={`tbody-structured-${entry.rowIndex}-${cell.cellId}`}
-                                      rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
-                                      colSpan={cell.colspan > 1 ? cell.colspan : undefined}
-                                      onMouseEnter={() => {
-                                        if (evidence?.anchor) {
-                                          ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                        }
-                                      }}
-                                      onClick={(event) => {
-                                        if (!evidence?.anchor) return
-                                        event.stopPropagation()
-                                        ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                      }}
-                                      style={{
-                                        padding: '10px 12px',
-                                        verticalAlign: 'top',
-                                        borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
-                                        color: ctx?.themeStyle?.bodyColor,
-                                        fontSize: 13,
-                                        lineHeight: 1.55,
-                                        whiteSpace: 'pre-wrap',
-                                        textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
-                                        cursor: evidence?.anchor ? 'pointer' : 'inherit',
-                                      }}
-                                    >
-                                      {cell.text || '—'}
-                                    </td>
-                                  )
-                                })()
-                              ))}
-                            </tr>
-                          )
-                        })}
+                        {structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount).map((entry) => (
+                          <tr key={`tbody-structured-${entry.rowIndex}`}>
+                            {entry.cells.map((cell) => (
+                              <td
+                                key={`tbody-structured-${entry.rowIndex}-${cell.cellId}`}
+                                rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
+                                colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                style={{
+                                  padding: '10px 12px',
+                                  verticalAlign: 'top',
+                                  borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                  color: ctx?.themeStyle?.bodyColor,
+                                  fontSize: 13,
+                                  lineHeight: 1.55,
+                                  whiteSpace: 'pre-wrap',
+                                  textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
+                                }}
+                              >
+                                {cell.text || '—'}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
                       </tbody>
                     </>
                   ) : (
                     <>
                       {effectiveHeaderRowCount > 0 ? (
                         <thead>
-                          {paddedMatrix.slice(0, effectiveHeaderRowCount).map((row, rowIndex) => {
-                            const evidence = rowEvidenceMap.get(rowIndex)
-                            return (
-                              <tr
-                                key={`thead-${rowIndex}`}
-                                onMouseEnter={() => {
-                                  if (evidence?.anchor) {
-                                    ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                  }
-                                }}
-                                onClick={() => {
-                                  if (evidence?.anchor) {
-                                    ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                  }
-                                }}
-                                style={{ cursor: evidence?.anchor ? 'pointer' : 'default' }}
-                              >
-                                {row.map((cell, cellIndex) => (
-                                  <th
-                                    key={`thead-${rowIndex}-${cellIndex}`}
-                                    style={{
-                                      padding: '10px 12px',
-                                      textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
-                                      fontWeight: 700,
-                                      fontSize: 13,
-                                      color: ctx?.themeStyle?.headingColor,
-                                      background: 'transparent',
-                                      borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
-                                    }}
-                                  >
-                                    {cell || '—'}
-                                  </th>
-                                ))}
-                              </tr>
-                            )
-                          })}
-                        </thead>
-                      ) : null}
-                      <tbody>
-                        {paddedMatrix.slice(effectiveHeaderRowCount).map((row, rowIndex) => {
-                          const absoluteRowIndex = rowIndex + effectiveHeaderRowCount
-                          const evidence = rowEvidenceMap.get(absoluteRowIndex)
-                          return (
-                            <tr
-                              key={`tbody-${rowIndex}`}
-                              onMouseEnter={() => {
-                                if (evidence?.anchor) {
-                                  ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
-                                }
-                              }}
-                              onClick={() => {
-                                if (evidence?.anchor) {
-                                  ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
-                                }
-                              }}
-                              style={{
-                                cursor: evidence?.anchor ? 'pointer' : 'default',
-                                background: evidence?.anchor
-                                  ? (ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.015)' : 'rgba(15, 23, 42, 0.015)')
-                                  : undefined,
-                              }}
-                            >
+                          {paddedMatrix.slice(0, effectiveHeaderRowCount).map((row, rowIndex) => (
+                            <tr key={`thead-${rowIndex}`}>
                               {row.map((cell, cellIndex) => (
-                                <td
-                                  key={`tbody-${rowIndex}-${cellIndex}`}
+                                <th
+                                  key={`thead-${rowIndex}-${cellIndex}`}
                                   style={{
                                     padding: '10px 12px',
-                                    verticalAlign: 'top',
-                                    borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
-                                    color: ctx?.themeStyle?.bodyColor,
-                                    fontSize: 13,
-                                    lineHeight: 1.55,
-                                    whiteSpace: 'pre-wrap',
                                     textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
+                                    fontWeight: 700,
+                                    fontSize: 13,
+                                    color: ctx?.themeStyle?.headingColor,
+                                    background: 'transparent',
+                                    borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                   }}
                                 >
                                   {cell || '—'}
-                                </td>
+                                </th>
                               ))}
                             </tr>
-                          )
-                        })}
+                          ))}
+                        </thead>
+                      ) : null}
+                      <tbody>
+                        {paddedMatrix.slice(effectiveHeaderRowCount).map((row, rowIndex) => (
+                          <tr key={`tbody-${rowIndex}`}>
+                            {row.map((cell, cellIndex) => (
+                              <td
+                                key={`tbody-${rowIndex}-${cellIndex}`}
+                                style={{
+                                  padding: '10px 12px',
+                                  verticalAlign: 'top',
+                                  borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                  color: ctx?.themeStyle?.bodyColor,
+                                  fontSize: 13,
+                                  lineHeight: 1.55,
+                                  whiteSpace: 'pre-wrap',
+                                  textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
+                                }}
+                              >
+                                {cell || '—'}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
                       </tbody>
                     </>
                   )}

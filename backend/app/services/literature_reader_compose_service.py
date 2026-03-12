@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v7"
+COMPOSE_ENGINE_VERSION = "reader_compose_v8"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -2011,20 +2011,11 @@ class LiteratureReaderComposeService:
                 merged_text = "\n\n".join(text for text in clean_texts if text).strip()
                 component = "ParagraphProse"
                 props = {"text": merged_text or "[empty]", "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}]}
-            node_source_layout_ids = source_layout_ids
-            if group_kind == "table":
-                body_only_layout_ids = [
-                    layout_id
-                    for layout_id in source_layout_ids
-                    if str((layout_index.get(layout_id) or {}).get("node_kind") or "").strip().lower() == "table"
-                ]
-                if body_only_layout_ids:
-                    node_source_layout_ids = body_only_layout_ids
             nodes.append(
                 {
                     "node_id": str(group.get("group_id") or f"group_{order_key}").strip() or f"group_{order_key}",
                     "component": component,
-                    "source_layout_ids": node_source_layout_ids,
+                    "source_layout_ids": source_layout_ids,
                     "props": props,
                     "display": "default",
                     "order_key": float(order_key),
