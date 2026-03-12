@@ -17,11 +17,25 @@ The system should stay grounded in deterministic reader extraction, and use gene
 ## Product Boundary
 
 - [x] Keep `/literature/:id/read` as the stable reader for PDF/AI reading, evidence checking, annotations, and comments.
+- [x] Narrow `/literature/:id/read` further:
+  its target is simplified AI-arranged flowing reading plus cleaned body content and evidence verification, not the long-term home of page-level generative UI product design.
+- [x] Treat the embedded AI-arranged view inside `/literature/:id/read` as legacy transitional compose preview debt, not the long-term generative UI product surface.
 - [x] Treat `/literature/:paperId/experience` as the target product page for expanded generative UI.
 - [x] Treat `/literature/:paperId/read/workbench` as debug/workbench only, not the end-user product surface.
 - [x] Keep the core scope at the system level: compose grounding -> story understanding -> tool/resource reasoning -> experience rendering.
 - [x] Preserve `page` and `kb` as valid reading context inputs when they come from real navigation state.
 - [x] Forbid unsafe demo defaults such as hardcoded `kb=84`; the issue was the hardcoded default, not the parameter itself.
+
+## Execution Lanes
+
+- [x] Primary lane:
+  continue building generative UI through `/experience` as the product surface, with `/read/workbench` as the debug and inspection lane for the same runtime.
+- [x] Legacy lane:
+  treat `/read` compose preview issues as inherited reader debt unless they directly block flowing reading, evidence verification, or fallback safety.
+- [x] Do not let `/read` legacy compose/highlight problems redefine the main generative-ui plan:
+  they should be tracked and fixed as a separate stability stream, not confused with `/experience` product progress.
+- [x] Future simplification target for `/read`:
+  keep AI-assisted layout and cleaned-text rendering, but simplify it toward HTML-style flowing reading while letting `/experience` absorb page design, storytelling, and generative interaction.
 
 ## External Reference Points
 
@@ -54,6 +68,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
 ## Phase 1: Stabilize Current Flow
 
 - [x] Audit current branch changes and identify risks in the generative reader path.
+- [x] Reconfirm that `/read` generative compose is a stability target, not the page to polish into the final generative UI product.
 - [x] Remove unsafe hardcoded frontend defaults such as `kb=84`.
 - [x] Make experience/workbench routes safe with editable URL-backed defaults.
 - [x] Refactor the experience page loading state machine to avoid stale-state polling bugs.
@@ -98,6 +113,10 @@ The system should stay grounded in deterministic reader extraction, and use gene
 
 ## Phase 4: Narrow Agent Responsibilities
 
+- [ ] Add page-archetype gating for `/read` compose previews:
+  title / cover / author-heavy pages should not be treated as ordinary evidence-reading pages just because the compose pipeline can legally produce a `done` plan.
+- [x] Start a separate `/read` `layout_uid_v1` pipeline skeleton:
+  keep the new chain behind an internal pipeline-version gate, use `page_grounding_v1` layout atoms plus current-page render as input, and validate exact-once `uniqueId` grouping before any future default rollout.
 - [ ] Keep `story_substrate` deterministic as much as possible.
 - [ ] Limit the planner to:
   reading goal selection, block selection, block data population.
@@ -199,3 +218,27 @@ The system should stay grounded in deterministic reader extraction, and use gene
   add one real paper-page golden plus contract fixtures for methods-heavy and concept-heavy coverage, alongside generative/experience snapshot tests and an eval asset guard.
 - [x] Separate internal planning copy from user-visible section summaries:
   storyboard `purpose` now stays in section metadata as planner notes, while `/experience` shows user-facing summaries instead of prompt-like planning text.
+- [x] Repair malformed cached compose fallback payloads at the API boundary:
+  `/read` no longer fails the fallback path just because legacy cached payloads miss `engine_version` or `ui_plan.plan_id`.
+- [x] Reclassify `/read` AI compose as a transitional embedded preview:
+  attractive sample pages on `/read` do not define the product target; `/experience` remains the page that should absorb future generative UI product investment.
+- [x] Split `/read` highlight issues into two tracks:
+  `78/page=4` vs `78/page=7` is not a missing-backend-anchor problem, while `85/page=1` is a real `bbox_rebuilt` geometry regression on metadata-heavy pages.
+- [x] Start the lightweight `/read` grounding split:
+  add `page_grounding_v1` to composed payloads so `uniqueId`-level layout atoms, page-local reading nodes, evidence geometry, and page-image references are preserved as a stable input layer for later `/experience` and for a slimmer `/read`.
+- [x] Add the first `layout_uid_v1` `/read` pipeline skeleton:
+  when explicitly selected, `/read` can now route away from `simplified_v2`, build a `uniqueId`-only grouping prompt for `qwen3.5-plus`, enforce exact-once `layout_id` assignment, and fall back to deterministic grouping without switching default traffic yet.
+- [x] Expose the new `/read` pipeline for direct acceptance through URL state:
+  `/read?...&compose=layout_uid_v1` now forwards `pipeline_version` through cached/stream/prefetch paths and surfaces a visible pipeline tag in the page UI.
+- [x] Make `layout_uid_v1` the default `/read` compose path:
+  `READER_PIPELINE_VERSION`, service defaults, and Docker defaults now all point to `layout_uid_v1`, so `/read` no longer needs an explicit `compose=` query to stay on the `uniqueId`-grouping chain.
+- [x] Switch `/read` highlight geometry to prefer `uniqueId -> blocks[].pos`:
+  `layout_uid_v1` components now emit layout-based anchors from `page_grounding_v1.evidence_map`, pass `source_atom_ids=source_layout_ids`, and let the frontend preview/highlight flow resolve evidence from `page_grounding_v1` before falling back to block-level page-structure geometry.
+- [x] Start deterministic `table / equation` materialization on `/read`:
+  `layout_uid_v1` no longer treats tables as empty `rows=[]` shells or formulas as stray prose; table groups now build matrix/header/caption props from `uniqueId` block geometry and markdown-like rows, while equation groups materialize into dedicated `EquationBlock` nodes.
+- [x] Preserve DocMind `table.cells[]` in `page_grounding_v1` and restore row-level table evidence:
+  `/read` table materialization now prefers cell truth over flattened markdown rows, keeps table captions coalesced with table bundles, and emits `row_evidence` anchors so hovering/clicking a table row can preview and jump to evidence instead of only highlighting the whole table.
+- [x] Fix `/read` table evidence and equation rendering regressions:
+  row-level table anchors no longer use row-local pseudo page dimensions, `TablePanel` keeps `table_cells` through contract normalization and exposes direct `证据 / 预览` controls again, and `EquationBlock` now renders KaTeX plus the original evidence image while splitting trailing `where ...` prose into description text.
+- [ ] Finish `/read` table stabilization:
+  current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

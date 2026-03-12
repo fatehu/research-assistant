@@ -1,6 +1,10 @@
-import { Fragment, type CSSProperties, type ReactNode, useState } from 'react'
+import { Fragment, type CSSProperties, type ReactNode, useEffect, useState } from 'react'
 import { Alert, Button, Card, Input, List, Space, Tag, Tooltip, Popover, Typography, message } from 'antd'
 import { DownOutlined, DragOutlined, LinkOutlined, MoreOutlined, PlusOutlined } from '@ant-design/icons'
+import ReactMarkdown from 'react-markdown'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
 
 import type {
   ReaderComponentAction,
@@ -22,11 +26,11 @@ export type ReaderComponentRenderContext = {
   isActionableAnchor?: (anchor: ReaderComponentSourceAnchor) => boolean
   onJumpAnchor?: (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { pinPreview?: boolean; sourceBlockIds?: string[] },
+    options?: { pinPreview?: boolean; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
   ) => void
   onPreviewAnchors?: (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { pinPreview?: boolean; sourceBlockIds?: string[] },
+    options?: { pinPreview?: boolean; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
   ) => void
   onHidePreview?: () => void
   onInlineQuery?: (node: ReaderComponentNode, question: string) => Promise<void> | void
@@ -34,7 +38,7 @@ export type ReaderComponentRenderContext = {
   onManualInsertSlot?: (nodeId: string) => void
   resolveAnchorPreviewImage?: (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[] },
+    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
   ) => Promise<string | null>
 }
 
@@ -72,6 +76,88 @@ function deriveFigureSourceLabel(caption: string, sourceLabel: string): string {
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+}
+
+function asStringMatrix(value: unknown): string[][] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? '').trim()) : []))
+    .filter((row) => row.length > 0)
+}
+
+type TableRowEvidence = {
+  rowIndex: number
+  label: string
+  sourceAtomIds: string[]
+  anchor: ReaderComponentSourceAnchor | null
+}
+
+type TableCellShape = {
+  cellId: number
+  rowStart: number
+  rowEnd: number
+  colStart: number
+  colEnd: number
+  rowspan: number
+  colspan: number
+  text: string
+  layoutIds: string[]
+}
+
+function asTableRowEvidence(value: unknown): TableRowEvidence[] {
+  if (!Array.isArray(value)) return []
+  const rows: TableRowEvidence[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const rowIndex = asNumber(row.row_index, -1)
+    if (rowIndex < 0) continue
+    rows.push({
+      rowIndex,
+      label: asString(row.label) || `Row ${rowIndex + 1}`,
+      sourceAtomIds: asStringArray(row.source_atom_ids),
+      anchor: row.anchor && typeof row.anchor === 'object' ? (row.anchor as ReaderComponentSourceAnchor) : null,
+    })
+  }
+  return rows
+}
+
+function asTableCells(value: unknown): TableCellShape[] {
+  if (!Array.isArray(value)) return []
+  const cells: TableCellShape[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const rowStart = asNumber(row.row_start, -1)
+    const rowEnd = asNumber(row.row_end, rowStart)
+    const colStart = asNumber(row.col_start, -1)
+    const colEnd = asNumber(row.col_end, colStart)
+    if (rowStart < 0 || colStart < 0) continue
+    cells.push({
+      cellId: asNumber(row.cell_id, cells.length),
+      rowStart,
+      rowEnd: Math.max(rowStart, rowEnd),
+      colStart,
+      colEnd: Math.max(colStart, colEnd),
+      rowspan: Math.max(1, asNumber(row.rowspan, Math.max(1, rowEnd - rowStart + 1))),
+      colspan: Math.max(1, asNumber(row.colspan, Math.max(1, colEnd - colStart + 1))),
+      text: asString(row.text),
+      layoutIds: asStringArray(row.layout_ids),
+    })
+  }
+  return cells
+}
+
+function buildEquationMarkdown(value: string): string {
+  const latex = asString(value)
+  if (!latex) return '$$x = y$$'
+  if (
+    (latex.startsWith('$$') && latex.endsWith('$$'))
+    || (latex.startsWith('\\[') && latex.endsWith('\\]'))
+  ) {
+    return latex
+  }
+  return ['$$', latex, '$$'].join('\n')
 }
 
 type ParagraphSegment = {
@@ -140,6 +226,7 @@ function normalizeAnchorRows(value: unknown): ReaderComponentSourceAnchor[] {
       segment_total: Number.isFinite(Number(row.segment_total)) ? Number(row.segment_total) : undefined,
       bbox_hint: row.bbox_hint as ReaderComponentSourceAnchor['bbox_hint'],
       canonical_block_id: typeof row.canonical_block_id === 'string' ? row.canonical_block_id : undefined,
+      source_layout_id: typeof row.source_layout_id === 'string' ? row.source_layout_id : undefined,
       coord_version: typeof row.coord_version === 'string' ? row.coord_version : undefined,
       anchor_confidence: Number.isFinite(Number(row.anchor_confidence)) ? Number(row.anchor_confidence) : undefined,
       anchor_v2: row.anchor_v2 as ReaderComponentSourceAnchor['anchor_v2'],
@@ -256,12 +343,26 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
   }
   if (node.type === 'TablePanel') {
     const title = text('title') || '表格'
+    const matrix = asStringMatrix((props as Record<string, unknown>).matrix)
+    const headerRowCount = asNumber((props as Record<string, unknown>).header_row_count, 0)
     const rows = asRecordArray((props as Record<string, unknown>).rows)
-    if (!rows.length) return `### ${title}\n\n(暂无结构化行数据)`
-    const headers = Object.keys(rows[0] || {})
-    const headerRow = `| ${headers.join(' | ')} |`
-    const sepRow = `| ${headers.map(() => '---').join(' | ')} |`
-    const bodyRows = rows.map((row) => `| ${headers.map((h) => asString(row[h])).join(' | ')} |`)
+    const rawMarkdown = text('raw_markdown')
+    if (matrix.length > 0) {
+      const normalized = matrix.map((row) => row.filter((cell, idx) => idx < row.length))
+      const header = normalized[0] || []
+      const body = normalized.slice(Math.max(1, headerRowCount || 1))
+      const headerRow = `| ${header.join(' | ')} |`
+      const sepRow = `| ${header.map(() => '---').join(' | ')} |`
+      const bodyRows = body.map((row) => `| ${row.join(' | ')} |`)
+      return [`### ${title}`, '', headerRow, sepRow, ...bodyRows].join('\n')
+    }
+    if (!rows.length) return rawMarkdown ? `### ${title}\n\n${rawMarkdown}` : `### ${title}\n\n(暂无结构化行数据)`
+    const headers = asStringArray((props as Record<string, unknown>).headers)
+    const orderedHeaders = headers.length > 0 ? headers : Object.keys(rows[0] || {})
+    const rowKeys = orderedHeaders.map((_, index) => `col_${index + 1}`)
+    const headerRow = `| ${orderedHeaders.join(' | ')} |`
+    const sepRow = `| ${orderedHeaders.map(() => '---').join(' | ')} |`
+    const bodyRows = rows.map((row) => `| ${rowKeys.map((key) => asString(row[key] ?? row[key.replace(/^col_/, '')] ?? '')).join(' | ')} |`)
     return [`### ${title}`, '', headerRow, sepRow, ...bodyRows].join('\n')
   }
   if (node.type === 'FigurePanel') {
@@ -412,6 +513,9 @@ function ActionBar(props: {
   const sourceBlockIds = Array.isArray(node.source_block_ids)
     ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
     : []
+  const sourceAtomIds = Array.isArray(node.source_atom_ids)
+    ? node.source_atom_ids.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
   const compactActionLabel = (key: string, fallback: string): string => {
     const normalized = canonicalActionKey(key)
     if (normalized === 'repair') return '修复'
@@ -439,7 +543,7 @@ function ActionBar(props: {
               icon={<LinkOutlined />}
               style={actionBtnStyle}
               disabled={!canJump}
-              onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true, sourceBlockIds })}
+              onClick={() => ctx.onJumpAnchor?.(anchorRefs, { pinPreview: true, sourceBlockIds, sourceAtomIds })}
             >
               {label}
             </Button>
@@ -464,7 +568,7 @@ function ActionBar(props: {
               size="small"
               style={actionBtnStyle}
               disabled={!canJump}
-              onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true, sourceBlockIds })}
+              onClick={() => ctx.onPreviewAnchors?.(anchorRefs, { pinPreview: true, sourceBlockIds, sourceAtomIds })}
             >
               {label}
             </Button>
@@ -541,9 +645,9 @@ function InlineQuerySlotNode(props: {
   ctx: ReaderComponentRenderContext
 }): ReactNode {
   const { node, ctx } = props
-  if (!ctx.onInlineQuery) return null
   const [expanded, setExpanded] = useState(false)
   const [value, setValue] = useState('')
+  if (!ctx.onInlineQuery) return null
   const loading = ctx.inlineQueryLoadingNodeId === node.id
   return (
     <Card size="small" style={{ ...baseCardStyle(ctx), margin: '8px 0' }}>
@@ -580,6 +684,130 @@ function InlineQuerySlotNode(props: {
         </Space>
       )}
     </Card>
+  )
+}
+
+function EquationBlockNode(props: {
+  node: ReaderComponentNode
+  ctx: ReaderComponentRenderContext
+  withAnchorPreview: (child: ReactNode) => ReactNode
+}): ReactNode {
+  const { node, ctx, withAnchorPreview } = props
+  const latex = asString((node.props || {}).latex)
+  const label = asString((node.props || {}).label)
+  const description = asString((node.props || {}).description)
+  const resolveAnchorPreviewImage = ctx.resolveAnchorPreviewImage
+  const [evidenceImage, setEvidenceImage] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const anchorRefs = normalizeAnchorRows(node.source_anchor_refs)
+    const sourceBlockIds = Array.isArray(node.source_block_ids)
+      ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
+      : []
+    const sourceAtomIds = Array.isArray(node.source_atom_ids)
+      ? node.source_atom_ids.map((item) => String(item || '').trim()).filter(Boolean)
+      : []
+    if (!resolveAnchorPreviewImage || anchorRefs.length === 0) {
+      setEvidenceImage(null)
+      return () => {
+        cancelled = true
+      }
+    }
+    void resolveAnchorPreviewImage(anchorRefs, {
+      preferredPage: Number(anchorRefs[0]?.page || 0) || undefined,
+      sourceBlockIds,
+      sourceAtomIds,
+    }).then((imageUrl) => {
+      if (!cancelled) setEvidenceImage(imageUrl || null)
+    }).catch(() => {
+      if (!cancelled) setEvidenceImage(null)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    resolveAnchorPreviewImage,
+    node.source_anchor_refs,
+    node.source_block_ids,
+    node.source_atom_ids,
+  ])
+
+  return withAnchorPreview(
+    <div style={{
+      margin: '24px 0',
+      padding: '16px',
+      textAlign: 'center',
+      backgroundColor: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.01)',
+      borderRadius: 12,
+      position: 'relative',
+    }}>
+      <ActionBar node={node} ctx={ctx} />
+      {evidenceImage ? (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: '10px 12px',
+            borderRadius: 10,
+            border: `1px solid ${ctx.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+            background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(15, 23, 42, 0.025)',
+          }}
+        >
+          <Text strong style={{ display: 'block', marginBottom: 8, color: ctx.themeStyle?.headingColor }}>
+            公式证据
+          </Text>
+          <img
+            src={evidenceImage}
+            alt={label || 'equation evidence'}
+            style={{ maxWidth: '100%', height: 'auto', borderRadius: 8 }}
+          />
+        </div>
+      ) : null}
+      <div style={{
+        fontSize: 20,
+        overflowX: 'auto',
+        padding: '10px 0',
+        color: ctx.themeStyle?.bodyColor,
+      }}>
+        <div style={{ display: 'inline-block', verticalAlign: 'middle', textAlign: 'left' }}>
+          <ReactMarkdown
+            remarkPlugins={[remarkMath]}
+            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
+            components={{
+              p: ({ children }) => <>{children}</>,
+            }}
+          >
+            {buildEquationMarkdown(latex)}
+          </ReactMarkdown>
+        </div>
+        {label && (
+          <span style={{
+            position: 'absolute',
+            right: 20,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            fontWeight: 'bold',
+            color: ctx.themeStyle?.bodyColor,
+            opacity: 0.6,
+          }}>
+            ({label})
+          </span>
+        )}
+      </div>
+      {description && (
+        <div style={{
+          marginTop: 12,
+          fontSize: 13,
+          color: ctx.themeStyle?.bodyColor,
+          opacity: 0.78,
+          lineHeight: 1.7,
+          textAlign: 'left',
+        }}>
+          {description}
+        </div>
+      )}
+      {renderChildren(node.children || [], ctx)}
+    </div>,
   )
 }
 
@@ -720,6 +948,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             pinPreview: false,
             sourceBlockIds: Array.isArray(node.source_block_ids)
               ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
+              : [],
+            sourceAtomIds: Array.isArray(node.source_atom_ids)
+              ? node.source_atom_ids.map((item) => String(item || '').trim()).filter(Boolean)
               : [],
           })
         } else {
@@ -1022,8 +1253,44 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
 
     case 'TablePanel': {
       const title = asString(props.title)
+      const headers = asStringArray(props.headers)
+      const matrix = asStringMatrix(props.matrix)
+      const tableCells = asTableCells(props.table_cells)
+      const headerRowCount = asNumber(props.header_row_count, 0)
       const rows = asRecordArray(props.rows)
+      const caption = asString(props.caption)
+      const notes = asStringArray(props.notes)
+      const rawMarkdown = asString(props.raw_markdown)
+      const rowEvidence = asTableRowEvidence(props.row_evidence)
       const aiInsight = asString(props.ai_insight)
+      const nodeAnchorRefs = normalizeAnchorRows(node.source_anchor_refs)
+      const nodeSourceBlockIds = Array.isArray(node.source_block_ids)
+        ? node.source_block_ids.map((item) => String(item || '').trim()).filter(Boolean)
+        : []
+      const nodeSourceAtomIds = Array.isArray(node.source_atom_ids)
+        ? node.source_atom_ids.map((item) => String(item || '').trim()).filter(Boolean)
+        : []
+      const fallbackMatrix = rows.length
+        ? [
+            headers.length ? headers : Object.keys(rows[0] || {}),
+            ...rows.map((row) => {
+              const keys = headers.length ? headers.map((_, index) => `col_${index + 1}`) : Object.keys(row)
+              return keys.map((key) => asString(row[key] ?? ''))
+            }),
+          ]
+        : []
+      const effectiveMatrix = matrix.length > 0 ? matrix : fallbackMatrix
+      const effectiveHeaderRowCount = matrix.length > 0 ? Math.max(0, Math.min(headerRowCount, matrix.length - 1)) : (headers.length ? 1 : 0)
+      const columnCount = effectiveMatrix.reduce((max, row) => Math.max(max, row.length), 0)
+      const paddedMatrix = effectiveMatrix.map((row) => [...row, ...Array(Math.max(0, columnCount - row.length)).fill('')])
+      const rowEvidenceMap = new Map(rowEvidence.map((item) => [item.rowIndex, item]))
+      const maxStructuredRow = tableCells.reduce((max, cell) => Math.max(max, cell.rowEnd), -1)
+      const structuredRows = Array.from({ length: maxStructuredRow + 1 }, (_, rowIndex) => ({
+        rowIndex,
+        cells: tableCells
+          .filter((cell) => cell.rowStart === rowIndex)
+          .sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId),
+      })).filter((entry) => entry.cells.length > 0)
       return withAnchorPreview(
         <DraggableContainer node={node}>
           <Card size="small" title={title || '表格'} style={baseCardStyle(ctx)}>
@@ -1031,31 +1298,266 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               node={node}
               ctx={ctx}
               extraActions={(
-                <Button
-                  size="small"
-                  onClick={async () => {
-                    const markdown = componentToMarkdown(node)
-                    try {
-                      await navigator.clipboard.writeText(markdown)
-                      message.success('表格 Markdown 已复制')
-                    } catch {
-                      message.warning('复制失败')
-                    }
-                  }}
-                >
-                  导出CSV/Markdown
-                </Button>
+                <Space wrap size={8}>
+                  <Button
+                    size="small"
+                    disabled={nodeAnchorRefs.length === 0}
+                    onClick={() => ctx.onJumpAnchor?.(nodeAnchorRefs, {
+                      pinPreview: true,
+                      sourceBlockIds: nodeSourceBlockIds,
+                      sourceAtomIds: nodeSourceAtomIds,
+                    })}
+                  >
+                    证据
+                  </Button>
+                  <Button
+                    size="small"
+                    disabled={nodeAnchorRefs.length === 0}
+                    onClick={() => ctx.onPreviewAnchors?.(nodeAnchorRefs, {
+                      pinPreview: true,
+                      sourceBlockIds: nodeSourceBlockIds,
+                      sourceAtomIds: nodeSourceAtomIds,
+                    })}
+                  >
+                    预览
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={async () => {
+                      const markdown = componentToMarkdown(node)
+                      try {
+                        await navigator.clipboard.writeText(markdown)
+                        message.success('表格 Markdown 已复制')
+                      } catch {
+                        message.warning('复制失败')
+                      }
+                    }}
+                  >
+                    导出CSV/Markdown
+                  </Button>
+                </Space>
               )}
             />
-            <List
-              size="small"
-              dataSource={rows}
-              renderItem={(row, idx) => (
-                <List.Item key={`row-${idx}`}>
-                  <Text style={{ color: ctx?.themeStyle?.bodyColor }}>{Object.values(row).map((item) => asString(item)).join(' | ')}</Text>
-                </List.Item>
-              )}
-            />
+            {structuredRows.length > 0 || paddedMatrix.length > 0 ? (
+              <div style={{ overflowX: 'auto', borderRadius: 10, border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}` }}>
+                {rowEvidence.length > 0 ? (
+                  <div style={{ padding: '10px 12px', borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`, background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.02)' : 'rgba(15, 23, 42, 0.025)' }}>
+                    <Text style={{ fontSize: 12, color: ctx?.themeStyle?.bodyColor, opacity: 0.72 }}>
+                      悬停表格行可预览证据，点击行可定位到 PDF 高光。
+                    </Text>
+                  </div>
+                ) : null}
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, (structuredRows.length > 0 ? Math.max(...tableCells.map((cell) => cell.colEnd + 1), 0) : columnCount) * 140)}px` }}>
+                  {structuredRows.length > 0 ? (
+                    <>
+                      {structuredRows.some((entry) => entry.rowIndex < effectiveHeaderRowCount) ? (
+                        <thead>
+                          {structuredRows.filter((entry) => entry.rowIndex < effectiveHeaderRowCount).map((entry) => {
+                            const evidence = rowEvidenceMap.get(entry.rowIndex)
+                            return (
+                              <tr
+                                key={`thead-structured-${entry.rowIndex}`}
+                                onMouseEnter={() => {
+                                  if (evidence?.anchor) {
+                                    ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
+                                  }
+                                }}
+                                onClick={() => {
+                                  if (evidence?.anchor) {
+                                    ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
+                                  }
+                                }}
+                                style={{ cursor: evidence?.anchor ? 'pointer' : 'default' }}
+                              >
+                                {entry.cells.map((cell) => (
+                                  <th
+                                    key={`thead-structured-${entry.rowIndex}-${cell.cellId}`}
+                                    rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
+                                    colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                    scope="col"
+                                    style={{
+                                      padding: '10px 12px',
+                                      textAlign: 'left',
+                                      fontWeight: 700,
+                                      fontSize: 13,
+                                      color: ctx?.themeStyle?.headingColor,
+                                      background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+                                      borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                    }}
+                                  >
+                                    {cell.text || '—'}
+                                  </th>
+                                ))}
+                              </tr>
+                            )
+                          })}
+                        </thead>
+                      ) : null}
+                      <tbody>
+                        {structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount).map((entry) => {
+                          const evidence = rowEvidenceMap.get(entry.rowIndex)
+                          return (
+                            <tr
+                              key={`tbody-structured-${entry.rowIndex}`}
+                              onMouseEnter={() => {
+                                if (evidence?.anchor) {
+                                  ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
+                                }
+                              }}
+                              onClick={() => {
+                                if (evidence?.anchor) {
+                                  ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
+                                }
+                              }}
+                              style={{
+                                cursor: evidence?.anchor ? 'pointer' : 'default',
+                                background: evidence?.anchor
+                                  ? (ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.015)' : 'rgba(15, 23, 42, 0.015)')
+                                  : undefined,
+                              }}
+                            >
+                              {entry.cells.map((cell) => (
+                                <td
+                                  key={`tbody-structured-${entry.rowIndex}-${cell.cellId}`}
+                                  rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
+                                  colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                  style={{
+                                    padding: '10px 12px',
+                                    verticalAlign: 'top',
+                                    borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                    color: ctx?.themeStyle?.bodyColor,
+                                    fontSize: 13,
+                                    lineHeight: 1.55,
+                                    whiteSpace: 'pre-wrap',
+                                  }}
+                                >
+                                  {cell.text || '—'}
+                                </td>
+                              ))}
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </>
+                  ) : (
+                    <>
+                      {effectiveHeaderRowCount > 0 ? (
+                        <thead>
+                          {paddedMatrix.slice(0, effectiveHeaderRowCount).map((row, rowIndex) => {
+                            const evidence = rowEvidenceMap.get(rowIndex)
+                            return (
+                              <tr
+                                key={`thead-${rowIndex}`}
+                                onMouseEnter={() => {
+                                  if (evidence?.anchor) {
+                                    ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
+                                  }
+                                }}
+                                onClick={() => {
+                                  if (evidence?.anchor) {
+                                    ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
+                                  }
+                                }}
+                                style={{ cursor: evidence?.anchor ? 'pointer' : 'default' }}
+                              >
+                                {row.map((cell, cellIndex) => (
+                                  <th
+                                    key={`thead-${rowIndex}-${cellIndex}`}
+                                    style={{
+                                      padding: '10px 12px',
+                                      textAlign: 'left',
+                                      fontWeight: 700,
+                                      fontSize: 13,
+                                      color: ctx?.themeStyle?.headingColor,
+                                      background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+                                      borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                    }}
+                                  >
+                                    {cell || '—'}
+                                  </th>
+                                ))}
+                              </tr>
+                            )
+                          })}
+                        </thead>
+                      ) : null}
+                      <tbody>
+                        {paddedMatrix.slice(effectiveHeaderRowCount).map((row, rowIndex) => {
+                          const absoluteRowIndex = rowIndex + effectiveHeaderRowCount
+                          const evidence = rowEvidenceMap.get(absoluteRowIndex)
+                          return (
+                            <tr
+                              key={`tbody-${rowIndex}`}
+                              onMouseEnter={() => {
+                                if (evidence?.anchor) {
+                                  ctx.onPreviewAnchors?.([evidence.anchor], { sourceAtomIds: evidence.sourceAtomIds })
+                                }
+                              }}
+                              onClick={() => {
+                                if (evidence?.anchor) {
+                                  ctx.onJumpAnchor?.([evidence.anchor], { pinPreview: true, sourceAtomIds: evidence.sourceAtomIds })
+                                }
+                              }}
+                              style={{
+                                cursor: evidence?.anchor ? 'pointer' : 'default',
+                                background: evidence?.anchor
+                                  ? (ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(255,255,255,0.015)' : 'rgba(15, 23, 42, 0.015)')
+                                  : undefined,
+                              }}
+                            >
+                              {row.map((cell, cellIndex) => (
+                                <td
+                                  key={`tbody-${rowIndex}-${cellIndex}`}
+                                  style={{
+                                    padding: '10px 12px',
+                                    verticalAlign: 'top',
+                                    borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                    color: ctx?.themeStyle?.bodyColor,
+                                    fontSize: 13,
+                                    lineHeight: 1.55,
+                                    whiteSpace: 'pre-wrap',
+                                  }}
+                                >
+                                  {cell || '—'}
+                                </td>
+                              ))}
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </>
+                  )}
+                </table>
+              </div>
+            ) : rawMarkdown ? (
+              <Paragraph style={{ marginBottom: 0, color: ctx?.themeStyle?.bodyColor, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+                {rawMarkdown}
+              </Paragraph>
+            ) : (
+              <List
+                size="small"
+                dataSource={rows}
+                renderItem={(row, idx) => (
+                  <List.Item key={`row-${idx}`}>
+                    <Text style={{ color: ctx?.themeStyle?.bodyColor }}>{Object.values(row).map((item) => asString(item)).join(' | ')}</Text>
+                  </List.Item>
+                )}
+              />
+            )}
+            {caption ? (
+              <Paragraph style={{ marginTop: 12, marginBottom: 0, color: ctx?.themeStyle?.bodyColor, opacity: 0.82, lineHeight: 1.65 }}>
+                {caption}
+              </Paragraph>
+            ) : null}
+            {notes.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                {notes.map((note, idx) => (
+                  <Paragraph key={`table-note-${idx}`} style={{ marginBottom: idx === notes.length - 1 ? 0 : 6, color: ctx?.themeStyle?.bodyColor, opacity: 0.72, fontSize: 12, lineHeight: 1.55 }}>
+                    {note}
+                  </Paragraph>
+                ))}
+              </div>
+            ) : null}
             {aiInsight ? (
               <div style={{
                 marginTop: 14, padding: '12px 16px',
@@ -1480,59 +1982,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     }
 
     case 'EquationBlock': {
-      const latex = asString(props.latex)
-      const label = asString(props.label)
-      const description = asString(props.description)
-
-      return withAnchorPreview(
-        <div style={{
-          margin: '24px 0',
-          padding: '16px',
-          textAlign: 'center',
-          backgroundColor: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.01)',
-          borderRadius: 12,
-          position: 'relative',
-        }}>
-          <ActionBar node={node} ctx={ctx} />
-          <div style={{
-            fontSize: 20,
-            fontFamily: 'serif',
-            overflowX: 'auto',
-            padding: '10px 0',
-            color: ctx.themeStyle?.bodyColor,
-          }}>
-            {/* Simple centered display for LaTeX, assuming frontend handles MathJax/KaTeX globally or we just show it nicely */}
-            <div style={{ display: 'inline-block', verticalAlign: 'middle' }}>
-              {latex}
-            </div>
-            {label && (
-              <span style={{
-                position: 'absolute',
-                right: 20,
-                top: '50%',
-                transform: 'translateY(-50%)',
-                fontWeight: 'bold',
-                color: ctx.themeStyle?.bodyColor,
-                opacity: 0.6,
-              }}>
-                ({label})
-              </span>
-            )}
-          </div>
-          {description && (
-            <div style={{
-              marginTop: 12,
-              fontSize: 13,
-              color: ctx.themeStyle?.bodyColor,
-              opacity: 0.7,
-              fontStyle: 'italic'
-            }}>
-              {description}
-            </div>
-          )}
-          {renderChildren(node.children || [], ctx)}
-        </div>
-      )
+      return <EquationBlockNode node={node} ctx={ctx} withAnchorPreview={withAnchorPreview} />
     }
 
     case 'MethodologyCard': {

@@ -2,6 +2,7 @@ import { z } from 'zod'
 
 const stringArray = z.array(z.string()).default([])
 const recordArray = z.array(z.record(z.any())).default([])
+const stringMatrix = z.array(z.array(z.string())).default([])
 
 export const readerComponentSchemas = {
   PaperHeaderCard: z.object({
@@ -39,7 +40,15 @@ export const readerComponentSchemas = {
   }),
   TablePanel: z.object({
     title: z.string().optional(),
+    headers: stringArray.optional(),
+    header_row_count: z.number().optional(),
+    matrix: stringMatrix.optional(),
+    table_cells: recordArray.optional(),
     rows: recordArray.optional(),
+    caption: z.string().optional(),
+    notes: stringArray.optional(),
+    raw_markdown: z.string().optional(),
+    row_evidence: recordArray.optional(),
     ai_insight: z.string().optional(),
   }),
   CitationLinks: z.object({
