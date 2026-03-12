@@ -315,11 +315,13 @@ function isJumpableAnchor(
   const start = Number(anchor.start_char || 0)
   const end = Number(anchor.end_char || 0)
   if (end <= start) return false
-  if (Number(anchor.segment_index || 0) > 0 || Number(anchor.segment_total || 0) > 0) return false
   const canonicalBlockId = String(anchor.canonical_block_id || '').trim()
   const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
   const sourceLayoutId = String(anchor.source_layout_id || '').trim()
   const hasGeometryPolygons = Array.isArray(anchor.geometry?.polygons) && anchor.geometry!.polygons.length > 0
+  const segmentIndex = Number(anchor.segment_index || 0)
+  const segmentTotal = Number(anchor.segment_total || 0)
+  if (coordVersion === 'anchor_v2' && (segmentIndex > 0 || segmentTotal > 0)) return false
   if (coordVersion === 'anchor_v2' && !canonicalBlockId) return false
   if (coordVersion === 'layout_uid_v1' && !sourceLayoutId && !hasGeometryPolygons) return false
   if (!['anchor_v2', 'layout_uid_v1'].includes(coordVersion)) return false
