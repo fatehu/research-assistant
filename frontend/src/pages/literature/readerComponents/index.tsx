@@ -38,7 +38,13 @@ export type ReaderComponentRenderContext = {
   onManualInsertSlot?: (nodeId: string) => void
   resolveAnchorPreviewImage?: (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
+    options?: {
+      preferredPage?: number
+      segmentIndex?: number
+      sourceBlockIds?: string[]
+      sourceAtomIds?: string[]
+      variant?: 'default' | 'display_formula'
+    },
   ) => Promise<string | null>
 }
 
@@ -49,6 +55,13 @@ function asString(value: unknown): string {
 function asNumber(value: unknown, fallback: number): number {
   const num = Number(value)
   return Number.isFinite(num) ? num : fallback
+}
+
+function asNumberArray(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item > 0)
 }
 
 function asStringArray(value: unknown): string[] {
@@ -95,6 +108,21 @@ type TableCellShape = {
   colspan: number
   text: string
   layoutIds: string[]
+  x0?: number
+  x1?: number
+  y0?: number
+  y1?: number
+}
+
+type StructuredTableRowShape = {
+  rowIndex: number
+  cells: TableCellShape[]
+}
+
+type LogicalTableRowShape = {
+  rowIndex: number
+  sourceRowIndices: number[]
+  cells: TableCellShape[]
 }
 
 function asTableCells(value: unknown): TableCellShape[] {
@@ -118,6 +146,10 @@ function asTableCells(value: unknown): TableCellShape[] {
       colspan: Math.max(1, asNumber(row.colspan, Math.max(1, colEnd - colStart + 1))),
       text: asString(row.text),
       layoutIds: asStringArray(row.layout_ids),
+      x0: row.x0 == null ? undefined : asNumber(row.x0, 0),
+      x1: row.x1 == null ? undefined : asNumber(row.x1, 0),
+      y0: row.y0 == null ? undefined : asNumber(row.y0, 0),
+      y1: row.y1 == null ? undefined : asNumber(row.y1, 0),
     })
   }
   return cells
@@ -133,6 +165,12 @@ function buildEquationMarkdown(value: string): string {
     return latex
   }
   return ['$$', latex, '$$'].join('\n')
+}
+
+function normalizeEquationRenderMode(value: unknown): 'image_first' | 'math_first' | 'text_only' {
+  const mode = asString(value).toLowerCase()
+  if (mode === 'math_first' || mode === 'text_only') return mode
+  return 'image_first'
 }
 
 function splitTableCaptionLabel(value: string): { label: string; caption: string } {
@@ -152,6 +190,149 @@ function looksNumericTableCell(value: string): boolean {
   return /^[-+±]?\d+(?:\.\d+)?%?$/.test(text)
     || /^\(±?\d+(?:\.\d+)?\)$/.test(text)
     || /^\(0\.\d+\)$/.test(text)
+}
+
+function deriveColumnWidthRatios(tableCells: TableCellShape[], fallbackCount: number): number[] {
+  const maxCol = tableCells.reduce((max, cell) => Math.max(max, cell.colEnd), -1)
+  const count = Math.max(fallbackCount, maxCol + 1)
+  if (count <= 0) return []
+  const bounds: Array<{ x0: number; x1: number } | null> = Array.from({ length: count }, () => null)
+  let globalX0: number | null = null
+  let globalX1: number | null = null
+  for (const cell of tableCells) {
+    if (typeof cell.x0 !== 'number' || typeof cell.x1 !== 'number' || cell.x1 <= cell.x0) continue
+    globalX0 = globalX0 == null ? cell.x0 : Math.min(globalX0, cell.x0)
+    globalX1 = globalX1 == null ? cell.x1 : Math.max(globalX1, cell.x1)
+    const span = Math.max(1, cell.colEnd - cell.colStart + 1)
+    const segWidth = (cell.x1 - cell.x0) / span
+    for (let offset = 0; offset < span; offset += 1) {
+      const index = cell.colStart + offset
+      if (index < 0 || index >= count) continue
+      const segX0 = cell.x0 + segWidth * offset
+      const segX1 = cell.x0 + segWidth * (offset + 1)
+      const current = bounds[index]
+      bounds[index] = current
+        ? { x0: Math.min(current.x0, segX0), x1: Math.max(current.x1, segX1) }
+        : { x0: segX0, x1: segX1 }
+    }
+  }
+  if (globalX0 == null || globalX1 == null || globalX1 <= globalX0) return []
+  const total = globalX1 - globalX0
+  const raw = bounds.map((item) => (item ? Math.max(0.02, (item.x1 - item.x0) / total) : 0))
+  const sum = raw.reduce((acc, value) => acc + value, 0)
+  if (sum <= 0) return []
+  return raw.map((value) => value / sum)
+}
+
+function cloneTableCellShape(cell: TableCellShape): TableCellShape {
+  return {
+    ...cell,
+    layoutIds: [...cell.layoutIds],
+  }
+}
+
+function mergeTableCellText(base: string, extra: string): string {
+  const lines = [
+    ...asString(base).split('\n').map((item) => item.trim()).filter(Boolean),
+    ...asString(extra).split('\n').map((item) => item.trim()).filter(Boolean),
+  ]
+  if (lines.length === 0) return ''
+  return Array.from(new Set(lines)).join('\n')
+}
+
+function isContinuationTableRow(cells: TableCellShape[]): boolean {
+  if (cells.length === 0) return false
+  const meaningfulCells = cells.filter((cell) => asString(cell.text))
+  const effectiveCells = meaningfulCells.length > 0 ? meaningfulCells : cells
+  const firstColumn = Math.min(...effectiveCells.map((cell) => cell.colStart))
+  const hasLeadingColumnContent = effectiveCells.some((cell) => cell.colStart === 0 && asString(cell.text))
+  return !hasLeadingColumnContent && firstColumn > 0
+}
+
+function appendCellsToLogicalRow(target: LogicalTableRowShape, nextCells: TableCellShape[]): void {
+  for (const cell of nextCells) {
+    const existing = target.cells.find((item) => item.colStart === cell.colStart && item.colEnd === cell.colEnd)
+    if (existing) {
+      existing.text = mergeTableCellText(existing.text, cell.text)
+      existing.layoutIds = Array.from(new Set([...existing.layoutIds, ...cell.layoutIds]))
+      existing.rowEnd = Math.max(existing.rowEnd, cell.rowEnd)
+      existing.rowspan = Math.max(existing.rowspan, cell.rowspan)
+      if (typeof cell.x0 === 'number') existing.x0 = typeof existing.x0 === 'number' ? Math.min(existing.x0, cell.x0) : cell.x0
+      if (typeof cell.x1 === 'number') existing.x1 = typeof existing.x1 === 'number' ? Math.max(existing.x1, cell.x1) : cell.x1
+      if (typeof cell.y0 === 'number') existing.y0 = typeof existing.y0 === 'number' ? Math.min(existing.y0, cell.y0) : cell.y0
+      if (typeof cell.y1 === 'number') existing.y1 = typeof existing.y1 === 'number' ? Math.max(existing.y1, cell.y1) : cell.y1
+    } else {
+      target.cells.push(cloneTableCellShape(cell))
+    }
+  }
+  target.cells.sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId)
+}
+
+function buildLogicalTableRows(rows: StructuredTableRowShape[]): LogicalTableRowShape[] {
+  const logicalRows: LogicalTableRowShape[] = []
+  const physicalToLogical = new Map<number, number>()
+  for (const row of rows) {
+    const shouldMergeIntoPrevious = isContinuationTableRow(row.cells) && logicalRows.length > 0
+    if (shouldMergeIntoPrevious) {
+      const targetIndex = logicalRows.length - 1
+      const target = logicalRows[targetIndex]
+      target.sourceRowIndices.push(row.rowIndex)
+      appendCellsToLogicalRow(target, row.cells)
+      physicalToLogical.set(row.rowIndex, targetIndex)
+      continue
+    }
+    logicalRows.push({
+      rowIndex: row.rowIndex,
+      sourceRowIndices: [row.rowIndex],
+      cells: row.cells.map(cloneTableCellShape),
+    })
+    physicalToLogical.set(row.rowIndex, logicalRows.length - 1)
+  }
+  for (const [logicalIndex, row] of logicalRows.entries()) {
+    for (const cell of row.cells) {
+      const logicalRowStart = physicalToLogical.get(cell.rowStart) ?? logicalIndex
+      const logicalRowEnd = physicalToLogical.get(cell.rowEnd) ?? logicalRowStart
+      cell.rowStart = logicalRowStart
+      cell.rowEnd = logicalRowEnd
+      cell.rowspan = Math.max(1, logicalRowEnd - logicalRowStart + 1)
+    }
+  }
+  return logicalRows
+}
+
+function buildRenderedTableRowSlots(
+  cells: TableCellShape[],
+  columnCount: number,
+): Array<{ cell: TableCellShape | null; colSpan: number; columnIndex: number }> {
+  if (columnCount <= 0) return []
+  const slots: Array<{ cell: TableCellShape | null; colSpan: number; columnIndex: number }> = []
+  const sorted = [...cells].sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId)
+  let currentColumn = 0
+  for (const cell of sorted) {
+    if (cell.colStart > currentColumn) {
+      slots.push({
+        cell: null,
+        colSpan: cell.colStart - currentColumn,
+        columnIndex: currentColumn,
+      })
+      currentColumn = cell.colStart
+    }
+    const colSpan = Math.max(1, cell.colspan)
+    slots.push({
+      cell,
+      colSpan,
+      columnIndex: cell.colStart,
+    })
+    currentColumn = cell.colStart + colSpan
+  }
+  if (currentColumn < columnCount) {
+    slots.push({
+      cell: null,
+      colSpan: columnCount - currentColumn,
+      columnIndex: currentColumn,
+    })
+  }
+  return slots
 }
 
 type ParagraphSegment = {
@@ -391,7 +572,10 @@ export function componentToMarkdown(node: ReaderComponentNode): string {
     return [`### 引用文献: ${text('title')}`, `- 作者: ${asStringArray((props as Record<string, unknown>).authors).join(', ')}`, `- 年份: ${text('year')}`, `- 期刊: ${text('journal')}`, `- DOI: ${text('doi')}`, text('abstract_tldr') ? `- TL;DR: ${text('abstract_tldr')}` : ''].filter(Boolean).join('\n')
   }
   if (node.type === 'EquationBlock') {
-    return [`$$`, text('latex'), `$$`, text('description') ? `*注: ${text('description')}*` : ''].filter(Boolean).join('\n')
+    const transcript = text('transcript')
+    const latex = text('latex')
+    const body = transcript || latex
+    return [`### 公式`, body ? `- 转写: ${body}` : '', text('description') ? `- 注: ${text('description')}` : ''].filter(Boolean).join('\n')
   }
   if (node.type === 'MethodologyCard') {
     const steps = asStringArray((props as Record<string, unknown>).steps)
@@ -695,6 +879,8 @@ function EquationBlockNode(props: {
   const latex = asString((node.props || {}).latex)
   const label = asString((node.props || {}).label)
   const description = asString((node.props || {}).description)
+  const transcript = asString((node.props || {}).transcript)
+  const renderMode = normalizeEquationRenderMode((node.props || {}).render_mode)
   const resolveAnchorPreviewImage = ctx.resolveAnchorPreviewImage
   const [evidenceImage, setEvidenceImage] = useState<string | null>(null)
 
@@ -717,6 +903,7 @@ function EquationBlockNode(props: {
       preferredPage: Number(anchorRefs[0]?.page || 0) || undefined,
       sourceBlockIds,
       sourceAtomIds,
+      variant: renderMode === 'image_first' ? 'display_formula' : 'default',
     }).then((imageUrl) => {
       if (!cancelled) setEvidenceImage(imageUrl || null)
     }).catch(() => {
@@ -727,6 +914,7 @@ function EquationBlockNode(props: {
     }
   }, [
     resolveAnchorPreviewImage,
+    renderMode,
     node.source_anchor_refs,
     node.source_block_ids,
     node.source_atom_ids,
@@ -742,57 +930,70 @@ function EquationBlockNode(props: {
       position: 'relative',
     }}>
       <ActionBar node={node} ctx={ctx} />
-      {evidenceImage ? (
-        <div
-          style={{
-            marginBottom: 12,
-            padding: '10px 12px',
-            borderRadius: 10,
-            border: `1px solid ${ctx.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
-            background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(15, 23, 42, 0.025)',
-          }}
-        >
-          <Text strong style={{ display: 'block', marginBottom: 8, color: ctx.themeStyle?.headingColor }}>
-            公式证据
-          </Text>
-          <img
-            src={evidenceImage}
-            alt={label || 'equation evidence'}
-            style={{ maxWidth: '100%', height: 'auto', borderRadius: 8 }}
-          />
-        </div>
-      ) : null}
       <div style={{
         fontSize: 20,
         overflowX: 'auto',
         padding: '10px 0',
         color: ctx.themeStyle?.bodyColor,
       }}>
-        <div style={{ display: 'inline-block', verticalAlign: 'middle', textAlign: 'left' }}>
-          <ReactMarkdown
-            remarkPlugins={[remarkMath]}
-            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
-            components={{
-              p: ({ children }) => <>{children}</>,
+        {evidenceImage && renderMode === 'image_first' ? (
+          <div
+            style={{
+              display: 'inline-flex',
+              maxWidth: '100%',
+              padding: '6px 8px',
+              borderRadius: 10,
+              border: `1px solid ${ctx.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+              background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.02)' : 'rgba(255,255,255,0.82)',
+              boxShadow: isDarkTheme(ctx)
+                ? '0 10px 28px rgba(0, 0, 0, 0.24)'
+                : '0 10px 28px rgba(15, 23, 42, 0.08)',
             }}
           >
-            {buildEquationMarkdown(latex)}
-          </ReactMarkdown>
-        </div>
-        {label && (
-          <span style={{
-            position: 'absolute',
-            right: 20,
-            top: '50%',
-            transform: 'translateY(-50%)',
-            fontWeight: 'bold',
-            color: ctx.themeStyle?.bodyColor,
-            opacity: 0.6,
-          }}>
-            ({label})
-          </span>
+            <img
+              src={evidenceImage}
+              alt={label || 'equation'}
+              style={{ maxWidth: '100%', height: 'auto', borderRadius: 8 }}
+            />
+          </div>
+        ) : renderMode === 'math_first' && latex ? (
+          <div style={{ display: 'inline-block', verticalAlign: 'middle', textAlign: 'left' }}>
+            <ReactMarkdown
+              remarkPlugins={[remarkMath]}
+              rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
+              components={{
+                p: ({ children }) => <>{children}</>,
+              }}
+            >
+              {buildEquationMarkdown(latex)}
+            </ReactMarkdown>
+          </div>
+        ) : (
+          <pre
+            style={{
+              margin: 0,
+              padding: '10px 14px',
+              display: 'inline-block',
+              maxWidth: '100%',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              textAlign: 'left',
+              borderRadius: 10,
+              background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+              color: ctx.themeStyle?.bodyColor,
+              fontSize: 16,
+              lineHeight: 1.7,
+            }}
+          >
+            {transcript || latex}
+          </pre>
         )}
       </div>
+      {label ? (
+        <div style={{ marginTop: 8, color: ctx.themeStyle?.bodyColor, opacity: 0.65, fontSize: 13 }}>
+          {label}
+        </div>
+      ) : null}
       {description && (
         <div style={{
           marginTop: 12,
@@ -805,6 +1006,28 @@ function EquationBlockNode(props: {
           {description}
         </div>
       )}
+      {renderMode === 'image_first' && transcript ? (
+        <details style={{ marginTop: 12, textAlign: 'left' }}>
+          <summary style={{ cursor: 'pointer', color: ctx.themeStyle?.bodyColor, opacity: 0.72 }}>
+            查看 OCR 转写
+          </summary>
+          <pre
+            style={{
+              margin: '10px 0 0',
+              padding: '10px 12px',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              borderRadius: 8,
+              background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.04)' : 'rgba(15, 23, 42, 0.04)',
+              color: ctx.themeStyle?.bodyColor,
+              fontSize: 13,
+              lineHeight: 1.6,
+            }}
+          >
+            {transcript}
+          </pre>
+        </details>
+      ) : null}
       {renderChildren(node.children || [], ctx)}
     </div>,
   )
@@ -1253,6 +1476,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
     case 'TablePanel': {
       const title = asString(props.title)
       const headers = asStringArray(props.headers)
+      const columnWidths = asNumberArray(props.column_widths)
       const matrix = asStringMatrix(props.matrix)
       const tableCells = asTableCells(props.table_cells)
       const headerRowCount = asNumber(props.header_row_count, 0)
@@ -1275,20 +1499,46 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const columnCount = effectiveMatrix.reduce((max, row) => Math.max(max, row.length), 0)
       const paddedMatrix = effectiveMatrix.map((row) => [...row, ...Array(Math.max(0, columnCount - row.length)).fill('')])
       const maxStructuredRow = tableCells.reduce((max, cell) => Math.max(max, cell.rowEnd), -1)
-      const structuredRows = Array.from({ length: maxStructuredRow + 1 }, (_, rowIndex) => ({
+      const structuredRows: StructuredTableRowShape[] = Array.from({ length: maxStructuredRow + 1 }, (_, rowIndex) => ({
         rowIndex,
         cells: tableCells
           .filter((cell) => cell.rowStart === rowIndex)
           .sort((left, right) => left.colStart - right.colStart || left.cellId - right.cellId),
       })).filter((entry) => entry.cells.length > 0)
+      const logicalStructuredRows = structuredRows.length > 0 ? buildLogicalTableRows(structuredRows) : []
       const { label: tableLabel, caption: fullCaption } = splitTableCaptionLabel(caption || title)
       const displayTitle = tableLabel || (title && title !== caption ? title : '表格')
       const effectiveCaption = fullCaption || (caption && caption !== displayTitle ? caption : '')
       const inferredColumnCount = structuredRows.length > 0
         ? Math.max(...tableCells.map((cell) => cell.colEnd + 1), 0)
         : columnCount
-      const bodyRowsForAlignment = structuredRows.length > 0
-        ? structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount)
+      const effectiveColumnWidths = columnWidths.length === inferredColumnCount
+        ? columnWidths
+        : deriveColumnWidthRatios(tableCells, inferredColumnCount)
+      let logicalHeaderRowCount = 0
+      for (const row of logicalStructuredRows) {
+        if (row.sourceRowIndices.some((rowIndex) => rowIndex < effectiveHeaderRowCount)) {
+          logicalHeaderRowCount += 1
+        } else {
+          break
+        }
+      }
+      const renderedHeaders = headers.length === inferredColumnCount
+        ? headers
+        : (
+          logicalStructuredRows.length > 0
+            ? Array.from({ length: inferredColumnCount }, (_, colIndex) => (
+              logicalStructuredRows
+                .slice(0, logicalHeaderRowCount)
+                .flatMap((entry) => entry.cells.filter((cell) => cell.colStart === colIndex))
+                .flatMap((cell) => asString(cell.text).split('\n').map((line) => line.trim()).filter(Boolean))
+                .filter((line, index, array) => array.indexOf(line) === index)
+                .join('\n')
+            ))
+            : []
+        )
+      const bodyRowsForAlignment = logicalStructuredRows.length > 0
+        ? logicalStructuredRows.slice(logicalHeaderRowCount)
         : paddedMatrix.slice(effectiveHeaderRowCount).map((row, rowIndex) => ({
           rowIndex: rowIndex + effectiveHeaderRowCount,
           cells: row.map((text, colStart) => ({ text, colStart })),
@@ -1328,60 +1578,104 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 </Space>
               )}
             />
-            {structuredRows.length > 0 || paddedMatrix.length > 0 ? (
+            {logicalStructuredRows.length > 0 || paddedMatrix.length > 0 ? (
               <div style={{ overflowX: 'auto', borderRadius: 10, border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}` }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, inferredColumnCount * 140)}px`, borderTop: '2px solid rgba(17, 24, 39, 0.55)', borderBottom: '2px solid rgba(17, 24, 39, 0.55)' }}>
-                  {structuredRows.length > 0 ? (
+                <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: `${Math.max(420, inferredColumnCount * 116)}px`, borderTop: '2px solid rgba(17, 24, 39, 0.55)', borderBottom: '2px solid rgba(17, 24, 39, 0.55)' }}>
+                  {effectiveColumnWidths.length === inferredColumnCount ? (
+                    <colgroup>
+                      {effectiveColumnWidths.map((ratio, index) => (
+                        <col key={`col-${index}`} style={{ width: `${(ratio * 100).toFixed(2)}%` }} />
+                      ))}
+                    </colgroup>
+                  ) : null}
+                  {logicalStructuredRows.length > 0 ? (
                     <>
-                      {structuredRows.some((entry) => entry.rowIndex < effectiveHeaderRowCount) ? (
+                      {renderedHeaders.length > 0 ? (
                         <thead>
-                          {structuredRows.filter((entry) => entry.rowIndex < effectiveHeaderRowCount).map((entry) => (
-                            <tr key={`thead-structured-${entry.rowIndex}`}>
-                              {entry.cells.map((cell) => (
+                          <tr key="thead-structured-merged">
+                            {renderedHeaders.map((cell, cellIndex) => (
                                 <th
-                                  key={`thead-structured-${entry.rowIndex}-${cell.cellId}`}
-                                  rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
-                                  colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                  key={`thead-structured-${cellIndex}`}
                                   scope="col"
                                   style={{
-                                    padding: '10px 12px',
-                                    textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
+                                    padding: '8px 10px',
+                                    textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
                                     fontWeight: 700,
-                                    fontSize: 13,
+                                    fontSize: 12.5,
                                     color: ctx?.themeStyle?.headingColor,
                                     background: 'transparent',
                                     borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                   }}
                                 >
-                                  {cell.text || '—'}
+                                  {cell
+                                    ? cell.split('\n').map((part, index) => (
+                                      <div
+                                        key={`thead-line-${cellIndex}-${index}`}
+                                        style={{
+                                          display: 'block',
+                                          fontWeight: index === 0 ? 700 : 600,
+                                          opacity: index === 0 ? 1 : 0.92,
+                                          marginTop: index === 0 ? 0 : 2,
+                                        }}
+                                      >
+                                        {part}
+                                      </div>
+                                    ))
+                                    : '—'}
                                 </th>
-                              ))}
-                            </tr>
-                          ))}
+                            ))}
+                          </tr>
                         </thead>
                       ) : null}
                       <tbody>
-                        {structuredRows.filter((entry) => entry.rowIndex >= effectiveHeaderRowCount).map((entry) => (
+                        {logicalStructuredRows.slice(logicalHeaderRowCount).map((entry) => (
                           <tr key={`tbody-structured-${entry.rowIndex}`}>
-                            {entry.cells.map((cell) => (
-                              <td
+                            {buildRenderedTableRowSlots(entry.cells, inferredColumnCount).map((slot) => {
+                              if (!slot.cell) {
+                                return (
+                                  <td
+                                    key={`tbody-structured-${entry.rowIndex}-empty-${slot.columnIndex}`}
+                                    colSpan={slot.colSpan > 1 ? slot.colSpan : undefined}
+                                    style={{
+                                      padding: '8px 10px',
+                                      verticalAlign: 'top',
+                                      borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                                      color: 'transparent',
+                                      fontSize: 12.5,
+                                      lineHeight: 1.45,
+                                      whiteSpace: 'pre-wrap',
+                                      textAlign: 'left',
+                                    }}
+                                  >
+                                    {' '}
+                                  </td>
+                                )
+                              }
+                              const cell = slot.cell
+                              const isRowHeader = cell.colStart === 0 && !centeredColumns.has(0) && !looksNumericTableCell(cell.text)
+                              const CellTag = isRowHeader ? 'th' : 'td'
+                              return (
+                              <CellTag
                                 key={`tbody-structured-${entry.rowIndex}-${cell.cellId}`}
                                 rowSpan={cell.rowspan > 1 ? cell.rowspan : undefined}
-                                colSpan={cell.colspan > 1 ? cell.colspan : undefined}
+                                colSpan={slot.colSpan > 1 ? slot.colSpan : undefined}
+                                {...(isRowHeader ? { scope: 'row' } : {})}
                                 style={{
-                                  padding: '10px 12px',
+                                  padding: '8px 10px',
                                   verticalAlign: 'top',
                                   borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                   color: ctx?.themeStyle?.bodyColor,
-                                  fontSize: 13,
-                                  lineHeight: 1.55,
+                                  fontSize: 12.5,
+                                  lineHeight: 1.45,
                                   whiteSpace: 'pre-wrap',
                                   textAlign: centeredColumns.has(cell.colStart) ? 'center' : 'left',
+                                  fontWeight: isRowHeader ? 600 : 400,
+                                  fontVariantNumeric: centeredColumns.has(cell.colStart) ? 'tabular-nums' : undefined,
                                 }}
                               >
                                 {cell.text || '—'}
-                              </td>
-                            ))}
+                              </CellTag>
+                            )})}
                           </tr>
                         ))}
                       </tbody>
@@ -1396,10 +1690,10 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                                 <th
                                   key={`thead-${rowIndex}-${cellIndex}`}
                                   style={{
-                                    padding: '10px 12px',
+                                    padding: '8px 10px',
                                     textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
                                     fontWeight: 700,
-                                    fontSize: 13,
+                                    fontSize: 12.5,
                                     color: ctx?.themeStyle?.headingColor,
                                     background: 'transparent',
                                     borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
@@ -1419,14 +1713,15 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                               <td
                                 key={`tbody-${rowIndex}-${cellIndex}`}
                                 style={{
-                                  padding: '10px 12px',
+                                  padding: '8px 10px',
                                   verticalAlign: 'top',
                                   borderBottom: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                                   color: ctx?.themeStyle?.bodyColor,
-                                  fontSize: 13,
-                                  lineHeight: 1.55,
+                                  fontSize: 12.5,
+                                  lineHeight: 1.45,
                                   whiteSpace: 'pre-wrap',
                                   textAlign: centeredColumns.has(cellIndex) ? 'center' : 'left',
+                                  fontVariantNumeric: centeredColumns.has(cellIndex) ? 'tabular-nums' : undefined,
                                 }}
                               >
                                 {cell || '—'}
