@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v9"
+COMPOSE_ENGINE_VERSION = "reader_compose_v10"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -4271,6 +4271,8 @@ class LiteratureReaderComposeService:
                 notes = props.get("notes")
                 row_evidence = props.get("row_evidence")
                 cell_evidence = props.get("cell_evidence")
+                logical_rows = props.get("logical_rows")
+                reconstruction_notes = props.get("reconstruction_notes")
                 return {
                     "title": str(props.get("title") or fb_text or "Table").strip(),
                     "rows": rows if isinstance(rows, list) else [],
@@ -4279,11 +4281,15 @@ class LiteratureReaderComposeService:
                     "column_widths": column_widths if isinstance(column_widths, list) else [],
                     "table_cells": table_cells if isinstance(table_cells, list) else [],
                     "header_row_count": int(props.get("header_row_count") or 0),
+                    "logical_rows": logical_rows if isinstance(logical_rows, list) else [],
+                    "logical_header_row_count": int(props.get("logical_header_row_count") or 0),
                     "caption": str(props.get("caption") or "").strip(),
                     "notes": notes if isinstance(notes, list) else [],
                     "raw_markdown": str(props.get("raw_markdown") or "").strip(),
                     "row_evidence": row_evidence if isinstance(row_evidence, list) else [],
                     "cell_evidence": cell_evidence if isinstance(cell_evidence, list) else [],
+                    "reconstruction_mode": str(props.get("reconstruction_mode") or "").strip(),
+                    "reconstruction_notes": reconstruction_notes if isinstance(reconstruction_notes, list) else [],
                     "ai_insight": str(props.get("ai_insight") or "").strip(),
                 }
             return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}

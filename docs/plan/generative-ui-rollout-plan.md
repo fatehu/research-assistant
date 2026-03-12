@@ -260,5 +260,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `EquationBlock` now carries `render_mode=image_first` plus `transcript`, the body view prefers the original formula crop instead of forcing low-quality OCR into KaTeX, and OCR text is demoted to an optional transcript fallback.
 - [ ] Add an AI-assisted logical-row reconstruction pass for `/read` tables:
   keep DocMind `cells[]` and `uniqueId -> blocks[].pos` as geometry truth, use current-page render plus raw physical rows only to group physical rows into logical rows, and require strict exact-once fallback-safe validation before any table plan can override the current deterministic materializer.
+  2026-03-13: runtime gap identified. The AI pass was wired into `layout_uid_v1`, but `_panel_plan_to_ui_plan(...)`
+  dropped `logical_rows / logical_header_row_count / reconstruction_mode / reconstruction_notes`, so live `TablePanel`
+  props still fell back to deterministic rows. Fix paired with `reader_compose_v10`.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

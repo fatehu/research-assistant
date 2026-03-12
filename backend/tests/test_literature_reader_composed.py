@@ -6927,6 +6927,133 @@ def test_layout_uid_group_plan_to_panel_plan_should_apply_ai_table_logical_rows(
     assert str((((logical_rows[1] or {}).get("cells") or [])[1].get("text") or "")) == "72.6\n(±2.75)"
 
 
+def test_panel_plan_to_ui_plan_should_keep_ai_table_logical_row_fields():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
+        page=7,
+        panel_plan={
+            "plan_id": "panel_plan_keep_ai_table_rows",
+            "panels": [
+                {
+                    "panel_id": "main",
+                    "nodes": [
+                        {
+                            "node_id": "table_1",
+                            "component": "TablePanel",
+                            "source_layout_ids": ["layout_table_1"],
+                            "props": {
+                                "title": "Table 5",
+                                "rows": [["legacy"]],
+                                "logical_rows": [
+                                    {
+                                        "logical_row_id": "logical_row_0",
+                                        "row_role": "header",
+                                        "source_row_indices": [0, 1],
+                                        "cells": [
+                                            {
+                                                "text": "DeepSeek-R1\ndistill-Qwen-32B",
+                                                "col_start": 0,
+                                                "col_span": 1,
+                                            },
+                                            {
+                                                "text": "BF16\n(Reported)",
+                                                "col_start": 1,
+                                                "col_span": 1,
+                                            },
+                                        ],
+                                    }
+                                ],
+                                "logical_header_row_count": 1,
+                                "reconstruction_mode": "ai_logical_rows",
+                                "reconstruction_notes": ["ai_table_logical_rows"],
+                            },
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "layout_table_1",
+                "source_text": "Table 5",
+                "type": "table",
+            }
+        ],
+        layout_to_block_ids={"layout_table_1": ["p7_dm_table_1"]},
+        base_payload={
+            "assets": [],
+            "blocks": [],
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout_table_1",
+                        "clean_text": "Table 5",
+                        "raw_text": "Table 5",
+                        "canonical_block_ids": ["p7_dm_table_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 220},
+                            {"x": 920, "y": 220},
+                            {"x": 920, "y": 720},
+                            {"x": 120, "y": 720},
+                        ],
+                        "blocks": [
+                            {
+                                "block_index": 1,
+                                "text": "Table 5",
+                                "pos": [
+                                    {"x": 120, "y": 220},
+                                    {"x": 920, "y": 220},
+                                    {"x": 920, "y": 720},
+                                    {"x": 120, "y": 720},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "evidence_map": [
+                    {
+                        "source_layout_id": "layout_table_1",
+                        "source_block_ids": ["p7_dm_table_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 220},
+                            {"x": 920, "y": 220},
+                            {"x": 920, "y": 720},
+                            {"x": 120, "y": 720},
+                        ],
+                        "block_positions": [
+                            [
+                                {"x": 120, "y": 220},
+                                {"x": 920, "y": 220},
+                                {"x": 920, "y": 720},
+                                {"x": 120, "y": 720},
+                            ]
+                        ],
+                    }
+                ],
+                "page_image": {"width": 1600, "height": 2200},
+            },
+        },
+        style_intent=None,
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list(ui_plan.get("components") or [])
+    assert len(components) == 1
+    node = dict(components[0] or {})
+    props = dict(node.get("props") or {})
+    assert str(props.get("reconstruction_mode") or "") == "ai_logical_rows"
+    assert list(props.get("reconstruction_notes") or []) == ["ai_table_logical_rows"]
+    assert int(props.get("logical_header_row_count") or 0) == 1
+    logical_rows = list(props.get("logical_rows") or [])
+    assert len(logical_rows) == 1
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((((logical_rows[0] or {}).get("cells") or [])[0].get("text") or "")) == "DeepSeek-R1\ndistill-Qwen-32B"
+
+
 @pytest.mark.asyncio
 async def test_build_or_get_composed_payload_should_route_layout_uid_v1_pipeline(monkeypatch):
     service = LiteratureReaderComposeService()
