@@ -932,7 +932,7 @@ def _experience_plan_cache_key(
     provider_token = str(getattr(settings, "generative_reader_agent_provider", "") or getattr(settings, "reader_agent_provider", "") or "").strip()
     model_hash = hashlib.sha256(f"{provider_token}:{model_token}".encode("utf-8")).hexdigest()[:12]
     return (
-        f"lit:experience:v15:{int(user_id)}:{int(paper_id)}:{int(focus_page)}:{int(selected_kb_id)}:"
+        f"lit:experience:v16:{int(user_id)}:{int(paper_id)}:{int(focus_page)}:{int(selected_kb_id)}:"
         f"{sig_hash}:{plan_hash}:{intent_hash}:{profile_hash}:{sections_hash}:{model_hash}"
     )
 

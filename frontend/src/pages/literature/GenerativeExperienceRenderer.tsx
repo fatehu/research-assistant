@@ -460,7 +460,7 @@ export function GenerativeExperienceRenderer(props: GenerativeExperienceRenderer
               <div className="reader-experience-page__hero-claims">
                 {preferDisplayCopy(hero?.display_subtitle, hero?.subtitle) ? (
                   <Card size="small" className="reader-experience-page__module-card reader-experience-page__hero-mini">
-                    <Text className="reader-experience-page__eyebrow">为什么值得读</Text>
+                    <Text className="reader-experience-page__eyebrow">阅读切入点</Text>
                     <Paragraph className="reader-experience-page__summary">{preferDisplayCopy(hero?.display_subtitle, hero?.subtitle)}</Paragraph>
                   </Card>
                 ) : null}

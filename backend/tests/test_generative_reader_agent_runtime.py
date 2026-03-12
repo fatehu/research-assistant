@@ -639,6 +639,28 @@ def test_build_experience_plan_should_emit_display_copy_fields():
     assert experience["meta"]["content_budget"]["max_claim_cards"] >= 1
 
 
+def test_build_experience_plan_should_keep_storyboard_purpose_out_of_user_visible_summary():
+    runtime = GenerativeReaderAgentRuntime()
+
+    experience = runtime.build_experience_plan(
+        paper_id=78,
+        focus_page=7,
+        user_intent="help me understand this page",
+        reader_profile="curious_generalist",
+        focus_section_ids=[],
+        compose_payload=_sample_payload(),
+        generative_plan=_sample_done_plan(),
+    )
+
+    sections = {row["section_type"]: row for row in experience["main_sections"]}
+
+    assert sections["focus_stage"]["meta"]["planner_purpose"] == "先围绕最关键的图或证据建立理解抓手，不急着把所有信息同时展开。"
+    assert sections["reading_flow"]["meta"]["planner_purpose"] == "把清洗后的正文作为主阅读流，避免让辅助卡片替代论文内容本身。"
+    assert "理解抓手" not in sections["focus_stage"]["display_summary"]
+    assert "清洗后的正文" not in sections["reading_flow"]["display_summary"]
+    assert "辅助卡片替代论文内容本身" not in sections["reading_flow"]["display_summary"]
+
+
 def test_build_experience_plan_should_prune_redundant_modules_by_budget():
     runtime = GenerativeReaderAgentRuntime()
     plan = _sample_done_plan()

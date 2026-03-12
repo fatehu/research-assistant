@@ -1077,6 +1077,39 @@ class GenerativeReaderAgentRuntime:
         return "外部资源要少而精，只在它们能降低读者困惑时再使用。"
 
     @staticmethod
+    def _compose_section_display_summary(
+        *,
+        section_type: str,
+        archetype: str,
+        focus_label: str,
+        background_topics: Sequence[str],
+        resource_strategy: str,
+    ) -> str:
+        section_token = str(section_type or "").strip()
+        focus_token = str(focus_label or "").strip()
+        if section_token == "hero":
+            return "先明确这一页最值得关注的问题，再进入图和正文。"
+        if section_token == "focus_stage":
+            if archetype == "figure_explainer" and focus_token:
+                return f"先看 {focus_token}，抓住这页最关键的结果和比较对象。"
+            return "先抓住最关键的图或证据，再带着问题回到正文。"
+        if section_token == "reading_flow":
+            return "回到正文，确认作者如何解释这些结果，以及证据是否支撑结论。"
+        if section_token == "explainer_cluster":
+            return "把读懂这一页必须知道的术语、指标和概念补齐。"
+        if section_token == "supporting_resources":
+            if background_topics:
+                return f"补充理解这页所需的 {', '.join(background_topics[:2])} 等背景，而不是替代论文本身。"
+            if resource_strategy:
+                return "补充少量高相关的外部资料，帮助理解这页内容。"
+            return "补充理解这页所需的少量背景资料，而不是替代论文内容。"
+        if section_token == "question_lab":
+            return "用几个追问检查自己是否真正理解了这一页。"
+        if section_token == "story_map":
+            return "在不打扰主阅读面的前提下，补充这页的叙事意图、阅读钩子和工具决策。"
+        return "围绕当前页面的核心内容组织一个更易读的阅读入口。"
+
+    @staticmethod
     def _dedupe_strings(rows: Sequence[str], limit: Optional[int] = None) -> List[str]:
         deduped: List[str] = []
         seen: set[str] = set()
@@ -2115,12 +2148,21 @@ class GenerativeReaderAgentRuntime:
                 "question_lab": "继续探索",
             }
         section_summaries = {
-            "hero": "先帮助读者建立这一页的阅读目标，再进入证据与正文。",
-            "focus_stage": hero_angle or "把最关键的图或证据放到页面中心，先帮助读者建立理解抓手。",
-            "reading_flow": "保留清洗后的正文阅读流，作为这页最稳定的论文内容。",
-            "explainer_cluster": "只展示真正能降低理解门槛的解释内容。",
-            "supporting_resources": resource_strategy or "补充少量高相关的外部资源，帮助理解正文而不是替代正文。",
-            "question_lab": "把理解进一步转化为追问、比较和继续探索。",
+            section_type: self._compose_section_display_summary(
+                section_type=section_type,
+                archetype=page_archetype,
+                focus_label=focus_label,
+                background_topics=page_brief.get("resource_gaps") or [],
+                resource_strategy=resource_strategy,
+            )
+            for section_type in [
+                "hero",
+                "focus_stage",
+                "reading_flow",
+                "explainer_cluster",
+                "supporting_resources",
+                "question_lab",
+            ]
         }
 
         section_entries: Dict[str, Dict[str, Any]] = {
@@ -2248,8 +2290,11 @@ class GenerativeReaderAgentRuntime:
                 entry["title"] = beat_title
                 entry["display_title"] = beat_title
             if beat_purpose:
-                entry["summary"] = beat_purpose
-                entry["display_summary"] = beat_purpose
+                entry_meta = dict(entry.get("meta") or {})
+                entry_meta["planner_purpose"] = beat_purpose
+                entry_meta["planner_role"] = str(beat.get("role") or "").strip()
+                entry_meta["planner_beat_id"] = str(beat.get("beat_id") or "").strip()
+                entry["meta"] = entry_meta
             if beat_target_ids:
                 entry["target_ids"] = self._dedupe_strings([*beat_target_ids, *list(entry.get("target_ids") or [])])
 

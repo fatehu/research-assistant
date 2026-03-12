@@ -1,6 +1,6 @@
 # Generative UI Rollout Plan
 
-Last updated: 2026-03-11
+Last updated: 2026-03-12
 Status: in progress
 Owner: Codex + repository maintainers
 
@@ -88,6 +88,10 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [x] Create a block registry so the model can only select known block types.
 - [x] Move Figure, Glossary, Question, Resource, and the current widget families into the registry.
 - [x] Support block-level loading, partial, empty, and error states.
+- [ ] Reduce dependence on the fixed `section_type` taxonomy:
+  treat the current section enum as a transitional compatibility layer, and keep moving toward layout/block-oriented execution instead of column names with AI-filled content.
+- [ ] Remove remaining renderer-side section-specific branching where a block/layout contract can express the same intent:
+  the goal is not a prettier template shell, but a thinner execution layer over plan outputs.
 - [ ] Support incremental block patching instead of full-page refresh.
 - [ ] Add runtime telemetry for render failures, durations, and engagement.
 - [x] Turn workbench into a debug/inspection surface instead of a second product path.
@@ -193,3 +197,5 @@ The system should stay grounded in deterministic reader extraction, and use gene
   section `blocks` can now surface `ready / loading / partial / empty / error`, and the renderer degrades each block without collapsing the whole section.
 - [x] Seed Phase 6 evaluation assets with a hybrid golden set and snapshot guards:
   add one real paper-page golden plus contract fixtures for methods-heavy and concept-heavy coverage, alongside generative/experience snapshot tests and an eval asset guard.
+- [x] Separate internal planning copy from user-visible section summaries:
+  storyboard `purpose` now stays in section metadata as planner notes, while `/experience` shows user-facing summaries instead of prompt-like planning text.

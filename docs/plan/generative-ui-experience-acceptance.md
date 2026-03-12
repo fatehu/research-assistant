@@ -660,6 +660,8 @@ npm --prefix frontend run build
 - [x] `ReaderExperienceBlockRef.state` 扩展为：
   `ready / loading / partial / empty / error`
 - [x] `GenerativeExperienceRenderer` 增加 block-level loading / partial / empty / error 降级显示，而不是只依赖 section 级空态
+- [x] 修正 hero mini card 的语义标签：
+  原先将 `hero subtitle / hero_angle` 误标成“为什么值得读”，现改回“阅读切入点”，避免把阅读策略当成页面价值判断
 - [x] 新增 Phase 6 评测骨架：
   `golden_pages.json`、generative/experience snapshot fixtures、`test_generative_ui_evaluation.py`、`check_generative_ui_eval_assets.py`
 - [x] 新增 runtime 回归：
@@ -679,3 +681,43 @@ npm --prefix frontend run build
 - [ ] `http://localhost:3000/literature/78/experience?page=7&reader=curious_generalist` 是否继续稳定显示，不因为 block 状态契约或 renderer 收敛而出现新异常
 - [ ] `http://localhost:3000/literature/78/read/workbench?page=7&reader=curious_generalist` 是否明显更像 debug shell，而不是另一套产品页模板
 - [ ] `/experience` 的 block 在内容不足时，是否更像“局部 loading / partial / empty / error 降级”，而不是整页坏掉
+
+## 2026-03-12 Iteration 18
+
+范围：
+
+- `/literature/78/experience?page=7&reader=curious_generalist`
+- 目标：收掉“规划腔文案直接露到页面”的系统问题，把 storyboard planning note 与用户可见 section summary 分层
+
+自动化结果：
+
+- [x] `backend/.venv-incremental/bin/python -m pytest backend/tests/test_generative_reader_agent_runtime.py -q`
+  结果：`33 passed`
+- [x] `backend/.venv-incremental/bin/python -m pytest backend/tests/test_generative_ui_evaluation.py -q`
+  结果：`3 passed`
+- [x] `backend/.venv-incremental/bin/python -m pytest backend/tests/test_literature_reader_api.py -k "experience_plan or generative_plan or reader_experience_flow" -q`
+  结果：`7 passed`
+- [x] `cd frontend && ./node_modules/.bin/eslint src/pages/literature/GenerativeExperienceRenderer.tsx`
+  结果：退出码 `0`
+
+本轮代码结果：
+
+- [x] `storyboard.purpose` 不再直接覆盖 `section.display_summary`
+- [x] section `meta` 新增：
+  `planner_purpose / planner_role / planner_beat_id`
+- [x] `/experience` section summary 改为真正面向读者的展示文案，而不是“主阅读流 / 理解抓手 / 主画布”这类内部规划语句
+- [x] hero mini card 继续保留“阅读切入点”语义，不再把策略文案误标成“为什么值得读”
+- [x] experience cache key 升级到新版本，避免旧的 prompt-like page summary 继续命中缓存
+
+问题记录：
+
+- [x] 此前页面里出现的
+  “把清洗后的正文作为主阅读流……”
+  “先围绕最关键的图或证据建立理解抓手……”
+  这类句子，根因是 storyboard `purpose` 被直接当成 section summary 输出
+- [x] 现在这些句子仍保留在 debug 元数据里，便于诊断，但不再默认展示在产品页主视图
+
+本轮待你手工确认：
+
+- [ ] `/experience` 的各 section 说明是否不再像提示词/规划 note，而更像给读者的解释型文案
+- [ ] 如果你展开 debug/workbench 信息，仍能看到 planner purpose 等内部规划线索
