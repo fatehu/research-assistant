@@ -240,13 +240,17 @@ function mergeTableCellText(base: string, extra: string): string {
   return Array.from(new Set(lines)).join('\n')
 }
 
-function isContinuationTableRow(cells: TableCellShape[]): boolean {
-  if (cells.length === 0) return false
-  const meaningfulCells = cells.filter((cell) => asString(cell.text))
-  const effectiveCells = meaningfulCells.length > 0 ? meaningfulCells : cells
+function shouldMergeTableRowIntoPrevious(
+  previousLogicalRow: LogicalTableRowShape | undefined,
+  nextCells: TableCellShape[],
+  nextRowIndex: number,
+): boolean {
+  if (!previousLogicalRow || nextCells.length === 0) return false
+  const meaningfulCells = nextCells.filter((cell) => asString(cell.text))
+  const effectiveCells = meaningfulCells.length > 0 ? meaningfulCells : nextCells
   const firstColumn = Math.min(...effectiveCells.map((cell) => cell.colStart))
-  const hasLeadingColumnContent = effectiveCells.some((cell) => cell.colStart === 0 && asString(cell.text))
-  return !hasLeadingColumnContent && firstColumn > 0
+  if (firstColumn <= 0) return false
+  return previousLogicalRow.cells.some((cell) => cell.colStart < firstColumn && cell.rowEnd >= nextRowIndex)
 }
 
 function appendCellsToLogicalRow(target: LogicalTableRowShape, nextCells: TableCellShape[]): void {
@@ -272,7 +276,11 @@ function buildLogicalTableRows(rows: StructuredTableRowShape[]): LogicalTableRow
   const logicalRows: LogicalTableRowShape[] = []
   const physicalToLogical = new Map<number, number>()
   for (const row of rows) {
-    const shouldMergeIntoPrevious = isContinuationTableRow(row.cells) && logicalRows.length > 0
+    const shouldMergeIntoPrevious = shouldMergeTableRowIntoPrevious(
+      logicalRows[logicalRows.length - 1],
+      row.cells,
+      row.rowIndex,
+    )
     if (shouldMergeIntoPrevious) {
       const targetIndex = logicalRows.length - 1
       const target = logicalRows[targetIndex]
