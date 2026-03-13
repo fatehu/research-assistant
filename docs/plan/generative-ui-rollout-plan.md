@@ -263,5 +263,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
   2026-03-13: runtime gap identified. The AI pass was wired into `layout_uid_v1`, but `_panel_plan_to_ui_plan(...)`
   dropped `logical_rows / logical_header_row_count / reconstruction_mode / reconstruction_notes`, so live `TablePanel`
   props still fell back to deterministic rows. Fix paired with `reader_compose_v10`.
+  2026-03-13: prompt/payload strengthened for benchmark-table pairing. The AI table pass now explicitly recognizes
+  multi-line headers, `value + (±)` row pairs, and blank-first-column continuation rows, and receives row-level hints
+  (`blank_first_column`, `numeric_like_count`, `uncertainty_like_count`, `contains_pm`, `looks_like_uncertainty_row`).
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

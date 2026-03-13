@@ -6927,6 +6927,37 @@ def test_layout_uid_group_plan_to_panel_plan_should_apply_ai_table_logical_rows(
     assert str((((logical_rows[1] or {}).get("cells") or [])[1].get("text") or "")) == "72.6\n(±2.75)"
 
 
+def test_layout_uid_table_logical_row_system_prompt_should_describe_value_uncertainty_pairing():
+    service = LiteratureReaderComposeService()
+    prompt = service._layout_uid_table_logical_row_system_prompt()  # pylint: disable=protected-access
+
+    assert "value row and its uncertainty row `(±...)` usually belong to the same logical data row" in prompt
+    assert "blank first-column continuation row" in prompt
+    assert "multi-line headers" in prompt
+
+
+def test_build_layout_uid_table_logical_row_prompt_payload_should_include_pairing_hints():
+    service = LiteratureReaderComposeService()
+    payload = service._build_layout_uid_table_logical_row_prompt_payload(  # pylint: disable=protected-access
+        page=7,
+        title="Table 5",
+        caption="Benchmark results",
+        table_cells=[
+            {"cell_id": 1, "row_start": 2, "row_end": 2, "col_start": 0, "col_end": 0, "text": "AIME 2024"},
+            {"cell_id": 2, "row_start": 2, "row_end": 2, "col_start": 1, "col_end": 1, "text": "72.6"},
+            {"cell_id": 3, "row_start": 3, "row_end": 3, "col_start": 1, "col_end": 1, "text": "(±2.75)"},
+            {"cell_id": 4, "row_start": 3, "row_end": 3, "col_start": 2, "col_end": 2, "text": "(±4.71)"},
+        ],
+    )
+
+    rows = list(payload.get("physical_rows") or [])
+    assert len(rows) == 2
+    assert dict(rows[0].get("hints") or {}).get("blank_first_column") is False
+    assert dict(rows[1].get("hints") or {}).get("blank_first_column") is True
+    assert dict(rows[1].get("hints") or {}).get("looks_like_uncertainty_row") is True
+    assert "value_plus_uncertainty" in list((payload.get("rules") or {}).get("common_patterns") or [])
+
+
 def test_panel_plan_to_ui_plan_should_keep_ai_table_logical_row_fields():
     service = LiteratureReaderComposeService()
     ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access

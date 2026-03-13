@@ -1148,15 +1148,76 @@ class LiteratureReaderComposeService:
             "Never rewrite cell text, never invent cells, never modify geometry, and never invent row indices. "
             "Use the attached page image only as visual reference for whether adjacent physical rows belong to the same logical benchmark row. "
             "Each physical row index must be assigned exactly once. "
+            "Important patterns: multi-line headers should usually become one logical header row; "
+            "a value row and its uncertainty row `(±...)` usually belong to the same logical data row; "
+            "a blank first-column continuation row that continues benchmark values from the row above should usually be merged upward; "
+            "rows with a benchmark label in the first column usually start a new logical row. "
             "Return JSON with status and step_result. "
             "Output format: "
             "{\"status\":\"done\",\"step_result\":{\"logical_rows\":["
-            "{\"logical_row_id\":\"lr1\",\"row_role\":\"header\",\"source_row_indices\":[0,1],\"rationale\":\"multi_line_header\"}"
+            "{\"logical_row_id\":\"lr1\",\"row_role\":\"header\",\"source_row_indices\":[0,1],\"rationale\":\"multi_line_header\"},"
+            "{\"logical_row_id\":\"lr2\",\"row_role\":\"data\",\"source_row_indices\":[2,3],\"rationale\":\"value_plus_uncertainty\"}"
             "],\"notes\":[\"...\"]}}"
         )
 
     @staticmethod
+    def _looks_like_numeric_table_cell(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(
+            re.fullmatch(r"[-+±]?\d+(?:\.\d+)?%?", text)
+            or re.fullmatch(r"\(±?\d+(?:\.\d+)?\)", text)
+            or re.fullmatch(r"\d+(?:\.\d+)?", text)
+        )
+
+    @staticmethod
+    def _looks_like_uncertainty_table_cell(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"\(±?\d+(?:\.\d+)?\)", text) or "±" in text)
+
+    def _build_layout_uid_table_physical_row_hints(
+        self,
+        *,
+        row_index: int,
+        cells: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized_cells = [dict(cell) for cell in list(cells or []) if isinstance(cell, Mapping)]
+        first_col_text = ""
+        if normalized_cells:
+            first_cell = min(normalized_cells, key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)))
+            if int(first_cell.get("col_start") or 0) == 0:
+                first_col_text = self._normalize_spaces(str(first_cell.get("text") or ""))
+        texts = [self._normalize_spaces(str(cell.get("text") or "")) for cell in normalized_cells]
+        non_empty_texts = [text for text in texts if text]
+        non_empty_col_starts = sorted(
+            {
+                int(cell.get("col_start") or 0)
+                for cell in normalized_cells
+                if self._normalize_spaces(str(cell.get("text") or ""))
+            }
+        )
+        uncertainty_like_count = sum(1 for text in non_empty_texts if self._looks_like_uncertainty_table_cell(text))
+        numeric_like_count = sum(1 for text in non_empty_texts if self._looks_like_numeric_table_cell(text))
+        return {
+            "row_index": int(row_index),
+            "first_col_text": first_col_text,
+            "blank_first_column": not bool(first_col_text),
+            "non_empty_col_starts": non_empty_col_starts,
+            "numeric_like_count": int(numeric_like_count),
+            "uncertainty_like_count": int(uncertainty_like_count),
+            "contains_pm": any("±" in text for text in non_empty_texts),
+            "looks_like_uncertainty_row": bool(
+                non_empty_texts
+                and uncertainty_like_count >= max(1, len(non_empty_texts) // 2)
+                and not first_col_text
+            ),
+        }
+
     def _build_layout_uid_table_physical_rows(
+        self,
         table_cells: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
         rows_map: Dict[int, List[Dict[str, Any]]] = {}
@@ -1188,6 +1249,7 @@ class LiteratureReaderComposeService:
                 {
                     "row_index": int(row_index),
                     "cells": cells,
+                    "hints": self._build_layout_uid_table_physical_row_hints(row_index=row_index, cells=cells),
                 }
             )
         return physical_rows
@@ -1220,6 +1282,11 @@ class LiteratureReaderComposeService:
                 "forbid_text_rewrite": True,
                 "forbid_geometry_mutation": True,
                 "allowed_row_roles": ["header", "data", "note"],
+                "common_patterns": [
+                    "multi_line_header",
+                    "value_plus_uncertainty",
+                    "blank_first_column_continuation",
+                ],
             },
         }
 
