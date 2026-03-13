@@ -258,7 +258,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `/read` evidence/highlight changes must now follow explicit rules in `docs/TESTING_GUIDE.md` and `docs/LITERATURE_TEST_GUIDE.md`, including DocMind-only geometry truth, no global preview-path changes for local table/formula fixes, and mandatory prose-heavy plus table-heavy regression pages before merging evidence-chain changes.
 - [x] Move `/read` formulas to an image-first display contract:
   `EquationBlock` now carries `render_mode=image_first` plus `transcript`, the body view prefers the original formula crop instead of forcing low-quality OCR into KaTeX, and OCR text is demoted to an optional transcript fallback.
-- [ ] Add an AI-assisted logical-row reconstruction pass for `/read` tables:
+- [x] Add an AI-assisted logical-row reconstruction pass for `/read` tables:
   keep DocMind `cells[]` and `uniqueId -> blocks[].pos` as geometry truth, use current-page render plus raw physical rows only to group physical rows into logical rows, and require strict exact-once fallback-safe validation before any table plan can override the current deterministic materializer.
   2026-03-13: runtime gap identified. The AI pass was wired into `layout_uid_v1`, but `_panel_plan_to_ui_plan(...)`
   dropped `logical_rows / logical_header_row_count / reconstruction_mode / reconstruction_notes`, so live `TablePanel`
@@ -266,5 +266,9 @@ The system should stay grounded in deterministic reader extraction, and use gene
   2026-03-13: prompt/payload strengthened for benchmark-table pairing. The AI table pass now explicitly recognizes
   multi-line headers, `value + (±)` row pairs, and blank-first-column continuation rows, and receives row-level hints
   (`blank_first_column`, `numeric_like_count`, `uncertainty_like_count`, `contains_pm`, `looks_like_uncertainty_row`).
+  2026-03-13: live image delivery stabilized. `_invoke_single_agent_model(...)` now localizes safe remote page-image URLs to
+  local prompt-cache files before calling DashScope, so normal `/read` fresh rebuilds no longer fall back with
+  `Failed to download multimodal content`. Fresh `paper 85 / page 7` rebuilds now return `reader_compose_v11` with
+  `reconstruction_mode=ai_logical_rows` and `logical_rows=13`.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.

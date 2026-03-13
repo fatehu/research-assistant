@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+from io import BytesIO
 
 import pytest
 
@@ -6362,6 +6363,127 @@ def test_pipeline_version_should_default_to_layout_uid_v1_when_unset(monkeypatch
     monkeypatch.setattr(settings, "reader_pipeline_version", "")
 
     assert service._pipeline_version() == "layout_uid_v1"  # pylint: disable=protected-access
+
+
+def test_build_page_grounding_v1_should_localize_remote_page_image_when_path_missing(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+
+    class _FakeHeaders:
+        @staticmethod
+        def get_content_type():
+            return "image/png"
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def info(self):
+            return _FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    image_bytes = BytesIO()
+    from PIL import Image
+    Image.new("RGB", (32, 48), color="white").save(image_bytes, format="PNG")
+
+    monkeypatch.setattr(compose_module, "urlopen", lambda *_args, **_kwargs: _FakeResponse(image_bytes.getvalue()))
+
+    grounding = service._build_page_grounding_v1(  # pylint: disable=protected-access
+        page=7,
+        payload={
+            "paper_id": 85,
+            "docmind_structure": {
+                "layouts": [],
+                "page_image_url": "https://example.com/docmind/page7.png",
+                "page_image_path": "",
+            },
+            "page_structure_v3": {"block_groups": []},
+        },
+    )
+
+    page_image = dict(grounding.get("page_image") or {})
+    localized_path = str(page_image.get("path") or "")
+    assert localized_path
+    assert os.path.exists(localized_path)
+    assert localized_path.endswith(".png")
+
+
+@pytest.mark.asyncio
+async def test_invoke_single_agent_model_should_localize_remote_prompt_image_for_dashscope(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(compose_module.settings, "aliyun_api_key", "test-key")
+    monkeypatch.setattr(compose_module.settings, "aliyun_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setattr(compose_module.settings, "reader_agent_model", "qwen-3.5-plus")
+
+    class _FakeHeaders:
+        @staticmethod
+        def get_content_type():
+            return "image/png"
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def info(self):
+            return _FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    image_bytes = BytesIO()
+    from PIL import Image
+    Image.new("RGB", (48, 32), color="white").save(image_bytes, format="PNG")
+
+    monkeypatch.setattr(compose_module, "urlopen", lambda *_args, **_kwargs: _FakeResponse(image_bytes.getvalue()))
+    captured = {"image_paths": []}
+
+    async def _fake_chat_json(**kwargs):
+        captured["image_paths"] = list(kwargs.get("image_paths") or [])
+        return {
+            "parsed": {
+                "status": "done",
+                "step_result": {"ok": True},
+                "self_check": {},
+                "fixes_applied": [],
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        }
+
+    monkeypatch.setattr(DashScopeMultimodalService, "is_available", staticmethod(lambda: True))
+    monkeypatch.setattr(DashScopeMultimodalService, "chat_json", _fake_chat_json)
+
+    result = await service._invoke_single_agent_model(  # pylint: disable=protected-access
+        system_prompt="Group table rows.",
+        user_prompt={"rows": []},
+        rendered_page_image="https://example.com/docmind/page7.png",
+        rendered_page_image_path="",
+        step=2,
+        phase="layout_uid_table_logical_rows:table_1",
+    )
+
+    assert result["status"] == "done"
+    assert captured["image_paths"]
+    localized_uri = str(captured["image_paths"][0])
+    assert localized_uri.startswith("file://")
+    localized_path = localized_uri.removeprefix("file://")
+    assert os.path.exists(localized_path)
+    assert localized_path.endswith(".png")
 
 
 def test_panel_plan_to_ui_plan_should_emit_layout_geometry_anchor_and_source_atom_ids():

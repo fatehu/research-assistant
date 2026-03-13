@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v10"
+COMPOSE_ENGINE_VERSION = "reader_compose_v11"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -4508,8 +4508,13 @@ class LiteratureReaderComposeService:
 
         request_timeout = max(2.0, float(int(getattr(settings, "reader_agent_timeout_ms", 90000) or 90000)) / 1000.0)
         max_tokens = max(512, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000))
+        localized_prompt_image_path = self._ensure_local_prompt_image_path(
+            image_url=str(rendered_page_image or "").strip(),
+            image_path=str(rendered_page_image_path or "").strip(),
+            cache_key=f"{phase}:{step}:{str(rendered_page_image or '').strip()}",
+        )
         local_image_paths = DashScopeMultimodalService.collect_local_file_uris(
-            str(rendered_page_image_path or "").strip(),
+            str(localized_prompt_image_path or "").strip(),
             limit=1,
         )
         if (
@@ -14914,6 +14919,102 @@ class LiteratureReaderComposeService:
 
         return None, None
 
+    def _ensure_local_grounding_page_image(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        page_image_url: str,
+        page_image_path: str,
+    ) -> str:
+        local_path = str(page_image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            return local_path
+
+        remote_url = str(page_image_url or "").strip()
+        if not self._is_safe_http_url(remote_url):
+            return local_path
+
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        os.makedirs(out_dir, exist_ok=True)
+        parsed = urlparse(remote_url)
+        filename = os.path.basename(parsed.path)
+        fallback_target = os.path.join(out_dir, f"page_{max(1, int(page))}.png")
+        existing_targets = [
+            os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+            for ext in ("png", "jpg", "jpeg", "webp")
+        ]
+        for target in existing_targets:
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+
+        try:
+            with urlopen(remote_url, timeout=20) as response:  # nosec B310 - trusted DocMind image URL
+                data = response.read()
+                content_type = ""
+                try:
+                    content_type = str(response.info().get_content_type() or "").strip().lower()
+                except Exception:
+                    content_type = ""
+            if not data:
+                return local_path
+            extension = self._guess_image_extension(filename=filename, content_type=content_type)
+            target = os.path.join(out_dir, f"page_{max(1, int(page))}.{extension}")
+            with open(target, "wb") as fp:
+                fp.write(data)
+            return target if os.path.exists(target) and os.path.getsize(target) > 0 else fallback_target
+        except Exception as exc:
+            logger.warning(f"[ReaderComposeService] failed to localize grounding page image: {exc}")
+            return local_path
+
+    def _ensure_local_prompt_image_path(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        cache_key: str,
+    ) -> str:
+        local_path = str(image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            return local_path
+
+        remote_url = str(image_url or "").strip()
+        if not self._is_safe_http_url(remote_url):
+            return local_path
+
+        cache_token = str(cache_key or remote_url or "prompt_image").strip()
+        digest = hashlib.sha256(cache_token.encode("utf-8")).hexdigest()[:20]
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, "prompt_images")
+        os.makedirs(out_dir, exist_ok=True)
+        existing_targets = [
+            os.path.join(out_dir, f"{digest}.{ext}")
+            for ext in ("png", "jpg", "jpeg", "webp")
+        ]
+        for target in existing_targets:
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+
+        parsed = urlparse(remote_url)
+        filename = os.path.basename(parsed.path)
+        try:
+            with urlopen(remote_url, timeout=20) as response:  # nosec B310 - trusted DocMind image URL
+                data = response.read()
+                content_type = ""
+                try:
+                    content_type = str(response.info().get_content_type() or "").strip().lower()
+                except Exception:
+                    content_type = ""
+            if not data:
+                return local_path
+            extension = self._guess_image_extension(filename=filename, content_type=content_type)
+            target = os.path.join(out_dir, f"{digest}.{extension}")
+            with open(target, "wb") as fp:
+                fp.write(data)
+            return target if os.path.exists(target) and os.path.getsize(target) > 0 else local_path
+        except Exception as exc:
+            logger.warning(f"[ReaderComposeService] failed to localize prompt image: {exc}")
+            return local_path
+
     def _build_layout_uid_anchor_from_grounding(
         self,
         *,
@@ -15390,8 +15491,15 @@ class LiteratureReaderComposeService:
                 }
             )
 
+        paper_id = int(payload.get("paper_id") or 0) or 0
         page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
         page_image_path = str(docmind_structure.get("page_image_path") or "").strip()
+        page_image_path = self._ensure_local_grounding_page_image(
+            paper_id=paper_id,
+            page=page,
+            page_image_url=page_image_url,
+            page_image_path=page_image_path,
+        )
         page_image_width = int(docmind_structure.get("page_image_width") or 0) or None
         page_image_height = int(docmind_structure.get("page_image_height") or 0) or None
         if not page_image_width or not page_image_height:
