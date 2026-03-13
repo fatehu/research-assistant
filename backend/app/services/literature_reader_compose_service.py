@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v11"
+COMPOSE_ENGINE_VERSION = "reader_compose_v12"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -1514,7 +1514,10 @@ class LiteratureReaderComposeService:
                 }
             )
 
+        logical_rows = self._normalize_layout_uid_logical_row_pairs(logical_rows)
+
         for logical_index, logical_row in enumerate(logical_rows):
+            logical_row["row_index"] = int(logical_index)
             for cell in list(logical_row.get("cells") or []):
                 physical_row_start = int(cell.get("row_start") or 0)
                 physical_row_end = int(cell.get("row_end") or physical_row_start)
@@ -1531,6 +1534,137 @@ class LiteratureReaderComposeService:
             else:
                 break
         return logical_rows, int(logical_header_row_count)
+
+    def _normalize_layout_uid_logical_row_pairs(
+        self,
+        logical_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized_rows: List[Dict[str, Any]] = []
+
+        def _cells_by_column(cells: Sequence[Mapping[str, Any]]) -> Dict[int, Dict[str, Any]]:
+            return {
+                int(cell.get("col_start") or 0): dict(cell)
+                for cell in list(cells or [])
+                if isinstance(cell, Mapping)
+            }
+
+        def _merge_rows(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+            previous_cells = [dict(cell) for cell in list(previous.get("cells") or []) if isinstance(cell, Mapping)]
+            previous_by_col = {int(cell.get("col_start") or 0): cell for cell in previous_cells}
+            current_cells = sorted(
+                [dict(cell) for cell in list(current.get("cells") or []) if isinstance(cell, Mapping)],
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+
+            for cell in current_cells:
+                col_start = int(cell.get("col_start") or 0)
+                existing = previous_by_col.get(col_start)
+                if existing is None:
+                    previous_cells.append(dict(cell))
+                    previous_by_col[col_start] = previous_cells[-1]
+                    continue
+                existing_text = self._normalize_spaces(str(existing.get("text") or ""))
+                incoming_text = self._normalize_spaces(str(cell.get("text") or ""))
+                if incoming_text and incoming_text != existing_text:
+                    existing["text"] = self._merge_layout_uid_table_cell_text(existing_text, incoming_text)
+                existing["layout_ids"] = list(
+                    dict.fromkeys(
+                        [
+                            *[str(item).strip() for item in list(existing.get("layout_ids") or []) if str(item).strip()],
+                            *[str(item).strip() for item in list(cell.get("layout_ids") or []) if str(item).strip()],
+                        ]
+                    )
+                )
+                for key in ("x0", "y0"):
+                    existing_value = existing.get(key)
+                    incoming_value = cell.get(key)
+                    if incoming_value is None:
+                        continue
+                    if existing_value is None:
+                        existing[key] = incoming_value
+                    else:
+                        existing[key] = min(float(existing_value), float(incoming_value))
+                for key in ("x1", "y1"):
+                    existing_value = existing.get(key)
+                    incoming_value = cell.get(key)
+                    if incoming_value is None:
+                        continue
+                    if existing_value is None:
+                        existing[key] = incoming_value
+                    else:
+                        existing[key] = max(float(existing_value), float(incoming_value))
+
+            previous["cells"] = sorted(
+                previous_cells,
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            previous["source_row_indices"] = sorted(
+                {
+                    int(item)
+                    for item in [
+                        *list(previous.get("source_row_indices") or []),
+                        *list(current.get("source_row_indices") or []),
+                    ]
+                    if isinstance(item, int) or str(item).strip().isdigit()
+                }
+            )
+            return previous
+
+        def _should_merge(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
+            if str(previous.get("row_role") or "").strip().lower() != "data":
+                return False
+            if str(current.get("row_role") or "").strip().lower() != "data":
+                return False
+
+            previous_by_col = _cells_by_column(previous.get("cells") or [])
+            current_by_col = _cells_by_column(current.get("cells") or [])
+            previous_label = self._normalize_spaces(str((previous_by_col.get(0) or {}).get("text") or ""))
+            current_label = self._normalize_spaces(str((current_by_col.get(0) or {}).get("text") or ""))
+            previous_first_metric = self._normalize_spaces(str((previous_by_col.get(1) or {}).get("text") or ""))
+            current_first_metric = self._normalize_spaces(str((current_by_col.get(1) or {}).get("text") or ""))
+
+            previous_numeric_cols = {
+                col_start
+                for col_start, cell in previous_by_col.items()
+                if col_start > 0
+                and self._looks_like_numeric_table_cell(str(cell.get("text") or ""))
+                and not self._looks_like_uncertainty_table_cell(str(cell.get("text") or ""))
+            }
+            current_uncertainty_cols = {
+                col_start
+                for col_start, cell in current_by_col.items()
+                if col_start > 0 and self._looks_like_uncertainty_table_cell(str(cell.get("text") or ""))
+            }
+            if not previous_numeric_cols or not current_uncertainty_cols:
+                return False
+
+            overlap = previous_numeric_cols & current_uncertainty_cols
+            if len(overlap) < max(2, len(current_uncertainty_cols) // 2):
+                return False
+
+            previous_blank_lead = not previous_label and not previous_first_metric
+            current_blank_lead = not current_label and not current_first_metric
+            return previous_blank_lead or current_blank_lead
+
+        for raw_row in list(logical_rows or []):
+            if not isinstance(raw_row, Mapping):
+                continue
+            current = {
+                "row_index": int(raw_row.get("row_index") or len(normalized_rows)),
+                "row_role": str(raw_row.get("row_role") or "data").strip() or "data",
+                "source_row_indices": [
+                    int(item)
+                    for item in list(raw_row.get("source_row_indices") or [])
+                    if isinstance(item, int) or str(item).strip().isdigit()
+                ],
+                "cells": [dict(cell) for cell in list(raw_row.get("cells") or []) if isinstance(cell, Mapping)],
+            }
+            if normalized_rows and _should_merge(normalized_rows[-1], current):
+                normalized_rows[-1] = _merge_rows(normalized_rows[-1], current)
+                continue
+            normalized_rows.append(current)
+
+        return normalized_rows
 
     def _build_layout_uid_table_props(
         self,

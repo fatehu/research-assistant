@@ -7080,6 +7080,59 @@ def test_build_layout_uid_table_logical_row_prompt_payload_should_include_pairin
     assert "value_plus_uncertainty" in list((payload.get("rules") or {}).get("common_patterns") or [])
 
 
+def test_materialize_layout_uid_logical_table_rows_should_merge_sparse_value_row_with_uncertainty_row():
+    service = LiteratureReaderComposeService()
+    logical_rows, logical_header_row_count = service._materialize_layout_uid_logical_table_rows(  # pylint: disable=protected-access
+        normalized_cells=[
+            {"cell_id": 1, "row_start": 0, "row_end": 0, "col_start": 2, "col_end": 2, "text": "38.34", "layout_ids": ["r0c2"]},
+            {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 3, "col_end": 3, "text": "41.66", "layout_ids": ["r0c3"]},
+            {"cell_id": 3, "row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0, "text": "AIME 2024", "layout_ids": ["r1c0"]},
+            {"cell_id": 4, "row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1, "text": "39.2", "layout_ids": ["r1c1"]},
+            {"cell_id": 5, "row_start": 1, "row_end": 1, "col_start": 2, "col_end": 2, "text": "(±2.52)", "layout_ids": ["r1c2"]},
+            {"cell_id": 6, "row_start": 1, "row_end": 1, "col_start": 3, "col_end": 3, "text": "(±4.72)", "layout_ids": ["r1c3"]},
+        ],
+        logical_row_plan={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "data", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1]},
+            ]
+        },
+    )
+
+    assert logical_header_row_count == 0
+    assert len(logical_rows) == 1
+    cells = {int(cell.get("col_start") or 0): dict(cell) for cell in list((logical_rows[0] or {}).get("cells") or [])}
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((cells[0].get("text") or "")) == "AIME 2024"
+    assert str((cells[1].get("text") or "")) == "39.2"
+    assert str((cells[2].get("text") or "")) == "38.34\n(±2.52)"
+    assert str((cells[3].get("text") or "")) == "41.66\n(±4.72)"
+
+
+def test_materialize_layout_uid_logical_table_rows_should_merge_blank_lead_uncertainty_row_into_previous():
+    service = LiteratureReaderComposeService()
+    logical_rows, _ = service._materialize_layout_uid_logical_table_rows(  # pylint: disable=protected-access
+        normalized_cells=[
+            {"cell_id": 1, "row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0, "text": "MBPP+", "layout_ids": ["r0c0"]},
+            {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 2, "col_end": 2, "text": "73.35", "layout_ids": ["r0c2"]},
+            {"cell_id": 3, "row_start": 0, "row_end": 0, "col_start": 3, "col_end": 3, "text": "72.90", "layout_ids": ["r0c3"]},
+            {"cell_id": 4, "row_start": 1, "row_end": 1, "col_start": 2, "col_end": 2, "text": "(±1.21)", "layout_ids": ["r1c2"]},
+            {"cell_id": 5, "row_start": 1, "row_end": 1, "col_start": 3, "col_end": 3, "text": "(±0.66)", "layout_ids": ["r1c3"]},
+        ],
+        logical_row_plan={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "data", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1]},
+            ]
+        },
+    )
+
+    assert len(logical_rows) == 1
+    cells = {int(cell.get("col_start") or 0): dict(cell) for cell in list((logical_rows[0] or {}).get("cells") or [])}
+    assert str((cells[2].get("text") or "")) == "73.35\n(±1.21)"
+    assert str((cells[3].get("text") or "")) == "72.90\n(±0.66)"
+
+
 def test_panel_plan_to_ui_plan_should_keep_ai_table_logical_row_fields():
     service = LiteratureReaderComposeService()
     ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
