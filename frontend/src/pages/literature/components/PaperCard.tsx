@@ -1,4 +1,4 @@
-import { Button, Tag, Dropdown, Rate, message } from 'antd'
+import { Button, Tag, Dropdown, Rate } from 'antd'
 import {
   DeleteOutlined, EyeOutlined, DownloadOutlined,
   MoreOutlined, CheckOutlined, FireOutlined,
@@ -80,10 +80,7 @@ const PaperCard = ({ paper, index, sourceInfo, onSelect, onDelete, onDownloadPdf
               { key: 'view', icon: <EyeOutlined />, label: '查看详情', onClick: () => onSelect(paper) },
               {
                 key: 'download', icon: <DownloadOutlined />, label: '下载 PDF',
-                onClick: async () => {
-                  try { await onDownloadPdf(paper.id); message.success('PDF 下载成功') }
-                  catch { message.error('下载失败') }
-                },
+                onClick: async () => { await onDownloadPdf(paper.id) },
                 disabled: !paper.pdf_url || paper.pdf_downloaded,
               },
               { type: 'divider' as const },

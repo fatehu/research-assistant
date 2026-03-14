@@ -79,6 +79,13 @@ export function normalizeGenerativeStyleKey(raw: string | undefined): ReaderGene
   return 'journal_classic'
 }
 
+export function mapComposeStyleIntentToKey(styleIntent: string | undefined): ReaderGenerativeStyleKey {
+  const normalized = String(styleIntent || '').trim().toLowerCase()
+  if (normalized === 'clinical' || normalized === 'clinical_brief') return 'clinical_brief'
+  if (normalized === 'preprint' || normalized === 'preprint_modern') return 'preprint_modern'
+  return 'journal_classic'
+}
+
 export function resolveGenerativeStyleTokens(
   styleKey: ReaderGenerativeStyleKey,
   themeMode: ReaderThemeMode,

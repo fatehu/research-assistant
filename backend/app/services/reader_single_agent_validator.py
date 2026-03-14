@@ -263,6 +263,29 @@ class ReaderSingleAgentValidator:
             description = props.get("description")
             if description is not None and not isinstance(description, str):
                 errs.append("component_props_invalid:EquationBlock:description:string_required")
+            render_mode = props.get("render_mode")
+            if render_mode is not None and not isinstance(render_mode, str):
+                errs.append("component_props_invalid:EquationBlock:render_mode:string_required")
+            transcript = props.get("transcript")
+            if transcript is not None and not isinstance(transcript, str):
+                errs.append("component_props_invalid:EquationBlock:transcript:string_required")
+            normalized_text = props.get("normalized_text")
+            if normalized_text is not None and not isinstance(normalized_text, str):
+                errs.append("component_props_invalid:EquationBlock:normalized_text:string_required")
+            normalized_latex = props.get("normalized_latex")
+            if normalized_latex is not None and not isinstance(normalized_latex, str):
+                errs.append("component_props_invalid:EquationBlock:normalized_latex:string_required")
+            normalization_reason = props.get("normalization_reason")
+            if normalization_reason is not None and not isinstance(normalization_reason, str):
+                errs.append("component_props_invalid:EquationBlock:normalization_reason:string_required")
+            normalization_mode = props.get("normalization_mode")
+            if normalization_mode is not None and not isinstance(normalization_mode, str):
+                errs.append("component_props_invalid:EquationBlock:normalization_mode:string_required")
+            normalization_confidence = props.get("normalization_confidence")
+            if normalization_confidence is not None and isinstance(normalization_confidence, bool):
+                errs.append("component_props_invalid:EquationBlock:normalization_confidence:number_required")
+            elif normalization_confidence is not None and not isinstance(normalization_confidence, (int, float)):
+                errs.append("component_props_invalid:EquationBlock:normalization_confidence:number_required")
             return errs
 
         if component == "MethodologyCard":

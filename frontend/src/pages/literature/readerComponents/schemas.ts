@@ -113,6 +113,11 @@ export const readerComponentSchemas = {
     description: z.string().optional(),
     render_mode: z.enum(['image_first', 'math_first', 'text_only']).optional(),
     transcript: z.string().optional(),
+    normalized_text: z.string().optional(),
+    normalized_latex: z.string().optional(),
+    normalization_reason: z.string().optional(),
+    normalization_mode: z.string().optional(),
+    normalization_confidence: z.number().optional(),
   }),
   MethodologyCard: z.object({
     title: z.string().optional(),

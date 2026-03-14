@@ -8,8 +8,10 @@ import re
 import time
 import uuid
 import asyncio
+import httpx
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from urllib.parse import urljoin, urlparse, unquote
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +19,11 @@ from sqlalchemy import select, and_, or_, func, delete, distinct, text
 from sqlalchemy.orm import selectinload
 from loguru import logger
 from pydantic import BaseModel, Field
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover - optional at runtime
+    BeautifulSoup = None
 
 from app.config import settings
 from app.core.database import async_session_factory, get_db
@@ -52,6 +59,8 @@ from app.schemas.literature import (
     CollectionUpdate,
     CollectionWithPapers,
     DownloadPdfRequest,
+    ImportPaperByLinkRequest,
+    ImportPaperByLinkResponse,
     LiteratureAskMessage as LiteratureAskMessageSchema,
     LiteratureAskRequest,
     LiteratureAskSession as LiteratureAskSessionSchema,
@@ -307,7 +316,7 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
         "citation_count": paper.citation_count or 0,
         "reference_count": paper.reference_count or 0,
         "url": paper.url,
-        "pdf_url": paper.pdf_url,
+        "pdf_url": _resolve_pdf_download_url(paper),
         "arxiv_url": paper.arxiv_url,
         "pdf_path": paper.pdf_path,
         "pdf_downloaded": paper.pdf_downloaded or False,
@@ -426,6 +435,586 @@ def _normalize_arxiv_id(value: Optional[str]) -> str:
     return raw
 
 
+def _normalize_external_link(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*://", token, flags=re.IGNORECASE):
+        return token
+    if token.startswith("//"):
+        return f"https:{token}"
+    if "." in token and " " not in token:
+        return f"https://{token}"
+    return token
+
+
+def _extract_doi_from_text(value: Optional[str]) -> Optional[str]:
+    token = unquote(str(value or "").strip())
+    if not token:
+        return None
+
+    match = re.search(r"10\.\d{4,9}/[^\s\"'<>]+", token, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    doi = match.group(0).strip().rstrip(").,;]}")
+    doi = doi.split("?", 1)[0].split("#", 1)[0]
+    doi = re.sub(r"^(?:https?://)?(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
+    doi = re.sub(r"^doi:\s*", "", doi, flags=re.IGNORECASE)
+    return doi or None
+
+
+def _extract_pubmed_id_from_text(value: Optional[str]) -> Optional[str]:
+    token = unquote(str(value or "").strip())
+    if not token:
+        return None
+
+    patterns = (
+        r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)",
+        r"\bpmid[:\s]*([0-9]+)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, token, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_openalex_id_from_text(value: Optional[str]) -> Optional[str]:
+    token = unquote(str(value or "").strip())
+    if not token:
+        return None
+    match = re.search(r"(?:api\.)?openalex\.org/(?:works/)?(W\d+)\b", token, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def _extract_semantic_scholar_id_from_text(value: Optional[str]) -> Optional[str]:
+    token = unquote(str(value or "").strip())
+    if not token:
+        return None
+    match = re.search(r"semanticscholar\.org/paper/(?:[^/?#]+/)?([A-Za-z0-9-]{16,})", token, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_arxiv_id_from_text(value: Optional[str]) -> Optional[str]:
+    token = unquote(str(value or "").strip())
+    if not token:
+        return None
+
+    url_patterns = (
+        r"10\.48550/arxiv\.([^\s\"'<>?#]+)",
+        r"arxiv(?:\.org)?/(?:abs|pdf|html)/([^/?#]+)",
+        r"\barxiv:\s*([^\s]+)",
+    )
+    for pattern in url_patterns:
+        match = re.search(pattern, token, flags=re.IGNORECASE)
+        if match:
+            return _normalize_arxiv_id(match.group(1).removesuffix(".pdf").rstrip(").,;]}"))
+
+    direct = token.strip()
+    direct = direct.removesuffix(".pdf")
+    if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Za-z\-]+)?/\d{7})(?:v\d+)?", direct, flags=re.IGNORECASE):
+        return _normalize_arxiv_id(direct)
+    return None
+
+
+def _extract_year_from_text(value: Optional[str]) -> Optional[int]:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    match = re.search(r"\b(19|20)\d{2}\b", token)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_meta_values(soup: Any, keys: Sequence[str]) -> List[str]:
+    if soup is None:
+        return []
+
+    key_set = {str(key).strip().lower() for key in keys if str(key).strip()}
+    values: List[str] = []
+    for meta in soup.find_all("meta"):
+        key = (
+            meta.get("name")
+            or meta.get("property")
+            or meta.get("http-equiv")
+            or meta.get("itemprop")
+            or ""
+        ).strip().lower()
+        if key not in key_set:
+            continue
+        content = str(meta.get("content") or "").strip()
+        if content:
+            values.append(content)
+    return values
+
+
+def _build_manual_paper_result_from_html(url: str, html: str) -> Optional[PaperResult]:
+    if not html or BeautifulSoup is None:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_values = _extract_meta_values(soup, ["citation_title", "dc.title", "og:title", "twitter:title"])
+    title = title_values[0] if title_values else ""
+    if not title:
+        title_tag = soup.find("title")
+        title = str(title_tag.get_text(strip=True) if title_tag else "").strip()
+
+    if not title:
+        return None
+
+    author_values = _extract_meta_values(soup, ["citation_author", "dc.creator", "author"])
+    authors = [{"name": name.strip()} for name in author_values if str(name).strip()]
+
+    abstract_values = _extract_meta_values(
+        soup,
+        ["citation_abstract", "description", "og:description", "twitter:description", "dc.description"],
+    )
+    abstract = abstract_values[0].strip() if abstract_values else None
+
+    venue_values = _extract_meta_values(
+        soup,
+        ["citation_journal_title", "citation_conference_title", "citation_inbook_title", "dc.source", "og:site_name"],
+    )
+    venue = venue_values[0].strip() if venue_values else None
+
+    year_values = _extract_meta_values(
+        soup,
+        ["citation_publication_date", "citation_online_date", "dc.date", "article:published_time"],
+    )
+    year = _extract_year_from_text(year_values[0] if year_values else None)
+
+    doi_values = _extract_meta_values(soup, ["citation_doi", "dc.identifier"])
+    doi = _extract_doi_from_text(doi_values[0] if doi_values else html)
+
+    pdf_values = _extract_meta_values(soup, ["citation_pdf_url", "pdf_url"])
+    pdf_url = urljoin(url, pdf_values[0]) if pdf_values else None
+
+    external_seed = doi or url or title
+    external_id = hashlib.md5(external_seed.encode("utf-8")).hexdigest()
+
+    return PaperResult(
+        source="manual",
+        external_id=external_id,
+        title=title,
+        abstract=abstract,
+        authors=authors,
+        year=year,
+        venue=venue,
+        citation_count=0,
+        reference_count=0,
+        url=url,
+        pdf_url=pdf_url,
+        arxiv_id=None,
+        doi=doi,
+        fields_of_study=[],
+        raw_data={"import_method": "html_meta", "source_url": url},
+    )
+
+
+async def _resolve_doi_to_paper(service: Any, doi: str) -> Optional[PaperResult]:
+    normalized = _extract_doi_from_text(doi)
+    if not normalized:
+        return None
+
+    openalex_paper = await service.openalex.get_paper_by_doi(normalized)
+    crossref_paper = await service.crossref.get_paper_by_doi(normalized)
+
+    if openalex_paper and crossref_paper:
+        if not openalex_paper.abstract and crossref_paper.abstract:
+            openalex_paper.abstract = crossref_paper.abstract
+        if not openalex_paper.venue and crossref_paper.venue:
+            openalex_paper.venue = crossref_paper.venue
+        if not openalex_paper.url and crossref_paper.url:
+            openalex_paper.url = crossref_paper.url
+        if not openalex_paper.pdf_url and crossref_paper.pdf_url:
+            openalex_paper.pdf_url = crossref_paper.pdf_url
+        if not openalex_paper.authors and crossref_paper.authors:
+            openalex_paper.authors = crossref_paper.authors
+        return openalex_paper
+
+    return openalex_paper or crossref_paper
+
+
+def _build_save_request_from_paper_result(
+    paper: PaperResult,
+    *,
+    collection_ids: Optional[Sequence[int]] = None,
+    imported_link: Optional[str] = None,
+) -> SavePaperFromSearchRequest:
+    inferred_arxiv_id = _infer_arxiv_id_from_candidates(
+        paper.arxiv_id,
+        paper.url,
+        paper.doi,
+        imported_link,
+    )
+    inferred_pdf_url = paper.pdf_url or _build_arxiv_pdf_url(inferred_arxiv_id)
+    external_id = str(paper.external_id or paper.url or paper.doi or "").strip()
+    if not external_id:
+        external_seed = f"{paper.title}|{paper.year or ''}|{paper.doi or ''}|{paper.url or ''}"
+        external_id = hashlib.md5(external_seed.encode("utf-8")).hexdigest()
+
+    raw_data = dict(paper.raw_data or {})
+    if imported_link:
+        raw_data["imported_link"] = imported_link
+
+    return SavePaperFromSearchRequest(
+        source=str(paper.source or "manual"),
+        external_id=external_id,
+        title=paper.title,
+        abstract=paper.abstract,
+        authors=paper.authors or [],
+        year=paper.year,
+        venue=paper.venue,
+        citation_count=int(paper.citation_count or 0),
+        reference_count=int(paper.reference_count or 0),
+        url=paper.url,
+        pdf_url=inferred_pdf_url,
+        arxiv_id=inferred_arxiv_id or paper.arxiv_id,
+        doi=paper.doi,
+        fields_of_study=paper.fields_of_study or [],
+        raw_data=raw_data,
+        collection_ids=[int(item) for item in (collection_ids or [])],
+    )
+
+
+def _build_saved_lookup_keys(paper: PaperResult) -> List[str]:
+    keys: List[str] = []
+
+    semantic_id = (paper.external_id or "").strip()
+    if paper.source == "semantic_scholar" and semantic_id:
+        keys.append(f"s2:{semantic_id}")
+
+    arxiv_id = _normalize_arxiv_id(paper.arxiv_id or (paper.external_id if paper.source == "arxiv" else None))
+    if arxiv_id:
+        keys.append(f"arxiv:{arxiv_id}")
+
+    pubmed_id = (paper.external_id or "").strip()
+    if paper.source == "pubmed" and pubmed_id:
+        keys.append(f"pubmed:{pubmed_id}")
+
+    doi_norm = _normalize_text(paper.doi)
+    if doi_norm:
+        keys.append(f"doi:{doi_norm}")
+
+    title = (paper.title or "").strip()
+    if title:
+        keys.append(f"title:{title}")
+
+    return keys
+
+
+async def _load_saved_paper_lookup(
+    db: AsyncSession,
+    user_id: int,
+    papers: Sequence[PaperResult],
+) -> Dict[str, int]:
+    semantic_ids: Set[str] = set()
+    arxiv_ids: Set[str] = set()
+    pubmed_ids: Set[str] = set()
+    dois: Set[str] = set()
+    titles: Set[str] = set()
+
+    for paper in papers:
+        semantic_id = (paper.external_id or "").strip()
+        if paper.source == "semantic_scholar" and semantic_id:
+            semantic_ids.add(semantic_id)
+
+        arxiv_id = _normalize_arxiv_id(paper.arxiv_id or (paper.external_id if paper.source == "arxiv" else None))
+        if arxiv_id:
+            arxiv_ids.add(arxiv_id)
+
+        pubmed_id = (paper.external_id or "").strip()
+        if paper.source == "pubmed" and pubmed_id:
+            pubmed_ids.add(pubmed_id)
+
+        doi_norm = _normalize_text(paper.doi)
+        if doi_norm:
+            dois.add(doi_norm)
+
+        title = (paper.title or "").strip()
+        if title:
+            titles.add(title)
+
+    predicates = []
+    if semantic_ids:
+        predicates.append(Paper.semantic_scholar_id.in_(semantic_ids))
+    if arxiv_ids:
+        predicates.append(Paper.arxiv_id.in_(arxiv_ids))
+    if pubmed_ids:
+        predicates.append(Paper.pubmed_id.in_(pubmed_ids))
+    if dois:
+        predicates.append(func.lower(Paper.doi).in_(dois))
+    if titles:
+        predicates.append(Paper.title.in_(titles))
+
+    if not predicates:
+        return {}
+
+    rows = await db.execute(
+        select(
+            Paper.id,
+            Paper.semantic_scholar_id,
+            Paper.arxiv_id,
+            Paper.pubmed_id,
+            Paper.doi,
+            Paper.title,
+        ).where(
+            and_(
+                Paper.user_id == int(user_id),
+                or_(*predicates),
+            )
+        )
+    )
+
+    lookup: Dict[str, int] = {}
+    for row in rows.all():
+        paper_id = int(row[0])
+        semantic_scholar_id = row[1]
+        arxiv_id = row[2]
+        pubmed_id = row[3]
+        doi = row[4]
+        title = row[5]
+
+        if semantic_scholar_id:
+            lookup[f"s2:{semantic_scholar_id}"] = paper_id
+        if arxiv_id:
+            lookup[f"arxiv:{_normalize_arxiv_id(arxiv_id)}"] = paper_id
+        if pubmed_id:
+            lookup[f"pubmed:{pubmed_id}"] = paper_id
+        if doi:
+            lookup[f"doi:{_normalize_text(doi)}"] = paper_id
+        if title:
+            lookup[f"title:{str(title).strip()}"] = paper_id
+
+    return lookup
+
+
+def _resolve_saved_paper_id(paper: PaperResult, saved_lookup: Mapping[str, int]) -> Optional[int]:
+    for key in _build_saved_lookup_keys(paper):
+        paper_id = saved_lookup.get(key)
+        if paper_id is not None:
+            return int(paper_id)
+    return None
+
+
+async def _load_collection_ids_for_paper(db: AsyncSession, paper_id: int) -> List[int]:
+    rows = await db.execute(
+        select(paper_collection_association.c.collection_id).where(
+            paper_collection_association.c.paper_id == int(paper_id)
+        )
+    )
+    return [int(row[0]) for row in rows.fetchall()]
+
+
+async def _add_paper_to_collections_if_missing(
+    db: AsyncSession,
+    *,
+    paper_id: int,
+    user_id: int,
+    collection_ids: Sequence[int],
+) -> List[int]:
+    normalized_ids = [int(item) for item in collection_ids if item is not None]
+    if not normalized_ids:
+        return []
+
+    existing_ids = set(await _load_collection_ids_for_paper(db, int(paper_id)))
+    added_ids: List[int] = []
+
+    for coll_id in normalized_ids:
+        if coll_id in existing_ids:
+            continue
+
+        coll_result = await db.execute(
+            select(PaperCollection).where(
+                and_(
+                    PaperCollection.id == int(coll_id),
+                    PaperCollection.user_id == int(user_id),
+                )
+            )
+        )
+        collection = coll_result.scalar_one_or_none()
+        if not collection:
+            continue
+
+        await db.execute(
+            paper_collection_association.insert().values(
+                paper_id=int(paper_id),
+                collection_id=int(coll_id),
+            )
+        )
+        await db.execute(
+            PaperCollection.__table__.update().where(
+                PaperCollection.id == int(coll_id)
+            ).values(paper_count=PaperCollection.paper_count + 1)
+        )
+        added_ids.append(int(coll_id))
+        existing_ids.add(int(coll_id))
+
+    return added_ids
+
+
+async def _find_existing_paper_for_request(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    request: SavePaperFromSearchRequest,
+) -> Optional[Paper]:
+    request_doi = _normalize_text(request.doi)
+    request_arxiv_id = _normalize_arxiv_id(
+        request.arxiv_id or (request.external_id if request.source == "arxiv" else None)
+    )
+
+    if request.source == "semantic_scholar" and request.external_id:
+        stmt = select(Paper).where(
+            and_(
+                Paper.user_id == int(user_id),
+                Paper.semantic_scholar_id == request.external_id,
+            )
+        )
+    elif request.source == "arxiv" and request_arxiv_id:
+        stmt = select(Paper).where(
+            and_(
+                Paper.user_id == int(user_id),
+                Paper.arxiv_id == request_arxiv_id,
+            )
+        )
+    elif request.source == "pubmed" and request.external_id:
+        stmt = select(Paper).where(
+            and_(
+                Paper.user_id == int(user_id),
+                Paper.pubmed_id == request.external_id,
+            )
+        )
+    elif request_doi:
+        stmt = select(Paper).where(
+            and_(
+                Paper.user_id == int(user_id),
+                func.lower(Paper.doi) == request_doi,
+            )
+        )
+    else:
+        stmt = select(Paper).where(
+            and_(
+                Paper.user_id == int(user_id),
+                Paper.title == request.title,
+            )
+        )
+
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _resolve_paper_from_link(
+    service: Any,
+    raw_link: str,
+) -> Tuple[PaperResult, str, str]:
+    candidate = _normalize_external_link(raw_link)
+    if not candidate:
+        raise HTTPException(status_code=422, detail="请输入论文链接或 DOI / arXiv 标识")
+
+    arxiv_id = _extract_arxiv_id_from_text(candidate)
+    if arxiv_id:
+        paper = await service.arxiv.get_paper(arxiv_id)
+        if paper:
+            return paper, "arxiv", f"https://arxiv.org/abs/{arxiv_id}"
+
+    doi = _extract_doi_from_text(candidate)
+    if doi:
+        paper = await _resolve_doi_to_paper(service, doi)
+        if paper:
+            return paper, "doi", f"https://doi.org/{doi}"
+
+    pubmed_id = _extract_pubmed_id_from_text(candidate)
+    if pubmed_id:
+        paper = await service.pubmed.get_paper(pubmed_id)
+        if paper:
+            return paper, "pubmed", f"https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}/"
+
+    openalex_id = _extract_openalex_id_from_text(candidate)
+    if openalex_id:
+        paper = await service.openalex.get_paper(openalex_id)
+        if paper:
+            return paper, "openalex", f"https://openalex.org/{openalex_id}"
+
+    semantic_scholar_id = _extract_semantic_scholar_id_from_text(candidate)
+    if semantic_scholar_id:
+        paper = await service.s2.get_paper(semantic_scholar_id)
+        if paper:
+            return paper, "semantic_scholar", candidate
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=422, detail="目前仅支持 DOI、arXiv、PubMed、OpenAlex、Semantic Scholar 或网页链接")
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            headers={"User-Agent": "ResearchAssistant/1.0"},
+        ) as client:
+            response = await client.get(candidate)
+    except Exception as exc:
+        logger.error(f"[Literature API] 链接解析请求失败: {exc}")
+        raise HTTPException(status_code=502, detail="链接请求失败，请稍后重试") from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=404, detail="无法访问该链接，无法导入论文")
+
+    final_url = str(response.url)
+
+    doi = _extract_doi_from_text(final_url)
+    if doi:
+        paper = await _resolve_doi_to_paper(service, doi)
+        if paper:
+            return paper, "doi_redirect", final_url
+
+    arxiv_id = _extract_arxiv_id_from_text(final_url)
+    if arxiv_id:
+        paper = await service.arxiv.get_paper(arxiv_id)
+        if paper:
+            return paper, "arxiv_redirect", final_url
+
+    pubmed_id = _extract_pubmed_id_from_text(final_url)
+    if pubmed_id:
+        paper = await service.pubmed.get_paper(pubmed_id)
+        if paper:
+            return paper, "pubmed_redirect", final_url
+
+    openalex_id = _extract_openalex_id_from_text(final_url)
+    if openalex_id:
+        paper = await service.openalex.get_paper(openalex_id)
+        if paper:
+            return paper, "openalex_redirect", final_url
+
+    manual_paper = _build_manual_paper_result_from_html(final_url, response.text)
+    if manual_paper and manual_paper.doi:
+        resolved = await _resolve_doi_to_paper(service, manual_paper.doi)
+        if resolved:
+            if not resolved.url and manual_paper.url:
+                resolved.url = manual_paper.url
+            if not resolved.pdf_url and manual_paper.pdf_url:
+                resolved.pdf_url = manual_paper.pdf_url
+            if not resolved.abstract and manual_paper.abstract:
+                resolved.abstract = manual_paper.abstract
+            if not resolved.venue and manual_paper.venue:
+                resolved.venue = manual_paper.venue
+            return resolved, "html_meta_doi", final_url
+
+    if manual_paper:
+        return manual_paper, "html_meta", final_url
+
+    raise HTTPException(status_code=404, detail="无法从该链接解析论文信息，请尝试 DOI、arXiv 或 PubMed 链接")
+
+
 def _build_paper_entity_identity(paper: Paper) -> Dict[str, Any]:
     doi_norm = _normalize_text(paper.doi)
     arxiv_norm = _normalize_arxiv_id(paper.arxiv_id)
@@ -509,6 +1098,70 @@ def _resolve_local_pdf_path(user_id: int, paper: Paper) -> Optional[str]:
         if os.path.exists(path):
             return path
     return None
+
+
+def _build_arxiv_pdf_url(arxiv_id: Optional[str]) -> Optional[str]:
+    normalized = _normalize_arxiv_id(arxiv_id)
+    if not normalized:
+        return None
+    return f"https://arxiv.org/pdf/{normalized}"
+
+
+def _infer_arxiv_id_from_candidates(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        arxiv_id = _extract_arxiv_id_from_text(value)
+        if arxiv_id:
+            return arxiv_id
+    return None
+
+
+def _build_pdf_download_candidates(paper: Paper) -> List[str]:
+    raw_data = getattr(paper, "raw_data", {}) or {}
+    direct_pdf_url = str(getattr(paper, "pdf_url", "") or "").strip()
+    arxiv_id = _infer_arxiv_id_from_candidates(
+        getattr(paper, "arxiv_id", None),
+        getattr(paper, "arxiv_url", None),
+        getattr(paper, "url", None),
+        getattr(paper, "doi", None),
+        raw_data.get("imported_link"),
+        raw_data.get("source_url"),
+        raw_data.get("id"),
+    )
+
+    candidates: List[str] = []
+
+    if arxiv_id:
+        arxiv_pdf_url = _build_arxiv_pdf_url(arxiv_id)
+        if arxiv_pdf_url:
+            candidates.append(arxiv_pdf_url)
+
+    if direct_pdf_url:
+        candidates.append(direct_pdf_url)
+
+    for candidate in (
+        raw_data.get("pdf_url"),
+        raw_data.get("oa_url"),
+        getattr(paper, "url", None),
+        getattr(paper, "arxiv_url", None),
+    ):
+        token = str(candidate or "").strip()
+        if token.lower().endswith(".pdf"):
+            candidates.append(token)
+
+    unique_candidates: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(normalized)
+    return unique_candidates
+
+
+def _resolve_pdf_download_url(paper: Paper) -> Optional[str]:
+    candidates = _build_pdf_download_candidates(paper)
+    return candidates[0] if candidates else None
 
 
 async def _get_owned_collection_or_404(
@@ -2322,7 +2975,7 @@ def _to_comment_response(comment: PaperComment) -> PaperCommentResponse:
 @router.get("/search", response_model=PaperSearchResponse)
 async def search_papers(
     query: str = Query(..., min_length=1, description="搜索关键词"),
-    source: str = Query("semantic_scholar", description="数据源：semantic_scholar, arxiv, pubmed, openalex, crossref"),
+    source: str = Query("semantic_scholar", description="数据源：semantic_scholar, arxiv, pubmed, openalex, crossref, multi"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     year_start: Optional[int] = Query(None, description="起始年份"),
@@ -2341,6 +2994,7 @@ async def search_papers(
     - pubmed: PubMed (生物医学文献)
     - openalex: OpenAlex (开放学术图谱)
     - crossref: CrossRef (DOI 元数据)
+    - multi: Semantic Scholar + arXiv + PubMed 并行融合
     """
     logger.info(f"[Literature API] 搜索: {query}, source={source}, user={current_user.id}")
     
@@ -2356,63 +3010,27 @@ async def search_papers(
         kwargs["open_access_only"] = True
     
     # 执行搜索
-    result = await service.search(query, source, limit, offset, **kwargs)
-    
+    if source == "multi":
+        result = await service.search_multi(
+            query=query,
+            limit_per_source=limit,
+            offset=offset,
+            year_range=kwargs.get("year_range"),
+        )
+    else:
+        result = await service.search(query, source, limit, offset, **kwargs)
+
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
-    
+
     # 检查哪些论文已保存
     papers = result.get("papers", [])
     search_results = []
-    
+
+    saved_lookup = await _load_saved_paper_lookup(db, current_user.id, papers)
+
     for paper in papers:
-        is_saved = False
-        saved_paper_id = None
-        
-        # 检查是否已保存
-        if paper.external_id:
-            if source == "semantic_scholar":
-                stmt = select(Paper).where(
-                    and_(
-                        Paper.user_id == current_user.id,
-                        Paper.semantic_scholar_id == paper.external_id
-                    )
-                )
-            elif source == "arxiv":
-                stmt = select(Paper).where(
-                    and_(
-                        Paper.user_id == current_user.id,
-                        Paper.arxiv_id == paper.external_id
-                    )
-                )
-            elif source == "pubmed":
-                stmt = select(Paper).where(
-                    and_(
-                        Paper.user_id == current_user.id,
-                        Paper.pubmed_id == paper.external_id
-                    )
-                )
-            elif paper.doi:  # crossref, openalex 用 DOI
-                stmt = select(Paper).where(
-                    and_(
-                        Paper.user_id == current_user.id,
-                        Paper.doi == paper.doi
-                    )
-                )
-            else:
-                stmt = select(Paper).where(
-                    and_(
-                        Paper.user_id == current_user.id,
-                        Paper.title == paper.title
-                    )
-                )
-            
-            existing = await db.execute(stmt)
-            existing_paper = existing.scalar_one_or_none()
-            if existing_paper:
-                is_saved = True
-                saved_paper_id = existing_paper.id
-        
+        saved_paper_id = _resolve_saved_paper_id(paper, saved_lookup)
         search_results.append(PaperSearchResult(
             source=paper.source,
             external_id=paper.external_id,
@@ -2428,7 +3046,7 @@ async def search_papers(
             arxiv_id=paper.arxiv_id,
             doi=paper.doi,
             fields_of_study=paper.fields_of_study,
-            is_saved=is_saved,
+            is_saved=saved_paper_id is not None,
             saved_paper_id=saved_paper_id
         ))
     
@@ -2445,7 +3063,8 @@ async def search_papers(
     
     return PaperSearchResponse(
         total=result.get("total", 0),
-        offset=offset,
+        offset=result.get("offset", offset),
+        has_more=bool(result.get("has_more", offset + len(search_results) < int(result.get("total", 0) or 0))),
         papers=search_results,
         query=query,
         source=source
@@ -2587,41 +3206,32 @@ async def save_paper(
 ):
     """保存论文（从搜索结果）。"""
     logger.info(f"[Literature API] 保存论文: {request.title[:50]}...")
-    
-    # 检查是否已存在
-    if request.source == "semantic_scholar" and request.external_id:
-        stmt = select(Paper).where(
-            and_(
-                Paper.user_id == current_user.id,
-                Paper.semantic_scholar_id == request.external_id
-            )
+
+    request_arxiv_id = _normalize_arxiv_id(
+        _infer_arxiv_id_from_candidates(
+            request.arxiv_id,
+            request.external_id if request.source == "arxiv" else None,
+            request.doi,
+            request.url,
+            (request.raw_data or {}).get("imported_link"),
         )
-    elif request.source == "arxiv" and request.arxiv_id:
-        stmt = select(Paper).where(
-            and_(
-                Paper.user_id == current_user.id,
-                Paper.arxiv_id == request.arxiv_id
-            )
-        )
-    else:
-        stmt = select(Paper).where(
-            and_(
-                Paper.user_id == current_user.id,
-                Paper.title == request.title
-            )
-        )
-    
-    result = await db.execute(stmt)
-    existing = result.scalar_one_or_none()
-    
+    )
+    request_pdf_url = request.pdf_url or _build_arxiv_pdf_url(request_arxiv_id)
+    existing = await _find_existing_paper_for_request(
+        db,
+        user_id=current_user.id,
+        request=request,
+    )
+
     if existing:
         raise HTTPException(status_code=400, detail="论文已存在")
-    
+
     # 创建论文
     paper = Paper(
         user_id=current_user.id,
         semantic_scholar_id=request.external_id if request.source == "semantic_scholar" else None,
-        arxiv_id=request.arxiv_id,
+        arxiv_id=request_arxiv_id or None,
+        pubmed_id=request.external_id if request.source == "pubmed" else None,
         doi=request.doi,
         title=request.title,
         abstract=request.abstract,
@@ -2631,8 +3241,8 @@ async def save_paper(
         citation_count=request.citation_count,
         reference_count=request.reference_count,
         url=request.url,
-        pdf_url=request.pdf_url,
-        arxiv_url=f"https://arxiv.org/abs/{request.arxiv_id}" if request.arxiv_id else None,
+        pdf_url=request_pdf_url,
+        arxiv_url=f"https://arxiv.org/abs/{request_arxiv_id}" if request_arxiv_id else None,
         fields_of_study=request.fields_of_study,
         source=request.source,
         raw_data=request.raw_data
@@ -2641,10 +3251,10 @@ async def save_paper(
     db.add(paper)
     await db.flush()
     await _ensure_paper_entity(db, paper)
-    
+
     # 添加到收藏夹
-    collection_ids = request.collection_ids or []
-    
+    collection_ids = [int(item) for item in dict.fromkeys(request.collection_ids or [])]
+
     # 如果没有指定收藏夹，添加到默认收藏夹
     if not collection_ids:
         default_stmt = select(PaperCollection).where(
@@ -2656,31 +3266,79 @@ async def save_paper(
         default_result = await db.execute(default_stmt)
         # 使用 scalars().first() 安全处理可能存在的多个默认收藏夹
         default_collection = default_result.scalars().first()
-        
+
         if default_collection:
             collection_ids = [default_collection.id]
-    
-    for coll_id in collection_ids:
-        await db.execute(
-            paper_collection_association.insert().values(
-                paper_id=paper.id,
-                collection_id=coll_id
-            )
+
+    if collection_ids:
+        collection_ids = await _add_paper_to_collections_if_missing(
+            db,
+            paper_id=paper.id,
+            user_id=current_user.id,
+            collection_ids=collection_ids,
         )
-        # 更新收藏夹计数
-        await db.execute(
-            select(PaperCollection).where(PaperCollection.id == coll_id).with_for_update()
-        )
-        await db.execute(
-            PaperCollection.__table__.update().where(
-                PaperCollection.id == coll_id
-            ).values(paper_count=PaperCollection.paper_count + 1)
-        )
-    
+
     await db.commit()
     await db.refresh(paper)
-    
+
     return PaperResponse(**paper_to_response(paper, collection_ids))
+
+
+@router.post("/papers/import-link", response_model=ImportPaperByLinkResponse)
+async def import_paper_by_link(
+    request: ImportPaperByLinkRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """通过外部链接解析并入库论文。"""
+    logger.info(f"[Literature API] 链接入库: {request.link[:120]}")
+
+    service = get_literature_service()
+    paper_result, resolved_source, normalized_link = await _resolve_paper_from_link(
+        service,
+        request.link,
+    )
+    save_request = _build_save_request_from_paper_result(
+        paper_result,
+        collection_ids=request.collection_ids,
+        imported_link=normalized_link,
+    )
+
+    existing = await _find_existing_paper_for_request(
+        db,
+        user_id=current_user.id,
+        request=save_request,
+    )
+
+    if existing:
+        if request.collection_ids:
+            await _add_paper_to_collections_if_missing(
+                db,
+                paper_id=existing.id,
+                user_id=current_user.id,
+                collection_ids=request.collection_ids,
+            )
+            await db.commit()
+
+        collection_ids = await _load_collection_ids_for_paper(db, existing.id)
+        return ImportPaperByLinkResponse(
+            paper=PaperResponse(**paper_to_response(existing, collection_ids)),
+            already_exists=True,
+            resolved_source=resolved_source,
+            normalized_link=normalized_link,
+        )
+
+    saved_paper = await save_paper(
+        request=save_request,
+        db=db,
+        current_user=current_user,
+    )
+    return ImportPaperByLinkResponse(
+        paper=saved_paper,
+        already_exists=False,
+        resolved_source=resolved_source,
+        normalized_link=normalized_link,
+    )
 
 
 @router.patch("/papers/{paper_id}", response_model=PaperResponse)
@@ -3213,10 +3871,11 @@ async def download_paper_pdf(
     if not paper:
         raise HTTPException(status_code=404, detail="论文不存在")
     
-    if not paper.pdf_url:
-        raise HTTPException(status_code=400, detail="该论文没有 PDF 下载链接")
-    
-    if paper.pdf_downloaded and paper.pdf_path and not knowledge_base_id:
+    download_candidates = _build_pdf_download_candidates(paper)
+    if not download_candidates:
+        raise HTTPException(status_code=400, detail="该论文暂无可用 PDF 下载链接")
+
+    if paper.pdf_downloaded and paper.pdf_path and os.path.exists(paper.pdf_path) and not knowledge_base_id:
         return {"message": "PDF 已下载", "pdf_path": paper.pdf_path}
     
     if paper.pdf_downloaded and paper.pdf_path and os.path.exists(paper.pdf_path):
@@ -3233,12 +3892,21 @@ async def download_paper_pdf(
 
         # 下载 PDF
         service = get_literature_service()
-        success = await service.download_pdf(paper.pdf_url, pdf_path)
+        success = False
+        download_error = ""
+        download_url = ""
+        for candidate_url in download_candidates:
+            success, download_error = await service.download_pdf(candidate_url, pdf_path)
+            if success:
+                download_url = candidate_url
+                break
 
         if not success:
-            raise HTTPException(status_code=500, detail="PDF 下载失败")
+            raise HTTPException(status_code=502, detail=download_error or "PDF 下载失败")
 
         # 更新论文记录
+        if not paper.pdf_url or str(paper.pdf_url).strip() != download_url:
+            paper.pdf_url = download_url
         paper.pdf_path = pdf_path
         paper.pdf_downloaded = True
     
@@ -3472,6 +4140,114 @@ async def stream_reader_page_asset(
     )
 
 
+@router.get("/reader/grounding-page-assets/{paper_id}/{page}")
+async def stream_reader_grounding_page_asset(
+    paper_id: int,
+    page: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """返回已本地化持久化的 DocMind 整页图，避免继续暴露临时 URL。"""
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    compose_service = get_literature_reader_compose_service()
+    candidate_path = compose_service._find_existing_grounding_page_image_path(  # pylint: disable=protected-access
+        paper_id=int(paper.id),
+        page=int(page),
+    )
+    if not candidate_path or not os.path.exists(candidate_path):
+        raise HTTPException(status_code=404, detail="页面本地化渲染图不存在")
+
+    ext = str(os.path.splitext(candidate_path)[1] or "").lower().lstrip(".")
+    media_type = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(
+        path=candidate_path,
+        media_type=media_type,
+        filename=os.path.basename(candidate_path),
+    )
+
+
+@router.get("/reader/docmind-page-image/{paper_id}/{page}")
+async def stream_reader_docmind_page_image(
+    paper_id: int,
+    page: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """返回已本地化的 DocMind 整页渲染图，不再直接代理临时远端 URL。"""
+    paper = await db.get(Paper, int(paper_id))
+    if paper is None:
+        raise HTTPException(status_code=404, detail="论文不存在")
+    if int(page) <= 0:
+        raise HTTPException(status_code=400, detail="页码必须从 1 开始")
+
+    service = get_literature_reader_service()
+    compose_service = get_literature_reader_compose_service()
+    try:
+        payload, _ = await service.build_or_get_page_payload(
+            db=db,
+            user_id=int(paper.user_id),
+            paper=paper,
+            page=int(page),
+            selected_kb_id=None,
+            force_refresh=False,
+            prefer_agent=False,
+            style_hint=None,
+            publish_ready_event_enabled=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Literature API] docmind page image build failed "
+            f"paper={paper_id} page={page}: {exc}"
+        )
+        raise HTTPException(status_code=404, detail="页面原始渲染图不存在") from exc
+
+    docmind_structure = dict((payload or {}).get("docmind_structure") or {})
+    image_path = str(docmind_structure.get("page_image_path") or "").strip()
+    if image_path and os.path.exists(image_path):
+        ext = os.path.splitext(image_path)[1].lower()
+        media_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(ext, "application/octet-stream")
+        return FileResponse(
+            path=image_path,
+            media_type=media_type,
+            filename=os.path.basename(image_path),
+        )
+
+    localized_path = compose_service._ensure_local_grounding_page_image(  # pylint: disable=protected-access
+        paper_id=int(paper.id),
+        page=int(page),
+        page_image_url=str(docmind_structure.get("page_image_url") or "").strip(),
+        page_image_path=image_path,
+    )
+    if localized_path and os.path.exists(localized_path):
+        ext = os.path.splitext(localized_path)[1].lower()
+        media_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(ext, "application/octet-stream")
+        return FileResponse(
+            path=localized_path,
+            media_type=media_type,
+            filename=os.path.basename(localized_path),
+        )
+
+    raise HTTPException(status_code=404, detail="页面原始渲染图不存在")
+
+
 async def process_document_background(doc_id: int, kb_id: int, file_path: str):
     """兼容旧调用：转发到知识库文档处理任务。"""
     from app.api.knowledge import process_document_task
@@ -3526,6 +4302,7 @@ async def _prefetch_reader_composed_pages_background(
     paper_id: int,
     pages: Sequence[int],
     selected_kb_id: Optional[int],
+    pipeline_version: Optional[str],
     style_intent: Optional[str],
     latency_budget_ms: Optional[int],
     quality_target: Optional[float],
@@ -3549,6 +4326,7 @@ async def _prefetch_reader_composed_pages_background(
             paper=paper,
             pages=pages,
             selected_kb_id=selected_kb_id,
+            pipeline_version_override=pipeline_version,
             style_intent=style_intent,
             latency_budget_ms=latency_budget_ms,
             quality_target=quality_target,
@@ -3785,6 +4563,7 @@ async def get_reader_composed_generative_plan(
         paper=paper,
         page=page_num,
         selected_kb_id=payload.selected_kb_id,
+        pipeline_version_override=getattr(payload, "pipeline_version", None),
         force_refresh=bool(payload.force_refresh),
         regenerate=bool(payload.regenerate),
         latency_budget_ms=payload.latency_budget_ms,
@@ -4203,10 +4982,14 @@ async def get_reader_composed_page_cached(
         user_id=int(current_user.id),
         paper_id=int(paper.id),
         page=page_num,
+        pipeline_version_override=getattr(payload, "pipeline_version", None),
     )
     if not isinstance(composed_payload, dict):
         raise HTTPException(status_code=404, detail="No cached reader payload available for this page")
     payload_for_response = dict(composed_payload)
+    ensure_contract = getattr(compose_service, "_ensure_payload_contract", None)
+    if callable(ensure_contract):
+        payload_for_response = ensure_contract(page=page_num, payload=payload_for_response)
     cache_layer_value = str(payload_for_response.get("cache_layer") or "").strip().lower()
     if cache_layer_value not in {"redis", "db", "none"}:
         payload_for_response["cache_layer"] = "db"
@@ -4308,6 +5091,7 @@ async def stream_reader_composed_page(
                 paper=paper,
                 page=page_num,
                 selected_kb_id=payload.selected_kb_id,
+                pipeline_version_override=getattr(payload, "pipeline_version", None),
                 force_refresh=bool(payload.force_refresh),
                 regenerate=bool(payload.regenerate),
                 latency_budget_ms=payload.latency_budget_ms,
@@ -4899,6 +5683,7 @@ async def prefetch_reader_composed_pages(
             paper_id=int(paper.id),
             pages=queued,
             selected_kb_id=payload.selected_kb_id,
+            pipeline_version=getattr(payload, "pipeline_version", None),
             style_intent=payload.style_intent,
             latency_budget_ms=payload.latency_budget_ms,
             quality_target=payload.quality_target,
@@ -5392,18 +6177,28 @@ async def add_paper_to_knowledge(
     # 确保本地 PDF 可用
     pdf_path = paper.pdf_path
     if not pdf_path or not os.path.exists(pdf_path):
-        if not paper.pdf_url:
-            raise HTTPException(status_code=400, detail="论文缺少 PDF 文件与下载链接，无法入库")
+        download_candidates = _build_pdf_download_candidates(paper)
+        if not download_candidates:
+            raise HTTPException(status_code=400, detail="论文缺少可用 PDF 文件与下载链接，无法入库")
         pdf_path = _build_paper_pdf_file_path(
             user_id=current_user.id,
             paper_id=int(paper.id),
             title=paper.title,
             ensure_dir=True,
         )
-        success = await get_literature_service().download_pdf(paper.pdf_url, pdf_path)
+        success = False
+        download_error = ""
+        download_url = ""
+        for candidate_url in download_candidates:
+            success, download_error = await get_literature_service().download_pdf(candidate_url, pdf_path)
+            if success:
+                download_url = candidate_url
+                break
         if not success:
-            raise HTTPException(status_code=500, detail="PDF 下载失败，无法加入知识库")
+            raise HTTPException(status_code=502, detail=download_error or "PDF 下载失败，无法加入知识库")
         paper.pdf_downloaded = True
+        if not paper.pdf_url or str(paper.pdf_url).strip() != download_url:
+            paper.pdf_url = download_url
         paper.pdf_path = pdf_path
 
     original_filename = os.path.basename(pdf_path)

@@ -17286,7 +17286,7 @@ class LiteratureReaderComposeService:
         return datetime.now(timezone.utc).isoformat()
 
     async def _read_payload_from_redis(self, key: str) -> Optional[Dict[str, Any]]:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return None
         try:
@@ -17299,7 +17299,7 @@ class LiteratureReaderComposeService:
             return None
 
     async def _write_payload_to_redis(self, key: str, payload: Dict[str, Any]) -> None:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return
         try:
@@ -17312,7 +17312,7 @@ class LiteratureReaderComposeService:
             logger.warning(f"[ReaderComposeService] redis set failed: {exc}")
 
     async def _acquire_lock(self, lock_key: str) -> Optional[str]:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return None
         token = uuid.uuid4().hex
@@ -17325,7 +17325,7 @@ class LiteratureReaderComposeService:
             return None
 
     async def _release_lock(self, lock_key: str, token: str) -> None:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return
         try:

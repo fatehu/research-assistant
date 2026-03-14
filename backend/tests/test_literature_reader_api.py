@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.api import literature as literature_api
 from app.models.knowledge import DocumentStatus
 from app.models.literature import KnowledgeLinkStatus
+from app.services.literature_reader_compose_service import LiteratureReaderComposeService
 
 
 class _FakeResult:
@@ -33,11 +34,162 @@ class _FakeResult:
 class _FakeDB:
     def __init__(self, results):
         self._results = list(results)
+        self.committed = False
 
     async def execute(self, _query):
         if not self._results:
             return _FakeResult(rows=[])
         return self._results.pop(0)
+
+    async def commit(self):
+        self.committed = True
+
+
+@pytest.mark.asyncio
+async def test_get_reader_composed_page_cached_should_repair_malformed_fallback_payload(monkeypatch):
+    paper = SimpleNamespace(id=85, title="Fallback Paper", pdf_path="demo.pdf")
+    real_service = LiteratureReaderComposeService()
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    class _FakeComposeService:
+        async def get_latest_cached_payload_only(self, **_kwargs):
+            return {
+                "paper_id": 85,
+                "page": 1,
+                "status": "fallback",
+                "degraded_reason": "no_drop_blocks_failed_auto_fallback",
+                "pipeline_version": "simplified_v2",
+                "source_signature": "legacy-fallback-sig",
+                "build_mode": "compose_agent_simplified",
+                "ui_plan": {
+                    "components": [],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {
+                    "overall": 0.0,
+                    "degraded": True,
+                    "stop_reason": "no_drop_blocks_failed_auto_fallback",
+                },
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        def _ensure_payload_contract(self, *, page: int, payload: dict):
+            return real_service._ensure_payload_contract(page=page, payload=payload)
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.get_reader_composed_page_cached(
+        paper_id=85,
+        payload=literature_api.ReaderComposeRequest(page=1, selected_kb_id=84),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=1),
+    )
+
+    assert response.payload.status == "fallback"
+    assert response.payload.engine_version
+    assert response.payload.ui_plan.plan_id
+    assert response.payload.build_mode == "compose_agent_simplified"
+    assert response.cache_meta["cache_layer"] == "db"
+
+
+@pytest.mark.asyncio
+async def test_get_reader_composed_page_cached_should_pass_pipeline_version_override(monkeypatch):
+    paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
+    captured: dict[str, object] = {}
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    class _FakeComposeService:
+        async def get_latest_cached_payload_only(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "paper_id": 78,
+                "page": 7,
+                "status": "done",
+                "pipeline_version": "layout_uid_v1",
+                "engine_version": "reader_compose_v6",
+                "source_signature": "layout-uid-sig",
+                "build_mode": "compose_agent_layout_uid_v1",
+                "ui_plan": {
+                    "plan_id": "layout_uid_v1_p7",
+                    "components": [],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {"overall": 0.91, "degraded": False, "stop_reason": "layout_uid_v1_done"},
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        def _ensure_payload_contract(self, *, page: int, payload: dict):
+            return payload
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.get_reader_composed_page_cached(
+        paper_id=78,
+        payload=literature_api.ReaderComposeRequest(page=7, pipeline_version="layout_uid_v1"),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=1),
+    )
+
+    assert captured["pipeline_version_override"] == "layout_uid_v1"
+    assert response.payload.pipeline_version == "layout_uid_v1"
+
+
+@pytest.mark.asyncio
+async def test_get_reader_composed_page_cached_should_default_to_layout_uid_v1_pipeline(monkeypatch):
+    paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
+    captured: dict[str, object] = {}
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    class _FakeComposeService:
+        async def get_latest_cached_payload_only(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "paper_id": 78,
+                "page": 7,
+                "status": "done",
+                "pipeline_version": "layout_uid_v1",
+                "engine_version": "reader_compose_v6",
+                "source_signature": "layout-uid-default-sig",
+                "build_mode": "compose_agent_layout_uid_v1",
+                "ui_plan": {
+                    "plan_id": "layout_uid_v1_p7",
+                    "components": [],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {"overall": 0.92, "degraded": False, "stop_reason": "layout_uid_v1_done"},
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        def _ensure_payload_contract(self, *, page: int, payload: dict):
+            return payload
+
+    monkeypatch.setattr(literature_api.settings, "reader_pipeline_version", "layout_uid_v1")
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.get_reader_composed_page_cached(
+        paper_id=78,
+        payload=literature_api.ReaderComposeRequest(page=7),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=1),
+    )
+
+    assert captured["pipeline_version_override"] is None
+    assert response.payload.pipeline_version == "layout_uid_v1"
 
 
 @pytest.mark.asyncio
@@ -80,6 +232,205 @@ async def test_stream_paper_pdf_raises_404_when_missing(monkeypatch):
         )
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_docmind_page_image_reads_local_file(monkeypatch, tmp_path: Path):
+    image_path = tmp_path / "docmind_page.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    paper = SimpleNamespace(id=85, user_id=1)
+
+    class _FakeDBWithPaper:
+        async def get(self, _model, _paper_id):
+            return paper
+
+    class _FakeReaderService:
+        async def build_or_get_page_payload(self, **_kwargs):
+            return {
+                "docmind_structure": {
+                    "page_image_path": str(image_path),
+                    "page_image_url": "",
+                },
+            }, SimpleNamespace()
+
+    monkeypatch.setattr(literature_api, "get_literature_reader_service", lambda: _FakeReaderService())
+
+    response = await literature_api.stream_reader_docmind_page_image(
+        paper_id=85,
+        page=7,
+        db=_FakeDBWithPaper(),
+    )
+
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == image_path
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_grounding_page_asset_reads_localized_file(monkeypatch, tmp_path: Path):
+    image_path = tmp_path / "grounding_pages" / "page_7.png"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    paper = SimpleNamespace(id=85, user_id=1)
+
+    class _FakeDBWithPaper:
+        async def get(self, _model, _paper_id):
+            return paper
+
+    class _FakeComposeService:
+        @staticmethod
+        def _find_existing_grounding_page_image_path(*, paper_id, page):  # pylint: disable=unused-argument
+            return str(image_path)
+
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.stream_reader_grounding_page_asset(
+        paper_id=85,
+        page=7,
+        db=_FakeDBWithPaper(),
+    )
+
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == image_path
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_docmind_page_image_localizes_remote_url(monkeypatch, tmp_path: Path):
+    paper = SimpleNamespace(id=85, user_id=1)
+
+    class _FakeDBWithPaper:
+        async def get(self, _model, _paper_id):
+            return paper
+
+    class _FakeReaderService:
+        async def build_or_get_page_payload(self, **_kwargs):
+            return {
+                "docmind_structure": {
+                    "page_image_path": "",
+                    "page_image_url": "https://example.com/page.png",
+                },
+            }, SimpleNamespace()
+
+    monkeypatch.setattr(literature_api, "get_literature_reader_service", lambda: _FakeReaderService())
+
+    localized_path = tmp_path / "paper_85" / "grounding_pages" / "page_7.png"
+    localized_path.parent.mkdir(parents=True, exist_ok=True)
+    localized_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    class _FakeComposeService:
+        @staticmethod
+        def _ensure_local_grounding_page_image(*, paper_id, page, page_image_url, page_image_path):  # pylint: disable=unused-argument
+            return str(localized_path)
+
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.stream_reader_docmind_page_image(
+        paper_id=85,
+        page=7,
+        db=_FakeDBWithPaper(),
+    )
+
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == localized_path
+
+
+@pytest.mark.asyncio
+async def test_download_paper_pdf_derives_arxiv_pdf_url_from_doi(monkeypatch, tmp_path: Path):
+    paper = SimpleNamespace(
+        id=17,
+        user_id=9,
+        title="Attention Is All You Need",
+        pdf_url=None,
+        pdf_downloaded=False,
+        pdf_path=None,
+        arxiv_id=None,
+        arxiv_url=None,
+        doi="10.48550/arXiv.1706.03762",
+        raw_data={"imported_link": "https://doi.org/10.48550/arXiv.1706.03762"},
+        document_id=None,
+    )
+    db = _FakeDB([_FakeResult(row=paper)])
+    captured: dict[str, str] = {}
+    save_path = tmp_path / "attention_17.pdf"
+
+    class _FakeService:
+        async def download_pdf(self, pdf_url: str, path: str):
+            captured["pdf_url"] = pdf_url
+            captured["save_path"] = path
+            Path(path).write_bytes(b"%PDF-1.4\n%EOF\n")
+            return True, ""
+
+    monkeypatch.setattr(literature_api, "get_literature_service", lambda: _FakeService())
+    monkeypatch.setattr(
+        literature_api,
+        "_build_paper_pdf_file_path",
+        lambda **kwargs: str(save_path),
+    )
+
+    response = await literature_api.download_paper_pdf(
+        paper_id=17,
+        knowledge_base_id=None,
+        background_tasks=None,
+        db=db,
+        current_user=SimpleNamespace(id=9),
+    )
+
+    assert response["message"] == "PDF 下载成功"
+    assert captured["pdf_url"] == "https://arxiv.org/pdf/1706.03762"
+    assert captured["save_path"] == str(save_path)
+    assert paper.pdf_downloaded is True
+    assert paper.pdf_path == str(save_path)
+    assert paper.pdf_url == "https://arxiv.org/pdf/1706.03762"
+    assert save_path.exists()
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_download_paper_pdf_falls_back_when_stored_pdf_url_is_stale(monkeypatch, tmp_path: Path):
+    paper = SimpleNamespace(
+        id=18,
+        user_id=9,
+        title="Attention Is All You Need",
+        pdf_url="https://example.com/stale.pdf",
+        pdf_downloaded=False,
+        pdf_path=None,
+        arxiv_id=None,
+        arxiv_url=None,
+        doi="10.48550/arXiv.1706.03762",
+        raw_data={"imported_link": "https://doi.org/10.48550/arXiv.1706.03762"},
+        document_id=None,
+    )
+    db = _FakeDB([_FakeResult(row=paper)])
+    attempts: list[str] = []
+    save_path = tmp_path / "attention_18.pdf"
+
+    class _FakeService:
+        async def download_pdf(self, pdf_url: str, path: str):
+            attempts.append(pdf_url)
+            if pdf_url == "https://example.com/stale.pdf":
+                return False, "PDF 下载失败，上游返回 404"
+            Path(path).write_bytes(b"%PDF-1.4\n%EOF\n")
+            return True, ""
+
+    monkeypatch.setattr(literature_api, "get_literature_service", lambda: _FakeService())
+    monkeypatch.setattr(
+        literature_api,
+        "_build_paper_pdf_file_path",
+        lambda **kwargs: str(save_path),
+    )
+
+    response = await literature_api.download_paper_pdf(
+        paper_id=18,
+        knowledge_base_id=None,
+        background_tasks=None,
+        db=db,
+        current_user=SimpleNamespace(id=9),
+    )
+
+    assert response["message"] == "PDF 下载成功"
+    assert attempts == [
+        "https://arxiv.org/pdf/1706.03762",
+    ]
+    assert paper.pdf_url == "https://arxiv.org/pdf/1706.03762"
 
 
 @pytest.mark.asyncio

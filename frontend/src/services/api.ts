@@ -1540,6 +1540,7 @@ export interface ReaderGroundingBlock {
   block_index: number
   text: string
   pos: ReaderGroundingPoint[]
+  style_id: number
 }
 
 export interface ReaderGroundingTableCell {
@@ -1560,6 +1561,12 @@ export interface ReaderGroundingLayoutAtom {
   layout_sub_type: string
   raw_text: string
   clean_text: string
+  normalized_text: string
+  normalization_reason: string
+  normalization_mode: string
+  normalization_confidence?: number | null
+  alignment: string
+  line_height: number
   layout_pos: ReaderGroundingPoint[]
   blocks: ReaderGroundingBlock[]
   table_cells: ReaderGroundingTableCell[]
@@ -1575,6 +1582,10 @@ export interface ReaderGroundingReadingNode {
   node_kind: string
   raw_text: string
   clean_text: string
+  normalized_text: string
+  normalization_reason: string
+  normalization_mode: string
+  normalization_confidence?: number | null
   source_layout_ids: string[]
   source_block_ids: string[]
   include_in_main_flow: boolean
@@ -1600,6 +1611,8 @@ export interface ReaderGroundingPageImage {
   width?: number | null
   height?: number | null
   source: string
+  origin_url?: string
+  local_cached?: boolean
 }
 
 export interface ReaderPageGrounding {

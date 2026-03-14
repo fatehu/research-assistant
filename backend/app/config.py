@@ -144,15 +144,15 @@ class Settings(BaseSettings):
     pdf_rag_fail_open: bool = True
     pdf_rag_qwen_device: Literal["auto", "cpu", "cuda"] = "auto"
     pdf_rag_action_model_dir: str = str(
-        Path("tmp") / "qwen_lora" / "qwen_action_lora_merged_v1"
+        Path("models") / "runtime" / "qwen_action_lora_base_v4_drop"
     )
     pdf_rag_clean_model_dir: str = str(
-        Path("tmp") / "qwen_lora" / "qwen_clean_lora_merged_v1"
+        Path("models") / "runtime" / "qwen_clean_lora_merged_v1"
     )
     pdf_rag_chunk_model_dir: str = str(
-        Path("tmp") / "qwen_lora" / "qwen_chunk_lora_merged_v1"
+        Path("models") / "runtime" / "qwen_chunk_lora_v5_context_paragraph"
     )
-    pdf_rag_ocr_enabled: bool = True
+    pdf_rag_ocr_enabled: bool = False
     pdf_rag_ocr_model: str = "qwen3.5:0.8b-stable"
     pdf_rag_ocr_timeout_seconds: int = 30
     pdf_rag_ocr_dpi: int = 180
@@ -297,7 +297,7 @@ class Settings(BaseSettings):
     reader_simplified_allowlist_papers: str = ""
     reader_simplified_allowlist_pages: str = ""
     # Cache/payload version isolation token for simplified pipeline.
-    reader_pipeline_version: str = "simplified_v2"
+    reader_pipeline_version: str = "layout_uid_v1"
     # Single-agent V2 runtime contract
     reader_agent_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
     reader_agent_model: str = "qwen-3.5-plus"
@@ -326,6 +326,12 @@ class Settings(BaseSettings):
     reader_agent_tool_whitelist: str = "paper_read,knowledge_search"
     # Agent assembly timeout in seconds. <=0 means no timeout.
     reader_agent_assembly_timeout_seconds: int = 180
+    # Generative reader agent (resource enrichment + interactive module planning)
+    generative_reader_agent_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
+    generative_reader_agent_model: str = ""
+    generative_reader_agent_tool_whitelist: str = "paper_read,knowledge_search,web_search,web_scrape"
+    generative_reader_agent_max_iterations: int = 6
+    generative_reader_agent_timeout_seconds: int = 45
     # Legacy DeepSeek assembly timeout in seconds. <=0 means no timeout.
     reader_compose_layout_llm_timeout_seconds: int = 120
     # Reader anchor quality gate / jump control

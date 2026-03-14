@@ -845,6 +845,7 @@ class ReaderGroundingBlock(BaseModel):
     block_index: int = 0
     text: str = ""
     pos: List[ReaderGroundingPoint] = Field(default_factory=list)
+    style_id: int = 0
 
 
 class ReaderGroundingTableCell(BaseModel):
@@ -865,6 +866,12 @@ class ReaderGroundingLayoutAtom(BaseModel):
     layout_sub_type: str = ""
     raw_text: str = ""
     clean_text: str = ""
+    normalized_text: str = ""
+    normalization_reason: str = ""
+    normalization_mode: str = ""
+    normalization_confidence: Optional[float] = None
+    alignment: str = ""
+    line_height: float = 0.0
     layout_pos: List[ReaderGroundingPoint] = Field(default_factory=list)
     blocks: List[ReaderGroundingBlock] = Field(default_factory=list)
     table_cells: List[ReaderGroundingTableCell] = Field(default_factory=list)
@@ -880,6 +887,10 @@ class ReaderGroundingReadingNode(BaseModel):
     node_kind: str = ""
     raw_text: str = ""
     clean_text: str = ""
+    normalized_text: str = ""
+    normalization_reason: str = ""
+    normalization_mode: str = ""
+    normalization_confidence: Optional[float] = None
     source_layout_ids: List[str] = Field(default_factory=list)
     source_block_ids: List[str] = Field(default_factory=list)
     include_in_main_flow: bool = True
@@ -905,6 +916,8 @@ class ReaderGroundingPageImage(BaseModel):
     width: Optional[int] = None
     height: Optional[int] = None
     source: str = ""
+    origin_url: str = ""
+    local_cached: bool = False
 
 
 class ReaderPageGrounding(BaseModel):

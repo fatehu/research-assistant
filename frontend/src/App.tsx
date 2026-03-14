@@ -14,6 +14,8 @@ const SmartChunkingPage = lazy(() => import('@/pages/knowledge/SmartChunkingPage
 const LiteraturePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.LiteraturePage })))
 const PaperReaderPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderPage })))
 const PaperReaderReviewPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderReviewPage })))
+const PaperReaderWorkbenchPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderWorkbenchPage })))
+const PaperReaderExperiencePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderExperiencePage })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
 const AdminStatisticsPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.StatisticsPage })))
@@ -144,6 +146,26 @@ function App() {
             <PrivateRoute>
               <ErrorBoundary>
                 {withSuspense(<PaperReaderReviewPage />)}
+              </ErrorBoundary>
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/read/workbench"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderWorkbenchPage />)}
+              </ErrorBoundary>
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/experience"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderExperiencePage />)}
               </ErrorBoundary>
             </PrivateRoute>
           }
