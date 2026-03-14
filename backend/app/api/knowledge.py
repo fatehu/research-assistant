@@ -169,6 +169,14 @@ async def _document_file_has_other_references(db: AsyncSession, doc: Document) -
     return int(linked_paper_count or 0) > 0
 
 
+def _should_run_chunk_quality_gate(*, gate_enabled: bool, used_pdf_rag_ingest: bool) -> bool:
+    if not gate_enabled:
+        return False
+    if used_pdf_rag_ingest:
+        return False
+    return True
+
+
 # ========== 可用嵌入模型注册表 ==========
 
 # 面向用户的模型描述信息
@@ -852,6 +860,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             text = ""
             primary_chunks = []
             context_chunks = []
+            used_pdf_rag_ingest = False
 
             if doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
                 extract_started_at = time.perf_counter()
@@ -869,6 +878,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 doc.metadata_ = current_metadata
                 if bool(pdf_result.get("applied")):
                     primary_chunks = list(pdf_result.get("chunks") or [])
+                    used_pdf_rag_ingest = True
                     logger.info(
                         f"[doc:{task_trace_id}] PDF 行级 RAG 链路完成: chars={len(text)}, chunks={len(primary_chunks)}, "
                         f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
@@ -1008,8 +1018,16 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 按位置排序
             chunks_to_save.sort(key=lambda x: x["start_char"])
 
+            # Skip the legacy chunk gate for PDF line-RAG outputs. Those chunks have
+            # already been judged by the action/clean/chunk pipeline and should not
+            # be re-scored by the older chunk-quality design.
+            should_run_chunk_quality_gate = _should_run_chunk_quality_gate(
+                gate_enabled=bool(settings.chunk_quality_gate_enabled),
+                used_pdf_rag_ingest=used_pdf_rag_ingest,
+            )
+
             # Chunk quality gate (optional): score + mark bad chunks + local repair.
-            if settings.chunk_quality_gate_enabled:
+            if should_run_chunk_quality_gate:
                 gate_started_at = time.perf_counter()
                 gate_service = get_chunk_quality_gate_service()
                 logger.info(
@@ -1057,6 +1075,18 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     await db.commit()
                     await _emit_status()
                     return
+            elif bool(settings.chunk_quality_gate_enabled) and used_pdf_rag_ingest:
+                logger.info(
+                    f"[doc:{task_trace_id}] 跳过 chunk quality gate: pdf_rag_ingest 已产出主分块, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["chunk_quality_gate"] = {
+                    "enabled": False,
+                    "skipped": True,
+                    "skipped_reason": "pdf_rag_ingest_managed_chunks",
+                }
+                doc.metadata_ = current_metadata
 
             # 生成嵌入向量
             logger.info(f"[doc:{task_trace_id}] 开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")

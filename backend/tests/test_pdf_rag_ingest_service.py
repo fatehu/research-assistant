@@ -39,7 +39,12 @@ class _FakeRuntime:
     def available(self) -> bool:
         return True
 
+    def release(self) -> None:
+        return None
+
     def classify_action(self, text: str) -> str:
+        if "drop me" in text:
+            return "DROP"
         if "split words" in text:
             return "REPAIR"
         return "KEEP"
@@ -58,6 +63,9 @@ class _UnavailableRuntime:
 
     def available(self) -> bool:
         return False
+
+    def release(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -94,6 +102,62 @@ async def test_ingest_pdf_builds_line_chunks_with_raw_and_normalized_metadata(mo
     second_meta = second_chunk["metadata"]["extra"]
     assert second_meta["line_ids"] == ["p1_l002_main", "p1_l003_main"]
     assert second_meta["pages"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_preserves_source_order_in_chunk_metadata(monkeypatch):
+    service = PdfRagIngestService()
+    lines = [
+        _line(order=0, page=1, text="Heading", start=0, end=7),
+        _line(order=1, page=1, text="Alpha", start=8, end=13),
+        _line(order=2, page=1, text="drop me footer", start=14, end=28),
+        _line(order=3, page=1, text="Methods", start=29, end=36),
+        _line(order=4, page=1, text="Beta", start=37, end=41),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_extract_lines",
+        lambda _file_path: (lines, "\n".join(item.raw_text for item in lines)),
+    )
+    monkeypatch.setattr(pdf_rag_module, "_runtime", _FakeRuntime())
+
+    result = await service.ingest_pdf(file_path="dummy.pdf", document_name="paper.pdf")
+
+    assert result["applied"] is True
+    all_line_ids = []
+    for chunk in result["chunks"]:
+        all_line_ids.extend(chunk["metadata"]["extra"]["line_ids"])
+    assert all_line_ids == ["p1_l000_main", "p1_l001_main", "p1_l003_main", "p1_l004_main"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_drop_lines_are_discarded_without_ocr(monkeypatch):
+    service = PdfRagIngestService()
+    lines = [
+        _line(order=0, page=1, text="Intro", start=0, end=5),
+        _line(order=1, page=1, text="drop me footer", start=6, end=20),
+        _line(order=2, page=1, text="Body", start=21, end=25),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_extract_lines",
+        lambda _file_path: (lines, "\n".join(item.raw_text for item in lines)),
+    )
+    monkeypatch.setattr(pdf_rag_module, "_runtime", _FakeRuntime())
+
+    async def _unexpected_ocr(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("OCR should not be called for DROP lines")
+
+    monkeypatch.setattr(service, "_recover_with_ocr", _unexpected_ocr)
+
+    result = await service.ingest_pdf(file_path="dummy.pdf", document_name="paper.pdf")
+
+    assert result["applied"] is True
+    assert result["report"]["accepted_line_count"] == 2
+    assert result["report"]["dropped_line_count"] == 1
+    assert result["report"]["action_counts"]["DROP"] == 1
+    assert result["report"]["ocr_used_count"] == 0
+    assert result["report"]["dropped_line_ids"] == ["p1_l001_main"]
 
 
 def test_validate_and_fill_coverage_adds_missing_lines_as_single_chunks():
