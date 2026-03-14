@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal
@@ -10,6 +12,7 @@ from typing import Any, Dict, List, Literal
 from loguru import logger
 
 MCPTransport = Literal["stdio", "sse", "streamable_http"]
+_ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _normalize_transport(raw: Any, *, default: MCPTransport = "stdio") -> MCPTransport:
@@ -19,6 +22,15 @@ def _normalize_transport(raw: Any, *, default: MCPTransport = "stdio") -> MCPTra
     if value in {"http", "https"}:
         return "streamable_http"
     return default
+
+
+def _expand_env_placeholders(value: str) -> str:
+    text = str(value or "")
+
+    def _replace(match: re.Match[str]) -> str:
+        return os.getenv(match.group(1), "")
+
+    return _ENV_PLACEHOLDER_RE.sub(_replace, text)
 
 
 @dataclass
@@ -66,12 +78,12 @@ class MCPServerConfig:
             name=name,
             transport=transport,
             enabled=bool(payload.get("enabled", True)),
-            command=str(payload.get("command", "")).strip(),
-            args=[str(x) for x in args],
-            env={str(k): str(v) for k, v in env.items()},
-            cwd=str(payload.get("cwd", "")).strip(),
-            url=str(payload.get("url", "")).strip(),
-            headers={str(k): str(v) for k, v in headers.items()},
+            command=_expand_env_placeholders(str(payload.get("command", "")).strip()),
+            args=[_expand_env_placeholders(str(x)) for x in args],
+            env={str(k): _expand_env_placeholders(str(v)) for k, v in env.items()},
+            cwd=_expand_env_placeholders(str(payload.get("cwd", "")).strip()),
+            url=_expand_env_placeholders(str(payload.get("url", "")).strip()),
+            headers={str(k): _expand_env_placeholders(str(v)) for k, v in headers.items()},
             timeout_seconds=timeout,
             sse_read_timeout_seconds=sse_read_timeout,
         )

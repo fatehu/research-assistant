@@ -337,6 +337,100 @@ class AgentCore:
             return m.group(1).strip()
         return re.sub(r"</?(?:think|action|observation|answer)>", "", content or "").strip()
 
+    @classmethod
+    def _normalize_messages_for_plain_chat(cls, messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for raw in list(messages or []):
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role", "") or "").strip().lower() or "user"
+            content = str(raw.get("content", "") or "")
+            if role == "tool":
+                text = content.strip()
+                if text:
+                    normalized.append({"role": "user", "content": f"<observation>\n{text}\n</observation>"})
+                continue
+            if role == "assistant":
+                clean = cls._strip_think_content(content)
+                if raw.get("tool_calls"):
+                    if clean:
+                        normalized.append({"role": "assistant", "content": clean})
+                    continue
+                normalized.append({"role": "assistant", "content": clean})
+                continue
+            normalized.append({"role": role, "content": content})
+        return normalized
+
+    @classmethod
+    def _normalize_messages_for_function_calling(cls, messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        rows = [item for item in list(messages or []) if isinstance(item, dict)]
+        idx = 0
+        total = len(rows)
+
+        def _tool_as_observation(msg: Dict[str, Any]) -> None:
+            text = str(msg.get("content", "") or "").strip()
+            if text:
+                normalized.append({"role": "user", "content": f"<observation>\n{text}\n</observation>"})
+
+        while idx < total:
+            raw = rows[idx]
+            role = str(raw.get("role", "") or "").strip().lower() or "user"
+            content = str(raw.get("content", "") or "")
+
+            if role == "tool":
+                _tool_as_observation(raw)
+                idx += 1
+                continue
+
+            if role == "assistant" and raw.get("tool_calls"):
+                clean = cls._strip_think_content(content)
+                tool_calls = [call for call in list(raw.get("tool_calls") or []) if isinstance(call, dict)]
+                expected_ids = [str(call.get("id") or "").strip() for call in tool_calls if str(call.get("id") or "").strip()]
+
+                following_tools: List[Dict[str, Any]] = []
+                cursor = idx + 1
+                while cursor < total and str(rows[cursor].get("role", "") or "").strip().lower() == "tool":
+                    following_tools.append(rows[cursor])
+                    cursor += 1
+
+                found_ids = [str(item.get("tool_call_id") or "").strip() for item in following_tools if str(item.get("tool_call_id") or "").strip()]
+                if expected_ids and all(call_id in found_ids for call_id in expected_ids):
+                    normalized.append(
+                        {
+                            "role": "assistant",
+                            "content": clean,
+                            "tool_calls": tool_calls,
+                        }
+                    )
+                    for tool_msg in following_tools:
+                        entry = {
+                            "role": "tool",
+                            "tool_call_id": str(tool_msg.get("tool_call_id") or ""),
+                            "content": str(tool_msg.get("content", "") or ""),
+                        }
+                        tool_name = str(tool_msg.get("name") or "").strip()
+                        if tool_name:
+                            entry["name"] = tool_name
+                        normalized.append(entry)
+                else:
+                    if clean:
+                        normalized.append({"role": "assistant", "content": clean})
+                    for tool_msg in following_tools:
+                        _tool_as_observation(tool_msg)
+                idx = cursor
+                continue
+
+            if role == "assistant":
+                normalized.append({"role": "assistant", "content": cls._strip_think_content(content)})
+                idx += 1
+                continue
+
+            normalized.append({"role": role, "content": content})
+            idx += 1
+
+        return normalized
+
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
@@ -761,6 +855,7 @@ class AgentCore:
         system_prompt: str,
     ) -> tuple[List[Dict[str, Any]], bool]:
         user_text = self._latest_user_text(context.messages)
+        llm_messages = self._normalize_messages_for_function_calling(llm_messages)
         response = await self.llm.chat_with_tools(
             messages=llm_messages,
             tools=self._collect_llm_tool_schemas(user_text),
@@ -826,6 +921,7 @@ class AgentCore:
         llm_messages: List[Dict[str, Any]],
         system_prompt: str,
     ) -> tuple[List[Dict[str, Any]], bool]:
+        llm_messages = self._normalize_messages_for_plain_chat(llm_messages)
         response = await self.llm.chat(
             messages=llm_messages,
             system_prompt=system_prompt,

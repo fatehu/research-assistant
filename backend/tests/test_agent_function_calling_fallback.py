@@ -104,3 +104,110 @@ async def test_function_calling_direct_answer_emits_thought_step():
     assert thought_events
     assert "问题分析" in str(thought_events[0].get("data", ""))
     assert done_events and "直接回答" in str(done_events[0]["data"]["answer"])
+
+
+def test_plain_chat_normalization_strips_tool_protocol_messages():
+    messages = [
+        {"role": "user", "content": "用户问题"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "paper_read", "arguments": "{\"query\":\"Fig 3\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "paper_read",
+            "content": "paper observation",
+        },
+    ]
+
+    normalized = ReActAgent._normalize_messages_for_plain_chat(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "用户问题"},
+        {"role": "user", "content": "<observation>\npaper observation\n</observation>"},
+    ]
+
+
+def test_function_calling_normalization_preserves_complete_tool_call_groups():
+    messages = [
+        {"role": "user", "content": "用户问题"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "paper_read", "arguments": "{\"query\":\"Fig 3\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "paper_read",
+            "content": "paper observation",
+        },
+    ]
+
+    normalized = ReActAgent._normalize_messages_for_function_calling(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "用户问题"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "paper_read", "arguments": "{\"query\":\"Fig 3\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "paper_read",
+            "content": "paper observation",
+        },
+    ]
+
+
+def test_function_calling_normalization_downgrades_broken_tool_call_groups():
+    messages = [
+        {"role": "user", "content": "用户问题"},
+        {
+            "role": "assistant",
+            "content": "先查一下",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "paper_read", "arguments": "{\"query\":\"Fig 3\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_other",
+            "name": "paper_read",
+            "content": "orphan observation",
+        },
+    ]
+
+    normalized = ReActAgent._normalize_messages_for_function_calling(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "用户问题"},
+        {"role": "assistant", "content": "先查一下"},
+        {"role": "user", "content": "<observation>\norphan observation\n</observation>"},
+    ]

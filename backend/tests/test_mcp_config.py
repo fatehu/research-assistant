@@ -52,6 +52,26 @@ def test_parse_claude_desktop_payload():
     assert configs[0].url == "https://mcp.exa.ai/mcp"
 
 
+def test_parse_payload_expands_env_placeholders(monkeypatch):
+    monkeypatch.setenv("MCP_TAVILY_MCP_URL", "https://mcp.tavily.com/mcp?token=demo")
+    monkeypatch.setenv("MCP_TEST_HEADER", "secret-token")
+
+    payload = {
+        "mcpServers": {
+            "tavily": {
+                "type": "http",
+                "url": "${MCP_TAVILY_MCP_URL}",
+                "headers": {"Authorization": "Bearer ${MCP_TEST_HEADER}"},
+            }
+        }
+    }
+
+    configs = parse_mcp_server_configs_payload(payload, 20)
+    assert len(configs) == 1
+    assert configs[0].url == "https://mcp.tavily.com/mcp?token=demo"
+    assert configs[0].headers["Authorization"] == "Bearer secret-token"
+
+
 def test_load_mcp_server_configs_from_file(tmp_path):
     path = tmp_path / "mcp_servers.json"
     path.write_text(
@@ -74,6 +94,28 @@ def test_load_mcp_server_configs_from_file(tmp_path):
 
     configs_direct = load_mcp_server_configs_from_file(str(path), 30)
     assert len(configs_direct) == 1
+
+
+def test_load_mcp_server_configs_from_file_expands_env_placeholders(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_TAVILY_MCP_URL", "https://mcp.tavily.com/mcp?token=file-demo")
+    path = tmp_path / "mcp_servers.json"
+    path.write_text(
+        """
+        {
+          "mcpServers": {
+            "tavily": {
+              "type": "http",
+              "url": "${MCP_TAVILY_MCP_URL}"
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    configs = load_mcp_server_configs_from_file(str(path), 20)
+    assert len(configs) == 1
+    assert configs[0].url == "https://mcp.tavily.com/mcp?token=file-demo"
 
 
 def test_save_and_serialize_claude_desktop_config(tmp_path):

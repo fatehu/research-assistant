@@ -370,6 +370,60 @@ class WebSearchTool(ToolBase):
             error="web_search_all_failed",
         )
 
+
+class WebScrapeInput(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    formats: Optional[List[str]] = None
+    only_main_content: bool = True
+
+
+class WebScrapeTool(ToolBase):
+    """网页抓取工具壳：优先交给 MCP 路由（例如 Firecrawl）。"""
+
+    name = "web_scrape"
+    parallel_safe = True
+    description = "抓取网页正文、结构化内容或提取页面关键信息。优先由 MCP 抓取工具处理。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "要抓取的网页 URL",
+            },
+            "formats": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "期望的输出格式，例如 markdown、html、text",
+            },
+            "only_main_content": {
+                "type": "boolean",
+                "description": "是否尽量仅抓取正文区域",
+                "default": True,
+            },
+        },
+        "required": ["url"],
+    }
+    input_model = WebScrapeInput
+    timeout_seconds = 45
+    retry_count = 0
+
+    async def _execute(
+        self,
+        url: str,
+        formats: Optional[List[str]] = None,
+        only_main_content: bool = True,
+    ) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="web_scrape 当前依赖外部 MCP 抓取服务；请检查 Firecrawl MCP 路由是否已启用。",
+            error="web_scrape_mcp_required",
+            data={
+                "url": url,
+                "formats": formats or [],
+                "only_main_content": bool(only_main_content),
+            },
+        )
+
     async def _safe_provider_call(
         self,
         provider_name: str,
@@ -1954,6 +2008,7 @@ class DefaultToolProvider:
         tools.extend(
             [
                 WebSearchTool(),
+                WebScrapeTool(),
                 CalculatorTool(),
                 DateTimeTool(),
                 TextAnalysisTool(),

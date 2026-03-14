@@ -8,11 +8,15 @@ from app.services.mcp.templates import get_mcp_server_templates
 
 def test_mcp_templates_basic_shape():
     templates = get_mcp_server_templates()
-    assert len(templates) >= 5
+    assert len(templates) >= 8
 
     ids = {item["id"] for item in templates}
     assert "filesystem" in ids
+    assert "fetch" in ids
     assert "postgres" in ids
+    assert "sequential_thinking" in ids
+    assert "memory" in ids
+    assert "tavily_search" in ids
     assert "firecrawl" in ids
 
     for item in templates:
