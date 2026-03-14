@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!docker-entrypoint.sh
+!requirements.txt
+!alembic.ini
+!mcp_servers.json
+!app/
+!app/**
+!alembic/
+!alembic/**
