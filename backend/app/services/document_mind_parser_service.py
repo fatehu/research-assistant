@@ -629,8 +629,20 @@ class DocumentMindParserService:
             if not isinstance(page_row, dict):
                 page_row = pages[0]
         image_url = ""
+        image_width = 0
+        image_height = 0
+        image_path = ""
         if isinstance(page_row, dict):
             image_url = str(page_row.get("imageUrl") or page_row.get("image_url") or "").strip()
+            try:
+                image_width = int(page_row.get("imageWidth") or page_row.get("pageWidth") or 0)
+            except Exception:
+                image_width = 0
+            try:
+                image_height = int(page_row.get("imageHeight") or page_row.get("pageHeight") or 0)
+            except Exception:
+                image_height = 0
+            image_path = str(page_row.get("sourceImagePath") or page_row.get("source_image_path") or "").strip()
 
         structure = {
             "layouts": [row for row in list(data.get("layouts") or []) if isinstance(row, dict)],
@@ -640,6 +652,9 @@ class DocumentMindParserService:
             "doc_info": doc_info,
             "version": str(data.get("version") or ""),
             "page_image_url": image_url,
+            "page_image_path": image_path,
+            "page_image_width": image_width,
+            "page_image_height": image_height,
             "raw_result": data,
         }
         return structure, meta

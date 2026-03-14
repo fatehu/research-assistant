@@ -19,8 +19,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from loguru import logger
+from PIL import Image
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +49,8 @@ LOCK_WAIT_SECONDS = 6.0
 LOCK_POLL_INTERVAL_SECONDS = 0.22
 REDIS_KEY_PREFIX = "lit:reader:gpage:v1"
 REDIS_LOCK_PREFIX = "lit:reader:gpage:lock:v1"
+UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", "./uploads"))
+PAGE_RENDER_ASSET_DIR = os.path.join(UPLOAD_DIR, "reader_page_assets")
 
 
 SECTION_KEYWORDS = {
@@ -124,6 +129,12 @@ class LiteratureReaderService:
                         f"paper={paper.id} page={page_num} reason={bypass_reason or 'missing_docmind_layouts'}"
                     )
                 else:
+                    cached_payload = self._repair_docmind_page_image_contract(
+                        payload=cached_payload,
+                        paper_id=int(paper.id),
+                        page=page_num,
+                        eager_localize=False,
+                    )
                     payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
                     return payload, ReaderBuildMeta(
                         cache_hit=True,
@@ -147,6 +158,12 @@ class LiteratureReaderService:
                         f"paper={paper.id} page={page_num} reason={bypass_reason or 'missing_docmind_layouts'}"
                     )
                 else:
+                    cached_row = self._repair_docmind_page_image_contract(
+                        payload=cached_row,
+                        paper_id=int(paper.id),
+                        page=page_num,
+                        eager_localize=False,
+                    )
                     await self._write_payload_to_redis(redis_key, cached_row)
                     payload = self._with_cache_meta(cached_row, cache_hit=True, cache_layer="db")
                     return payload, ReaderBuildMeta(
@@ -254,6 +271,12 @@ class LiteratureReaderService:
                 "assets": assets,
                 "generated_at": datetime.utcnow().isoformat(),
             }
+            payload = self._repair_docmind_page_image_contract(
+                payload=payload,
+                paper_id=int(paper.id),
+                page=page_num,
+                eager_localize=True,
+            )
 
             await self._upsert_payload_to_db(
                 db=db,
@@ -1561,6 +1584,140 @@ class LiteratureReaderService:
         if dm_reason in {"disabled_or_not_allowlisted", "client_unavailable"}:
             return True, dm_reason
         return False, ""
+
+    @staticmethod
+    def _is_safe_http_url(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text or not re.match(r"^https?://", text, flags=re.IGNORECASE):
+            return False
+        try:
+            parsed = urlparse(text)
+        except Exception:
+            return False
+        return bool(parsed.scheme and parsed.netloc)
+
+    @staticmethod
+    def _guess_image_extension(*, filename: str, content_type: str) -> str:
+        name = str(filename or "").strip().lower()
+        if name.endswith(".jpg") or name.endswith(".jpeg"):
+            return "jpg"
+        if name.endswith(".webp"):
+            return "webp"
+        return "png" if str(content_type or "").strip().lower() == "image/png" else "png"
+
+    @staticmethod
+    def _find_existing_grounding_page_image_path(*, paper_id: int, page: int) -> str:
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            target = os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+        return ""
+
+    def _ensure_local_docmind_page_image(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        page_image_url: str,
+        page_image_path: str,
+    ) -> str:
+        local_path = str(page_image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            return local_path
+        existing_path = self._find_existing_grounding_page_image_path(paper_id=int(paper_id), page=int(page))
+        if existing_path:
+            return existing_path
+        remote_url = str(page_image_url or "").strip()
+        if not self._is_safe_http_url(remote_url):
+            return ""
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        os.makedirs(out_dir, exist_ok=True)
+        parsed = urlparse(remote_url)
+        filename = os.path.basename(parsed.path)
+        try:
+            with urlopen(remote_url, timeout=20) as response:  # nosec B310 - trusted DocMind image URL
+                data = response.read()
+                content_type = ""
+                try:
+                    content_type = str(response.info().get_content_type() or "").strip().lower()
+                except Exception:
+                    content_type = ""
+        except Exception as exc:
+            logger.warning(f"[ReaderService] failed to localize docmind page image: {exc}")
+            return ""
+        if not data:
+            return ""
+        ext = self._guess_image_extension(filename=filename, content_type=content_type)
+        target = os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+        try:
+            with open(target, "wb") as handle:
+                handle.write(data)
+            return target if os.path.exists(target) and os.path.getsize(target) > 0 else ""
+        except Exception as exc:
+            logger.warning(f"[ReaderService] failed to persist docmind page image: {exc}")
+            return ""
+
+    @staticmethod
+    def _read_image_size(image_path: str) -> Tuple[int, int]:
+        local_path = str(image_path or "").strip()
+        if not local_path or not os.path.exists(local_path):
+            return 0, 0
+        try:
+            with Image.open(local_path) as image:
+                width, height = image.size
+            return int(width or 0), int(height or 0)
+        except Exception:
+            return 0, 0
+
+    def _repair_docmind_page_image_contract(
+        self,
+        *,
+        payload: Dict[str, Any],
+        paper_id: int,
+        page: int,
+        eager_localize: bool,
+    ) -> Dict[str, Any]:
+        cloned = dict(payload or {})
+        docmind_structure = dict(cloned.get("docmind_structure") or {})
+        if not docmind_structure:
+            return cloned
+        doc_info = dict(docmind_structure.get("doc_info") or {})
+        pages = [row for row in list(doc_info.get("pages") or []) if isinstance(row, dict)]
+        page_row: Dict[str, Any] = {}
+        if pages:
+            page_idx = max(0, int(page) - 1)
+            if page_idx < len(pages):
+                page_row = dict(pages[page_idx] or {})
+            elif pages:
+                page_row = dict(pages[0] or {})
+        image_url = str(docmind_structure.get("page_image_url") or page_row.get("imageUrl") or page_row.get("image_url") or "").strip()
+        image_path = str(docmind_structure.get("page_image_path") or page_row.get("sourceImagePath") or page_row.get("source_image_path") or "").strip()
+        width = int(docmind_structure.get("page_image_width") or page_row.get("imageWidth") or page_row.get("pageWidth") or 0)
+        height = int(docmind_structure.get("page_image_height") or page_row.get("imageHeight") or page_row.get("pageHeight") or 0)
+        if eager_localize:
+            localized_path = self._ensure_local_docmind_page_image(
+                paper_id=int(paper_id),
+                page=int(page),
+                page_image_url=image_url,
+                page_image_path=image_path,
+            )
+            if localized_path:
+                image_path = localized_path
+        else:
+            existing_path = self._find_existing_grounding_page_image_path(paper_id=int(paper_id), page=int(page))
+            if existing_path:
+                image_path = existing_path
+        if (not width or not height) and image_path:
+            img_w, img_h = self._read_image_size(image_path)
+            width = width or img_w
+            height = height or img_h
+        docmind_structure["page_image_url"] = image_url
+        docmind_structure["page_image_path"] = image_path
+        docmind_structure["page_image_width"] = width
+        docmind_structure["page_image_height"] = height
+        cloned["docmind_structure"] = docmind_structure
+        return cloned
 
     @staticmethod
     def _signature_hash(signature: str) -> str:

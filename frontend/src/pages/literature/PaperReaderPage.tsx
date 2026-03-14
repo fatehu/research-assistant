@@ -792,6 +792,7 @@ type ReaderAnchorPreviewOptions = {
   segmentIndex?: number
   sourceBlockIds?: string[]
   sourceAtomIds?: string[]
+  variant?: 'default' | 'display_formula'
 }
 
 type PageStructureBlockSpatialRow = {
@@ -1301,7 +1302,10 @@ function buildAnchorPreviewTarget(
   return { previewAnchor, previewAnchors }
 }
 
-function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
+function buildPreviewKey(
+  anchor: ReaderComponentSourceAnchor,
+  variant: 'default' | 'display_formula' = 'default',
+): string {
   const bbox = anchor.bbox_hint
   const bboxKey = bbox
     ? [bbox.x0, bbox.x1, bbox.top, bbox.bottom, bbox.page_width, bbox.page_height].map((n) => Number(n || 0)).join(':')
@@ -1315,6 +1319,7 @@ function buildPreviewKey(anchor: ReaderComponentSourceAnchor): string {
       .join('|')
     : 'none'
   return [
+    variant,
     Number(anchor.page || 0),
     Number(anchor.start_char || 0),
     Number(anchor.end_char || 0),
@@ -1425,8 +1430,14 @@ function buildPageStructureSpatialIndex(
   const rows = Array.isArray(pageStructure?.block_groups) ? pageStructure!.block_groups : []
   const blockMap: Record<string, PageStructureBlockSpatialRow> = {}
   const layoutMap: Record<string, PageStructureLayoutSpatialRow> = {}
-  let pageWidth = 0
-  let pageHeight = 0
+  const groundingPageWidth = Number(grounding?.page_image?.width || 0) > 0
+    ? Number(grounding?.page_image?.width || 0)
+    : 0
+  const groundingPageHeight = Number(grounding?.page_image?.height || 0) > 0
+    ? Number(grounding?.page_image?.height || 0)
+    : 0
+  let pageWidth = groundingPageWidth
+  let pageHeight = groundingPageHeight
   for (const raw of rows) {
     if (!raw || typeof raw !== 'object') continue
     const row = raw as Record<string, unknown>
@@ -1533,12 +1544,16 @@ function buildPageStructureSpatialIndex(
         })(),
     }
   }
-  const resolvedPageWidth = Number(spatialDimensions?.pageWidth || 0) > 0
-    ? Number(spatialDimensions?.pageWidth || 0)
-    : pageWidth
-  const resolvedPageHeight = Number(spatialDimensions?.pageHeight || 0) > 0
-    ? Number(spatialDimensions?.pageHeight || 0)
-    : pageHeight
+  const resolvedPageWidth = groundingPageWidth > 0
+    ? groundingPageWidth
+    : Number(spatialDimensions?.pageWidth || 0) > 0
+      ? Number(spatialDimensions?.pageWidth || 0)
+      : pageWidth
+  const resolvedPageHeight = groundingPageHeight > 0
+    ? groundingPageHeight
+    : Number(spatialDimensions?.pageHeight || 0) > 0
+      ? Number(spatialDimensions?.pageHeight || 0)
+      : pageHeight
   if (resolvedPageWidth > 0 || resolvedPageHeight > 0) {
     for (const row of Object.values(blockMap)) {
       if (row.bbox) {
@@ -2166,7 +2181,9 @@ async function renderAnchorEvidenceImage(
   pageProxy: any,
   textItems: PdfTextItemLike[],
   anchor: ReaderComponentSourceAnchor,
+  options?: { variant?: 'default' | 'display_formula' },
 ): Promise<{ imageDataUrl: string | null; matchMethod: AnchorMatchMethod; confidence: number; fallbackUsed: boolean }> {
+  const variant = options?.variant || 'default'
   const renderScale = 2.4
   const viewport = pageProxy.getViewport({ scale: renderScale })
   const canvas = document.createElement('canvas')
@@ -2237,22 +2254,31 @@ async function renderAnchorEvidenceImage(
 
   const fullRect = { x: 0, y: 0, width: viewport.width, height: viewport.height }
   const rect = rectCandidate?.rect || fullRect
-  const padX = strictPageStructurePreview
-    ? Math.max(12, rect.width * 0.06)
-    : Math.max(18, rect.width * 0.2)
-  const padY = strictPageStructurePreview
-    ? Math.max(14, rect.height * 0.18)
-    : Math.max(26, rect.height * 0.52)
-  const minCropWidth = strictPageStructurePreview
-    ? Math.min(viewport.width * 0.98, Math.max(rect.width + padX * 2, viewport.width * 0.26))
-    : Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
-  const minCropHeight = strictPageStructurePreview
-    ? Math.min(viewport.height * 0.96, Math.max(rect.height + padY * 2, viewport.height * 0.14))
-    : Math.min(viewport.height * 0.78, Math.max(rect.height + padY * 2, viewport.height * 0.28))
+  const displayFormula = variant === 'display_formula'
+  const padX = displayFormula
+    ? Math.max(10, rect.width * 0.05)
+    : strictPageStructurePreview
+      ? Math.max(12, rect.width * 0.06)
+      : Math.max(18, rect.width * 0.2)
+  const padY = displayFormula
+    ? Math.max(10, rect.height * 0.14)
+    : strictPageStructurePreview
+      ? Math.max(14, rect.height * 0.18)
+      : Math.max(26, rect.height * 0.52)
+  const minCropWidth = displayFormula
+    ? Math.min(viewport.width * 0.72, Math.max(rect.width + padX * 2, 96))
+    : strictPageStructurePreview
+      ? Math.min(viewport.width * 0.98, Math.max(rect.width + padX * 2, viewport.width * 0.26))
+      : Math.min(viewport.width * 0.92, Math.max(rect.width + padX * 2, viewport.width * 0.42))
+  const minCropHeight = displayFormula
+    ? Math.min(viewport.height * 0.22, Math.max(rect.height + padY * 2, 36))
+    : strictPageStructurePreview
+      ? Math.min(viewport.height * 0.96, Math.max(rect.height + padY * 2, viewport.height * 0.14))
+      : Math.min(viewport.height * 0.78, Math.max(rect.height + padY * 2, viewport.height * 0.28))
   const targetWidth = Math.min(canvas.width, Math.max(1, minCropWidth))
   const targetHeight = Math.min(canvas.height, Math.max(1, minCropHeight))
   const centerX = rect.x + rect.width / 2
-  const centerY = strictPageStructurePreview
+  const centerY = strictPageStructurePreview || displayFormula
     ? rect.y + rect.height / 2
     : rect.y + rect.height / 2 + Math.min(40, rect.height * 0.18)
   const cropRect = clampRect(
@@ -2298,7 +2324,7 @@ async function renderAnchorEvidenceImage(
     outputCanvas.height,
   )
 
-  if (polygonCandidate && polygonCandidate.length > 0 && matchMethod === 'polygon') {
+  if (!displayFormula && polygonCandidate && polygonCandidate.length > 0 && matchMethod === 'polygon') {
     outputCtx.fillStyle = 'rgba(245, 158, 11, 0.20)'
     outputCtx.strokeStyle = 'rgba(245, 158, 11, 0.95)'
     outputCtx.lineWidth = Math.max(2, Math.round(2 * outputScale))
@@ -2319,7 +2345,7 @@ async function renderAnchorEvidenceImage(
       outputCtx.fill()
       outputCtx.stroke()
     }
-  } else if (rectCandidate?.rect) {
+  } else if (!displayFormula && rectCandidate?.rect) {
     const hx = (rect.x - finalCropRect.x) * outputScale
     const hy = (rect.y - finalCropRect.y) * outputScale
     const hw = rect.width * outputScale
@@ -2656,16 +2682,86 @@ export default function PaperReaderPage() {
       : []),
     [composedPayload],
   )
+  const composedOmissionGroups = useMemo(() => {
+    const grounding = composedPayload?.page_grounding_v1
+    const layoutAtoms = Array.isArray(grounding?.layout_atoms) ? grounding.layout_atoms : []
+    const atomById = new Map(
+      layoutAtoms
+        .map((atom) => {
+          const layoutId = String(atom?.layout_id || '').trim()
+          return layoutId ? [layoutId, atom] : null
+        })
+        .filter((entry): entry is [string, NonNullable<typeof layoutAtoms[number]>] => Array.isArray(entry)),
+    )
+    const groups = new Map<string, {
+      reason: string
+      recoverable: boolean
+      items: Array<{
+        layoutId: string
+        kind: string
+        sourceText: string
+        normalizedText: string
+      }>
+    }>()
+    for (const rawItem of composedOmissions) {
+      const reason = String(rawItem.reason || '').trim() || 'omitted'
+      const targetLayoutIds = Array.isArray(rawItem.target_layout_ids)
+        ? rawItem.target_layout_ids.map((item) => String(item || '').trim()).filter(Boolean)
+        : []
+      const group = groups.get(reason) || {
+        reason,
+        recoverable: Boolean(rawItem.recoverable),
+        items: [],
+      }
+      const seenLayoutIds = new Set(group.items.map((item) => item.layoutId))
+      for (const layoutId of targetLayoutIds) {
+        if (seenLayoutIds.has(layoutId)) continue
+        const atom = atomById.get(layoutId)
+        const sourceText = String(atom?.clean_text || atom?.raw_text || '').trim()
+        const normalizedText = String(atom?.normalized_text || '').trim()
+        const normalizationMode = String(atom?.normalization_mode || '').trim().toLowerCase()
+        if (
+          reason === 'footer'
+          && !normalizedText
+          && ['footer_hide_fragment', 'hide_fragment', 'footer_fragment_hidden'].includes(normalizationMode)
+        ) {
+          continue
+        }
+        group.items.push({
+          layoutId,
+          kind: String(atom?.node_kind || reason || 'layout').trim() || 'layout',
+          sourceText,
+          normalizedText,
+        })
+        seenLayoutIds.add(layoutId)
+      }
+      groups.set(reason, group)
+    }
+    return Array.from(groups.values())
+      .sort((left, right) => right.items.length - left.items.length)
+  }, [composedOmissions, composedPayload])
+  const composedFooterOmissionGroups = useMemo(
+    () => composedOmissionGroups.filter((group) => group.reason === 'footer'),
+    [composedOmissionGroups],
+  )
+  const composedOtherOmissionGroups = useMemo(
+    () => composedOmissionGroups.filter((group) => group.reason !== 'footer'),
+    [composedOmissionGroups],
+  )
   const composedLinkAssets = useMemo(
     () => composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image'),
     [composedAssets],
   )
-  const composedPageImageUrl = useMemo(
-    () => String(
-      ((composedPayload as unknown as { docmind_structure?: { page_image_url?: unknown } })?.docmind_structure?.page_image_url) || '',
-    ).trim(),
-    [composedPayload],
-  )
+  const composedGroundingPageImageUrl = useMemo(() => {
+    const pageImage = composedPayload?.page_grounding_v1?.page_image
+    const url = String(pageImage?.url || '').trim()
+    if (!url) return ''
+    if (pageImage?.local_cached) return toAbsoluteApiUrl(url)
+    if (url.startsWith('/api/v1/literature/reader/grounding-page-assets/')) {
+      return toAbsoluteApiUrl(url)
+    }
+    return ''
+  }, [composedPayload])
   const composedPageStructureIndex = useMemo(
     () => buildPageStructureSpatialIndex(
       (composedPayload?.page_structure_v3 || {}) as Record<string, unknown>,
@@ -2674,6 +2770,69 @@ export default function PaperReaderPage() {
     ),
     [composedPayload],
   )
+  const composedNormalizationItems = useMemo(() => {
+    const items: Array<{
+      key: string
+      kind: string
+      layoutId?: string
+      sourceText: string
+      normalizedText: string
+      reason: string
+      mode: string
+      confidence?: number | null
+    }> = []
+    const grounding = composedPayload?.page_grounding_v1
+    const layoutAtoms = Array.isArray(grounding?.layout_atoms) ? grounding.layout_atoms : []
+    for (const atom of layoutAtoms) {
+      const sourceText = String(atom?.clean_text || atom?.raw_text || '').trim()
+      const normalizedText = String(atom?.normalized_text || '').trim()
+      if (!sourceText || !normalizedText || normalizedText === sourceText) continue
+      items.push({
+        key: `layout:${String(atom?.layout_id || '').trim()}`,
+        kind: String(atom?.node_kind || '').trim() || 'layout',
+        layoutId: String(atom?.layout_id || '').trim(),
+        sourceText,
+        normalizedText,
+        reason: String(atom?.normalization_reason || '').trim(),
+        mode: String(atom?.normalization_mode || '').trim(),
+        confidence: typeof atom?.normalization_confidence === 'number' ? atom.normalization_confidence : null,
+      })
+    }
+    const stack: ReaderComponentNode[] = Array.isArray(activeComposedPlan?.components)
+      ? [...activeComposedPlan.components]
+      : []
+    while (stack.length > 0) {
+      const node = stack.shift()
+      if (!node) continue
+      const nodeType = String((node as { type?: unknown }).type || '').trim()
+      const nodeProps = ((node as { props?: unknown }).props && typeof (node as { props?: unknown }).props === 'object')
+        ? (node as { props: Record<string, unknown> }).props
+        : {}
+      if (nodeType === 'EquationBlock') {
+        const normalizedLatex = String(nodeProps.normalized_latex || '').trim()
+        const normalizedText = String(nodeProps.normalized_text || '').trim()
+        const transcript = String(nodeProps.transcript || '').trim()
+        const sourceText = normalizedLatex ? (transcript || String(nodeProps.latex || '').trim()) : transcript
+        const effectiveNormalized = normalizedLatex || normalizedText
+        if (sourceText && effectiveNormalized && effectiveNormalized !== sourceText) {
+          items.push({
+            key: `equation:${String((node as { id?: unknown }).id || '').trim()}`,
+            kind: 'equation',
+            sourceText,
+            normalizedText: effectiveNormalized,
+            reason: String(nodeProps.normalization_reason || '').trim(),
+            mode: String(nodeProps.normalization_mode || '').trim(),
+            confidence: typeof nodeProps.normalization_confidence === 'number'
+              ? Number(nodeProps.normalization_confidence || 0)
+              : null,
+          })
+        }
+      }
+      const children: ReaderComponentNode[] = Array.isArray(node.children) ? node.children : []
+      stack.push(...children)
+    }
+    return items
+  }, [activeComposedPlan, composedPayload])
   const readerAutoSaveAtText = useMemo(() => {
     if (!readerAutoSaveAt) return '尚未同步'
     const ts = new Date(readerAutoSaveAt)
@@ -4231,7 +4390,10 @@ export default function PaperReaderPage() {
     return ''
   }
 
-  const renderPreviewForAnchor = async (anchor: ReaderComponentSourceAnchor) => {
+  const renderPreviewForAnchor = async (
+    anchor: ReaderComponentSourceAnchor,
+    options?: { variant?: 'default' | 'display_formula' },
+  ) => {
     const targetPage = Number(anchor.page || 0)
     if (!pdfDoc || targetPage <= 0) {
       return { imageDataUrl: null, matchMethod: 'fallback' as AnchorMatchMethod, confidence: 0.3, fallbackUsed: true }
@@ -4239,7 +4401,7 @@ export default function PaperReaderPage() {
     const pageProxy = await pdfDoc.getPage(targetPage)
     const textContent = await pageProxy.getTextContent()
     const textItems = Array.isArray(textContent?.items) ? (textContent.items as PdfTextItemLike[]) : []
-    return renderAnchorEvidenceImage(pageProxy, textItems, anchor)
+    return renderAnchorEvidenceImage(pageProxy, textItems, anchor, options)
   }
 
   const showAnchorPreview = (
@@ -4344,7 +4506,13 @@ export default function PaperReaderPage() {
 
   const resolveAnchorPreviewImage = async (
     anchors: ReaderComponentSourceAnchor[],
-    options?: { preferredPage?: number; segmentIndex?: number; sourceBlockIds?: string[]; sourceAtomIds?: string[] },
+    options?: {
+      preferredPage?: number
+      segmentIndex?: number
+      sourceBlockIds?: string[]
+      sourceAtomIds?: string[]
+      variant?: 'default' | 'display_formula'
+    },
   ): Promise<string | null> => {
     const target = buildAnchorFromPageStructureBlocks({
       anchors,
@@ -4356,7 +4524,7 @@ export default function PaperReaderPage() {
     if (!target) return null
     const anchor = target.previewAnchor
 
-    const previewKey = buildPreviewKey(anchor)
+    const previewKey = buildPreviewKey(anchor, options?.variant || 'default')
     const cached = anchorPreviewCacheRef.current.get(previewKey)
     if (cached?.imageDataUrl) return cached.imageDataUrl
     try {
@@ -4376,7 +4544,7 @@ export default function PaperReaderPage() {
         const source = extracted || fallback
         resolvedText = buildAnchorPreviewSnippet(source, anchor) || source.slice(0, 320)
       }
-      const rendered = await renderPreviewForAnchor(anchor)
+      const rendered = await renderPreviewForAnchor(anchor, { variant: options?.variant || 'default' })
       anchorPreviewCacheRef.current.set(previewKey, {
         text: resolvedText,
         imageDataUrl: rendered.imageDataUrl,
@@ -4982,11 +5150,11 @@ export default function PaperReaderPage() {
         if (assetId) {
           return toAbsoluteApiUrl(`/api/v1/literature/reader/figure-assets/${paperId}/${assetPage}/${assetId}`)
         }
-        if (composedPageImageUrl) return toAbsoluteApiUrl(composedPageImageUrl)
+        if (composedGroundingPageImageUrl) return composedGroundingPageImageUrl
         return ''
       }
-      if (/^https?:\/\/(?:dx\.)?doi\.org\//i.test(token) && composedPageImageUrl) {
-        return toAbsoluteApiUrl(composedPageImageUrl)
+      if (/^https?:\/\/(?:dx\.)?doi\.org\//i.test(token) && composedGroundingPageImageUrl) {
+        return composedGroundingPageImageUrl
       }
       if (
         !token.startsWith('/')
@@ -5632,6 +5800,64 @@ export default function PaperReaderPage() {
   )
 
   const renderAiContextPanel = () => {
+    const renderOmissionGroups = (
+      groups: Array<{
+        reason: string
+        recoverable: boolean
+        items: Array<{
+          layoutId: string
+          kind: string
+          sourceText: string
+          normalizedText: string
+        }>
+      }>,
+      emptyDescription: string,
+    ) => (groups.length > 0 ? (
+      <div className="reader-workbench__omission-list">
+        {groups.map((group, idx) => (
+          <div key={`compose-omit-${group.reason}-${idx}`} className="reader-workbench__omission-item">
+            <Space size={8} wrap>
+              <Tag color="red">{group.reason}</Tag>
+              <Tag>{`${group.items.length} layouts`}</Tag>
+              {group.recoverable ? <Tag color="green">recoverable</Tag> : null}
+            </Space>
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {group.items.slice(0, 8).map((entry) => {
+                const effectiveText = entry.normalizedText || entry.sourceText
+                return (
+                  <div key={`${group.reason}:${entry.layoutId}`} className="reader-workbench__decision-item">
+                    <Space size={8} wrap>
+                      <Tag color="blue">{entry.kind}</Tag>
+                      <Tag>{entry.layoutId}</Tag>
+                    </Space>
+                    <div style={{ marginTop: 6 }}>
+                      {entry.normalizedText && entry.sourceText && entry.normalizedText !== entry.sourceText ? (
+                        <>
+                          <Text delete type="secondary">{entry.sourceText}</Text>
+                          <div style={{ marginTop: 6 }}>
+                            <Text>{entry.normalizedText}</Text>
+                          </div>
+                        </>
+                      ) : effectiveText ? (
+                        <Text>{effectiveText}</Text>
+                      ) : (
+                        <Text type="secondary">无可读文本，仅保留布局占位。</Text>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+              {group.items.length > 8 ? (
+                <Text className="reader-workbench__rail-note">{`其余 ${group.items.length - 8} 项已折叠。`}</Text>
+              ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    ) : (
+      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyDescription} />
+    ))
+
     const sectionItems = [
       ...(composedContextComponents.length > 0 ? [{
         key: 'page-context',
@@ -5695,30 +5921,48 @@ export default function PaperReaderPage() {
           </Space>
         ),
       },
+      ...(composedNormalizationItems.length > 0 ? [{
+        key: 'normalizations',
+        label: `Normalize 变更 · ${composedNormalizationItems.length}`,
+        children: (
+          <div className="reader-workbench__decision-list">
+            {composedNormalizationItems.slice(0, 20).map((item) => (
+              <div key={item.key} className="reader-workbench__decision-item">
+                <Space size={8} wrap>
+                  <Tag color="purple">{item.kind}</Tag>
+                  {item.layoutId ? <Tag>{item.layoutId}</Tag> : null}
+                  {item.mode ? <Tag color="blue">{item.mode}</Tag> : null}
+                  {typeof item.confidence === 'number' ? (
+                    <Tag color={item.confidence >= 0.85 ? 'green' : 'gold'}>
+                      {`置信 ${(item.confidence * 100).toFixed(0)}%`}
+                    </Tag>
+                  ) : null}
+                </Space>
+                <div style={{ marginTop: 6 }}>
+                  <Text delete type="secondary">{item.sourceText}</Text>
+                </div>
+                <div style={{ marginTop: 6 }}>
+                  <Text>{item.normalizedText}</Text>
+                </div>
+                {item.reason ? (
+                  <div style={{ marginTop: 6 }}>
+                    <Text className="reader-workbench__rail-note">{item.reason}</Text>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ),
+      }] : []),
+      ...(composedFooterOmissionGroups.length > 0 ? [{
+        key: 'footer-omissions',
+        label: `Footer / Links · ${composedFooterOmissionGroups.reduce((sum, group) => sum + group.items.length, 0)}`,
+        children: renderOmissionGroups(composedFooterOmissionGroups, 'No hidden footer items.'),
+      }] : []),
       {
         key: 'omissions',
-        label: `Intentional Omissions${composedOmissions.length ? ` · ${composedOmissions.length}` : ''}`,
-        children: composedOmissions.length > 0 ? (
-          <div className="reader-workbench__omission-list">
-            {composedOmissions.map((item, idx) => {
-              const decision = String(item.decision || '').trim()
-              const reason = String(item.reason || '').trim()
-              return (
-                <div key={`compose-omit-${idx}`} className="reader-workbench__omission-item">
-                  <Space size={8} wrap>
-                    {decision ? <Tag color={decision === 'hide' ? 'red' : (decision === 'collapse' ? 'gold' : 'blue')}>{decision}</Tag> : null}
-                    {item.recoverable ? <Tag color="green">recoverable</Tag> : null}
-                  </Space>
-                  <div style={{ marginTop: 6 }}>
-                    {reason ? <Text>{reason}</Text> : <Text type="secondary">未提供原因</Text>}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No intentional omissions." />
-        ),
+        label: `Intentional Omissions${composedOtherOmissionGroups.length ? ` · ${composedOtherOmissionGroups.reduce((sum, group) => sum + group.items.length, 0)}` : ''}`,
+        children: renderOmissionGroups(composedOtherOmissionGroups, 'No intentional omissions.'),
       },
       {
         key: 'quality',

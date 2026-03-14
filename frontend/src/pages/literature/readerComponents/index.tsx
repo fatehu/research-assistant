@@ -69,6 +69,27 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => String(item || '').trim()).filter(Boolean)
 }
 
+function stripLeadingListBullet(text: string): string {
+  return String(text ?? '').replace(/^\s*[·•●◦▪‣]\s*/, '').trim()
+}
+
+function renderNormalizedInlineText(text: string): ReactNode {
+  const source = String(text ?? '')
+  if (!source.includes('^')) return source
+  const parts = source.split(/(\^\d{1,3})/g)
+  if (parts.length <= 1) return source
+  return parts.map((part, idx) => {
+    if (/^\^\d{1,3}$/.test(part)) {
+      return (
+        <sup key={`sup-${idx}`}>
+          {part.slice(1)}
+        </sup>
+      )
+    }
+    return <Fragment key={`txt-${idx}`}>{part}</Fragment>
+  })
+}
+
 function normalizeDoiHref(value: unknown): string {
   const doi = asString(value)
   if (!doi) return ''
@@ -913,6 +934,13 @@ function EquationBlockNode(props: {
   const label = asString((node.props || {}).label)
   const description = asString((node.props || {}).description)
   const transcript = asString((node.props || {}).transcript)
+  const normalizedText = asString((node.props || {}).normalized_text)
+  const normalizedLatex = asString((node.props || {}).normalized_latex)
+  const normalizationReason = asString((node.props || {}).normalization_reason)
+  const normalizationMode = asString((node.props || {}).normalization_mode)
+  const normalizationConfidenceValue = typeof (node.props || {}).normalization_confidence === 'number'
+    ? Number((node.props || {}).normalization_confidence || 0)
+    : null
   const renderMode = normalizeEquationRenderMode((node.props || {}).render_mode)
   const resolveAnchorPreviewImage = ctx.resolveAnchorPreviewImage
   const [evidenceImage, setEvidenceImage] = useState<string | null>(null)
@@ -1039,6 +1067,66 @@ function EquationBlockNode(props: {
           {description}
         </div>
       )}
+      {(normalizedLatex || normalizedText || normalizationReason) ? (
+        <details style={{ marginTop: 12, textAlign: 'left' }}>
+          <summary style={{ cursor: 'pointer', color: ctx.themeStyle?.bodyColor, opacity: 0.78 }}>
+            查看 AI 规范化公式
+          </summary>
+          <div
+            style={{
+              marginTop: 10,
+              padding: '12px 14px',
+              borderRadius: 10,
+              border: `1px solid ${ctx.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+              background: isDarkTheme(ctx) ? 'rgba(255,255,255,0.03)' : 'rgba(15, 23, 42, 0.03)',
+            }}
+          >
+            {normalizedLatex ? (
+              <div style={{ fontSize: 18, overflowX: 'auto', color: ctx.themeStyle?.bodyColor }}>
+                <ReactMarkdown
+                  remarkPlugins={[remarkMath]}
+                  rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
+                  components={{
+                    p: ({ children }) => <>{children}</>,
+                  }}
+                >
+                  {buildEquationMarkdown(normalizedLatex)}
+                </ReactMarkdown>
+              </div>
+            ) : null}
+            {!normalizedLatex && normalizedText ? (
+              <pre
+                style={{
+                  margin: 0,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontSize: 15,
+                  lineHeight: 1.7,
+                  color: ctx.themeStyle?.bodyColor,
+                  background: 'transparent',
+                }}
+              >
+                {normalizedText}
+              </pre>
+            ) : null}
+            {normalizationReason ? (
+              <div style={{ marginTop: 10, fontSize: 13, lineHeight: 1.7, color: ctx.themeStyle?.bodyColor, opacity: 0.8 }}>
+                {normalizationReason}
+              </div>
+            ) : null}
+            <div style={{ marginTop: 10 }}>
+              <Space size={8} wrap>
+                {normalizationMode ? <Tag color="geekblue">{normalizationMode}</Tag> : null}
+                {normalizationConfidenceValue !== null ? (
+                  <Tag color={normalizationConfidenceValue >= 0.75 ? 'green' : (normalizationConfidenceValue >= 0.5 ? 'gold' : 'default')}>
+                    置信度 {Math.round(normalizationConfidenceValue * 100)}%
+                  </Tag>
+                ) : null}
+              </Space>
+            </div>
+          </div>
+        </details>
+      ) : null}
       {renderMode === 'image_first' && transcript ? (
         <details style={{ marginTop: 12, textAlign: 'left' }}>
           <summary style={{ cursor: 'pointer', color: ctx.themeStyle?.bodyColor, opacity: 0.72 }}>
@@ -1115,7 +1203,7 @@ function ParagraphProseNode(props: {
                 margin: idx === 0 ? 0 : '10px 0 0 0',
               }}
             >
-              {item.text}
+              {renderNormalizedInlineText(item.text)}
             </p>
           ))}
           {renderChildren(node.children || [], ctx)}
@@ -1331,7 +1419,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               fontFamily: ctx.themeStyle?.headingFontFamily,
             }}
           >
-            {text}
+            {renderNormalizedInlineText(text)}
           </Title>
           {renderChildren(node.children || [], ctx)}
         </div>,
@@ -1396,7 +1484,9 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 fontFamily: ctx.themeStyle?.bodyFontFamily,
               }}
             >
-              {items.map((item, idx) => <li key={`li-${idx}`}>{item}</li>)}
+              {items.map((item, idx) => (
+                <li key={`li-${idx}`}>{renderNormalizedInlineText(stripLeadingListBullet(item))}</li>
+              ))}
               {renderChildren(node.children || [], ctx)}
             </ul>
           </div>

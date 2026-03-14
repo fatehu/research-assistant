@@ -1,6 +1,6 @@
 # Generative UI Rollout Plan
 
-Last updated: 2026-03-12
+Last updated: 2026-03-13
 Status: in progress
 Owner: Codex + repository maintainers
 
@@ -218,6 +218,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
   add one real paper-page golden plus contract fixtures for methods-heavy and concept-heavy coverage, alongside generative/experience snapshot tests and an eval asset guard.
 - [x] Separate internal planning copy from user-visible section summaries:
   storyboard `purpose` now stays in section metadata as planner notes, while `/experience` shows user-facing summaries instead of prompt-like planning text.
+- [x] Stop exposing temporary DocMind page-image URLs through `page_grounding_v1`:
+  localize DocMind page images into reader-owned assets, mark the localized source explicitly, and keep future grounding/image consumers on repository-controlled local files and routes.
 - [x] Repair malformed cached compose fallback payloads at the API boundary:
   `/read` no longer fails the fallback path just because legacy cached payloads miss `engine_version` or `ui_plan.plan_id`.
 - [x] Reclassify `/read` AI compose as a transitional embedded preview:
@@ -258,6 +260,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
   `/read` evidence/highlight changes must now follow explicit rules in `docs/TESTING_GUIDE.md` and `docs/LITERATURE_TEST_GUIDE.md`, including DocMind-only geometry truth, no global preview-path changes for local table/formula fixes, and mandatory prose-heavy plus table-heavy regression pages before merging evidence-chain changes.
 - [x] Move `/read` formulas to an image-first display contract:
   `EquationBlock` now carries `render_mode=image_first` plus `transcript`, the body view prefers the original formula crop instead of forcing low-quality OCR into KaTeX, and OCR text is demoted to an optional transcript fallback.
+- [x] Add AI-assisted formula normalization on top of image-first `/read` formulas:
+  `layout_uid_v1` now preserves formula style hints (`alignment`, `line_height`, `style_id`) inside `page_grounding_v1`, runs a dedicated equation normalization pass with the current page render as visual reference, and materializes optional `normalized_text / normalized_latex / normalization_reason / normalization_confidence` into `EquationBlock` without changing DocMind evidence geometry. `/read` decision logs also expose `layout_uid_v1:equations_normalized=<count>` for the AI context rail.
 - [x] Add an AI-assisted logical-row reconstruction pass for `/read` tables:
   keep DocMind `cells[]` and `uniqueId -> blocks[].pos` as geometry truth, use current-page render plus raw physical rows only to group physical rows into logical rows, and require strict exact-once fallback-safe validation before any table plan can override the current deterministic materializer.
   2026-03-13: runtime gap identified. The AI pass was wired into `layout_uid_v1`, but `_panel_plan_to_ui_plan(...)`
@@ -270,5 +274,55 @@ The system should stay grounded in deterministic reader extraction, and use gene
   local prompt-cache files before calling DashScope, so normal `/read` fresh rebuilds no longer fall back with
   `Failed to download multimodal content`. Fresh `paper 85 / page 7` rebuilds now return `reader_compose_v11` with
   `reconstruction_mode=ai_logical_rows` and `logical_rows=13`.
+- [x] Unify `/read` prompt images and grounding page images to the same local render asset:
+  `layout_uid_v1` now upgrades `page_grounding_v1.page_image` to the same `/api/v1/literature/reader/page-assets/...`
+  render asset used for prompt-time multimodal calls, while still keeping `page_image.width/height` derived from
+  DocMind geometry truth. Fresh `paper 85 / page 8` rebuilds now return `reader_compose_v14` with
+  `page_grounding_v1.page_image.source=page_render_asset`, and the live DashScope multimodal call succeeds with
+  `images=1` instead of falling back because of an expired DocMind URL.
+- [x] Add a generic AI-assisted normalize layer for `/read` prose/layout text:
+  `page_grounding_v1.layout_atoms` and `reading_nodes` now preserve `normalized_text / normalization_reason /
+  normalization_mode / normalization_confidence`; `layout_uid_v1` runs an exact-once text-normalization pass over
+  titles, headings, paragraphs, lists, and figure/table captions using the current page render as visual reference;
+  grouping and panel materialization now prefer `normalized_text`; and `/read` AI context surfaces `Normalize 变更`
+  so display-layer repairs remain reviewable without changing DocMind evidence truth.
+- [x] Keep normalize display formatting out of the `/read` evidence chain:
+  normalized markers such as `^6` may render as real superscripts in the main reading surface, but evidence anchors,
+  quote-text cache repair, and preview geometry remain plain-text and DocMind-grounded.
+- [x] Surface hidden normalize output in `/read` AI context:
+  `footer / header / doi / metadata` now participate in the controlled normalize pass for review-only use, and `Intentional Omissions` is grouped by omission reason with readable text previews (and `source -> normalized` diffs when available).
+- [x] Re-separate AI prompt images from evidence grounding images on `/read`:
+  `page_render_asset` remains valid as a prompt-time multimodal image, but `page_grounding_v1.page_image` for
+  evidence/highlight must prefer the localized DocMind page image and its true dimensions so `uniqueId -> blocks[].pos`
+  does not get re-scaled against the wrong page size.
+- [x] Remove the remaining stale URL dependency from `/read` normalize/page-grounding live calls:
+  when `page_grounding_v1` already resolves to a local `page_render_asset`, width/height resolution now uses that same
+  local asset instead of re-fetching `docmind_page_image_url`, which avoids extra `403 Forbidden` failures on pages
+  whose DocMind image URLs have expired.
+- [x] Preserve and backfill normalize enrichments through contract repair:
+  `_ensure_payload_contract(...)` no longer overwrites `page_grounding_v1` with a clean rebuild that drops
+  `normalized_text`; it now merges existing grounding enrichments and can backfill from
+  `layout_advice_v3.text_normalizations.normalization_plan`, so cached `reader_compose_v15` payloads such as
+  `paper 85 / page 8` still expose the 11 text-normalization repairs on read.
+- [x] Preserve cached `page_grounding_v1` on payload-only read paths:
+  when cache reads no longer carry enough source graph to rebuild grounding, contract repair now keeps the existing
+  `page_image / layout_atoms / evidence_map / reading_nodes` and refreshes `layout_uid_v1` anchors from that preserved
+  grounding, so body text normalization and evidence-preview geometry stay in sync.
+- [x] Persist cache-read contract repairs back into storage:
+  when a stale cached `/read` payload is repaired on read, the repaired payload is now written back into the DB/Redis
+  cache layers so subsequent page loads no longer depend on transient on-read anchor repair.
+- [x] Backfill the DocMind page-image contract inside the reader structure cache:
+  `docmind_structure` now preserves `page_image_width / page_image_height` from `doc_info.pages[*]` and fresh reader
+  payload builds eagerly try to localize the per-page DocMind image into `grounding_pages/page_<n>.*`. Old cached pages
+  therefore recover the real DocMind page dimensions before compose/evidence runs, instead of falling back to content
+  boundary sizes like `1227x1844` or `1296x1844`.
 - [ ] Finish `/read` table stabilization:
   current `layout_uid_v1` table materializer handles common row/column tables and markdown-like table text, but still does not reconstruct rowspan/colspan-heavy layouts or full semantic notes.
+- [x] Prepare a lower-cost backend rebuild baseline for local `/read` and generative-ui iteration:
+  `backend/.dockerignore` now excludes local virtualenvs, uploads, docs, and test artifacts from Docker build context; local `.env/.env.example` default `TORCH_INDEX_URL` to `cu121` for NVIDIA machines; and `.gitattributes` enforces LF for shell scripts so `backend/docker-entrypoint.sh` no longer breaks rebuilt containers with CRLF shebangs.
+- [x] Converge backend-side Docker services onto one shared build owner:
+  `backend` now owns the only backend image build, while `codelab-runner`, `mcp_web`, and `mcp_literature` reuse `research-assistant-backend:latest` instead of repeating the same Dockerfile build graph.
+- [x] Split local-vs-CI torch wheel defaults cleanly:
+  local `.env` keeps `cu121` for NVIDIA development, while `.github/docker-compose.ci.yml` now forces `TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu` so nightly and PR smoke workflows do not inherit the local CUDA default.
+- [x] Harden backend rebuilds against transient torch download failures and complete the shared-image rollout:
+  `backend/Dockerfile` now retries the torch install step, the shared backend image successfully rebuilt with `cu121`, and both `backend` and `codelab-runner` are now running on the same rebuilt image digest instead of stale pre-fix images.

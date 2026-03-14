@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import inspect
 from io import BytesIO
 import json
@@ -62,7 +63,7 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v12"
+COMPOSE_ENGINE_VERSION = "reader_compose_v15"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
@@ -556,7 +557,10 @@ class LiteratureReaderComposeService:
                     )
                     await self._delete_payload_from_redis(redis_key)
                 else:
-                    payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                    repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
+                    if repaired_cached_payload != cached_payload:
+                        await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+                    payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
                     payload = await self._apply_overlay_for_user(
                         db=db,
                         user_id=int(user_id),
@@ -672,7 +676,10 @@ class LiteratureReaderComposeService:
                     if self._should_rebuild_cached_payload(cached_payload):
                         await self._delete_payload_from_redis(redis_key)
                     else:
-                        payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                        repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
+                        if repaired_cached_payload != cached_payload:
+                            await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+                        payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
                         payload = await self._apply_overlay_for_user(
                             db=db,
                             user_id=int(user_id),
@@ -1097,7 +1104,7 @@ class LiteratureReaderComposeService:
                     "layout_type": str(atom.get("layout_type") or "").strip().lower(),
                     "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
                     "node_kind": str(atom.get("node_kind") or "").strip().lower(),
-                    "text": str(atom.get("clean_text") or atom.get("raw_text") or "").strip(),
+                    "text": self._normalized_grounding_text(atom),
                     "include_in_main_flow": bool(atom.get("include_in_main_flow")),
                     "region_hint": str(atom.get("region_hint") or "").strip(),
                     "layout_pos": list(atom.get("layout_pos") or []),
@@ -1140,6 +1147,640 @@ class LiteratureReaderComposeService:
         )
 
     @staticmethod
+    def _layout_uid_text_normalization_system_prompt() -> str:
+        return (
+            "You normalize display text for the /read reader. "
+            "The indivisible unit is layout_id (DocMind uniqueId). "
+            "Use the attached page image only as visual reference. "
+            "You may repair OCR and style artifacts such as superscripts, subscripts, broken spacing, broken list markers, "
+            "title stitching, citation-marker bleed, hyphenation leftovers, and footer/header link footnotes. "
+            "For footer-like link items, preserve the URL exactly and recover leading footnote/reference markers such as ^6, ^7, ^8, ^9 when visually obvious. "
+            "You may use footer_bundles context to normalize sequential footer items together, especially when marker-only layouts, noisy URLs, page numbers, and sibling footnotes appear in the same local group. "
+            "For footer bundles, you may keep one sibling as the readable final footnote/link and hide redundant fragments by returning an empty normalized_text with mode footer_hide_fragment. "
+            "Do not invent new URLs, but you may repair obvious OCR pollution around an existing URL or footnote marker by looking at the page image and nearby footer siblings. "
+            "Do not translate, do not summarize, do not paraphrase, do not change meaning, and do not change ownership or geometry. "
+            "Return JSON with status and step_result. "
+            "Each candidate layout_id must appear exactly once in items. "
+            "If no change is needed, return the source text unchanged and explain briefly. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"items\":["
+            "{\"layout_id\":\"...\",\"normalized_text\":\"...\",\"reason\":\"...\",\"confidence\":0.94,\"mode\":\"ocr_cleanup\"}"
+            "],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _layout_uid_text_normalization_allowed_node_kinds() -> Set[str]:
+        return {
+            "title",
+            "section_heading",
+            "paragraph",
+            "list",
+            "figure_caption",
+            "table_caption",
+            "metadata",
+            "doi",
+            "header",
+            "footer",
+        }
+
+    @staticmethod
+    def _normalized_grounding_text(atom: Mapping[str, Any]) -> str:
+        return str(
+            atom.get("normalized_text")
+            or atom.get("clean_text")
+            or atom.get("raw_text")
+            or ""
+        ).strip()
+
+    def _build_layout_uid_text_normalization_prompt_payload(
+        self,
+        *,
+        page: int,
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        footer_bundles = self._build_layout_uid_footer_bundles(layout_atoms)
+        footer_bundle_by_layout_id: Dict[str, Dict[str, Any]] = {}
+        for bundle in footer_bundles:
+            bundle_id = str(bundle.get("bundle_id") or "").strip()
+            bundle_summary = {
+                "bundle_id": bundle_id,
+                "item_count": int(bundle.get("item_count") or 0),
+                "reading_order_start": int(bundle.get("reading_order_start") or 0),
+                "reading_order_end": int(bundle.get("reading_order_end") or 0),
+            }
+            for item in list(bundle.get("items") or []):
+                if not isinstance(item, Mapping):
+                    continue
+                layout_id = str(item.get("layout_id") or "").strip()
+                if layout_id:
+                    footer_bundle_by_layout_id[layout_id] = bundle_summary
+        allowed_kinds = self._layout_uid_text_normalization_allowed_node_kinds()
+        candidates: List[Dict[str, Any]] = []
+        for atom in sorted(layout_atoms, key=lambda item: int(item.get("reading_order") or 0)):
+            layout_id = str(atom.get("layout_id") or "").strip()
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            if not layout_id or not source_text or node_kind not in allowed_kinds:
+                continue
+            if not bool(atom.get("include_in_main_flow")) and node_kind not in {"metadata", "doi", "header", "footer"}:
+                continue
+            candidates.append(
+                {
+                    "layout_id": layout_id,
+                    "reading_order": int(atom.get("reading_order") or 0),
+                    "node_kind": node_kind,
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "source_text": source_text,
+                    "alignment": str(atom.get("alignment") or "").strip().lower(),
+                    "line_height": float(atom.get("line_height") or 0.0),
+                    "footer_bundle": dict(footer_bundle_by_layout_id.get(layout_id) or {}),
+                    "block_styles": [
+                        {
+                            "style_id": int(block.get("style_id") or 0),
+                            "text": str(block.get("text") or "").strip(),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_text_normalization",
+            },
+            "layout_atoms": candidates,
+            "footer_bundles": footer_bundles,
+            "rules": {
+                "task": "normalize_display_text_only",
+                "exactly_once_assignment": True,
+                "forbid_translation": True,
+                "forbid_geometry_mutation": True,
+                "forbid_ownership_mutation": True,
+                "allowed_repairs": [
+                    "ocr_cleanup",
+                    "superscript_or_subscript_recovery",
+                    "spacing_repair",
+                    "hyphenation_repair",
+                    "heading_or_list_stitching",
+                    "citation_marker_cleanup",
+                    "footer_bundle_rewrite",
+                    "footer_bundle_hide_fragment",
+                ],
+            },
+        }
+
+    def _build_layout_uid_footer_bundles(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        footer_atoms = [
+            dict(atom)
+            for atom in list(layout_atoms or [])
+            if isinstance(atom, Mapping)
+            and str(atom.get("node_kind") or "").strip().lower() == "footer"
+            and str(atom.get("layout_id") or "").strip()
+        ]
+        if not footer_atoms:
+            return []
+        footer_atoms.sort(key=lambda item: int(item.get("reading_order") or 0))
+
+        bundles: List[List[Dict[str, Any]]] = []
+        current_bundle: List[Dict[str, Any]] = []
+        previous_order: Optional[int] = None
+        for atom in footer_atoms:
+            reading_order = int(atom.get("reading_order") or 0)
+            if current_bundle and previous_order is not None and reading_order - previous_order > 2:
+                bundles.append(current_bundle)
+                current_bundle = []
+            current_bundle.append(atom)
+            previous_order = reading_order
+        if current_bundle:
+            bundles.append(current_bundle)
+
+        result: List[Dict[str, Any]] = []
+        for idx, bundle in enumerate(bundles, start=1):
+            items: List[Dict[str, Any]] = []
+            for atom in bundle:
+                source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                text_for_url = source_text or str(atom.get("normalized_text") or "").strip()
+                primary_style_id = 0
+                block_styles = [
+                    dict(block)
+                    for block in list(atom.get("blocks") or [])
+                    if isinstance(block, Mapping)
+                ]
+                if block_styles:
+                    primary_style_id = int((block_styles[0] or {}).get("style_id") or 0)
+                items.append(
+                    {
+                        "layout_id": str(atom.get("layout_id") or "").strip(),
+                        "reading_order": int(atom.get("reading_order") or 0),
+                        "source_text": source_text,
+                        "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                        "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                        "primary_style_id": primary_style_id,
+                        "contains_url": bool(self._extract_url_from_footer_text(text_for_url)),
+                        "is_marker_only": bool(re.fullmatch(r"[\^\[\(]?[0-9]{1,3}[\]\)]?", source_text)),
+                    }
+                )
+            result.append(
+                {
+                    "bundle_id": f"footer_bundle_{idx}",
+                    "item_count": len(items),
+                    "reading_order_start": int((items[0] or {}).get("reading_order") or 0),
+                    "reading_order_end": int((items[-1] or {}).get("reading_order") or 0),
+                    "items": items,
+                }
+            )
+        return result
+
+    def _normalize_layout_uid_text_normalization_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        candidate_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+            and str(row.get("node_kind") or "").strip().lower() in self._layout_uid_text_normalization_allowed_node_kinds()
+            and str(row.get("layout_id") or "").strip()
+            and str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            and (
+                bool(row.get("include_in_main_flow"))
+                or str(row.get("node_kind") or "").strip().lower() in {"metadata", "doi", "header", "footer"}
+            )
+        ]
+        source_text_by_id = {
+            str(row.get("layout_id") or "").strip(): str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            for row in candidate_atoms
+        }
+        known_ids = set(source_text_by_id.keys())
+        used_ids: List[str] = []
+        normalized_items: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        for raw_item in list((step_result or {}).get("items") or []):
+            if not isinstance(raw_item, Mapping):
+                continue
+            layout_id = str(raw_item.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            if layout_id not in known_ids:
+                errors.append(f"unknown_layout_id:{layout_id}")
+                continue
+            used_ids.append(layout_id)
+            source_text = source_text_by_id.get(layout_id, "")
+            normalized_text = self._normalize_spaces(str(raw_item.get("normalized_text") or source_text))
+            reason = self._normalize_spaces(str(raw_item.get("reason") or ""))
+            mode = self._normalize_spaces(str(raw_item.get("mode") or "")) or "no_change"
+            allow_hidden_fragment = mode in {"footer_hide_fragment", "hide_fragment", "footer_fragment_hidden"}
+            if allow_hidden_fragment:
+                normalized_text = ""
+            confidence = 0.0
+            try:
+                confidence = max(0.0, min(1.0, float(raw_item.get("confidence") or 0.0)))
+            except Exception:
+                confidence = 0.0
+                errors.append(f"invalid_confidence:{layout_id}")
+            if len(normalized_text) > 1200:
+                errors.append(f"normalized_text_too_long:{layout_id}")
+                normalized_text = source_text
+            changed = allow_hidden_fragment or bool(normalized_text and normalized_text != source_text)
+            normalized_items.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "normalized_text": normalized_text if changed else source_text,
+                    "reason": reason if changed else "",
+                    "mode": mode if changed else "no_change",
+                    "confidence": confidence if changed else 0.0,
+                    "changed": changed,
+                }
+            )
+
+        duplicates = sorted({layout_id for layout_id in used_ids if used_ids.count(layout_id) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_layout_id:{layout_id}" for layout_id in duplicates])
+        missing = [layout_id for layout_id in source_text_by_id if layout_id not in set(used_ids)]
+        if missing:
+            errors.extend([f"missing_layout_id:{layout_id}" for layout_id in missing])
+
+        if errors:
+            return {
+                "items": [],
+                "notes": ["deterministic_text_normalization_fallback"],
+            }, {
+                "passed": False,
+                "errors": errors,
+                "fallback_used": True,
+            }
+
+        changed_items = [dict(item) for item in normalized_items if bool(item.get("changed"))]
+        return {
+            "items": changed_items,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    def _apply_layout_uid_text_normalization_to_grounding(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        normalization_plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        next_grounding = dict(grounding or {})
+        items = [
+            dict(row)
+            for row in list((normalization_plan or {}).get("items") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        ]
+        if not items:
+            return next_grounding
+        item_by_id = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in items
+        }
+        updated_atoms: List[Dict[str, Any]] = []
+        for raw_atom in list((grounding or {}).get("layout_atoms") or []):
+            if not isinstance(raw_atom, Mapping):
+                continue
+            atom = dict(raw_atom)
+            layout_id = str(atom.get("layout_id") or "").strip()
+            normalized = dict(item_by_id.get(layout_id) or {})
+            if normalized:
+                atom["normalized_text"] = str(normalized.get("normalized_text") or "").strip()
+                atom["normalization_reason"] = str(normalized.get("reason") or "").strip()
+                atom["normalization_mode"] = str(normalized.get("mode") or "").strip()
+                atom["normalization_confidence"] = float(normalized.get("confidence") or 0.0)
+            updated_atoms.append(atom)
+        updated_atoms = self._backfill_footer_link_normalizations(updated_atoms)
+        atom_text_by_id = {
+            str(atom.get("layout_id") or "").strip(): str(atom.get("normalized_text") or "").strip()
+            for atom in updated_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        atom_reason_by_id = {
+            str(atom.get("layout_id") or "").strip(): {
+                "reason": str(atom.get("normalization_reason") or "").strip(),
+                "mode": str(atom.get("normalization_mode") or "").strip(),
+                "confidence": atom.get("normalization_confidence"),
+            }
+            for atom in updated_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        updated_nodes: List[Dict[str, Any]] = []
+        for raw_node in list((grounding or {}).get("reading_nodes") or []):
+            if not isinstance(raw_node, Mapping):
+                continue
+            node = dict(raw_node)
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            normalized_parts = [atom_text_by_id.get(layout_id, "").strip() for layout_id in source_layout_ids if atom_text_by_id.get(layout_id, "").strip()]
+            if normalized_parts:
+                node["normalized_text"] = "\n\n".join(normalized_parts).strip()
+                primary_layout_id = source_layout_ids[0]
+                node_meta = atom_reason_by_id.get(primary_layout_id) or {}
+                node["normalization_reason"] = str(node_meta.get("reason") or "").strip()
+                node["normalization_mode"] = str(node_meta.get("mode") or "").strip()
+                node["normalization_confidence"] = node_meta.get("confidence")
+            updated_nodes.append(node)
+        next_meta = dict(next_grounding.get("meta") or {})
+        next_grounding["layout_atoms"] = updated_atoms
+        next_grounding["reading_nodes"] = updated_nodes
+        normalization_summary = self._build_grounding_normalization_summary(updated_atoms)
+        if normalization_summary:
+            next_meta["normalization_summary"] = normalization_summary
+        next_grounding["meta"] = next_meta
+        return next_grounding
+
+    @staticmethod
+    def _extract_url_from_footer_text(text: str) -> str:
+        match = re.search(r"https?://\S+", str(text or "").strip(), flags=re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(0) or "").strip().rstrip(".,;:)]}>")
+
+    @staticmethod
+    def _extract_superscript_marker(text: str) -> Optional[int]:
+        match = re.match(r"^\^(\d{1,3})\b", str(text or "").strip())
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    def _backfill_footer_link_normalizations(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        updated_atoms = [dict(atom) for atom in list(layout_atoms or []) if isinstance(atom, Mapping)]
+        footer_atoms = sorted(
+            [
+                atom
+                for atom in updated_atoms
+                if str(atom.get("node_kind") or "").strip().lower() == "footer"
+            ],
+            key=lambda atom: int(atom.get("reading_order") or 0),
+        )
+        next_marker: Optional[int] = None
+        for atom in footer_atoms:
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            normalized_text = str(atom.get("normalized_text") or "").strip()
+            normalization_mode = str(atom.get("normalization_mode") or "").strip().lower()
+            if normalization_mode in {"footer_hide_fragment", "hide_fragment", "footer_fragment_hidden"}:
+                continue
+            known_marker = self._extract_superscript_marker(normalized_text)
+            if known_marker is not None:
+                next_marker = known_marker + 1
+                continue
+            canonical_url = self._extract_url_from_footer_text(source_text)
+            if not canonical_url:
+                continue
+            if normalized_text and normalized_text != source_text:
+                continue
+            fallback_text = canonical_url
+            if next_marker is not None:
+                fallback_text = f"^{next_marker} {canonical_url}"
+                next_marker += 1
+            atom["normalized_text"] = fallback_text
+            current_reason = str(atom.get("normalization_reason") or "").strip()
+            current_mode = str(atom.get("normalization_mode") or "").strip()
+            atom["normalization_reason"] = current_reason if current_reason and current_reason != "no_change" else "footer_link_cleanup"
+            atom["normalization_mode"] = current_mode if current_mode and current_mode != "no_change" else "footer_link_fallback"
+            atom["normalization_confidence"] = atom.get("normalization_confidence") if atom.get("normalization_confidence") not in (None, "", 0, 0.0) else 0.62
+        return updated_atoms
+
+    def _build_grounding_normalization_summary(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        changed_items: List[Dict[str, Any]] = []
+        for atom in list(layout_atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            layout_id = str(atom.get("layout_id") or "").strip()
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            normalized_text = str(atom.get("normalized_text") or "").strip()
+            if not layout_id or not source_text or not normalized_text or normalized_text == source_text:
+                continue
+            changed_items.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "normalized_text": normalized_text,
+                    "reason": str(atom.get("normalization_reason") or "").strip(),
+                    "mode": str(atom.get("normalization_mode") or "").strip(),
+                    "confidence": float(atom.get("normalization_confidence") or 0.0),
+                }
+            )
+        if not changed_items:
+            return None
+        return {
+            "item_count": len(changed_items),
+            "items": changed_items[:24],
+        }
+
+    def _merge_existing_grounding_enrichments(
+        self,
+        *,
+        existing_grounding: Mapping[str, Any],
+        rebuilt_grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(rebuilt_grounding or {})
+        if not isinstance(existing_grounding, Mapping):
+            return merged
+
+        existing_page_image = dict((existing_grounding or {}).get("page_image") or {})
+        rebuilt_page_image = dict((rebuilt_grounding or {}).get("page_image") or {})
+        if rebuilt_page_image:
+            merged_page_image = dict(rebuilt_page_image)
+            for key in ("width", "height"):
+                if merged_page_image.get(key) in (None, "", 0, 0.0, False) and existing_page_image.get(key) not in (
+                    None,
+                    "",
+                    0,
+                    0.0,
+                    False,
+                ):
+                    merged_page_image[key] = existing_page_image.get(key)
+            merged["page_image"] = merged_page_image
+        elif existing_page_image:
+            merged["page_image"] = dict(existing_page_image)
+
+        rebuilt_evidence_map = [
+            dict(row)
+            for row in list((rebuilt_grounding or {}).get("evidence_map") or [])
+            if isinstance(row, Mapping)
+        ]
+        if rebuilt_evidence_map:
+            merged["evidence_map"] = rebuilt_evidence_map
+        else:
+            merged["evidence_map"] = [
+                dict(row)
+                for row in list((existing_grounding or {}).get("evidence_map") or [])
+                if isinstance(row, Mapping)
+            ]
+
+        existing_atoms_by_id: Dict[str, Dict[str, Any]] = {}
+        for atom in list((existing_grounding or {}).get("layout_atoms") or []):
+            if not isinstance(atom, Mapping):
+                continue
+            layout_id = str(atom.get("layout_id") or "").strip()
+            if layout_id:
+                existing_atoms_by_id[layout_id] = dict(atom)
+
+        merged_atoms: List[Dict[str, Any]] = []
+        rebuilt_atoms = [
+            dict(raw_atom)
+            for raw_atom in list((rebuilt_grounding or {}).get("layout_atoms") or [])
+            if isinstance(raw_atom, Mapping)
+        ]
+        if not rebuilt_atoms:
+            rebuilt_atoms = [
+                dict(raw_atom)
+                for raw_atom in list((existing_grounding or {}).get("layout_atoms") or [])
+                if isinstance(raw_atom, Mapping)
+            ]
+        for raw_atom in rebuilt_atoms:
+            if not isinstance(raw_atom, Mapping):
+                continue
+            atom = dict(raw_atom)
+            existing_atom = existing_atoms_by_id.get(str(atom.get("layout_id") or "").strip()) or {}
+            for field in (
+                "normalized_text",
+                "normalization_reason",
+                "normalization_mode",
+                "normalization_confidence",
+            ):
+                if field in existing_atom and existing_atom.get(field) not in (None, ""):
+                    atom[field] = existing_atom.get(field)
+            merged_atoms.append(atom)
+        merged["layout_atoms"] = merged_atoms
+
+        atom_text_by_id = {
+            str(atom.get("layout_id") or "").strip(): str(atom.get("normalized_text") or "").strip()
+            for atom in merged_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        atom_meta_by_id = {
+            str(atom.get("layout_id") or "").strip(): {
+                "reason": str(atom.get("normalization_reason") or "").strip(),
+                "mode": str(atom.get("normalization_mode") or "").strip(),
+                "confidence": atom.get("normalization_confidence"),
+            }
+            for atom in merged_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+
+        existing_nodes_by_source_ids: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        for node in list((existing_grounding or {}).get("reading_nodes") or []):
+            if not isinstance(node, Mapping):
+                continue
+            key = tuple(
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            )
+            if key:
+                existing_nodes_by_source_ids[key] = dict(node)
+
+        merged_nodes: List[Dict[str, Any]] = []
+        rebuilt_nodes = [
+            dict(raw_node)
+            for raw_node in list((rebuilt_grounding or {}).get("reading_nodes") or [])
+            if isinstance(raw_node, Mapping)
+        ]
+        if not rebuilt_nodes:
+            rebuilt_nodes = [
+                dict(raw_node)
+                for raw_node in list((existing_grounding or {}).get("reading_nodes") or [])
+                if isinstance(raw_node, Mapping)
+            ]
+        for raw_node in rebuilt_nodes:
+            if not isinstance(raw_node, Mapping):
+                continue
+            node = dict(raw_node)
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            existing_node = existing_nodes_by_source_ids.get(tuple(source_layout_ids)) or {}
+            if existing_node:
+                for field in (
+                    "normalized_text",
+                    "normalization_reason",
+                    "normalization_mode",
+                    "normalization_confidence",
+                ):
+                    if field in existing_node and existing_node.get(field) not in (None, ""):
+                        node[field] = existing_node.get(field)
+            if not str(node.get("normalized_text") or "").strip() and source_layout_ids:
+                normalized_parts = [
+                    atom_text_by_id.get(layout_id, "").strip()
+                    for layout_id in source_layout_ids
+                    if atom_text_by_id.get(layout_id, "").strip()
+                ]
+                if normalized_parts:
+                    node["normalized_text"] = "\n\n".join(normalized_parts).strip()
+                    primary_layout_id = source_layout_ids[0]
+                    node_meta = atom_meta_by_id.get(primary_layout_id) or {}
+                    node["normalization_reason"] = str(node_meta.get("reason") or "").strip()
+                    node["normalization_mode"] = str(node_meta.get("mode") or "").strip()
+                    node["normalization_confidence"] = node_meta.get("confidence")
+            merged_nodes.append(node)
+        merged["reading_nodes"] = merged_nodes
+
+        merged_meta = {
+            **dict((existing_grounding or {}).get("meta") or {}),
+            **dict(merged.get("meta") or {}),
+        }
+        normalization_summary = self._build_grounding_normalization_summary(merged_atoms)
+        if normalization_summary:
+            merged_meta["normalization_summary"] = normalization_summary
+        merged["meta"] = merged_meta
+        return merged
+
+    def _backfill_grounding_text_normalizations_from_payload(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        current_grounding = dict(grounding or {})
+        current_summary = dict((current_grounding.get("meta") or {}).get("normalization_summary") or {})
+        if int(current_summary.get("item_count") or 0) > 0:
+            return current_grounding
+        text_normalizations = dict(((payload or {}).get("layout_advice_v3") or {}).get("text_normalizations") or {})
+        normalization_plan = dict(text_normalizations.get("normalization_plan") or {})
+        if not list(normalization_plan.get("items") or []):
+            return current_grounding
+        return self._apply_layout_uid_text_normalization_to_grounding(
+            grounding=current_grounding,
+            normalization_plan=normalization_plan,
+        )
+
+    @staticmethod
     def _layout_uid_table_logical_row_system_prompt() -> str:
         return (
             "You refine a single table for the /read reader. "
@@ -1158,6 +1799,27 @@ class LiteratureReaderComposeService:
             "{\"logical_row_id\":\"lr1\",\"row_role\":\"header\",\"source_row_indices\":[0,1],\"rationale\":\"multi_line_header\"},"
             "{\"logical_row_id\":\"lr2\",\"row_role\":\"data\",\"source_row_indices\":[2,3],\"rationale\":\"value_plus_uncertainty\"}"
             "],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _layout_uid_equation_normalization_system_prompt() -> str:
+        return (
+            "You normalize a single formula-like layout for the /read reader. "
+            "DocMind geometry and evidence are already fixed. "
+            "Use the attached page image and the provided layout/style hints only to improve display-layer readability. "
+            "Never change layout_id, ownership, geometry, source ids, or evidence. "
+            "Return JSON with status and step_result. "
+            "If the OCR text is too unreliable, return empty normalized_latex and explain why. "
+            "Prefer concise normalized_text and normalized_latex that preserve the source language and symbols. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{"
+            "\"normalized_text\":\"...\","
+            "\"normalized_latex\":\"...\","
+            "\"reason\":\"...\","
+            "\"confidence\":0.82,"
+            "\"mode\":\"latex_reconstructed\","
+            "\"notes\":[\"...\"]"
+            "}}"
         )
 
     @staticmethod
@@ -1372,6 +2034,133 @@ class LiteratureReaderComposeService:
             "fallback_used": False,
         }
 
+    def _build_layout_uid_equation_normalization_prompt_payload(
+        self,
+        *,
+        page: int,
+        group_id: str,
+        atoms: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        compact_atoms: List[Dict[str, Any]] = []
+        for atom in list(atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            compact_atoms.append(
+                {
+                    "layout_id": str(atom.get("layout_id") or "").strip(),
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "raw_text": str(atom.get("raw_text") or "").strip(),
+                    "clean_text": str(atom.get("clean_text") or "").strip(),
+                    "alignment": str(atom.get("alignment") or "").strip().lower(),
+                    "line_height": float(atom.get("line_height") or 0.0),
+                    "layout_pos": list(atom.get("layout_pos") or []),
+                    "blocks": [
+                        {
+                            "text": str(block.get("text") or "").strip(),
+                            "style_id": int(block.get("style_id") or 0),
+                            "pos": list(block.get("pos") or []),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        transcript_parts = [
+            self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            for atom in compact_atoms
+            if self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+        ]
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_equation_normalization",
+                "group_id": str(group_id or "").strip(),
+            },
+            "equation": {
+                "layout_count": len(compact_atoms),
+                "transcript": " ".join(transcript_parts).strip(),
+                "atoms": compact_atoms,
+            },
+            "rules": {
+                "task": "normalize_formula_display_text",
+                "preserve_geometry": True,
+                "preserve_source_ids": True,
+                "forbid_translation": True,
+                "forbid_evidence_rewrite": True,
+                "allow_empty_normalized_latex": True,
+            },
+        }
+
+    def _normalize_layout_uid_equation_refinement(
+        self,
+        *,
+        atoms: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        transcript_parts = [
+            self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            for atom in list(atoms or [])
+            if isinstance(atom, Mapping)
+        ]
+        transcript = " ".join([part for part in transcript_parts if part]).strip()
+        normalized_text = self._normalize_spaces(str((step_result or {}).get("normalized_text") or ""))
+        normalized_latex = str((step_result or {}).get("normalized_latex") or "").strip()
+        reason = self._normalize_spaces(str((step_result or {}).get("reason") or ""))
+        mode = self._normalize_spaces(str((step_result or {}).get("mode") or "")) or "display_normalized"
+        notes = [
+            self._normalize_spaces(str(item))
+            for item in list((step_result or {}).get("notes") or [])
+            if self._normalize_spaces(str(item))
+        ]
+        errors: List[str] = []
+        confidence_value = 0.0
+        raw_confidence = (step_result or {}).get("confidence")
+        try:
+            confidence_value = float(raw_confidence)
+        except Exception:
+            confidence_value = 0.0
+            if raw_confidence is not None:
+                errors.append("invalid_confidence")
+        confidence_value = max(0.0, min(1.0, confidence_value))
+        if normalized_latex and len(normalized_latex) > 800:
+            errors.append("normalized_latex_too_long")
+            normalized_latex = ""
+        if normalized_text and len(normalized_text) > 800:
+            errors.append("normalized_text_too_long")
+            normalized_text = ""
+        if normalized_latex and "\n\n" in normalized_latex:
+            normalized_latex = normalized_latex.replace("\n\n", "\n").strip()
+        if normalized_text and transcript and normalized_text == transcript:
+            normalized_text = ""
+        if not normalized_text and normalized_latex:
+            normalized_text = normalized_latex
+        if not normalized_text and not normalized_latex:
+            return {
+                "normalized_text": "",
+                "normalized_latex": "",
+                "reason": "",
+                "confidence": 0.0,
+                "mode": "",
+                "notes": notes,
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_normalization"],
+                "fallback_used": True,
+            }
+        return {
+            "normalized_text": normalized_text,
+            "normalized_latex": normalized_latex,
+            "reason": reason,
+            "confidence": confidence_value,
+            "mode": mode,
+            "notes": notes,
+        }, {
+            "passed": not bool(errors),
+            "errors": errors,
+            "fallback_used": False,
+        }
+
     @staticmethod
     def _looks_like_table_caption_text(text: str) -> bool:
         normalized = str(text or "").strip()
@@ -1380,11 +2169,34 @@ class LiteratureReaderComposeService:
         return bool(re.match(r"^table\s*\d+[a-z]?(?:[\s:.\-]|$)", normalized, flags=re.IGNORECASE))
 
     @staticmethod
-    def _looks_like_equation_text(text: str) -> bool:
+    def _looks_like_quantization_config_text(text: str) -> bool:
         normalized = str(text or "").strip()
         if not normalized:
             return False
         lowered = normalized.lower()
+        bullet_or_enumerated = bool(re.match(r"^(?:[•·\-*]\s*|\d+\.\s*)", normalized))
+        quantization_token_count = len(
+            re.findall(
+                r"\b(?:fp8|bf16|q\d(?:[._-]?[a-z0-9]+)*|\d-bit|llama\.cpp\d*|unsloth\d*|tencent api|reported|ours)\b",
+                lowered,
+            )
+        )
+        if quantization_token_count == 0:
+            return False
+        if bullet_or_enumerated:
+            return True
+        if ":" in normalized or " for " in lowered:
+            return True
+        return False
+
+    @classmethod
+    def _looks_like_equation_text(cls, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        if cls._looks_like_quantization_config_text(normalized):
+            return False
         if any(
             token in lowered
             for token in (
@@ -1406,7 +2218,7 @@ class LiteratureReaderComposeService:
             return True
         if normalized.startswith("$$") or normalized.startswith("\\(") or normalized.startswith("\\["):
             return True
-        math_symbol_count = len(re.findall(r"[=+\-*/^_≤≥≈∑∫√±×÷]", normalized))
+        math_symbol_count = len(re.findall(r"[=+*/^≤≥≈∑∫√±×÷]", normalized))
         alpha_token_count = len(re.findall(r"[A-Za-z]{2,}", normalized))
         if math_symbol_count >= 2 and alpha_token_count <= 10 and len(normalized) <= 240:
             return True
@@ -2172,6 +2984,7 @@ class LiteratureReaderComposeService:
         self,
         *,
         atoms: Sequence[Mapping[str, Any]],
+        equation_refinement: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         clean_texts = [
             self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
@@ -2202,13 +3015,37 @@ class LiteratureReaderComposeService:
                 label = extracted_label
             merged = self._normalize_spaces(merged[: trailing_label.start()])
         latex = merged.replace("−", "-").replace("–", "-").strip()
-        return {
+        normalized_refinement = dict(equation_refinement or {})
+        normalized_text = self._normalize_spaces(str(normalized_refinement.get("normalized_text") or ""))
+        normalized_latex = str(normalized_refinement.get("normalized_latex") or "").strip()
+        normalization_reason = self._normalize_spaces(str(normalized_refinement.get("reason") or ""))
+        normalization_mode = self._normalize_spaces(str(normalized_refinement.get("mode") or ""))
+        normalization_confidence = 0.0
+        try:
+            normalization_confidence = max(
+                0.0,
+                min(1.0, float(normalized_refinement.get("confidence") or 0.0)),
+            )
+        except Exception:
+            normalization_confidence = 0.0
+        props = {
             "latex": latex or "x = y",
             "label": label,
             "description": description,
             "render_mode": "image_first",
             "transcript": transcript,
         }
+        if normalized_text:
+            props["normalized_text"] = normalized_text
+        if normalized_latex:
+            props["normalized_latex"] = normalized_latex
+        if normalization_reason:
+            props["normalization_reason"] = normalization_reason
+        if normalization_mode:
+            props["normalization_mode"] = normalization_mode
+        if normalized_text or normalized_latex:
+            props["normalization_confidence"] = float(normalization_confidence)
+        return props
 
     def _build_layout_uid_fallback_group_plan(
         self,
@@ -2557,6 +3394,62 @@ class LiteratureReaderComposeService:
             }
         return refinement_map
 
+    async def _build_layout_uid_equation_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "equation":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            prompt_payload = self._build_layout_uid_equation_normalization_prompt_payload(
+                page=page,
+                group_id=group_id,
+                atoms=atoms,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_equation_normalization_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_equation_normalization:{group_id}",
+            )
+            normalized_refinement, validation = self._normalize_layout_uid_equation_refinement(
+                atoms=atoms,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "normalization": normalized_refinement,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
     def _layout_uid_group_plan_to_panel_plan(
         self,
         *,
@@ -2564,6 +3457,7 @@ class LiteratureReaderComposeService:
         grouping_plan: Mapping[str, Any],
         grounding: Mapping[str, Any],
         table_refinements: Optional[Mapping[str, Any]] = None,
+        equation_refinements: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         layout_index = {
             str(row.get("layout_id") or "").strip(): dict(row)
@@ -2620,9 +3514,9 @@ class LiteratureReaderComposeService:
                 continue
             atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
             clean_texts = [
-                str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                self._normalized_grounding_text(atom)
                 for atom in atoms
-                if str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                if self._normalized_grounding_text(atom)
             ]
             group_kind = str(group.get("group_kind") or "").strip().lower() or "paragraph"
             component = "ParagraphProse"
@@ -2678,7 +3572,11 @@ class LiteratureReaderComposeService:
                 }
             elif group_kind == "equation":
                 component = "EquationBlock"
-                props = self._build_layout_uid_equation_props(atoms=atoms)
+                refinement = dict((equation_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                props = self._build_layout_uid_equation_props(
+                    atoms=atoms,
+                    equation_refinement=dict(refinement.get("normalization") or {}) if refinement else None,
+                )
             else:
                 paragraphs = [{"text": text} for text in clean_texts if text]
                 merged_text = "\n\n".join(text for text in clean_texts if text).strip()
@@ -2735,6 +3633,20 @@ class LiteratureReaderComposeService:
         resolved_pipeline_version = self._pipeline_version(pipeline_version)
         payload = self._ensure_payload_contract(page=page, payload=dict(base_payload or {}))
         grounding = dict(payload.get("page_grounding_v1") or {})
+        docmind_structure = dict(payload.get("docmind_structure") or {})
+        pdf_path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+            user_id=int(paper.user_id),
+            paper_id=int(paper.id),
+            paper_title=paper.title,
+            paper_pdf_path=paper.pdf_path,
+        )
+        page_image_asset = self._resolve_reader_page_image_asset(
+            paper_id=int(paper.id),
+            page=int(page),
+            pdf_path=str(pdf_path or ""),
+            docmind_page_image_url=str(docmind_structure.get("page_image_url") or "").strip(),
+            docmind_page_image_path=str(docmind_structure.get("page_image_path") or "").strip(),
+        )
         layout_atoms = [
             dict(row)
             for row in list(grounding.get("layout_atoms") or [])
@@ -2757,8 +3669,38 @@ class LiteratureReaderComposeService:
             )
 
         page_image = dict(grounding.get("page_image") or {})
-        rendered_page_image = str(page_image.get("url") or "").strip()
-        rendered_page_image_path = str(page_image.get("path") or "").strip()
+        rendered_page_image = str(page_image_asset.get("url") or page_image.get("url") or "").strip()
+        rendered_page_image_path = str(page_image_asset.get("path") or page_image.get("path") or "").strip()
+        text_normalization_map: Dict[str, Dict[str, Any]] = {}
+        if rendered_page_image or rendered_page_image_path:
+            text_normalization_prompt_payload = self._build_layout_uid_text_normalization_prompt_payload(
+                page=page,
+                grounding=grounding,
+            )
+            if list(text_normalization_prompt_payload.get("layout_atoms") or []):
+                text_normalization_result = await self._invoke_single_agent_model(
+                    system_prompt=self._layout_uid_text_normalization_system_prompt(),
+                    user_prompt=text_normalization_prompt_payload,
+                    rendered_page_image=rendered_page_image,
+                    rendered_page_image_path=rendered_page_image_path,
+                    step=1,
+                    phase="layout_uid_text_normalization",
+                )
+                normalized_text_plan, text_normalization_validation = self._normalize_layout_uid_text_normalization_plan(
+                    grounding=grounding,
+                    step_result=dict(text_normalization_result.get("step_result") or {}),
+                )
+                text_normalization_map = {
+                    "normalization_plan": normalized_text_plan,
+                    "validation": text_normalization_validation,
+                    "usage": dict(text_normalization_result.get("usage") or {}),
+                    "model_status": str(text_normalization_result.get("status") or "").strip().lower() or "done",
+                }
+                grounding = self._apply_layout_uid_text_normalization_to_grounding(
+                    grounding=grounding,
+                    normalization_plan=normalized_text_plan,
+                )
+                payload["page_grounding_v1"] = grounding
         prompt_payload = self._build_layout_uid_prompt_payload(
             paper=paper,
             page=page,
@@ -2783,11 +3725,19 @@ class LiteratureReaderComposeService:
             rendered_page_image=rendered_page_image,
             rendered_page_image_path=rendered_page_image_path,
         )
+        equation_refinement_map = await self._build_layout_uid_equation_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
         panel_plan = self._layout_uid_group_plan_to_panel_plan(
             page=page,
             grouping_plan=normalized_grouping_plan,
             grounding=grounding,
             table_refinements=table_refinement_map,
+            equation_refinements=equation_refinement_map,
         )
         docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
             page=page,
@@ -2829,8 +3779,11 @@ class LiteratureReaderComposeService:
         used_fallback = bool(grouping_validation.get("fallback_used"))
         decision_log = [
             "layout_uid_v1:unique_id_grouping",
+            f"layout_uid_v1:text_normalized={len(list(((text_normalization_map.get('normalization_plan') or {}).get('items') or [])))}",
             f"layout_uid_v1:groups={len(list(normalized_grouping_plan.get('groups') or []))}",
             f"layout_uid_v1:omissions={len(omissions)}",
+            f"layout_uid_v1:tables_refined={sum(1 for item in list(table_refinement_map.values()) if isinstance(item, Mapping) and list(((item.get('logical_row_plan') or {}).get('logical_rows') or [])))}",
+            f"layout_uid_v1:equations_normalized={sum(1 for item in list(equation_refinement_map.values()) if isinstance(item, Mapping) and (((item.get('normalization') or {}).get('normalized_text')) or ((item.get('normalization') or {}).get('normalized_latex'))))}",
         ] + [
             str(item).strip()
             for item in list(normalized_grouping_plan.get("notes") or [])
@@ -2866,6 +3819,7 @@ class LiteratureReaderComposeService:
             "ordered_block_ids": used_layout_ids,
             "suggested_components": component_hints,
             "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
+            "text_normalizations": text_normalization_map,
             "table_refinements": table_refinement_map,
             "visual_hints": [],
             "notes": list(decision_log),
@@ -2888,6 +3842,7 @@ class LiteratureReaderComposeService:
             "used": True,
             "pipeline": "reader_layout_uid_v1",
             "elapsed_ms": elapsed_ms,
+            "text_normalization": text_normalization_map,
             "grouping_validation": dict(grouping_validation),
         }
         quality_report = {
@@ -3091,35 +4046,22 @@ class LiteratureReaderComposeService:
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
-        rendered_page_image = str(
-            (((payload.get("docmind_structure") or {}).get("page_image_url") or ""))
-        ).strip()
-        rendered_page_image_path = ""
+        page_image_asset = self._resolve_reader_page_image_asset(
+            paper_id=int(paper.id),
+            page=int(page),
+            pdf_path=str(pdf_path or ""),
+            docmind_page_image_url=str((((payload.get("docmind_structure") or {}).get("page_image_url") or ""))).strip(),
+            docmind_page_image_path=str((((payload.get("docmind_structure") or {}).get("page_image_path") or ""))).strip(),
+        )
+        rendered_page_image = str(page_image_asset.get("url") or "").strip()
+        rendered_page_image_path = str(page_image_asset.get("path") or "").strip()
         if rendered_page_image and not self._is_safe_prompt_image_url(rendered_page_image):
             rendered_page_image = ""
-        if pdf_path and os.path.exists(pdf_path):
-            try:
-                fallback_image = await self.ensure_page_render_asset(
-                    paper_id=int(paper.id),
-                    page=int(page),
-                    pdf_path=str(pdf_path),
-                )
-                fallback_path = self._find_existing_page_render_asset_path(
-                    paper_id=int(paper.id),
-                    page=int(page),
-                )
-                if fallback_path and os.path.exists(fallback_path):
-                    rendered_page_image_path = str(fallback_path)
-                if fallback_image and self._is_safe_prompt_image_url(fallback_image):
-                    if not rendered_page_image:
-                        rendered_page_image = fallback_image
-                    mm_meta = dict(payload.get("mm_assist_meta") or {})
-                    mm_meta["stage1_prompt_image_source"] = "page_render_asset_url"
-                    payload["mm_assist_meta"] = mm_meta
-            except Exception as exc:
-                logger.debug(
-                    f"[ReaderComposeService] stage1 prompt image fallback failed paper={paper.id} page={page}: {exc}"
-                )
+        page_image_source = str(page_image_asset.get("source") or "").strip()
+        if rendered_page_image or rendered_page_image_path:
+            mm_meta = dict(payload.get("mm_assist_meta") or {})
+            mm_meta["stage1_prompt_image_source"] = page_image_source or "unknown"
+            payload["mm_assist_meta"] = mm_meta
         if pdf_path and os.path.exists(pdf_path):
             try:
                 payload = await self._ensure_figure_assets_for_payload(
@@ -3619,6 +4561,15 @@ class LiteratureReaderComposeService:
             return candidate
         return None
 
+    @staticmethod
+    def _find_existing_grounding_page_image_path(*, paper_id: int, page: int) -> Optional[str]:
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            candidate = os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        return None
+
     async def ensure_page_render_asset(
         self,
         *,
@@ -3641,6 +4592,105 @@ class LiteratureReaderComposeService:
         if created_path and os.path.exists(created_path):
             return self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page))
         return ""
+
+    def _resolve_reader_page_image_asset(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str = "",
+        docmind_page_image_url: str = "",
+        docmind_page_image_path: str = "",
+    ) -> Dict[str, str]:
+        existing_path = self._find_existing_page_render_asset_path(
+            paper_id=int(paper_id),
+            page=int(page),
+        )
+        if existing_path and os.path.exists(existing_path):
+            return {
+                "url": self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(existing_path),
+                "source": "page_render_asset",
+                "origin_url": "",
+                "local_cached": True,
+            }
+
+        local_pdf_path = str(pdf_path or "").strip()
+        if local_pdf_path and os.path.exists(local_pdf_path):
+            created_path = self._build_page_render_asset_sync(
+                paper_id=int(paper_id),
+                page=int(page),
+                pdf_path=local_pdf_path,
+            )
+            if created_path and os.path.exists(created_path):
+                return {
+                    "url": self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page)),
+                    "path": str(created_path),
+                    "source": "page_render_asset",
+                    "origin_url": "",
+                    "local_cached": True,
+                }
+
+        remote_url = str(docmind_page_image_url or "").strip()
+        localized_path = self._ensure_local_grounding_page_image(
+            paper_id=int(paper_id),
+            page=int(page),
+            page_image_url=remote_url,
+            page_image_path=str(docmind_page_image_path or "").strip(),
+        )
+        if localized_path and os.path.exists(localized_path):
+            return {
+                "url": self._build_grounding_page_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(localized_path),
+                "source": "docmind_page_image_localized",
+                "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+                "local_cached": True,
+            }
+
+        return {
+            "url": "",
+            "path": "",
+            "source": "docmind_page_image_unlocalized" if self._is_safe_http_url(remote_url) else "",
+            "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+            "local_cached": False,
+        }
+
+    def _resolve_grounding_page_image_asset(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str = "",
+        docmind_page_image_url: str = "",
+        docmind_page_image_path: str = "",
+    ) -> Dict[str, str]:
+        existing_grounding_path = self._find_existing_grounding_page_image_path(
+            paper_id=int(paper_id),
+            page=int(page),
+        )
+        remote_url = str(docmind_page_image_url or "").strip()
+        localized_path = self._ensure_local_grounding_page_image(
+            paper_id=int(paper_id),
+            page=int(page),
+            page_image_url=remote_url,
+            page_image_path=str(docmind_page_image_path or existing_grounding_path or "").strip(),
+        )
+        if localized_path and os.path.exists(localized_path):
+            return {
+                "url": self._build_grounding_page_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(localized_path),
+                "source": "docmind_page_image_localized",
+                "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+                "local_cached": True,
+            }
+
+        return {
+            "url": "",
+            "path": "",
+            "source": "docmind_page_image_unlocalized" if self._is_safe_http_url(remote_url) else "",
+            "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+            "local_cached": False,
+        }
 
     def _infer_docmind_page_size(
         self,
@@ -4076,7 +5126,7 @@ class LiteratureReaderComposeService:
             atom = grounding_layout_map.get(token) or {}
             evidence = grounding_evidence_map.get(token) or {}
             quote_text = self._normalize_spaces(
-                str(atom.get("clean_text") or atom.get("raw_text") or "")
+                str(atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
             ) or self._normalize_spaces(str((docmind_map.get(token) or {}).get("source_text") or ""))
             canonical_block_ids = [
                 self._normalize_canonical_block_id(page=page, raw_id=str(item))
@@ -4656,39 +5706,39 @@ class LiteratureReaderComposeService:
             and bool(local_image_paths)
             and DashScopeMultimodalService.is_available()
         ):
-            try:
-                result = await DashScopeMultimodalService.chat_json(
-                    api_key=api_key,
-                    base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or base_url or "").strip(),
-                    model=model_name,
-                    system_prompt=str(system_prompt or ""),
-                    user_prompt=json.dumps(user_prompt, ensure_ascii=False),
-                    image_paths=local_image_paths,
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                )
-                parsed = dict(result.get("parsed") or {})
-                if not parsed:
-                    return {}
-                return {
-                    "status": str(parsed.get("status") or ""),
-                    "step_result": dict(parsed.get("step_result") or {}),
-                    "usage": dict(result.get("usage") or {}),
-                    "self_check": dict(parsed.get("self_check") or {}),
-                    "fixes_applied": list(parsed.get("fixes_applied") or []),
-                }
-            except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
-                logger.warning(
-                    f"[ReaderComposeService] single_agent_v2 dashscope call failed "
-                    f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
-                )
+            for attempt in range(1, 3):
+                try:
+                    result = await DashScopeMultimodalService.chat_json(
+                        api_key=api_key,
+                        base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or base_url or "").strip(),
+                        model=model_name,
+                        system_prompt=str(system_prompt or ""),
+                        user_prompt=json.dumps(user_prompt, ensure_ascii=False),
+                        image_paths=local_image_paths,
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                    )
+                    parsed = dict(result.get("parsed") or {})
+                    if not parsed:
+                        return {}
+                    return {
+                        "status": str(parsed.get("status") or ""),
+                        "step_result": dict(parsed.get("step_result") or {}),
+                        "usage": dict(result.get("usage") or {}),
+                        "self_check": dict(parsed.get("self_check") or {}),
+                        "fixes_applied": list(parsed.get("fixes_applied") or []),
+                    }
+                except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+                    logger.warning(
+                        f"[ReaderComposeService] single_agent_v2 dashscope call failed "
+                        f"step={step} phase={phase} model={model_name} attempt={attempt}: {type(exc).__name__}: {exc}"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.4)
 
         content_parts: List[Dict[str, Any]] = [
             {"type": "text", "text": json.dumps(user_prompt, ensure_ascii=False)}
         ]
-        image_token = str(rendered_page_image or "").strip()
-        if image_token and self._is_safe_prompt_image_url(image_token):
-            content_parts.append({"type": "image_url", "image_url": {"url": image_token}})
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         try:
@@ -11721,6 +12771,43 @@ class LiteratureReaderComposeService:
             return True
         return False
 
+    @classmethod
+    def _is_public_prompt_image_url(cls, raw: str) -> bool:
+        value = str(raw or "").strip()
+        if not cls._is_safe_prompt_image_url(value):
+            return False
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            return False
+        hostname = str(parsed.hostname or "").strip().lower()
+        if not hostname:
+            return False
+        if hostname in {
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "backend",
+            "frontend",
+            "postgres",
+            "redis",
+            "research_backend",
+            "research_frontend",
+            "research_postgres",
+            "research_redis",
+        }:
+            return False
+        try:
+            host_ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            return True
+        return not (
+            host_ip.is_private
+            or host_ip.is_loopback
+            or host_ip.is_link_local
+            or host_ip.is_reserved
+        )
+
     @staticmethod
     def _asset_base_url() -> str:
         for raw in (
@@ -11764,6 +12851,12 @@ class LiteratureReaderComposeService:
     def _build_page_render_asset_url(cls, *, paper_id: int, page: int) -> str:
         return cls._absolute_asset_url(
             f"/api/v1/literature/reader/page-assets/{int(paper_id)}/{int(page)}"
+        )
+
+    @classmethod
+    def _build_grounding_page_asset_url(cls, *, paper_id: int, page: int) -> str:
+        return cls._absolute_asset_url(
+            f"/api/v1/literature/reader/grounding-page-assets/{int(paper_id)}/{int(page)}"
         )
 
     @staticmethod
@@ -14577,10 +15670,24 @@ class LiteratureReaderComposeService:
         )
         cloned["main_block_ids"] = list(cloned.get("main_block_ids") or main_block_ids)
         cloned["aux_block_ids"] = list(cloned.get("aux_block_ids") or aux_block_ids)
-        cloned["page_grounding_v1"] = self._build_page_grounding_v1(
+        rebuilt_grounding = self._build_page_grounding_v1(
             page=page,
             payload=cloned,
         )
+        rebuilt_grounding = self._backfill_grounding_text_normalizations_from_payload(
+            payload=cloned,
+            grounding=rebuilt_grounding,
+        )
+        cloned["page_grounding_v1"] = self._merge_existing_grounding_enrichments(
+            existing_grounding=dict(cloned.get("page_grounding_v1") or {}),
+            rebuilt_grounding=rebuilt_grounding,
+        )
+        ui_plan = self._refresh_layout_uid_source_anchor_refs(
+            page=page,
+            payload=cloned,
+            ui_plan=ui_plan,
+        )
+        cloned["ui_plan"] = ui_plan
         cloned["enrichment_bundle"] = self._build_enrichment_bundle(
             page=page,
             payload=cloned,
@@ -14614,8 +15721,8 @@ class LiteratureReaderComposeService:
         payload: Dict[str, Any],
         nodes: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        docmind_structure = dict((payload or {}).get("docmind_structure") or {})
-        page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        grounding_page_image = dict((((payload or {}).get("page_grounding_v1") or {}).get("page_image") or {}))
+        page_image_url = str(grounding_page_image.get("url") or "").strip()
         style_cues = dict((payload or {}).get("style_cues") or {})
         block_group_index = self._build_block_group_index(page=page, payload=payload)
         layout_block_id_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
@@ -15039,18 +16146,6 @@ class LiteratureReaderComposeService:
             except Exception as exc:
                 logger.debug(f"[ReaderComposeService] failed to read local grounding page image size: {exc}")
 
-        remote_url = str(page_image_url or "").strip()
-        if remote_url and urlparse(remote_url).scheme in {"http", "https"}:
-            try:
-                with urlopen(remote_url, timeout=12) as response:  # nosec B310 - trusted DocMind image URL
-                    data = response.read()
-                with Image.open(BytesIO(data)) as image:
-                    width, height = image.size
-                if width > 0 and height > 0:
-                    return int(width), int(height)
-            except Exception as exc:
-                logger.debug(f"[ReaderComposeService] failed to fetch grounding page image size: {exc}")
-
         return None, None
 
     def _ensure_local_grounding_page_image(
@@ -15183,7 +16278,7 @@ class LiteratureReaderComposeService:
             page_image=page_image,
         )
         normalized_quote = self._normalize_spaces(
-            str(quote_text or atom.get("clean_text") or atom.get("raw_text") or "")
+            str(quote_text or atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
         )
         normalized_block_ids = [
             self._normalize_canonical_block_id(page=page, raw_id=str(item))
@@ -15253,6 +16348,84 @@ class LiteratureReaderComposeService:
             "source_word_ids": [],
             "source_char_ranges": [],
         }
+
+    def _refresh_layout_uid_source_anchor_refs(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        grounding = dict((payload or {}).get("page_grounding_v1") or {})
+        grounding_layout_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        if not grounding_layout_map:
+            return ui_plan
+
+        def _walk(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            output: List[Dict[str, Any]] = []
+            for raw in list(nodes or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                explicit_layout_ids = [
+                    str(item).strip()
+                    for item in list(node.get("source_atom_ids") or node.get("source_layout_ids") or [])
+                    if str(item).strip()
+                ]
+                anchor_layout_ids = [
+                    str((row.get("source_layout_id") or "")).strip()
+                    for row in list(node.get("source_anchor_refs") or [])
+                    if isinstance(row, Mapping) and str((row.get("source_layout_id") or "")).strip()
+                ]
+                source_layout_ids = [
+                    item
+                    for item in list(dict.fromkeys(explicit_layout_ids + anchor_layout_ids))
+                    if item in grounding_layout_map
+                ]
+                source_layout_ids = list(dict.fromkeys(source_layout_ids))
+                existing_refs = [
+                    dict(row)
+                    for row in list(node.get("source_anchor_refs") or [])
+                    if isinstance(row, Mapping)
+                ]
+                non_layout_refs = [
+                    row
+                    for row in existing_refs
+                    if str(row.get("coord_version") or ((row.get("anchor_v2") or {}).get("coord_version") if isinstance(row.get("anchor_v2"), Mapping) else "") or "").strip() != "layout_uid_v1"
+                ]
+                rebuilt_refs: List[Dict[str, Any]] = []
+                source_block_ids = [
+                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                    for item in list(node.get("source_block_ids") or [])
+                ]
+                source_block_ids = [item for item in source_block_ids if item]
+                for layout_id in source_layout_ids:
+                    atom = grounding_layout_map.get(layout_id) or {}
+                    rebuilt = self._build_layout_uid_anchor_from_grounding(
+                        page=page,
+                        payload=payload,
+                        layout_id=layout_id,
+                        quote_text=self._normalize_spaces(
+                            str(atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
+                        ),
+                        canonical_block_ids=source_block_ids,
+                    )
+                    if isinstance(rebuilt, dict):
+                        rebuilt_refs.append(rebuilt)
+                if rebuilt_refs:
+                    node["source_anchor_refs"] = rebuilt_refs + non_layout_refs
+                if isinstance(node.get("children"), list):
+                    node["children"] = _walk(list(node.get("children") or []))
+                output.append(node)
+            return output
+
+        refreshed = dict(ui_plan or {})
+        refreshed["components"] = _walk(list(refreshed.get("components") or []))
+        return refreshed
 
     def _extract_docmind_table_cells(self, row: Mapping[str, Any]) -> List[Dict[str, Any]]:
         output: List[Dict[str, Any]] = []
@@ -15421,6 +16594,11 @@ class LiteratureReaderComposeService:
             return "header"
         if layout_sub_type in {"page_footer", "page"} or layout_type in {"foot", "footer_line", "foot_pagenum"}:
             return "footer"
+        if (
+            layout_sub_type in {"footnote", "corner_note", "footer_note"}
+            or layout_type in {"corner_note", "footer_note", "footnote"}
+        ):
+            return "footer"
         if layout_type == "title" or "heading" in kind_set:
             return "title" if layout_type == "title" else "section_heading"
         if layout_type in {"figure", "image", "picture"} or layout_sub_type in {"figure", "image", "picture"}:
@@ -15511,6 +16689,7 @@ class LiteratureReaderComposeService:
                             "block_index": int(block_idx),
                             "text": text,
                             "pos": pos,
+                            "style_id": self._safe_int(block.get("styleId"), 0),
                         }
                     )
             if not blocks:
@@ -15523,6 +16702,7 @@ class LiteratureReaderComposeService:
                             "block_index": 1,
                             "text": fallback_text,
                             "pos": list(layout_pos),
+                            "style_id": 0,
                         }
                     )
                     if fallback_text:
@@ -15578,6 +16758,12 @@ class LiteratureReaderComposeService:
                     "layout_sub_type": str(row.get("subType") or "").strip().lower(),
                     "raw_text": raw_text,
                     "clean_text": clean_text,
+                    "normalized_text": "",
+                    "normalization_reason": "",
+                    "normalization_mode": "",
+                    "normalization_confidence": None,
+                    "alignment": str(row.get("alignment") or "").strip().lower(),
+                    "line_height": self._safe_float(row.get("lineHeight"), 0.0),
                     "layout_pos": layout_pos,
                     "blocks": blocks,
                     "table_cells": table_cells,
@@ -15597,6 +16783,10 @@ class LiteratureReaderComposeService:
                     "node_kind": node_kind,
                     "raw_text": raw_text,
                     "clean_text": clean_text,
+                    "normalized_text": "",
+                    "normalization_reason": "",
+                    "normalization_mode": "",
+                    "normalization_confidence": None,
                     "source_layout_ids": [layout_id],
                     "source_block_ids": canonical_block_ids,
                     "include_in_main_flow": include_in_main_flow,
@@ -15626,14 +16816,17 @@ class LiteratureReaderComposeService:
             )
 
         paper_id = int(payload.get("paper_id") or 0) or 0
-        page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
-        page_image_path = str(docmind_structure.get("page_image_path") or "").strip()
-        page_image_path = self._ensure_local_grounding_page_image(
+        docmind_page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        docmind_page_image_path = str(docmind_structure.get("page_image_path") or "").strip()
+        page_image_asset = self._resolve_grounding_page_image_asset(
             paper_id=paper_id,
             page=page,
-            page_image_url=page_image_url,
-            page_image_path=page_image_path,
+            pdf_path="",
+            docmind_page_image_url=docmind_page_image_url,
+            docmind_page_image_path=docmind_page_image_path,
         )
+        page_image_url = str(page_image_asset.get("url") or "").strip()
+        page_image_path = str(page_image_asset.get("path") or "").strip()
         page_image_width = int(docmind_structure.get("page_image_width") or 0) or None
         page_image_height = int(docmind_structure.get("page_image_height") or 0) or None
         if not page_image_width or not page_image_height:
@@ -15643,6 +16836,24 @@ class LiteratureReaderComposeService:
             )
             page_image_width = page_image_width or resolved_width
             page_image_height = page_image_height or resolved_height
+        if not page_image_width or not page_image_height:
+            inferred_width, inferred_height = self._grounding_page_dimensions(
+                grounding_layout_map={
+                    str(row.get("layout_id") or "").strip(): dict(row)
+                    for row in layout_atoms
+                    if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+                },
+                grounding_evidence_map={
+                    str(row.get("source_layout_id") or "").strip(): dict(row)
+                    for row in evidence_map
+                    if isinstance(row, Mapping) and str(row.get("source_layout_id") or "").strip()
+                },
+                page_image={},
+            )
+            if not page_image_width and inferred_width and inferred_width > 0:
+                page_image_width = int(inferred_width)
+            if not page_image_height and inferred_height and inferred_height > 0:
+                page_image_height = int(inferred_height)
         counts_by_kind: Dict[str, int] = {}
         for row in reading_nodes:
             kind = str(row.get("node_kind") or "").strip() or "unknown"
@@ -15659,7 +16870,9 @@ class LiteratureReaderComposeService:
                 "path": page_image_path,
                 "width": page_image_width,
                 "height": page_image_height,
-                "source": "docmind_page_image" if (page_image_url or page_image_path) else "",
+                "source": str(page_image_asset.get("source") or ""),
+                "origin_url": str(page_image_asset.get("origin_url") or ""),
+                "local_cached": bool(page_image_asset.get("local_cached")),
             },
             "meta": {
                 "source": "docmind_layout_unique_id_v1",
@@ -15830,7 +17043,12 @@ class LiteratureReaderComposeService:
             return None
         if not isinstance(row.payload_json, dict):
             return None
-        return dict(row.payload_json)
+        payload = dict(row.payload_json)
+        repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+        if repaired != payload:
+            row.payload_json = dict(repaired)
+            await db.commit()
+        return repaired
 
     async def get_latest_cached_payload_only(
         self,
@@ -15893,7 +17111,11 @@ class LiteratureReaderComposeService:
                 continue
             if self._should_rebuild_cached_payload(payload):
                 continue
-            return payload
+            repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+            if repaired != payload:
+                row.payload_json = dict(repaired)
+                await db.commit()
+            return repaired
         return None
 
     async def _read_compatible_payload_from_db(
@@ -15934,7 +17156,11 @@ class LiteratureReaderComposeService:
                 continue
             if self._should_rebuild_cached_payload(payload):
                 continue
-            return payload
+            repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+            if repaired != payload:
+                row.payload_json = dict(repaired)
+                await db.commit()
+            return repaired
         return None
 
     async def _read_review_seed_payload_from_cache(
@@ -15963,7 +17189,10 @@ class LiteratureReaderComposeService:
                 "[ReaderComposeService] review session cloned exact redis cache "
                 f"paper={paper.id} page={page}"
             )
-            cached_payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+            repaired_cached_payload = self._ensure_payload_contract(page=int(page), payload=dict(cached_payload))
+            if repaired_cached_payload != cached_payload:
+                await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+            cached_payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
             cached_payload = await self._apply_overlay_for_user(
                 db=db,
                 user_id=int(user_id),
