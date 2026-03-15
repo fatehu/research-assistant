@@ -40,8 +40,11 @@ The system should stay grounded in deterministic reader extraction, and use gene
 ## External Reference Points
 
 - [x] Align with mature generative UI patterns from Google/A2A/A2UI, Vercel AI SDK, and Anthropic Artifacts at the principle level.
+- [x] Maintain a local curated reference shelf under `docs/reference/generative-ui` and use it to constrain `/experience` and `/workbench` architecture decisions before adding new runtime or page-generation behavior.
 - [x] Use those references to reinforce three constraints in this repo:
   renderer executes structured plans, agent outputs stay schema-bound, and arbitrary frontend code generation is out of scope.
+- [x] Use the reference shelf in a disciplined order:
+  repo guidance first, then protocol/runtime comparison, then official framework/runtime references, then academic papers for architectural guardrails.
 - [x] Keep moving toward agent-decided page structure:
   section presence, section order, hero placement, region assignment, and layout variant should come from plan outputs instead of frontend heuristics.
 - [x] Keep tool choice autonomous:
