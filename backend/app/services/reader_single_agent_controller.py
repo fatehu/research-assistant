@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -308,19 +309,59 @@ async def parse_json_dict_from_model_text(raw_text: str) -> Dict[str, Any]:
     text = str(raw_text or "").strip()
     if not text:
         return {}
-    if text.startswith("```"):
-        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    try:
-        data = json.loads(text)
-        return dict(data) if isinstance(data, dict) else {}
-    except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return {}
+
+    def _try_parse(candidate: str) -> Dict[str, Any]:
         try:
-            data = json.loads(text[start : end + 1])
+            data = json.loads(candidate)
             return dict(data) if isinstance(data, dict) else {}
         except Exception:
             return {}
 
+    candidates: List[str] = [text]
+    fenced = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text, flags=re.IGNORECASE)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    if text.lower().startswith("json"):
+        trimmed = re.sub(r"^json\s*[:\n\r]*", "", text, flags=re.IGNORECASE).strip()
+        if trimmed:
+            candidates.append(trimmed)
+
+    for candidate in candidates:
+        parsed = _try_parse(candidate)
+        if parsed:
+            return parsed
+
+    start = text.find("{")
+    if start < 0:
+        return {}
+    in_string = False
+    escape = False
+    depth = 0
+    object_start = -1
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                object_start = idx
+            depth += 1
+            continue
+        if char == "}":
+            if depth <= 0:
+                continue
+            depth -= 1
+            if depth == 0 and object_start >= 0:
+                parsed = _try_parse(text[object_start : idx + 1])
+                if parsed:
+                    return parsed
+    return {}

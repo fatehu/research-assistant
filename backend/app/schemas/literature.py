@@ -1410,6 +1410,7 @@ class ExperienceSessionV2ArtifactDraftNode(BaseModel):
     ]
     text: str = ""
     display_text: str = ""
+    translation_zh: str = ""
     label: str = ""
     caption: str = ""
     term: str = ""
@@ -1468,6 +1469,19 @@ class ExperienceSessionV2ArtifactDraftNode(BaseModel):
             ).strip()
         if display_text and not str(payload.get("display_text") or "").strip():
             payload["display_text"] = display_text
+
+        translation_zh = str(payload.get("translation_zh") or "").strip()
+        if not translation_zh and node_kind == "original_excerpt":
+            translation_zh = str(
+                payload.get("translation")
+                or payload.get("translation_cn")
+                or payload.get("zh_translation")
+                or payload.get("reader_translation_zh")
+                or payload.get("chinese_translation")
+                or ""
+            ).strip()
+        if translation_zh and not str(payload.get("translation_zh") or "").strip():
+            payload["translation_zh"] = translation_zh
 
         definition = str(payload.get("definition") or "").strip()
         if not definition and node_kind == "term_note":
@@ -1826,6 +1840,9 @@ class ExperienceSessionV2NarrativeBrief(BaseModel):
     current_page_main_arc: Union[str, Dict[str, Any]] = ""
     continuity_resolutions: Union[str, List[Any], Dict[str, Any]] = Field(default_factory=list)
     required_media_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    opening_key_points: List[str] = Field(default_factory=list)
+    previous_page_bridge: Dict[str, Any] = Field(default_factory=dict)
+    next_page_bridge: Dict[str, Any] = Field(default_factory=dict)
     reader_attention_order: List[str] = Field(default_factory=list)
     must_surface_nodes: List[str] = Field(default_factory=list)
     suppressed_threads: List[str] = Field(default_factory=list)
@@ -1870,6 +1887,30 @@ class ExperienceSessionV2NarrativeBrief(BaseModel):
                 "media_plan",
                 "must_surface_media",
                 "visual_evidence",
+            ),
+            "opening_key_points": (
+                "opening_key_points",
+                "opening_points",
+                "opening_takeaways",
+                "page_opening_points",
+                "lead_points",
+                "lead_takeaways",
+                "opening_bullets",
+                "reader_opening_points",
+            ),
+            "previous_page_bridge": (
+                "previous_page_bridge",
+                "from_previous_page",
+                "previous_page_context",
+                "previous_bridge",
+                "bridge_from_previous_page",
+            ),
+            "next_page_bridge": (
+                "next_page_bridge",
+                "to_next_page",
+                "next_page_context",
+                "next_bridge",
+                "bridge_to_next_page",
             ),
             "content_strategy": (
                 "content_strategy",
@@ -1932,6 +1973,17 @@ class ExperienceSessionV2NarrativeBrief(BaseModel):
             if resolved not in (None, "", [], {}):
                 payload[canonical_key] = resolved
 
+        continuity_payload = payload.get("continuity_resolutions")
+        if isinstance(continuity_payload, Mapping):
+            if payload.get("previous_page_bridge") in (None, "", [], {}):
+                previous_payload = continuity_payload.get("from_previous_page") or continuity_payload.get("previous_page")
+                if previous_payload not in (None, "", [], {}):
+                    payload["previous_page_bridge"] = previous_payload
+            if payload.get("next_page_bridge") in (None, "", [], {}):
+                next_payload = continuity_payload.get("to_next_page") or continuity_payload.get("next_page")
+                if next_payload not in (None, "", [], {}):
+                    payload["next_page_bridge"] = next_payload
+
         raw_media_value = payload.get("required_media_refs")
         if isinstance(raw_media_value, Mapping):
             raw_media_refs = [dict(raw_media_value)]
@@ -1989,6 +2041,19 @@ class ExperienceSessionV2NarrativeBrief(BaseModel):
                 }
             )
         payload["required_media_refs"] = normalized_media_refs
+
+        opening_points = payload.get("opening_key_points")
+        if isinstance(opening_points, str):
+            payload["opening_key_points"] = [opening_points]
+        elif not isinstance(opening_points, Sequence) or isinstance(opening_points, (bytes, bytearray)):
+            payload["opening_key_points"] = []
+
+        for bridge_key in ("previous_page_bridge", "next_page_bridge"):
+            bridge_value = payload.get(bridge_key)
+            if isinstance(bridge_value, str):
+                payload[bridge_key] = {"bridge_text": bridge_value}
+            elif not isinstance(bridge_value, Mapping):
+                payload[bridge_key] = {}
         return payload
 
     @staticmethod
@@ -2019,6 +2084,7 @@ class ExperienceSessionV2NarrativeBrief(BaseModel):
             payload.setdefault("type", str(payload.get("type") or "media_ref").strip() or "media_ref")
             normalized_media_refs.append(payload)
         self.required_media_refs = normalized_media_refs
+        self.opening_key_points = [str(item).strip() for item in list(self.opening_key_points or []) if str(item).strip()][:6]
         if not self._has_strategy_value(self.content_strategy):
             raise ValueError("narrative brief requires content_strategy")
         if not self._has_strategy_value(self.presentation_strategy):

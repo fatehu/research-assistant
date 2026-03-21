@@ -184,7 +184,7 @@ _ARTIFACT_DRAFT_V2_SUPPORTED_NODE_KINDS = {
 }
 
 _ADJACENT_PAGE_STRUCTURED_PRIMARY_ATTEMPTS = 3
-_EXPERIENCE_V2_RUNTIME_VERSION = "artifactdraft_v5_zh"
+_EXPERIENCE_V2_RUNTIME_VERSION = "artifactdraft_v10_opening_bridges_prompt_only"
 _EXPERIENCE_V2_ARTIFACT_DRAFT_MAX_RETRIEVAL_ROUNDS = 2
 _EXPERIENCE_SESSION_V2_NARRATIVE_BRIEF_REQUIRED_FIELDS = {
     "focus_page",
@@ -3150,6 +3150,7 @@ def _build_page_artifact_v2_from_dossier(
         raise ValueError("page_artifact_v2 requires current-page spine anchors")
 
     signature = str(dossier_signature or "").strip() or _reading_dossier_v2_signature(dossier_payload)
+    authored_meta = _jsonable_dict(authored_payload.get("meta") or {})
     artifact_payload = {
         "version": "page_artifact_v2",
         "artifact_contract_id": "page_artifact_v2.contract.v1",
@@ -3205,6 +3206,16 @@ def _build_page_artifact_v2_from_dossier(
         "meta": {
             "dossier_contract": str(dossier_payload.get("dossier_contract") or "").strip(),
             "artifact_build_mode": "phase3_model_draft_promotion",
+            **(
+                {"reader_opening": _jsonable_dict(authored_meta.get("reader_opening") or {})}
+                if _jsonable_dict(authored_meta.get("reader_opening") or {})
+                else {}
+            ),
+            **(
+                {"reader_outro": _jsonable_dict(authored_meta.get("reader_outro") or {})}
+                if _jsonable_dict(authored_meta.get("reader_outro") or {})
+                else {}
+            ),
         },
     }
     return PageArtifactV2.model_validate(artifact_payload).model_dump(mode="json")
@@ -4084,6 +4095,10 @@ def _resolve_excerpt_against_current_page_grounding(
         str(override.get("display_text") or "").strip(),
         max_chars=max_chars,
     )
+    override_meta = _jsonable_dict(override.get("meta") or {})
+    override_translation_zh = str(override.get("translation_zh") or override_meta.get("translation_zh") or "").strip()
+    if override_translation_zh:
+        override_meta["translation_zh"] = override_translation_zh
 
     def _match(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
         for row in rows:
@@ -4121,7 +4136,7 @@ def _resolve_excerpt_against_current_page_grounding(
                 "layout_ids": matched_layout_ids,
                 "block_ids": matched_block_ids,
                 "node_id": str(row.get("node_id") or "").strip(),
-                "meta": _jsonable_dict(override.get("meta") or row.get("meta") or {}),
+                "meta": {**_jsonable_dict(row.get("meta") or {}), **override_meta} if override_meta else _jsonable_dict(row.get("meta") or {}),
             }
         return None
 
@@ -4210,6 +4225,10 @@ def _resolve_excerpt_against_current_page_grounding(
         str(override.get("display_text") or "").strip(),
         max_chars=max_chars,
     )
+    override_meta = _jsonable_dict(override.get("meta") or {})
+    override_translation_zh = str(override.get("translation_zh") or override_meta.get("translation_zh") or "").strip()
+    if override_translation_zh:
+        override_meta["translation_zh"] = override_translation_zh
 
     def _match(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
         for row in rows:
@@ -4247,7 +4266,7 @@ def _resolve_excerpt_against_current_page_grounding(
                 "layout_ids": matched_layout_ids,
                 "block_ids": matched_block_ids,
                 "node_id": str(row.get("node_id") or "").strip(),
-                "meta": _jsonable_dict(override.get("meta") or row.get("meta") or {}),
+                "meta": {**_jsonable_dict(row.get("meta") or {}), **override_meta} if override_meta else _jsonable_dict(row.get("meta") or {}),
             }
         return None
 
@@ -4371,6 +4390,9 @@ def _build_experience_session_v2_narrative_brief_prompt_payload(
         },
         "required_fields": sorted(_EXPERIENCE_SESSION_V2_NARRATIVE_BRIEF_REQUIRED_FIELDS),
         "recommended_fields": [
+            "opening_key_points",
+            "previous_page_bridge",
+            "next_page_bridge",
             "reader_attention_order",
             "must_surface_nodes",
             "suppressed_threads",
@@ -4400,6 +4422,34 @@ def _build_experience_session_v2_narrative_brief_prompt_payload(
                     "what must be repaired from the previous page",
                     "what will matter on the next page",
                     "which continuity details are important enough to shape drafting",
+                ],
+            },
+            "opening_key_points": {
+                "preferred_form": "ordered_list_of_2_to_4_short_reader_facing_points",
+                "focus": [
+                    "the key takeaways the reader should hold before entering detailed excerpts",
+                    "what makes the current page important right now",
+                    "what the figure/table/equation is proving on this page",
+                ],
+                "avoid": [
+                    "long quoted excerpts",
+                    "copying the first original paragraph verbatim",
+                ],
+            },
+            "previous_page_bridge": {
+                "preferred_form": "small_object",
+                "focus": [
+                    "previous page number when available",
+                    "1 to 2 short previous-page takeaways that matter now",
+                    "one bridge sentence explaining how the current page picks up from there",
+                ],
+            },
+            "next_page_bridge": {
+                "preferred_form": "small_object",
+                "focus": [
+                    "next page number when available",
+                    "1 to 2 short next-page takeaways that matter next",
+                    "one bridge sentence explaining how the current page flows forward",
                 ],
             },
             "content_strategy": {
@@ -4479,21 +4529,25 @@ def _experience_session_v2_narrative_brief_system_prompt() -> str:
         "6) Do not emit HTML, JavaScript, markdown, or arbitrary page copy.\n"
         "7) Output strict JSON only.\n"
         "8) Required top-level fields: focus_page, current_page_main_arc, continuity_resolutions, required_media_refs, content_strategy, presentation_strategy.\n"
-        "9) Optional but strongly preferred top-level fields: reader_attention_order, must_surface_nodes, suppressed_threads.\n"
+        "9) Optional but strongly preferred top-level fields: opening_key_points, previous_page_bridge, next_page_bridge, reader_attention_order, must_surface_nodes, suppressed_threads.\n"
         "10) Field-shape rules: current_page_main_arc, content_strategy, and presentation_strategy may be either a concise string or a structured JSON object; continuity_resolutions may be a string, list, or structured JSON object; required_media_refs must remain a JSON array.\n"
         "11) current_page_main_arc should sound like a reading-director instruction, not a paper summary and not an implementation note.\n"
         "12) continuity_resolutions should be concrete continuity decisions, usually 2 to 4 items, and should avoid 'this page completes the previous page' style phrasing unless absolutely necessary.\n"
-        "13) reader_attention_order should give the intended reading order in short imperative or descriptive steps.\n"
-        "14) must_surface_nodes should identify the page-local evidence anchors that the downstream draft must keep visible.\n"
-        "15) suppressed_threads should identify lower-value threads that should stay secondary or omitted.\n"
-        "16) required_media_refs should list the media/assets that must be surfaced to understand the current page, including multiple items when the page genuinely needs them.\n"
-        "17) content_strategy should express reading order, excerpt density, evidence emphasis, and whether term notes or external resources are needed.\n"
-        "18) presentation_strategy should express high-level reader-surface decisions only; avoid implementation detail, accessibility checklists, or renderer micro-specs unless they are essential to comprehension.\n"
-        "19) Prefer required_media_refs items as objects like {\"type\":\"figure\",\"label\":\"Fig 3\",\"description\":\"...\"}; short strings are acceptable only when they clearly name the required media.\n"
-        "20) Do not optimize for brevity alone. The strategy should be concise but sufficiently complete to drive a full reader page.\n"
-        "21) Write strategy text in Simplified Chinese by default so workbench inspection and downstream drafting stay aligned with a Chinese reader-facing experience.\n"
-        "22) Preserve canonical labels or abbreviations such as Figure 3, DOI, USMLE, and exact quoted source phrases when they are the clearest reference.\n"
-        "23) When a technical term matters, explain it in Chinese and include the original English term in parentheses on first mention when helpful.\n"
+        "13) opening_key_points should provide 2 to 4 short Chinese takeaways for the opening of the current page. Do not use a long original excerpt as the opening cue.\n"
+        "14) If a previous page exists and materially matters, provide previous_page_bridge as an object such as {\"page\":6,\"key_points\":[...],\"bridge_text\":\"...\"}. Keep it short and subordinate to the current page.\n"
+        "15) If a next page exists and materially matters, provide next_page_bridge as an object such as {\"page\":8,\"key_points\":[...],\"bridge_text\":\"...\"}. Use it to show what the current page is handing forward.\n"
+        "16) reader_attention_order should give the intended reading order in short imperative or descriptive steps.\n"
+        "17) must_surface_nodes should identify the page-local evidence anchors that the downstream draft must keep visible.\n"
+        "18) suppressed_threads should identify lower-value threads that should stay secondary or omitted.\n"
+        "19) required_media_refs should list the media/assets that must be surfaced to understand the current page, including multiple items when the page genuinely needs them.\n"
+        "20) content_strategy should express reading order, excerpt density, evidence emphasis, and whether term notes or external resources are needed.\n"
+        "21) presentation_strategy should express high-level reader-surface decisions only; avoid implementation detail, accessibility checklists, or renderer micro-specs unless they are essential to comprehension.\n"
+        "22) Prefer required_media_refs items as objects like {\"type\":\"figure\",\"label\":\"Fig 3\",\"description\":\"...\"}; short strings are acceptable only when they clearly name the required media.\n"
+        "23) Do not optimize for brevity alone. The strategy should be concise but sufficiently complete to drive a full reader page.\n"
+        "24) Write strategy text in Simplified Chinese by default so workbench inspection and downstream drafting stay aligned with a Chinese reader-facing experience.\n"
+        "25) Preserve canonical labels or abbreviations such as Figure 3, DOI, USMLE, and exact quoted source phrases when they are the clearest reference.\n"
+        "26) When a technical term matters, explain it in Chinese and include the original English term in parentheses on first mention when helpful.\n"
+        "27) Avoid awkward hyphenated Chinese compounds for technical relations. For example, render answer-explanation concordance as '答案与解释的一致性（answer-explanation concordance）' rather than '答案-解释一致性'.\n"
     )
 
 
@@ -4595,14 +4649,135 @@ def _compact_narrative_brief_lines(value: Any, *, max_items: int = 4, max_chars:
     return [text] if text else []
 
 
+def _compact_reader_bridge_payload(raw_bridge: Any) -> Dict[str, Any]:
+    payload = _jsonable_dict(raw_bridge or {})
+    if not payload and isinstance(raw_bridge, str):
+        text = _clean_reader_facing_excerpt_text(str(raw_bridge), max_chars=200)
+        return {"bridge_text": text} if text else {}
+    if not payload:
+        return {}
+
+    page = int(
+        payload.get("page")
+        or payload.get("page_number")
+        or payload.get("from_page")
+        or payload.get("to_page")
+        or 0
+    )
+    key_points = [
+        _clean_reader_facing_excerpt_text(str(item), max_chars=160)
+        for item in list(
+            payload.get("key_points")
+            or payload.get("takeaways")
+            or payload.get("page_points")
+            or payload.get("page_takeaways")
+            or []
+        )
+        if str(item).strip()
+    ][:3]
+    if not key_points:
+        leaf_strings = _narrative_brief_leaf_strings(
+            payload.get("specific_resolutions")
+            or payload.get("reading_focus")
+            or payload.get("main_points")
+            or payload,
+            max_items=4,
+        )
+        key_points = [
+            _clean_reader_facing_excerpt_text(item, max_chars=160)
+            for item in leaf_strings
+            if str(item).strip()
+        ][:3]
+
+    bridge_text = _compact_narrative_brief_text(
+        payload.get("bridge_text")
+        or payload.get("bridge_to_current_page")
+        or payload.get("bridge_from_current_page")
+        or payload.get("transition_text")
+        or payload.get("repair_note")
+        or payload.get("resolution_action")
+        or payload.get("reader_guidance")
+        or payload.get("summary"),
+        max_chars=220,
+    )
+    if not bridge_text:
+        candidate_lines = [
+            item
+            for item in _narrative_brief_leaf_strings(payload, max_items=8)
+            if item not in key_points
+        ]
+        if candidate_lines:
+            bridge_text = _clean_reader_facing_excerpt_text(candidate_lines[0], max_chars=220)
+
+    compact: Dict[str, Any] = {}
+    if page > 0:
+        compact["page"] = page
+    if key_points:
+        compact["key_points"] = key_points
+    if bridge_text:
+        compact["bridge_text"] = bridge_text
+    return compact
+
+
+def _build_reader_frame_from_narrative_brief(narrative_brief: Mapping[str, Any]) -> Dict[str, Any]:
+    brief = _jsonable_dict(narrative_brief or {})
+    continuity = _jsonable_dict(brief.get("continuity_resolutions") or {})
+    opening_key_points = [
+        _clean_reader_facing_excerpt_text(str(item), max_chars=180)
+        for item in list(brief.get("opening_key_points") or [])
+        if str(item).strip()
+    ][:4]
+    if not opening_key_points:
+        opening_key_points = [
+            _clean_reader_facing_excerpt_text(str(item), max_chars=180)
+            for item in list(brief.get("reader_attention_order") or [])
+            if str(item).strip()
+        ][:4]
+
+    previous_page_bridge = _compact_reader_bridge_payload(
+        brief.get("previous_page_bridge")
+        or continuity.get("from_previous_page")
+        or continuity.get("previous_page")
+    )
+    next_page_bridge = _compact_reader_bridge_payload(
+        brief.get("next_page_bridge")
+        or continuity.get("to_next_page")
+        or continuity.get("next_page")
+    )
+
+    reader_opening: Dict[str, Any] = {}
+    summary = _compact_narrative_brief_text(brief.get("current_page_main_arc"), max_chars=320)
+    if summary:
+        reader_opening["summary"] = summary
+    if opening_key_points:
+        reader_opening["key_points"] = opening_key_points
+    if previous_page_bridge:
+        reader_opening["previous_page_bridge"] = previous_page_bridge
+
+    reader_outro: Dict[str, Any] = {}
+    if next_page_bridge:
+        reader_outro["next_page_bridge"] = next_page_bridge
+
+    return {
+        "reader_opening": reader_opening,
+        "reader_outro": reader_outro,
+    }
+
+
 def _compact_narrative_brief_payload(narrative_brief: Mapping[str, Any]) -> Dict[str, Any]:
     brief = _jsonable_dict(narrative_brief or {})
+    reader_frame = _build_reader_frame_from_narrative_brief(brief)
+    reader_opening = _jsonable_dict(reader_frame.get("reader_opening") or {})
+    reader_outro = _jsonable_dict(reader_frame.get("reader_outro") or {})
     return {
         "focus_page": int(brief.get("focus_page") or 0),
         "current_page_main_arc": _compact_narrative_brief_text(brief.get("current_page_main_arc"), max_chars=520),
         "content_strategy": _compact_narrative_brief_text(brief.get("content_strategy"), max_chars=360),
         "presentation_strategy": _compact_narrative_brief_text(brief.get("presentation_strategy"), max_chars=360),
         "required_media_refs": list(brief.get("required_media_refs") or [])[:8],
+        "opening_key_points": list(reader_opening.get("key_points") or [])[:4],
+        "previous_page_bridge": _jsonable_dict(reader_opening.get("previous_page_bridge") or {}),
+        "next_page_bridge": _jsonable_dict(reader_outro.get("next_page_bridge") or {}),
         "reader_attention_order": [
             _clean_reader_facing_excerpt_text(str(item), max_chars=180)
             for item in list(brief.get("reader_attention_order") or [])
@@ -4681,16 +4856,30 @@ async def _generate_experience_session_v2_narrative_brief(
         user_intent=user_intent,
     )
     config = _experience_session_v2_reader_agent_config()
-    parsed = await _call_experience_session_v2_narrative_brief_model(
-        system_prompt=_experience_session_v2_narrative_brief_system_prompt(),
-        user_prompt_payload=prompt_payload,
-        provider=str(config.get("provider") or "").strip(),
-        api_key=str(config.get("api_key") or "").strip(),
-        base_url=str(config.get("base_url") or "").strip(),
-        model=str(config.get("model") or "").strip(),
-        timeout_seconds=float(config.get("timeout_seconds") or 0.0),
-        max_tokens=int(config.get("max_tokens") or 0),
-    )
+    system_prompt = _experience_session_v2_narrative_brief_system_prompt()
+
+    async def _call_with_prompt(active_system_prompt: str) -> Dict[str, Any]:
+        return await _call_experience_session_v2_narrative_brief_model(
+            system_prompt=active_system_prompt,
+            user_prompt_payload=prompt_payload,
+            provider=str(config.get("provider") or "").strip(),
+            api_key=str(config.get("api_key") or "").strip(),
+            base_url=str(config.get("base_url") or "").strip(),
+            model=str(config.get("model") or "").strip(),
+            timeout_seconds=float(config.get("timeout_seconds") or 0.0),
+            max_tokens=int(config.get("max_tokens") or 0),
+        )
+
+    try:
+        parsed = await _call_with_prompt(system_prompt)
+    except ValueError as exc:
+        if "invalid JSON output" not in str(exc):
+            raise
+        retry_prompt = (
+            system_prompt
+            + "24) Final reminder: return exactly one JSON object with no code fences, no commentary, and no prose outside the JSON object.\n"
+        )
+        parsed = await _call_with_prompt(retry_prompt)
     brief_payload = _validate_experience_session_v2_narrative_brief_payload(parsed)
     brief_meta = _jsonable_dict(brief_payload.get("meta") or {})
     brief_meta.update(
@@ -5022,7 +5211,7 @@ def _experience_session_v2_artifact_draft_system_prompt() -> str:
         "23) Use these exact node fields:\n"
         '    - heading: {"node_kind":"heading","text":"..."}\n'
         '    - paragraph: {"node_kind":"paragraph","text":"..."}\n'
-        '    - original_excerpt: {"node_kind":"original_excerpt","display_text":"...","source_layout_ids":["..."],"source_block_ids":["..."]}\n'
+        '    - original_excerpt: {"node_kind":"original_excerpt","display_text":"...","translation_zh":"...","source_layout_ids":["..."],"source_block_ids":["..."]}\n'
         '    - figure_slot/table_slot/equation_slot: {"node_kind":"figure_slot","label":"...","caption":"...","source_layout_ids":["..."]}\n'
         '    - aside: {"node_kind":"aside","text":"..."}\n'
         '    - term_note: {"node_kind":"term_note","term":"...","definition":"..."}\n'
@@ -5036,9 +5225,12 @@ def _experience_session_v2_artifact_draft_system_prompt() -> str:
         "28) Do not replace required field names with aliases such as content, body, source_layout_id, resource_refs, resources, or tool.\n"
         "29) All reader-facing authored text must be written in Simplified Chinese, including heading.text, paragraph.text, aside.text, term_note.definition, and authored external_resource labels.\n"
         "30) Keep canonical labels such as Figure 3, DOI, USMLE, URLs, and source titles in their original form when they are the clearest anchor.\n"
-        "31) original_excerpt.display_text should usually remain in the source language excerpt with only light OCR/spacing fixes; do not translate excerpts into Chinese.\n"
-        "32) For term_note, explain the concept in Chinese and include the original English term in parentheses on first mention when helpful.\n"
-        "33) template_hint, layout_recipe, and presentation_mode should normally be concise strings; if you need structured planning detail, put it under meta rather than replacing those fields with objects.\n"
+        "31) original_excerpt.display_text should remain the source-language excerpt with only light OCR/spacing fixes.\n"
+        "32) For every original_excerpt node, also provide translation_zh as a faithful Simplified Chinese translation shown to the reader beneath the excerpt.\n"
+        "33) translation_zh should preserve the meaning of the excerpt and may smooth OCR/spacing issues, but it must not add claims that are absent from the source excerpt.\n"
+        "34) For term_note, explain the concept in Chinese and include the original English term in parentheses on first mention when helpful.\n"
+        "35) template_hint, layout_recipe, and presentation_mode should normally be concise strings; if you need structured planning detail, put it under meta rather than replacing those fields with objects.\n"
+        "36) Prefer natural Chinese technical phrasing. Avoid awkward hyphenated compounds such as '答案-解释一致性'; prefer forms like '答案与解释的一致性' and keep the English term in parentheses on first mention when helpful.\n"
     )
 
 
@@ -5394,6 +5586,7 @@ def _promote_experience_v2_artifact_draft_to_authored_plan(
                 "node_kind": node_kind,
                 "text": str(node.get("text") or "").strip(),
                 "display_text": str(node.get("display_text") or "").strip(),
+                "translation_zh": str(node.get("translation_zh") or "").strip(),
                 "label": str(node.get("label") or "").strip(),
                 "caption": str(node.get("caption") or "").strip(),
                 "term": str(node.get("term") or "").strip(),
@@ -5427,12 +5620,16 @@ def _promote_experience_v2_artifact_draft_to_authored_plan(
             )
             continue
         if node_kind == "original_excerpt":
+            excerpt_meta = {"from_draft_node_kind": "original_excerpt", **_jsonable_dict(node.get("meta") or {})}
+            translation_zh = str(node.get("translation_zh") or "").strip()
+            if translation_zh:
+                excerpt_meta["translation_zh"] = translation_zh
             excerpt_overrides.append(
                 {
                     "display_text": str(node.get("display_text") or "").strip(),
                     "source_layout_ids": list(node.get("source_layout_ids") or []),
                     "source_block_ids": list(node.get("source_block_ids") or []),
-                    "meta": {"from_draft_node_kind": "original_excerpt", **_jsonable_dict(node.get("meta") or {})},
+                    "meta": excerpt_meta,
                 }
             )
             continue
@@ -5895,6 +6092,9 @@ def _build_page_artifact_v2_authored_plan_from_session(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     session = ExperienceSessionV2.model_validate(_jsonable_dict(session_payload)).model_dump(mode="json")
     del paper, compose_payload, reading_dossier
+    latest_narrative_brief = _find_latest_experience_session_v2_narrative_brief(session)
+    if not latest_narrative_brief:
+        raise ValueError("artifact draft generation failed: narrative brief layer missing in session execution")
     resolved_artifact_draft = (
         ExperienceSessionV2ArtifactDraft.model_validate(_jsonable_dict(artifact_draft)).model_dump(mode="json")
         if isinstance(artifact_draft, Mapping)
@@ -5913,6 +6113,14 @@ def _build_page_artifact_v2_authored_plan_from_session(
         artifact_draft=resolved_artifact_draft,
         resource_bundle=resolved_resource_bundle,
     )
+    reader_frame = _build_reader_frame_from_narrative_brief(latest_narrative_brief)
+    authored_meta = _jsonable_dict(authored_plan.get("meta") or {})
+    if _jsonable_dict(reader_frame.get("reader_opening") or {}):
+        authored_meta["reader_opening"] = _jsonable_dict(reader_frame.get("reader_opening") or {})
+    if _jsonable_dict(reader_frame.get("reader_outro") or {}):
+        authored_meta["reader_outro"] = _jsonable_dict(reader_frame.get("reader_outro") or {})
+    if authored_meta:
+        authored_plan["meta"] = authored_meta
     return resolved_resource_bundle, authored_plan
 
 

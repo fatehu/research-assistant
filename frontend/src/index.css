@@ -27,9 +27,7 @@ body.workbench-v2-route-active {
 }
 
 body.experience-v2-route-active {
-  background:
-    radial-gradient(circle at top left, rgba(255, 246, 226, 0.94) 0%, rgba(255, 246, 226, 0) 34%),
-    linear-gradient(180deg, #f7f2e9 0%, #f1ebdf 48%, #ece6dc 100%);
+  background: linear-gradient(180deg, #f7f5ef 0%, #f3f0e8 100%);
   color: #18263e;
 }
 

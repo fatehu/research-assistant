@@ -4387,6 +4387,20 @@ def _build_sample_experience_session_v2_narrative_brief(**overrides) -> dict:
             {"kind": "page_image", "page": 7, "ref": "https://example.com/p7.png"},
             {"kind": "figure", "page": 7, "layout_id": "layout:7:fig1"},
         ],
+        "opening_key_points": [
+            "本页先用 Fig 3 抓住答案-解释一致性与洞察密度这两个主指标。",
+            "阅读时先看图里的总体比较，再回到正文解释 DOI 的意义。",
+        ],
+        "previous_page_bridge": {
+            "page": 6,
+            "key_points": ["上一页先把准确率和判定框架铺好。"],
+            "bridge_text": "本页沿着这个结果框架，进一步问回答是否真的具有教学价值。",
+        },
+        "next_page_bridge": {
+            "page": 8,
+            "key_points": ["下一页会把 DOI 继续带入 discussion。"],
+            "bridge_text": "读完本页的图证之后，下一页会把这些结果转成讨论层的解释。",
+        },
         "content_strategy": "current_page_spine_with_inline_enrichment",
         "presentation_strategy": "renderer_bound_guided_reading",
         "meta": {
@@ -4436,6 +4450,20 @@ def _build_sample_rich_experience_session_v2_narrative_brief(**overrides) -> dic
             {"kind": "page_image", "page": 8, "ref": "https://example.com/p8.png"},
             {"kind": "figure", "page": 7, "layout_id": "layout:7:fig3d"},
         ],
+        "opening_key_points": [
+            "这一页把结果页里的 DOI 与 discussion 的解释任务接起来。",
+            "读者要先抓住上一页 Fig 3D 的 DOI 线索，再看 discussion 怎样接手。",
+        ],
+        "previous_page_bridge": {
+            "page": 7,
+            "key_points": ["上一页用 Fig 3 建立了 DOI 的比较结果。"],
+            "bridge_text": "本页不再重做结果，而是把 DOI 结果转成讨论层的解释。",
+        },
+        "next_page_bridge": {
+            "page": 9,
+            "key_points": ["下一页会继续展开讨论句子的后半段。"],
+            "bridge_text": "当前页页尾的开放句会在下一页完成，所以这里要保留向前延伸的感觉。",
+        },
         "content_strategy": {
             "primary_focus": "Use the discussion header to pivot from results into interpretation.",
             "reading_order": [
@@ -5377,6 +5405,41 @@ async def test_experience_session_v2_bootstrap_should_generate_model_backed_stru
     assert brief["content_strategy"] == "current_page_spine_with_inline_enrichment"
 
 
+@pytest.mark.asyncio
+async def test_parse_json_dict_from_model_text_should_extract_fenced_json_object():
+    parsed = await literature_api.parse_json_dict_from_model_text(
+        'Here is the JSON you requested:\\n```json\\n{"focus_page":7,"current_page_main_arc":"先看图。"}\\n```\\nDone.'
+    )
+
+    assert parsed["focus_page"] == 7
+    assert parsed["current_page_main_arc"] == "先看图。"
+
+
+@pytest.mark.asyncio
+async def test_experience_session_v2_bootstrap_should_retry_once_for_invalid_json_output(monkeypatch):
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    calls: list[str] = []
+
+    async def _fake_call(**kwargs):
+        calls.append(str(kwargs["system_prompt"]))
+        if len(calls) == 1:
+            raise ValueError("narrative brief generation failed: invalid JSON output")
+        return _build_sample_experience_session_v2_narrative_brief()
+
+    monkeypatch.setattr(literature_api, "_call_experience_session_v2_narrative_brief_model", _fake_call)
+
+    brief = await literature_api._generate_experience_session_v2_narrative_brief(
+        reading_dossier=dossier,
+        focus_page=7,
+        reader_profile="curious_generalist",
+        user_intent="follow the figure first",
+    )
+
+    assert len(calls) == 2
+    assert "Final reminder: return exactly one JSON object" in calls[1]
+    assert brief["focus_page"] == 7
+
+
 def test_experience_session_v2_narrative_brief_schema_should_accept_richer_strategy_objects():
     brief = _build_sample_rich_experience_session_v2_narrative_brief()
 
@@ -5629,6 +5692,36 @@ def test_experience_session_v2_narrative_brief_should_preserve_optional_planning
     assert brief["reader_attention_order"][0].startswith("Read the Fig 3")
     assert brief["must_surface_nodes"] == ["layout:7:fig1", "blk-7-1"]
     assert brief["suppressed_threads"] == ["Do not over-explain adjudication criteria on this page."]
+    assert brief["opening_key_points"] == []
+
+
+def test_experience_session_v2_narrative_brief_should_preserve_opening_and_adjacent_bridges():
+    brief = literature_api.ExperienceSessionV2NarrativeBrief.model_validate(
+        {
+            "focus_page": 7,
+            "current_page_main_arc": "本页用 Fig 3 把 concordance 和 DOI 放到同一阅读面上。",
+            "continuity_resolutions": {
+                "from_previous_page": {
+                    "page_number": 6,
+                    "specific_resolutions": ["上一页先把准确率和判定框架铺好。"],
+                    "bridge_to_current_page": "本页顺着上一页的问题，继续问回答是否真的具有教学价值。",
+                },
+                "to_next_page": {
+                    "page_number": 8,
+                    "specific_resolutions": ["下一页会把 DOI 带进 discussion。"],
+                    "bridge_from_current_page": "本页先把 Fig 3 的结果讲清，下一页再把这些结果转成讨论层解释。",
+                },
+            },
+            "required_media_refs": [{"kind": "figure", "page": 7, "layout_id": "layout:7:fig3"}],
+            "opening_points": ["先看 Fig 3 的四个面板。", "再回到正文理解 DOI 为什么重要。"],
+            "content_strategy": "figure_first_then_selective_excerpting",
+            "presentation_strategy": "keep_figure_and_caption_coupled",
+        }
+    ).model_dump(mode="json")
+
+    assert brief["opening_key_points"][0].startswith("先看 Fig 3")
+    assert brief["previous_page_bridge"]["page_number"] == 6
+    assert brief["next_page_bridge"]["page_number"] == 8
 
 
 def test_experience_session_v2_narrative_brief_should_normalize_nested_strategy_aliases():
@@ -5639,6 +5732,17 @@ def test_experience_session_v2_narrative_brief_should_normalize_nested_strategy_
                 "main_arc": "先用 Figure 3 建立当前页主问题，再把 DOI 作为第二主线。",
                 "continuity_notes": ["只保留来自上一页的方法学过渡，不要让它压住本页主发现。"],
                 "required_media": {"kind": "figure", "page": 7, "layout_id": "layout:7:fig3"},
+                "opening_takeaways": ["先抓 Fig 3。", "再回正文读 DOI。"],
+                "from_previous_page": {
+                    "page": 6,
+                    "key_points": ["上一页先铺了准确率结果。"],
+                    "bridge_text": "本页接着问这些正确答案是否有教学价值。",
+                },
+                "to_next_page": {
+                    "page": 8,
+                    "key_points": ["下一页会把 DOI 带入 discussion。"],
+                    "bridge_text": "本页先把结果看清，下一页再解释它意味着什么。",
+                },
                 "content_plan": {"sequence": ["figure_first", "short_excerpt_then_explain"]},
                 "presentation_plan": {"layout": "mixed_layout", "density": "moderate"},
                 "reader_steps": ["先看 Fig 3 总体比较。", "再看 DOI 结果。"],
@@ -5652,6 +5756,9 @@ def test_experience_session_v2_narrative_brief_should_normalize_nested_strategy_
     assert brief["content_strategy"]["sequence"][0] == "figure_first"
     assert brief["presentation_strategy"]["layout"] == "mixed_layout"
     assert brief["reader_attention_order"][0].startswith("先看 Fig 3")
+    assert brief["opening_key_points"][0] == "先抓 Fig 3。"
+    assert brief["previous_page_bridge"]["page"] == 6
+    assert brief["next_page_bridge"]["page"] == 8
 
 
 def test_experience_session_v2_artifact_draft_should_require_original_excerpt_display_text_and_source_ids():
@@ -5707,6 +5814,7 @@ def test_experience_session_v2_artifact_draft_should_normalize_common_model_alia
                     "node_id": "n2",
                     "node_kind": "original_excerpt",
                     "excerpt": "We first examined the frequency of insight.",
+                    "translation": "我们首先考察了洞见出现的频率。",
                     "source_layout_id": "layout:7:1",
                     "source_block_id": "blk-7-1",
                 },
@@ -5749,6 +5857,7 @@ def test_experience_session_v2_artifact_draft_should_normalize_common_model_alia
     assert draft["presentation_mode"] == "mixed_layout"
     assert draft["nodes"][0]["text"] == "先看图中的核心比较。"
     assert draft["nodes"][1]["display_text"] == "We first examined the frequency of insight."
+    assert draft["nodes"][1]["translation_zh"] == "我们首先考察了洞见出现的频率。"
     assert draft["nodes"][1]["source_layout_ids"] == ["layout:7:1"]
     assert draft["nodes"][1]["source_block_ids"] == ["blk-7-1"]
     assert draft["nodes"][2]["text"].startswith("这一段把图里的比较关系")
@@ -5867,7 +5976,12 @@ def test_experience_session_v2_prompts_should_require_chinese_guided_copy():
 
     assert "Simplified Chinese" in brief_prompt
     assert "Simplified Chinese" in draft_prompt
-    assert "do not translate excerpts into Chinese" in draft_prompt
+    assert "opening_key_points" in brief_prompt
+    assert "previous_page_bridge" in brief_prompt
+    assert "next_page_bridge" in brief_prompt
+    assert '"translation_zh":"..."' in draft_prompt
+    assert "do not translate excerpts into Chinese" not in draft_prompt
+    assert "provide translation_zh as a faithful Simplified Chinese translation" in draft_prompt
 
 
 def test_page_artifact_v2_compact_source_context_should_split_long_current_page_excerpt_candidates():
@@ -6436,6 +6550,62 @@ def test_page_artifact_v2_authored_plan_should_extract_structured_main_arc_from_
     assert resource_bundle["meta"]["retrieval_rounds"] == 1
 
 
+def test_page_artifact_v2_authored_plan_should_preserve_reader_opening_and_adjacent_bridges():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    session = literature_api._build_experience_session_v2(
+        cache_key="lit:experience_session:v2:test",
+        reading_dossier=dossier,
+        focus_page=7,
+        reader_profile="curious_generalist",
+        max_iterations=4,
+        max_tool_rounds=6,
+        narrative_brief=_build_sample_experience_session_v2_narrative_brief(),
+    )
+    session["meta"]["latest_artifact_draft"] = _build_sample_experience_session_v2_artifact_draft(
+        nodes=[
+            {
+                "node_kind": "heading",
+                "text": "先抓 Fig 3 的比较对象。",
+            },
+            {
+                "node_kind": "paragraph",
+                "text": "本页先建立 concordance 与 DOI 这两个主指标的阅读顺序。",
+            },
+            {
+                "node_kind": "original_excerpt",
+                "display_text": "We first examined the frequency of insight.",
+                "source_layout_ids": ["layout:7:1"],
+                "source_block_ids": ["blk-7-1"],
+            },
+            {
+                "node_kind": "paragraph",
+                "text": "接着用短 excerpt 把正文和图证绑在一起。",
+            },
+        ],
+    )
+    session["meta"]["latest_resource_bundle"] = literature_api._build_reader_v2_seed_resource_bundle(
+        paper=SimpleNamespace(
+            url="https://example.com/paper",
+            doi="10.1000/demo",
+            arxiv_url="https://arxiv.org/abs/1234.5678",
+            pdf_url="https://example.com/paper.pdf",
+        ),
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        narrative_brief=session["meta"]["latest_narrative_brief"],
+    )
+
+    _resource_bundle, authored_plan = literature_api._build_page_artifact_v2_authored_plan_from_session(
+        paper=SimpleNamespace(url="", doi="", arxiv_url="", pdf_url=""),
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        reading_dossier=dossier,
+        session_payload=session,
+    )
+
+    assert authored_plan["meta"]["reader_opening"]["key_points"][0].startswith("本页先用 Fig 3")
+    assert authored_plan["meta"]["reader_opening"]["previous_page_bridge"]["page"] == 6
+    assert authored_plan["meta"]["reader_outro"]["next_page_bridge"]["page"] == 8
+
+
 def test_page_artifact_v2_should_follow_promoted_draft_node_sequence_order():
     dossier = _build_sample_reading_dossier_v2_for_session()
     session = literature_api._build_experience_session_v2(
@@ -6511,6 +6681,126 @@ def test_page_artifact_v2_should_follow_promoted_draft_node_sequence_order():
     assert segment_kinds == ["heading", "original_excerpt", "paragraph", "figure_slot"]
     assert artifact["reading_blocks"][0]["meta"]["group_id"] == "g-intro"
     assert artifact["reading_blocks"][1]["meta"]["placement"] == "inline"
+
+
+def test_page_artifact_v2_should_expose_reader_opening_and_outro_meta():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    authored_plan = literature_api.PageArtifactV2AuthoredPlanInput.model_validate(
+        {
+            "template_id": "guided_mixed_media_v1",
+            "layout_recipe": "current_page_spine_interleave_v1",
+            "presentation_mode": "mixed_layout",
+            "widget_family": "reader_v2_surface",
+            "motion_preset": "calm_progressive",
+            "interaction_policy": "reader_first_guided",
+            "authored_text_blocks": [
+                {
+                    "segment_kind": "heading",
+                    "text": "先抓 Fig 3 的总体比较。",
+                    "meta": {"group_id": "g-1"},
+                },
+                {
+                    "segment_kind": "paragraph",
+                    "text": "这页要先把 concordance 和 DOI 的两条指标线并排看清。",
+                    "meta": {"group_id": "g-1"},
+                },
+            ],
+            "excerpt_overrides": [
+                {
+                    "display_text": "We first examined the frequency of insight.",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                }
+            ],
+            "meta": {
+                "reader_opening": {
+                    "summary": "本页先抓 Fig 3，再回到正文解释 DOI。",
+                    "key_points": ["先看图里的总体比较。", "再读 DOI 对教育价值意味着什么。"],
+                    "previous_page_bridge": {
+                        "page": 6,
+                        "key_points": ["上一页先铺了准确率和判定框架。"],
+                        "bridge_text": "本页沿着上一页的问题，继续问回答是否真的具有教学价值。",
+                    },
+                },
+                "reader_outro": {
+                    "next_page_bridge": {
+                        "page": 8,
+                        "key_points": ["下一页会把 DOI 带进 discussion。"],
+                        "bridge_text": "读完本页图证后，下一页会把这些结果转成讨论层解释。",
+                    }
+                },
+            },
+        }
+    ).model_dump(mode="json")
+
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=dossier,
+        authored_plan=authored_plan,
+    )
+
+    assert artifact["meta"]["reader_opening"]["summary"].startswith("本页先抓 Fig 3")
+    assert artifact["meta"]["reader_opening"]["previous_page_bridge"]["page"] == 6
+    assert artifact["meta"]["reader_outro"]["next_page_bridge"]["page"] == 8
+
+
+def test_page_artifact_v2_should_preserve_excerpt_translation_from_draft():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    session = literature_api._build_experience_session_v2(
+        cache_key="lit:experience_session:v2:test",
+        reading_dossier=dossier,
+        focus_page=7,
+        reader_profile="curious_generalist",
+        max_iterations=4,
+        max_tool_rounds=6,
+        narrative_brief=_build_sample_experience_session_v2_narrative_brief(),
+    )
+    session["meta"]["latest_artifact_draft"] = _build_sample_experience_session_v2_artifact_draft(
+        nodes=[
+            {
+                "node_kind": "original_excerpt",
+                "display_text": "We first examined the frequency of insight.",
+                "translation_zh": "我们首先考察了洞见出现的频率。",
+                "source_layout_ids": ["layout:7:1"],
+                "source_block_ids": ["blk-7-1"],
+            },
+            {
+                "node_kind": "paragraph",
+                "text": "先让读者看到原文，再用中文讲清它在这一页里的功能。",
+            },
+        ],
+    )
+    session["meta"]["latest_resource_bundle"] = literature_api._build_reader_v2_seed_resource_bundle(
+        paper=SimpleNamespace(
+            url="https://example.com/paper",
+            doi="10.1000/demo",
+            arxiv_url="https://arxiv.org/abs/1234.5678",
+            pdf_url="https://example.com/paper.pdf",
+        ),
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        narrative_brief=session["meta"]["latest_narrative_brief"],
+    )
+    paper = SimpleNamespace(
+        url="https://example.com/paper",
+        doi="10.1000/demo",
+        arxiv_url="https://arxiv.org/abs/1234.5678",
+        pdf_url="https://example.com/paper.pdf",
+    )
+
+    _resource_bundle, authored_plan = literature_api._build_page_artifact_v2_authored_plan_from_session(
+        paper=paper,
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        reading_dossier=dossier,
+        session_payload=session,
+    )
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=dossier,
+        authored_plan=authored_plan,
+    )
+
+    excerpt_block = next(
+        block for block in artifact["reading_blocks"] if block["segment_kind"] == "original_excerpt"
+    )
+    assert excerpt_block["meta"]["translation_zh"] == "我们首先考察了洞见出现的频率。"
 
 
 def test_page_artifact_v2_should_resolve_multiple_excerpt_subranges_from_same_grounding_row():
