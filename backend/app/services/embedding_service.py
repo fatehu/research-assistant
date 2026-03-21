@@ -86,6 +86,146 @@ class LocalEmbeddingModel:
         self._dimension: Optional[int] = None
         self._device: Optional[str] = None
         self._loaded = False
+        self._runtime_device_override: Optional[str] = None
+
+    @staticmethod
+    def _instantiate_sentence_transformer(sentence_transformer_cls, model_name: str, init_kwargs: Dict[str, object]):
+        """Instantiate SentenceTransformer while tolerating older constructor signatures."""
+        attempts = [dict(init_kwargs)]
+
+        while attempts:
+            current_kwargs = attempts.pop(0)
+            try:
+                return sentence_transformer_cls(model_name, **current_kwargs)
+            except TypeError:
+                compatibility_kwargs = dict(current_kwargs)
+                removed = False
+                for key in ("model_kwargs", "local_files_only", "backend"):
+                    if key in compatibility_kwargs:
+                        compatibility_kwargs.pop(key, None)
+                        removed = True
+                if removed:
+                    attempts.insert(0, compatibility_kwargs)
+                    continue
+                raise
+
+        raise RuntimeError("SentenceTransformer 初始化失败：没有可用的兼容构造参数")
+
+    def _build_sentence_transformer_load_profiles(
+        self,
+        *,
+        cache_dir: Optional[str],
+        device: str,
+    ) -> List[Tuple[str, Dict[str, object]]]:
+        base_kwargs: Dict[str, object] = {
+            "device": device,
+            "trust_remote_code": True,
+        }
+        if cache_dir:
+            base_kwargs["cache_folder"] = cache_dir
+
+        profiles: List[Tuple[str, Dict[str, object]]] = []
+        prefer_safetensors = bool(getattr(settings, "local_embedding_prefer_safetensors", True))
+        local_files_only = bool(getattr(settings, "local_embedding_local_files_only", False))
+        allow_legacy_fallback = bool(getattr(settings, "local_embedding_allow_legacy_pickle_fallback", True))
+
+        if prefer_safetensors:
+            if local_files_only or cache_dir:
+                profiles.append(
+                    (
+                        "safetensors_local_only",
+                        {
+                            **base_kwargs,
+                            "model_kwargs": {"use_safetensors": True},
+                            "local_files_only": True,
+                        },
+                    )
+                )
+            if not local_files_only:
+                profiles.append(
+                    (
+                        "safetensors_remote_allowed",
+                        {
+                            **base_kwargs,
+                            "model_kwargs": {"use_safetensors": True},
+                        },
+                    )
+                )
+
+        if allow_legacy_fallback:
+            legacy_kwargs = dict(base_kwargs)
+            if local_files_only:
+                legacy_kwargs["local_files_only"] = True
+            profiles.append(("legacy_default", legacy_kwargs))
+
+        if not profiles:
+            profiles.append(("default", dict(base_kwargs)))
+        return profiles
+
+    @staticmethod
+    def _is_runtime_device_error(exc: Exception) -> bool:
+        message = str(exc or "").lower()
+        return any(
+            needle in message
+            for needle in (
+                "cuda",
+                "cudnn",
+                "cublas",
+                "out of memory",
+                "mps",
+                "hip",
+                "rocm",
+                "nvidia",
+                "device-side",
+                "driver",
+            )
+        )
+
+    def _reset_loaded_model(self) -> None:
+        self._model = None
+        self._device = None
+        self._loaded = False
+
+    def _encode_with_runtime_fallback(
+        self,
+        texts: List[str],
+        *,
+        is_query: bool,
+        show_progress: bool,
+    ) -> np.ndarray:
+        try:
+            return self._model.encode(
+                texts,
+                batch_size=settings.local_embedding_batch_size,
+                show_progress_bar=show_progress,
+                normalize_embeddings=settings.local_embedding_normalize,
+                convert_to_numpy=True,
+            )
+        except Exception as exc:
+            allow_runtime_cpu_fallback = bool(
+                getattr(settings, "local_embedding_allow_runtime_cpu_fallback", True)
+            )
+            current_device = str(self._device or "").lower()
+            if (
+                allow_runtime_cpu_fallback
+                and current_device not in {"", "cpu"}
+                and self._is_runtime_device_error(exc)
+            ):
+                logger.warning(
+                    f"本地嵌入推理失败，尝试降级到 CPU 重试: model={self._model_name}, "
+                    f"device={current_device}, error={exc}"
+                )
+                self._runtime_device_override = "cpu"
+                self._reset_loaded_model()
+                self._load_model()
+                return self._model.encode(
+                    texts,
+                    batch_size=settings.local_embedding_batch_size,
+                    show_progress_bar=show_progress,
+                    normalize_embeddings=settings.local_embedding_normalize,
+                    convert_to_numpy=True,
+                )
+            raise
 
     def _load_model(self):
         """懒加载模型"""
@@ -100,7 +240,9 @@ class LocalEmbeddingModel:
             cache_dir = settings.local_embedding_cache_dir or None
 
             # 设备选择（显式 cuda/mps 也要做可用性校验，避免容器内无驱动直接失败）
-            requested_device = str(settings.local_embedding_device or "auto").strip().lower()
+            requested_device = str(
+                self._runtime_device_override or settings.local_embedding_device or "auto"
+            ).strip().lower()
             device = requested_device
             if device == "auto":
                 if torch.cuda.is_available():
@@ -132,13 +274,30 @@ class LocalEmbeddingModel:
                 logger.info(f"Embedding 设备已从 {requested_device} 回退到 {device}")
 
             logger.info(f"加载本地嵌入模型: {model_name}, device={device}")
-
-            self._model = SentenceTransformer(
-                model_name,
-                cache_folder=cache_dir,
+            load_profiles = self._build_sentence_transformer_load_profiles(
+                cache_dir=cache_dir,
                 device=device,
-                trust_remote_code=True,
             )
+            last_error: Optional[Exception] = None
+            for profile_name, init_kwargs in load_profiles:
+                try:
+                    self._model = self._instantiate_sentence_transformer(
+                        SentenceTransformer,
+                        model_name,
+                        init_kwargs,
+                    )
+                    logger.info(
+                        f"本地嵌入模型加载成功: profile={profile_name}, model={model_name}, device={device}"
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        f"本地嵌入模型加载失败，尝试下一配置: profile={profile_name}, model={model_name}, error={exc}"
+                    )
+
+            if self._model is None:
+                raise last_error or RuntimeError(f"加载本地嵌入模型失败: {model_name}")
             self._device = device
 
             # 确定输出维度 (优先使用实例级 target_dimension，其次全局 settings)
@@ -153,6 +312,10 @@ class LocalEmbeddingModel:
                 f"dimension={self._dimension}, device={device}"
             )
             self._loaded = True
+            if device == "cpu":
+                self._runtime_device_override = "cpu"
+            else:
+                self._runtime_device_override = None
 
         except ImportError:
             raise RuntimeError(
@@ -207,12 +370,10 @@ class LocalEmbeddingModel:
         if is_query:
             texts = [self._add_query_prefix(t) for t in texts]
 
-        embeddings = self._model.encode(
+        embeddings = self._encode_with_runtime_fallback(
             texts,
-            batch_size=settings.local_embedding_batch_size,
-            show_progress_bar=show_progress,
-            normalize_embeddings=settings.local_embedding_normalize,
-            convert_to_numpy=True,
+            is_query=is_query,
+            show_progress=show_progress,
         )
 
         # Matryoshka 维度截断

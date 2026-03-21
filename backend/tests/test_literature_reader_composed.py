@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from io import BytesIO
 
 import pytest
+from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -3670,6 +3671,11 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
     service = LiteratureReaderComposeService()
     captured: dict = {}
 
+    async def _fake_get_latest_cached_payload_only(**kwargs):
+        captured["theme_mode"] = kwargs.get("theme_mode")
+        captured["citation_tldr"] = kwargs.get("citation_tldr")
+        return None
+
     async def _fake_build_or_get(**kwargs):
         captured["theme_mode"] = kwargs.get("theme_mode")
         captured["citation_tldr"] = kwargs.get("citation_tldr")
@@ -3701,6 +3707,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
 
     async def _fake_answer(**_kwargs):
         return "Conclusion: answerable with current paragraph evidence."
+    monkeypatch.setattr(service, "get_latest_cached_payload_only", _fake_get_latest_cached_payload_only)
     monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build_or_get)
     monkeypatch.setattr(service, "_generate_inline_answer", _fake_answer)
 
@@ -3719,6 +3726,66 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
     assert captured["theme_mode"] == "dark"
     assert captured["citation_tldr"] is True
     assert isinstance(result.get("node"), dict)
+
+
+@pytest.mark.asyncio
+async def test_prepare_inline_query_answer_should_prefer_latest_cached_payload(monkeypatch):
+    service = LiteratureReaderComposeService()
+    captured: dict = {"cached_called": 0, "build_called": 0}
+
+    async def _fake_cached(**_kwargs):
+        captured["cached_called"] += 1
+        return {
+            "ui_plan": {
+                "components": [
+                    {
+                        "id": "n1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "Cached paragraph for inline query."},
+                        "children": [],
+                        "source_block_ids": ["p1_b1"],
+                        "source_anchor_refs": [
+                            {"page": 1, "start_char": 0, "end_char": 24, "quote_text": "Cached paragraph"}
+                        ],
+                    }
+                ]
+            }
+        }
+
+    async def _fake_build(**_kwargs):
+        captured["build_called"] += 1
+        raise AssertionError("should not rebuild when latest cached payload exists")
+
+    monkeypatch.setattr(service, "get_latest_cached_payload_only", _fake_cached)
+    monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build)
+
+    result = await service.prepare_inline_query_answer(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=1),
+        page=1,
+        node_id="n1",
+        question="what is this paragraph about?",
+        scope="section",
+    )
+
+    assert captured["cached_called"] == 1
+    assert captured["build_called"] == 0
+    assert bool(result.get("disabled")) is False
+    assert "Cached paragraph" in str(result.get("context_text") or "")
+
+
+def test_build_inline_answer_prompt_should_prefer_local_answer_over_hard_refusal():
+    service = LiteratureReaderComposeService()
+    prompt = service._build_inline_answer_prompt(
+        question="这里为什么这样做？",
+        context_text="当前节点：The model uses local calibration. 证据片段：local calibration reduces error.",
+        scope="section",
+    )
+
+    assert "Prefer a useful local answer" in prompt
+    assert "Only say 当前段落证据不足" in prompt
+    assert "请使用右侧“询问”进行全文问答" not in prompt
 
 
 @pytest.mark.asyncio
@@ -7888,12 +7955,211 @@ def test_build_layout_uid_equation_props_should_include_ai_normalization_fields(
         },
     )
 
-    assert str(props.get("render_mode") or "") == "image_first"
+    assert str(props.get("render_mode") or "") == "math_first"
     assert str(props.get("normalized_text") or "") == "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||"
     assert str(props.get("normalized_latex") or "") == r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert"
     assert str(props.get("normalization_reason") or "") == "Recovered theta and calibration subscript from the page image and style hints."
     assert float(props.get("normalization_confidence") or 0.0) == 0.84
     assert str(props.get("normalization_mode") or "") == "latex_reconstructed"
+
+
+def test_build_layout_uid_equation_props_should_extract_label_from_standalone_block():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": "QKT Attention(Q,K,V)=softmax( 一) (1) √dk",
+                "raw_text": "QKT Attention(Q,K,V)=softmax( 一) (1) √dk",
+                "blocks": [
+                    {"text": "QKT"},
+                    {"text": "Attention(Q,K,V)=softmax("},
+                    {"text": "一)"},
+                    {"text": "(1)"},
+                    {"text": "√dk"},
+                ],
+            }
+        ],
+        equation_refinement={
+            "normalized_text": "Attention(Q, K, V) = softmax(QK^T / √d_k)V",
+            "normalized_latex": r"\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V",
+            "reason": "Recovered the standard scaled dot-product attention equation from the page image.",
+            "confidence": 0.95,
+            "mode": "latex_reconstructed",
+        },
+    )
+
+    assert str(props.get("label") or "") == "(1)"
+    assert str(props.get("render_mode") or "") == "math_first"
+
+
+def test_build_layout_uid_equation_props_should_fallback_to_image_first_without_normalized_latex():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": "x = y",
+                "raw_text": "x = y",
+            }
+        ],
+        equation_refinement={
+            "normalized_text": "x = y",
+            "reason": "transcript_cleanup",
+            "confidence": 0.61,
+            "mode": "display_normalized",
+        },
+    )
+
+    assert str(props.get("render_mode") or "") == "image_first"
+    assert str(props.get("normalized_latex") or "") == ""
+
+
+def test_normalize_layout_uid_figure_refinement_should_accept_short_insight():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_figure_refinement(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "fig_1",
+                "node_kind": "figure",
+                "clean_text": "",
+                "raw_text": "",
+            },
+            {
+                "layout_id": "fig_caption_1",
+                "node_kind": "figure_caption",
+                "clean_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                "raw_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+            },
+        ],
+        step_result={
+            "insight": "左图给出缩放点积注意力流程，右图展示多头注意力把多个注意力分支并行组合。",
+            "reason": "image_grounded_summary",
+            "confidence": 0.91,
+            "mode": "image_grounded_summary",
+        },
+    )
+
+    assert validation.get("passed") is True
+    assert str(normalized.get("ai_insight") or "") == "左图给出缩放点积注意力流程，右图展示多头注意力把多个注意力分支并行组合。"
+    assert float(normalized.get("confidence") or 0.0) == 0.91
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_apply_figure_insight():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=4,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "figure_group_1",
+                    "group_kind": "figure",
+                    "source_layout_ids": ["figure_1", "figure_caption_1"],
+                    "rationale": "test_figure_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "figure_1",
+                    "node_kind": "figure",
+                    "clean_text": "",
+                    "raw_text": "",
+                    "layout_type": "figure",
+                    "layout_sub_type": "diagram",
+                },
+                {
+                    "layout_id": "figure_caption_1",
+                    "node_kind": "figure_caption",
+                    "clean_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                    "raw_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                    "layout_type": "text",
+                    "layout_sub_type": "caption",
+                },
+            ]
+        },
+        figure_refinements={
+            "figure_group_1": {
+                "insight": {
+                    "ai_insight": "右图强调多个注意力分支并行计算，再将结果拼接回统一输出。",
+                    "reason": "image_grounded_summary",
+                    "confidence": 0.88,
+                    "mode": "image_grounded_summary",
+                }
+            }
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 1
+    figure_props = dict((nodes[0] or {}).get("props") or {})
+    assert str(figure_props.get("source_label") or "") == "Figure 2"
+    assert str(figure_props.get("ai_insight") or "") == "右图强调多个注意力分支并行计算，再将结果拼接回统一输出。"
+
+
+def test_build_regenerated_node_should_not_inject_template_figure_insight():
+    service = LiteratureReaderComposeService()
+    regenerated = service._build_regenerated_node(  # pylint: disable=protected-access
+        node_before={
+            "id": "fig_1",
+            "type": "FigurePanel",
+            "props": {
+                "caption": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                "ai_insight": "",
+            },
+        }
+    )
+
+    props = dict(regenerated.get("props") or {})
+    assert str(props.get("ai_insight") or "") == ""
+
+
+def test_select_native_pdf_image_should_reject_shape_mismatch():
+    service = LiteratureReaderComposeService()
+    portrait = SimpleNamespace(image=SimpleNamespace(size=(405, 568)))
+    result = service._select_native_pdf_image(  # pylint: disable=protected-access
+        pypdf_images=[portrait],
+        pypdf_image_map={},
+        candidate_images=[],
+        bbox_pdf=(390.0, 171.0, 1120.0, 580.0),
+    )
+    assert result is None
+
+
+def test_select_native_pdf_image_should_accept_shape_match():
+    service = LiteratureReaderComposeService()
+    landscape = SimpleNamespace(image=SimpleNamespace(size=(730, 410)))
+    result = service._select_native_pdf_image(  # pylint: disable=protected-access
+        pypdf_images=[landscape],
+        pypdf_image_map={},
+        candidate_images=[],
+        bbox_pdf=(390.0, 171.0, 1120.0, 580.0),
+    )
+    assert result is landscape
+
+
+def test_write_composited_pdf_images_should_place_multiple_native_images(tmp_path):
+    service = LiteratureReaderComposeService()
+    left = SimpleNamespace(image=Image.new("RGB", (20, 40), "red"))
+    right = SimpleNamespace(image=Image.new("RGB", (40, 60), "blue"))
+    target = service._write_composited_pdf_images(  # pylint: disable=protected-access
+        out_dir=str(tmp_path),
+        asset_id="fig1",
+        page_images=[
+            {"x0": 10.0, "x1": 30.0, "top": 20.0, "bottom": 60.0},
+            {"x0": 40.0, "x1": 80.0, "top": 10.0, "bottom": 70.0},
+        ],
+        pypdf_images=[left, right],
+        page_render_size=(100, 100),
+        pdf_width=100.0,
+        pdf_height=100.0,
+    )
+    assert target is not None
+    image = Image.open(target)
+    assert image.size == (70, 60)
 
 
 def test_layout_uid_group_plan_to_panel_plan_should_apply_equation_normalization():
@@ -8697,6 +8963,85 @@ def test_panel_plan_to_ui_plan_should_keep_ai_table_logical_row_fields():
     assert len(logical_rows) == 1
     assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
     assert str((((logical_rows[0] or {}).get("cells") or [])[0].get("text") or "")) == "DeepSeek-R1\ndistill-Qwen-32B"
+
+
+def test_panel_plan_to_ui_plan_should_keep_equation_normalization_fields():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
+        page=3,
+        panel_plan={
+            "plan_id": "panel_plan_keep_equation_normalization",
+            "panels": [
+                {
+                    "panel_id": "main",
+                    "nodes": [
+                        {
+                            "node_id": "equation_1",
+                            "component": "EquationBlock",
+                            "source_layout_ids": ["layout_equation_1"],
+                            "props": {
+                                "latex": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                                "label": "(1)",
+                                "description": "",
+                                "render_mode": "math_first",
+                                "transcript": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                                "normalized_text": "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||",
+                                "normalized_latex": r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert",
+                                "normalization_reason": "Recovered theta and calibration subscript from the page image and style hints.",
+                                "normalization_mode": "latex_reconstructed",
+                                "normalization_confidence": 0.84,
+                            },
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "layout_equation_1",
+                "source_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                "type": "formula",
+            }
+        ],
+        layout_to_block_ids={"layout_equation_1": ["p3_dm_formula_1"]},
+        base_payload={
+            "assets": [],
+            "blocks": [],
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout_equation_1",
+                        "clean_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                        "raw_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                        "canonical_block_ids": ["p3_dm_formula_1"],
+                        "layout_pos": [
+                            {"x": 100, "y": 260},
+                            {"x": 340, "y": 260},
+                            {"x": 340, "y": 284},
+                            {"x": 100, "y": 284},
+                        ],
+                        "blocks": [],
+                    }
+                ],
+                "page_image": {"width": 1483, "height": 1920},
+            },
+        },
+        style_intent=None,
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list(ui_plan.get("components") or [])
+    assert len(components) == 1
+    props = dict((components[0] or {}).get("props") or {})
+    assert str(props.get("normalized_latex") or "") == r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert"
+    assert str(props.get("normalized_text") or "") == "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||"
+    assert str(props.get("normalization_reason") or "") == "Recovered theta and calibration subscript from the page image and style hints."
+    assert str(props.get("normalization_mode") or "") == "latex_reconstructed"
+    assert float(props.get("normalization_confidence") or 0.0) == 0.84
 
 
 @pytest.mark.asyncio

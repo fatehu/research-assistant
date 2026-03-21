@@ -2,6 +2,8 @@ import { type CSSProperties, type DragEvent, type ReactNode, useEffect, useMemo,
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ArrowLeftOutlined,
+  CompressOutlined,
+  ExpandOutlined,
   LeftOutlined,
   LinkOutlined,
   PushpinOutlined,
@@ -74,20 +76,18 @@ import {
   ReaderGenerativePagePayload,
   ReaderGenerativeSection,
   ReaderGenerativeStyleKey,
-  ReaderGenerativeStyleTuning,
   ReaderPageGrounding,
   ReaderPageReadyEventData,
   ReaderSession,
 } from '@/services/api'
 import {
   GENERATIVE_STYLE_LABELS,
-  GENERATIVE_STYLE_TOKENS,
   normalizeGenerativeStyleKey,
   type GenerativeStyleTokens,
   type ReaderThemeMode,
   resolveGenerativeStyleTokens,
 } from './generativeStyles'
-import { renderReaderComponentTree } from './readerComponents'
+import { renderNormalizedInlineText, renderReaderComponentTree } from './readerComponents'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 import './composedReader.css'
@@ -120,6 +120,28 @@ function normalizeComposePipelineVersion(value: string | null): string | undefin
   const token = String(value || '').trim().toLowerCase()
   if (token === 'layout_uid_v1') return 'layout_uid_v1'
   return undefined
+}
+
+const FOOTER_HIDE_FRAGMENT_MODES = new Set([
+  'footer_hide_fragment',
+  'hide_fragment',
+  'footer_fragment_hidden',
+])
+
+function isFooterLikeLayout(atom: Record<string, any> | undefined, reason: string): boolean {
+  const nodeKind = String(atom?.node_kind || '').trim().toLowerCase()
+  const layoutType = String(atom?.layout_type || '').trim().toLowerCase()
+  const layoutSubType = String(atom?.layout_sub_type || '').trim().toLowerCase()
+  if (reason === 'footer') return true
+  if (nodeKind === 'footer') return true
+  return ['corner_note', 'foot_pagenum', 'footnote', 'footer_note'].includes(layoutType)
+    || ['footer_note', 'page'].includes(layoutSubType)
+}
+
+function isMarkerOnlyFooterText(text: string): boolean {
+  const token = String(text || '').trim()
+  if (!token) return true
+  return /^[\^]?\d{1,3}$/.test(token) || /^[⁰¹²³⁴⁵⁶⁷⁸⁹]+$/.test(token)
 }
 
 function readJsonCache<T>(key: string | undefined): T | null {
@@ -188,12 +210,19 @@ type PageResourceLink = {
   source: 'metadata' | 'text'
 }
 
-const DEFAULT_READER_STYLE_TUNING: ReaderGenerativeStyleTuning = {
-  body_scale: 1,
-  line_height: 1.9,
-  heading_scale: 1,
-}
+const DEFAULT_READER_STYLE_KEY: ReaderGenerativeStyleKey = 'journal_classic'
+const DEFAULT_READER_FONT_SCALE = 1
+const DEFAULT_READER_LETTER_SPACING_EM = 0
 const DEFAULT_COMPOSE_MAX_ITERATIONS = 16
+
+function toAbsoluteApiUrl(rawUrl: string): string {
+  const token = String(rawUrl || '').trim()
+  if (!token) return ''
+  if (/^https?:\/\//i.test(token) || token.startsWith('data:') || token.startsWith('blob:')) return token
+  if (!token.startsWith('/')) return token
+  if (!READER_API_BASE_URL) return token
+  return `${READER_API_BASE_URL}${token}`
+}
 
 function pickStyleTokenString(tokens: Record<string, unknown>, keys: string[]): string {
   for (const key of keys) {
@@ -217,22 +246,6 @@ function mapComposeStyleIntentToKey(styleIntent: string, fallback: ReaderGenerat
   if (normalized === 'preprint' || normalized === 'preprint_modern') return 'preprint_modern'
   if (normalized === 'journal' || normalized === 'journal_classic' || normalized === 'auto') return 'journal_classic'
   return fallback
-}
-
-function normalizeReaderStyleTuning(
-  raw: unknown,
-  fallbackLineHeight: number,
-): ReaderGenerativeStyleTuning {
-  const source = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
-  const readNumber = (key: string, fallback: number): number => {
-    const value = Number(source[key])
-    return Number.isFinite(value) ? value : fallback
-  }
-  return {
-    body_scale: Math.max(0.9, Math.min(1.25, readNumber('body_scale', DEFAULT_READER_STYLE_TUNING.body_scale))),
-    line_height: Math.max(1.55, Math.min(2.2, readNumber('line_height', fallbackLineHeight))),
-    heading_scale: Math.max(0.95, Math.min(1.35, readNumber('heading_scale', DEFAULT_READER_STYLE_TUNING.heading_scale))),
-  }
 }
 
 const ACADEMIC_SECTION_KEYWORDS = [
@@ -758,15 +771,8 @@ type PendingSectionJump = {
   expectedPage?: number
 }
 
-type ReaderDetailLevel = 'concise' | 'standard' | 'deep'
-type ComposedBackendOptions = {
-  detailLevel: ReaderDetailLevel
-  compareMode: boolean
-  citationTldr: boolean
-}
 type PendingComposedRun = {
   regenerate: boolean
-  applyCurrentOptions: boolean
 }
 type AnchorMatchMethod = 'polygon' | 'bbox_hint' | 'quote_exact' | 'quote_fuzzy' | 'char_range' | 'fallback'
 
@@ -2416,6 +2422,7 @@ export default function PaperReaderPage() {
   const [fitWidth, setFitWidth] = useState<boolean>(true)
   const [textMode, setTextMode] = useState<boolean>(false)
   const [workspaceTab, setWorkspaceTab] = useState<string>('annotation')
+  const [immersiveMode, setImmersiveMode] = useState<boolean>(false)
   const [readerAutoSaveStatus, setReaderAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [readerAutoSaveAt, setReaderAutoSaveAt] = useState<string>('')
   const [readerAutoSaveError, setReaderAutoSaveError] = useState<string>('')
@@ -2436,14 +2443,10 @@ export default function PaperReaderPage() {
   const [generativeAssets, setGenerativeAssets] = useState<ReaderGenerativeAsset[]>([])
   const [generativeSummary, setGenerativeSummary] = useState<string>('')
   const [generativePayload, setGenerativePayload] = useState<ReaderGenerativePagePayload | null>(null)
-  const [generativeStyleKey, setGenerativeStyleKey] = useState<ReaderGenerativeStyleKey>('journal_classic')
+  const [generativeStyleKey, setGenerativeStyleKey] = useState<ReaderGenerativeStyleKey>(DEFAULT_READER_STYLE_KEY)
   const [themeMode, setThemeMode] = useState<ReaderThemeMode>('light')
-  const [detailLevel, setDetailLevel] = useState<ReaderDetailLevel>('standard')
-  const [compareMode, setCompareMode] = useState<boolean>(false)
-  const [citationTldr, setCitationTldr] = useState<boolean>(false)
-  const [generativeStyleTuning, setGenerativeStyleTuning] = useState<ReaderGenerativeStyleTuning>(
-    DEFAULT_READER_STYLE_TUNING,
-  )
+  const [readerFontScale, setReaderFontScale] = useState<number>(DEFAULT_READER_FONT_SCALE)
+  const [readerLetterSpacingEm, setReaderLetterSpacingEm] = useState<number>(DEFAULT_READER_LETTER_SPACING_EM)
   const [generativeCacheLabel, setGenerativeCacheLabel] = useState<string>('')
   const [composedLoading, setComposedLoading] = useState<boolean>(false)
   const [composedError, setComposedError] = useState<string>('')
@@ -2481,12 +2484,6 @@ export default function PaperReaderPage() {
   const composedStreamControllerRef = useRef<AbortController | null>(null)
   const pendingComposedRunRef = useRef<PendingComposedRun>({
     regenerate: false,
-    applyCurrentOptions: false,
-  })
-  const composedAppliedOptionsRef = useRef<ComposedBackendOptions>({
-    detailLevel: 'standard',
-    compareMode: false,
-    citationTldr: false,
   })
   const inlineQueryStreamControllerRef = useRef<AbortController | null>(null)
   const annotationInputRef = useRef<any>(null)
@@ -2545,23 +2542,23 @@ export default function PaperReaderPage() {
     if (!text) return 0
     return text.split(/\s+/).filter(Boolean).length
   }, [displayedTextBlocks])
+  const resolvedBodyLetterSpacing = useMemo(
+    () => `${Math.max(-0.02, Math.min(0.12, readerLetterSpacingEm)).toFixed(3)}em`,
+    [readerLetterSpacingEm],
+  )
   const baseGenerativeStyle = useMemo(
     () => resolveGenerativeStyleTokens(generativeStyleKey, themeMode),
     [generativeStyleKey, themeMode],
   )
-  const normalizedStyleTuning = useMemo(
-    () => normalizeReaderStyleTuning(generativeStyleTuning, baseGenerativeStyle.bodyLineHeight),
-    [baseGenerativeStyle.bodyLineHeight, generativeStyleTuning],
-  )
   const activeGenerativeStyle = useMemo(() => {
     const base = baseGenerativeStyle
-    const tunedBodyFontSize = Math.round(base.bodyFontSize * normalizedStyleTuning.body_scale * 10) / 10
+    const tunedBodyFontSize = Math.round(base.bodyFontSize * readerFontScale * 10) / 10
     return {
       ...base,
       bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
-      bodyLineHeight: normalizedStyleTuning.line_height,
+      bodyLetterSpacing: resolvedBodyLetterSpacing,
     }
-  }, [baseGenerativeStyle, normalizedStyleTuning])
+  }, [baseGenerativeStyle, readerFontScale, resolvedBodyLetterSpacing])
   const composedStyleTokens = useMemo<Record<string, unknown>>(() => {
     if (composedPlan?.style_tokens && typeof composedPlan.style_tokens === 'object') {
       return composedPlan.style_tokens as Record<string, unknown>
@@ -2572,13 +2569,13 @@ export default function PaperReaderPage() {
     return {}
   }, [composedPlan, composedPayload])
   const activeComposedStyle = useMemo<GenerativeStyleTokens>(() => {
-    const base = resolveGenerativeStyleTokens(generativeStyleKey, themeMode)
+    const base = resolveGenerativeStyleTokens(DEFAULT_READER_STYLE_KEY, themeMode)
 
     const tokenBodySize = pickStyleTokenNumber(composedStyleTokens, ['body_font_size', 'bodyFontSize'])
     const tokenLineHeight = pickStyleTokenNumber(composedStyleTokens, ['body_line_height', 'bodyLineHeight'])
 
     const tunedBodyFontSize = Math.round(
-      (tokenBodySize ?? base.bodyFontSize) * normalizedStyleTuning.body_scale * 10,
+      (tokenBodySize ?? base.bodyFontSize) * readerFontScale * 10,
     ) / 10
     const nextStyle: GenerativeStyleTokens = {
       ...base,
@@ -2589,10 +2586,11 @@ export default function PaperReaderPage() {
       bodyFontSize: Math.max(14, Math.min(24, tunedBodyFontSize)),
       bodyLineHeight: tokenLineHeight !== null
         ? Math.max(1.55, Math.min(2.2, tokenLineHeight))
-        : normalizedStyleTuning.line_height,
+        : base.bodyLineHeight,
+      bodyLetterSpacing: resolvedBodyLetterSpacing,
     }
     return nextStyle
-  }, [composedStyleTokens, generativeStyleKey, themeMode, normalizedStyleTuning])
+  }, [composedStyleTokens, readerFontScale, resolvedBodyLetterSpacing, themeMode])
   const generativeLayoutMode = useMemo<'split' | 'stack'>(() => (
     viewerWidth >= 1080 ? 'split' : 'stack'
   ), [viewerWidth])
@@ -2612,6 +2610,18 @@ export default function PaperReaderPage() {
     }
     lastTextModeRef.current = textMode
   }, [textMode])
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (
+        (e.key === 'i' || e.key === 'I') &&
+        !['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)
+      ) {
+        setImmersiveMode((prev) => !prev)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
   const pageResourceLinks = useMemo(
     () => collectPageResourceLinks(paper, rawPageText || pageText),
     [paper, rawPageText, pageText],
@@ -2701,41 +2711,77 @@ export default function PaperReaderPage() {
         kind: string
         sourceText: string
         normalizedText: string
+        readingOrder: number
+        layoutType: string
+        layoutSubType: string
+        nodeKind: string
       }>
     }>()
     for (const rawItem of composedOmissions) {
-      const reason = String(rawItem.reason || '').trim() || 'omitted'
+      const originalReason = String(rawItem.reason || '').trim() || 'omitted'
       const targetLayoutIds = Array.isArray(rawItem.target_layout_ids)
         ? rawItem.target_layout_ids.map((item) => String(item || '').trim()).filter(Boolean)
         : []
-      const group = groups.get(reason) || {
-        reason,
-        recoverable: Boolean(rawItem.recoverable),
-        items: [],
-      }
-      const seenLayoutIds = new Set(group.items.map((item) => item.layoutId))
+      const pendingItems: Array<{
+        displayReason: string
+        item: {
+          layoutId: string
+          kind: string
+          sourceText: string
+          normalizedText: string
+          readingOrder: number
+          layoutType: string
+          layoutSubType: string
+          nodeKind: string
+        }
+      }> = []
       for (const layoutId of targetLayoutIds) {
-        if (seenLayoutIds.has(layoutId)) continue
         const atom = atomById.get(layoutId)
         const sourceText = String(atom?.clean_text || atom?.raw_text || '').trim()
         const normalizedText = String(atom?.normalized_text || '').trim()
         const normalizationMode = String(atom?.normalization_mode || '').trim().toLowerCase()
+        const displayReason = isFooterLikeLayout(atom as Record<string, any> | undefined, originalReason) ? 'footer' : originalReason
         if (
-          reason === 'footer'
+          displayReason === 'footer'
           && !normalizedText
-          && ['footer_hide_fragment', 'hide_fragment', 'footer_fragment_hidden'].includes(normalizationMode)
+          && FOOTER_HIDE_FRAGMENT_MODES.has(normalizationMode)
         ) {
           continue
         }
-        group.items.push({
-          layoutId,
-          kind: String(atom?.node_kind || reason || 'layout').trim() || 'layout',
-          sourceText,
-          normalizedText,
+        pendingItems.push({
+          displayReason,
+          item: {
+            layoutId,
+            kind: String(atom?.node_kind || originalReason || 'layout').trim() || 'layout',
+            sourceText,
+            normalizedText,
+            readingOrder: Number(atom?.reading_order || 0),
+            layoutType: String(atom?.layout_type || '').trim(),
+            layoutSubType: String(atom?.layout_sub_type || '').trim(),
+            nodeKind: String(atom?.node_kind || '').trim(),
+          },
         })
-        seenLayoutIds.add(layoutId)
       }
-      groups.set(reason, group)
+      const pendingByReason = new Map<string, typeof pendingItems>()
+      for (const pending of pendingItems) {
+        const rows = pendingByReason.get(pending.displayReason) || []
+        rows.push(pending)
+        pendingByReason.set(pending.displayReason, rows)
+      }
+      for (const [reason, rows] of pendingByReason.entries()) {
+        const group = groups.get(reason) || {
+          reason,
+          recoverable: Boolean(rawItem.recoverable),
+          items: [],
+        }
+        const seenLayoutIds = new Set(group.items.map((item) => item.layoutId))
+        for (const pending of rows) {
+          if (seenLayoutIds.has(pending.item.layoutId)) continue
+          group.items.push(pending.item)
+          seenLayoutIds.add(pending.item.layoutId)
+        }
+        groups.set(reason, group)
+      }
     }
     return Array.from(groups.values())
       .sort((left, right) => right.items.length - left.items.length)
@@ -2748,6 +2794,42 @@ export default function PaperReaderPage() {
     () => composedOmissionGroups.filter((group) => group.reason !== 'footer'),
     [composedOmissionGroups],
   )
+  const composedFooterBundles = useMemo(() => {
+    const footerItems = composedFooterOmissionGroups
+      .flatMap((group) => group.items)
+      .slice()
+      .sort((left, right) => left.readingOrder - right.readingOrder)
+    if (footerItems.length === 0) return []
+
+    const bundles: Array<typeof footerItems> = []
+    let current: typeof footerItems = []
+    let previousOrder: number | null = null
+    for (const item of footerItems) {
+      if (current.length > 0 && previousOrder != null && item.readingOrder - previousOrder > 2) {
+        bundles.push(current)
+        current = []
+      }
+      current.push(item)
+      previousOrder = item.readingOrder
+    }
+    if (current.length > 0) bundles.push(current)
+
+    return bundles.map((items, index) => {
+      const richItems = items.filter((item) => !isMarkerOnlyFooterText(item.normalizedText || item.sourceText))
+      const visibleItems = (richItems.length > 0 ? richItems : items)
+        .map((item) => ({
+          ...item,
+          effectiveText: String(item.normalizedText || item.sourceText || '').trim(),
+        }))
+        .filter((item) => item.effectiveText)
+      return {
+        bundleId: `footer-bundle-${index + 1}`,
+        recoverable: true,
+        layoutCount: items.length,
+        items: visibleItems,
+      }
+    }).filter((bundle) => bundle.items.length > 0)
+  }, [composedFooterOmissionGroups])
   const composedLinkAssets = useMemo(
     () => composedAssets.filter((item) => item.kind === 'link' || item.kind === 'external_image'),
     [composedAssets],
@@ -3062,36 +3144,31 @@ export default function PaperReaderPage() {
       true,
     )
     const restoredReaderMode = String(sessionAnchor.reader_mode || '').toLowerCase()
-    const restoredStyleKey = normalizeGenerativeStyleKey(String(sessionAnchor.style_key || 'journal_classic'))
     const restoredThemeMode: ReaderThemeMode =
       String(sessionAnchor.theme_mode || 'light').toLowerCase() === 'dark' ? 'dark' : 'light'
-    const rawDetailLevel = String(sessionAnchor.detail_level || 'standard').toLowerCase()
-    const restoredDetailLevel: ReaderDetailLevel =
-      rawDetailLevel === 'concise' || rawDetailLevel === 'deep' ? rawDetailLevel : 'standard'
-    const restoredCompareMode = Boolean(sessionAnchor.compare_mode)
-    const restoredCitationTldr = Boolean(sessionAnchor.citation_tldr)
+    const restoredFontScale = clamp(
+      Number(sessionAnchor.font_scale || DEFAULT_READER_FONT_SCALE) || DEFAULT_READER_FONT_SCALE,
+      0.85,
+      1.4,
+    )
+    const restoredLetterSpacing = clamp(
+      Number(sessionAnchor.letter_spacing_em || DEFAULT_READER_LETTER_SPACING_EM) || DEFAULT_READER_LETTER_SPACING_EM,
+      -0.02,
+      0.12,
+    )
     const restoredMaxIterations = Math.max(
       4,
       Math.min(24, Number(sessionAnchor.compose_max_iterations || DEFAULT_COMPOSE_MAX_ITERATIONS) || DEFAULT_COMPOSE_MAX_ITERATIONS),
     )
-    composedAppliedOptionsRef.current = {
-      detailLevel: restoredDetailLevel,
-      compareMode: restoredCompareMode,
-      citationTldr: restoredCitationTldr,
-    }
     setReadPage(restoredPage)
     setZoomPercent(restoredZoom)
     setFitWidth(restoredFitWidth)
     setTextMode(false)
-    setGenerativeStyleKey(restoredStyleKey)
+    setGenerativeStyleKey(DEFAULT_READER_STYLE_KEY)
     setThemeMode(restoredThemeMode)
-    setDetailLevel(restoredDetailLevel)
-    setCompareMode(restoredCompareMode)
-    setCitationTldr(restoredCitationTldr)
+    setReaderFontScale(restoredFontScale)
+    setReaderLetterSpacingEm(restoredLetterSpacing)
     setComposeMaxIterations(restoredMaxIterations)
-    setGenerativeStyleTuning(
-      normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[restoredStyleKey].bodyLineHeight),
-    )
     setAnnotations(nextAnnotations)
     setComments(nextComments)
     setRatingSummary(nextRating)
@@ -3101,10 +3178,10 @@ export default function PaperReaderPage() {
 
     const fallbackKbCandidate = Number(
       requestedKbId ||
-        cachedReader?.selected_kb_id ||
-        nextSession.selected_kb_id ||
-        nextPaper.knowledge_base_id ||
-        kbList[0]?.id,
+      cachedReader?.selected_kb_id ||
+      nextSession.selected_kb_id ||
+      nextPaper.knowledge_base_id ||
+      kbList[0]?.id,
     )
     const fallbackKb =
       Number.isFinite(fallbackKbCandidate) && fallbackKbCandidate > 0 ? fallbackKbCandidate : undefined
@@ -3117,11 +3194,10 @@ export default function PaperReaderPage() {
       last_anchor: {
         fit_width: restoredFitWidth,
         reader_mode: restoredReaderMode === 'generative' ? 'generative' : 'pdf',
-        style_key: restoredStyleKey,
+        style_key: DEFAULT_READER_STYLE_KEY,
         theme_mode: restoredThemeMode,
-        detail_level: restoredDetailLevel,
-        compare_mode: restoredCompareMode,
-        citation_tldr: restoredCitationTldr,
+        font_scale: restoredFontScale,
+        letter_spacing_em: restoredLetterSpacing,
         compose_quality_target: 0.86,
         compose_max_iterations: restoredMaxIterations,
       },
@@ -3343,10 +3419,8 @@ export default function PaperReaderPage() {
   }, [pdfDoc, readPage, pdfNumPages])
 
   const requestGenerativeRefresh = () => {
-    // 把“本次刷新参数”写入 ref，仅供下一次请求消费。
     pendingComposedRunRef.current = {
       regenerate: true,
-      applyCurrentOptions: true,
     }
     setComposedRunSeed((prev) => prev + 1)
   }
@@ -3385,15 +3459,7 @@ export default function PaperReaderPage() {
     }
 
     const runOptions = pendingComposedRunRef.current
-    pendingComposedRunRef.current = { regenerate: false, applyCurrentOptions: false }
-    if (runOptions.applyCurrentOptions) {
-      composedAppliedOptionsRef.current = {
-        detailLevel,
-        compareMode,
-        citationTldr,
-      }
-    }
-    const appliedOptions = composedAppliedOptionsRef.current
+    pendingComposedRunRef.current = { regenerate: false }
 
     const controller = new AbortController()
     composedStreamControllerRef.current?.abort()
@@ -3436,9 +3502,6 @@ export default function PaperReaderPage() {
           pipeline_version: effectiveComposePipelineVersion,
           force_refresh: false,
           regenerate: false,
-          detail_level: appliedOptions.detailLevel,
-          compare_mode: appliedOptions.compareMode,
-          citation_tldr: appliedOptions.citationTldr,
           max_iterations: composeMaxIterations,
         })
         if (controller.signal.aborted) return false
@@ -3465,9 +3528,6 @@ export default function PaperReaderPage() {
           pipeline_version: effectiveComposePipelineVersion,
           force_refresh: false,
           regenerate: runOptions.regenerate,
-          detail_level: appliedOptions.detailLevel,
-          compare_mode: appliedOptions.compareMode,
-          citation_tldr: appliedOptions.citationTldr,
           max_iterations: composeMaxIterations,
         },
         (event, data) => {
@@ -3613,9 +3673,6 @@ export default function PaperReaderPage() {
     readPage,
     selectedKbId,
     effectiveComposePipelineVersion,
-    detailLevel,
-    compareMode,
-    citationTldr,
     composeMaxIterations,
     composedRunSeed,
   ])
@@ -3631,15 +3688,11 @@ export default function PaperReaderPage() {
     )
     if (queuedCandidates.length === 0) return
     queuedCandidates.forEach((item) => prefetchInFlightPagesRef.current.add(item))
-    const appliedOptions = composedAppliedOptionsRef.current
     literatureApi
       .prefetchReaderComposed(parsedPaperId, {
         pages: queuedCandidates,
         selected_kb_id: selectedKbId,
         pipeline_version: effectiveComposePipelineVersion,
-        detail_level: appliedOptions.detailLevel,
-        compare_mode: appliedOptions.compareMode,
-        citation_tldr: appliedOptions.citationTldr,
         max_iterations: Math.max(4, composeMaxIterations - 2),
       })
       .then((result) => {
@@ -3677,11 +3730,10 @@ export default function PaperReaderPage() {
       last_anchor: {
         fit_width: fitWidth,
         reader_mode: textMode ? 'generative' : 'pdf',
-        style_key: generativeStyleKey,
+        style_key: DEFAULT_READER_STYLE_KEY,
         theme_mode: themeMode,
-        detail_level: detailLevel,
-        compare_mode: compareMode,
-        citation_tldr: citationTldr,
+        font_scale: readerFontScale,
+        letter_spacing_em: readerLetterSpacingEm,
         compose_quality_target: 0.86,
         compose_max_iterations: composeMaxIterations,
       },
@@ -3694,11 +3746,9 @@ export default function PaperReaderPage() {
     selectedKbId,
     fitWidth,
     textMode,
-    generativeStyleKey,
     themeMode,
-    detailLevel,
-    compareMode,
-    citationTldr,
+    readerFontScale,
+    readerLetterSpacingEm,
     composeMaxIterations,
   ])
 
@@ -3712,11 +3762,10 @@ export default function PaperReaderPage() {
       last_anchor: {
         fit_width: fitWidth,
         reader_mode: textMode ? 'generative' : 'pdf',
-        style_key: generativeStyleKey,
+        style_key: DEFAULT_READER_STYLE_KEY,
         theme_mode: themeMode,
-        detail_level: detailLevel,
-        compare_mode: compareMode,
-        citation_tldr: citationTldr,
+        font_scale: readerFontScale,
+        letter_spacing_em: readerLetterSpacingEm,
         compose_quality_target: 0.86,
         compose_max_iterations: composeMaxIterations,
       },
@@ -3752,11 +3801,9 @@ export default function PaperReaderPage() {
     selectedKbId,
     fitWidth,
     textMode,
-    generativeStyleKey,
     themeMode,
-    detailLevel,
-    compareMode,
-    citationTldr,
+    readerFontScale,
+    readerLetterSpacingEm,
     composeMaxIterations,
   ])
 
@@ -4250,11 +4297,8 @@ export default function PaperReaderPage() {
         action,
         reason: action === 'degrade' ? '用户手动触发降级' : '用户手动触发修复',
         selected_kb_id: selectedKbId,
-        style_intent: generativeStyleKey,
+        style_intent: DEFAULT_READER_STYLE_KEY,
         theme_mode: themeMode,
-        detail_level: detailLevel,
-        compare_mode: compareMode,
-        citation_tldr: citationTldr,
       }
       const result = await literatureApi.actionReaderComposedNode(parsedPaperId, requestPayload)
       const nextNode = result.node_after
@@ -4310,11 +4354,8 @@ export default function PaperReaderPage() {
           question: compactQuestion,
           scope: 'section',
           selected_kb_id: selectedKbId,
-          style_intent: generativeStyleKey,
+          style_intent: DEFAULT_READER_STYLE_KEY,
           theme_mode: themeMode,
-          detail_level: detailLevel,
-          compare_mode: compareMode,
-          citation_tldr: citationTldr,
         },
         (event: ReaderInlineQueryEvent, data) => {
           if (event === 'token') {
@@ -4323,6 +4364,26 @@ export default function PaperReaderPage() {
           }
           if (event === 'sources') {
             sourceRows = Array.isArray(data) ? (data as ReaderInlineQuerySource[]) : []
+            return
+          }
+          if (event === 'disabled') {
+            const msg = String((data as { message?: string })?.message || '当前段落追问不可用，请改用右侧“询问”进行全文问答。')
+            const disabledNode: ReaderComponentNode = {
+              id: `answer_${Date.now()}`,
+              type: 'AnswerCard',
+              props: {
+                question: compactQuestion,
+                answer: msg,
+                foldable: false,
+              },
+              children: [],
+              source_block_ids: Array.isArray(node.source_block_ids) ? node.source_block_ids : [],
+              source_atom_ids: Array.isArray(node.source_atom_ids) ? node.source_atom_ids : [],
+              source_anchor_refs: toAnchorList(sourceRows),
+            }
+            applyNodeInsertToComposeState(String(node.id), disabledNode)
+            inserted = true
+            message.info(msg)
             return
           }
           if (event === 'done') {
@@ -4574,7 +4635,7 @@ export default function PaperReaderPage() {
     const params = new URLSearchParams()
     params.set('page', String(readPage))
     if (selectedKbId && selectedKbId > 0) params.set('kb', String(selectedKbId))
-    navigate(`/literature/${parsedPaperId}/experience?${params.toString()}`)
+    navigate(`/literature/${parsedPaperId}/experience-v2?${params.toString()}`)
   }
   const appendMarkdownToAnnotation = (markdown: string) => {
     const text = String(markdown || '').trim()
@@ -4733,7 +4794,7 @@ export default function PaperReaderPage() {
   const renderReaderSettingsContent = () => (
     <ConfigProvider
       theme={{
-        algorithm: theme.defaultAlgorithm,
+        algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {
           colorBgContainer: activeComposedStyle.panelBackground,
           colorBgElevated: activeComposedStyle.overlayBackground,
@@ -4773,9 +4834,8 @@ export default function PaperReaderPage() {
         },
       }}
     >
-      <Space direction="vertical" size={12} style={{ width: 280 }}>
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
         <div>
-          <Text strong>阅读设置</Text>
           <div>
             <Text type="secondary">这些是低频调整项，收起后把阅读画布还给正文。</Text>
           </div>
@@ -4795,55 +4855,42 @@ export default function PaperReaderPage() {
           />
         </Space>
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
-          <Text type="secondary">细节层级</Text>
-          <Select
-            popupClassName="reader-composed-popover-select"
-            size="small"
-            style={{ width: '100%' }}
-            value={detailLevel}
-            onChange={(value) => setDetailLevel(value as ReaderDetailLevel)}
-            options={[
-              { label: '简洁', value: 'concise' },
-              { label: '标准', value: 'standard' },
-              { label: '深入', value: 'deep' },
-            ]}
+          <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+            <Text type="secondary">字号</Text>
+            <Text>{Math.round(readerFontScale * 100)}%</Text>
+          </Space>
+          <Slider
+            min={0.9}
+            max={1.3}
+            step={0.05}
+            value={readerFontScale}
+            onChange={(value) => setReaderFontScale(Array.isArray(value) ? value[0] : value)}
+            tooltip={{ formatter: (value) => `${Math.round(Number(value || 0) * 100)}%` }}
           />
         </Space>
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
-          <Text type="secondary">阅读风格</Text>
-          <Select
-            popupClassName="reader-composed-popover-select"
-            size="small"
-            style={{ width: '100%' }}
-            value={generativeStyleKey}
-            onChange={(value) => {
-              const nextStyle = value as ReaderGenerativeStyleKey
-              setGenerativeStyleKey(nextStyle)
-              setGenerativeStyleTuning(
-                normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
-              )
-            }}
-            options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
+          <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+            <Text type="secondary">字距</Text>
+            <Text>{resolvedBodyLetterSpacing}</Text>
+          </Space>
+          <Slider
+            min={-0.01}
+            max={0.08}
+            step={0.005}
+            value={readerLetterSpacingEm}
+            onChange={(value) => setReaderLetterSpacingEm(Array.isArray(value) ? value[0] : value)}
+            tooltip={{ formatter: (value) => `${Number(value || 0).toFixed(3)}em` }}
           />
         </Space>
-        <Space size={8} wrap>
-          <Button
-            size="small"
-            type={compareMode ? 'primary' : 'default'}
-            className="reader-settings-toggle-btn"
-            onClick={() => setCompareMode((prev) => !prev)}
-          >
-            对比模式
-          </Button>
-          <Button
-            size="small"
-            type={citationTldr ? 'primary' : 'default'}
-            className="reader-settings-toggle-btn"
-            onClick={() => setCitationTldr((prev) => !prev)}
-          >
-            引用 TL;DR
-          </Button>
-        </Space>
+        <Button
+          size="small"
+          onClick={() => {
+            setReaderFontScale(DEFAULT_READER_FONT_SCALE)
+            setReaderLetterSpacingEm(DEFAULT_READER_LETTER_SPACING_EM)
+          }}
+        >
+          恢复默认
+        </Button>
       </Space>
     </ConfigProvider>
   )
@@ -5082,14 +5129,6 @@ export default function PaperReaderPage() {
       composedLoading ||
       Boolean(composedError) ||
       Boolean(composedPayload)
-    const toAbsoluteApiUrl = (rawUrl: string): string => {
-      const token = String(rawUrl || '').trim()
-      if (!token) return ''
-      if (/^https?:\/\//i.test(token) || token.startsWith('data:') || token.startsWith('blob:')) return token
-      if (!token.startsWith('/')) return token
-      if (!READER_API_BASE_URL) return token
-      return `${READER_API_BASE_URL}${token}`
-    }
     const resolveFigureImageUrl = (rawUrl: string, node?: ReaderComponentNode): string => {
       const token = String(rawUrl || '').trim()
       if (!token) return ''
@@ -5207,27 +5246,41 @@ export default function PaperReaderPage() {
               color: activeComposedStyle.bodyColor,
             } as CSSProperties}
           >
-            <div className="reader-workbench__topbar">
-              <div className="reader-workbench__meta">
-                <div className="reader-workbench__eyebrow">
-                  <Tag color="blue">AI Reader</Tag>
-                  <Tag color="geekblue">第 {readPage} 页</Tag>
-                  {effectiveComposePipelineVersion ? <Tag color="purple">{effectiveComposePipelineVersion}</Tag> : null}
-                  {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+            <div className={`reader-workbench__topbar ${immersiveMode ? 'reader-workbench__topbar--immersive' : ''}`}>
+              {!immersiveMode && (
+                <div className="reader-workbench__meta">
+                  <div className="reader-workbench__eyebrow">
+                    <Tag color="blue">AI Reader</Tag>
+                    <Tag color="geekblue">第 {readPage} 页</Tag>
+                    {effectiveComposePipelineVersion ? <Tag color="purple">{effectiveComposePipelineVersion}</Tag> : null}
+                    {composedCacheLabel ? <Tag color="cyan">{composedCacheLabel}</Tag> : null}
+                  </div>
+                  <Title level={3} className="reader-workbench__title">
+                    AI Reading Workbench
+                  </Title>
+                  <Text className="reader-workbench__subtitle">
+                    {pageWordCount} 词 · 字号 {Math.round(readerFontScale * 100)}% · 字距 {resolvedBodyLetterSpacing} · {themeMode === 'dark' ? '深色纸面' : '浅色纸面'}
+                  </Text>
                 </div>
-                <Title level={3} className="reader-workbench__title">
-                  AI Reading Workbench
-                </Title>
-                <Text className="reader-workbench__subtitle">
-                  {pageWordCount} 词 · {detailLevel === 'concise' ? '简洁' : detailLevel === 'deep' ? '深入' : '标准'}阅读 · {GENERATIVE_STYLE_LABELS[generativeStyleKey]} · {themeMode === 'dark' ? '深色纸面' : '浅色纸面'}
-                </Text>
-              </div>
+              )}
+
+              {immersiveMode && (
+                <div className="flex items-center gap-2">
+                  <Text strong style={{ fontSize: 13, opacity: 0.8 }}>沉浸模式已开启</Text>
+                  <Tag color="blue">第 {readPage} 页</Tag>
+                </div>
+              )}
 
               <div className="reader-workbench__controls">
-                <Space size={8} wrap>
-                  <Tag>{compareMode ? '对比开' : '对比关'}</Tag>
-                  <Tag>{citationTldr ? 'TL;DR 开' : 'TL;DR 关'}</Tag>
-                </Space>
+                <Tooltip title={immersiveMode ? '退出沉浸模式 (I)' : '进入沉浸模式 (I)'}>
+                  <Button
+                    size="small"
+                    icon={immersiveMode ? <CompressOutlined /> : <ExpandOutlined />}
+                    onClick={() => setImmersiveMode(!immersiveMode)}
+                  >
+                    {immersiveMode ? '退出' : '沉浸'}
+                  </Button>
+                </Tooltip>
                 <Popover
                   trigger="click"
                   placement="bottomRight"
@@ -5387,6 +5440,12 @@ export default function PaperReaderPage() {
             justifyContent: 'space-between',
             gap: 10,
             flexWrap: 'wrap',
+            position: 'sticky',
+            top: 0,
+            zIndex: 100,
+            background: activeGenerativeStyle.pageBackground,
+            boxShadow: '0 4px 12px rgba(15, 23, 42, 0.04)',
+            backdropFilter: 'blur(8px)',
           }}
         >
           <Space size={8} wrap>
@@ -5405,12 +5464,7 @@ export default function PaperReaderPage() {
               style={{ minWidth: 168 }}
               value={generativeStyleKey}
               onChange={(value) => {
-                // 切换风格会触发 useEffect 重新拉取该风格对应内容。
-                const nextStyle = value as ReaderGenerativeStyleKey
-                setGenerativeStyleKey(nextStyle)
-                setGenerativeStyleTuning(
-                  normalizeReaderStyleTuning({}, GENERATIVE_STYLE_TOKENS[nextStyle].bodyLineHeight),
-                )
+                setGenerativeStyleKey(value as ReaderGenerativeStyleKey)
               }}
               options={Object.entries(GENERATIVE_STYLE_LABELS).map(([value, label]) => ({ value, label }))}
             />
@@ -5614,7 +5668,7 @@ export default function PaperReaderPage() {
                             : headingDepth === 2
                               ? 22
                               : 19
-                        const headingSize = Math.round(baseHeadingSize * normalizedStyleTuning.heading_scale)
+                        const headingSize = Math.round(baseHeadingSize * clamp(readerFontScale, 0.95, 1.2))
                         return (
                           <div
                             key={`heading-${index}`}
@@ -5666,7 +5720,7 @@ export default function PaperReaderPage() {
             <Empty description="当前页暂无可提取文本（可能是扫描图像页）" />
           )}
         </div>
-      </div>
+      </div >
     )
   }
 
@@ -5809,6 +5863,10 @@ export default function PaperReaderPage() {
           kind: string
           sourceText: string
           normalizedText: string
+          readingOrder: number
+          layoutType: string
+          layoutSubType: string
+          nodeKind: string
         }>
       }>,
       emptyDescription: string,
@@ -5835,11 +5893,11 @@ export default function PaperReaderPage() {
                         <>
                           <Text delete type="secondary">{entry.sourceText}</Text>
                           <div style={{ marginTop: 6 }}>
-                            <Text>{entry.normalizedText}</Text>
+                            <Text>{renderNormalizedInlineText(entry.normalizedText)}</Text>
                           </div>
                         </>
                       ) : effectiveText ? (
-                        <Text>{effectiveText}</Text>
+                        <Text>{renderNormalizedInlineText(effectiveText)}</Text>
                       ) : (
                         <Text type="secondary">无可读文本，仅保留布局占位。</Text>
                       )}
@@ -5850,6 +5908,45 @@ export default function PaperReaderPage() {
               {group.items.length > 8 ? (
                 <Text className="reader-workbench__rail-note">{`其余 ${group.items.length - 8} 项已折叠。`}</Text>
               ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    ) : (
+      <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyDescription} />
+    ))
+
+    const renderFooterBundles = (
+      bundles: Array<{
+        bundleId: string
+        recoverable: boolean
+        layoutCount: number
+        items: Array<{
+          layoutId: string
+          kind: string
+          sourceText: string
+          normalizedText: string
+          effectiveText: string
+        }>
+      }>,
+      emptyDescription: string,
+    ) => (bundles.length > 0 ? (
+      <div className="reader-workbench__decision-list">
+        {bundles.map((bundle) => (
+          <div key={bundle.bundleId} className="reader-workbench__decision-item">
+            <Space size={8} wrap>
+              <Tag color="blue">footer</Tag>
+              <Tag>{`${bundle.layoutCount} layouts`}</Tag>
+              {bundle.recoverable ? <Tag color="green">recoverable</Tag> : null}
+            </Space>
+            <div style={{ marginTop: 8 }}>
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                {bundle.items.map((item) => (
+                  <div key={item.layoutId}>
+                    <Text>{renderNormalizedInlineText(item.effectiveText)}</Text>
+                  </div>
+                ))}
+              </Space>
             </div>
           </div>
         ))}
@@ -5954,10 +6051,10 @@ export default function PaperReaderPage() {
           </div>
         ),
       }] : []),
-      ...(composedFooterOmissionGroups.length > 0 ? [{
+      ...(composedFooterBundles.length > 0 ? [{
         key: 'footer-omissions',
-        label: `Footer / Links · ${composedFooterOmissionGroups.reduce((sum, group) => sum + group.items.length, 0)}`,
-        children: renderOmissionGroups(composedFooterOmissionGroups, 'No hidden footer items.'),
+        label: `Footer / Links · ${composedFooterBundles.length}`,
+        children: renderFooterBundles(composedFooterBundles, 'No hidden footer items.'),
       }] : []),
       {
         key: 'omissions',
@@ -6241,394 +6338,394 @@ export default function PaperReaderPage() {
                 popupClassName="reader-workspace-tabs-popup"
                 tabBarStyle={{ marginBottom: 14, paddingInline: 2 }}
                 items={[
-              ...(textMode ? [{
-                key: 'ai_context',
-                label: 'AI 上下文',
-                children: renderAiContextPanel(),
-              }] : []),
-              {
-                key: 'annotation',
-                label: '批注',
-                children: (
-                  renderThreeTierPanel(
-                    '批注工作区',
-                    '在阅读过程中记录页级批注，并用摘要列表快速扫描。',
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      {editingAnnotationId ? (
-                        <Space size={8} wrap>
-                          <Tag color="processing">编辑中</Tag>
-                          <Text type="secondary">保存后会覆盖原批注内容。</Text>
-                        </Space>
-                      ) : null}
-                      <Space size={8} wrap>
-                        <Tag color="blue">全部 {annotations.length}</Tag>
-                        <Tag color="geekblue">当前页 {currentPageAnnotations.length}</Tag>
-                      </Space>
-                      <Space wrap size={10} style={{ width: '100%' }}>
-                        <Select
-                          value={annotationType}
-                          onChange={(v) => setAnnotationType(v)}
-                          options={[
-                            { label: '笔记', value: 'note' },
-                            { label: '高亮', value: 'highlight' },
-                          ]}
-                          style={{ width: 122 }}
-                        />
-                        <Input
-                          type="number"
-                          min={1}
-                          max={pdfNumPages || undefined}
-                          value={annotationPage}
-                          onChange={(e) => {
-                            const value = Number(e.target.value || 1)
-                            if (!Number.isFinite(value) || value <= 0) return
-                            const maxPage = pdfNumPages > 0 ? pdfNumPages : value
-                            setAnnotationPage(clamp(Math.round(value), 1, maxPage))
-                          }}
-                          style={{ width: 112 }}
-                          addonBefore="页"
-                        />
-                        <Button onClick={() => setAnnotationPage(readPage)}>定位到当前页</Button>
-                      </Space>
-                      <div onDragOver={handleAnnotationDragOver} onDrop={handleAnnotationDrop}>
-                        <TextArea
-                          ref={annotationInputRef}
-                          rows={4}
-                          value={annotationContent}
-                          onChange={(e) => setAnnotationContent(e.target.value)}
-                          placeholder={editingAnnotationId ? '编辑批注内容' : '输入批注内容（支持从左侧拖拽组件 Markdown 到此处）'}
-                          style={{ borderRadius: 10 }}
-                        />
-                      </div>
-                      <Space size={10} wrap>
-                        <Button
-                          loading={annotationSubmitting}
-                          onClick={handleSaveAnnotation}
-                          style={workspacePrimaryButtonStyle}
-                        >
-                          {editingAnnotationId ? '保存修改' : '新增批注'}
-                        </Button>
-                        {editingAnnotationId ? (
-                          <Button
-                            onClick={handleCancelEditAnnotation}
-                            disabled={annotationSubmitting}
-                            style={workspaceSecondaryButtonStyle}
-                          >
-                            取消编辑
-                          </Button>
-                        ) : null}
-                      </Space>
-                    </Space>,
-                    <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                      <List
-                        size="small"
-                        dataSource={[...annotations].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())}
-                        style={{ maxHeight: 340, overflowY: 'auto', paddingRight: 4 }}
-                        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无批注" /> }}
-                        renderItem={(item) => (
-                          <List.Item
-                            actions={[
-                              <Button key="jump" size="small" onClick={() => setReadPage(item.page)}>
-                                跳转
-                              </Button>,
-                              <Button key="edit" size="small" onClick={() => handleStartEditAnnotation(item)}>
-                                编辑
-                              </Button>,
-                              <Popconfirm
-                                key="delete"
-                                title="删除这条批注？"
-                                description="删除后不可恢复。"
-                                okText="删除"
-                                cancelText="取消"
-                                okButtonProps={{ danger: true, loading: deletingAnnotationId === item.id }}
-                                onConfirm={async () => handleDeleteAnnotation(item.id)}
-                              >
-                                <Button size="small" danger loading={deletingAnnotationId === item.id}>
-                                  删除
-                                </Button>
-                              </Popconfirm>,
-                            ]}
-                          >
-                            <Space direction="vertical" size={4} style={{ width: '100%' }}>
-                              <Space size={8} wrap>
-                                <Text strong>第 {item.page} 页</Text>
-                                <Tag color={item.annotation_type === 'highlight' ? 'gold' : 'blue'} style={{ marginInlineEnd: 0 }}>
-                                  {item.annotation_type === 'highlight' ? '高亮' : '笔记'}
-                                </Tag>
-                                {editingAnnotationId === item.id ? <Tag color="processing">正在编辑</Tag> : null}
-                              </Space>
-                              <Paragraph
-                                style={{ marginBottom: 0 }}
-                                type="secondary"
-                                ellipsis={{ rows: 2, expandable: true, symbol: '展开' }}
-                              >
-                                {item.content || item.quote_text || '(空)'}
-                              </Paragraph>
+                  ...(textMode ? [{
+                    key: 'ai_context',
+                    label: 'AI 上下文',
+                    children: renderAiContextPanel(),
+                  }] : []),
+                  {
+                    key: 'annotation',
+                    label: '批注',
+                    children: (
+                      renderThreeTierPanel(
+                        '批注工作区',
+                        '在阅读过程中记录页级批注，并用摘要列表快速扫描。',
+                        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                          {editingAnnotationId ? (
+                            <Space size={8} wrap>
+                              <Tag color="processing">编辑中</Tag>
+                              <Text type="secondary">保存后会覆盖原批注内容。</Text>
                             </Space>
-                          </List.Item>
-                        )}
-                      />
-                    </Space>,
-                  )
-                ),
-              },
-              {
-                key: 'comment',
-                label: '评论',
-                children: (
-                  renderThreeTierPanel(
-                    '评论区',
-                    '查看公开评论，支持全部/同组筛选。',
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      <Radio.Group
-                        value={commentFilter}
-                        onChange={async (e) => {
-                          const next = e.target.value as CommentFilter
-                          setCommentFilter(next)
-                          try {
-                            await reloadComments(next)
-                          } catch {
-                            message.error('加载评论失败')
-                          }
-                        }}
-                        options={[
-                          { label: '全部', value: 'all' },
-                          { label: '同组', value: 'same_group' },
-                        ]}
-                      />
-                      <TextArea
-                        rows={4}
-                        value={commentText}
-                        onChange={(e) => setCommentText(e.target.value)}
-                        placeholder="输入评论"
-                        style={{ borderRadius: 10 }}
-                      />
-                      <Button onClick={handleAddComment} style={workspacePrimaryButtonStyle}>
-                        发布评论
-                      </Button>
-                    </Space>,
-                    <List
-                      size="small"
-                      dataSource={comments}
-                      style={{ maxHeight: 300, overflowY: 'auto', paddingRight: 4 }}
-                      renderItem={(item) => (
-                        <List.Item>
-                          <Space direction="vertical" size={2}>
-                            <Text strong>{item.author?.full_name || item.author?.username || `用户${item.user_id}`}</Text>
-                            <Text>{item.content}</Text>
+                          ) : null}
+                          <Space size={8} wrap>
+                            <Tag color="blue">全部 {annotations.length}</Tag>
+                            <Tag color="geekblue">当前页 {currentPageAnnotations.length}</Tag>
                           </Space>
-                        </List.Item>
-                      )}
-                    />,
-                  )
-                ),
-              },
-              {
-                key: 'rating',
-                label: '评分/入库',
-                children: (
-                  renderThreeTierPanel(
-                    '评分与入库',
-                    '维护个人评分，并跟踪知识库处理状态。',
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      <Space align="center">
-                        <Text>我的评分</Text>
-                        <Rate value={ratingSummary?.my_rating || 0} onChange={handleRate} />
-                      </Space>
-                      <Space wrap>
-                        <Tag>全站均分: {ratingSummary?.global_avg ?? '-'}</Tag>
-                        <Tag>全站人数: {ratingSummary?.global_count ?? 0}</Tag>
-                        <Tag>同组均分: {ratingSummary?.same_group_avg ?? '-'}</Tag>
-                        <Tag>同组人数: {ratingSummary?.same_group_count ?? 0}</Tag>
-                      </Space>
-                      <Select
-                        style={{ width: '100%' }}
-                        placeholder="选择知识库"
-                        options={kbOptions}
-                        value={selectedKbId}
-                        onChange={(v) => setSelectedKbId(v)}
-                      />
-                      <Button onClick={handleAddToKnowledge}>加入知识库</Button>
-                    </Space>,
-                    <List
-                      size="small"
-                      dataSource={knowledgeLinks}
-                      renderItem={(item) => {
-                        const normalized = normalizeKnowledgeLinkStatus(item.status)
-                        const color =
-                          normalized === 'completed'
-                            ? 'green'
-                            : normalized === 'failed'
-                              ? 'red'
-                              : normalized === 'pending'
-                                ? 'gold'
-                                : normalized === 'running'
-                                  ? 'blue'
-                                  : 'default'
-                        return (
-                          <List.Item>
-                            <Space direction="vertical" size={2}>
-                              <Text>KB#{item.knowledge_base_id}</Text>
-                              <Tag color={color}>{normalized}</Tag>
-                              {item.error_message ? <Text type="danger">{item.error_message}</Text> : null}
-                            </Space>
-                          </List.Item>
-                        )
-                      }}
-                    />,
-                  )
-                ),
-              },
-              {
-                key: 'ask',
-                label: '询问',
-                children: (
-                  renderThreeTierPanel(
-                    '询问工作区',
-                    '配置提问范围与模式，查看回答、历史和可跳转来源。',
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      <Radio.Group
-                        value={askScope}
-                        onChange={(e) => setAskScope(e.target.value as LiteratureAskScope)}
-                        options={askScopeOptions}
-                      />
-                      <Radio.Group
-                        value={askMode}
-                        onChange={(e) => setAskMode(e.target.value as 'agentic' | 'classic')}
-                        options={askModeOptions}
-                      />
-                      {askScope === 'collection' ? (
-                        <Select
-                          placeholder="选择收藏夹"
-                          options={collectionOptions}
-                          value={askCollectionId}
-                          onChange={(v) => setAskCollectionId(v)}
-                        />
-                      ) : null}
-                      <Select
-                        placeholder="选择知识库"
-                        options={kbOptions}
-                        value={selectedKbId}
-                        onChange={(v) => setSelectedKbId(v)}
-                      />
-                      {askScope === 'collection' && askCollectionId && selectedKbId ? (
-                        collectionReadinessLoading ? (
-                          <Space>
-                            <Spin size="small" />
-                            <Text type="secondary">正在检查收藏夹入库就绪度...</Text>
+                          <Space wrap size={10} style={{ width: '100%' }}>
+                            <Select
+                              value={annotationType}
+                              onChange={(v) => setAnnotationType(v)}
+                              options={[
+                                { label: '笔记', value: 'note' },
+                                { label: '高亮', value: 'highlight' },
+                              ]}
+                              style={{ width: 122 }}
+                            />
+                            <Input
+                              type="number"
+                              min={1}
+                              max={pdfNumPages || undefined}
+                              value={annotationPage}
+                              onChange={(e) => {
+                                const value = Number(e.target.value || 1)
+                                if (!Number.isFinite(value) || value <= 0) return
+                                const maxPage = pdfNumPages > 0 ? pdfNumPages : value
+                                setAnnotationPage(clamp(Math.round(value), 1, maxPage))
+                              }}
+                              style={{ width: 112 }}
+                              addonBefore="页"
+                            />
+                            <Button onClick={() => setAnnotationPage(readPage)}>定位到当前页</Button>
                           </Space>
-                        ) : collectionReadiness ? (
-                          <Alert
-                            showIcon
-                            type={collectionReadiness.can_cross_paper_answer ? 'info' : 'warning'}
-                            message={
-                              collectionReadiness.can_cross_paper_answer
-                                ? `可跨论文联合回答：${collectionReadiness.completed_papers}/${collectionReadiness.total_papers} 篇已就绪`
-                                : '当前收藏夹暂无可联合回答论文'
-                            }
-                            description={(
-                              <Space direction="vertical" size={6} style={{ width: '100%' }}>
-                                <Text type="secondary">
-                                  联合回答仅覆盖 `completed` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
-                                </Text>
-                                <Space wrap size={6}>
-                                  <Tag color="green">completed: {collectionReadiness.completed_papers}</Tag>
-                                  <Tag color="blue">running: {collectionReadiness.running_papers}</Tag>
-                                  <Tag color="gold">pending: {collectionReadiness.pending_papers}</Tag>
-                                  <Tag color="red">failed: {collectionReadiness.failed_papers}</Tag>
-                                  <Tag color="orange">timeout: {collectionReadiness.timeout_papers}</Tag>
-                                  <Tag color="purple">cancelled: {collectionReadiness.cancelled_papers}</Tag>
-                                  <Tag>missing: {collectionReadiness.missing_papers}</Tag>
+                          <div onDragOver={handleAnnotationDragOver} onDrop={handleAnnotationDrop}>
+                            <TextArea
+                              ref={annotationInputRef}
+                              rows={4}
+                              value={annotationContent}
+                              onChange={(e) => setAnnotationContent(e.target.value)}
+                              placeholder={editingAnnotationId ? '编辑批注内容' : '输入批注内容（支持从左侧拖拽组件 Markdown 到此处）'}
+                              style={{ borderRadius: 10 }}
+                            />
+                          </div>
+                          <Space size={10} wrap>
+                            <Button
+                              loading={annotationSubmitting}
+                              onClick={handleSaveAnnotation}
+                              style={workspacePrimaryButtonStyle}
+                            >
+                              {editingAnnotationId ? '保存修改' : '新增批注'}
+                            </Button>
+                            {editingAnnotationId ? (
+                              <Button
+                                onClick={handleCancelEditAnnotation}
+                                disabled={annotationSubmitting}
+                                style={workspaceSecondaryButtonStyle}
+                              >
+                                取消编辑
+                              </Button>
+                            ) : null}
+                          </Space>
+                        </Space>,
+                        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                          <List
+                            size="small"
+                            dataSource={[...annotations].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())}
+                            style={{ maxHeight: 340, overflowY: 'auto', paddingRight: 4 }}
+                            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无批注" /> }}
+                            renderItem={(item) => (
+                              <List.Item
+                                actions={[
+                                  <Button key="jump" size="small" onClick={() => setReadPage(item.page)}>
+                                    跳转
+                                  </Button>,
+                                  <Button key="edit" size="small" onClick={() => handleStartEditAnnotation(item)}>
+                                    编辑
+                                  </Button>,
+                                  <Popconfirm
+                                    key="delete"
+                                    title="删除这条批注？"
+                                    description="删除后不可恢复。"
+                                    okText="删除"
+                                    cancelText="取消"
+                                    okButtonProps={{ danger: true, loading: deletingAnnotationId === item.id }}
+                                    onConfirm={async () => handleDeleteAnnotation(item.id)}
+                                  >
+                                    <Button size="small" danger loading={deletingAnnotationId === item.id}>
+                                      删除
+                                    </Button>
+                                  </Popconfirm>,
+                                ]}
+                              >
+                                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                                  <Space size={8} wrap>
+                                    <Text strong>第 {item.page} 页</Text>
+                                    <Tag color={item.annotation_type === 'highlight' ? 'gold' : 'blue'} style={{ marginInlineEnd: 0 }}>
+                                      {item.annotation_type === 'highlight' ? '高亮' : '笔记'}
+                                    </Tag>
+                                    {editingAnnotationId === item.id ? <Tag color="processing">正在编辑</Tag> : null}
+                                  </Space>
+                                  <Paragraph
+                                    style={{ marginBottom: 0 }}
+                                    type="secondary"
+                                    ellipsis={{ rows: 2, expandable: true, symbol: '展开' }}
+                                  >
+                                    {item.content || item.quote_text || '(空)'}
+                                  </Paragraph>
                                 </Space>
-                                {notReadyCollectionPapers.length > 0 ? (
-                                  <Text type="secondary">
-                                    未就绪示例：{notReadyCollectionPapers.slice(0, 3).map((item) => item.title).join('；')}
-                                  </Text>
-                                ) : null}
-                              </Space>
+                              </List.Item>
                             )}
                           />
-                        ) : null
-                      ) : null}
-                      <Select
-                        placeholder="会话历史（仅自己可见）"
-                        value={askSessionId}
-                        allowClear
-                        onChange={(v) => {
-                          const next = Number(v || 0)
-                          setAskSessionId(next > 0 ? next : undefined)
-                        }}
-                        options={askSessions.map((item) => ({
-                          label: `${item.title || '未命名问题'} · ${String(item.updated_at || '').replace('T', ' ').slice(0, 16)}`,
-                          value: item.id,
-                        }))}
-                      />
-                      <TextArea
-                        rows={3}
-                        value={askQuestion}
-                        onChange={(e) => setAskQuestion(e.target.value)}
-                        placeholder="输入你的问题"
-                      />
-                      <Button type="primary" loading={asking} onClick={handleAsk}>
-                        开始询问
-                      </Button>
-                    </Space>,
-                    <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                      <Card size="small" title="回答">
-                        {renderAnswerWithCitations()}
-                      </Card>
-                      <Card size="small" title="会话记录">
+                        </Space>,
+                      )
+                    ),
+                  },
+                  {
+                    key: 'comment',
+                    label: '评论',
+                    children: (
+                      renderThreeTierPanel(
+                        '评论区',
+                        '查看公开评论，支持全部/同组筛选。',
+                        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                          <Radio.Group
+                            value={commentFilter}
+                            onChange={async (e) => {
+                              const next = e.target.value as CommentFilter
+                              setCommentFilter(next)
+                              try {
+                                await reloadComments(next)
+                              } catch {
+                                message.error('加载评论失败')
+                              }
+                            }}
+                            options={[
+                              { label: '全部', value: 'all' },
+                              { label: '同组', value: 'same_group' },
+                            ]}
+                          />
+                          <TextArea
+                            rows={4}
+                            value={commentText}
+                            onChange={(e) => setCommentText(e.target.value)}
+                            placeholder="输入评论"
+                            style={{ borderRadius: 10 }}
+                          />
+                          <Button onClick={handleAddComment} style={workspacePrimaryButtonStyle}>
+                            发布评论
+                          </Button>
+                        </Space>,
                         <List
                           size="small"
-                          dataSource={askMessages}
-                          locale={{ emptyText: '暂无会话消息' }}
+                          dataSource={comments}
+                          style={{ maxHeight: 300, overflowY: 'auto', paddingRight: 4 }}
                           renderItem={(item) => (
                             <List.Item>
-                              <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                                <Text strong>{item.role === 'assistant' ? '助手' : '我'}</Text>
+                              <Space direction="vertical" size={2}>
+                                <Text strong>{item.author?.full_name || item.author?.username || `用户${item.user_id}`}</Text>
                                 <Text>{item.content}</Text>
                               </Space>
                             </List.Item>
                           )}
-                        />
-                      </Card>
-                      <List
-                        size="small"
-                        header="引用来源（支持页码/章节定位）"
-                        dataSource={askSources}
-                        renderItem={(item, itemIndex) => {
-                          const pageTextValue = item.page
-                            ? `${item.page}${item.page_source === 'estimated' ? '（估算）' : ''}`
-                            : '未知'
-                          return (
-                            <List.Item
-                              actions={[
-                                <Button key="jump" size="small" onClick={() => void jumpToSource(item)}>
-                                  跳转
-                                </Button>,
-                              ]}
-                            >
-                              <Space direction="vertical" size={2}>
-                                <Text strong>{`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}</Text>
-                                <Space wrap size={4}>
-                                  <Tag>页码: {pageTextValue}</Tag>
-                                  {item.section_title ? <Tag color="blue">章节: {item.section_title}</Tag> : null}
-                                  {item.score_source === 'fallback' || item.score == null ? (
-                                    <Tag color="default">分数: 无（回退检索）</Tag>
-                                  ) : (
-                                    <Tag>分数: {item.score}</Tag>
-                                  )}
+                        />,
+                      )
+                    ),
+                  },
+                  {
+                    key: 'rating',
+                    label: '评分/入库',
+                    children: (
+                      renderThreeTierPanel(
+                        '评分与入库',
+                        '维护个人评分，并跟踪知识库处理状态。',
+                        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                          <Space align="center">
+                            <Text>我的评分</Text>
+                            <Rate value={ratingSummary?.my_rating || 0} onChange={handleRate} />
+                          </Space>
+                          <Space wrap>
+                            <Tag>全站均分: {ratingSummary?.global_avg ?? '-'}</Tag>
+                            <Tag>全站人数: {ratingSummary?.global_count ?? 0}</Tag>
+                            <Tag>同组均分: {ratingSummary?.same_group_avg ?? '-'}</Tag>
+                            <Tag>同组人数: {ratingSummary?.same_group_count ?? 0}</Tag>
+                          </Space>
+                          <Select
+                            style={{ width: '100%' }}
+                            placeholder="选择知识库"
+                            options={kbOptions}
+                            value={selectedKbId}
+                            onChange={(v) => setSelectedKbId(v)}
+                          />
+                          <Button onClick={handleAddToKnowledge}>加入知识库</Button>
+                        </Space>,
+                        <List
+                          size="small"
+                          dataSource={knowledgeLinks}
+                          renderItem={(item) => {
+                            const normalized = normalizeKnowledgeLinkStatus(item.status)
+                            const color =
+                              normalized === 'completed'
+                                ? 'green'
+                                : normalized === 'failed'
+                                  ? 'red'
+                                  : normalized === 'pending'
+                                    ? 'gold'
+                                    : normalized === 'running'
+                                      ? 'blue'
+                                      : 'default'
+                            return (
+                              <List.Item>
+                                <Space direction="vertical" size={2}>
+                                  <Text>KB#{item.knowledge_base_id}</Text>
+                                  <Tag color={color}>{normalized}</Tag>
+                                  {item.error_message ? <Text type="danger">{item.error_message}</Text> : null}
                                 </Space>
-                                <Text>{item.snippet}</Text>
+                              </List.Item>
+                            )
+                          }}
+                        />,
+                      )
+                    ),
+                  },
+                  {
+                    key: 'ask',
+                    label: '询问',
+                    children: (
+                      renderThreeTierPanel(
+                        '询问工作区',
+                        '配置提问范围与模式，查看回答、历史和可跳转来源。',
+                        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                          <Radio.Group
+                            value={askScope}
+                            onChange={(e) => setAskScope(e.target.value as LiteratureAskScope)}
+                            options={askScopeOptions}
+                          />
+                          <Radio.Group
+                            value={askMode}
+                            onChange={(e) => setAskMode(e.target.value as 'agentic' | 'classic')}
+                            options={askModeOptions}
+                          />
+                          {askScope === 'collection' ? (
+                            <Select
+                              placeholder="选择收藏夹"
+                              options={collectionOptions}
+                              value={askCollectionId}
+                              onChange={(v) => setAskCollectionId(v)}
+                            />
+                          ) : null}
+                          <Select
+                            placeholder="选择知识库"
+                            options={kbOptions}
+                            value={selectedKbId}
+                            onChange={(v) => setSelectedKbId(v)}
+                          />
+                          {askScope === 'collection' && askCollectionId && selectedKbId ? (
+                            collectionReadinessLoading ? (
+                              <Space>
+                                <Spin size="small" />
+                                <Text type="secondary">正在检查收藏夹入库就绪度...</Text>
                               </Space>
-                            </List.Item>
-                          )
-                        }}
-                      />
-                    </Space>,
-                  )
-                ),
-              },
+                            ) : collectionReadiness ? (
+                              <Alert
+                                showIcon
+                                type={collectionReadiness.can_cross_paper_answer ? 'info' : 'warning'}
+                                message={
+                                  collectionReadiness.can_cross_paper_answer
+                                    ? `可跨论文联合回答：${collectionReadiness.completed_papers}/${collectionReadiness.total_papers} 篇已就绪`
+                                    : '当前收藏夹暂无可联合回答论文'
+                                }
+                                description={(
+                                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                                    <Text type="secondary">
+                                      联合回答仅覆盖 `completed` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
+                                    </Text>
+                                    <Space wrap size={6}>
+                                      <Tag color="green">completed: {collectionReadiness.completed_papers}</Tag>
+                                      <Tag color="blue">running: {collectionReadiness.running_papers}</Tag>
+                                      <Tag color="gold">pending: {collectionReadiness.pending_papers}</Tag>
+                                      <Tag color="red">failed: {collectionReadiness.failed_papers}</Tag>
+                                      <Tag color="orange">timeout: {collectionReadiness.timeout_papers}</Tag>
+                                      <Tag color="purple">cancelled: {collectionReadiness.cancelled_papers}</Tag>
+                                      <Tag>missing: {collectionReadiness.missing_papers}</Tag>
+                                    </Space>
+                                    {notReadyCollectionPapers.length > 0 ? (
+                                      <Text type="secondary">
+                                        未就绪示例：{notReadyCollectionPapers.slice(0, 3).map((item) => item.title).join('；')}
+                                      </Text>
+                                    ) : null}
+                                  </Space>
+                                )}
+                              />
+                            ) : null
+                          ) : null}
+                          <Select
+                            placeholder="会话历史（仅自己可见）"
+                            value={askSessionId}
+                            allowClear
+                            onChange={(v) => {
+                              const next = Number(v || 0)
+                              setAskSessionId(next > 0 ? next : undefined)
+                            }}
+                            options={askSessions.map((item) => ({
+                              label: `${item.title || '未命名问题'} · ${String(item.updated_at || '').replace('T', ' ').slice(0, 16)}`,
+                              value: item.id,
+                            }))}
+                          />
+                          <TextArea
+                            rows={3}
+                            value={askQuestion}
+                            onChange={(e) => setAskQuestion(e.target.value)}
+                            placeholder="输入你的问题"
+                          />
+                          <Button type="primary" loading={asking} onClick={handleAsk}>
+                            开始询问
+                          </Button>
+                        </Space>,
+                        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                          <Card size="small" title="回答">
+                            {renderAnswerWithCitations()}
+                          </Card>
+                          <Card size="small" title="会话记录">
+                            <List
+                              size="small"
+                              dataSource={askMessages}
+                              locale={{ emptyText: '暂无会话消息' }}
+                              renderItem={(item) => (
+                                <List.Item>
+                                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                                    <Text strong>{item.role === 'assistant' ? '助手' : '我'}</Text>
+                                    <Text>{item.content}</Text>
+                                  </Space>
+                                </List.Item>
+                              )}
+                            />
+                          </Card>
+                          <List
+                            size="small"
+                            header="引用来源（支持页码/章节定位）"
+                            dataSource={askSources}
+                            renderItem={(item, itemIndex) => {
+                              const pageTextValue = item.page
+                                ? `${item.page}${item.page_source === 'estimated' ? '（估算）' : ''}`
+                                : '未知'
+                              return (
+                                <List.Item
+                                  actions={[
+                                    <Button key="jump" size="small" onClick={() => void jumpToSource(item)}>
+                                      跳转
+                                    </Button>,
+                                  ]}
+                                >
+                                  <Space direction="vertical" size={2}>
+                                    <Text strong>{`[来源${Number(item.idx || itemIndex + 1)}] ${item.document_name}`}</Text>
+                                    <Space wrap size={4}>
+                                      <Tag>页码: {pageTextValue}</Tag>
+                                      {item.section_title ? <Tag color="blue">章节: {item.section_title}</Tag> : null}
+                                      {item.score_source === 'fallback' || item.score == null ? (
+                                        <Tag color="default">分数: 无（回退检索）</Tag>
+                                      ) : (
+                                        <Tag>分数: {item.score}</Tag>
+                                      )}
+                                    </Space>
+                                    <Text>{item.snippet}</Text>
+                                  </Space>
+                                </List.Item>
+                              )
+                            }}
+                          />
+                        </Space>,
+                      )
+                    ),
+                  },
                 ]}
               />
             </div>
@@ -6720,7 +6817,7 @@ export default function PaperReaderPage() {
             )}
           </Card>
         </ConfigProvider>
-      </div>
-    </div>
+      </  div>
+    </  div>
   )
 }

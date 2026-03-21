@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     local_embedding_cache_dir: str = ""
     local_embedding_normalize: bool = True
     local_embedding_dimension: int = 0
+    local_embedding_prefer_safetensors: bool = True
+    local_embedding_local_files_only: bool = False
+    local_embedding_allow_legacy_pickle_fallback: bool = True
+    local_embedding_allow_runtime_cpu_fallback: bool = True
     mock_embedding_model: str = "mock/deterministic"
     mock_embedding_dimension: int = 256
     embedding_dimension_policy: Literal["fixed", "adaptive"] = "adaptive"
@@ -92,6 +96,7 @@ class Settings(BaseSettings):
     agent_knowledge_score_threshold: float = 0.5
     search_timeout_primary_ms: int = 300000
     search_timeout_fallback_ms: int = 90000
+    knowledge_search_timeout_ms: int = 45000
     search_timeout_auto_fallback: bool = True
 
     # Query rewrite
@@ -302,7 +307,13 @@ class Settings(BaseSettings):
     reader_agent_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
     reader_agent_model: str = "qwen-3.5-plus"
     reader_agent_timeout_ms: int = 90000
-    reader_agent_max_tokens: int = 7000
+    reader_agent_max_tokens: int = 12000
+    # Optional dedicated Phase 3 artifact-drafting model settings.
+    # Empty / zero values cleanly fall back to the Phase 2 reader-agent config.
+    reader_artifact_agent_provider: str = ""
+    reader_artifact_agent_model: str = ""
+    reader_artifact_agent_timeout_ms: int = 0
+    reader_artifact_agent_max_tokens: int = 24000
     reader_agent_max_steps: int = 12
     reader_agent_max_repair_rounds: int = 2
     # Optional startup cleanup for legacy compose cache keys.
@@ -331,7 +342,9 @@ class Settings(BaseSettings):
     generative_reader_agent_model: str = ""
     generative_reader_agent_tool_whitelist: str = "paper_read,knowledge_search,web_search,web_scrape"
     generative_reader_agent_max_iterations: int = 6
-    generative_reader_agent_timeout_seconds: int = 45
+    generative_reader_agent_timeout_seconds: int = 180
+    generative_reader_planner_timeout_seconds: int = 75
+    generative_reader_page_generation_timeout_seconds: int = 90
     # Legacy DeepSeek assembly timeout in seconds. <=0 means no timeout.
     reader_compose_layout_llm_timeout_seconds: int = 120
     # Reader anchor quality gate / jump control
@@ -427,4 +440,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

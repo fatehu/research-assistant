@@ -198,6 +198,62 @@ async def test_web_search_all_providers_failed(monkeypatch):
     assert result.error == "web_search_all_failed"
 
 
+class _FakeSearchResponse:
+    def __init__(self, payload: dict, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSearchClient:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, *args, **kwargs):
+        return _FakeSearchResponse(self._payload)
+
+
+@pytest.mark.asyncio
+async def test_web_search_serper_payload_is_guided_reading_ready(monkeypatch):
+    tool = agent_tools.WebSearchTool()
+    tool.serper_api_key = "x"
+    payload = {
+        "answerBox": {
+            "answer": "USMLE includes Step 1, Step 2 CK, and Step 3.",
+            "link": "https://www.usmle.org/",
+        },
+        "organic": [
+            {
+                "title": "USMLE Overview",
+                "link": "https://www.usmle.org/",
+                "snippet": "Official overview of the exam sequence and purpose.",
+            }
+        ],
+    }
+    monkeypatch.setattr(agent_tools.httpx, "AsyncClient", lambda **kwargs: _FakeSearchClient(payload))
+
+    result = await tool._serper_search("usmle overview", max_results=3)
+
+    assert result.success is True
+    assert result.data["source_kind"] == "public_web_search"
+    assert result.data["provider_route"] == "local.web_search.serper"
+    assert result.data["reader_summary"]
+    assert result.data["provenance"]["tool_kind"] == "web_search"
+    assert result.data["structured_content"]["results"][0]["rank"] == 1
+    assert result.data["structured_content"]["results"][0]["domain"] == "usmle.org"
+    assert result.data["structured_content"]["results"][0]["is_authoritative_source"] is True
+    assert result.data["public_links"][0]["href"] == "https://www.usmle.org/"
+    assert result.data["structured_content"]["domains"][0]["domain"] == "usmle.org"
+
+
 class _FakeEvalError:
     def __init__(self, message: str):
         self._message = message

@@ -75,6 +75,17 @@ function preferDisplayCopy(primary: unknown, fallback: unknown): string {
   return String(fallback || '').trim()
 }
 
+function shouldRenderModuleSummary(raw: unknown): boolean {
+  const text = String(raw || '').trim()
+  if (!text) return false
+  return ![
+    '先补一层必要的方法背景。',
+    '先补上理解当前内容需要的背景。',
+    '补充少量真正需要的外部背景，帮助理解正文。',
+    '先用图或关键证据建立抓手，再回到正文核对作者的解释。',
+  ].includes(text)
+}
+
 function extractLinkDomain(href: string): string {
   try {
     const url = new URL(String(href || '').trim())
@@ -99,7 +110,7 @@ function renderResourceModuleCard(props: ResourceModuleRendererProps) {
           {primaryDomain ? <Tag bordered={false} className="reader-experience-page__domain-chip">{primaryDomain}</Tag> : null}
         </div>
         <Title level={4} style={{ margin: 0 }}>{title}</Title>
-        {summary ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
+        {shouldRenderModuleSummary(summary) ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
         {links.length ? (
           <div className="reader-experience-page__resource-links">
             {links.map((item, index) => {
@@ -107,7 +118,6 @@ function renderResourceModuleCard(props: ResourceModuleRendererProps) {
               const href = String(row.href || '').trim()
               const label = String(row.label || href || 'Link').trim()
               const domain = extractLinkDomain(href)
-              const snippet = String(row.snippet || '').trim()
               if (!href) return null
               return (
                 <a
@@ -121,7 +131,6 @@ function renderResourceModuleCard(props: ResourceModuleRendererProps) {
                   }}
                 >
                   <span className="reader-experience-page__resource-link-title">{label}</span>
-                  {snippet ? <span className="reader-experience-page__resource-link-snippet">{snippet}</span> : null}
                   <span className="reader-experience-page__resource-link-meta">
                     <span>{domain || '外部来源'}</span>
                     <span aria-hidden="true">↗</span>
@@ -155,7 +164,7 @@ function renderGlossaryModule(props: InteractionModuleRendererProps) {
           <Text className="reader-experience-page__eyebrow">{eyebrow}</Text>
         </div>
         <Title level={4} style={{ margin: 0 }}>{title}</Title>
-        {summary ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
+        {shouldRenderModuleSummary(summary) ? <Paragraph className="reader-experience-page__summary">{summary}</Paragraph> : null}
         {terms.length ? (
           <div className="reader-experience-page__term-list">
             {terms.map((item, index) => {

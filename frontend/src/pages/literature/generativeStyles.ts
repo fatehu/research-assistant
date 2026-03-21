@@ -13,6 +13,7 @@ export type GenerativeStyleTokens = {
   bodyFontFamily: string
   bodyFontSize: number
   bodyLineHeight: number
+  bodyLetterSpacing: string
   headingFontFamily: string
 }
 
@@ -28,9 +29,9 @@ export const GENERATIVE_STYLE_TOKENS: Record<ReaderGenerativeStyleKey, Generativ
   journal_classic: {
     pageBackground: 'linear-gradient(180deg, #f4f0e8 0%, #ede8de 100%)',
     panelBackground: '#f8f4ec',
-    surfaceBackground: '#fffdfa',
+    surfaceBackground: '#f2efe6',
     railBackground: '#f5f0e7',
-    overlayBackground: '#fffaf1',
+    overlayBackground: '#f2efe6',
     borderColor: '#d6deea',
     headingColor: '#102a50',
     bodyColor: '#14223b',
@@ -38,6 +39,7 @@ export const GENERATIVE_STYLE_TOKENS: Record<ReaderGenerativeStyleKey, Generativ
     bodyFontFamily: '"Source Han Serif SC","Noto Serif SC","Source Serif 4","Times New Roman",serif',
     bodyFontSize: 18,
     bodyLineHeight: 1.95,
+    bodyLetterSpacing: '0em',
     headingFontFamily: '"Source Han Serif SC","Noto Serif SC","Source Serif 4","Times New Roman",serif',
   },
   clinical_brief: {
@@ -53,6 +55,7 @@ export const GENERATIVE_STYLE_TOKENS: Record<ReaderGenerativeStyleKey, Generativ
     bodyFontFamily: '"IBM Plex Sans","Noto Sans SC","Segoe UI",sans-serif',
     bodyFontSize: 17,
     bodyLineHeight: 1.85,
+    bodyLetterSpacing: '0em',
     headingFontFamily: '"IBM Plex Sans","Noto Sans SC","Segoe UI",sans-serif',
   },
   preprint_modern: {
@@ -68,6 +71,7 @@ export const GENERATIVE_STYLE_TOKENS: Record<ReaderGenerativeStyleKey, Generativ
     bodyFontFamily: '"Space Grotesk","Noto Sans SC","Segoe UI",sans-serif',
     bodyFontSize: 17,
     bodyLineHeight: 1.85,
+    bodyLetterSpacing: '0em',
     headingFontFamily: '"Space Grotesk","Noto Sans SC","Segoe UI",sans-serif',
   },
 }

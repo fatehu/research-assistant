@@ -73,21 +73,37 @@ function stripLeadingListBullet(text: string): string {
   return String(text ?? '').replace(/^\s*[·•●◦▪‣]\s*/, '').trim()
 }
 
-function renderNormalizedInlineText(text: string): ReactNode {
+export function renderNormalizedInlineText(text: string): ReactNode {
   const source = String(text ?? '')
-  if (!source.includes('^')) return source
-  const parts = source.split(/(\^\d{1,3})/g)
-  if (parts.length <= 1) return source
-  return parts.map((part, idx) => {
-    if (/^\^\d{1,3}$/.test(part)) {
-      return (
-        <sup key={`sup-${idx}`}>
-          {part.slice(1)}
-        </sup>
-      )
+  if (!source || !source.includes('^')) return source
+
+  // Keep generic prose rendering conservative: superscript-only.
+  // Underscore-based parsing in body text incorrectly rewrites identifiers such as q4_k or mlp.down_proj.
+  const pattern = /([A-Za-z0-9)\]])(?:\^\{([^}]+)\}|\^([A-Za-z0-9+-]+))/g
+  const nodes: ReactNode[] = []
+  let cursor = 0
+  let match: RegExpExecArray | null = null
+
+  while ((match = pattern.exec(source)) !== null) {
+    const [token, base, supBraced, supSimple] = match
+    const start = match.index
+    if (start > cursor) {
+      nodes.push(<Fragment key={`txt-${cursor}`}>{source.slice(cursor, start)}</Fragment>)
     }
-    return <Fragment key={`txt-${idx}`}>{part}</Fragment>
-  })
+    const suffix = supBraced || supSimple || ''
+    nodes.push(
+      <Fragment key={`token-${start}`}>
+        {base}
+        <sup>{suffix}</sup>
+      </Fragment>,
+    )
+    cursor = start + token.length
+  }
+
+  if (cursor < source.length) {
+    nodes.push(<Fragment key={`txt-tail-${cursor}`}>{source.slice(cursor)}</Fragment>)
+  }
+  return nodes.length > 0 ? nodes : source
 }
 
 function normalizeDoiHref(value: unknown): string {
@@ -510,8 +526,18 @@ function isJumpableAnchor(
   return true
 }
 
+function isDarkColorToken(value: string | undefined): boolean {
+  const token = String(value || '').trim().toLowerCase()
+  if (!token) return false
+  return token.includes('#202733')
+    || token.includes('#171d26')
+    || token.includes('#262e3a')
+    || token.includes('#11161e')
+    || token.includes('rgba(18, 26, 44')
+}
+
 function baseCardStyle(ctx?: ReaderComponentRenderContext): CSSProperties {
-  const isDark = ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44')
+  const isDark = isDarkColorToken(ctx?.themeStyle?.panelBackground)
   return {
     borderRadius: 16,
     border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
@@ -522,7 +548,7 @@ function baseCardStyle(ctx?: ReaderComponentRenderContext): CSSProperties {
 }
 
 function isDarkTheme(ctx?: ReaderComponentRenderContext): boolean {
-  return Boolean(ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44'))
+  return isDarkColorToken(ctx?.themeStyle?.panelBackground)
 }
 
 function cardSurfaceStyles(
@@ -942,6 +968,8 @@ function EquationBlockNode(props: {
     ? Number((node.props || {}).normalization_confidence || 0)
     : null
   const renderMode = normalizeEquationRenderMode((node.props || {}).render_mode)
+  const effectiveRenderMode: 'image_first' | 'math_first' | 'text_only' = normalizedLatex ? 'math_first' : renderMode
+  const preferredLatex = normalizedLatex || latex
   const resolveAnchorPreviewImage = ctx.resolveAnchorPreviewImage
   const [evidenceImage, setEvidenceImage] = useState<string | null>(null)
 
@@ -964,7 +992,7 @@ function EquationBlockNode(props: {
       preferredPage: Number(anchorRefs[0]?.page || 0) || undefined,
       sourceBlockIds,
       sourceAtomIds,
-      variant: renderMode === 'image_first' ? 'display_formula' : 'default',
+      variant: effectiveRenderMode === 'image_first' ? 'display_formula' : 'default',
     }).then((imageUrl) => {
       if (!cancelled) setEvidenceImage(imageUrl || null)
     }).catch(() => {
@@ -975,7 +1003,7 @@ function EquationBlockNode(props: {
     }
   }, [
     resolveAnchorPreviewImage,
-    renderMode,
+    effectiveRenderMode,
     node.source_anchor_refs,
     node.source_block_ids,
     node.source_atom_ids,
@@ -997,7 +1025,7 @@ function EquationBlockNode(props: {
         padding: '10px 0',
         color: ctx.themeStyle?.bodyColor,
       }}>
-        {evidenceImage && renderMode === 'image_first' ? (
+        {evidenceImage && effectiveRenderMode === 'image_first' ? (
           <div
             style={{
               display: 'inline-flex',
@@ -1017,17 +1045,44 @@ function EquationBlockNode(props: {
               style={{ maxWidth: '100%', height: 'auto', borderRadius: 8 }}
             />
           </div>
-        ) : renderMode === 'math_first' && latex ? (
-          <div style={{ display: 'inline-block', verticalAlign: 'middle', textAlign: 'left' }}>
-            <ReactMarkdown
-              remarkPlugins={[remarkMath]}
-              rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
-              components={{
-                p: ({ children }) => <>{children}</>,
-              }}
-            >
-              {buildEquationMarkdown(latex)}
-            </ReactMarkdown>
+        ) : effectiveRenderMode === 'math_first' && preferredLatex ? (
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 16,
+              width: '100%',
+              maxWidth: '100%',
+              verticalAlign: 'middle',
+            }}
+          >
+            <div style={{ display: 'inline-block', verticalAlign: 'middle', textAlign: 'left', overflowX: 'auto' }}>
+              <ReactMarkdown
+                remarkPlugins={[remarkMath]}
+                rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: 'ignore' }] as any]}
+                components={{
+                  p: ({ children }) => <>{children}</>,
+                }}
+              >
+                {buildEquationMarkdown(preferredLatex)}
+              </ReactMarkdown>
+            </div>
+            {label ? (
+              <div
+                style={{
+                  flex: '0 0 auto',
+                  minWidth: 36,
+                  textAlign: 'right',
+                  color: ctx.themeStyle?.bodyColor,
+                  opacity: 0.7,
+                  fontSize: 14,
+                  lineHeight: 1.4,
+                }}
+              >
+                {label}
+              </div>
+            ) : null}
           </div>
         ) : (
           <pre
@@ -1050,7 +1105,7 @@ function EquationBlockNode(props: {
           </pre>
         )}
       </div>
-      {label ? (
+      {label && effectiveRenderMode !== 'math_first' ? (
         <div style={{ marginTop: 8, color: ctx.themeStyle?.bodyColor, opacity: 0.65, fontSize: 13 }}>
           {label}
         </div>
@@ -1070,7 +1125,7 @@ function EquationBlockNode(props: {
       {(normalizedLatex || normalizedText || normalizationReason) ? (
         <details style={{ marginTop: 12, textAlign: 'left' }}>
           <summary style={{ cursor: 'pointer', color: ctx.themeStyle?.bodyColor, opacity: 0.78 }}>
-            查看 AI 规范化公式
+            查看规范化详情
           </summary>
           <div
             style={{
@@ -1127,7 +1182,7 @@ function EquationBlockNode(props: {
           </div>
         </details>
       ) : null}
-      {renderMode === 'image_first' && transcript ? (
+      {effectiveRenderMode === 'image_first' && transcript ? (
         <details style={{ marginTop: 12, textAlign: 'left' }}>
           <summary style={{ cursor: 'pointer', color: ctx.themeStyle?.bodyColor, opacity: 0.72 }}>
             查看 OCR 转写
@@ -1170,6 +1225,7 @@ function ParagraphProseNode(props: {
     textAlign: 'justify',
     color: ctx.themeStyle?.bodyColor,
     fontFamily: ctx.themeStyle?.bodyFontFamily,
+    letterSpacing: ctx.themeStyle?.bodyLetterSpacing,
   }
   const paragraphRows = paragraphs.length > 0
     ? paragraphs
@@ -1482,6 +1538,8 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 lineHeight: 1.9,
                 color: ctx.themeStyle?.bodyColor,
                 fontFamily: ctx.themeStyle?.bodyFontFamily,
+                fontSize: ctx.themeStyle?.bodyFontSize,
+                letterSpacing: ctx.themeStyle?.bodyLetterSpacing,
               }}
             >
               {items.map((item, idx) => (
@@ -1506,6 +1564,11 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const preferContain = imageFit !== 'cover'
       const sourceLabel = deriveFigureSourceLabel(caption, asString(props.source_label))
       const aiInsight = asString(props.ai_insight)
+      const darkMode = isDarkTheme(ctx)
+      const mediaSurfaceBackground = darkMode ? 'rgba(255, 255, 255, 0.035)' : 'rgba(15, 23, 42, 0.03)'
+      const detailSurfaceBackground = darkMode ? 'rgba(255, 255, 255, 0.045)' : 'rgba(15, 23, 42, 0.03)'
+      const insightSurfaceBackground = darkMode ? 'rgba(73, 127, 255, 0.14)' : 'rgba(23, 119, 255, 0.04)'
+      const insightBorderColor = darkMode ? 'rgba(112, 157, 255, 0.58)' : '#1677ff'
       return withAnchorPreview(
         <DraggableContainer node={node}>
           <Card size="small" style={{ ...baseCardStyle(ctx), marginBottom: 14 }} styles={cardSurfaceStyles(ctx, { bodyPadding: '16px 16px' })}>
@@ -1532,7 +1595,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             {imageUrl ? (
               <div
                 style={{
-                  background: preferContain ? 'rgba(15, 23, 42, 0.03)' : 'transparent',
+                  background: preferContain ? mediaSurfaceBackground : 'transparent',
                   borderRadius: 12,
                   padding: preferContain ? 12 : 0,
                 }}
@@ -1558,19 +1621,28 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                   marginTop: 12,
                   padding: '12px 14px',
                   borderRadius: 12,
-                  background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44')
-                    ? 'rgba(255, 255, 255, 0.04)'
-                    : 'rgba(15, 23, 42, 0.03)',
+                  background: detailSurfaceBackground,
                   border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
                 }}
               >
-                {sourceLabel ? <Tag style={{ marginBottom: 8 }}>{sourceLabel}</Tag> : null}
+                {sourceLabel ? (
+                  <Tag
+                    style={{
+                      marginBottom: 8,
+                      color: ctx?.themeStyle?.headingColor,
+                      background: darkMode ? 'rgba(109, 136, 196, 0.16)' : 'rgba(255,255,255,0.7)',
+                      borderColor: ctx?.themeStyle?.borderColor,
+                    }}
+                  >
+                    {sourceLabel}
+                  </Tag>
+                ) : null}
                 {caption ? (
                   <Paragraph
                     style={{
                       marginBottom: 0,
                       color: ctx?.themeStyle?.bodyColor,
-                      opacity: 0.88,
+                      opacity: darkMode ? 0.96 : 0.88,
                       lineHeight: 1.72,
                       whiteSpace: 'pre-wrap',
                     }}
@@ -1583,11 +1655,12 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             {aiInsight ? (
               <div style={{
                 marginTop: 14, padding: '12px 16px',
-                background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(22, 119, 255, 0.05)' : 'rgba(23, 119, 255, 0.04)',
-                borderRadius: 10, borderLeft: '4px solid #1677ff'
+                background: insightSurfaceBackground,
+                borderRadius: 10,
+                borderLeft: `4px solid ${insightBorderColor}`,
               }}>
-                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>✨ AI 深度洞察</Text>
-                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7 }}>{aiInsight}</Text>
+                <Text strong style={{ color: darkMode ? '#b7cbff' : '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>✨ AI 深度洞察</Text>
+                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7, opacity: darkMode ? 0.98 : 1 }}>{aiInsight}</Text>
               </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>
@@ -1610,6 +1683,10 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const notes = asStringArray(props.notes)
       const rawMarkdown = asString(props.raw_markdown)
       const aiInsight = asString(props.ai_insight)
+      const darkMode = isDarkTheme(ctx)
+      const detailSurfaceBackground = darkMode ? 'rgba(255, 255, 255, 0.045)' : 'rgba(15, 23, 42, 0.03)'
+      const insightSurfaceBackground = darkMode ? 'rgba(73, 127, 255, 0.14)' : 'rgba(23, 119, 255, 0.04)'
+      const insightBorderColor = darkMode ? 'rgba(112, 157, 255, 0.58)' : '#1677ff'
       const fallbackMatrix = rows.length
         ? [
             headers.length ? headers : Object.keys(rows[0] || {}),
@@ -1881,14 +1958,24 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
               />
             )}
             {effectiveCaption ? (
-              <Paragraph style={{ marginTop: 12, marginBottom: 0, color: ctx?.themeStyle?.bodyColor, opacity: 0.82, lineHeight: 1.65 }}>
-                {effectiveCaption}
-              </Paragraph>
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: '12px 14px',
+                  borderRadius: 12,
+                  background: detailSurfaceBackground,
+                  border: `1px solid ${ctx?.themeStyle?.borderColor || 'rgba(9, 30, 66, 0.08)'}`,
+                }}
+              >
+                <Paragraph style={{ marginBottom: 0, color: ctx?.themeStyle?.bodyColor, opacity: darkMode ? 0.96 : 0.82, lineHeight: 1.65 }}>
+                  {effectiveCaption}
+                </Paragraph>
+              </div>
             ) : null}
             {notes.length > 0 ? (
               <div style={{ marginTop: 10 }}>
                 {notes.map((note, idx) => (
-                  <Paragraph key={`table-note-${idx}`} style={{ marginBottom: idx === notes.length - 1 ? 0 : 6, color: ctx?.themeStyle?.bodyColor, opacity: 0.72, fontSize: 12, lineHeight: 1.55 }}>
+                  <Paragraph key={`table-note-${idx}`} style={{ marginBottom: idx === notes.length - 1 ? 0 : 6, color: ctx?.themeStyle?.bodyColor, opacity: darkMode ? 0.9 : 0.72, fontSize: 12, lineHeight: 1.55 }}>
                     {note}
                   </Paragraph>
                 ))}
@@ -1897,11 +1984,12 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
             {aiInsight ? (
               <div style={{
                 marginTop: 14, padding: '12px 16px',
-                background: ctx?.themeStyle?.panelBackground?.includes('rgba(18, 26, 44') ? 'rgba(22, 119, 255, 0.05)' : 'rgba(23, 119, 255, 0.04)',
-                borderRadius: 10, borderLeft: '4px solid #1677ff'
+                background: insightSurfaceBackground,
+                borderRadius: 10,
+                borderLeft: `4px solid ${insightBorderColor}`
               }}>
-                <Text strong style={{ color: '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>📊 AI 数据解读</Text>
-                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7 }}>{aiInsight}</Text>
+                <Text strong style={{ color: darkMode ? '#b7cbff' : '#1677ff', display: 'block', marginBottom: 6, fontSize: 13, letterSpacing: 0.5 }}>📊 AI 数据解读</Text>
+                <Text style={{ color: ctx?.themeStyle?.bodyColor, lineHeight: 1.7, opacity: darkMode ? 0.98 : 1 }}>{aiInsight}</Text>
               </div>
             ) : null}
             <div style={{ marginTop: 10 }}>{renderChildren(node.children || [], ctx)}</div>

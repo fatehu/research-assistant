@@ -16,6 +16,8 @@ const PaperReaderPage = lazy(() => import('@/pages/literature').then((m) => ({ d
 const PaperReaderReviewPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderReviewPage })))
 const PaperReaderWorkbenchPage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderWorkbenchPage })))
 const PaperReaderExperiencePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderExperiencePage })))
+const PaperReaderWorkbenchV2Page = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderWorkbenchV2Page })))
+const PaperReaderExperienceV2Page = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderExperienceV2Page })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
 const AdminStatisticsPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.StatisticsPage })))
@@ -166,6 +168,26 @@ function App() {
             <PrivateRoute>
               <ErrorBoundary>
                 {withSuspense(<PaperReaderExperiencePage />)}
+              </ErrorBoundary>
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/workbench-v2"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderWorkbenchV2Page />)}
+              </ErrorBoundary>
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/literature/:paperId/experience-v2"
+          element={
+            <PrivateRoute>
+              <ErrorBoundary>
+                {withSuspense(<PaperReaderExperienceV2Page />)}
               </ErrorBoundary>
             </PrivateRoute>
           }

@@ -4,7 +4,9 @@ import axios, { AxiosError } from 'axios'
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
-const LONG_RUNNING_READER_TIMEOUT_MS = 180000
+// Let long-running reader/workbench v2 builds be bounded by backend/runtime policy
+// instead of a browser-side hard timeout that aborts valid cold-start executions.
+const LONG_RUNNING_READER_TIMEOUT_MS = 0
 
 export interface ApiErrorContract {
   code?: string
@@ -34,6 +36,25 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
+
+const inflightCachedExperienceRequests = new Map<string, Promise<ReaderExperiencePlanResponse>>()
+const inflightCachedExperienceV2Requests = new Map<string, Promise<ReaderExperienceV2Response>>()
+
+function reuseInflightRequest<T>(
+  inflight: Map<string, Promise<T>>,
+  key: string,
+  factory: () => Promise<T>,
+): Promise<T> {
+  const cached = inflight.get(key)
+  if (cached) return cached
+  const request = factory().finally(() => {
+    if (inflight.get(key) === request) {
+      inflight.delete(key)
+    }
+  })
+  inflight.set(key, request)
+  return request
+}
 
 // Request interceptor - attach token
 api.interceptors.request.use((config) => {
@@ -1426,6 +1447,25 @@ export interface ReaderGenerativeJsWidgetPlan {
   meta: Record<string, unknown>
 }
 
+export interface ReaderAdjacentPageItem {
+  label: string
+  description: string
+}
+
+export interface ReaderAdjacentPageContext {
+  page: number
+  relation: string
+  reference_only: boolean
+  source: string
+  summary: string
+  body_text: string
+  figures: ReaderAdjacentPageItem[]
+  tables: ReaderAdjacentPageItem[]
+  equations: ReaderAdjacentPageItem[]
+  continuation_hints: string[]
+  raw_text: string
+}
+
 export interface ReaderGenerativePlan {
   version: string
   status: 'draft' | 'done' | 'fallback'
@@ -1511,6 +1551,56 @@ export interface ReaderExperienceSection {
   meta: Record<string, unknown>
 }
 
+export interface ReaderExperienceGuidedBeat {
+  beat_id: string
+  beat_type: string
+  section_type_hint: string
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  reader_goal: string
+  continuity_note: string
+  target_ids: string[]
+  tool_objectives: string[]
+  block_stack: ReaderExperienceBlockRef[]
+  drop_notes: string[]
+  importance: number
+  meta: Record<string, unknown>
+}
+
+export interface ReaderTeachingManuscriptReferenceLink {
+  label: string
+  href: string
+  note?: string
+}
+
+export interface ReaderTeachingManuscriptGlossaryItem {
+  term: string
+  note: string
+}
+
+export interface ReaderTeachingManuscriptSegment {
+  segment_id: string
+  segment_type: 'figure' | 'body' | 'bridge' | string
+  title: string
+  teaching_text: string
+  anchor_excerpt?: string
+  target_ids: string[]
+  glossary?: ReaderTeachingManuscriptGlossaryItem[]
+  adjacent_bridge?: string
+  reference_links?: ReaderTeachingManuscriptReferenceLink[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderTeachingManuscript {
+  version?: string
+  status?: 'done' | 'fallback' | 'seed' | string
+  title?: string
+  opening?: string
+  segments: ReaderTeachingManuscriptSegment[]
+}
+
 export interface ReaderExperiencePlan {
   version: string
   status: 'draft' | 'done' | 'fallback'
@@ -1523,6 +1613,8 @@ export interface ReaderExperiencePlan {
   narrative_goal: string
   hero: ReaderExperienceHero
   main_sections: ReaderExperienceSection[]
+  guided_beats: ReaderExperienceGuidedBeat[]
+  teaching_manuscript?: ReaderTeachingManuscript | null
   supporting_resources: ReaderGenerativeResourceModule[]
   interactive_blocks: ReaderGenerativeInteractionModule[]
   widget_blocks: ReaderGenerativeJsWidgetPlan[]
@@ -1847,6 +1939,8 @@ export interface ReaderGenerativePlanResponse {
   cache_layer: string
   plan_cache_hit: boolean
   plan_cache_layer: string
+  adjacent_page_context: ReaderAdjacentPageContext[]
+  page_dossier: Record<string, unknown>
 }
 
 export interface ReaderExperiencePlanResponse {
@@ -1865,6 +1959,114 @@ export interface ReaderExperiencePlanResponse {
   generative_plan_cache_layer: string
   experience_cache_hit: boolean
   experience_cache_layer: string
+  adjacent_page_context: ReaderAdjacentPageContext[]
+  page_dossier: Record<string, unknown>
+}
+
+export type PageArtifactV2SegmentKind =
+  | 'heading'
+  | 'paragraph'
+  | 'original_excerpt'
+  | 'authored_explanation'
+  | 'figure_slot'
+  | 'table_slot'
+  | 'equation_slot'
+  | 'media_slot'
+  | 'aside_content'
+  | 'term_annotation'
+  | 'external_resource'
+
+export interface PageArtifactV2ReadingBlock {
+  segment_id: string
+  segment_kind: PageArtifactV2SegmentKind
+  source_lane: 'current_page' | 'authoring_plan'
+  page: number
+  text: string
+  source_layout_ids: string[]
+  source_block_ids: string[]
+  evidence_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface PageArtifactV2 {
+  version: 'page_artifact_v2'
+  artifact_contract_id: 'page_artifact_v2.contract.v1'
+  focus_page: number
+  reader_profile: string
+  dossier_signature: string
+  session_id?: string | null
+  template_id: string
+  layout_recipe: string
+  presentation_mode: string
+  widget_family: string
+  motion_preset: string
+  interaction_policy: string
+  reading_blocks: PageArtifactV2ReadingBlock[]
+  current_page_spine: {
+    page: number
+    owner: string
+    primary: boolean
+    reading_node_ids: string[]
+    layout_ids: string[]
+    block_ids: string[]
+    evidence_ids: string[]
+    main_segment_ids: string[]
+    meta: Record<string, unknown>
+  }
+  provenance: {
+    continuity_mode: string
+    adjacent_context_pages: number[]
+    include_adjacent_as_coequal_anchor: boolean
+    source_lanes: Record<string, unknown>
+    meta: Record<string, unknown>
+  }
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceV2Request {
+  page: number
+  selected_kb_id?: number
+  user_intent?: string
+  reader_profile?: string
+  force_refresh?: boolean
+  regenerate?: boolean
+}
+
+export interface ReaderExperienceV2Response {
+  focus_page: number
+  status: 'ready' | 'generating' | 'failed'
+  artifact?: PageArtifactV2 | null
+  compose_payload?: ReaderComposePayload | null
+  compose_status?: string
+  compose_build_mode?: string
+  compose_source_signature?: string
+  source_sig_hash?: string
+  artifact_cache_hit?: boolean
+  artifact_cache_layer?: string
+  session_cache_hit?: boolean
+  session_cache_layer?: string
+  session_id?: string
+  session_status?: string
+  failure_detail?: string
+  meta?: Record<string, unknown>
+}
+
+export interface ReaderWorkbenchV2Response {
+  focus_page: number
+  status: 'ready' | 'running' | 'failed' | 'empty'
+  compose_payload?: ReaderComposePayload | null
+  reading_dossier?: Record<string, unknown> | null
+  session?: Record<string, unknown> | null
+  artifact?: PageArtifactV2 | null
+  artifact_validation?: Record<string, unknown> | null
+  compose_source_signature?: string
+  source_sig_hash?: string
+  session_cache_hit?: boolean
+  session_cache_layer?: string
+  artifact_cache_hit?: boolean
+  artifact_cache_layer?: string
+  failure_detail?: string
+  meta?: Record<string, unknown>
 }
 
 export interface ReaderNodeActionRequest {
@@ -2459,10 +2661,52 @@ export const literatureApi = {
     paperId: number,
     payload: ReaderExperiencePlanRequest,
   ): Promise<ReaderExperiencePlanResponse> => {
+    const requestKey = JSON.stringify(['experience_plan_cached', paperId, payload])
+    return reuseInflightRequest(inflightCachedExperienceRequests, requestKey, async () => {
+      const response = await api.post(
+        `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
+        payload,
+        { timeout: 30000 },
+      )
+      return response.data
+    })
+  },
+
+  getCachedReaderExperienceV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderExperienceV2Response> => {
+    const requestKey = JSON.stringify(['experience_v2_cached', paperId, payload])
+    return reuseInflightRequest(inflightCachedExperienceV2Requests, requestKey, async () => {
+      const response = await api.post(
+        `/api/v1/literature/papers/${paperId}/experience-v2/cached`,
+        payload,
+        { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+      )
+      return response.data
+    })
+  },
+
+  getReaderExperienceV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderExperienceV2Response> => {
     const response = await api.post(
-      `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
+      `/api/v1/literature/papers/${paperId}/experience-v2`,
       payload,
-      { timeout: 30000 },
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getReaderWorkbenchV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderWorkbenchV2Response> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/workbench-v2`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
     )
     return response.data
   },

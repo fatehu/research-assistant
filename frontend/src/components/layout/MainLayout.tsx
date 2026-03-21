@@ -543,7 +543,7 @@ const MainLayout = () => {
   }, [location.pathname, menuItems])
 
   return (
-    <Layout className="h-screen bg-slate-950">
+    <Layout className="flex h-screen min-h-0 overflow-hidden bg-slate-950">
       {/* 侧边栏 */}
       <Sider
         width={280}
@@ -741,9 +741,12 @@ const MainLayout = () => {
       </Sider>
       
       {/* 主内容区 */}
-      <Layout className="bg-slate-950" style={{ marginLeft: collapsed ? 72 : 280, transition: 'margin-left 0.2s' }}>
+      <Layout
+        className="main-layout__content-shell flex min-h-0 flex-1 flex-col overflow-hidden bg-slate-950"
+        style={{ marginLeft: collapsed ? 72 : 280, transition: 'margin-left 0.2s' }}
+      >
         {/* 顶部栏 */}
-        <Header className="h-14 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl" style={{ zIndex: 100 }}>
+        <Header className="h-14 shrink-0 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl" style={{ zIndex: 100 }}>
           {/* 搜索 */}
           <div className="flex-1 max-w-md relative" ref={searchContainerRef}>
             <Input
@@ -858,7 +861,7 @@ const MainLayout = () => {
         </Header>
         
         {/* 内容 */}
-        <Content className="overflow-auto">
+        <Content className="main-layout__content min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
           <Outlet />
         </Content>
       </Layout>

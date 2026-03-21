@@ -1,0 +1,2667 @@
+{
+  "version": "reading_dossier_v2",
+  "dossier_contract": "rd2.v1",
+  "focus_page": 7,
+  "reader_profile": "curious_generalist",
+  "compose_source_signature": "compose_v3|p:78|kb:0|m:1772896437|s:1065400|pm:single_agent_v2|pv:layout_uid_v1|mode:auto/light/standard/0/0|h:02bbc305bf226cc17021857b",
+  "current_page": {
+    "owner": "compose/page_grounding_v1",
+    "fidelity": "grounded_evidence",
+    "build_meta": {
+      "status": "done",
+      "build_mode": "compose_agent_layout_uid_v1",
+      "pipeline_version": "layout_uid_v1",
+      "degraded": false,
+      "degraded_reason": "",
+      "compose_assets": [
+        {
+          "kind": "link",
+          "label": "Paper Home",
+          "source": "metadata",
+          "href": "https://openalex.org/W4319662928",
+          "meta": {
+            "asset_id": "",
+            "layout_unique_id": "",
+            "layout_id": "",
+            "page": 7
+          }
+        },
+        {
+          "kind": "link",
+          "label": "PDF Source",
+          "source": "metadata",
+          "href": "https://journals.plos.org/digitalhealth/article/file?id=10.1371/journal.pdig.0000198&type=printable",
+          "meta": {
+            "asset_id": "",
+            "layout_unique_id": "",
+            "layout_id": "",
+            "page": 7
+          }
+        },
+        {
+          "kind": "link",
+          "label": "DOI: 10.1371/journal.pdig.0000198",
+          "source": "metadata",
+          "href": "https://doi.org/10.1371/journal.pdig.0000198",
+          "meta": {
+            "asset_id": "",
+            "layout_unique_id": "",
+            "layout_id": "",
+            "page": 7
+          }
+        },
+        {
+          "kind": "link",
+          "label": "DOI: 10.1371/journal.pdig.0000198.g003",
+          "source": "text",
+          "href": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+          "meta": {
+            "asset_id": "",
+            "layout_unique_id": "",
+            "layout_id": "",
+            "page": 7
+          }
+        }
+      ]
+    },
+    "rich_grounding": {
+      "version": "page_grounding_v1",
+      "page": 7,
+      "layout_atoms": [
+        {
+          "layout_id": "3e0e67d4468dbfd8ab7c569f6c9fa501",
+          "reading_order": 2,
+          "layout_type": "head",
+          "layout_sub_type": "page_header",
+          "raw_text": "ChatGPT and medical education",
+          "clean_text": "ChatGPT and medical education",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "right",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 1121.0,
+              "y": 94.0
+            },
+            {
+              "x": 1397.0,
+              "y": 94.0
+            },
+            {
+              "x": 1397.0,
+              "y": 116.0
+            },
+            {
+              "x": 1121.0,
+              "y": 116.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "ChatGPT and medical education",
+              "pos": [
+                {
+                  "x": 1120.0,
+                  "y": 94.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 94.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 115.0
+                },
+                {
+                  "x": 1120.0,
+                  "y": 115.0
+                }
+              ],
+              "style_id": 1
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l002_b001"
+          ],
+          "node_kind": "header",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "4af8eac11276f156a7e649c9b6744a0c",
+          "reading_order": 3,
+          "layout_type": "header_line",
+          "layout_sub_type": "none",
+          "raw_text": "[empty]",
+          "clean_text": "[empty]",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "left",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 81.0,
+              "y": 130.0
+            },
+            {
+              "x": 1397.0,
+              "y": 130.0
+            },
+            {
+              "x": 1397.0,
+              "y": 134.0
+            },
+            {
+              "x": 81.0,
+              "y": 134.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "[empty]",
+              "pos": [
+                {
+                  "x": 81.0,
+                  "y": 130.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 130.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 134.0
+                },
+                {
+                  "x": 81.0,
+                  "y": 134.0
+                }
+              ],
+              "style_id": 0
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l003_b001"
+          ],
+          "node_kind": "header",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "984badf7f0354e29a834e8248cbbd067",
+          "reading_order": 4,
+          "layout_type": "foot",
+          "layout_sub_type": "page_footer",
+          "raw_text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198 February 9,2023",
+          "clean_text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198 February 9,2023",
+          "normalized_text": "PLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023",
+          "normalization_reason": "Footer text cleaned: added spaces around pipe and date",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.95,
+          "alignment": "left",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 84.0,
+              "y": 1814.0
+            },
+            {
+              "x": 805.0,
+              "y": 1814.0
+            },
+            {
+              "x": 805.0,
+              "y": 1838.0
+            },
+            {
+              "x": 84.0,
+              "y": 1838.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198",
+              "pos": [
+                {
+                  "x": 85.0,
+                  "y": 1812.0
+                },
+                {
+                  "x": 645.0,
+                  "y": 1812.0
+                },
+                {
+                  "x": 645.0,
+                  "y": 1839.0
+                },
+                {
+                  "x": 85.0,
+                  "y": 1839.0
+                }
+              ],
+              "style_id": 2
+            },
+            {
+              "block_index": 2,
+              "text": "February 9,2023",
+              "pos": [
+                {
+                  "x": 656.0,
+                  "y": 1815.0
+                },
+                {
+                  "x": 803.0,
+                  "y": 1815.0
+                },
+                {
+                  "x": 803.0,
+                  "y": 1836.0
+                },
+                {
+                  "x": 656.0,
+                  "y": 1836.0
+                }
+              ],
+              "style_id": 3
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l004_b001",
+            "p7_dm_p7_l004_b002"
+          ],
+          "node_kind": "footer",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 2,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "5a78710651c0a081462431d5364afdae",
+          "reading_order": 5,
+          "layout_type": "foot_pagenum",
+          "layout_sub_type": "page",
+          "raw_text": "7/12",
+          "clean_text": "7/12",
+          "normalized_text": "",
+          "normalization_reason": "Redundant page number in footer bundle",
+          "normalization_mode": "footer_hide_fragment",
+          "normalization_confidence": 0.98,
+          "alignment": "right",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 1349.0,
+              "y": 1816.0
+            },
+            {
+              "x": 1396.0,
+              "y": 1816.0
+            },
+            {
+              "x": 1396.0,
+              "y": 1834.0
+            },
+            {
+              "x": 1349.0,
+              "y": 1834.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "7/12",
+              "pos": [
+                {
+                  "x": 1345.0,
+                  "y": 1815.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 1815.0
+                },
+                {
+                  "x": 1397.0,
+                  "y": 1834.0
+                },
+                {
+                  "x": 1345.0,
+                  "y": 1834.0
+                }
+              ],
+              "style_id": 4
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l005_b001"
+          ],
+          "node_kind": "footer",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "05fb9340aa7b7a3ad2bdd0643c63d6a3",
+          "reading_order": 6,
+          "layout_type": "figure",
+          "layout_sub_type": "picture",
+          "raw_text": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup100-E100-一wcasocou80-SS Step 160-Step 2CK Step 340-wcoasu5020-00OE MC-NJ J MC--J USMLE12CK3Accurate Accurate Inaccurate Inaccurate Input Concordant Discordant Concordant Discordant C D Explanation Insight Density of Insight100-p=3.41×108p=2.18×10°p=3.48×10-t80-1.0-60-40-0.5-20-0-0.0OE-J MC-NJ MC-J USMLE12CK Input口Accurate口Inaccurate",
+          "clean_text": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup100-E100-一wcasocou80-SS Step 160-Step 2CK Step 340-wcoasu5020-00OE MC-NJ J MC--J USMLE12CK3Accurate Accurate Inaccurate Inaccurate Input Concordant Discordant Concordant Discordant C D Explanation Insight Density of Insight100-p=3.41×108p=2.18×10°p=3.48×10-t80-1.0-60-40-0.5-20-0-0.0OE-J MC-NJ MC-J USMLE12CK Input口Accurate口Inaccurate",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "center",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 82.0,
+              "y": 195.0
+            },
+            {
+              "x": 1390.0,
+              "y": 195.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1115.0
+            },
+            {
+              "x": 82.0,
+              "y": 1115.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup100-E100-一wcasocou80-SS Step 160-Step 2CK Step 340-wcoasu5020-00OE MC-NJ J MC--J USMLE12CK3Accurate Accurate Inaccurate Inaccurate Input Concordant Discordant Concordant Discordant C D Explanation Insight Density of Insight100-p=3.41×108p=2.18×10°p=3.48×10-t80-1.0-60-40-0.5-20-0-0.0OE-J MC-NJ MC-J USMLE12CK Input口Accurate口Inaccurate",
+              "pos": [
+                {
+                  "x": 82.0,
+                  "y": 195.0
+                },
+                {
+                  "x": 1390.0,
+                  "y": 195.0
+                },
+                {
+                  "x": 1390.0,
+                  "y": 1115.0
+                },
+                {
+                  "x": 82.0,
+                  "y": 1115.0
+                }
+              ],
+              "style_id": 0
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l006_b001"
+          ],
+          "node_kind": "figure",
+          "include_in_main_flow": true,
+          "region_hint": "figure_meta",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "cd465845fe0ee100a10a088ed5dd3e16",
+          "reading_order": 7,
+          "layout_type": "figure_name",
+          "layout_sub_type": "none",
+          "raw_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "clean_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "normalized_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p < 0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥ 1 insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "normalization_reason": "Fixed OCR error '≥l' to '≥ 1', added spacing to 'p < 0.001'",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.96,
+          "alignment": "left",
+          "line_height": 4.0,
+          "layout_pos": [
+            {
+              "x": 111.0,
+              "y": 1117.0
+            },
+            {
+              "x": 1380.0,
+              "y": 1117.0
+            },
+            {
+              "x": 1380.0,
+              "y": 1266.0
+            },
+            {
+              "x": 111.0,
+              "y": 1266.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI)",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1122.0
+                },
+                {
+                  "x": 1385.0,
+                  "y": 1122.0
+                },
+                {
+                  "x": 1385.0,
+                  "y": 1143.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1143.0
+                }
+              ],
+              "style_id": 3
+            },
+            {
+              "block_index": 2,
+              "text": "based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1146.0
+                },
+                {
+                  "x": 1368.0,
+                  "y": 1146.0
+                },
+                {
+                  "x": 1368.0,
+                  "y": 1166.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1166.0
+                }
+              ],
+              "style_id": 5
+            },
+            {
+              "block_index": 3,
+              "text": "between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C:",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1169.0
+                },
+                {
+                  "x": 1337.0,
+                  "y": 1169.0
+                },
+                {
+                  "x": 1337.0,
+                  "y": 1190.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1190.0
+                }
+              ],
+              "style_id": 6
+            },
+            {
+              "block_index": 4,
+              "text": "Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1193.0
+                },
+                {
+                  "x": 1329.0,
+                  "y": 1193.0
+                },
+                {
+                  "x": 1329.0,
+                  "y": 1211.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1211.0
+                }
+              ],
+              "style_id": 5
+            },
+            {
+              "block_index": 5,
+              "text": "accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1216.0
+                },
+                {
+                  "x": 1351.0,
+                  "y": 1216.0
+                },
+                {
+                  "x": 1351.0,
+                  "y": 1234.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1234.0
+                }
+              ],
+              "style_id": 5
+            },
+            {
+              "block_index": 6,
+              "text": "2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1238.0
+                },
+                {
+                  "x": 928.0,
+                  "y": 1238.0
+                },
+                {
+                  "x": 928.0,
+                  "y": 1257.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1257.0
+                }
+              ],
+              "style_id": 7
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l007_b001",
+            "p7_dm_p7_l007_b002",
+            "p7_dm_p7_l007_b003",
+            "p7_dm_p7_l007_b004",
+            "p7_dm_p7_l007_b005",
+            "p7_dm_p7_l007_b006"
+          ],
+          "node_kind": "paragraph",
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "block_count": 6,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "0f87aa876d6a32d6bbc3a990d753f5d8",
+          "reading_order": 8,
+          "layout_type": "text",
+          "layout_sub_type": "para",
+          "raw_text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+          "clean_text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "left",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 110.0,
+              "y": 1275.0
+            },
+            {
+              "x": 477.0,
+              "y": 1275.0
+            },
+            {
+              "x": 477.0,
+              "y": 1296.0
+            },
+            {
+              "x": 110.0,
+              "y": 1296.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+              "pos": [
+                {
+                  "x": 108.0,
+                  "y": 1274.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1274.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1294.0
+                },
+                {
+                  "x": 108.0,
+                  "y": 1294.0
+                }
+              ],
+              "style_id": 8
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l008_b001"
+          ],
+          "node_kind": "doi",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "2ca3924c689295b6d4e4a7ef083f7cd0",
+          "reading_order": 9,
+          "layout_type": "text",
+          "layout_sub_type": "para",
+          "raw_text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK, and post-graduate year 1 resident for Step 3.",
+          "clean_text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK, and post-graduate year 1 resident for Step 3.",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "left",
+          "line_height": 7.0,
+          "layout_pos": [
+            {
+              "x": 482.0,
+              "y": 1336.0
+            },
+            {
+              "x": 1381.0,
+              "y": 1336.0
+            },
+            {
+              "x": 1381.0,
+              "y": 1392.0
+            },
+            {
+              "x": 482.0,
+              "y": 1392.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step",
+              "pos": [
+                {
+                  "x": 479.0,
+                  "y": 1332.0
+                },
+                {
+                  "x": 1382.0,
+                  "y": 1332.0
+                },
+                {
+                  "x": 1382.0,
+                  "y": 1364.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1364.0
+                }
+              ],
+              "style_id": 9
+            },
+            {
+              "block_index": 2,
+              "text": "2CK, and post-graduate year 1 resident for Step 3.",
+              "pos": [
+                {
+                  "x": 478.0,
+                  "y": 1365.0
+                },
+                {
+                  "x": 966.0,
+                  "y": 1365.0
+                },
+                {
+                  "x": 966.0,
+                  "y": 1394.0
+                },
+                {
+                  "x": 478.0,
+                  "y": 1394.0
+                }
+              ],
+              "style_id": 10
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l009_b001",
+            "p7_dm_p7_l009_b002"
+          ],
+          "node_kind": "paragraph",
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "block_count": 2,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "b7f30cb723aa8f9eb203713b91ae19a3",
+          "reading_order": 10,
+          "layout_type": "text",
+          "layout_sub_type": "para",
+          "raw_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+          "clean_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+          "normalized_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n = 11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items [*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI > 0.6 (i.e. unique, novel, nonobvious, and",
+          "normalization_reason": "Fixed spacing: 'n = 11', 'items [*]', 'DOI > 0.6'. Hyphenation already resolved in source.",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.97,
+          "alignment": "left",
+          "line_height": 6.0,
+          "layout_pos": [
+            {
+              "x": 483.0,
+              "y": 1399.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1399.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1708.0
+            },
+            {
+              "x": 483.0,
+              "y": 1708.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at",
+              "pos": [
+                {
+                  "x": 510.0,
+                  "y": 1396.0
+                },
+                {
+                  "x": 1356.0,
+                  "y": 1396.0
+                },
+                {
+                  "x": 1356.0,
+                  "y": 1425.0
+                },
+                {
+                  "x": 510.0,
+                  "y": 1425.0
+                }
+              ],
+              "style_id": 9
+            },
+            {
+              "block_index": 2,
+              "text": "least one significant insight in 88.9% of all responses. Insight frequency was generally consis",
+              "pos": [
+                {
+                  "x": 479.0,
+                  "y": 1430.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1430.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1455.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1455.0
+                }
+              ],
+              "style_id": 10
+            },
+            {
+              "block_index": 3,
+              "text": "tent between exam type and question input format (Fig 3C). In Step 2CK however, insight",
+              "pos": [
+                {
+                  "x": 481.0,
+                  "y": 1461.0
+                },
+                {
+                  "x": 1353.0,
+                  "y": 1461.0
+                },
+                {
+                  "x": 1353.0,
+                  "y": 1488.0
+                },
+                {
+                  "x": 481.0,
+                  "y": 1488.0
+                }
+              ],
+              "style_id": 11
+            },
+            {
+              "block_index": 4,
+              "text": "decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the",
+              "pos": [
+                {
+                  "x": 480.0,
+                  "y": 1491.0
+                },
+                {
+                  "x": 1356.0,
+                  "y": 1491.0
+                },
+                {
+                  "x": 1356.0,
+                  "y": 1519.0
+                },
+                {
+                  "x": 480.0,
+                  "y": 1519.0
+                }
+              ],
+              "style_id": 12
+            },
+            {
+              "block_index": 5,
+              "text": "decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible",
+              "pos": [
+                {
+                  "x": 480.0,
+                  "y": 1523.0
+                },
+                {
+                  "x": 1386.0,
+                  "y": 1523.0
+                },
+                {
+                  "x": 1386.0,
+                  "y": 1550.0
+                },
+                {
+                  "x": 480.0,
+                  "y": 1550.0
+                }
+              ],
+              "style_id": 13
+            },
+            {
+              "block_index": 6,
+              "text": "pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data).",
+              "pos": [
+                {
+                  "x": 480.0,
+                  "y": 1556.0
+                },
+                {
+                  "x": 1296.0,
+                  "y": 1556.0
+                },
+                {
+                  "x": 1296.0,
+                  "y": 1581.0
+                },
+                {
+                  "x": 480.0,
+                  "y": 1581.0
+                }
+              ],
+              "style_id": 14
+            },
+            {
+              "block_index": 7,
+              "text": "Next, we quantified the density of insight (DOI) contained within AI-generated explana-",
+              "pos": [
+                {
+                  "x": 509.0,
+                  "y": 1587.0
+                },
+                {
+                  "x": 1368.0,
+                  "y": 1587.0
+                },
+                {
+                  "x": 1368.0,
+                  "y": 1612.0
+                },
+                {
+                  "x": 509.0,
+                  "y": 1612.0
+                }
+              ],
+              "style_id": 15
+            },
+            {
+              "block_index": 8,
+              "text": "tions. A density index was defined by normalizing the number of unique insights against the",
+              "pos": [
+                {
+                  "x": 479.0,
+                  "y": 1619.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1619.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1644.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1644.0
+                }
+              ],
+              "style_id": 10
+            },
+            {
+              "block_index": 9,
+              "text": "number of possible answer choices. This analysis was performed on MC-J entries only. High",
+              "pos": [
+                {
+                  "x": 480.0,
+                  "y": 1649.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1649.0
+                },
+                {
+                  "x": 1371.0,
+                  "y": 1676.0
+                },
+                {
+                  "x": 480.0,
+                  "y": 1676.0
+                }
+              ],
+              "style_id": 15
+            },
+            {
+              "block_index": 10,
+              "text": "quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+              "pos": [
+                {
+                  "x": 479.0,
+                  "y": 1681.0
+                },
+                {
+                  "x": 1394.0,
+                  "y": 1681.0
+                },
+                {
+                  "x": 1394.0,
+                  "y": 1709.0
+                },
+                {
+                  "x": 479.0,
+                  "y": 1709.0
+                }
+              ],
+              "style_id": 16
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l010_b001",
+            "p7_dm_p7_l010_b002",
+            "p7_dm_p7_l010_b003",
+            "p7_dm_p7_l010_b004",
+            "p7_dm_p7_l010_b005",
+            "p7_dm_p7_l010_b006",
+            "p7_dm_p7_l010_b007",
+            "p7_dm_p7_l010_b008",
+            "p7_dm_p7_l010_b009",
+            "p7_dm_p7_l010_b010"
+          ],
+          "node_kind": "paragraph",
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "block_count": 10,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "layout_id": "6dbfb10bcdb781b8a59980a0673f486d",
+          "reading_order": 1,
+          "layout_type": "head",
+          "layout_sub_type": "page_header",
+          "raw_text": "PLOS DIGITAL HEALTH",
+          "clean_text": "PLOS DIGITAL HEALTH",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "alignment": "left",
+          "line_height": 0.0,
+          "layout_pos": [
+            {
+              "x": 85.0,
+              "y": 88.0
+            },
+            {
+              "x": 383.0,
+              "y": 88.0
+            },
+            {
+              "x": 383.0,
+              "y": 116.0
+            },
+            {
+              "x": 85.0,
+              "y": 116.0
+            }
+          ],
+          "blocks": [
+            {
+              "block_index": 1,
+              "text": "PLOS DIGITAL HEALTH",
+              "pos": [
+                {
+                  "x": 87.0,
+                  "y": 85.0
+                },
+                {
+                  "x": 385.0,
+                  "y": 85.0
+                },
+                {
+                  "x": 385.0,
+                  "y": 118.0
+                },
+                {
+                  "x": 87.0,
+                  "y": 118.0
+                }
+              ],
+              "style_id": 0
+            }
+          ],
+          "table_cells": [],
+          "canonical_block_ids": [
+            "p7_dm_p7_l001_b001"
+          ],
+          "node_kind": "header",
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        }
+      ],
+      "reading_nodes": [
+        {
+          "node_id": "layout:3e0e67d4468dbfd8ab7c569f6c9fa501",
+          "node_kind": "header",
+          "raw_text": "ChatGPT and medical education",
+          "clean_text": "ChatGPT and medical education",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "3e0e67d4468dbfd8ab7c569f6c9fa501"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l002_b001"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "head",
+            "layout_sub_type": "page_header",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:4af8eac11276f156a7e649c9b6744a0c",
+          "node_kind": "header",
+          "raw_text": "[empty]",
+          "clean_text": "[empty]",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "4af8eac11276f156a7e649c9b6744a0c"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l003_b001"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "header_line",
+            "layout_sub_type": "none",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:984badf7f0354e29a834e8248cbbd067",
+          "node_kind": "footer",
+          "raw_text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198 February 9,2023",
+          "clean_text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198 February 9,2023",
+          "normalized_text": "PLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023",
+          "normalization_reason": "Footer text cleaned: added spaces around pipe and date",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.95,
+          "source_layout_ids": [
+            "984badf7f0354e29a834e8248cbbd067"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l004_b001",
+            "p7_dm_p7_l004_b002"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "foot",
+            "layout_sub_type": "page_footer",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:5a78710651c0a081462431d5364afdae",
+          "node_kind": "footer",
+          "raw_text": "7/12",
+          "clean_text": "7/12",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "5a78710651c0a081462431d5364afdae"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l005_b001"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "foot_pagenum",
+            "layout_sub_type": "page",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:05fb9340aa7b7a3ad2bdd0643c63d6a3",
+          "node_kind": "figure",
+          "raw_text": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup100-E100-一wcasocou80-SS Step 160-Step 2CK Step 340-wcoasu5020-00OE MC-NJ J MC--J USMLE12CK3Accurate Accurate Inaccurate Inaccurate Input Concordant Discordant Concordant Discordant C D Explanation Insight Density of Insight100-p=3.41×108p=2.18×10°p=3.48×10-t80-1.0-60-40-0.5-20-0-0.0OE-J MC-NJ MC-J USMLE12CK Input口Accurate口Inaccurate",
+          "clean_text": "A B Answer-Explanation Concordance Concordance by Accuracy Subgroup100-E100-一wcasocou80-SS Step 160-Step 2CK Step 340-wcoasu5020-00OE MC-NJ J MC--J USMLE12CK3Accurate Accurate Inaccurate Inaccurate Input Concordant Discordant Concordant Discordant C D Explanation Insight Density of Insight100-p=3.41×108p=2.18×10°p=3.48×10-t80-1.0-60-40-0.5-20-0-0.0OE-J MC-NJ MC-J USMLE12CK Input口Accurate口Inaccurate",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "05fb9340aa7b7a3ad2bdd0643c63d6a3"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l006_b001"
+          ],
+          "include_in_main_flow": true,
+          "region_hint": "figure_meta",
+          "meta": {
+            "layout_type": "figure",
+            "layout_sub_type": "picture",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:cd465845fe0ee100a10a088ed5dd3e16",
+          "node_kind": "paragraph",
+          "raw_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "clean_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "normalized_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p < 0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥ 1 insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+          "normalization_reason": "Fixed OCR error '≥l' to '≥ 1', added spacing to 'p < 0.001'",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.96,
+          "source_layout_ids": [
+            "cd465845fe0ee100a10a088ed5dd3e16"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l007_b001",
+            "p7_dm_p7_l007_b002",
+            "p7_dm_p7_l007_b003",
+            "p7_dm_p7_l007_b004",
+            "p7_dm_p7_l007_b005",
+            "p7_dm_p7_l007_b006"
+          ],
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "layout_type": "figure_name",
+            "layout_sub_type": "none",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:0f87aa876d6a32d6bbc3a990d753f5d8",
+          "node_kind": "doi",
+          "raw_text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+          "clean_text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "0f87aa876d6a32d6bbc3a990d753f5d8"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l008_b001"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "text",
+            "layout_sub_type": "para",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:2ca3924c689295b6d4e4a7ef083f7cd0",
+          "node_kind": "paragraph",
+          "raw_text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK, and post-graduate year 1 resident for Step 3.",
+          "clean_text": "adjudicator, as a second-year medical student for Step 1, fourth-year medical student for Step 2CK, and post-graduate year 1 resident for Step 3.",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "2ca3924c689295b6d4e4a7ef083f7cd0"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l009_b001",
+            "p7_dm_p7_l009_b002"
+          ],
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "layout_type": "text",
+            "layout_sub_type": "para",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:b7f30cb723aa8f9eb203713b91ae19a3",
+          "node_kind": "paragraph",
+          "raw_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+          "clean_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+          "normalized_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n = 11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items [*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI > 0.6 (i.e. unique, novel, nonobvious, and",
+          "normalization_reason": "Fixed spacing: 'n = 11', 'items [*]', 'DOI > 0.6'. Hyphenation already resolved in source.",
+          "normalization_mode": "ocr_cleanup",
+          "normalization_confidence": 0.97,
+          "source_layout_ids": [
+            "b7f30cb723aa8f9eb203713b91ae19a3"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l010_b001",
+            "p7_dm_p7_l010_b002",
+            "p7_dm_p7_l010_b003",
+            "p7_dm_p7_l010_b004",
+            "p7_dm_p7_l010_b005",
+            "p7_dm_p7_l010_b006",
+            "p7_dm_p7_l010_b007",
+            "p7_dm_p7_l010_b008",
+            "p7_dm_p7_l010_b009",
+            "p7_dm_p7_l010_b010"
+          ],
+          "include_in_main_flow": true,
+          "region_hint": "main_body",
+          "meta": {
+            "layout_type": "text",
+            "layout_sub_type": "para",
+            "table_cell_count": 0
+          }
+        },
+        {
+          "node_id": "layout:6dbfb10bcdb781b8a59980a0673f486d",
+          "node_kind": "header",
+          "raw_text": "PLOS DIGITAL HEALTH",
+          "clean_text": "PLOS DIGITAL HEALTH",
+          "normalized_text": "",
+          "normalization_reason": "",
+          "normalization_mode": "",
+          "normalization_confidence": null,
+          "source_layout_ids": [
+            "6dbfb10bcdb781b8a59980a0673f486d"
+          ],
+          "source_block_ids": [
+            "p7_dm_p7_l001_b001"
+          ],
+          "include_in_main_flow": false,
+          "region_hint": "side_context",
+          "meta": {
+            "layout_type": "head",
+            "layout_sub_type": "page_header",
+            "table_cell_count": 0
+          }
+        }
+      ],
+      "evidence_map": [
+        {
+          "evidence_id": "layout:3e0e67d4468dbfd8ab7c569f6c9fa501",
+          "source_layout_id": "3e0e67d4468dbfd8ab7c569f6c9fa501",
+          "source_block_ids": [
+            "p7_dm_p7_l002_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 1121.0,
+              "y": 94.0
+            },
+            {
+              "x": 1397.0,
+              "y": 94.0
+            },
+            {
+              "x": 1397.0,
+              "y": 116.0
+            },
+            {
+              "x": 1121.0,
+              "y": 116.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 1120.0,
+                "y": 94.0
+              },
+              {
+                "x": 1397.0,
+                "y": 94.0
+              },
+              {
+                "x": 1397.0,
+                "y": 115.0
+              },
+              {
+                "x": 1120.0,
+                "y": 115.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:4af8eac11276f156a7e649c9b6744a0c",
+          "source_layout_id": "4af8eac11276f156a7e649c9b6744a0c",
+          "source_block_ids": [
+            "p7_dm_p7_l003_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 81.0,
+              "y": 130.0
+            },
+            {
+              "x": 1397.0,
+              "y": 130.0
+            },
+            {
+              "x": 1397.0,
+              "y": 134.0
+            },
+            {
+              "x": 81.0,
+              "y": 134.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 81.0,
+                "y": 130.0
+              },
+              {
+                "x": 1397.0,
+                "y": 130.0
+              },
+              {
+                "x": 1397.0,
+                "y": 134.0
+              },
+              {
+                "x": 81.0,
+                "y": 134.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:984badf7f0354e29a834e8248cbbd067",
+          "source_layout_id": "984badf7f0354e29a834e8248cbbd067",
+          "source_block_ids": [
+            "p7_dm_p7_l004_b001",
+            "p7_dm_p7_l004_b002"
+          ],
+          "layout_pos": [
+            {
+              "x": 84.0,
+              "y": 1814.0
+            },
+            {
+              "x": 805.0,
+              "y": 1814.0
+            },
+            {
+              "x": 805.0,
+              "y": 1838.0
+            },
+            {
+              "x": 84.0,
+              "y": 1838.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 85.0,
+                "y": 1812.0
+              },
+              {
+                "x": 645.0,
+                "y": 1812.0
+              },
+              {
+                "x": 645.0,
+                "y": 1839.0
+              },
+              {
+                "x": 85.0,
+                "y": 1839.0
+              }
+            ],
+            [
+              {
+                "x": 656.0,
+                "y": 1815.0
+              },
+              {
+                "x": 803.0,
+                "y": 1815.0
+              },
+              {
+                "x": 803.0,
+                "y": 1836.0
+              },
+              {
+                "x": 656.0,
+                "y": 1836.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 2,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:5a78710651c0a081462431d5364afdae",
+          "source_layout_id": "5a78710651c0a081462431d5364afdae",
+          "source_block_ids": [
+            "p7_dm_p7_l005_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 1349.0,
+              "y": 1816.0
+            },
+            {
+              "x": 1396.0,
+              "y": 1816.0
+            },
+            {
+              "x": 1396.0,
+              "y": 1834.0
+            },
+            {
+              "x": 1349.0,
+              "y": 1834.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 1345.0,
+                "y": 1815.0
+              },
+              {
+                "x": 1397.0,
+                "y": 1815.0
+              },
+              {
+                "x": 1397.0,
+                "y": 1834.0
+              },
+              {
+                "x": 1345.0,
+                "y": 1834.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:05fb9340aa7b7a3ad2bdd0643c63d6a3",
+          "source_layout_id": "05fb9340aa7b7a3ad2bdd0643c63d6a3",
+          "source_block_ids": [
+            "p7_dm_p7_l006_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 82.0,
+              "y": 195.0
+            },
+            {
+              "x": 1390.0,
+              "y": 195.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1115.0
+            },
+            {
+              "x": 82.0,
+              "y": 1115.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 82.0,
+                "y": 195.0
+              },
+              {
+                "x": 1390.0,
+                "y": 195.0
+              },
+              {
+                "x": 1390.0,
+                "y": 1115.0
+              },
+              {
+                "x": 82.0,
+                "y": 1115.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:cd465845fe0ee100a10a088ed5dd3e16",
+          "source_layout_id": "cd465845fe0ee100a10a088ed5dd3e16",
+          "source_block_ids": [
+            "p7_dm_p7_l007_b001",
+            "p7_dm_p7_l007_b002",
+            "p7_dm_p7_l007_b003",
+            "p7_dm_p7_l007_b004",
+            "p7_dm_p7_l007_b005",
+            "p7_dm_p7_l007_b006"
+          ],
+          "layout_pos": [
+            {
+              "x": 111.0,
+              "y": 1117.0
+            },
+            {
+              "x": 1380.0,
+              "y": 1117.0
+            },
+            {
+              "x": 1380.0,
+              "y": 1266.0
+            },
+            {
+              "x": 111.0,
+              "y": 1266.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 108.0,
+                "y": 1122.0
+              },
+              {
+                "x": 1385.0,
+                "y": 1122.0
+              },
+              {
+                "x": 1385.0,
+                "y": 1143.0
+              },
+              {
+                "x": 108.0,
+                "y": 1143.0
+              }
+            ],
+            [
+              {
+                "x": 108.0,
+                "y": 1146.0
+              },
+              {
+                "x": 1368.0,
+                "y": 1146.0
+              },
+              {
+                "x": 1368.0,
+                "y": 1166.0
+              },
+              {
+                "x": 108.0,
+                "y": 1166.0
+              }
+            ],
+            [
+              {
+                "x": 108.0,
+                "y": 1169.0
+              },
+              {
+                "x": 1337.0,
+                "y": 1169.0
+              },
+              {
+                "x": 1337.0,
+                "y": 1190.0
+              },
+              {
+                "x": 108.0,
+                "y": 1190.0
+              }
+            ],
+            [
+              {
+                "x": 108.0,
+                "y": 1193.0
+              },
+              {
+                "x": 1329.0,
+                "y": 1193.0
+              },
+              {
+                "x": 1329.0,
+                "y": 1211.0
+              },
+              {
+                "x": 108.0,
+                "y": 1211.0
+              }
+            ],
+            [
+              {
+                "x": 108.0,
+                "y": 1216.0
+              },
+              {
+                "x": 1351.0,
+                "y": 1216.0
+              },
+              {
+                "x": 1351.0,
+                "y": 1234.0
+              },
+              {
+                "x": 108.0,
+                "y": 1234.0
+              }
+            ],
+            [
+              {
+                "x": 108.0,
+                "y": 1238.0
+              },
+              {
+                "x": 928.0,
+                "y": 1238.0
+              },
+              {
+                "x": 928.0,
+                "y": 1257.0
+              },
+              {
+                "x": 108.0,
+                "y": 1257.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 6,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:0f87aa876d6a32d6bbc3a990d753f5d8",
+          "source_layout_id": "0f87aa876d6a32d6bbc3a990d753f5d8",
+          "source_block_ids": [
+            "p7_dm_p7_l008_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 110.0,
+              "y": 1275.0
+            },
+            {
+              "x": 477.0,
+              "y": 1275.0
+            },
+            {
+              "x": 477.0,
+              "y": 1296.0
+            },
+            {
+              "x": 110.0,
+              "y": 1296.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 108.0,
+                "y": 1274.0
+              },
+              {
+                "x": 479.0,
+                "y": 1274.0
+              },
+              {
+                "x": 479.0,
+                "y": 1294.0
+              },
+              {
+                "x": 108.0,
+                "y": 1294.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:2ca3924c689295b6d4e4a7ef083f7cd0",
+          "source_layout_id": "2ca3924c689295b6d4e4a7ef083f7cd0",
+          "source_block_ids": [
+            "p7_dm_p7_l009_b001",
+            "p7_dm_p7_l009_b002"
+          ],
+          "layout_pos": [
+            {
+              "x": 482.0,
+              "y": 1336.0
+            },
+            {
+              "x": 1381.0,
+              "y": 1336.0
+            },
+            {
+              "x": 1381.0,
+              "y": 1392.0
+            },
+            {
+              "x": 482.0,
+              "y": 1392.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 479.0,
+                "y": 1332.0
+              },
+              {
+                "x": 1382.0,
+                "y": 1332.0
+              },
+              {
+                "x": 1382.0,
+                "y": 1364.0
+              },
+              {
+                "x": 479.0,
+                "y": 1364.0
+              }
+            ],
+            [
+              {
+                "x": 478.0,
+                "y": 1365.0
+              },
+              {
+                "x": 966.0,
+                "y": 1365.0
+              },
+              {
+                "x": 966.0,
+                "y": 1394.0
+              },
+              {
+                "x": 478.0,
+                "y": 1394.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 2,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:b7f30cb723aa8f9eb203713b91ae19a3",
+          "source_layout_id": "b7f30cb723aa8f9eb203713b91ae19a3",
+          "source_block_ids": [
+            "p7_dm_p7_l010_b001",
+            "p7_dm_p7_l010_b002",
+            "p7_dm_p7_l010_b003",
+            "p7_dm_p7_l010_b004",
+            "p7_dm_p7_l010_b005",
+            "p7_dm_p7_l010_b006",
+            "p7_dm_p7_l010_b007",
+            "p7_dm_p7_l010_b008",
+            "p7_dm_p7_l010_b009",
+            "p7_dm_p7_l010_b010"
+          ],
+          "layout_pos": [
+            {
+              "x": 483.0,
+              "y": 1399.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1399.0
+            },
+            {
+              "x": 1390.0,
+              "y": 1708.0
+            },
+            {
+              "x": 483.0,
+              "y": 1708.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 510.0,
+                "y": 1396.0
+              },
+              {
+                "x": 1356.0,
+                "y": 1396.0
+              },
+              {
+                "x": 1356.0,
+                "y": 1425.0
+              },
+              {
+                "x": 510.0,
+                "y": 1425.0
+              }
+            ],
+            [
+              {
+                "x": 479.0,
+                "y": 1430.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1430.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1455.0
+              },
+              {
+                "x": 479.0,
+                "y": 1455.0
+              }
+            ],
+            [
+              {
+                "x": 481.0,
+                "y": 1461.0
+              },
+              {
+                "x": 1353.0,
+                "y": 1461.0
+              },
+              {
+                "x": 1353.0,
+                "y": 1488.0
+              },
+              {
+                "x": 481.0,
+                "y": 1488.0
+              }
+            ],
+            [
+              {
+                "x": 480.0,
+                "y": 1491.0
+              },
+              {
+                "x": 1356.0,
+                "y": 1491.0
+              },
+              {
+                "x": 1356.0,
+                "y": 1519.0
+              },
+              {
+                "x": 480.0,
+                "y": 1519.0
+              }
+            ],
+            [
+              {
+                "x": 480.0,
+                "y": 1523.0
+              },
+              {
+                "x": 1386.0,
+                "y": 1523.0
+              },
+              {
+                "x": 1386.0,
+                "y": 1550.0
+              },
+              {
+                "x": 480.0,
+                "y": 1550.0
+              }
+            ],
+            [
+              {
+                "x": 480.0,
+                "y": 1556.0
+              },
+              {
+                "x": 1296.0,
+                "y": 1556.0
+              },
+              {
+                "x": 1296.0,
+                "y": 1581.0
+              },
+              {
+                "x": 480.0,
+                "y": 1581.0
+              }
+            ],
+            [
+              {
+                "x": 509.0,
+                "y": 1587.0
+              },
+              {
+                "x": 1368.0,
+                "y": 1587.0
+              },
+              {
+                "x": 1368.0,
+                "y": 1612.0
+              },
+              {
+                "x": 509.0,
+                "y": 1612.0
+              }
+            ],
+            [
+              {
+                "x": 479.0,
+                "y": 1619.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1619.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1644.0
+              },
+              {
+                "x": 479.0,
+                "y": 1644.0
+              }
+            ],
+            [
+              {
+                "x": 480.0,
+                "y": 1649.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1649.0
+              },
+              {
+                "x": 1371.0,
+                "y": 1676.0
+              },
+              {
+                "x": 480.0,
+                "y": 1676.0
+              }
+            ],
+            [
+              {
+                "x": 479.0,
+                "y": 1681.0
+              },
+              {
+                "x": 1394.0,
+                "y": 1681.0
+              },
+              {
+                "x": 1394.0,
+                "y": 1709.0
+              },
+              {
+                "x": 479.0,
+                "y": 1709.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 10,
+            "table_cell_count": 0
+          }
+        },
+        {
+          "evidence_id": "layout:6dbfb10bcdb781b8a59980a0673f486d",
+          "source_layout_id": "6dbfb10bcdb781b8a59980a0673f486d",
+          "source_block_ids": [
+            "p7_dm_p7_l001_b001"
+          ],
+          "layout_pos": [
+            {
+              "x": 85.0,
+              "y": 88.0
+            },
+            {
+              "x": 383.0,
+              "y": 88.0
+            },
+            {
+              "x": 383.0,
+              "y": 116.0
+            },
+            {
+              "x": 85.0,
+              "y": 116.0
+            }
+          ],
+          "block_positions": [
+            [
+              {
+                "x": 87.0,
+                "y": 85.0
+              },
+              {
+                "x": 385.0,
+                "y": 85.0
+              },
+              {
+                "x": 385.0,
+                "y": 118.0
+              },
+              {
+                "x": 87.0,
+                "y": 118.0
+              }
+            ]
+          ],
+          "table_cells": [],
+          "geometry_source": "docmind_layout_blocks",
+          "highlight_strategy": "layout_block_union",
+          "meta": {
+            "block_count": 1,
+            "table_cell_count": 0
+          }
+        }
+      ],
+      "page_image": {
+        "url": "http://localhost:8888/api/v1/literature/reader/grounding-page-assets/78/7",
+        "path": "/app/uploads/reader_page_assets/paper_78/grounding_pages/page_7.png",
+        "width": 1483,
+        "height": 1920,
+        "source": "docmind_page_image_localized",
+        "origin_url": "__normalized__docmind_signed_origin_url__",
+        "local_cached": true
+      },
+      "meta": {
+        "source": "docmind_layout_unique_id_v1",
+        "layout_count": 10,
+        "reading_node_count": 10,
+        "main_flow_node_count": 4,
+        "counts_by_kind": {
+          "header": 3,
+          "footer": 2,
+          "figure": 1,
+          "paragraph": 3,
+          "doi": 1
+        },
+        "normalization_summary": {
+          "item_count": 3,
+          "items": [
+            {
+              "layout_id": "984badf7f0354e29a834e8248cbbd067",
+              "source_text": "PLOS Digital Health|https://doi.org/10.1371/journal.pdig.0000198 February 9,2023",
+              "normalized_text": "PLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023",
+              "reason": "Footer text cleaned: added spaces around pipe and date",
+              "mode": "ocr_cleanup",
+              "confidence": 0.95
+            },
+            {
+              "layout_id": "cd465845fe0ee100a10a088ed5dd3e16",
+              "source_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p<0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥l insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+              "normalized_text": "Fig 3. Concordance and insight of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated on concordance and density of insight (DOI) based on the ACI scoring system provided in S2 Data. A: Overall concordance across all exam types and question encoding formats. B: Concordance rates stratified between accurate vs inaccurate outputs, across all exam types and question encoding formats. p < 0.001 for accurate vs inaccurate outputs by Fisher exact test. C: Overall insight prevalence, defined as proportion of outputs with ≥ 1 insight, across all exams for questions encoded in MC-J format. D: DOI stratified between accurate vs inaccurate outputs, across all exam types for questions encoded in MC-J format. Horizontal line indicates the mean. p-value determined by parametric 2-way ANOVA testing with Benjamini-Krieger-Yekutieli (BKY) post hoc to control for false discovery rate.",
+              "reason": "Fixed OCR error '≥l' to '≥ 1', added spacing to 'p < 0.001'",
+              "mode": "ocr_cleanup",
+              "confidence": 0.96
+            },
+            {
+              "layout_id": "b7f30cb723aa8f9eb203713b91ae19a3",
+              "source_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n=11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items[*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI>0.6 (i.e. unique, novel, nonobvious, and",
+              "normalized_text": "We first examined the frequency (prevalence) of insight. Overall, ChatGPT produced at least one significant insight in 88.9% of all responses. Insight frequency was generally consistent between exam type and question input format (Fig 3C). In Step 2CK however, insight decreased by 10.3% (n = 11 items) between MC-NJ and MC-J formulations, paralleling the decrement in accuracy (Fig 1B). Review of this subset of questions did not reveal a discernible pattern for the paradoxical decrease (see specifically annotated items [*] in S1 Data). Next, we quantified the density of insight (DOI) contained within AI-generated explanations. A density index was defined by normalizing the number of unique insights against the number of possible answer choices. This analysis was performed on MC-J entries only. High quality outputs were generally characterized by DOI > 0.6 (i.e. unique, novel, nonobvious, and",
+              "reason": "Fixed spacing: 'n = 11', 'items [*]', 'DOI > 0.6'. Hyphenation already resolved in source.",
+              "mode": "ocr_cleanup",
+              "confidence": 0.97
+            }
+          ]
+        }
+      }
+    }
+  },
+  "adjacent_pages": {
+    "owner": "api/adjacent_page_extraction",
+    "fidelity": "ordered_structured_context",
+    "reference_only": false,
+    "limits": {
+      "reference_only": false,
+      "max_pages": 2,
+      "max_page_summary_chars": 400,
+      "max_content_stream_items": 48,
+      "max_continuation_hints": 6,
+      "max_raw_text_chars": 1600
+    },
+    "pages": [
+      {
+        "page": 6,
+        "relation": "previous_page",
+        "source": "neighbor_page_vlm_parse",
+        "fidelity": "ordered_structured_context",
+        "reference_only": false,
+        "page_image": {
+          "url": "http://localhost:8888/api/v1/literature/reader/page-assets/78/6",
+          "width": 1360,
+          "height": 1760
+        },
+        "page_summary": "Page 6 of the PLOS Digital Health article 'ChatGPT and medical education,' presenting Figure 2 with two bar charts (A and B) showing ChatGPT accuracy on USMLE questions across different formats, followed by text discussing answer-explanation concordance and nonobvious insights in generated explanations.",
+        "content_stream": [
+          {
+            "seq": 1,
+            "type": "figure",
+            "text": "Fig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated to be accurate, inaccurate, or indeterminate based on the ACI scoring system provided in S2 Data. A: Accuracy distribution for inputs encoded as open-ended questions. B: Accuracy distribution for inputs encoded as multiple choice single answer without (MC-NJ) or with forced justification (MC-J).",
+            "ocr_text": "Fig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated to be accurate, inaccurate, or indeterminate based on the ACI scoring system provided in S2 Data. A: Accuracy distribution for inputs encoded as open-ended questions. B: Accuracy distribution for inputs encoded as multiple choice single answer without (MC-NJ) or with forced justification (MC-J).",
+            "role": "figure_caption",
+            "label": "Fig 2",
+            "caption": "Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated to be accurate, inaccurate, or indeterminate based on the ACI scoring system provided in S2 Data. A: Accuracy distribution for inputs encoded as open-ended questions. B: Accuracy distribution for inputs encoded as multiple choice single answer without (MC-NJ) or with forced justification (MC-J).",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 2,
+            "type": "figure",
+            "text": "A: Open-Ended",
+            "ocr_text": "A: Open-Ended",
+            "role": "figure_label",
+            "label": "A",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 3,
+            "type": "figure",
+            "text": "USMLE 1 2CK 3",
+            "ocr_text": "USMLE 1 2CK 3",
+            "role": "x-axis_labels",
+            "label": "x-axis",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 4,
+            "type": "figure",
+            "text": "Accuracy (%)",
+            "ocr_text": "Accuracy (%)",
+            "role": "y-axis_label",
+            "label": "y-axis",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 5,
+            "type": "figure",
+            "text": "Legend: Accurate (dark blue), Indeterminate (light gray), Inaccurate (light blue)",
+            "ocr_text": "Legend: Accurate (dark blue), Indeterminate (light gray), Inaccurate (light blue)",
+            "role": "legend",
+            "label": "legend",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 6,
+            "type": "figure",
+            "text": "B: Multiple Choice Single Answer",
+            "ocr_text": "B: Multiple Choice Single Answer",
+            "role": "figure_label",
+            "label": "B",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 7,
+            "type": "figure",
+            "text": "Input: NJ J NJ J NJ J",
+            "ocr_text": "Input: NJ J NJ J NJ J",
+            "role": "x-axis_labels",
+            "label": "x-axis",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 8,
+            "type": "figure",
+            "text": "USMLE 1 2CK 3",
+            "ocr_text": "USMLE 1 2CK 3",
+            "role": "x-axis_labels",
+            "label": "x-axis",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 9,
+            "type": "figure",
+            "text": "Accuracy (%)",
+            "ocr_text": "Accuracy (%)",
+            "role": "y-axis_label",
+            "label": "y-axis",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 10,
+            "type": "paragraph",
+            "text": "These data indicate that ChatGPT exhibits very high answer-explanation concordance, likely reflecting high internal consistency in its probabilistic language model.",
+            "ocr_text": "These data indicate that ChatGPT exhibits very high answer-explanation concordance, likely reflecting high internal consistency in its probabilistic language model.",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 11,
+            "type": "header",
+            "text": "Explanations generated by ChatGPT contain nonobvious insights",
+            "ocr_text": "Explanations generated by ChatGPT contain nonobvious insights",
+            "role": "header",
+            "label": "section_header",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 12,
+            "type": "paragraph",
+            "text": "Having established the accuracy and concordance of ChatGPT, we next examined its potential to augment human learning in the domain of medical education. AI-generated explanations were independently adjudicated by 2 physician reviewers. Explanation content was examined for significant insights, defined as instances that met the criteria (see S2 Data) of novelty, non-obviousness, and validity. The perspective of the target test audience was adopted by the",
+            "ocr_text": "Having established the accuracy and concordance of ChatGPT, we next examined its potential to augment human learning in the domain of medical education. AI-generated explanations were independently adjudicated by 2 physician reviewers. Explanation content was examined for significant insights, defined as instances that met the criteria (see S2 Data) of novelty, non-obviousness, and validity. The perspective of the target test audience was adopted by the",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          },
+          {
+            "seq": 13,
+            "type": "footer",
+            "text": "PLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023 6/12",
+            "ocr_text": "PLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023 6/12",
+            "role": "footer",
+            "label": "page_footer",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {}
+          }
+        ],
+        "continuation_hints": [
+          "Continues from previous page: discussion of ChatGPT’s accuracy and concordance leading into examination of explanation quality.",
+          "Next page will likely detail the methodology and results of the nonobvious insight evaluation."
+        ],
+        "raw_text": "PLOS DIGITAL HEALTH\nChatGPT and medical education\nA\nOpen-Ended\nAccuracy (%)\n100\n50\n0\nUSMLE 1 2CK 3\nAccurate Indeterminate Inaccurate\nB\nMultiple Choice Single Answer\nAccuracy (%)\n100\n50\n0\nInput NJ J NJ J NJ J\nUSMLE 1 2CK 3\nPass Range\nFig 2. Accuracy of ChatGPT on USMLE. For USMLE Steps 1, 2CK, and 3, AI outputs were adjudicated to be accurate, inaccurate, or indeterminate based on the ACI scoring system provided in S2 Data. A: Accuracy distribution for inputs encoded as open-ended questions. B: Accuracy distribution for inputs encoded as multiple choice single answer without (MC-NJ) or with forced justification (MC-J).\nhttps://doi.org/10.1371/journal.pdig.0000198.g002\nThese data indicate that ChatGPT exhibits very high answer-explanation concordance, likely reflecting high internal consistency in its probabilistic language model.\nExplanations generated by ChatGPT contain nonobvious insights\nHaving established the accuracy and concordance of ChatGPT, we next examined its potential to augment human learning in the domain of medical education. AI-generated explanations were independently adjudicated by 2 physician reviewers. Explanation content was examined for significant insights, defined as instances that met the criteria (see S2 Data) of novelty, non-obviousness, and validity. The perspective of the target test audience was adopted by the\nPLOS Digital Health | https://doi.org/10.1371/journal.pdig.0000198 February 9, 2023 6/12",
+        "meta": {
+          "parser_model": "qwen3-vl-flash",
+          "parser_version": "adjacent_structured_v2:qwen3-vl-flash",
+          "attempt_index": 1,
+          "attempt_count": 3,
+          "page_scope_cache_key": "lit:adjacent_page_structured:v2:ordered_structured_context.v1:78:6:previous_page:2d857ffeff6bd9b2:6a630e0f3d03",
+          "page_scope_cache_layer": "redis"
+        }
+      },
+      {
+        "page": 8,
+        "relation": "next_page",
+        "source": "neighbor_page_vlm_parse",
+        "fidelity": "ordered_structured_context",
+        "reference_only": false,
+        "page_image": {
+          "url": "http://localhost:8888/api/v1/literature/reader/page-assets/78/8",
+          "width": 1360,
+          "height": 1760
+        },
+        "page_summary": "Discussion section of a research paper on ChatGPT's performance in medical education, highlighting its rising accuracy on USMLE exams and potential to generate novel insights for learners.",
+        "content_stream": [
+          {
+            "seq": 1,
+            "type": "paragraph",
+            "text": "valid insights provided for >3 out of 5 choices); low quality outputs were generally characterized by DOI ≤0.2. The upper limit on DOI is only bounded by the maximum length of text output. Across all exam types, we observed that mean DOI was significantly higher in questions items answered accurately versus inaccurately (0.458 versus 0.199, p <0.0001) (Fig 3D).",
+            "ocr_text": "valid insights provided for >3 out of 5 choices); low quality outputs were generally characterized by DOI ≤0.2. The upper limit on DOI is only bounded by the maximum length of text output. Across all exam types, we observed that mean DOI was significantly higher in questions items answered accurately versus inaccurately (0.458 versus 0.199, p <0.0001) (Fig 3D).",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "valid insights provided for >3 out of 5 choices); low quality outputs were generally characterized by DOI ≤0.2. The upper limit on DOI is only bounded by the maximum length of text output. Across all exam types, we observed that mean DOI was significantly higher in questions items answered accurately versus inaccurately (0.458 versus 0.199, p <0.0001) (Fig 3D).",
+            "meta": {}
+          },
+          {
+            "seq": 2,
+            "type": "paragraph",
+            "text": "The high frequency and moderate density of insights indicate that it may be possible for a target learner (e.g., such as a second-year medical student preparing for Step 1) to gain new or remedial knowledge from the ChatGPT AI output, particularly if answering incorrectly.",
+            "ocr_text": "The high frequency and moderate density of insights indicate that it may be possible for a target learner (e.g., such as a second-year medical student preparing for Step 1) to gain new or remedial knowledge from the ChatGPT AI output, particularly if answering incorrectly.",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "The high frequency and moderate density of insights indicate that it may be possible for a target learner (e.g., such as a second-year medical student preparing for Step 1) to gain new or remedial knowledge from the ChatGPT AI output, particularly if answering incorrectly.",
+            "meta": {}
+          },
+          {
+            "seq": 3,
+            "type": "header",
+            "text": "Discussion",
+            "ocr_text": "Discussion",
+            "role": "header",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "Discussion",
+            "meta": {}
+          },
+          {
+            "seq": 4,
+            "type": "paragraph",
+            "text": "In this study, we provide new and surprising evidence that ChatGPT is able to perform several intricate tasks relevant to handling complex medical and clinical information. To assess ChatGPT’s capabilities against biomedical and clinical questions of standardized complexity and difficulty, we tested its performance characteristics on the United States Medical Licensing Examination (USMLE).",
+            "ocr_text": "In this study, we provide new and surprising evidence that ChatGPT is able to perform several intricate tasks relevant to handling complex medical and clinical information. To assess ChatGPT’s capabilities against biomedical and clinical questions of standardized complexity and difficulty, we tested its performance characteristics on the United States Medical Licensing Examination (USMLE).",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "In this study, we provide new and surprising evidence that ChatGPT is able to perform several intricate tasks relevant to handling complex medical and clinical information. To assess ChatGPT’s capabilities against biomedical and clinical questions of standardized complexity and difficulty, we tested its performance characteristics on the United States Medical Licensing Examination (USMLE).",
+            "meta": {}
+          },
+          {
+            "seq": 5,
+            "type": "paragraph",
+            "text": "Our findings can be organized into two major themes: (1) the rising accuracy of ChatGPT, which approaches or exceeds the passing threshold for USMLE; and (2) the potential for this AI to generate novel insights that can assist human learners in a medical education setting.",
+            "ocr_text": "Our findings can be organized into two major themes: (1) the rising accuracy of ChatGPT, which approaches or exceeds the passing threshold for USMLE; and (2) the potential for this AI to generate novel insights that can assist human learners in a medical education setting.",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "Our findings can be organized into two major themes: (1) the rising accuracy of ChatGPT, which approaches or exceeds the passing threshold for USMLE; and (2) the potential for this AI to generate novel insights that can assist human learners in a medical education setting.",
+            "meta": {}
+          },
+          {
+            "seq": 6,
+            "type": "header",
+            "text": "The rising accuracy of ChatGPT",
+            "ocr_text": "The rising accuracy of ChatGPT",
+            "role": "header",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "The rising accuracy of ChatGPT",
+            "meta": {}
+          },
+          {
+            "seq": 7,
+            "type": "paragraph",
+            "text": "The most recent iteration of the GPT LLM (GPT3) achieved 46% accuracy with zero prompting [12], which marginally improved to 50% with further model training and extensive prompt tuning. Previous models, merely months prior, performed at 36.7% [13]. In this present study, ChatGPT performed at >50% accuracy across all examinations, exceeding 60% in some analyses. The USMLE pass threshold, while varying by year, is approximately 60%. Therefore, ChatGPT now approaches the passing range. Being the first experiment to reach this benchmark, we believe this is a surprising and impressive result. Moreover, we provided no prompting or training to the AI, minimized grounding bias by expunging the AI session prior to inputting each question variant, and avoided chain-of-thought biasing by requesting forced justification only as the final input. Further model interaction and prompt tuning could often produce more accurate results. Given this trajectory, it is likely that AI performance will continue to improve as LLM models continue to mature.",
+            "ocr_text": "The most recent iteration of the GPT LLM (GPT3) achieved 46% accuracy with zero prompting [12], which marginally improved to 50% with further model training and extensive prompt tuning. Previous models, merely months prior, performed at 36.7% [13]. In this present study, ChatGPT performed at >50% accuracy across all examinations, exceeding 60% in some analyses. The USMLE pass threshold, while varying by year, is approximately 60%. Therefore, ChatGPT now approaches the passing range. Being the first experiment to reach this benchmark, we believe this is a surprising and impressive result. Moreover, we provided no prompting or training to the AI, minimized grounding bias by expunging the AI session prior to inputting each question variant, and avoided chain-of-thought biasing by requesting forced justification only as the final input. Further model interaction and prompt tuning could often produce more accurate results. Given this trajectory, it is likely that AI performance will continue to improve as LLM models continue to mature.",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "The most recent iteration of the GPT LLM (GPT3) achieved 46% accuracy with zero prompting [12], which marginally improved to 50% with further model training and extensive prompt tuning. Previous models, merely months prior, performed at 36.7% [13]. In this present study, ChatGPT performed at >50% accuracy across all examinations, exceeding 60% in some analyses. The USMLE pass threshold, while varying by year, is approximately 60%. Therefore, ChatGPT now approaches the passing range. Being the first experiment to reach this benchmark, we believe this is a surprising and impressive result. Moreover, we provided no prompting or training to the AI, minimized grounding bias by expunging the AI session prior to inputting each question variant, and avoided chain-of-thought biasing by requesting forced justification only as the final input. Further model interaction and prompt tuning could often produce more accurate results. Given this trajectory, it is likely that AI performance will continue to improve as LLM models continue to mature.",
+            "meta": {}
+          },
+          {
+            "seq": 8,
+            "type": "paragraph",
+            "text": "Paradoxically, ChatGPT outperformed PubMedGPT [14] (accuracy 50.3%), a counterpart LLM with similar neural structure, but trained exclusively on biomedical domain literature. We speculate that domain-specific training may have created greater ambivalence in the PubMedGPT model, as it absorbs real-world text from ongoing academic discourse that tends to be inconclusive, contradictory, or highly conservative or noncommittal in its language. A foundation LLM trained on general content, such as ChatGPT, may therefore have an advantage because it is also exposed to broader clinical content, such as patient-facing disease primers and provider-facing drug package inserts, that are more definitive and congruent.",
+            "ocr_text": "Paradoxically, ChatGPT outperformed PubMedGPT [14] (accuracy 50.3%), a counterpart LLM with similar neural structure, but trained exclusively on biomedical domain literature. We speculate that domain-specific training may have created greater ambivalence in the PubMedGPT model, as it absorbs real-world text from ongoing academic discourse that tends to be inconclusive, contradictory, or highly conservative or noncommittal in its language. A foundation LLM trained on general content, such as ChatGPT, may therefore have an advantage because it is also exposed to broader clinical content, such as patient-facing disease primers and provider-facing drug package inserts, that are more definitive and congruent.",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "Paradoxically, ChatGPT outperformed PubMedGPT [14] (accuracy 50.3%), a counterpart LLM with similar neural structure, but trained exclusively on biomedical domain literature. We speculate that domain-specific training may have created greater ambivalence in the PubMedGPT model, as it absorbs real-world text from ongoing academic discourse that tends to be inconclusive, contradictory, or highly conservative or noncommittal in its language. A foundation LLM trained on general content, such as ChatGPT, may therefore have an advantage because it is also exposed to broader clinical content, such as patient-facing disease primers and provider-facing drug package inserts, that are more definitive and congruent.",
+            "meta": {}
+          },
+          {
+            "seq": 9,
+            "type": "paragraph",
+            "text": "An additional explanation for the observed difference in performance may be the disparate AI testing datasets. Our present study tested ChatGPT against contemporary USMLE examinations (publicly available no earlier than 2022, 5 answer choices per question), whereas previous reports tested language models against the MedQA-USMLE dataset [13] (publicly available 2009–2020, 4 answer choices per question). Although we did not perform a direct comparison against MedQA-USMLE, our approach nonetheless has several advantages. It is guaranteed that none of our inputs were previously seen by GPT3, whereas many of the inputs from MedQA-USMLE would have likely been ingested during model pretraining. Considering that medical knowledge proliferates at a faster-than-exponential rate [15] and previous",
+            "ocr_text": "An additional explanation for the observed difference in performance may be the disparate AI testing datasets. Our present study tested ChatGPT against contemporary USMLE examinations (publicly available no earlier than 2022, 5 answer choices per question), whereas previous reports tested language models against the MedQA-USMLE dataset [13] (publicly available 2009–2020, 4 answer choices per question). Although we did not perform a direct comparison against MedQA-USMLE, our approach nonetheless has several advantages. It is guaranteed that none of our inputs were previously seen by GPT3, whereas many of the inputs from MedQA-USMLE would have likely been ingested during model pretraining. Considering that medical knowledge proliferates at a faster-than-exponential rate [15] and previous",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "An additional explanation for the observed difference in performance may be the disparate AI testing datasets. Our present study tested ChatGPT against contemporary USMLE examinations (publicly available no earlier than 2022, 5 answer choices per question), whereas previous reports tested language models against the MedQA-USMLE dataset [13] (publicly available 2009–2020, 4 answer choices per question). Although we did not perform a direct comparison against MedQA-USMLE, our approach nonetheless has several advantages. It is guaranteed that none of our inputs were previously seen by GPT3, whereas many of the inputs from MedQA-USMLE would have likely been ingested during model pretraining. Considering that medical knowledge proliferates at a faster-than-exponential rate [15] and previous",
+            "meta": {}
+          }
+        ],
+        "continuation_hints": [
+          "Continuation of discussion on ChatGPT's performance advantages and implications for medical education.",
+          "Further elaboration on dataset differences and model training impacts."
+        ],
+        "raw_text": "valid insights provided for >3 out of 5 choices); low quality outputs were generally characterized by DOI ≤0.2. The upper limit on DOI is only bounded by the maximum length of text output. Across all exam types, we observed that mean DOI was significantly higher in questions items answered accurately versus inaccurately (0.458 versus 0.199, p <0.0001) (Fig 3D). The high frequency and moderate density of insights indicate that it may be possible for a target learner (e.g., such as a second-year medical student preparing for Step 1) to gain new or remedial knowledge from the ChatGPT AI output, particularly if answering incorrectly.\n\nDiscussion\nIn this study, we provide new and surprising evidence that ChatGPT is able to perform several intricate tasks relevant to handling complex medical and clinical information. To assess ChatGPT’s capabilities against biomedical and clinical questions of standardized complexity and difficulty, we tested its performance characteristics on the United States Medical Licensing Examination (USMLE).\nOur findings can be organized into two major themes: (1) the rising accuracy of ChatGPT, which approaches or exceeds the passing threshold for USMLE; and (2) the potential for this AI to generate novel insights that can assist human learners in a medical education setting.\n\nThe rising accuracy of ChatGPT\nThe most recent iteration of the GPT LLM (GPT3) achieved 46% accuracy with zero prompting [12], which marginally improved to 50% with further model training and extensive prompt tuning. Previous models, merely months prior, performed at 36.7% [13]. In",
+        "meta": {
+          "journal": "PLOS DIGITAL HEALTH",
+          "title": "ChatGPT and medical education",
+          "page_number": 8,
+          "total_pages": 12,
+          "date": "February 9, 2023",
+          "doi": "https://doi.org/10.1371/journal.pdig.0000198",
+          "parser_model": "qwen3-vl-flash",
+          "parser_version": "adjacent_structured_v2:qwen3-vl-flash",
+          "attempt_index": 1,
+          "attempt_count": 3,
+          "page_scope_cache_key": "lit:adjacent_page_structured:v2:ordered_structured_context.v1:78:8:next_page:31f35d39190300ed:6a630e0f3d03",
+          "page_scope_cache_layer": "redis"
+        }
+      }
+    ]
+  },
+  "derived_adjacent_bridge_cues": {
+    "owner": "runtime",
+    "fidelity": "derived_summary",
+    "items": []
+  },
+  "cache_meta": {
+    "dossier_namespace": "lit:reading_dossier:v2",
+    "compose_pipeline_version": "layout_uid_v1",
+    "source_sig_hash": "48ecb3fec17e2333",
+    "adjacent_context_parser_version": "adjacent_structured_v2:qwen3-vl-flash",
+    "adjacent_context_sig_hash": "c0788a985eea69d6",
+    "adjacent_context_page_scope_version": "ordered_structured_context.v1"
+  },
+  "meta": {
+    "compose_status": "done",
+    "compose_build_mode": "compose_agent_layout_uid_v1",
+    "current_page_grounding_degraded": false,
+    "current_page_grounding_degraded_reason": ""
+  }
+}

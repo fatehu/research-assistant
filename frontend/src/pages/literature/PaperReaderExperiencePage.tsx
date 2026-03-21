@@ -5,8 +5,6 @@ import {
   Button,
   Card,
   Empty,
-  Input,
-  InputNumber,
   Space,
   Tag,
   Typography,
@@ -24,12 +22,13 @@ import {
   GenerativeExperienceRenderer,
   type ExperienceLayoutVariant,
 } from './GenerativeExperienceRenderer'
+import { buildReaderExperiencePrimitives } from './experienceReaderPrimitives'
 import { useReaderSurfaceLoader } from './readerSurfaceLoader'
 import { useExperienceActionBus } from './useExperienceActionBus'
 import type { ReaderComponentRenderContext } from './readerComponents'
 import './composedReader.css'
 
-const { Title, Text, Paragraph } = Typography
+const { Text } = Typography
 const READER_API_BASE_URL = String(
   ((import.meta as any).env?.VITE_API_BASE_URL as string) || 'http://localhost:8888',
 )
@@ -74,96 +73,105 @@ function normalizeExperienceLayoutVariant(raw: string): ExperienceLayoutVariant 
   return 'resource_augmented_reader'
 }
 
-function hasNonDraftExperiencePlan(
-  response: { plan?: { status?: string | null } | null } | null | undefined,
-): boolean {
-  const status = String(response?.plan?.status || '').trim().toLowerCase()
-  return status === 'done' || status === 'fallback'
+function isDoneLikeStatus(value: unknown): boolean {
+  const token = String(value || '').trim().toLowerCase()
+  return token === 'done' || token === 'completed' || token === 'complete'
 }
 
-function classifyReaderSurfaceState(params: {
-  composeError: string | null
+function hasProvisionalStatusToken(value: unknown): boolean {
+  const token = String(value || '').trim().toLowerCase()
+  if (!token) return false
+  return (
+    token.includes('seed')
+    || token.includes('draft')
+    || token.includes('fallback')
+    || token.includes('provisional')
+  )
+}
+
+function isSeedExperiencePlan(
+  response: { plan?: { meta?: Record<string, unknown> | null } | null; experience_cache_layer?: string | null } | null | undefined,
+): boolean {
+  const meta = (response?.plan?.meta && typeof response.plan.meta === 'object')
+    ? response.plan.meta
+    : null
+  return Boolean(meta?.seed_plan || response?.experience_cache_layer === 'derived_seed')
+}
+
+function isCompletedFinalExperiencePlan(
+  response: {
+    plan?: { status?: string | null; meta?: Record<string, unknown> | null; teaching_manuscript?: { status?: string | null } | null } | null
+    compose_status?: string | null
+    experience_cache_layer?: string | null
+  } | null | undefined,
+): boolean {
+  if (!response || !response.plan) return false
+  if (isSeedExperiencePlan(response)) return false
+  if (!isDoneLikeStatus(response.plan.status)) return false
+  if (hasProvisionalStatusToken(response.compose_status)) return false
+  if (hasProvisionalStatusToken(response.experience_cache_layer)) return false
+  const meta = (response.plan.meta && typeof response.plan.meta === 'object')
+    ? response.plan.meta
+    : null
+  if (meta?.seed_plan || meta?.provisional || meta?.is_provisional || meta?.final_surface_ready === false) return false
+  const fallbackReason = String(meta?.fallback_reason || '').trim().toLowerCase()
+  if (fallbackReason) return false
+  const manuscriptStatus = String(response.plan.teaching_manuscript?.status || '').trim()
+  if (manuscriptStatus && !isDoneLikeStatus(manuscriptStatus)) return false
+  if (hasProvisionalStatusToken(manuscriptStatus)) return false
+  return true
+}
+
+function classifyFinalManuscriptSurfaceState(params: {
   planError: string | null
-  hasComposePayload: boolean
   hasPlan: boolean
+  hasPrimaryExperience: boolean
   composeLoading: boolean
   planLoading: boolean
   backgroundRefreshing: boolean
+  seedPlan: boolean
 }): { title: string; description: string } | null {
   const {
-    composeError,
     planError,
-    hasComposePayload,
     hasPlan,
+    hasPrimaryExperience,
     composeLoading,
     planLoading,
     backgroundRefreshing,
+    seedPlan,
   } = params
-  const composeToken = String(composeError || '').trim().toLowerCase()
-  const planToken = String(planError || '').trim().toLowerCase()
   if (composeLoading || planLoading || backgroundRefreshing) return null
-  if (composeToken.includes('pdf')) {
+  if (hasPrimaryExperience) return null
+  if (seedPlan || hasPlan) {
     return {
-      title: '论文 PDF 尚未就绪',
-      description: '当前页还没有可用的 PDF 渲染结果，暂时无法生成展开式体验。',
+      title: '体验内容生成中',
+      description: '当前页面正在完善阅读体验内容，请稍后刷新。',
     }
   }
-  if (composeToken.includes('no cached reader payload available') || composeToken.includes('暂无正文底座')) {
+  if (String(planError || '').trim()) {
     return {
-      title: '暂无正文底座',
-      description: '当前页还没有可用的 compose payload，请先回到阅读器触发正文清洗或稍后重试。',
+      title: '体验内容暂未就绪',
+      description: String(planError || '').trim(),
     }
   }
-  if (!hasComposePayload && composeError) {
-    return {
-      title: '正文底座加载失败',
-      description: composeError,
-    }
+  return {
+    title: '体验内容暂未就绪',
+    description: '请稍后刷新，或先返回阅读器继续阅读。',
   }
-  if (hasComposePayload && !hasPlan && (planToken.includes('network error') || planToken.includes('加载体验计划失败'))) {
-    return {
-      title: '增强计划暂未就绪',
-      description: '正文底座已可用，但体验计划还没有成功返回。你可以稍后刷新体验，或先回到阅读器继续阅读。',
-    }
-  }
-  if (hasComposePayload && !hasPlan) {
-    return {
-      title: '增强计划暂未就绪',
-      description: '当前已拿到底座内容，但更完整的体验计划还没准备好。',
-    }
-  }
-  return null
-}
-
-function localizeReadingPathStep(step: string): string {
-  const token = String(step || '').trim().toLowerCase()
-  if (token === 'hero_summary') return '核心摘要'
-  if (token === 'focus_evidence') return '聚焦证据'
-  if (token === 'key_finding') return '关键发现'
-  if (token === 'context_explainer') return '背景解释'
-  if (token === 'supporting_resources') return '延伸资源'
-  if (token === 'explore_questions') return '继续探索'
-  if (token === 'reading_flow') return '正文阅读'
-  if (token === 'hero') return '开场摘要'
-  if (token === 'focus') return '重点内容'
-  if (token === 'read') return '阅读正文'
-  if (token === 'explore') return '扩展探索'
-  return String(step || '').replace(/[_-]+/g, ' ')
-}
-
-function isEnglishHeavyReaderCopy(raw: string): boolean {
-  const text = String(raw || '').trim()
-  if (!text) return false
-  const cjkMatches = text.match(/[\u3400-\u9fff]/g) || []
-  const latinMatches = text.match(/[A-Za-z]/g) || []
-  if (cjkMatches.length > 0) return false
-  return latinMatches.length >= 24 && latinMatches.length > cjkMatches.length * 4
 }
 
 function preferDisplayCopy(primary: unknown, fallback: unknown): string {
   const primaryText = String(primary || '').trim()
   if (primaryText) return primaryText
   return String(fallback || '').trim()
+}
+
+function buildReaderSignalSnippet(raw: unknown, maxChars: number = 52): string {
+  const text = String(raw || '').trim().replace(/\s+/g, ' ')
+  if (!text) return ''
+  const sentence = (text.match(/[^。！？!?]+[。！？!?]?/) || [text])[0].trim()
+  if (sentence.length <= maxChars) return sentence
+  return `${sentence.slice(0, Math.max(0, maxChars - 1)).trim()}…`
 }
 
 function toAbsoluteApiUrl(rawUrl: string): string {
@@ -250,10 +258,10 @@ export default function PaperReaderExperiencePage() {
   const initialIntent = searchParams.get('intent') || ''
   const initialReader = searchParams.get('reader') || 'curious_generalist'
 
-  const [focusPage, setFocusPage] = useState(Number.isFinite(initialPage) && initialPage > 0 ? initialPage : 1)
-  const [selectedKbId, setSelectedKbId] = useState(Number.isFinite(initialKbId) && initialKbId > 0 ? initialKbId : 0)
-  const [userIntent, setUserIntent] = useState(initialIntent)
-  const [readerProfile, setReaderProfile] = useState(initialReader)
+  const [focusPage] = useState(Number.isFinite(initialPage) && initialPage > 0 ? initialPage : 1)
+  const [selectedKbId] = useState(Number.isFinite(initialKbId) && initialKbId > 0 ? initialKbId : 0)
+  const [userIntent] = useState(initialIntent)
+  const [readerProfile] = useState(initialReader)
   const [reloadState, setReloadState] = useState({ nonce: 0, forceFresh: false })
 
   const numericPaperId = Number(paperId || 0)
@@ -305,13 +313,81 @@ export default function PaperReaderExperiencePage() {
 
   const effectiveComposePayload = composePayload || experienceResponse?.compose_payload || null
   const experiencePlan = experienceResponse?.plan || null
-  const generativePlan = experienceResponse?.generative_plan || null
+  const generativePlan = experienceResponse?.generative_plan || effectiveComposePayload?.generative_reader_plan || null
   const layoutVariant = normalizeExperienceLayoutVariant(experiencePlan?.layout_variant || String(experiencePlan?.meta?.layout_variant || ''))
+  const manuscript = experiencePlan?.teaching_manuscript || null
+  const hasPrimaryExperienceSignals = Boolean(
+    (experiencePlan?.hero && (String(experiencePlan.hero.display_summary || experiencePlan.hero.summary || '').trim() || String(experiencePlan.hero.display_title || experiencePlan.hero.title || '').trim()))
+    || (Array.isArray(experiencePlan?.main_sections) && experiencePlan.main_sections.length > 0)
+    || (Array.isArray(experiencePlan?.guided_beats) && experiencePlan.guided_beats.length > 0)
+    || (Array.isArray(experiencePlan?.supporting_resources) && experiencePlan.supporting_resources.length > 0)
+    || (Array.isArray(experiencePlan?.interactive_blocks) && experiencePlan.interactive_blocks.length > 0)
+    || (Array.isArray(experiencePlan?.widget_blocks) && experiencePlan.widget_blocks.length > 0),
+  )
+  const hasCompletedFinalExperience = isCompletedFinalExperiencePlan(experienceResponse)
+  const hasPrimaryExperience = hasCompletedFinalExperience && hasPrimaryExperienceSignals
 
   const composedAssets = useMemo<ReaderComposeAsset[]>(
     () => (Array.isArray(effectiveComposePayload?.assets) ? effectiveComposePayload.assets : []),
     [effectiveComposePayload?.assets],
   )
+  const readerPrimitives = useMemo(
+    () => buildReaderExperiencePrimitives({ experiencePlan, generativePlan }),
+    [experiencePlan, generativePlan],
+  )
+  const contextCards = useMemo(() => {
+    const cards: Array<{ key: string; title: string; body: ReactNode }> = []
+    if (readerPrimitives.terms.length || readerPrimitives.backgroundTopics.length) {
+      cards.push({
+        key: 'context',
+        title: '阅读前需了解',
+        body: (
+          <div className="reader-experience-page__chip-cloud">
+            {readerPrimitives.terms.map((item) => <Tag key={`term-${item}`}>{item}</Tag>)}
+            {readerPrimitives.backgroundTopics.map((item) => <Tag key={`topic-${item}`} color="orange">{item}</Tag>)}
+          </div>
+        ),
+      })
+    }
+    if (readerPrimitives.visibleClaims.length || readerPrimitives.hooks.length) {
+      const claimSignalRows = readerPrimitives.visibleClaims
+        .slice(0, 2)
+        .map((claim) => ({
+          id: claim.claim_id,
+          compact: buildReaderSignalSnippet(preferDisplayCopy(claim.display_text, claim.text)),
+        }))
+        .filter((item) => item.compact)
+      cards.push({
+        key: 'signals',
+        title: '阅读线索',
+        body: (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            {claimSignalRows.length ? (
+              <details className="reader-experience-page__source-toggle">
+                <summary>
+                  <Text className="reader-experience-page__eyebrow">查看本页线索</Text>
+                  <Text type="secondary">{`${claimSignalRows.length} 条`}</Text>
+                </summary>
+                <div className="reader-experience-page__source-toggle-body">
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    {claimSignalRows.map((item) => (
+                      <Text key={item.id} type="secondary">{item.compact}</Text>
+                    ))}
+                  </Space>
+                </div>
+              </details>
+            ) : null}
+            {readerPrimitives.hooks.length ? (
+              <div className="reader-experience-page__chip-cloud">
+                {readerPrimitives.hooks.map((hook, index) => <Tag key={`hook-${index}`} color="blue">{hook}</Tag>)}
+              </div>
+            ) : null}
+          </Space>
+        ),
+      })
+    }
+    return cards
+  }, [readerPrimitives.backgroundTopics, readerPrimitives.hooks, readerPrimitives.terms, readerPrimitives.visibleClaims])
   const composedPageImageUrl = String(
     ((effectiveComposePayload as unknown as { docmind_structure?: { page_image_url?: unknown } })?.docmind_structure?.page_image_url)
     || '',
@@ -382,33 +458,14 @@ export default function PaperReaderExperiencePage() {
       .filter((node) => getReaderNodePlacement(node) === 'main')
       .map((node) => sanitizeExperienceNode(node))
   ), [effectiveComposePayload])
-  const hero = experiencePlan?.hero || null
-  const storyTitle = (() => {
-    const title = String(hero?.display_title || experiencePlan?.page_story_title || '').trim()
-    if (title && title.toLowerCase() !== 'fig 3') return title
-    return `论文 ${numericPaperId} 展开阅读`
-  })()
-  const storySubtitle = preferDisplayCopy(hero?.display_subtitle, experiencePlan?.page_story_subtitle || '基于清洗后正文内容生成的展开式阅读体验。')
-  const storyGoal = preferDisplayCopy(hero?.display_summary, experiencePlan?.narrative_goal || '')
-  const mainSections = useMemo(() => experiencePlan?.main_sections || [], [experiencePlan?.main_sections])
-  const pageBrief = generativePlan?.page_brief || null
-  const contentBudget = (pageBrief?.content_budget && typeof pageBrief.content_budget === 'object')
-    ? pageBrief.content_budget as Record<string, number>
-    : {}
-  const readingPath = experiencePlan?.reading_path || []
-  const primaryFocusTargetId = String(hero?.target_ids?.[0] || '').trim()
+
+  const primaryFocusTargetId = String(experiencePlan?.hero?.target_ids?.[0] || '').trim()
   const { activeTargetId, lastUiEvent, dispatchBlockAction, getBlockUiAction } = useExperienceActionBus({
     paperId: numericPaperId,
     focusPage,
     primaryFocusTargetId,
   })
   const effectiveFocusTargetId = activeTargetId || primaryFocusTargetId
-  const mainClaims = generativePlan?.story_substrate?.main_claims || []
-  const termsToExplain = generativePlan?.story_substrate?.terms_to_explain || []
-  const backgroundGaps = generativePlan?.story_substrate?.background_gaps || []
-  const resourceModules = experiencePlan?.supporting_resources || []
-  const interactionModules = experiencePlan?.interactive_blocks || []
-  const widgetBlocks = experiencePlan?.widget_blocks || []
 
   const focusNode = useMemo(() => {
     if (!effectiveFocusTargetId) {
@@ -423,178 +480,55 @@ export default function PaperReaderExperiencePage() {
     return mainComponents.filter((node) => String(node.id || '').trim() !== focusId)
   }, [focusNode, mainComponents])
 
-  const questionModules = interactionModules.filter((module) => String(module.module_type || '').trim() === 'QuestionStarterPanel')
-
-  const focusHeading = (() => {
-    const heroTitle = String(preferDisplayCopy(hero?.display_title, hero?.title)).trim()
-    if (heroTitle) return heroTitle
-    if (focusNode?.type === 'FigurePanel') {
-      const props = (focusNode.props && typeof focusNode.props === 'object') ? focusNode.props as Record<string, unknown> : {}
-      const sourceLabel = String(props.source_label || '').trim()
-      const title = String(props.title || '').trim()
-      if (sourceLabel && title) return `${sourceLabel} · ${title}`
-      if (sourceLabel) return sourceLabel
-      if (title) return title
-    }
-    return storyTitle
+  const storyTitle = (() => {
+    const title = String(experiencePlan?.hero?.display_title || experiencePlan?.page_story_title || '').trim()
+    if (title && title.toLowerCase() !== 'fig 3') return title
+    return `论文 ${numericPaperId} 阅读体验`
   })()
 
-  const visibleClaims = mainClaims
-    .filter((claim) => !isEnglishHeavyReaderCopy(preferDisplayCopy(claim?.display_text, claim?.text)))
-    .slice(0, Math.max(1, Number(contentBudget.max_claim_cards || 2)))
-  const visibleTerms = termsToExplain.slice(0, 5)
-  const visibleBackgroundGaps = backgroundGaps.slice(0, 4)
-  const visibleHooks = useMemo(() => (
-    Array.isArray(pageBrief?.experience_hooks)
-      ? pageBrief.experience_hooks.slice(0, Math.max(1, Number(contentBudget.max_hooks || 2)))
-      : []
-  ), [contentBudget.max_hooks, pageBrief?.experience_hooks])
-  const fallbackQuestions = useMemo(() => {
-    if (questionModules.length) return []
-    return [
-      '图里的哪一部分最能改变你对这页结论的理解？',
-      '这页里哪些专业术语需要先解释，才能真正看懂结果？',
-      '如果读者不是专业人士，最需要补充的背景信息是什么？',
-    ]
-  }, [questionModules.length])
-  const fallbackQuestionAnswers = useMemo(() => {
-    if (!fallbackQuestions.length) return []
-    return [
-      {
-        question: fallbackQuestions[0],
-        answer: preferDisplayCopy(hero?.display_summary, hero?.summary) || storyGoal || '先看主图，再回到正文核对哪一个变化最关键。',
-      },
-      {
-        question: fallbackQuestions[1],
-        answer: visibleTerms.length
-          ? `优先要解释的是 ${visibleTerms.slice(0, 3).map((item) => item.term).join('、')}，因为它们直接决定你能不能正确读懂这页的图和结论。`
-          : '最容易卡住理解的通常是页面里的评价指标和基准名称。',
-      },
-      {
-        question: fallbackQuestions[2],
-        answer: visibleBackgroundGaps.length
-          ? `最值得补的背景是 ${visibleBackgroundGaps[0].topic}，因为它能帮助非专业读者理解这页在比较什么。`
-          : '最值得补的外部背景通常是这页引用的考试体系或评价框架。',
-      },
-    ]
-  }, [fallbackQuestions, hero?.display_summary, hero?.summary, storyGoal, visibleTerms, visibleBackgroundGaps])
-  const sectionMap = useMemo<Record<string, typeof mainSections[number]>>(
-    () => Object.fromEntries(mainSections.map((section) => [String(section.section_type || '').trim(), section])),
-    [mainSections],
-  )
-  const topStatusText = (() => {
-    if ((composeLoading && !effectiveComposePayload) || (planLoading && !effectiveComposePayload && !experiencePlan)) return '正在准备体验页'
-    if (backgroundRefreshing) return '后台更新中'
-    if (planError) return '基础内容已就绪'
-    if (experienceResponse?.experience_cache_hit) return '已就绪'
-    return '最新生成'
-  })()
-  const narrativeSections = useMemo(
-    () => mainSections.filter((section) => String(section.section_type || '').trim() !== 'hero'),
-    [mainSections],
-  )
-  const storyMapSection = sectionMap.story_map
-  const storyMapMeta = useMemo(() => {
-    if (!storyMapSection) return { rationaleRows: [] as string[], hookRows: [] as string[], toolRows: [] as string[] }
-    const meta = (storyMapSection.meta && typeof storyMapSection.meta === 'object')
-      ? storyMapSection.meta as Record<string, unknown>
-      : {}
-    return {
-      rationaleRows: Array.isArray(meta.rationale) ? meta.rationale.map((item) => String(item || '').trim()).filter(Boolean) : [],
-      hookRows: Array.isArray(meta.hooks) ? meta.hooks.map((item) => String(item || '').trim()).filter(Boolean) : [],
-      toolRows: Array.isArray(meta.used_tools) ? meta.used_tools.map((item) => String(item || '').trim()).filter(Boolean) : [],
-    }
-  }, [storyMapSection])
-  const surfaceState = classifyReaderSurfaceState({
-    composeError,
+  const focusHeading = String(preferDisplayCopy(experiencePlan?.hero?.display_title, experiencePlan?.hero?.title)).trim() || storyTitle
+
+  const isSeedState = surfaceLoadState === 'showing_seed'
+    || isSeedExperiencePlan(experienceResponse)
+    || (Boolean(experienceResponse) && !hasCompletedFinalExperience)
+  const surfaceState = classifyFinalManuscriptSurfaceState({
     planError,
-    hasComposePayload: Boolean(effectiveComposePayload),
-    hasPlan: Boolean(hasNonDraftExperiencePlan(experienceResponse)),
+    hasPlan: Boolean(experienceResponse?.plan),
+    hasPrimaryExperience,
     composeLoading,
     planLoading,
     backgroundRefreshing,
+    seedPlan: isSeedState,
   })
 
-  const contextCards = useMemo(() => {
-    const cards: Array<{ key: string; title: string; body: ReactNode }> = []
-    if (visibleTerms.length || visibleBackgroundGaps.length) {
-      cards.push({
-        key: 'context',
-        title: '阅读前需了解',
-        body: (
-          <div className="reader-experience-page__chip-cloud">
-            {visibleTerms.map((item) => (
-              <Tag key={item.term}>{item.term}</Tag>
-            ))}
-            {visibleBackgroundGaps.map((item) => (
-              <Tag key={item.topic} color="orange">{item.topic}</Tag>
-            ))}
-          </div>
-        ),
-      })
-    }
-    if (visibleClaims.length || visibleHooks.length) {
-      const compactClaims = visibleClaims.slice(0, 2)
-      const hiddenClaimCount = Math.max(0, visibleClaims.length - compactClaims.length)
-      cards.push({
-        key: 'signals',
-        title: '本页信号',
-        body: (
-          <Space direction="vertical" size={10} style={{ width: '100%' }}>
-            {compactClaims.length ? (
-              <div className="reader-experience-page__signal-list">
-                {compactClaims.map((claim) => (
-                  <div key={claim.claim_id} className="reader-experience-page__signal-item">
-                    <Text>{preferDisplayCopy(claim.display_text, claim.text)}</Text>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            {hiddenClaimCount > 0 ? (
-              <Text type="secondary" className="reader-experience-page__summary">+{hiddenClaimCount} 条更多信号</Text>
-            ) : null}
-            {visibleHooks.length ? (
-              <div className="reader-experience-page__chip-cloud">
-                {visibleHooks.map((hook, index) => (
-                  <Tag key={`hook-${index}`} color="blue">{hook}</Tag>
-                ))}
-              </div>
-            ) : null}
-          </Space>
-        ),
-      })
-    }
-    return cards
-  }, [visibleBackgroundGaps, visibleClaims, visibleHooks, visibleTerms])
+  const topStatusText = (() => {
+    if ((composeLoading || planLoading) && !hasPrimaryExperience) return '体验生成中'
+    if (hasPrimaryExperience && backgroundRefreshing) return '体验已就绪（后台更新）'
+    if (hasPrimaryExperience && experienceResponse?.experience_cache_hit) return '体验已就绪'
+    if (hasPrimaryExperience) return '体验已更新'
+    if (backgroundRefreshing || isSeedState) return '体验收敛中'
+    if (planError) return '体验暂未就绪'
+    return '等待体验'
+  })()
+
+  const queryToken = useMemo(() => {
+    const next = new URLSearchParams()
+    next.set('page', String(focusPage))
+    if (selectedKbId > 0) next.set('kb', String(selectedKbId))
+    if (readerProfile.trim()) next.set('reader', readerProfile.trim())
+    if (userIntent.trim()) next.set('intent', userIntent.trim())
+    return next.toString()
+  }, [focusPage, readerProfile, selectedKbId, userIntent])
 
   return (
     <div className="reader-experience-page">
       <div className="reader-experience-page__header">
         <div className="reader-experience-page__hero-copy">
           <div className="reader-experience-page__status-row">
-            <Text className="reader-experience-page__eyebrow">展开阅读页</Text>
+            <Text className="reader-experience-page__eyebrow">阅读体验</Text>
             <span className="reader-experience-page__status-chip">{topStatusText}</span>
           </div>
-          <Title level={1} className="reader-experience-page__title">{storyTitle}</Title>
-          <Paragraph className="reader-experience-page__subtitle">{storySubtitle}</Paragraph>
-          {storyGoal ? <Paragraph className="reader-experience-page__goal">{storyGoal}</Paragraph> : null}
-          <div className="reader-experience-page__path">
-            {(readingPath.length ? readingPath : ['hero', 'focus', 'read', 'explore']).map((step, index) => (
-              <div key={`${step}-${index}`} className="reader-experience-page__path-step">
-                <span className="reader-experience-page__path-index">{index + 1}</span>
-                <span>{localizeReadingPathStep(step)}</span>
-              </div>
-            ))}
-          </div>
-          {visibleHooks.length ? (
-            <div className="reader-experience-page__path reader-experience-page__path--hooks">
-              {visibleHooks.map((hook, index) => (
-                <div key={`hook-${index}`} className="reader-experience-page__path-step reader-experience-page__path-step--hook">
-                  <span>{hook}</span>
-                </div>
-              ))}
-            </div>
-          ) : null}
+          <Text type="secondary">{`论文 ${numericPaperId} · 第 ${focusPage} 页`}</Text>
         </div>
         <div className="reader-experience-page__header-actions">
           <Space wrap size={10}>
@@ -604,55 +538,19 @@ export default function PaperReaderExperiencePage() {
             >
               刷新体验
             </Button>
+            <Link to={`/literature/${numericPaperId}/workbench-v2?${queryToken}`}>打开 Workbench</Link>
             <Link to={`/literature/${numericPaperId}/read?page=${focusPage}`}>返回阅读器</Link>
           </Space>
         </div>
       </div>
 
-      <details className="reader-experience-page__details">
-        <summary>页面参数</summary>
-        <div className="reader-experience-page__details-body">
-          <Space wrap size={16} align="start">
-            <div>
-              <Text type="secondary">页码</Text>
-              <div>
-                <InputNumber min={1} value={focusPage} onChange={(value) => setFocusPage(Number(value || 1))} />
-              </div>
-            </div>
-            <div>
-              <Text type="secondary">知识库</Text>
-              <div>
-                <InputNumber min={0} value={selectedKbId} onChange={(value) => setSelectedKbId(Number(value || 0))} />
-              </div>
-            </div>
-            <div style={{ minWidth: 220 }}>
-              <Text type="secondary">读者画像</Text>
-              <Input value={readerProfile} onChange={(event) => setReaderProfile(event.target.value)} />
-            </div>
-            <div style={{ minWidth: 320, flex: '1 1 320px' }}>
-              <Text type="secondary">阅读意图</Text>
-              <Input.TextArea value={userIntent} onChange={(event) => setUserIntent(event.target.value)} autoSize={{ minRows: 2, maxRows: 4 }} />
-            </div>
-          </Space>
-        </div>
-      </details>
-
       {composeError ? <Alert type="error" showIcon message={composeError} className="reader-experience-page__alert" /> : null}
-      {!composeError && planError ? (
+      {!composeError && planError && !hasCompletedFinalExperience ? (
         <Alert
           type="warning"
           showIcon
-          message={planError}
-          description="正文底座已加载，体验计划暂未完成。"
-          className="reader-experience-page__alert"
-        />
-      ) : null}
-      {selectedKbId <= 0 ? (
-        <Alert
-          type="info"
-          showIcon
-          message="当前未绑定知识库"
-          description="本页会优先基于论文正文与公开资源生成体验；如果你希望引入知识库检索，可在上方参数里填入 kb。"
+          message="体验内容还在生成"
+          description="系统已在后台继续完善内容。"
           className="reader-experience-page__alert"
         />
       ) : null}
@@ -669,79 +567,38 @@ export default function PaperReaderExperiencePage() {
         </Card>
       ) : null}
 
-      {!surfaceState ? (
+      {!surfaceState && hasPrimaryExperience ? (
         <GenerativeExperienceRenderer
+          renderMode="full"
           layoutVariant={layoutVariant}
-          hero={hero}
+          hero={experiencePlan?.hero || null}
           focusHeading={focusHeading}
-          visibleClaims={visibleClaims}
+          visibleClaims={readerPrimitives.visibleClaims}
           contextCards={contextCards}
-          narrativeSections={narrativeSections}
+          narrativeSections={experiencePlan?.main_sections || []}
+          guidedBeats={experiencePlan?.guided_beats || []}
+          teachingManuscript={manuscript}
+          toolEnrichmentPacket={(
+            (experiencePlan?.meta as Record<string, unknown> | undefined)?.tool_enrichment_packet as Record<string, unknown> | undefined
+          ) || ({} as Record<string, unknown>)}
           focusNode={focusNode}
+          bodyFlowNodes={mainComponents}
           readingFlowNodes={readingFlowNodes}
           renderCtx={renderCtx}
           composeLoading={composeLoading}
           hasComposePayload={Boolean(effectiveComposePayload)}
           backgroundRefreshing={backgroundRefreshing}
-          fallbackQuestionAnswers={fallbackQuestionAnswers}
-          resourceModules={resourceModules}
-          interactionModules={interactionModules}
-          widgetBlocks={widgetBlocks}
+          fallbackQuestionAnswers={readerPrimitives.fallbackQuestionAnswers}
+          resourceModules={experiencePlan?.supporting_resources || []}
+          interactionModules={experiencePlan?.interactive_blocks || []}
+          widgetBlocks={experiencePlan?.widget_blocks || []}
           getBlockUiAction={getBlockUiAction}
           dispatchBlockAction={dispatchBlockAction}
           lastUiEvent={lastUiEvent}
           topStatusText={topStatusText}
+          seedMode={false}
         />
       ) : null}
-
-      <details className="reader-experience-page__details">
-        <summary>页面生成细节</summary>
-        <div className="reader-experience-page__details-body">
-          <Space wrap>
-            <Tag>{`焦点页 ${focusPage}`}</Tag>
-            <Tag>{`读者 ${readerProfile}`}</Tag>
-            {experienceResponse?.cache_layer ? <Tag>{`compose ${experienceResponse.cache_layer}`}</Tag> : null}
-            {experienceResponse?.experience_cache_layer ? <Tag>{`experience ${experienceResponse.experience_cache_layer}`}</Tag> : null}
-            {experienceResponse?.generative_plan_cache_layer ? <Tag>{`plan ${experienceResponse.generative_plan_cache_layer}`}</Tag> : null}
-            {generativePlan?.used_tools?.length ? <Tag>{`工具:${generativePlan.used_tools.join(', ')}`}</Tag> : null}
-            {experienceResponse?.experience_cache_hit ? <Tag color="cyan">体验缓存命中</Tag> : null}
-            {experienceResponse?.generative_plan_cache_hit ? <Tag color="blue">计划缓存命中</Tag> : null}
-          </Space>
-          <Paragraph className="reader-experience-page__summary">
-            {String(generativePlan?.meta?.notes || experiencePlan?.meta?.derived_from || '').trim() || '当前体验页建立在 compose 底座与 generative plan 之上。'}
-          </Paragraph>
-          {storyMapMeta.rationaleRows.length ? (
-            <div className="reader-experience-page__details-section">
-              <Text className="reader-experience-page__eyebrow">页面规划依据</Text>
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                {storyMapMeta.rationaleRows.map((row, index) => (
-                  <Paragraph key={`details-rationale-${index}`} className="reader-experience-page__summary">{row}</Paragraph>
-                ))}
-              </Space>
-            </div>
-          ) : null}
-          {storyMapMeta.hookRows.length ? (
-            <div className="reader-experience-page__details-section">
-              <Text className="reader-experience-page__eyebrow">阅读钩子</Text>
-              <div className="reader-experience-page__chip-cloud">
-                {storyMapMeta.hookRows.map((hook, index) => (
-                  <Tag key={`details-hook-${index}`}>{hook}</Tag>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          {storyMapMeta.toolRows.length ? (
-            <div className="reader-experience-page__details-section">
-              <Text className="reader-experience-page__eyebrow">使用工具</Text>
-              <div className="reader-experience-page__chip-cloud">
-                {storyMapMeta.toolRows.map((tool) => (
-                  <Tag key={tool} color="geekblue">{tool}</Tag>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
-      </details>
     </div>
   )
 }

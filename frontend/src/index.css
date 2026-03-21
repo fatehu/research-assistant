@@ -21,6 +21,111 @@ body {
   overflow: hidden;
 }
 
+body.experience-v2-route-active,
+body.workbench-v2-route-active {
+  overflow: auto;
+}
+
+body.experience-v2-route-active {
+  background:
+    radial-gradient(circle at top left, rgba(255, 246, 226, 0.94) 0%, rgba(255, 246, 226, 0) 34%),
+    linear-gradient(180deg, #f7f2e9 0%, #f1ebdf 48%, #ece6dc 100%);
+  color: #18263e;
+}
+
+body.experience-v2-route-active a {
+  color: #355ea7;
+}
+
+body.experience-v2-route-active a:hover {
+  color: #254c90;
+}
+
+body.experience-v2-route-active .ant-card,
+body.experience-v2-route-active .ant-pro-card {
+  background: rgba(255, 252, 246, 0.98) !important;
+  border: 1px solid rgba(86, 110, 156, 0.16) !important;
+  backdrop-filter: none !important;
+  box-shadow: 0 18px 38px rgba(24, 34, 58, 0.08) !important;
+}
+
+body.experience-v2-route-active .ant-card-head,
+body.experience-v2-route-active .ant-pro-card-header {
+  border-bottom: 1px solid rgba(86, 110, 156, 0.12) !important;
+  color: #18263e !important;
+}
+
+body.experience-v2-route-active .ant-card-body,
+body.experience-v2-route-active .ant-pro-card-body,
+body.experience-v2-route-active .ant-typography,
+body.experience-v2-route-active .ant-result-title,
+body.experience-v2-route-active .ant-result-subtitle,
+body.experience-v2-route-active .ant-empty-description,
+body.experience-v2-route-active .ant-alert-message,
+body.experience-v2-route-active .ant-alert-description {
+  color: #18263e !important;
+}
+
+body.experience-v2-route-active .ant-typography.ant-typography-secondary,
+body.experience-v2-route-active .ant-result-subtitle,
+body.experience-v2-route-active .ant-empty-description {
+  color: rgba(24, 38, 62, 0.68) !important;
+}
+
+body.experience-v2-route-active .ant-tag {
+  border-color: rgba(86, 110, 156, 0.12) !important;
+}
+
+body.experience-v2-route-active .main-layout__content-shell,
+body.experience-v2-route-active .main-layout__content {
+  background: transparent !important;
+}
+
+body.workbench-v2-route-active a {
+  color: #355ea7;
+}
+
+body.workbench-v2-route-active a:hover {
+  color: #254c90;
+}
+
+body.workbench-v2-route-active .ant-card,
+body.workbench-v2-route-active .ant-collapse > .ant-collapse-item,
+body.workbench-v2-route-active .ant-collapse-content,
+body.workbench-v2-route-active .ant-collapse-content-box {
+  background: rgba(255, 252, 246, 0.98) !important;
+  border-color: rgba(86, 110, 156, 0.16) !important;
+  box-shadow: 0 18px 38px rgba(24, 34, 58, 0.08) !important;
+}
+
+body.workbench-v2-route-active .ant-card-head,
+body.workbench-v2-route-active .ant-collapse-header {
+  color: #18263e !important;
+  border-color: rgba(86, 110, 156, 0.12) !important;
+}
+
+body.workbench-v2-route-active .ant-card-head-title,
+body.workbench-v2-route-active .ant-typography,
+body.workbench-v2-route-active .ant-result-title,
+body.workbench-v2-route-active .ant-result-subtitle,
+body.workbench-v2-route-active .ant-empty-description,
+body.workbench-v2-route-active .ant-alert-message,
+body.workbench-v2-route-active .ant-alert-description,
+body.workbench-v2-route-active .ant-collapse-content-box,
+body.workbench-v2-route-active pre {
+  color: #18263e !important;
+}
+
+body.workbench-v2-route-active .ant-typography.ant-typography-secondary,
+body.workbench-v2-route-active .ant-empty-description,
+body.workbench-v2-route-active .ant-result-subtitle {
+  color: rgba(24, 38, 62, 0.72) !important;
+}
+
+body.workbench-v2-route-active .ant-tag {
+  border-color: rgba(86, 110, 156, 0.12) !important;
+}
+
 /* 自定义滚动条 */
 ::-webkit-scrollbar {
   width: 6px;

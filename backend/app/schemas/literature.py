@@ -2,7 +2,10 @@
 文献管理 Schema
 """
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+import hashlib
+import re
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -675,13 +678,30 @@ class ReaderPageBrief(BaseModel):
     hero_angle: str = ""
     primary_focus_target_id: str = ""
     secondary_support_target_ids: List[str] = Field(default_factory=list)
+    body_flow_target_ids: List[str] = Field(default_factory=list)
     reading_path: List[str] = Field(default_factory=list)
     interaction_opportunities: List[str] = Field(default_factory=list)
     resource_gaps: List[str] = Field(default_factory=list)
     experience_hooks: List[str] = Field(default_factory=list)
     resource_strategy: str = ""
-    storyboard: List[Dict[str, Any]] = Field(default_factory=list)
+    storyboard: List["ReaderPageStoryboardBeat"] = Field(default_factory=list)
     content_budget: Dict[str, int] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderPageStoryboardBeat(BaseModel):
+    beat_id: str
+    role: str = ""
+    section_type: str = ""
+    title: str = ""
+    purpose: str = ""
+    reader_goal: str = ""
+    continuity_note: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    tool_objectives: List[str] = Field(default_factory=list)
+    block_stack: List[str] = Field(default_factory=list)
+    drop_notes: List[str] = Field(default_factory=list)
+    priority: int = 0
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -694,7 +714,7 @@ class ReaderGenerativeResourceModule(BaseModel):
     summary: str = ""
     display_summary: str = ""
     links: List[Dict[str, Any]] = Field(default_factory=list)
-    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata"] = "agent"
+    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata", "tool_trace"] = "agent"
     interaction_mode: str = ""
     meta: Dict[str, Any] = Field(default_factory=dict)
 
@@ -707,7 +727,7 @@ class ReaderGenerativeInteractionModule(BaseModel):
     display_title: str = ""
     display_summary: str = ""
     props: Dict[str, Any] = Field(default_factory=dict)
-    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata"] = "agent"
+    source: Literal["agent", "paper_read", "knowledge_search", "web", "mcp", "fallback", "paper_assets", "metadata", "tool_trace"] = "agent"
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -721,6 +741,131 @@ class ReaderGenerativeJsWidgetPlan(BaseModel):
     data_requirements: List[str] = Field(default_factory=list)
     props: Dict[str, Any] = Field(default_factory=dict)
     meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderAdjacentPageItem(BaseModel):
+    label: str = ""
+    description: str = ""
+
+
+class ReaderAdjacentPageContext(BaseModel):
+    page: int = Field(default=0, ge=0)
+    relation: str = ""
+    reference_only: bool = True
+    source: str = ""
+    summary: str = ""
+    body_text: str = ""
+    figures: List[ReaderAdjacentPageItem] = Field(default_factory=list)
+    tables: List[ReaderAdjacentPageItem] = Field(default_factory=list)
+    equations: List[ReaderAdjacentPageItem] = Field(default_factory=list)
+    continuation_hints: List[str] = Field(default_factory=list)
+    raw_text: str = ""
+
+
+class ReadingDossierV2AdjacentPageImage(BaseModel):
+    url: str = ""
+    width: Optional[int] = Field(default=None, ge=0)
+    height: Optional[int] = Field(default=None, ge=0)
+
+
+_LEGACY_ADJACENT_JSON_STUFFING_KEYS = (
+    '"page"',
+    '"relation"',
+    '"content_stream"',
+    '"page_summary"',
+    '"summary"',
+    '"body_text"',
+    '"continuation_hints"',
+    '"reference_only"',
+    '"fidelity"',
+)
+
+
+def _looks_like_legacy_adjacent_payload_stuffing(value: str) -> bool:
+    text = str(value or "").strip()
+    if len(text) < 24:
+        return False
+    candidate = text.lstrip("`").strip()
+    if not candidate.startswith(("{", "[")):
+        return False
+    hits = sum(1 for key in _LEGACY_ADJACENT_JSON_STUFFING_KEYS if key in candidate)
+    if hits >= 2 and ("content_stream" in candidate or "body_text" in candidate or "page_summary" in candidate):
+        return True
+    return bool(
+        re.search(
+            r'^\{\s*"page"\s*:\s*\d+.*"(content_stream|body_text|page_summary|summary)"\s*:',
+            candidate,
+            re.DOTALL,
+        )
+    )
+
+
+class ReadingDossierV2AdjacentContentStreamItem(BaseModel):
+    seq: int = Field(..., ge=1)
+    type: Literal["paragraph", "figure", "table", "equation", "caption", "header", "footer"]
+    text: str = ""
+    ocr_text: str = ""
+    role: str = ""
+    label: str = ""
+    caption: str = ""
+    description: str = ""
+    columns: List[str] = Field(default_factory=list)
+    rows: List[List[str]] = Field(default_factory=list)
+    normalized_text: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_content_payload(self):
+        if not any(
+            [
+                str(self.text or "").strip(),
+                str(self.ocr_text or "").strip(),
+                str(self.caption or "").strip(),
+                str(self.description or "").strip(),
+                str(self.normalized_text or "").strip(),
+                bool(self.columns),
+                bool(self.rows),
+            ]
+        ):
+            raise ValueError("adjacent content_stream item must preserve extracted content")
+        if _looks_like_legacy_adjacent_payload_stuffing(self.text):
+            raise ValueError(
+                "adjacent content_stream item text contains legacy JSON payload stuffing; invalid ordered_structured_context"
+            )
+        if _looks_like_legacy_adjacent_payload_stuffing(self.ocr_text):
+            raise ValueError(
+                "adjacent content_stream item ocr_text contains legacy JSON payload stuffing; invalid ordered_structured_context"
+            )
+        return self
+
+
+class ReadingDossierV2AdjacentPageRow(BaseModel):
+    page: int = Field(default=0, ge=1)
+    relation: Literal["previous_page", "next_page"]
+    source: str = ""
+    fidelity: Literal["ordered_structured_context"] = "ordered_structured_context"
+    reference_only: bool = False
+    page_image: ReadingDossierV2AdjacentPageImage = Field(default_factory=ReadingDossierV2AdjacentPageImage)
+    page_summary: str = ""
+    content_stream: List[ReadingDossierV2AdjacentContentStreamItem] = Field(default_factory=list)
+    continuation_hints: List[str] = Field(default_factory=list)
+    raw_text: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_structured_context(self):
+        if self.reference_only:
+            raise ValueError("reading_dossier_v2 adjacent rows cannot remain reference_only")
+        if not list(self.content_stream or []):
+            raise ValueError(
+                "neighboring-page structured context not implemented: adjacent page row missing ordered content_stream"
+            )
+        seqs = [int(item.seq) for item in list(self.content_stream or [])]
+        if seqs != sorted(seqs):
+            raise ValueError("adjacent page content_stream must preserve page reading order")
+        if len(seqs) != len(set(seqs)):
+            raise ValueError("adjacent page content_stream seq values must be unique")
+        return self
 
 
 class ReaderGenerativePlan(BaseModel):
@@ -816,6 +961,56 @@ class ReaderExperienceSection(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ReaderExperienceGuidedBeat(BaseModel):
+    beat_id: str
+    beat_type: str = ""
+    section_type_hint: str = ""
+    title: str = ""
+    display_title: str = ""
+    summary: str = ""
+    display_summary: str = ""
+    reader_goal: str = ""
+    continuity_note: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    tool_objectives: List[str] = Field(default_factory=list)
+    block_stack: List[ReaderExperienceBlockRef] = Field(default_factory=list)
+    drop_notes: List[str] = Field(default_factory=list)
+    importance: int = 0
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderTeachingManuscriptReferenceLink(BaseModel):
+    label: str = ""
+    href: str = ""
+    note: str = ""
+
+
+class ReaderTeachingManuscriptGlossaryItem(BaseModel):
+    term: str = ""
+    note: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+
+
+class ReaderTeachingManuscriptSegment(BaseModel):
+    segment_id: str
+    segment_type: str = ""
+    title: str = ""
+    teaching_text: str = ""
+    anchor_excerpt: str = ""
+    target_ids: List[str] = Field(default_factory=list)
+    full_evidence_target_ids: List[str] = Field(default_factory=list)
+    glossary: List[ReaderTeachingManuscriptGlossaryItem] = Field(default_factory=list)
+    adjacent_bridge: str = ""
+    reference_links: List[ReaderTeachingManuscriptReferenceLink] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderTeachingManuscript(BaseModel):
+    version: str = "v1"
+    status: Literal["draft", "done", "fallback"] = "draft"
+    segments: List[ReaderTeachingManuscriptSegment] = Field(default_factory=list)
+
+
 class ReaderExperiencePlan(BaseModel):
     version: str = "v1"
     status: Literal["draft", "done", "fallback"] = "draft"
@@ -823,11 +1018,14 @@ class ReaderExperiencePlan(BaseModel):
     focus_page: int = Field(default=1, ge=1)
     reader_profile: str = "curious_generalist"
     layout_variant: str = "resource_augmented_reader"
+    fidelity_mode: Literal["strict", "light_repair", "guided_explainer"] = "light_repair"
     page_story_title: str = ""
     page_story_subtitle: str = ""
     narrative_goal: str = ""
     hero: ReaderExperienceHero = Field(default_factory=ReaderExperienceHero)
     main_sections: List[ReaderExperienceSection] = Field(default_factory=list)
+    guided_beats: List[ReaderExperienceGuidedBeat] = Field(default_factory=list)
+    teaching_manuscript: Optional[ReaderTeachingManuscript] = None
     supporting_resources: List[ReaderGenerativeResourceModule] = Field(default_factory=list)
     interactive_blocks: List[ReaderGenerativeInteractionModule] = Field(default_factory=list)
     widget_blocks: List[ReaderGenerativeJsWidgetPlan] = Field(default_factory=list)
@@ -930,6 +1128,995 @@ class ReaderPageGrounding(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ReadingDossierV2CurrentPageLane(BaseModel):
+    owner: str = "compose/page_grounding_v1"
+    fidelity: str = "grounded_evidence"
+    build_meta: Dict[str, Any] = Field(default_factory=dict)
+    rich_grounding: ReaderPageGrounding = Field(default_factory=ReaderPageGrounding)
+
+
+class ReadingDossierV2AdjacentPagesLimits(BaseModel):
+    reference_only: bool = False
+    max_pages: int = Field(default=2, ge=0, le=8)
+    max_page_summary_chars: int = Field(default=400, ge=32, le=4000)
+    max_content_stream_items: int = Field(default=48, ge=1, le=256)
+    max_continuation_hints: int = Field(default=6, ge=1, le=24)
+    max_raw_text_chars: int = Field(default=1600, ge=64, le=24000)
+
+
+class ReadingDossierV2AdjacentPagesLane(BaseModel):
+    owner: str = "api/adjacent_page_extraction"
+    fidelity: Literal["ordered_structured_context"] = "ordered_structured_context"
+    reference_only: bool = False
+    limits: ReadingDossierV2AdjacentPagesLimits = Field(default_factory=ReadingDossierV2AdjacentPagesLimits)
+    pages: List[ReadingDossierV2AdjacentPageRow] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_pages(self):
+        if self.reference_only:
+            raise ValueError("reading_dossier_v2 adjacent_pages lane cannot be reference_only")
+        return self
+
+
+class ReadingDossierV2DerivedAdjacentBridgeCue(BaseModel):
+    cue_id: str = ""
+    from_page: int = Field(default=0, ge=0)
+    to_page: int = Field(default=0, ge=0)
+    text: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReadingDossierV2DerivedAdjacentBridgeCuesLane(BaseModel):
+    owner: str = "runtime"
+    fidelity: str = "derived_summary"
+    items: List[ReadingDossierV2DerivedAdjacentBridgeCue] = Field(default_factory=list)
+
+
+class ReadingDossierV2CacheMetaLane(BaseModel):
+    dossier_namespace: str = "lit:reading_dossier:v2"
+    compose_pipeline_version: str = ""
+    source_sig_hash: str = ""
+    adjacent_context_parser_version: str = ""
+    adjacent_context_sig_hash: str = ""
+    adjacent_context_page_scope_version: str = "ordered_structured_context.v1"
+
+
+class ReadingDossierV2(BaseModel):
+    version: Literal["reading_dossier_v2"] = "reading_dossier_v2"
+    dossier_contract: str = "rd2.v1"
+    focus_page: int = Field(default=1, ge=1)
+    reader_profile: str = "curious_generalist"
+    compose_source_signature: str = ""
+    current_page: ReadingDossierV2CurrentPageLane = Field(default_factory=ReadingDossierV2CurrentPageLane)
+    adjacent_pages: ReadingDossierV2AdjacentPagesLane = Field(default_factory=ReadingDossierV2AdjacentPagesLane)
+    derived_adjacent_bridge_cues: ReadingDossierV2DerivedAdjacentBridgeCuesLane = Field(
+        default_factory=ReadingDossierV2DerivedAdjacentBridgeCuesLane
+    )
+    cache_meta: ReadingDossierV2CacheMetaLane = Field(default_factory=ReadingDossierV2CacheMetaLane)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PageArtifactV2AuthoredPlanInput(BaseModel):
+    template_id: str = Field(..., min_length=1)
+    layout_recipe: str = Field(..., min_length=1)
+    presentation_mode: str = Field(..., min_length=1)
+    widget_family: str = Field(..., min_length=1)
+    motion_preset: str = Field(..., min_length=1)
+    interaction_policy: str = Field(..., min_length=1)
+    authored_explanations: List[str] = Field(default_factory=list)
+    authored_text_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    excerpt_overrides: List[Dict[str, Any]] = Field(default_factory=list)
+    figure_slots: List[Dict[str, Any]] = Field(default_factory=list)
+    table_slots: List[Dict[str, Any]] = Field(default_factory=list)
+    equation_slots: List[Dict[str, Any]] = Field(default_factory=list)
+    media_slots: List[Dict[str, Any]] = Field(default_factory=list)
+    aside_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    term_annotations: List[Dict[str, Any]] = Field(default_factory=list)
+    external_resources: List[Dict[str, Any]] = Field(default_factory=list)
+    requested_node_kinds: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_authored_explanations(self):
+        cleaned = [str(item).strip() for item in list(self.authored_explanations or []) if str(item).strip()]
+        self.authored_explanations = cleaned
+        normalized_text_blocks: List[Dict[str, Any]] = []
+        for raw_item in list(self.authored_text_blocks or []):
+            if not isinstance(raw_item, Mapping):
+                continue
+            segment_kind = str(raw_item.get("segment_kind") or "").strip()
+            text = str(raw_item.get("text") or "").strip()
+            if segment_kind not in {"heading", "paragraph", "authored_explanation"}:
+                raise ValueError("authored_text_blocks only support heading, paragraph, or authored_explanation kinds")
+            if not text:
+                raise ValueError("authored_text_blocks require non-empty text")
+            normalized_text_blocks.append(
+                {
+                    "segment_kind": segment_kind,
+                    "text": text,
+                    "meta": dict(raw_item.get("meta") or {}),
+                }
+            )
+        self.authored_text_blocks = normalized_text_blocks
+        if not cleaned and not normalized_text_blocks:
+            raise ValueError("authored plan requires at least one non-empty authored text block or explanation")
+        return self
+
+
+class ExperienceSessionV2ArtifactDraftResourceRequest(BaseModel):
+    request_id: str = Field(..., min_length=1)
+    tool_name: Literal["paper_read", "knowledge_search", "web_search", "web_scrape"]
+    query: str = ""
+    url: str = ""
+    reason: str = ""
+    max_results: int = Field(default=3, ge=1, le=6)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_request_shape(cls, value: Any):
+        if not isinstance(value, Mapping):
+            return value
+        payload = dict(value)
+        tool_name = str(
+            payload.get("tool_name")
+            or payload.get("tool")
+            or payload.get("name")
+            or payload.get("requested_tool")
+            or ""
+        ).strip()
+        if tool_name and not str(payload.get("tool_name") or "").strip():
+            payload["tool_name"] = tool_name
+
+        if not str(payload.get("query") or "").strip():
+            query = str(payload.get("q") or payload.get("search_query") or payload.get("search_term") or "").strip()
+            if query:
+                payload["query"] = query
+
+        if not str(payload.get("url") or "").strip():
+            url = str(payload.get("href") or payload.get("target_url") or "").strip()
+            if url:
+                payload["url"] = url
+
+        if not str(payload.get("reason") or "").strip():
+            reason = str(payload.get("purpose") or payload.get("why") or payload.get("note") or "").strip()
+            if reason:
+                payload["reason"] = reason
+
+        if not str(payload.get("request_id") or "").strip():
+            seed = "|".join(
+                part
+                for part in [
+                    str(payload.get("tool_name") or "").strip(),
+                    str(payload.get("query") or "").strip(),
+                    str(payload.get("url") or "").strip(),
+                    str(payload.get("reason") or "").strip(),
+                ]
+                if part
+            )
+            if seed:
+                payload["request_id"] = f"req-{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:12]}"
+        return payload
+
+    @model_validator(mode="after")
+    def _validate_request_shape(self):
+        if self.tool_name == "web_scrape":
+            if not str(self.url or "").strip():
+                raise ValueError("artifact_draft web_scrape requests require url")
+            return self
+        if not str(self.query or "").strip():
+            raise ValueError("artifact_draft retrieval requests require query")
+        return self
+
+
+def _artifact_draft_node_collect_string_list(
+    payload: Mapping[str, Any],
+    *,
+    direct_keys: Sequence[str],
+    nested_keys: Sequence[str] = (),
+    object_id_keys: Sequence[str] = (),
+) -> List[str]:
+    values: List[str] = []
+
+    def _append(raw: Any):
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text:
+                values.append(text)
+            return
+        if isinstance(raw, Mapping):
+            for object_key in object_id_keys:
+                candidate = str(raw.get(object_key) or "").strip()
+                if candidate:
+                    values.append(candidate)
+                    return
+            return
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            for item in raw:
+                _append(item)
+
+    for key in direct_keys:
+        _append(payload.get(key))
+    for key in nested_keys:
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            _append(nested)
+        elif isinstance(nested, Sequence) and not isinstance(nested, (str, bytes, bytearray)):
+            for item in nested:
+                _append(item)
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+_ARTIFACT_DRAFT_ALLOWED_READER_ROLES = {
+    "anchor_excerpt",
+    "teaching_explanation",
+    "continuity_bridge",
+    "support_note",
+    "visual_evidence",
+}
+
+
+def _normalize_artifact_draft_reader_role(node_kind: str, raw_value: Any) -> str:
+    role = str(raw_value or "").strip().lower()
+    aliases = {
+        "anchor": "anchor_excerpt",
+        "excerpt": "anchor_excerpt",
+        "anchor_quote": "anchor_excerpt",
+        "teaching": "teaching_explanation",
+        "explanation": "teaching_explanation",
+        "teaching_note": "teaching_explanation",
+        "bridge": "continuity_bridge",
+        "continuity": "continuity_bridge",
+        "support": "support_note",
+        "note": "support_note",
+        "visual": "visual_evidence",
+        "visual_anchor": "visual_evidence",
+        "media": "visual_evidence",
+    }
+    if role in aliases:
+        role = aliases[role]
+    if role:
+        return role
+    if node_kind == "original_excerpt":
+        return "anchor_excerpt"
+    if node_kind == "paragraph":
+        return "teaching_explanation"
+    if node_kind in {"figure_slot", "table_slot", "equation_slot"}:
+        return "visual_evidence"
+    if node_kind in {"aside", "term_note", "external_resource"}:
+        return "support_note"
+    return ""
+
+
+class ExperienceSessionV2ArtifactDraftNode(BaseModel):
+    node_kind: Literal[
+        "heading",
+        "paragraph",
+        "original_excerpt",
+        "figure_slot",
+        "table_slot",
+        "equation_slot",
+        "aside",
+        "term_note",
+        "external_resource",
+    ]
+    text: str = ""
+    display_text: str = ""
+    label: str = ""
+    caption: str = ""
+    term: str = ""
+    definition: str = ""
+    source_layout_ids: List[str] = Field(default_factory=list)
+    source_block_ids: List[str] = Field(default_factory=list)
+    resource_ref_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_node_shape(cls, value: Any):
+        if not isinstance(value, Mapping):
+            return value
+        payload = dict(value)
+        node_kind = str(
+            payload.get("node_kind")
+            or payload.get("kind")
+            or payload.get("type")
+            or payload.get("node_type")
+            or ""
+        ).strip()
+        if node_kind:
+            payload["node_kind"] = node_kind
+
+        label = str(payload.get("label") or payload.get("title") or payload.get("name") or "").strip()
+        if label and not str(payload.get("label") or "").strip():
+            payload["label"] = label
+
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            if node_kind == "heading":
+                text = str(payload.get("heading") or payload.get("title") or payload.get("label") or "").strip()
+            elif node_kind in {"paragraph", "aside"}:
+                text = str(
+                    payload.get("content")
+                    or payload.get("body")
+                    or payload.get("paragraph_text")
+                    or payload.get("aside_text")
+                    or payload.get("summary")
+                    or ""
+                ).strip()
+            elif node_kind == "term_note":
+                text = str(payload.get("definition") or payload.get("content") or payload.get("body") or "").strip()
+        if text and not str(payload.get("text") or "").strip():
+            payload["text"] = text
+
+        display_text = str(payload.get("display_text") or "").strip()
+        if not display_text and node_kind == "original_excerpt":
+            display_text = str(
+                payload.get("excerpt")
+                or payload.get("quote")
+                or payload.get("content")
+                or payload.get("text")
+                or ""
+            ).strip()
+        if display_text and not str(payload.get("display_text") or "").strip():
+            payload["display_text"] = display_text
+
+        definition = str(payload.get("definition") or "").strip()
+        if not definition and node_kind == "term_note":
+            definition = str(payload.get("text") or payload.get("content") or "").strip()
+        if definition and not str(payload.get("definition") or "").strip():
+            payload["definition"] = definition
+
+        if not str(payload.get("caption") or "").strip() and node_kind in {"figure_slot", "table_slot", "equation_slot"}:
+            caption = str(payload.get("description") or payload.get("summary") or payload.get("text") or "").strip()
+            if caption:
+                payload["caption"] = caption
+
+        layout_ids = _artifact_draft_node_collect_string_list(
+            payload,
+            direct_keys=("source_layout_ids", "source_layout_id", "layout_id", "layout_ids", "anchor_layout_id"),
+            nested_keys=("source_ref", "source_refs", "figure_ref", "table_ref", "equation_ref", "media_ref", "binding"),
+            object_id_keys=("source_layout_id", "layout_id", "anchor_layout_id", "source_layout_ref"),
+        )
+        if layout_ids:
+            payload["source_layout_ids"] = layout_ids
+
+        block_ids = _artifact_draft_node_collect_string_list(
+            payload,
+            direct_keys=("source_block_ids", "source_block_id", "block_id", "block_ids"),
+            nested_keys=("source_ref", "source_refs", "binding"),
+            object_id_keys=("source_block_id", "block_id", "source_block_ref"),
+        )
+        if block_ids:
+            payload["source_block_ids"] = block_ids
+
+        resource_ref_ids = _artifact_draft_node_collect_string_list(
+            payload,
+            direct_keys=("resource_ref_ids", "resource_ref_id", "resource_ids", "resource_id"),
+            nested_keys=("resource_refs", "resources", "bundle_entries", "resource_ref", "resource"),
+            object_id_keys=("resource_id", "resource_ref_id"),
+        )
+        if resource_ref_ids:
+            payload["resource_ref_ids"] = resource_ref_ids
+
+        meta = dict(payload.get("meta") or {})
+        node_id = str(payload.get("node_id") or "").strip()
+        if node_id:
+            meta.setdefault("node_id", node_id)
+        for source_key, meta_key in (
+            ("lane", "lane"),
+            ("placement", "placement"),
+            ("prominence", "prominence"),
+            ("group_id", "group_id"),
+            ("group_label", "group_label"),
+            ("section_id", "section_id"),
+            ("section_label", "section_label"),
+        ):
+            value = str(payload.get(source_key) or "").strip()
+            if value:
+                meta.setdefault(meta_key, value)
+        reader_role = _normalize_artifact_draft_reader_role(
+            node_kind,
+            payload.get("reader_role")
+            or meta.get("reader_role")
+            or payload.get("role")
+            or payload.get("readerRole"),
+        )
+        if reader_role:
+            meta.setdefault("reader_role", reader_role)
+        if meta:
+            payload["meta"] = meta
+        return payload
+
+    @model_validator(mode="after")
+    def _validate_node_shape(self):
+        if self.node_kind in {"heading", "paragraph", "aside"} and not str(self.text or "").strip():
+            raise ValueError(f"{self.node_kind} nodes require text")
+        if self.node_kind == "original_excerpt":
+            if not str(self.display_text or "").strip():
+                raise ValueError("original_excerpt nodes require display_text")
+            if not list(self.source_layout_ids or []) and not list(self.source_block_ids or []):
+                raise ValueError("original_excerpt nodes require source ids")
+        if self.node_kind in {"figure_slot", "table_slot", "equation_slot"}:
+            if not list(self.source_layout_ids or []) and not str(self.meta.get("source_layout_id") or "").strip():
+                raise ValueError(f"{self.node_kind} nodes require source_layout_ids")
+        if self.node_kind == "term_note":
+            if not str(self.term or self.label or "").strip():
+                raise ValueError("term_note nodes require term or label")
+            if not str(self.definition or self.text or "").strip():
+                raise ValueError("term_note nodes require definition or text")
+        if self.node_kind == "external_resource":
+            if not list(self.resource_ref_ids or []):
+                raise ValueError("external_resource nodes require resource_ref_ids")
+            if not str(self.label or self.text or "").strip():
+                raise ValueError("external_resource nodes require label or text")
+        reader_role = str((self.meta or {}).get("reader_role") or "").strip()
+        if reader_role and reader_role not in _ARTIFACT_DRAFT_ALLOWED_READER_ROLES:
+            raise ValueError(
+                "artifact_draft nodes only support reader_role values: "
+                + ", ".join(sorted(_ARTIFACT_DRAFT_ALLOWED_READER_ROLES))
+            )
+        return self
+
+
+class ExperienceSessionV2ArtifactDraft(BaseModel):
+    version: Literal["experience_session_artifact_draft_v1"] = "experience_session_artifact_draft_v1"
+    focus_page: int = Field(default=1, ge=1)
+    template_hint: str = Field(..., min_length=1)
+    layout_recipe: str = Field(..., min_length=1)
+    presentation_mode: str = Field(..., min_length=1)
+    widget_family: str = "reader_v2_surface"
+    motion_preset: str = "calm_progressive"
+    interaction_policy: str = "reader_first_guided"
+    nodes: List[ExperienceSessionV2ArtifactDraftNode] = Field(default_factory=list)
+    resource_requests: List[ExperienceSessionV2ArtifactDraftResourceRequest] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_draft_shape(cls, value: Any):
+        if not isinstance(value, Mapping):
+            return value
+        payload = dict(value)
+        draft_meta = dict(payload.get("meta") or {})
+
+        def _normalize_top_level_string_field(
+            field_name: str,
+            *,
+            alias_keys: Sequence[str],
+            default_value: str,
+        ) -> None:
+            raw_value = payload.get(field_name)
+            if isinstance(raw_value, str) and raw_value.strip():
+                payload[field_name] = raw_value.strip()
+                return
+            for alias_key in alias_keys:
+                alias_value = payload.get(alias_key)
+                if isinstance(alias_value, str) and alias_value.strip():
+                    payload[field_name] = alias_value.strip()
+                    return
+            if isinstance(raw_value, Mapping):
+                draft_meta.setdefault(f"{field_name}_config", dict(raw_value))
+                preferred = ""
+                for key in ("recipe", "mode", "name", "id", "variant", "style", "label"):
+                    item = raw_value.get(key)
+                    if isinstance(item, str) and item.strip():
+                        preferred = item.strip()
+                        break
+                if preferred:
+                    payload[field_name] = preferred
+                    return
+                compact_parts: List[str] = []
+                for key, item in raw_value.items():
+                    if isinstance(item, str) and item.strip():
+                        compact_parts.append(f"{key}:{item.strip()}")
+                    elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                        compact_parts.append(f"{key}:{item}")
+                    if len(compact_parts) >= 4:
+                        break
+                if compact_parts:
+                    payload[field_name] = "|".join(compact_parts)
+                    return
+                payload[field_name] = default_value
+                return
+            if isinstance(raw_value, Sequence) and not isinstance(raw_value, (str, bytes, bytearray)):
+                draft_meta.setdefault(f"{field_name}_config", list(raw_value))
+                compact_items = [str(item).strip() for item in raw_value if str(item).strip()]
+                payload[field_name] = "|".join(compact_items[:4]) if compact_items else default_value
+                return
+            payload[field_name] = default_value
+
+        if not str(payload.get("template_hint") or "").strip() or not isinstance(payload.get("template_hint"), str):
+            _normalize_top_level_string_field(
+                "template_hint",
+                alias_keys=("template_id", "template"),
+                default_value="guided_mixed_media_v1",
+            )
+        if not str(payload.get("layout_recipe") or "").strip() or not isinstance(payload.get("layout_recipe"), str):
+            _normalize_top_level_string_field(
+                "layout_recipe",
+                alias_keys=("layout", "layout_strategy"),
+                default_value="current_page_spine_interleave_v1",
+            )
+        if not str(payload.get("presentation_mode") or "").strip() or not isinstance(payload.get("presentation_mode"), str):
+            _normalize_top_level_string_field(
+                "presentation_mode",
+                alias_keys=("presentation", "presentation_strategy"),
+                default_value="mixed_layout",
+            )
+        if "resource_requests" not in payload and isinstance(payload.get("retrieval_requests"), Sequence):
+            payload["resource_requests"] = list(payload.get("retrieval_requests") or [])
+        if draft_meta:
+            payload["meta"] = draft_meta
+        return payload
+
+    @model_validator(mode="after")
+    def _validate_draft(self):
+        if not list(self.nodes or []):
+            raise ValueError("artifact_draft requires nodes")
+        if not any(node.node_kind in {"heading", "paragraph", "original_excerpt"} for node in list(self.nodes or [])):
+            raise ValueError("artifact_draft requires guided-reading narrative nodes")
+        main_nodes = [
+            node
+            for node in list(self.nodes or [])
+            if str((node.meta or {}).get("lane") or "main").strip() != "support"
+        ]
+        excerpt_nodes = [node for node in main_nodes if node.node_kind == "original_excerpt"]
+        paragraph_nodes = [node for node in main_nodes if node.node_kind == "paragraph"]
+        if excerpt_nodes and not paragraph_nodes:
+            raise ValueError("artifact_draft requires teaching paragraphs alongside selected excerpts")
+        return self
+
+
+class PageArtifactV2ReadingBlock(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    segment_kind: Literal[
+        "heading",
+        "paragraph",
+        "original_excerpt",
+        "authored_explanation",
+        "figure_slot",
+        "table_slot",
+        "equation_slot",
+        "media_slot",
+        "aside_content",
+        "term_annotation",
+        "external_resource",
+    ]
+    source_lane: Literal["current_page", "authoring_plan"] = "current_page"
+    page: int = Field(default=1, ge=1)
+    text: str = ""
+    source_layout_ids: List[str] = Field(default_factory=list)
+    source_block_ids: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_text(self):
+        text = str(self.text or "").strip()
+        if not text:
+            raise ValueError("reading block text cannot be empty")
+        self.text = text
+        if self.segment_kind in {"figure_slot", "table_slot", "equation_slot", "media_slot"}:
+            meta = dict(self.meta or {})
+            binding = meta.get("media_binding") or meta.get("figure_binding") or {}
+            binding_kind = str(binding.get("binding_kind") or meta.get("binding_kind") or "").strip()
+            page_asset_ref = str(
+                binding.get("page_asset_ref")
+                or binding.get("page_image_url")
+                or binding.get("page_image_path")
+                or meta.get("page_image_url")
+                or ""
+            ).strip()
+            if not page_asset_ref:
+                raise ValueError(f"{self.segment_kind} blocks must include current-page asset bindings")
+            if binding_kind.endswith("_layout_anchor"):
+                if not list(self.source_layout_ids or []):
+                    raise ValueError(f"{self.segment_kind} blocks must include resolved current-page layout bindings")
+                if not list(self.evidence_ids or []):
+                    raise ValueError(f"{self.segment_kind} blocks must include resolved current-page evidence bindings")
+            elif binding_kind != "page_image_anchor":
+                raise ValueError(f"{self.segment_kind} blocks must declare a supported binding kind")
+        return self
+
+
+class PageArtifactV2CurrentPageSpine(BaseModel):
+    page: int = Field(default=1, ge=1)
+    owner: str = "reading_dossier_v2.current_page"
+    primary: bool = True
+    reading_node_ids: List[str] = Field(default_factory=list)
+    layout_ids: List[str] = Field(default_factory=list)
+    block_ids: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
+    main_segment_ids: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_spine_anchors(self):
+        has_anchor = any(
+            [
+                bool(self.reading_node_ids),
+                bool(self.layout_ids),
+                bool(self.block_ids),
+                bool(self.evidence_ids),
+            ]
+        )
+        if not has_anchor:
+            raise ValueError("current_page_spine must include at least one grounding anchor")
+        if not list(self.main_segment_ids or []):
+            raise ValueError("current_page_spine must include main_segment_ids")
+        return self
+
+
+class PageArtifactV2ProvenanceLane(BaseModel):
+    continuity_mode: Literal[
+        "current_page_primary_ordered_adjacent_context",
+    ] = "current_page_primary_ordered_adjacent_context"
+    adjacent_context_pages: List[int] = Field(default_factory=list)
+    include_adjacent_as_coequal_anchor: bool = False
+    source_lanes: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PageArtifactV2(BaseModel):
+    version: Literal["page_artifact_v2"] = "page_artifact_v2"
+    artifact_contract_id: Literal["page_artifact_v2.contract.v1"] = "page_artifact_v2.contract.v1"
+    focus_page: int = Field(default=1, ge=1)
+    reader_profile: str = "curious_generalist"
+    dossier_signature: str = ""
+    session_id: Optional[str] = None
+    template_id: str = Field(..., min_length=1)
+    layout_recipe: str = Field(..., min_length=1)
+    presentation_mode: str = Field(..., min_length=1)
+    widget_family: str = Field(..., min_length=1)
+    motion_preset: str = Field(..., min_length=1)
+    interaction_policy: str = Field(..., min_length=1)
+    reading_blocks: List[PageArtifactV2ReadingBlock] = Field(default_factory=list)
+    current_page_spine: PageArtifactV2CurrentPageSpine
+    provenance: PageArtifactV2ProvenanceLane = Field(default_factory=PageArtifactV2ProvenanceLane)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_contract(self):
+        if int(self.current_page_spine.page) != int(self.focus_page):
+            raise ValueError("current_page_spine.page must equal focus_page")
+        if bool(self.provenance.include_adjacent_as_coequal_anchor):
+            raise ValueError("adjacent pages cannot be co-equal anchors in page_artifact_v2")
+
+        original_segments = [item for item in list(self.reading_blocks or []) if item.segment_kind == "original_excerpt"]
+        authored_segments = [
+            item
+            for item in list(self.reading_blocks or [])
+            if item.segment_kind in {"heading", "paragraph", "authored_explanation"}
+        ]
+        if not original_segments:
+            raise ValueError("page_artifact_v2 requires original_excerpt blocks")
+        if not authored_segments:
+            raise ValueError("page_artifact_v2 requires authored narrative blocks")
+
+        original_ids = {str(item.segment_id) for item in original_segments}
+        spine_ids = {str(item).strip() for item in list(self.current_page_spine.main_segment_ids or []) if str(item).strip()}
+        if not spine_ids or not (spine_ids & original_ids):
+            raise ValueError("current_page_spine.main_segment_ids must point to original_excerpt blocks")
+        if any(segment_id not in original_ids for segment_id in spine_ids):
+            raise ValueError("current_page_spine.main_segment_ids cannot include non-original blocks")
+
+        adjacent_pages_meta = dict(self.provenance.source_lanes or {}).get("adjacent_pages_meta")
+        if self.provenance.adjacent_context_pages and not isinstance(adjacent_pages_meta, dict):
+            raise ValueError("page_artifact_v2 provenance must preserve ordered adjacent_pages context")
+        return self
+
+
+class ExperienceSessionV2RuntimeBudget(BaseModel):
+    max_iterations: int = Field(default=6, ge=1, le=32)
+    max_tool_rounds: int = Field(default=8, ge=1, le=64)
+
+
+class ExperienceSessionV2NarrativeBrief(BaseModel):
+    version: Literal["experience_session_narrative_brief_v2"] = "experience_session_narrative_brief_v2"
+    focus_page: int = Field(default=1, ge=1)
+    current_page_main_arc: Union[str, Dict[str, Any]] = ""
+    continuity_resolutions: Union[str, List[Any], Dict[str, Any]] = Field(default_factory=list)
+    required_media_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    reader_attention_order: List[str] = Field(default_factory=list)
+    must_surface_nodes: List[str] = Field(default_factory=list)
+    suppressed_threads: List[str] = Field(default_factory=list)
+    content_strategy: Union[str, Dict[str, Any]] = ""
+    presentation_strategy: Union[str, Dict[str, Any]] = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_strategy_shape(cls, value: Any):
+        if not isinstance(value, Mapping):
+            return value
+        payload = dict(value)
+        nested_strategy_roots = [
+            payload.get("reading_strategy"),
+            payload.get("strategy"),
+            payload.get("narrative_strategy"),
+            payload.get("brief"),
+        ]
+
+        field_aliases = {
+            "current_page_main_arc": (
+                "current_page_main_arc",
+                "main_arc",
+                "page_arc",
+                "page_main_arc",
+                "primary_claim",
+                "page_role",
+            ),
+            "continuity_resolutions": (
+                "continuity_resolutions",
+                "continuity",
+                "continuity_notes",
+                "continuity_plan",
+                "continuity_bridges",
+                "bridges",
+            ),
+            "required_media_refs": (
+                "required_media_refs",
+                "required_media",
+                "media_refs",
+                "media_plan",
+                "must_surface_media",
+                "visual_evidence",
+            ),
+            "content_strategy": (
+                "content_strategy",
+                "content_plan",
+                "reading_plan",
+                "teaching_strategy",
+                "drafting_strategy",
+                "composition_strategy",
+            ),
+            "presentation_strategy": (
+                "presentation_strategy",
+                "presentation",
+                "presentation_plan",
+                "layout_strategy",
+                "surface_strategy",
+                "display_strategy",
+            ),
+            "reader_attention_order": (
+                "reader_attention_order",
+                "attention_order",
+                "reading_order",
+                "reader_steps",
+            ),
+            "must_surface_nodes": (
+                "must_surface_nodes",
+                "must_surface",
+                "surface_nodes",
+                "must_keep_nodes",
+                "evidence_anchors",
+            ),
+            "suppressed_threads": (
+                "suppressed_threads",
+                "secondary_threads",
+                "deprioritized_threads",
+                "omit_threads",
+            ),
+        }
+
+        for canonical_key, aliases in field_aliases.items():
+            current_value = payload.get(canonical_key)
+            if current_value not in (None, "", [], {}):
+                continue
+            resolved = None
+            for alias in aliases:
+                alias_value = payload.get(alias)
+                if alias_value not in (None, "", [], {}):
+                    resolved = alias_value
+                    break
+            if resolved in (None, "", [], {}):
+                for nested in nested_strategy_roots:
+                    if not isinstance(nested, Mapping):
+                        continue
+                    for alias in aliases:
+                        alias_value = nested.get(alias)
+                        if alias_value not in (None, "", [], {}):
+                            resolved = alias_value
+                            break
+                    if resolved not in (None, "", [], {}):
+                        break
+            if resolved not in (None, "", [], {}):
+                payload[canonical_key] = resolved
+
+        raw_media_value = payload.get("required_media_refs")
+        if isinstance(raw_media_value, Mapping):
+            raw_media_refs = [dict(raw_media_value)]
+        elif isinstance(raw_media_value, (str, bytes, bytearray)):
+            raw_media_refs = [str(raw_media_value)]
+        else:
+            raw_media_refs = list(raw_media_value or [])
+        normalized_media_refs: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_media_refs, start=1):
+            if isinstance(item, Mapping):
+                normalized = dict(item)
+                label = str(
+                    normalized.get("label")
+                    or normalized.get("title")
+                    or normalized.get("name")
+                    or normalized.get("description")
+                    or normalized.get("text")
+                    or ""
+                ).strip()
+                media_type = str(
+                    normalized.get("type")
+                    or normalized.get("media_type")
+                    or normalized.get("kind")
+                    or ""
+                ).strip()
+                if not label:
+                    page = str(normalized.get("page") or "").strip()
+                    ref = str(
+                        normalized.get("ref")
+                        or normalized.get("layout_id")
+                        or normalized.get("layout_ref")
+                        or normalized.get("url")
+                        or ""
+                    ).strip()
+                    synthesized = " ".join(part for part in [media_type, page] if part).strip()
+                    label = synthesized or ref
+                if label and not str(normalized.get("label") or "").strip():
+                    normalized["label"] = label
+                if media_type and not str(normalized.get("type") or "").strip():
+                    normalized["type"] = media_type
+                normalized_media_refs.append(normalized)
+                continue
+            text = str(item or "").strip()
+            if not text:
+                continue
+            normalized_media_refs.append(
+                {
+                    "type": "media_ref",
+                    "label": text,
+                    "description": text,
+                    "meta": {
+                        "normalized_from": "string",
+                        "position": int(index),
+                    },
+                }
+            )
+        payload["required_media_refs"] = normalized_media_refs
+        return payload
+
+    @staticmethod
+    def _has_strategy_value(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, Mapping):
+            return any(ExperienceSessionV2NarrativeBrief._has_strategy_value(item) for item in value.values())
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return any(ExperienceSessionV2NarrativeBrief._has_strategy_value(item) for item in value)
+        return value is not None and bool(str(value).strip())
+
+    @model_validator(mode="after")
+    def _validate_brief(self):
+        if not self._has_strategy_value(self.current_page_main_arc):
+            raise ValueError("narrative brief requires current_page_main_arc")
+        if not self._has_strategy_value(self.continuity_resolutions):
+            raise ValueError("narrative brief requires continuity_resolutions")
+        normalized_media_refs = []
+        for item in list(self.required_media_refs or []):
+            payload = dict(item)
+            if not self._has_strategy_value(payload):
+                continue
+            label = str(payload.get("label") or payload.get("description") or payload.get("text") or "").strip()
+            if not label:
+                raise ValueError("narrative brief required_media_refs entries must include label-like content")
+            payload.setdefault("label", label)
+            payload.setdefault("type", str(payload.get("type") or "media_ref").strip() or "media_ref")
+            normalized_media_refs.append(payload)
+        self.required_media_refs = normalized_media_refs
+        if not self._has_strategy_value(self.content_strategy):
+            raise ValueError("narrative brief requires content_strategy")
+        if not self._has_strategy_value(self.presentation_strategy):
+            raise ValueError("narrative brief requires presentation_strategy")
+        return self
+
+
+class ExperienceSessionV2ContextCarry(BaseModel):
+    mode: Literal["full_dossier_bootstrap", "delta_state_handle"] = "full_dossier_bootstrap"
+    full_dossier: Optional[ReadingDossierV2] = None
+    delta_packet: Dict[str, Any] = Field(default_factory=dict)
+    state_handle: str = ""
+
+    @model_validator(mode="after")
+    def _validate_context_carry(self):
+        if self.mode == "full_dossier_bootstrap" and self.full_dossier is None:
+            self.full_dossier = ReadingDossierV2()
+        if self.mode == "delta_state_handle" and not str(self.state_handle or "").strip():
+            raise ValueError("delta_state_handle mode requires state_handle")
+        return self
+
+
+class ExperienceSessionV2ToolTraceEntry(BaseModel):
+    round_index: int = Field(default=1, ge=1)
+    tool_name: str = ""
+    success: bool = True
+    latency_ms: Optional[int] = Field(default=None, ge=0)
+    note: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperienceSessionV2Iteration(BaseModel):
+    iteration_index: int = Field(default=1, ge=1)
+    phase: Literal["bootstrap", "revise", "resume"] = "bootstrap"
+    context_carry: ExperienceSessionV2ContextCarry = Field(default_factory=ExperienceSessionV2ContextCarry)
+    narrative_brief: Optional[ExperienceSessionV2NarrativeBrief] = None
+    tool_trace: List[ExperienceSessionV2ToolTraceEntry] = Field(default_factory=list)
+    stop_reason: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_phase_context_contract(self):
+        if self.phase == "bootstrap":
+            if self.context_carry.mode != "full_dossier_bootstrap" or self.context_carry.full_dossier is None:
+                raise ValueError("bootstrap iteration requires full_dossier_bootstrap context")
+            if self.narrative_brief is None:
+                raise ValueError("bootstrap iteration requires narrative_brief")
+            return self
+        if self.context_carry.mode != "delta_state_handle":
+            raise ValueError("revise/resume iteration requires delta_state_handle context")
+        if not str(self.context_carry.state_handle or "").strip():
+            raise ValueError("revise/resume iteration requires non-empty state_handle")
+        return self
+
+
+class ExperienceSessionV2ResumeMeta(BaseModel):
+    preferred_strategy: Literal["resume", "restart"] = "resume"
+    resumable: bool = True
+    resume_state_handle: str = ""
+    resume_token: str = ""
+    last_failed_iteration: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperienceSessionV2ArtifactPromotionMeta(BaseModel):
+    promotion_ready: bool = False
+    completed_artifact_exists: bool = False
+    no_second_full_generation_pass: bool = True
+    artifact_ref: str = ""
+    promoted_fields: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperienceSessionV2(BaseModel):
+    version: Literal["experience_session_v2"] = "experience_session_v2"
+    status: Literal["running", "failed", "completed"] = "running"
+    stop_reason: str = ""
+    session_id: str
+    cache_namespace: str = "lit:experience_session:v2"
+    plan_kind: str = "experience_session_v2"
+    cache_key: str = ""
+    focus_page: int = Field(default=1, ge=1)
+    reader_profile: str = "curious_generalist"
+    dossier_signature: str = ""
+    runtime_budget: ExperienceSessionV2RuntimeBudget = Field(default_factory=ExperienceSessionV2RuntimeBudget)
+    iterations: List[ExperienceSessionV2Iteration] = Field(default_factory=list)
+    resume: ExperienceSessionV2ResumeMeta = Field(default_factory=ExperienceSessionV2ResumeMeta)
+    artifact_promotion: ExperienceSessionV2ArtifactPromotionMeta = Field(default_factory=ExperienceSessionV2ArtifactPromotionMeta)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_failed_stop_reason(self):
+        if self.status == "failed" and not str(self.stop_reason or "").strip():
+            raise ValueError("failed status requires stop_reason")
+        return self
+
+
 class ReaderComposePayload(BaseModel):
     paper_id: int
     page: int
@@ -1004,6 +2191,8 @@ class ReaderGenerativePlanResponse(BaseModel):
     cache_layer: str = "none"
     plan_cache_hit: bool = False
     plan_cache_layer: str = "none"
+    adjacent_page_context: List[ReaderAdjacentPageContext] = Field(default_factory=list)
+    page_dossier: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReaderExperiencePlanRequest(ReaderGenerativePlanRequest):
@@ -1028,6 +2217,47 @@ class ReaderExperiencePlanResponse(BaseModel):
     generative_plan_cache_layer: str = "none"
     experience_cache_hit: bool = False
     experience_cache_layer: str = "none"
+    adjacent_page_context: List[ReaderAdjacentPageContext] = Field(default_factory=list)
+    page_dossier: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderExperienceV2Response(BaseModel):
+    focus_page: int = Field(..., ge=1)
+    status: Literal["ready", "generating", "failed"] = "generating"
+    artifact: Optional[PageArtifactV2] = None
+    compose_payload: Dict[str, Any] = Field(default_factory=dict)
+    compose_status: Literal["done", "fallback"] = "done"
+    compose_build_mode: str = ""
+    compose_source_signature: str = ""
+    source_sig_hash: str = ""
+    artifact_cache_hit: bool = False
+    artifact_cache_layer: str = "none"
+    session_cache_hit: bool = False
+    session_cache_layer: str = "none"
+    session_id: str = ""
+    session_status: str = ""
+    failure_detail: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReaderWorkbenchV2Response(BaseModel):
+    focus_page: int = Field(..., ge=1)
+    status: Literal["ready", "running", "failed", "empty"] = "empty"
+    compose_payload: Dict[str, Any] = Field(default_factory=dict)
+    compose_status: Literal["done", "fallback"] = "done"
+    compose_build_mode: str = ""
+    compose_source_signature: str = ""
+    source_sig_hash: str = ""
+    reading_dossier: Optional[ReadingDossierV2] = None
+    session: Optional[ExperienceSessionV2] = None
+    artifact: Optional[PageArtifactV2] = None
+    artifact_validation: Dict[str, Any] = Field(default_factory=dict)
+    artifact_cache_hit: bool = False
+    artifact_cache_layer: str = "none"
+    session_cache_hit: bool = False
+    session_cache_layer: str = "none"
+    failure_detail: str = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReaderComposePrefetchRequest(BaseModel):

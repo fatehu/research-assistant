@@ -2092,6 +2092,162 @@ class LiteratureReaderComposeService:
             },
         }
 
+    def _build_layout_uid_figure_insight_prompt_payload(
+        self,
+        *,
+        page: int,
+        group_id: str,
+        atoms: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        compact_atoms: List[Dict[str, Any]] = []
+        caption_parts: List[str] = []
+        focus_bboxes: List[Tuple[float, float, float, float]] = []
+        for atom in list(atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            raw_text = str(atom.get("raw_text") or "").strip()
+            clean_text = str(atom.get("clean_text") or "").strip()
+            if node_kind != "figure" and (clean_text or raw_text):
+                caption_parts.append(clean_text or raw_text)
+            layout_pos = list(atom.get("layout_pos") or [])
+            bbox = self._bbox_from_docmind_pos(layout_pos)
+            if bbox is not None and node_kind == "figure":
+                focus_bboxes.append(tuple(float(value) for value in bbox))
+            compact_atoms.append(
+                {
+                    "layout_id": str(atom.get("layout_id") or "").strip(),
+                    "node_kind": node_kind,
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "raw_text": raw_text,
+                    "clean_text": clean_text,
+                    "layout_pos": layout_pos,
+                    "blocks": [
+                        {
+                            "text": str(block.get("text") or "").strip(),
+                            "style_id": int(block.get("style_id") or 0),
+                            "pos": list(block.get("pos") or []),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        caption = self._strip_leading_figure_caption_noise(" ".join(part for part in caption_parts if part).strip())
+        source_label = ""
+        if caption:
+            label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption, flags=re.IGNORECASE)
+            if label_match:
+                source_label = self._normalize_spaces(str(label_match.group(1) or ""))
+        focus_bbox = {}
+        if focus_bboxes:
+            focus_bbox = {
+                "x0": min(item[0] for item in focus_bboxes),
+                "top": min(item[1] for item in focus_bboxes),
+                "x1": max(item[2] for item in focus_bboxes),
+                "bottom": max(item[3] for item in focus_bboxes),
+            }
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_figure_insight",
+                "group_id": str(group_id or "").strip(),
+            },
+            "figure": {
+                "caption": caption,
+                "source_label": source_label,
+                "focus_bbox": focus_bbox,
+                "layout_count": len(compact_atoms),
+                "atoms": compact_atoms,
+            },
+            "rules": {
+                "task": "explain_figure_for_read",
+                "preserve_geometry": True,
+                "preserve_source_ids": True,
+                "forbid_caption_rewrite": True,
+                "output_language": "zh-CN",
+                "insight_must_be_image_grounded": True,
+                "insight_should_be_brief": True,
+            },
+        }
+
+    @staticmethod
+    def _layout_uid_figure_insight_system_prompt() -> str:
+        return (
+            "You explain a single figure group for the /read reader. "
+            "Use the attached page image as the primary visual reference and the focus_bbox/caption only as grounding hints. "
+            "Write one concise Chinese insight sentence that helps a reader understand what the figure is showing. "
+            "Do not simply restate the caption, do not invent evidence, and do not modify caption/source ids/geometry. "
+            "If the visible figure content is too unclear, return an empty insight. "
+            "Return JSON with status and step_result. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"insight\":\"...\",\"reason\":\"...\",\"confidence\":0.84,\"mode\":\"image_grounded_summary\",\"notes\":[\"...\"]}}"
+        )
+
+    def _normalize_layout_uid_figure_refinement(
+        self,
+        *,
+        atoms: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        caption_parts = [
+            self._strip_leading_figure_caption_noise(
+                str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            )
+            for atom in list(atoms or [])
+            if isinstance(atom, Mapping) and str(atom.get("node_kind") or "").strip().lower() != "figure"
+        ]
+        caption = " ".join(part for part in caption_parts if part).strip()
+        insight = self._normalize_spaces(
+            str((step_result or {}).get("insight") or (step_result or {}).get("ai_insight") or "")
+        )
+        reason = self._normalize_spaces(str((step_result or {}).get("reason") or ""))
+        mode = self._normalize_spaces(str((step_result or {}).get("mode") or "")) or "image_grounded_summary"
+        notes = [
+            self._normalize_spaces(str(item))
+            for item in list((step_result or {}).get("notes") or [])
+            if self._normalize_spaces(str(item))
+        ]
+        errors: List[str] = []
+        raw_confidence = (step_result or {}).get("confidence")
+        try:
+            confidence_value = float(raw_confidence)
+        except Exception:
+            confidence_value = 0.0
+            if raw_confidence is not None:
+                errors.append("invalid_confidence")
+        confidence_value = max(0.0, min(1.0, confidence_value))
+        if len(insight) > 220:
+            errors.append("insight_too_long")
+            insight = ""
+        if caption and insight and insight == caption:
+            errors.append("insight_duplicates_caption")
+            insight = ""
+        if not insight:
+            return {
+                "ai_insight": "",
+                "reason": "",
+                "confidence": 0.0,
+                "mode": "",
+                "notes": notes,
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_insight"],
+                "fallback_used": True,
+            }
+        return {
+            "ai_insight": insight,
+            "reason": reason,
+            "confidence": confidence_value,
+            "mode": mode,
+            "notes": notes,
+        }, {
+            "passed": not bool(errors),
+            "errors": errors,
+            "fallback_used": False,
+        }
+
     def _normalize_layout_uid_equation_refinement(
         self,
         *,
@@ -3008,6 +3164,19 @@ class LiteratureReaderComposeService:
         if where_match and where_match.start() > 0:
             description = self._normalize_spaces(merged[where_match.start() :])
             merged = self._normalize_spaces(merged[: where_match.start()])
+        if not label:
+            for atom in list(atoms or []):
+                if not isinstance(atom, Mapping):
+                    continue
+                for block in list(atom.get("blocks") or []):
+                    if not isinstance(block, Mapping):
+                        continue
+                    block_text = self._normalize_spaces(str(block.get("text") or ""))
+                    if re.fullmatch(r"\(\d+[A-Za-z]?\)", block_text):
+                        label = block_text
+                        break
+                if label:
+                    break
         trailing_label = re.search(r"(\(\d+[A-Za-z]?\))\s*$", merged)
         if trailing_label:
             extracted_label = self._normalize_spaces(str(trailing_label.group(1) or ""))
@@ -3032,7 +3201,7 @@ class LiteratureReaderComposeService:
             "latex": latex or "x = y",
             "label": label,
             "description": description,
-            "render_mode": "image_first",
+            "render_mode": "math_first" if normalized_latex else "image_first",
             "transcript": transcript,
         }
         if normalized_text:
@@ -3450,12 +3619,69 @@ class LiteratureReaderComposeService:
             }
         return refinement_map
 
+    async def _build_layout_uid_figure_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "figure":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            prompt_payload = self._build_layout_uid_figure_insight_prompt_payload(
+                page=page,
+                group_id=group_id,
+                atoms=atoms,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_figure_insight_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_figure_insight:{group_id}",
+            )
+            normalized_refinement, validation = self._normalize_layout_uid_figure_refinement(
+                atoms=atoms,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "insight": normalized_refinement,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
     def _layout_uid_group_plan_to_panel_plan(
         self,
         *,
         page: int,
         grouping_plan: Mapping[str, Any],
         grounding: Mapping[str, Any],
+        figure_refinements: Optional[Mapping[str, Any]] = None,
         table_refinements: Optional[Mapping[str, Any]] = None,
         equation_refinements: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -3547,12 +3773,20 @@ class LiteratureReaderComposeService:
                     if str(atom.get("node_kind") or "").strip().lower() != "figure"
                     and str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
                 ]
+                caption = self._strip_leading_figure_caption_noise(" ".join(caption_parts).strip())
+                source_label = ""
+                if caption:
+                    label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption, flags=re.IGNORECASE)
+                    if label_match:
+                        source_label = self._normalize_spaces(str(label_match.group(1) or ""))
+                refinement = dict((figure_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                insight = self._normalize_spaces(str((refinement.get("insight") or {}).get("ai_insight") or ""))
                 component = "FigurePanel"
                 props = {
-                    "caption": " ".join(caption_parts).strip(),
+                    "caption": caption,
                     "image_url": "",
-                    "source_label": "",
-                    "ai_insight": "",
+                    "source_label": source_label,
+                    "ai_insight": insight,
                 }
             elif group_kind == "table":
                 component = "TablePanel"
@@ -3732,10 +3966,18 @@ class LiteratureReaderComposeService:
             rendered_page_image=rendered_page_image,
             rendered_page_image_path=rendered_page_image_path,
         )
+        figure_refinement_map = await self._build_layout_uid_figure_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
         panel_plan = self._layout_uid_group_plan_to_panel_plan(
             page=page,
             grouping_plan=normalized_grouping_plan,
             grounding=grounding,
+            figure_refinements=figure_refinement_map,
             table_refinements=table_refinement_map,
             equation_refinements=equation_refinement_map,
         )
@@ -3782,6 +4024,7 @@ class LiteratureReaderComposeService:
             f"layout_uid_v1:text_normalized={len(list(((text_normalization_map.get('normalization_plan') or {}).get('items') or [])))}",
             f"layout_uid_v1:groups={len(list(normalized_grouping_plan.get('groups') or []))}",
             f"layout_uid_v1:omissions={len(omissions)}",
+            f"layout_uid_v1:figures_explained={sum(1 for item in list(figure_refinement_map.values()) if isinstance(item, Mapping) and str(((item.get('insight') or {}).get('ai_insight') or '')).strip())}",
             f"layout_uid_v1:tables_refined={sum(1 for item in list(table_refinement_map.values()) if isinstance(item, Mapping) and list(((item.get('logical_row_plan') or {}).get('logical_rows') or [])))}",
             f"layout_uid_v1:equations_normalized={sum(1 for item in list(equation_refinement_map.values()) if isinstance(item, Mapping) and (((item.get('normalization') or {}).get('normalized_text')) or ((item.get('normalization') or {}).get('normalized_latex'))))}",
         ] + [
@@ -3820,6 +4063,7 @@ class LiteratureReaderComposeService:
             "suggested_components": component_hints,
             "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
             "text_normalizations": text_normalization_map,
+            "figure_refinements": figure_refinement_map,
             "table_refinements": table_refinement_map,
             "visual_hints": [],
             "notes": list(decision_log),
@@ -4482,18 +4726,21 @@ class LiteratureReaderComposeService:
                         page_images=page_images,
                         bbox_pdf=bbox_pdf,
                     )
-                    native_image = self._select_native_pdf_image(
-                        pypdf_images=pypdf_images,
-                        pypdf_image_map=pypdf_image_map,
-                        candidate_images=candidate_images,
-                    )
-                    if native_image is not None:
-                        target_path = self._write_native_pdf_image(
-                            out_dir=out_dir,
-                            asset_id=layout_uid,
-                            image_obj=native_image,
+                    prefer_region_render = len(candidate_images) >= 2
+                    if not target_path and not prefer_region_render:
+                        native_image = self._select_native_pdf_image(
+                            pypdf_images=pypdf_images,
+                            pypdf_image_map=pypdf_image_map,
+                            candidate_images=candidate_images,
+                            bbox_pdf=bbox_pdf,
                         )
-                        method = "native" if target_path else method
+                        if native_image is not None:
+                            target_path = self._write_native_pdf_image(
+                                out_dir=out_dir,
+                                asset_id=layout_uid,
+                                image_obj=native_image,
+                            )
+                            method = "native" if target_path else method
                     if not target_path and bbox_pdf is not None:
                         if rendered_page is None:
                             rendered_page = page_obj.to_image(resolution=220).original
@@ -4502,6 +4749,8 @@ class LiteratureReaderComposeService:
                             asset_id=layout_uid,
                             page_image=rendered_page,
                             bbox_pdf=bbox_pdf,
+                            pdf_width=pdf_width,
+                            pdf_height=pdf_height,
                         )
                         method = "clip" if target_path else method
 
@@ -4808,17 +5057,55 @@ class LiteratureReaderComposeService:
         pypdf_images: Sequence[Any],
         pypdf_image_map: Dict[str, Any],
         candidate_images: Sequence[Dict[str, Any]],
+        bbox_pdf: Optional[Tuple[float, float, float, float]] = None,
     ) -> Optional[Any]:
         images = list(pypdf_images or [])
         if not images:
             return None
+
+        def _image_aspect_ratio(image_obj: Any) -> Optional[float]:
+            pil_image = getattr(image_obj, "image", None)
+            size = getattr(pil_image, "size", None)
+            if not isinstance(size, tuple) or len(size) != 2:
+                return None
+            width = float(size[0] or 0.0)
+            height = float(size[1] or 0.0)
+            if width <= 1.0 or height <= 1.0:
+                return None
+            return width / height
+
+        def _bbox_aspect_ratio(bbox: Optional[Tuple[float, float, float, float]]) -> Optional[float]:
+            if bbox is None:
+                return None
+            x0, y0, x1, y1 = bbox
+            width = float(x1 - x0)
+            height = float(y1 - y0)
+            if width <= 1.0 or height <= 1.0:
+                return None
+            return width / height
+
+        def _is_reasonable_shape_match(image_obj: Any) -> bool:
+            bbox_ratio = _bbox_aspect_ratio(bbox_pdf)
+            image_ratio = _image_aspect_ratio(image_obj)
+            if bbox_ratio is None or image_ratio is None:
+                return True
+            larger = max(bbox_ratio, image_ratio)
+            smaller = min(bbox_ratio, image_ratio)
+            if smaller <= 0.0:
+                return False
+            # Avoid using a native PDF image when its shape clearly disagrees
+            # with the DocMind figure bbox; in that case page clip is safer.
+            return (larger / smaller) <= 1.35
+
         if len(images) == 1:
-            return images[0]
+            return images[0] if _is_reasonable_shape_match(images[0]) else None
         for row in list(candidate_images or []):
             name = self._normalize_pdf_image_name(str(row.get("name") or ""))
             if name and name in pypdf_image_map:
-                return pypdf_image_map[name]
-        return images[0] if len(images) == 1 else None
+                candidate = pypdf_image_map[name]
+                if _is_reasonable_shape_match(candidate):
+                    return candidate
+        return None
 
     @staticmethod
     def _normalize_pdf_image_name(raw: str) -> str:
@@ -4850,6 +5137,128 @@ class LiteratureReaderComposeService:
             fp.write(bytes(data))
         return target
 
+    def _write_composited_pdf_images(
+        self,
+        *,
+        out_dir: str,
+        asset_id: str,
+        page_images: Sequence[Dict[str, Any]],
+        pypdf_images: Sequence[Any],
+        page_render_size: Tuple[int, int],
+        pdf_width: float,
+        pdf_height: float,
+    ) -> Optional[str]:
+        if not page_images or not pypdf_images:
+            return None
+        if len(page_images) < 2:
+            return None
+        if len(page_images) != len(pypdf_images):
+            return None
+        if pdf_width <= 0 or pdf_height <= 0:
+            return None
+        try:
+            from PIL import Image
+        except Exception:
+            return None
+
+        def _content_bbox(image_obj: Any) -> Optional[Tuple[int, int, int, int]]:
+            pil_image = getattr(image_obj, "image", None)
+            if pil_image is None:
+                return None
+            sample = pil_image.convert("RGB")
+            width, height = sample.size
+            if width <= 4 or height <= 4:
+                return None
+            corners = [
+                sample.getpixel((0, 0)),
+                sample.getpixel((max(0, width - 1), 0)),
+                sample.getpixel((0, max(0, height - 1))),
+                sample.getpixel((max(0, width - 1), max(0, height - 1))),
+            ]
+            bg = tuple(int(sum(channel[i] for channel in corners) / len(corners)) for i in range(3))
+            tolerance = 18
+            xs: List[int] = []
+            ys: List[int] = []
+            pixels = sample.load()
+            for y in range(height):
+                for x in range(width):
+                    px = pixels[x, y]
+                    if any(abs(int(px[i]) - int(bg[i])) > tolerance for i in range(3)):
+                        xs.append(x)
+                        ys.append(y)
+            if not xs or not ys:
+                return None
+            left = max(0, min(xs))
+            top = max(0, min(ys))
+            right = min(width, max(xs) + 1)
+            bottom = min(height, max(ys) + 1)
+            if right <= left or bottom <= top:
+                return None
+            # Ignore negligible trims; keep full image in that case.
+            if (right - left) >= width * 0.96 and (bottom - top) >= height * 0.96:
+                return None
+            return left, top, right, bottom
+
+        rx = float(page_render_size[0]) / float(pdf_width)
+        ry = float(page_render_size[1]) / float(pdf_height)
+        boxes: List[Tuple[float, float, float, float]] = []
+        ordered_rows = sorted(
+            [dict(row) for row in list(page_images or []) if isinstance(row, Mapping)],
+            key=lambda item: (
+                self._safe_float(item.get("top"), 0.0),
+                self._safe_float(item.get("x0"), 0.0),
+            ),
+        )
+        if len(ordered_rows) != len(pypdf_images):
+            return None
+        content_images: List[Tuple[Any, Tuple[float, float, float, float]]] = []
+        for row, image_obj in zip(ordered_rows, list(pypdf_images or [])):
+            x0 = self._safe_float(row.get("x0"), 0.0) * rx
+            x1 = self._safe_float(row.get("x1"), 0.0) * rx
+            y0 = self._safe_float(row.get("top"), 0.0) * ry
+            y1 = self._safe_float(row.get("bottom"), 0.0) * ry
+            if x1 <= x0 or y1 <= y0:
+                return None
+            pil_image = getattr(image_obj, "image", None)
+            if pil_image is None:
+                return None
+            crop_box = _content_bbox(image_obj)
+            if crop_box is not None:
+                img_w, img_h = pil_image.size
+                cx0, cy0, cx1, cy1 = crop_box
+                width_ratio = (x1 - x0) / max(1.0, float(img_w))
+                height_ratio = (y1 - y0) / max(1.0, float(img_h))
+                x0 = x0 + cx0 * width_ratio
+                x1 = x0 + (cx1 - cx0) * width_ratio
+                y0 = y0 + cy0 * height_ratio
+                y1 = y0 + (cy1 - cy0) * height_ratio
+                pil_image = pil_image.crop(crop_box)
+            boxes.append((x0, y0, x1, y1))
+            content_images.append((pil_image, (x0, y0, x1, y1)))
+        union = (
+            min(item[0] for item in boxes),
+            min(item[1] for item in boxes),
+            max(item[2] for item in boxes),
+            max(item[3] for item in boxes),
+        )
+        canvas_width = max(1, int(round(union[2] - union[0])))
+        canvas_height = max(1, int(round(union[3] - union[1])))
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+        for pil_image, box in content_images:
+            target_w = max(1, int(round(box[2] - box[0])))
+            target_h = max(1, int(round(box[3] - box[1])))
+            resized = pil_image.resize((target_w, target_h))
+            canvas.paste(
+                resized,
+                (
+                    int(round(box[0] - union[0])),
+                    int(round(box[1] - union[1])),
+                ),
+            )
+        target = os.path.join(out_dir, f"{asset_id}.png")
+        canvas.save(target, format="PNG")
+        return target
+
     def _write_clipped_page_image(
         self,
         *,
@@ -4857,17 +5266,25 @@ class LiteratureReaderComposeService:
         asset_id: str,
         page_image: Any,
         bbox_pdf: Tuple[float, float, float, float],
+        pdf_width: Optional[float] = None,
+        pdf_height: Optional[float] = None,
     ) -> Optional[str]:
         if page_image is None:
             return None
         width, height = page_image.size  # PIL image
         x0, y0, x1, y1 = bbox_pdf
-        pad_x = max(2, int((x1 - x0) * 0.01))
-        pad_y = max(2, int((y1 - y0) * 0.01))
+        if pdf_width and pdf_height and pdf_width > 0 and pdf_height > 0:
+            scale_x = float(width) / float(pdf_width)
+            scale_y = float(height) / float(pdf_height)
+            x0, x1 = x0 * scale_x, x1 * scale_x
+            y0, y1 = y0 * scale_y, y1 * scale_y
+        pad_x = max(8, int((x1 - x0) * 0.05))
+        pad_top = max(10, int((y1 - y0) * 0.12))
+        pad_bottom = max(8, int((y1 - y0) * 0.06))
         left = max(0, int(round(x0 - pad_x)))
-        top = max(0, int(round(y0 - pad_y)))
+        top = max(0, int(round(y0 - pad_top)))
         right = min(int(width), int(round(x1 + pad_x)))
-        bottom = min(int(height), int(round(y1 + pad_y)))
+        bottom = min(int(height), int(round(y1 + pad_bottom)))
         if right <= left + 6 or bottom <= top + 6:
             return None
         cropped = page_image.crop((left, top, right, bottom))
@@ -5501,13 +5918,29 @@ class LiteratureReaderComposeService:
                     "text": str(props.get("text") or fb_text).strip() or "[empty]",
                 }
             if component == "EquationBlock":
-                return {
+                normalized_latex = str(props.get("normalized_latex") or "").strip()
+                normalized_text = str(props.get("normalized_text") or "").strip()
+                normalization_reason = str(props.get("normalization_reason") or "").strip()
+                normalization_mode = str(props.get("normalization_mode") or "").strip()
+                normalization_confidence = props.get("normalization_confidence")
+                payload = {
                     "latex": str(props.get("latex") or props.get("text") or fb_text).strip() or "x = y",
                     "label": str(props.get("label") or "").strip(),
                     "description": str(props.get("description") or "").strip(),
                     "render_mode": str(props.get("render_mode") or "image_first").strip() or "image_first",
                     "transcript": str(props.get("transcript") or props.get("text") or fb_text).strip(),
                 }
+                if normalized_text:
+                    payload["normalized_text"] = normalized_text
+                if normalized_latex:
+                    payload["normalized_latex"] = normalized_latex
+                if normalization_reason:
+                    payload["normalization_reason"] = normalization_reason
+                if normalization_mode:
+                    payload["normalization_mode"] = normalization_mode
+                if isinstance(normalization_confidence, (int, float)) and not isinstance(normalization_confidence, bool):
+                    payload["normalization_confidence"] = float(normalization_confidence)
+                return payload
             if component == "MethodologyCard":
                 steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
                 if not steps and fb_text:
@@ -9244,6 +9677,73 @@ class LiteratureReaderComposeService:
         compare_mode: Optional[bool] = None,
         citation_tldr: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        prepared = await self.prepare_inline_query_answer(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            node_id=str(node_id),
+            question=str(question),
+            scope=str(scope),
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+        )
+        if bool(prepared.get("disabled")):
+            return prepared
+        answer = await self._generate_inline_answer(
+            question=question,
+            context_text=str(prepared.get("context_text") or ""),
+            scope=scope,
+        )
+        anchor_refs = list(prepared.get("anchor_refs") or [])
+        source_block_ids = list(prepared.get("source_block_ids") or [])
+        answer_node = self._build_inline_answer_node(
+            question=str(question).strip(),
+            answer=answer,
+            anchor_refs=anchor_refs,
+            source_block_ids=source_block_ids,
+        )
+        sources = []
+        for anchor in anchor_refs[:3]:
+            if not isinstance(anchor, dict):
+                continue
+            sources.append(
+                {
+                    "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
+                    "start_char": self._safe_int(anchor.get("start_char"), 0),
+                    "end_char": self._safe_int(anchor.get("end_char"), 0),
+                    "quote": str(anchor.get("quote") or anchor.get("quote_text") or "")[:240] or None,
+                    "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
+                }
+            )
+        return {"node": answer_node, "sources": sources}
+
+    async def _load_payload_for_inline_query(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: Optional[str],
+        compare_mode: Optional[bool],
+        citation_tldr: Optional[bool],
+    ) -> Dict[str, Any]:
+        cached_payload = await self.get_latest_cached_payload_only(
+            db=db,
+            user_id=int(user_id),
+            paper_id=int(paper.id),
+            page=int(page),
+        )
+        if isinstance(cached_payload, dict):
+            return cached_payload
         payload, _ = await self.build_or_get_composed_payload(
             db=db,
             user_id=int(user_id),
@@ -9258,6 +9758,37 @@ class LiteratureReaderComposeService:
             compare_mode=compare_mode,
             citation_tldr=citation_tldr,
             publish_ready_event_enabled=False,
+        )
+        return payload
+
+    async def prepare_inline_query_answer(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        node_id: str,
+        question: str,
+        scope: str = "section",
+        selected_kb_id: Optional[int] = None,
+        style_intent: Optional[str] = None,
+        theme_mode: Optional[str] = None,
+        detail_level: Optional[str] = None,
+        compare_mode: Optional[bool] = None,
+        citation_tldr: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        payload = await self._load_payload_for_inline_query(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
         )
 
         components = list(((payload.get("ui_plan") or {}).get("components") or []))
@@ -9309,42 +9840,74 @@ class LiteratureReaderComposeService:
             components=components,
             page=int(page),
         )
-        answer = await self._generate_inline_answer(
-            question=question,
-            context_text=context_text,
-            scope=scope,
+        return {
+            "disabled": False,
+            "question": str(question).strip(),
+            "scope": str(scope).strip() or "section",
+            "context_text": context_text,
+            "anchor_refs": anchor_refs[:3],
+            "source_block_ids": source_block_ids[:12],
+        }
+
+    @staticmethod
+    def _build_inline_answer_prompt(
+        *,
+        question: str,
+        context_text: str,
+        scope: str,
+    ) -> str:
+        compact_question = LiteratureReaderComposeService._normalize_spaces(question)
+        compact_context = LiteratureReaderComposeService._normalize_spaces(context_text)
+        if not compact_context:
+            compact_context = "当前段落缺少稳定证据，仅能做非常有限的局部追问。"
+        return (
+            "You are a literature reading assistant handling a paragraph follow-up question.\n"
+            "This is a local follow-up, not a full-paper QA task.\n"
+            "Answer only from the provided local context and nearby evidence.\n"
+            "Prefer a useful local answer when the evidence partially supports it.\n"
+            "If the support is local, tentative, or scope-limited, say that explicitly instead of refusing.\n"
+            "Only say 当前段落证据不足 when the context truly lacks the key fact required by the question.\n"
+            "Output in exactly two Chinese sentences:\n"
+            "1) 结论：...（可包含范围限制或不确定性）\n"
+            "2) 依据：...（概括当前节点与邻近证据，不要编造）\n"
+            f"问题：{compact_question}\n"
+            f"范围：{scope}\n"
+            f"上下文：{compact_context[:2200]}"
         )
-        answer_node = {
+
+    @staticmethod
+    def _fallback_inline_answer(question: str) -> str:
+        compact_question = LiteratureReaderComposeService._normalize_spaces(question)
+        return (
+            f"结论：当前段落暂时无法直接回答“{compact_question}”，但不代表全文没有答案。"
+            " 依据：当前只提供了本段与邻近证据，建议改问更具体的局部问题，或使用右侧“询问”做全文问答。"
+        )
+
+    def _build_inline_answer_node(
+        self,
+        *,
+        question: str,
+        answer: str,
+        anchor_refs: Sequence[Mapping[str, Any]],
+        source_block_ids: Sequence[str],
+    ) -> Dict[str, Any]:
+        return {
             "id": f"answer_{uuid.uuid4().hex[:12]}",
             "type": "AnswerCard",
             "props": {
                 "question": str(question).strip(),
-                "answer": answer,
+                "answer": str(answer).strip(),
                 "foldable": True,
             },
             "children": [],
-            "source_anchor_refs": anchor_refs[:3],
-            "source_block_ids": source_block_ids[:12],
+            "source_anchor_refs": [dict(anchor) for anchor in list(anchor_refs or [])[:3] if isinstance(anchor, Mapping)],
+            "source_block_ids": [str(item).strip() for item in list(source_block_ids or [])[:12] if str(item).strip()],
             "capabilities": ["copy", "jump_anchor", "drag_markdown"],
             "actions": [
                 {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
             ],
             "layout_slot": {"reserved_height": 220, "lock_height": False},
         }
-        sources = []
-        for anchor in anchor_refs[:3]:
-            if not isinstance(anchor, dict):
-                continue
-            sources.append(
-                {
-                    "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
-                    "start_char": self._safe_int(anchor.get("start_char"), 0),
-                    "end_char": self._safe_int(anchor.get("end_char"), 0),
-                    "quote": str(anchor.get("quote") or anchor.get("quote_text") or "")[:240] or None,
-                    "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
-                }
-            )
-        return {"node": answer_node, "sources": sources}
 
     async def _generate_inline_answer(
         self,
@@ -9353,22 +9916,10 @@ class LiteratureReaderComposeService:
         context_text: str,
         scope: str,
     ) -> str:
-        compact_question = self._normalize_spaces(question)
-        compact_context = self._normalize_spaces(context_text)
-        if not compact_context:
-            compact_context = "当前段落缺少稳定证据，仅能做非常有限的局部追问。"
-        prompt = (
-            "You are a literature reading assistant handling a paragraph follow-up question.\n"
-            "This is a local follow-up, not a full-paper QA task.\n"
-            "Answer strictly from the provided context and nearby evidence. Do not fabricate.\n"
-            "Do not claim paper-wide conclusions unless the local context clearly supports them.\n"
-            "Output in exactly two Chinese sentences:\n"
-            "1) 结论：...\n"
-            "2) 证据：...\n"
-            "If evidence is insufficient, explicitly answer: 结论：当前段落证据不足以回答；请使用右侧“询问”进行全文问答。\n"
-            f"问题：{compact_question}\n"
-            f"范围：{scope}\n"
-            f"上下文：{compact_context[:2200]}"
+        prompt = self._build_inline_answer_prompt(
+            question=question,
+            context_text=context_text,
+            scope=scope,
         )
         try:
             llm = await get_llm_service()
@@ -9382,10 +9933,29 @@ class LiteratureReaderComposeService:
                 return content
         except Exception as exc:
             logger.debug(f"[ReaderComposeService] inline answer generation failed: {exc}")
-        return (
-            f"结论：当前段落证据不足以回答“{compact_question}”；请使用右侧“询问”进行全文问答。"
-            "证据：当前只提供了本段及邻近上下文，无法支持更大范围结论。"
+        return self._fallback_inline_answer(question)
+
+    async def _stream_inline_answer_tokens(
+        self,
+        *,
+        question: str,
+        context_text: str,
+        scope: str,
+    ) -> AsyncGenerator[str, None]:
+        prompt = self._build_inline_answer_prompt(
+            question=question,
+            context_text=context_text,
+            scope=scope,
         )
+        llm = await get_llm_service()
+        async for token in llm.chat_stream(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=420,
+        ):
+            normalized = str(token or "")
+            if normalized:
+                yield normalized
 
     async def _apply_overlay_for_user(
         self,
@@ -9626,7 +10196,7 @@ class LiteratureReaderComposeService:
             props["text"] = self._repair_text_artifacts(self._normalize_spaces(str(props.get("text") or "")))
         elif node_type == "SectionHeading":
             props["text"] = self._repair_heading_text(self._normalize_spaces(str(props.get("text") or "")))
-        elif node_type in {"FigurePanel", "TablePanel"}:
+        elif node_type == "TablePanel":
             insight = self._normalize_spaces(str(props.get("ai_insight") or ""))
             if not insight:
                 props["ai_insight"] = "该图表用于支撑本页关键结论，建议结合原文锚点核对。"
@@ -15830,7 +16400,6 @@ class LiteratureReaderComposeService:
                         caption = self._strip_leading_figure_caption_noise(str(props.get("caption") or ""))
                     if caption:
                         props["caption"] = caption
-                        props["ai_insight"] = self._build_caption_insight(caption)
                     source_label = self._normalize_spaces(str(props.get("source_label") or ""))
                     if not source_label:
                         label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", str(props.get("caption") or ""), flags=re.IGNORECASE)

@@ -1,6 +1,6 @@
 # Generative UI Rollout Plan
 
-Last updated: 2026-03-13
+Last updated: 2026-03-15
 Status: in progress
 Owner: Codex + repository maintainers
 
@@ -10,9 +10,56 @@ Build a production-grade generative UI system for literature reading.
 
 The target architecture is:
 
-`compose payload -> generative plan -> experience runtime`
+`compose payload -> page dossier -> planning brief -> planner -> tool/enricher -> page generation -> experience runtime`
 
-The system should stay grounded in deterministic reader extraction, and use generation only for controlled augmentation.
+The system should keep `/read` grounded in deterministic reader extraction, while letting `/experience` and `/workbench` evolve into schema-bound, agent-driven rich webpage generation surfaces.
+
+For `/experience`, the current-page reading flow is the mandatory backbone. Adjacent-page VL context, tools, MCP, and enrichment modules exist to improve completeness, comprehension, and richness around that body flow; they must not replace or compress it away.
+
+Tools, MCP, and external-resource pipelines are implementation means. The product objective is always a richer, clearer, more teachable `/experience` page. A runtime that calls more tools but does not visibly improve comprehension should be treated as a regression, not progress.
+
+## Current Status Review
+
+What is already true:
+
+- `/read` is now a payload producer, not the target generative UI surface.
+- `/experience` and `/workbench` already share a staged runtime with:
+  `page_dossier`, `planning_brief`, `planner`, `tool/enricher`, `page_generation`, and runtime-stage inspection.
+- adjacent-page `VL-flash` context, tool budgets, and tool traces are already wired in.
+- current-page body flow is preserved more faithfully than the earlier compact-artifact runtime.
+- MCP-backed public-web routes already exist behind `web_search` / `web_scrape`.
+
+What is still not good enough:
+
+- `/experience` still behaves too much like `reading_flow + side cards`.
+- explanation, continuity bridges, figure/table walkthroughs, and tool results are not yet woven into the main reading path strongly enough.
+- current block families are too weak for a textbook-style guided reading page.
+- the system still risks drifting toward "compact artifact" behavior when the actual product goal is completeness, comprehension, and richness first.
+- `knowledge_search` is an internal tool, not MCP, and its runtime stability is still weaker than required for primary `/experience` enrichment.
+- MCP/public-web enrichment is still uneven: the system can call it, but the resulting page does not yet consistently become richer and easier to understand.
+
+Practical conclusion:
+
+- The next milestone is not more cards or more summaries.
+- The next milestone is guided reading:
+  near-complete current-page body flow stays intact, and AI explanation/tool enrichment is interleaved into that body flow.
+
+## Corrected Product Target
+
+`/experience` is a guided reading webpage, not a compact summary artifact.
+
+Priority order:
+
+1. content completeness
+2. comprehension and continuity
+3. richness from tools, neighboring pages, and external resources
+4. compactness and visual polish
+
+The planner may decide how the page is taught, but it may not decide whether the current-page body flow survives.
+
+Detailed execution plan:
+
+- `docs/plan/generative-ui-guided-reading-plan.md`
 
 ## Product Boundary
 
@@ -20,9 +67,9 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [x] Narrow `/literature/:id/read` further:
   its target is simplified AI-arranged flowing reading plus cleaned body content and evidence verification, not the long-term home of page-level generative UI product design.
 - [x] Treat the embedded AI-arranged view inside `/literature/:id/read` as legacy transitional compose preview debt, not the long-term generative UI product surface.
-- [x] Treat `/literature/:paperId/experience` as the target product page for expanded generative UI.
+- [x] Treat `/literature/:paperId/experience` as the target product page for agent-driven rich webpage generation.
 - [x] Treat `/literature/:paperId/read/workbench` as debug/workbench only, not the end-user product surface.
-- [x] Keep the core scope at the system level: compose grounding -> story understanding -> tool/resource reasoning -> experience rendering.
+- [x] Keep the core scope at the system level: compose grounding -> dossier/planning -> tool/resource reasoning -> page generation -> experience rendering.
 - [x] Preserve `page` and `kb` as valid reading context inputs when they come from real navigation state.
 - [x] Forbid unsafe demo defaults such as hardcoded `kb=84`; the issue was the hardcoded default, not the parameter itself.
 
@@ -39,7 +86,7 @@ The system should stay grounded in deterministic reader extraction, and use gene
 
 ## External Reference Points
 
-- [x] Align with mature generative UI patterns from Google/A2A/A2UI, Vercel AI SDK, and Anthropic Artifacts at the principle level.
+- [x] Align with mature generative UI patterns from Google/A2A/A2UI, Vercel AI SDK, Anthropic Artifacts, and similar agentic artifact systems at the principle level.
 - [x] Maintain a local curated reference shelf under `docs/reference/generative-ui` and use it to constrain `/experience` and `/workbench` architecture decisions before adding new runtime or page-generation behavior.
 - [x] Use those references to reinforce three constraints in this repo:
   renderer executes structured plans, agent outputs stay schema-bound, and arbitrary frontend code generation is out of scope.
@@ -58,14 +105,26 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [ ] All generated outputs must conform to a validated contract.
 - [ ] All generated outputs must be cacheable, replayable, and observable.
 - [ ] Any failure must degrade to the composed reader without blocking reading.
+- [ ] `/experience` must preserve near-complete current-page body flow as the main reading spine.
+- [ ] Adjacent-page VL context must shape continuity and explanation, not sit as a weak optional note.
+- [ ] Tool use should serve explicit reading goals:
+  term explanation, figure/table walkthroughs, method background, and why-it-matters bridges.
+- [ ] MCP and public-web tools are successful only when they create visible reader-facing value inside the guided reading flow; emitting tool traces or extra links alone is not sufficient.
+- [ ] Treat MCP routes, internal tools, and external-resource pipelines strictly as implementation means:
+  success is judged by whether `/experience` becomes more complete, clearer, and more teachable for the reader.
+- [ ] Treat `knowledge_search` as an internal retrieval tool with currently weaker stability than desired:
+  it may support enrichment, but `/experience` must not depend on it as the only path to richness or clarity.
+- [ ] Planner, tool, and MCP activity should always be judged by one product question first:
+  did this make the page easier to understand, richer, or more teachable for the reader?
+- [ ] `/workbench` must explain why each guided-reading segment exists and what it used.
 
 ## Phase 0: Freeze Scope
 
-- [x] Confirm the primary goal is controlled page-level generative augmentation, not freeform page generation.
+- [x] Confirm the primary goal is agent-decided rich page generation inside a schema-bound renderer, not freeform frontend code generation.
 - [ ] Limit the first production scope to the literature reader only.
-- [ ] Define the single primary chain as `compose payload -> generative plan -> experience runtime`.
+- [x] Define the single primary chain as `compose payload -> page dossier -> planning brief -> planner -> tool/enricher -> page generation -> experience runtime`.
 - [x] Decide which experimental entry points are temporary and which one is the long-term product surface.
-- [ ] Publish a short architecture note for shared terminology:
+- [x] Publish a short architecture note for shared terminology:
   `story_substrate`, `page_brief`, `block`, `widget`, `ui_action`, `event`.
 
 ## Phase 1: Stabilize Current Flow
@@ -113,6 +172,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [ ] Support incremental block patching instead of full-page refresh.
 - [ ] Add runtime telemetry for render failures, durations, and engagement.
 - [x] Turn workbench into a debug/inspection surface instead of a second product path.
+- [ ] Replace the current `reading_flow + side panels` composition with a guided-reading renderer that can interleave explanation blocks inside the main body flow.
+- [ ] Make agent/tool/MCP output materially improve `/experience` itself, not just `/workbench` inspect panels.
 
 ## Phase 4: Narrow Agent Responsibilities
 
@@ -124,15 +185,29 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [ ] Limit the planner to:
   reading goal selection, block selection, block data population.
 - [ ] Derive `page_brief` from deterministic signals first, then let the model fill gaps.
-- [x] Inject adjacent-page OCR context as reference-only metadata for continuation-heavy pages:
-  previous/next page render -> VL extraction -> labeled context -> current page planning.
+- [x] Inject adjacent-page VL context for continuation-heavy pages:
+  previous/next page render -> VL extraction -> structured dossier context -> current page planning.
 - [ ] Split external resource generation into:
   retrieval, filtering, summarization, trust scoring.
+- [ ] Treat MCP-backed public-web enrichment as a first-class option for guided reading beats, not just a fallback/backfill after reader-native tools.
 - [ ] Restrict widget generation to approved templates.
-- [ ] Add tool budgets:
+- [x] Add tool budgets:
   iteration count, latency, domain allowlist, duplicate-query suppression.
-- [ ] Consider a staged runtime:
-  planner -> enricher -> formatter.
+- [x] Consider a staged runtime:
+  planner -> tool/enricher -> page generation.
+- [x] Promote the staged runtime skeleton into the real runtime:
+  `page dossier -> planning brief -> planner -> tool/enricher -> page generation -> experience runtime`.
+- [x] Re-anchor `/experience` on full current-page body flow:
+  planner, page brief, and reading-flow materialization now preserve ordered current-page targets as the main reading backbone; budgets only prune enrichment layers.
+- [ ] Replace section-first page assembly with guided-reading beats:
+  planner and page-generation should describe how the user is led through the page, not just which sections/cards appear.
+- [ ] Interleave explanation blocks into the main reading path instead of treating them as sidecar resource cards.
+- [ ] Expand the `/experience` block vocabulary toward textbook-style guided reading blocks.
+- [ ] Make `/workbench` inspect beat coverage, tool objectives, enrichment outputs, and dropped/merged rationale.
+- [ ] Freeze the corrected product intent in a dedicated execution plan under `docs/plan`.
+- [ ] Promote adjacent-page VL context from "helpful continuity input" to a first-class planner input that explicitly shapes beat-level transitions, figure/table explanations, and next-step guidance.
+- [ ] Promote planner output from section strategy to guided-reading beats:
+  each beat should declare target coverage, reader goal, continuity note, tool objectives, and block stack.
 
 ## Phase 5: Make Interaction Real
 
@@ -142,6 +217,8 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [ ] Show why each external resource was recommended.
 - [ ] Add comparison blocks for figure-vs-body evidence checks.
 - [ ] Add guided reading blocks instead of static explanation cards.
+- [ ] Add explanation-first block families for `/experience`:
+  `GuideIntroBlock`, `ConceptBridgeBlock`, `FigureWalkthroughBlock`, `TableTakeawayBlock`, `WhyItMattersBlock`, `CheckpointBlock`, `NextStepBlock`.
 - [ ] Route all interactions through a shared event bus.
 
 ## Phase 6: Build Evaluation and Review
@@ -177,6 +254,32 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [ ] Treat Phase 6 as continuous work, not a tail task.
 - [ ] Use Phase 7 for controlled rollout after technical stability is proven.
 
+## Exit Gates
+
+### Feature-complete gate
+
+- [ ] `/experience` no longer looks like reordered prose with side cards.
+- [ ] current-page body flow remains near-complete.
+- [ ] `/experience` is judged acceptable first on content completeness, reader comprehension, and resource richness, not on visual compactness.
+- [ ] explanations, bridges, and walkthroughs are interleaved into the main reading path.
+- [ ] planner output is beat-based rather than only section-based.
+- [ ] `/workbench` can inspect beat coverage, target ids, tool objectives, tool outputs, public links, and dropped-content rationale.
+- [ ] agent/tool/MCP usage produces visible reader-facing improvements in understanding, not just more metadata or empty support cards.
+- [ ] at least one representative page shows meaningful beat-level summaries, supporting points, and resource links woven into the reading flow rather than relegated to empty side modules.
+
+### Launch-ready gate
+
+- [ ] versioned runtime and renderer contracts are finalized.
+- [ ] telemetry exists for stage latency, tool counts, suppression, timeout, and failure reasons.
+- [ ] golden/eval set covers figure-heavy, methods-heavy, and concept-heavy pages with explicit review criteria.
+- [ ] rollout guards exist:
+  feature flags, cache/version alignment, rollback path, kill switch.
+- [ ] representative `/experience` pages are manually accepted for completeness, comprehension, richness, continuity, and latency.
+- [ ] representative `/experience` pages are manually accepted for whether the page content is complete enough, explanations materially help understanding, and resources enrich reading without distracting from it.
+- [ ] representative `/experience` pages are manually accepted for whether tools/MCP made the page more teachable, not merely more decorated.
+- [ ] `/workbench` is manually accepted for full planner/tool/beat inspectability rather than partial runtime visibility.
+- [ ] local embedding/runtime configuration is verified as GPU-first in production paths while remaining CPU-compatible for CI/CD and fallback environments.
+
 ## Current Sprint
 
 - [x] Persist the rollout plan under `docs/plan`.
@@ -189,6 +292,18 @@ The system should stay grounded in deterministic reader extraction, and use gene
 - [x] Bump generative/experience cache versions to flush stale English-heavy plans.
 - [x] Add runtime-side generic English reader-copy rewrites so model outputs are still normalized for Chinese-facing UI.
 - [x] Add reference-only adjacent-page OCR context into fresh generative/experience planning and cover it with backend regressions.
+- [x] Upgrade adjacent-page context into a structured `page_dossier` input for `/experience`:
+  previous/next page `VL-flash` output now carries body text plus figure/table/equation descriptions and continuation hints, and `/workbench` surfaces the dossier directly for inspection.
+- [x] Surface `page_dossier`, adjacent continuity, and compact `tool_trace` as first-class `/experience` and `/workbench` observability:
+  the product/debug surfaces can now show what the agent saw, what tools it used, and what resource strategy/neighbor-page context shaped the webpage.
+- [x] Seed a staged runtime skeleton for `/experience`:
+  runtime now carries a deterministic `planning_brief` plus `runtime_stage_trace`, and `/workbench` can inspect those stages instead of treating the agent as a single opaque prompt.
+- [x] Promote the staged runtime from observability to real execution boundaries:
+  runtime now executes explicit `planner`, `tool/enricher`, and `page generation` stages with stage-specific outputs, legacy fallback, and failure handling.
+- [x] Surface staged-runtime internals in `/experience` and `/workbench`:
+  both surfaces now expose `planner_output` and `tool_enrichment_packet`, so dossier -> planner -> enrichment -> generation can be inspected without reading backend logs.
+- [x] Add deterministic tool-budget guardrails to the staged runtime:
+  `planning_brief` now carries `tool_budget`, planner prompt explicitly obeys it, tool execution enforces native/public-web caps plus duplicate-query suppression, and `/experience` + `/workbench` expose budget summaries and suppression results.
 - [x] Add route-level empty states for `/experience` and `/workbench` when KB/PDF/compose payload/plan are unavailable.
 - [x] Add a regression test for the cached seed -> fresh full plan -> cached hit flow on `/experience`.
 - [x] Add `display copy vs raw evidence` contract fields to the existing plan/runtime path and make `/experience` prefer `display_*` values.
