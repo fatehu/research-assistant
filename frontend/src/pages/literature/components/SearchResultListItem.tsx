@@ -16,11 +16,11 @@ interface SearchResultListItemProps {
 /** 搜索结果列表视图项 */
 const SearchResultListItem = ({ paper, index, sourceInfo, onSave }: SearchResultListItemProps) => (
   <div
-    className="flex items-center gap-4 px-4 py-3 border-b border-slate-700/50 hover:bg-slate-800/30 transition-colors group"
+    className="group flex items-center gap-4 rounded-[22px] border border-transparent px-4 py-3 transition-all duration-200 hover:border-white/[0.06] hover:bg-white/[0.04]"
     style={{ animationDelay: `${index * 30}ms` }}
   >
     {/* 来源图标 */}
-    <div className="w-10 h-10 rounded-lg bg-slate-700/50 flex items-center justify-center flex-shrink-0 text-lg">
+    <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl border border-white/5 bg-white/[0.04] text-lg">
       {sourceInfo.icon}
     </div>
 
@@ -58,7 +58,7 @@ const SearchResultListItem = ({ paper, index, sourceInfo, onSave }: SearchResult
         <Tag className="!bg-cyan-500/10 !border-cyan-500/20 !text-cyan-300 text-xs !m-0">DOI</Tag>
       )}
       {paper.pdf_url && (
-        <Tag className="!bg-green-500/10 !border-green-500/20 !text-green-400 text-xs !m-0">PDF</Tag>
+        <Tag className="!bg-emerald-500/10 !border-emerald-500/20 !text-emerald-300 text-xs !m-0">PDF</Tag>
       )}
     </div>
 
@@ -69,7 +69,12 @@ const SearchResultListItem = ({ paper, index, sourceInfo, onSave }: SearchResult
           <CheckOutlined /> 已保存
         </Tag>
       ) : (
-        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => onSave(paper)}>
+        <Button
+          size="small"
+          icon={<PlusOutlined />}
+          onClick={() => onSave(paper)}
+          className="!border-emerald-400/20 !bg-emerald-400/12 !text-emerald-200 hover:!border-emerald-300/30 hover:!bg-emerald-400/18"
+        >
           保存
         </Button>
       )}

@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import {
   BarChartOutlined,
   BookOutlined,
@@ -11,7 +11,6 @@ import {
   FileTextOutlined,
   FolderOpenOutlined,
   LinkOutlined,
-  MailOutlined,
   MessageOutlined,
   NotificationOutlined,
   ReadOutlined,
@@ -26,23 +25,156 @@ import {
   UserOutlined,
   UsergroupAddOutlined,
 } from '@ant-design/icons'
-import { Button, Card, Col, Empty, Input, List, Progress, Row, Segmented, Select, Space, Spin, Statistic, Table, Tag, Typography } from 'antd'
+import { Button, Card, Col, Empty, Input, List, Progress, Row, Segmented, Select, Space, Spin, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
+import { motion } from 'framer-motion'
 
 import { adminApi, type AdminAuditLogItem, type StatisticsDetailItem } from '@/services/api'
 import { useRoleStore } from '@/stores/roleStore'
 
 const { Paragraph, Text, Title } = Typography
 
-const panelStyle: React.CSSProperties = {
-  backgroundColor: '#161B22',
-  borderColor: '#30363D',
-  borderRadius: 18,
-  boxShadow: '0 18px 40px rgba(0, 0, 0, 0.24)',
+const sectionCardClass =
+  '!overflow-hidden !rounded-[28px] !border !border-white/[0.06] !bg-slate-900/50 !shadow-[inset_0_1px_0_rgba(255,255,255,0.04),0_28px_60px_rgba(2,6,23,0.34)] backdrop-blur-2xl'
+
+const insetPanelClass =
+  'rounded-[22px] border border-white/[0.06] bg-white/[0.03] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
+
+const actionButtonClass =
+  '!h-10 !rounded-2xl !border-white/10 !bg-white/[0.04] !px-4 !text-slate-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] hover:!border-white/15 hover:!bg-white/[0.08] hover:!text-white'
+
+const inputControlClass =
+  '!rounded-2xl !border border-white/10 !bg-white/[0.04] !text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-all hover:!border-white/15 hover:!bg-white/[0.06] focus-within:!border-white/20 focus-within:!bg-white/[0.06] focus-within:!shadow-[0_0_0_2px_rgba(255,255,255,0.05)] [&_.ant-input]:!bg-transparent [&_.ant-input-clear-icon]:!text-slate-500 hover:[&_.ant-input-clear-icon]:!text-slate-300'
+
+const sectionBodyStyle = {
+  padding: 20,
 }
 
-const panelBodyStyle = {
-  padding: 20,
+const progressTrailColor = 'rgba(148, 163, 184, 0.12)'
+
+const toneHex = {
+  sky: '#38bdf8',
+  cyan: '#22d3ee',
+  emerald: '#34d399',
+  teal: '#2dd4bf',
+  slate: '#94a3b8',
+  violet: '#a78bfa',
+  rose: '#fb7185',
+  amber: '#fbbf24',
+  red: '#f87171',
+} as const
+
+type AccentTone = keyof typeof toneHex
+
+const toneClassMap: Record<
+  AccentTone,
+  { shell: string; text: string; icon: string; badge: string; soft: string }
+> = {
+  sky: {
+    shell: 'border-sky-400/15 bg-sky-400/10',
+    text: 'text-sky-200',
+    icon: 'text-sky-300',
+    badge: 'border-sky-400/15 bg-sky-400/10 !text-sky-200',
+    soft: 'from-sky-400/10 to-sky-400/[0.03]',
+  },
+  cyan: {
+    shell: 'border-cyan-400/15 bg-cyan-400/10',
+    text: 'text-cyan-200',
+    icon: 'text-cyan-300',
+    badge: 'border-cyan-400/15 bg-cyan-400/10 !text-cyan-200',
+    soft: 'from-cyan-400/10 to-cyan-400/[0.03]',
+  },
+  emerald: {
+    shell: 'border-emerald-400/15 bg-emerald-400/10',
+    text: 'text-emerald-200',
+    icon: 'text-emerald-300',
+    badge: 'border-emerald-400/15 bg-emerald-400/10 !text-emerald-200',
+    soft: 'from-emerald-400/10 to-emerald-400/[0.03]',
+  },
+  teal: {
+    shell: 'border-teal-400/15 bg-teal-400/10',
+    text: 'text-teal-200',
+    icon: 'text-teal-300',
+    badge: 'border-teal-400/15 bg-teal-400/10 !text-teal-200',
+    soft: 'from-teal-400/10 to-teal-400/[0.03]',
+  },
+  slate: {
+    shell: 'border-white/10 bg-white/[0.06]',
+    text: 'text-slate-200',
+    icon: 'text-slate-300',
+    badge: 'border-white/10 bg-white/[0.06] !text-slate-300',
+    soft: 'from-white/[0.08] to-white/[0.03]',
+  },
+  violet: {
+    shell: 'border-violet-400/15 bg-violet-400/10',
+    text: 'text-violet-200',
+    icon: 'text-violet-300',
+    badge: 'border-violet-400/15 bg-violet-400/10 !text-violet-200',
+    soft: 'from-violet-400/10 to-violet-400/[0.03]',
+  },
+  rose: {
+    shell: 'border-rose-400/15 bg-rose-400/10',
+    text: 'text-rose-200',
+    icon: 'text-rose-300',
+    badge: 'border-rose-400/15 bg-rose-400/10 !text-rose-200',
+    soft: 'from-rose-400/10 to-rose-400/[0.03]',
+  },
+  amber: {
+    shell: 'border-amber-400/15 bg-amber-400/10',
+    text: 'text-amber-200',
+    icon: 'text-amber-300',
+    badge: 'border-amber-400/15 bg-amber-400/10 !text-amber-200',
+    soft: 'from-amber-400/10 to-amber-400/[0.03]',
+  },
+  red: {
+    shell: 'border-red-400/15 bg-red-400/10',
+    text: 'text-red-200',
+    icon: 'text-red-300',
+    badge: 'border-red-400/15 bg-red-400/10 !text-red-200',
+    soft: 'from-red-400/10 to-red-400/[0.03]',
+  },
+}
+
+const GlassTag = ({
+  children,
+  tone = 'slate',
+  icon,
+}: {
+  children: React.ReactNode
+  tone?: AccentTone
+  icon?: React.ReactNode
+}) => (
+  <Tag
+    bordered={false}
+    icon={icon}
+    className={`m-0 rounded-full border px-2.5 py-1 text-[11px] font-medium ${toneClassMap[tone].badge}`}
+  >
+    {children}
+  </Tag>
+)
+
+const MiniMetric = ({
+  label,
+  value,
+  tone,
+  icon,
+}: {
+  label: string
+  value: number
+  tone: AccentTone
+  icon: React.ReactNode
+}) => {
+  const toneClass = toneClassMap[tone]
+
+  return (
+    <div className={`h-full rounded-[22px] border border-white/[0.06] bg-gradient-to-b p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] ${toneClass.soft}`}>
+      <div className={`flex items-center gap-2 text-sm ${toneClass.icon}`}>
+        {icon}
+        <span className="text-[11px] font-semibold uppercase tracking-[0.18em]">{label}</span>
+      </div>
+      <div className="mt-3 text-[1.75rem] font-semibold tracking-tight text-slate-50">{value}</div>
+    </div>
+  )
 }
 
 const percent = (value: number, total: number) => {
@@ -82,130 +214,141 @@ const MetricCard = ({
   title,
   value,
   subtitle,
-  color,
+  tone,
   icon,
 }: {
   title: string
   value: number | string
   subtitle: string
-  color: string
+  tone: AccentTone
   icon: React.ReactNode
-}) => (
-  <Card bordered style={{ ...panelStyle, height: '100%', overflow: 'hidden' }} styles={{ body: panelBodyStyle }}>
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'flex-start',
-        gap: 12,
-      }}
-    >
-      <div>
-        <Text style={{ color: '#8B949E', fontSize: 12, letterSpacing: 0.6 }}>{title}</Text>
-        <div style={{ marginTop: 8, fontSize: 34, fontWeight: 700, color }}>{value}</div>
-        <Paragraph style={{ marginTop: 10, marginBottom: 0, color: '#9FB0C3' }}>{subtitle}</Paragraph>
+}) => {
+  const toneClass = toneClassMap[tone]
+
+  return (
+    <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <Text className="text-[11px] font-semibold uppercase tracking-[0.18em] !text-slate-500">{title}</Text>
+          <div className="mt-3 text-[2rem] font-semibold tracking-tight text-slate-50">{value}</div>
+          <Paragraph className="!mb-0 !mt-3 !text-sm !leading-6 !text-slate-400">{subtitle}</Paragraph>
+        </div>
+        <div
+          className={`grid h-12 w-12 place-items-center rounded-2xl border shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] ${toneClass.shell} ${toneClass.icon}`}
+        >
+          <span className="text-lg">{icon}</span>
+        </div>
       </div>
-      <div
-        style={{
-          width: 46,
-          height: 46,
-          borderRadius: 14,
-          display: 'grid',
-          placeItems: 'center',
-          color,
-          background: `${color}18`,
-          border: `1px solid ${color}33`,
-          fontSize: 20,
-        }}
-      >
-        {icon}
-      </div>
-    </div>
-  </Card>
-)
+    </Card>
+  )
+}
 
 const MetricChip = ({
   label,
   value,
-  color,
+  tone,
   icon,
 }: {
   label: string
   value: number
-  color: string
+  tone: AccentTone
   icon: React.ReactNode
-}) => (
-  <div
-    style={{
-      minHeight: 88,
-      padding: '14px 16px',
-      borderRadius: 16,
-      border: `1px solid ${color}33`,
-      background: `linear-gradient(180deg, ${color}14 0%, rgba(22,27,34,0.9) 100%)`,
-    }}
-  >
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, color }}>
-      {icon}
-      <Text style={{ color, fontSize: 12 }}>{label}</Text>
+}) => {
+  const toneClass = toneClassMap[tone]
+
+  return (
+    <div className={`min-h-[92px] rounded-[20px] border bg-gradient-to-b px-4 py-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] ${toneClass.shell} ${toneClass.soft}`}>
+      <div className={`flex items-center gap-2 ${toneClass.icon}`}>
+        {icon}
+        <Text className={`!text-[11px] !font-semibold !uppercase !tracking-[0.18em] ${toneClass.text}`}>{label}</Text>
+      </div>
+      <div className="mt-3 text-[1.65rem] font-semibold tracking-tight text-slate-50">{value}</div>
     </div>
-    <div style={{ marginTop: 10, fontSize: 26, fontWeight: 700, color: '#F0F6FC' }}>{value}</div>
-  </div>
-)
+  )
+}
 
 const TrendBars = ({
   title,
-  color,
+  tone,
   data,
   days,
 }: {
   title: string
-  color: string
+  tone: AccentTone
   data: Array<{ date: string; count: number }>
   days: number
 }) => {
   const maxValue = Math.max(...data.map((item) => item.count), 1)
+  const color = toneHex[tone]
 
   return (
-    <div
-      style={{
-        padding: 16,
-        borderRadius: 16,
-        border: '1px solid #30363D',
-        background: 'linear-gradient(180deg, rgba(13,17,23,0.92) 0%, rgba(22,27,34,0.96) 100%)',
-      }}
-    >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-        <Text style={{ color: '#E6EDF3', fontSize: 14, fontWeight: 600 }}>{title}</Text>
-        <Text style={{ color: '#8B949E', fontSize: 12 }}>近 {days} 天</Text>
+    <div className={`${insetPanelClass} bg-slate-950/35 p-4`}>
+      <div className="flex items-baseline justify-between gap-4">
+        <Text className="!text-sm !font-semibold !text-slate-100">{title}</Text>
+        <Text className="!text-[11px] !font-semibold !uppercase !tracking-[0.18em] !text-slate-500">近 {days} 天</Text>
       </div>
       <div
+        className="mt-4 grid min-h-[118px] items-end gap-3"
         style={{
-          marginTop: 16,
-          display: 'grid',
           gridTemplateColumns: `repeat(${Math.max(data.length, 1)}, minmax(0, 1fr))`,
-          gap: 10,
-          alignItems: 'end',
-          minHeight: 110,
         }}
       >
-        {data.map((item) => (
-          <div key={`${title}-${item.date}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
-            <Text style={{ color: '#8B949E', fontSize: 11 }}>{item.count}</Text>
-            <div
-              style={{
-                width: '100%',
-                height: Math.max(12, Math.round((item.count / maxValue) * 68)),
-                borderRadius: 999,
-                background: `linear-gradient(180deg, ${color} 0%, ${color}88 100%)`,
-                boxShadow: `0 10px 20px ${color}22`,
-              }}
-            />
-            <Text style={{ color: '#6E7681', fontSize: 11 }}>{formatDayLabel(item.date)}</Text>
+        {data.map((item, index) => (
+          <div key={`${title}-${item.date}`} className="flex flex-col items-center gap-2">
+            <Text className="!text-[11px] !text-slate-500">{item.count}</Text>
+            <div className="flex h-[76px] w-full items-end">
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: Math.max(12, Math.round((item.count / maxValue) * 76)), opacity: 1 }}
+                transition={{ type: 'spring', stiffness: 180, damping: 18, delay: index * 0.03 }}
+                className="w-full rounded-full"
+                style={{
+                  background: `linear-gradient(180deg, ${color} 0%, ${color}8f 100%)`,
+                  boxShadow: `0 10px 24px ${color}20`,
+                }}
+              />
+            </div>
+            <Text className="!text-[11px] !text-slate-600">{formatDayLabel(item.date)}</Text>
           </div>
         ))}
       </div>
     </div>
   )
+}
+
+const DetailTitle = ({ title, subtitle }: { title: string; subtitle?: string | null }) => (
+  <div>
+    <Text className="!text-slate-100">{title}</Text>
+    <Paragraph className="!m-0 !mt-1 !text-slate-500">{subtitle || '-'}</Paragraph>
+  </div>
+)
+
+const toneTagFromStatus = (value?: string | null): AccentTone => {
+  if (value === 'active' || value === 'accepted' || value === 'completed') return 'emerald'
+  if (value === 'pending' || value === 'pinned') return 'amber'
+  if (value === 'rejected' || value === 'failed' || value === 'inactive') return 'red'
+  if (value === 'invite') return 'cyan'
+  return 'slate'
+}
+
+const toneTagFromIndex = (index: number): AccentTone => {
+  if (index === 0) return 'amber'
+  if (index === 1) return 'sky'
+  if (index === 2) return 'slate'
+  return 'slate'
+}
+
+const renderStatusTag = (label: string, tone: AccentTone) => <GlassTag tone={tone}>{label}</GlassTag>
+
+const renderTableCellText = (value?: string | null, tone: 'primary' | 'secondary' | 'muted' = 'secondary') => {
+  const className =
+    tone === 'primary'
+      ? '!text-slate-100'
+      : tone === 'muted'
+        ? '!text-slate-500'
+        : '!text-slate-400'
+
+  return <Text className={className}>{value || '-'}</Text>
 }
 
 const StatisticsPage: React.FC = () => {
@@ -461,18 +604,13 @@ const StatisticsPage: React.FC = () => {
             title: '研究组',
             dataIndex: 'title',
             key: 'title',
-            render: (_, record) => (
-              <div>
-                <Text style={{ color: '#F0F6FC' }}>{record.title}</Text>
-                <Paragraph style={{ margin: '4px 0 0', color: '#8B949E' }}>{record.subtitle || '-'}</Paragraph>
-              </div>
-            ),
+            render: (_, record) => <DetailTitle title={record.title} subtitle={record.subtitle} />,
           },
           {
             title: '导师',
             dataIndex: 'owner_name',
             key: 'owner_name',
-            render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+            render: (value) => renderTableCellText(value),
           },
           {
             title: '成员数',
@@ -483,13 +621,13 @@ const StatisticsPage: React.FC = () => {
             title: '状态',
             dataIndex: 'status',
             key: 'status',
-            render: (value) => <Tag color={value === 'active' ? 'green' : 'default'}>{value === 'active' ? '启用' : '停用'}</Tag>,
+            render: (value) => renderStatusTag(value === 'active' ? '启用' : '停用', toneTagFromStatus(value)),
           },
           {
             title: '更新时间',
             dataIndex: 'updated_at',
             key: 'updated_at',
-            render: (value) => <Text style={{ color: '#6E7681' }}>{value ? formatDateTime(value) : '-'}</Text>,
+            render: (value) => renderTableCellText(value ? formatDateTime(value) : '-', 'muted'),
           },
         ]
       : detailEntity === 'shares'
@@ -498,36 +636,31 @@ const StatisticsPage: React.FC = () => {
               title: '资源',
               dataIndex: 'title',
               key: 'title',
-              render: (_, record) => (
-                <div>
-                  <Text style={{ color: '#F0F6FC' }}>{record.title}</Text>
-                  <Paragraph style={{ margin: '4px 0 0', color: '#8B949E' }}>{record.subtitle || '-'}</Paragraph>
-                </div>
-              ),
+              render: (_, record) => <DetailTitle title={record.title} subtitle={record.subtitle} />,
             },
             {
               title: '所有者',
               dataIndex: 'owner_name',
               key: 'owner_name',
-              render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+              render: (value) => renderTableCellText(value),
             },
             {
               title: '共享目标',
               dataIndex: 'target_name',
               key: 'target_name',
-              render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+              render: (value) => renderTableCellText(value),
             },
             {
               title: '权限',
               dataIndex: 'permission',
               key: 'permission',
-              render: (value) => <Tag color="blue">{value || '-'}</Tag>,
+              render: (value) => renderStatusTag(value || '-', 'sky'),
             },
             {
               title: '创建时间',
               dataIndex: 'created_at',
               key: 'created_at',
-              render: (value) => <Text style={{ color: '#6E7681' }}>{value ? formatDateTime(value) : '-'}</Text>,
+              render: (value) => renderTableCellText(value ? formatDateTime(value) : '-', 'muted'),
             },
           ]
         : detailEntity === 'invitations'
@@ -536,42 +669,37 @@ const StatisticsPage: React.FC = () => {
                 title: '邀请链路',
                 dataIndex: 'title',
                 key: 'title',
-                render: (_, record) => (
-                  <div>
-                    <Text style={{ color: '#F0F6FC' }}>{record.title}</Text>
-                    <Paragraph style={{ margin: '4px 0 0', color: '#8B949E' }}>{record.subtitle || '-'}</Paragraph>
-                  </div>
-                ),
+                render: (_, record) => <DetailTitle title={record.title} subtitle={record.subtitle} />,
               },
               {
                 title: '类型',
                 dataIndex: 'category',
                 key: 'category',
-                render: (value) => <Tag color="blue">{value === 'invite' ? '邀请' : '申请'}</Tag>,
+                render: (value) => renderStatusTag(value === 'invite' ? '邀请' : '申请', toneTagFromStatus(value)),
               },
               {
                 title: '状态',
                 dataIndex: 'status',
                 key: 'status',
-                render: (value) => <Tag color={value === 'accepted' ? 'green' : value === 'pending' ? 'gold' : value === 'rejected' ? 'red' : 'default'}>{value || '-'}</Tag>,
+                render: (value) => renderStatusTag(value || '-', toneTagFromStatus(value)),
               },
               {
                 title: '发起人',
                 dataIndex: 'owner_name',
                 key: 'owner_name',
-                render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+                render: (value) => renderTableCellText(value),
               },
               {
                 title: '目标',
                 dataIndex: 'target_name',
                 key: 'target_name',
-                render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+                render: (value) => renderTableCellText(value),
               },
               {
                 title: '创建时间',
                 dataIndex: 'created_at',
                 key: 'created_at',
-                render: (value) => <Text style={{ color: '#6E7681' }}>{value ? formatDateTime(value) : '-'}</Text>,
+                render: (value) => renderTableCellText(value ? formatDateTime(value) : '-', 'muted'),
               },
             ]
           : [
@@ -579,36 +707,31 @@ const StatisticsPage: React.FC = () => {
                 title: '公告',
                 dataIndex: 'title',
                 key: 'title',
-                render: (_, record) => (
-                  <div>
-                    <Text style={{ color: '#F0F6FC' }}>{record.title}</Text>
-                    <Paragraph style={{ margin: '4px 0 0', color: '#8B949E' }}>{record.subtitle || '-'}</Paragraph>
-                  </div>
-                ),
+                render: (_, record) => <DetailTitle title={record.title} subtitle={record.subtitle} />,
               },
               {
                 title: '导师',
                 dataIndex: 'owner_name',
                 key: 'owner_name',
-                render: (value) => <Text style={{ color: '#9FB0C3' }}>{value || '-'}</Text>,
+                render: (value) => renderTableCellText(value),
               },
               {
                 title: '类别',
                 dataIndex: 'category',
                 key: 'category',
-                render: (value) => <Tag color={value === 'pinned' ? 'gold' : 'default'}>{value === 'pinned' ? '置顶' : '普通'}</Tag>,
+                render: (value) => renderStatusTag(value === 'pinned' ? '置顶' : '普通', toneTagFromStatus(value)),
               },
               {
                 title: '状态',
                 dataIndex: 'status',
                 key: 'status',
-                render: (value) => <Tag color={value === 'active' ? 'green' : 'default'}>{value === 'active' ? '启用' : '停用'}</Tag>,
+                render: (value) => renderStatusTag(value === 'active' ? '启用' : '停用', toneTagFromStatus(value)),
               },
               {
                 title: '更新时间',
                 dataIndex: 'updated_at',
                 key: 'updated_at',
-                render: (value) => <Text style={{ color: '#6E7681' }}>{value ? formatDateTime(value) : '-'}</Text>,
+                render: (value) => renderTableCellText(value ? formatDateTime(value) : '-', 'muted'),
               },
             ]
 
@@ -618,28 +741,28 @@ const StatisticsPage: React.FC = () => {
       dataIndex: 'created_at',
       key: 'created_at',
       width: 190,
-      render: (value) => <Text style={{ color: '#6E7681' }}>{formatDateTime(value)}</Text>,
+      render: (value) => renderTableCellText(formatDateTime(value), 'muted'),
     },
     {
       title: '操作',
       dataIndex: 'action',
       key: 'action',
       width: 150,
-      render: (value) => <Tag color="blue">{getAuditActionLabel(value)}</Tag>,
+      render: (value) => renderStatusTag(getAuditActionLabel(value), 'sky'),
     },
     {
       title: '管理员',
       dataIndex: 'admin_name',
       key: 'admin_name',
       width: 140,
-      render: (value) => <Text style={{ color: '#E6EDF3' }}>{value}</Text>,
+      render: (value) => renderTableCellText(value, 'primary'),
     },
     {
       title: '对象',
       key: 'target',
       width: 180,
       render: (_, record) => (
-        <Text style={{ color: '#9FB0C3' }}>
+        <Text className="!text-slate-400">
           {[record.target_type, record.target_id].filter(Boolean).join(' / ') || '-'}
         </Text>
       ),
@@ -648,7 +771,7 @@ const StatisticsPage: React.FC = () => {
       title: '摘要',
       dataIndex: 'summary',
       key: 'summary',
-      render: (value) => <Text style={{ color: '#F0F6FC' }}>{value}</Text>,
+      render: (value) => renderTableCellText(value, 'primary'),
     },
   ]
 
@@ -673,53 +796,26 @@ const StatisticsPage: React.FC = () => {
   const knowledgeLinkCompletionRate = percent(completedKnowledgeLinks, literature.knowledge_links_total)
 
   return (
-    <div
-      style={{
-        minHeight: '100%',
-        padding: '24px',
-        background:
-          'radial-gradient(circle at top left, rgba(74,144,217,0.18), transparent 32%), radial-gradient(circle at top right, rgba(212,175,55,0.14), transparent 24%), linear-gradient(180deg, #0D1117 0%, #111827 100%)',
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          gap: 16,
-          flexWrap: 'wrap',
-          marginBottom: 24,
-        }}
-      >
-        <div>
-          <Space align="center" size="middle">
-            <div
-              style={{
-                width: 48,
-                height: 48,
-                borderRadius: 16,
-                display: 'grid',
-                placeItems: 'center',
-                background: 'linear-gradient(135deg, rgba(74,144,217,0.22), rgba(212,175,55,0.22))',
-                border: '1px solid rgba(148,163,184,0.22)',
-                color: '#D4AF37',
-                fontSize: 24,
-              }}
-            >
+    <div className="statistics-page min-h-full bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.14),transparent_28%),radial-gradient(circle_at_top_right,rgba(34,211,238,0.12),transparent_24%),linear-gradient(180deg,#020617_0%,#030712_48%,#0f172a_100%)] p-4 sm:p-6">
+      <Card bordered={false} className={`${sectionCardClass} mb-6`} styles={{ body: { padding: 24 } }}>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex min-w-0 items-start gap-4">
+            <div className="grid h-12 w-12 place-items-center rounded-[18px] border border-emerald-400/15 bg-gradient-to-br from-emerald-400/12 via-cyan-400/10 to-transparent text-xl text-emerald-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
               <BarChartOutlined />
             </div>
-            <div>
-              <Title level={3} style={{ margin: 0, color: '#F0F6FC' }}>
+            <div className="min-w-0">
+              <Text className="!text-[11px] !font-semibold !uppercase !tracking-[0.22em] !text-slate-500">Operations Pulse</Text>
+              <Title level={3} className="!mb-0 !mt-2 !text-slate-50">
                 系统统计
               </Title>
-              <Paragraph style={{ margin: '6px 0 0', color: '#9FB0C3' }}>
+              <Paragraph className="!mb-0 !mt-2 !max-w-3xl !text-slate-400">
                 管理员视角的运营概览，覆盖用户、资源、协作链路、导师分布和近期活动。
               </Paragraph>
             </div>
-          </Space>
-        </div>
-        <Space wrap>
+          </div>
+          <Space wrap>
           <Segmented
+            className="statistics-page__segmented"
             value={windowDays}
             options={[
               { label: '近 7 天', value: 7 },
@@ -728,10 +824,11 @@ const StatisticsPage: React.FC = () => {
             ]}
             onChange={(value) => setWindowDays(Number(value))}
           />
-          <Button icon={<ReloadOutlined />} onClick={() => fetchStatistics(windowDays)}>
+          <Button className={actionButtonClass} icon={<ReloadOutlined />} onClick={() => fetchStatistics(windowDays)}>
             刷新数据
           </Button>
           <Button
+            className={actionButtonClass}
             icon={<DownloadOutlined />}
             loading={exportingKey === 'summary'}
             onClick={() =>
@@ -744,8 +841,9 @@ const StatisticsPage: React.FC = () => {
           >
             导出总览
           </Button>
-        </Space>
-      </div>
+          </Space>
+        </div>
+      </Card>
 
       <Row gutter={[16, 16]}>
         <Col xs={24} md={12} xl={6}>
@@ -753,7 +851,7 @@ const StatisticsPage: React.FC = () => {
             title="用户总量"
             value={statistics.total_users}
             subtitle={`活跃 ${statistics.active_users} / 非活跃 ${statistics.inactive_users}`}
-            color="#4A90D9"
+            tone="sky"
             icon={<TeamOutlined />}
           />
         </Col>
@@ -767,7 +865,7 @@ const StatisticsPage: React.FC = () => {
               statistics.total_notebooks
             }
             subtitle={`知识库 ${statistics.total_knowledge_bases}，文档 ${statistics.total_documents}`}
-            color="#D4AF37"
+            tone="cyan"
             icon={<DatabaseOutlined />}
           />
         </Col>
@@ -776,7 +874,7 @@ const StatisticsPage: React.FC = () => {
             title="协作链路"
             value={statistics.total_groups + statistics.total_shared_resources + statistics.total_announcements}
             subtitle={`研究组 ${statistics.total_groups}，共享 ${statistics.total_shared_resources}`}
-            color="#52C41A"
+            tone="emerald"
             icon={<ShareAltOutlined />}
           />
         </Col>
@@ -785,48 +883,48 @@ const StatisticsPage: React.FC = () => {
             title={`近 ${statistics.time_window_days} 天新增`}
             value={activity.new_users_last_7_days}
             subtitle={`对话 ${activity.new_conversations_last_7_days}，Notebook ${activity.new_notebooks_last_7_days}`}
-            color="#F97316"
+            tone="teal"
             icon={<ThunderboltOutlined />}
           />
         </Col>
 
         <Col xs={24} xl={10}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 用户与导师制
               </Title>
-              <Tag color="blue">活跃率 {activeRate}%</Tag>
+              <GlassTag tone="sky">活跃率 {activeRate}%</GlassTag>
             </div>
             <Space direction="vertical" size={16} style={{ width: '100%' }}>
               <div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <Text style={{ color: '#9FB0C3' }}>管理员</Text>
-                  <Text style={{ color: '#D4AF37' }}>{statistics.admin_count}</Text>
+                <div className="mb-2 flex justify-between">
+                  <Text className="!text-slate-400">管理员</Text>
+                  <Text className="!text-sky-300">{statistics.admin_count}</Text>
                 </div>
-                <Progress percent={percent(statistics.admin_count, statistics.total_users)} showInfo={false} strokeColor="#D4AF37" trailColor="#2B313A" />
+                <Progress percent={percent(statistics.admin_count, statistics.total_users)} showInfo={false} strokeColor={toneHex.sky} trailColor={progressTrailColor} />
               </div>
               <div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <Text style={{ color: '#9FB0C3' }}>导师</Text>
-                  <Text style={{ color: '#4A90D9' }}>{statistics.mentor_count}</Text>
+                <div className="mb-2 flex justify-between">
+                  <Text className="!text-slate-400">导师</Text>
+                  <Text className="!text-cyan-300">{statistics.mentor_count}</Text>
                 </div>
-                <Progress percent={percent(statistics.mentor_count, statistics.total_users)} showInfo={false} strokeColor="#4A90D9" trailColor="#2B313A" />
+                <Progress percent={percent(statistics.mentor_count, statistics.total_users)} showInfo={false} strokeColor={toneHex.cyan} trailColor={progressTrailColor} />
               </div>
               <div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <Text style={{ color: '#9FB0C3' }}>学生</Text>
-                  <Text style={{ color: '#8B9FB2' }}>{statistics.student_count}</Text>
+                <div className="mb-2 flex justify-between">
+                  <Text className="!text-slate-400">学生</Text>
+                  <Text className="!text-emerald-300">{statistics.student_count}</Text>
                 </div>
-                <Progress percent={percent(statistics.student_count, statistics.total_users)} showInfo={false} strokeColor="#8B9FB2" trailColor="#2B313A" />
+                <Progress percent={percent(statistics.student_count, statistics.total_users)} showInfo={false} strokeColor={toneHex.emerald} trailColor={progressTrailColor} />
               </div>
             </Space>
-            <Row gutter={[12, 12]} style={{ marginTop: 18 }}>
+            <Row gutter={[12, 12]} className="mt-[18px]">
               <Col span={12}>
                 <MetricChip
                   label="已绑定导师学生"
                   value={mentorship.students_with_mentor}
-                  color="#52C41A"
+                  tone="emerald"
                   icon={<LinkOutlined />}
                 />
               </Col>
@@ -834,180 +932,180 @@ const StatisticsPage: React.FC = () => {
                 <MetricChip
                   label="待分配学生"
                   value={mentorship.students_without_mentor}
-                  color="#F97316"
+                  tone="teal"
                   icon={<UserOutlined />}
                 />
               </Col>
             </Row>
-            <Paragraph style={{ marginTop: 16, marginBottom: 0, color: '#8B949E' }}>
+            <Paragraph className="!mb-0 !mt-4 !text-slate-500">
               学生导师覆盖率 {mentorCoverage}%。
             </Paragraph>
           </Card>
         </Col>
 
         <Col xs={24} xl={14}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               资源总览
             </Title>
             <Row gutter={[12, 12]}>
               <Col xs={12} md={8}>
-                <MetricChip label="对话" value={statistics.total_conversations} color="#4A90D9" icon={<MessageOutlined />} />
+                <MetricChip label="对话" value={statistics.total_conversations} tone="sky" icon={<MessageOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="知识库" value={statistics.total_knowledge_bases} color="#00B894" icon={<DatabaseOutlined />} />
+                <MetricChip label="知识库" value={statistics.total_knowledge_bases} tone="cyan" icon={<DatabaseOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="文档" value={statistics.total_documents} color="#F97316" icon={<FileTextOutlined />} />
+                <MetricChip label="文档" value={statistics.total_documents} tone="teal" icon={<FileTextOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="论文" value={statistics.total_papers} color="#8B5CF6" icon={<BookOutlined />} />
+                <MetricChip label="论文" value={statistics.total_papers} tone="violet" icon={<BookOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="Notebook" value={statistics.total_notebooks} color="#E11D48" icon={<ReadOutlined />} />
+                <MetricChip label="Notebook" value={statistics.total_notebooks} tone="slate" icon={<ReadOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="共享资源" value={statistics.total_shared_resources} color="#22C55E" icon={<ShareAltOutlined />} />
+                <MetricChip label="共享资源" value={statistics.total_shared_resources} tone="emerald" icon={<ShareAltOutlined />} />
               </Col>
             </Row>
           </Card>
         </Col>
 
         <Col xs={24} xl={12}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               协作运营
             </Title>
             <Row gutter={[12, 12]}>
               <Col xs={12}>
-                <MetricChip label="研究组" value={collaboration.total_groups} color="#4A90D9" icon={<UsergroupAddOutlined />} />
+                <MetricChip label="研究组" value={collaboration.total_groups} tone="sky" icon={<UsergroupAddOutlined />} />
               </Col>
               <Col xs={12}>
-                <MetricChip label="活跃研究组" value={collaboration.active_groups} color="#52C41A" icon={<CheckCircleOutlined />} />
+                <MetricChip label="活跃研究组" value={collaboration.active_groups} tone="emerald" icon={<CheckCircleOutlined />} />
               </Col>
               <Col xs={12}>
-                <MetricChip label="组成员关系" value={collaboration.total_group_members} color="#A855F7" icon={<TeamOutlined />} />
+                <MetricChip label="组成员关系" value={collaboration.total_group_members} tone="violet" icon={<TeamOutlined />} />
               </Col>
               <Col xs={12}>
-                <MetricChip label="待处理邀请" value={collaboration.pending_invitations} color="#F97316" icon={<ClockCircleOutlined />} />
+                <MetricChip label="待处理邀请" value={collaboration.pending_invitations} tone="teal" icon={<ClockCircleOutlined />} />
               </Col>
               <Col xs={12}>
-                <MetricChip label="公告总数" value={collaboration.total_announcements} color="#FACC15" icon={<NotificationOutlined />} />
+                <MetricChip label="公告总数" value={collaboration.total_announcements} tone="slate" icon={<NotificationOutlined />} />
               </Col>
               <Col xs={12}>
-                <MetricChip label="启用公告" value={collaboration.active_announcements} color="#14B8A6" icon={<NotificationOutlined />} />
+                <MetricChip label="启用公告" value={collaboration.active_announcements} tone="cyan" icon={<NotificationOutlined />} />
               </Col>
             </Row>
           </Card>
         </Col>
 
         <Col xs={24} xl={12}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 文档处理状态
               </Title>
-              <Tag color="green">完成率 {documentCompletionRate}%</Tag>
+              <GlassTag tone="emerald">完成率 {documentCompletionRate}%</GlassTag>
             </div>
             <Row gutter={[12, 12]}>
               <Col xs={12} md={8}>
-                <MetricChip label="已完成" value={documentPipeline.completed_documents} color="#22C55E" icon={<CheckCircleOutlined />} />
+                <MetricChip label="已完成" value={documentPipeline.completed_documents} tone="emerald" icon={<CheckCircleOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="处理中" value={documentPipeline.running_documents} color="#4A90D9" icon={<SyncOutlined />} />
+                <MetricChip label="处理中" value={documentPipeline.running_documents} tone="sky" icon={<SyncOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="待处理" value={documentPipeline.pending_documents} color="#FACC15" icon={<ClockCircleOutlined />} />
+                <MetricChip label="待处理" value={documentPipeline.pending_documents} tone="slate" icon={<ClockCircleOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="失败" value={documentPipeline.failed_documents} color="#EF4444" icon={<StopOutlined />} />
+                <MetricChip label="失败" value={documentPipeline.failed_documents} tone="red" icon={<StopOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="超时" value={documentPipeline.timeout_documents} color="#FB7185" icon={<ThunderboltOutlined />} />
+                <MetricChip label="超时" value={documentPipeline.timeout_documents} tone="rose" icon={<ThunderboltOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="取消" value={documentPipeline.cancelled_documents} color="#94A3B8" icon={<StopOutlined />} />
+                <MetricChip label="取消" value={documentPipeline.cancelled_documents} tone="slate" icon={<StopOutlined />} />
               </Col>
             </Row>
           </Card>
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               近 {statistics.time_window_days} 天新增
             </Title>
             <Row gutter={[12, 12]}>
               <Col xs={12} md={8} xl={4}>
-                <Statistic title="新增用户" value={activity.new_users_last_7_days} valueStyle={{ color: '#4A90D9' }} prefix={<TeamOutlined />} />
+                <MiniMetric label="新增用户" value={activity.new_users_last_7_days} tone="sky" icon={<TeamOutlined />} />
               </Col>
               <Col xs={12} md={8} xl={4}>
-                <Statistic title="新增对话" value={activity.new_conversations_last_7_days} valueStyle={{ color: '#0EA5E9' }} prefix={<MessageOutlined />} />
+                <MiniMetric label="新增对话" value={activity.new_conversations_last_7_days} tone="cyan" icon={<MessageOutlined />} />
               </Col>
               <Col xs={12} md={8} xl={4}>
-                <Statistic title="新增知识库" value={activity.new_knowledge_bases_last_7_days} valueStyle={{ color: '#00B894' }} prefix={<DatabaseOutlined />} />
+                <MiniMetric label="新增知识库" value={activity.new_knowledge_bases_last_7_days} tone="emerald" icon={<DatabaseOutlined />} />
               </Col>
               <Col xs={12} md={8} xl={4}>
-                <Statistic title="新增论文" value={activity.new_papers_last_7_days} valueStyle={{ color: '#8B5CF6' }} prefix={<BookOutlined />} />
+                <MiniMetric label="新增论文" value={activity.new_papers_last_7_days} tone="violet" icon={<BookOutlined />} />
               </Col>
               <Col xs={12} md={8} xl={4}>
-                <Statistic title="新增 Notebook" value={activity.new_notebooks_last_7_days} valueStyle={{ color: '#E11D48' }} prefix={<ReadOutlined />} />
+                <MiniMetric label="新增 Notebook" value={activity.new_notebooks_last_7_days} tone="slate" icon={<ReadOutlined />} />
               </Col>
             </Row>
           </Card>
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               近 {statistics.time_window_days} 天趋势
             </Title>
             <Row gutter={[12, 12]}>
               <Col xs={24} lg={12} xl={8}>
-                <TrendBars title="用户" color="#4A90D9" data={trends.users} days={statistics.time_window_days} />
+                <TrendBars title="用户" tone="sky" data={trends.users} days={statistics.time_window_days} />
               </Col>
               <Col xs={24} lg={12} xl={8}>
-                <TrendBars title="对话" color="#0EA5E9" data={trends.conversations} days={statistics.time_window_days} />
+                <TrendBars title="对话" tone="cyan" data={trends.conversations} days={statistics.time_window_days} />
               </Col>
               <Col xs={24} lg={12} xl={8}>
-                <TrendBars title="知识库" color="#00B894" data={trends.knowledge_bases} days={statistics.time_window_days} />
+                <TrendBars title="知识库" tone="emerald" data={trends.knowledge_bases} days={statistics.time_window_days} />
               </Col>
               <Col xs={24} lg={12} xl={8}>
-                <TrendBars title="论文" color="#8B5CF6" data={trends.papers} days={statistics.time_window_days} />
+                <TrendBars title="论文" tone="violet" data={trends.papers} days={statistics.time_window_days} />
               </Col>
               <Col xs={24} lg={12} xl={8}>
-                <TrendBars title="Notebook" color="#E11D48" data={trends.notebooks} days={statistics.time_window_days} />
+                <TrendBars title="Notebook" tone="slate" data={trends.notebooks} days={statistics.time_window_days} />
               </Col>
             </Row>
           </Card>
         </Col>
 
         <Col xs={24} xl={10}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               共享与邀请分布
             </Title>
-            <Text style={{ color: '#9FB0C3', display: 'block', marginBottom: 10 }}>共享资源类型</Text>
+            <Text className="!mb-[10px] !block !text-slate-400">共享资源类型</Text>
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
               {shareBreakdown.length > 0 ? shareBreakdown.map((item) => (
                 <div key={`share-${item.key}`}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <Text style={{ color: '#E6EDF3' }}>{item.label}</Text>
-                    <Text style={{ color: '#22C55E' }}>{item.count}</Text>
+                  <div className="mb-1.5 flex justify-between">
+                    <Text className="!text-slate-200">{item.label}</Text>
+                    <Text className="!text-emerald-300">{item.count}</Text>
                   </div>
-                  <Progress percent={percent(item.count, statistics.total_shared_resources)} showInfo={false} strokeColor="#22C55E" trailColor="#2B313A" />
+                  <Progress percent={percent(item.count, statistics.total_shared_resources)} showInfo={false} strokeColor={toneHex.emerald} trailColor={progressTrailColor} />
                 </div>
               )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无共享资源" />}
             </Space>
-            <Text style={{ color: '#9FB0C3', display: 'block', marginTop: 18, marginBottom: 10 }}>邀请状态</Text>
+            <Text className="!mb-[10px] !mt-[18px] !block !text-slate-400">邀请状态</Text>
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
               {invitationBreakdown.length > 0 ? invitationBreakdown.map((item) => (
                 <div key={`invitation-${item.key}`}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <Text style={{ color: '#E6EDF3' }}>{item.label}</Text>
-                    <Text style={{ color: '#F97316' }}>{item.count}</Text>
+                  <div className="mb-1.5 flex justify-between">
+                    <Text className="!text-slate-200">{item.label}</Text>
+                    <Text className="!text-cyan-300">{item.count}</Text>
                   </div>
-                  <Progress percent={percent(item.count, invitationBreakdown.reduce((sum, current) => sum + current.count, 0))} showInfo={false} strokeColor="#F97316" trailColor="#2B313A" />
+                  <Progress percent={percent(item.count, invitationBreakdown.reduce((sum, current) => sum + current.count, 0))} showInfo={false} strokeColor={toneHex.cyan} trailColor={progressTrailColor} />
                 </div>
               )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无邀请记录" />}
             </Space>
@@ -1015,34 +1113,35 @@ const StatisticsPage: React.FC = () => {
         </Col>
 
         <Col xs={24} xl={14}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               导师排行
             </Title>
             <List
+              split={false}
               dataSource={topMentors}
               locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无导师数据" /> }}
               renderItem={(item, index) => (
-                <List.Item style={{ borderBlockEnd: '1px solid #2B313A', paddingInline: 0 }}>
-                  <div style={{ width: '100%', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                <List.Item className="!my-1 !rounded-[22px] !border !border-transparent !px-4 !py-3 transition-all duration-200 hover:!border-white/[0.06] hover:!bg-white/[0.04]">
+                  <div className="flex w-full items-center justify-between gap-3">
                     <div>
                       <Space size="middle">
-                        <Tag color={index === 0 ? 'gold' : index === 1 ? 'blue' : 'default'} icon={<CrownOutlined />}>
+                        <GlassTag tone={toneTagFromIndex(index)} icon={<CrownOutlined />}>
                           TOP {index + 1}
-                        </Tag>
+                        </GlassTag>
                         <div>
-                          <Text style={{ color: '#E6EDF3', fontSize: 15 }}>
+                          <Text className="!text-[15px] !text-slate-100">
                             {item.full_name || item.username}
                           </Text>
-                          <Paragraph style={{ margin: '4px 0 0', color: '#8B949E' }}>
+                          <Paragraph className="!m-0 !mt-1 !text-slate-500">
                             @{item.username}
                           </Paragraph>
                         </div>
                       </Space>
                     </div>
                     <Space size="large">
-                      <Statistic title="学生" value={item.student_count} valueStyle={{ color: '#4A90D9', fontSize: 22 }} prefix={<TeamOutlined />} />
-                      <Statistic title="研究组" value={item.group_count} valueStyle={{ color: '#22C55E', fontSize: 22 }} prefix={<FolderOpenOutlined />} />
+                      <MiniMetric label="学生" value={item.student_count} tone="sky" icon={<TeamOutlined />} />
+                      <MiniMetric label="研究组" value={item.group_count} tone="emerald" icon={<FolderOpenOutlined />} />
                     </Space>
                   </div>
                 </List.Item>
@@ -1052,26 +1151,27 @@ const StatisticsPage: React.FC = () => {
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <Title level={5} style={{ margin: '0 0 18px', color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <Title level={5} className="!mb-[18px] !mt-0 !text-slate-50">
               最近活动
             </Title>
             <List
+              split={false}
               dataSource={recentActivity}
               locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无近期活动" /> }}
               renderItem={(item) => (
-                <List.Item style={{ borderBlockEnd: '1px solid #2B313A', paddingInline: 0 }}>
-                  <div style={{ width: '100%', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                <List.Item className="!my-1 !rounded-[22px] !border !border-transparent !px-4 !py-3 transition-all duration-200 hover:!border-white/[0.06] hover:!bg-white/[0.04]">
+                  <div className="flex w-full items-center justify-between gap-3">
                     <div>
                       <Space wrap>
-                        <Tag color="blue">{item.type}</Tag>
-                        <Text style={{ color: '#F0F6FC', fontSize: 15 }}>{item.title}</Text>
+                        <GlassTag tone="sky">{item.type}</GlassTag>
+                        <Text className="!text-[15px] !text-slate-100">{item.title}</Text>
                       </Space>
-                      <Paragraph style={{ margin: '6px 0 0', color: '#8B949E' }}>
+                      <Paragraph className="!m-0 !mt-1.5 !text-slate-500">
                         {item.owner_name} · {item.owner_role}
                       </Paragraph>
                     </div>
-                    <Text style={{ color: '#6E7681' }}>{formatDateTime(item.created_at)}</Text>
+                    <Text className="!text-slate-500">{formatDateTime(item.created_at)}</Text>
                   </div>
                 </List.Item>
               )}
@@ -1080,124 +1180,124 @@ const StatisticsPage: React.FC = () => {
         </Col>
 
         <Col xs={24} xl={12}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 AI / RAG 专项
               </Title>
-              <Tag color="blue">运行成功率 {aiRunSuccessRate}%</Tag>
+              <GlassTag tone="sky">运行成功率 {aiRunSuccessRate}%</GlassTag>
             </div>
             <Row gutter={[12, 12]}>
               <Col xs={12} md={8}>
-                <MetricChip label="Agent 调用" value={aiRag.agent_runs_last_window} color="#4A90D9" icon={<RobotOutlined />} />
+                <MetricChip label="Agent 调用" value={aiRag.agent_runs_last_window} tone="sky" icon={<RobotOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="RAG 回复" value={aiRag.rag_messages_last_window} color="#22C55E" icon={<MessageOutlined />} />
+                <MetricChip label="RAG 回复" value={aiRag.rag_messages_last_window} tone="emerald" icon={<MessageOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="检索调用" value={aiRag.knowledge_search_calls_last_window} color="#F97316" icon={<SearchOutlined />} />
+                <MetricChip label="检索调用" value={aiRag.knowledge_search_calls_last_window} tone="cyan" icon={<SearchOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="引用有效" value={aiRag.citation_valid_answers_last_window} color="#D4AF37" icon={<LinkOutlined />} />
+                <MetricChip label="引用有效" value={aiRag.citation_valid_answers_last_window} tone="teal" icon={<LinkOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="压缩回退块" value={aiRag.compression_fallback_chunks_last_window} color="#FB7185" icon={<SyncOutlined />} />
+                <MetricChip label="压缩回退块" value={aiRag.compression_fallback_chunks_last_window} tone="rose" icon={<SyncOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="回复 Tokens" value={aiRag.assistant_total_tokens_last_window} color="#8B5CF6" icon={<ThunderboltOutlined />} />
+                <MetricChip label="回复 Tokens" value={aiRag.assistant_total_tokens_last_window} tone="violet" icon={<ThunderboltOutlined />} />
               </Col>
             </Row>
-            <Paragraph style={{ marginTop: 16, marginBottom: 0, color: '#8B949E' }}>
+            <Paragraph className="!mb-0 !mt-4 !text-slate-500">
               近 {statistics.time_window_days} 天引用有效率 {citationValidityRate}% ，修复成功率 {citationRepairRate}% ，压缩调用 {aiRag.compression_calls_last_window} 次。
             </Paragraph>
           </Card>
         </Col>
 
         <Col xs={24} xl={12}>
-          <Card bordered style={{ ...panelStyle, height: '100%' }} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={`${sectionCardClass} h-full`} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 CodeLab 专项
               </Title>
-              <Tag color="green">代码单元覆盖率 {codelabCellCoverage}%</Tag>
+              <GlassTag tone="emerald">代码单元覆盖率 {codelabCellCoverage}%</GlassTag>
             </div>
             <Row gutter={[12, 12]}>
               <Col xs={12} md={8}>
-                <MetricChip label="活跃 Notebook" value={codelab.notebooks_active_last_window} color="#4A90D9" icon={<ReadOutlined />} />
+                <MetricChip label="活跃 Notebook" value={codelab.notebooks_active_last_window} tone="sky" icon={<ReadOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="已执行 Notebook" value={codelab.executed_notebooks} color="#22C55E" icon={<CheckCircleOutlined />} />
+                <MetricChip label="已执行 Notebook" value={codelab.executed_notebooks} tone="emerald" icon={<CheckCircleOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="总执行次数" value={codelab.total_execution_count} color="#F97316" icon={<ThunderboltOutlined />} />
+                <MetricChip label="总执行次数" value={codelab.total_execution_count} tone="cyan" icon={<ThunderboltOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="代码单元" value={codelab.code_cells} color="#8B5CF6" icon={<CodeOutlined />} />
+                <MetricChip label="代码单元" value={codelab.code_cells} tone="violet" icon={<CodeOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="已执行单元" value={codelab.executed_code_cells} color="#E11D48" icon={<CheckCircleOutlined />} />
+                <MetricChip label="已执行单元" value={codelab.executed_code_cells} tone="teal" icon={<CheckCircleOutlined />} />
               </Col>
               <Col xs={12} md={8}>
-                <MetricChip label="Agent Tokens" value={codelab.agent_tokens_last_window} color="#14B8A6" icon={<RobotOutlined />} />
+                <MetricChip label="Agent Tokens" value={codelab.agent_tokens_last_window} tone="slate" icon={<RobotOutlined />} />
               </Col>
             </Row>
-            <Paragraph style={{ marginTop: 16, marginBottom: 0, color: '#8B949E' }}>
+            <Paragraph className="!mb-0 !mt-4 !text-slate-500">
               近 {statistics.time_window_days} 天 CodeLab Agent 调用 {codelab.agent_runs_last_window} 次。
             </Paragraph>
           </Card>
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, gap: 12, flexWrap: 'wrap' }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex flex-wrap items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 文献阅读专项
               </Title>
-              <Tag color="gold">知识链路完成率 {knowledgeLinkCompletionRate}%</Tag>
+              <GlassTag tone="slate">知识链路完成率 {knowledgeLinkCompletionRate}%</GlassTag>
             </div>
             <Row gutter={[16, 16]}>
               <Col xs={24} xl={14}>
                 <Row gutter={[12, 12]}>
                   <Col xs={12} md={8}>
-                    <MetricChip label="文献集" value={literature.total_collections} color="#4A90D9" icon={<FolderOpenOutlined />} />
+                    <MetricChip label="文献集" value={literature.total_collections} tone="sky" icon={<FolderOpenOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="活跃阅读会话" value={literature.active_read_sessions_last_window} color="#22C55E" icon={<ReadOutlined />} />
+                    <MetricChip label="活跃阅读会话" value={literature.active_read_sessions_last_window} tone="emerald" icon={<ReadOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="批注" value={literature.annotations_last_window} color="#F97316" icon={<FileTextOutlined />} />
+                    <MetricChip label="批注" value={literature.annotations_last_window} tone="cyan" icon={<FileTextOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="评论" value={literature.comments_last_window} color="#8B5CF6" icon={<MessageOutlined />} />
+                    <MetricChip label="评论" value={literature.comments_last_window} tone="violet" icon={<MessageOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="评分" value={literature.ratings_last_window} color="#FACC15" icon={<CrownOutlined />} />
+                    <MetricChip label="评分" value={literature.ratings_last_window} tone="slate" icon={<CrownOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="QA 会话" value={literature.qa_sessions_last_window} color="#14B8A6" icon={<BookOutlined />} />
+                    <MetricChip label="QA 会话" value={literature.qa_sessions_last_window} tone="teal" icon={<BookOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="QA 消息" value={literature.qa_messages_last_window} color="#E11D48" icon={<MessageOutlined />} />
+                    <MetricChip label="QA 消息" value={literature.qa_messages_last_window} tone="slate" icon={<MessageOutlined />} />
                   </Col>
                   <Col xs={12} md={8}>
-                    <MetricChip label="知识链路" value={literature.knowledge_links_total} color="#94A3B8" icon={<LinkOutlined />} />
+                    <MetricChip label="知识链路" value={literature.knowledge_links_total} tone="slate" icon={<LinkOutlined />} />
                   </Col>
                 </Row>
               </Col>
               <Col xs={24} xl={10}>
-                <Text style={{ color: '#9FB0C3', display: 'block', marginBottom: 10 }}>论文入知识库状态</Text>
+                <Text className="!mb-[10px] !block !text-slate-400">论文入知识库状态</Text>
                 <Space direction="vertical" size={12} style={{ width: '100%' }}>
                   {knowledgeLinkBreakdown.length > 0 ? knowledgeLinkBreakdown.map((item) => (
                     <div key={`paper-link-${item.key}`}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                        <Text style={{ color: '#E6EDF3' }}>{item.label}</Text>
-                        <Text style={{ color: '#D4AF37' }}>{item.count}</Text>
+                      <div className="mb-1.5 flex justify-between">
+                        <Text className="!text-slate-200">{item.label}</Text>
+                        <Text className="!text-cyan-300">{item.count}</Text>
                       </div>
                       <Progress
                         percent={percent(item.count, literature.knowledge_links_total)}
                         showInfo={false}
-                        strokeColor="#D4AF37"
-                        trailColor="#2B313A"
+                        strokeColor={toneHex.cyan}
+                        trailColor={progressTrailColor}
                       />
                     </div>
                   )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无知识链路记录" />}
@@ -1208,13 +1308,14 @@ const StatisticsPage: React.FC = () => {
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 18, flexWrap: 'wrap' }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex flex-wrap items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 明细下钻
               </Title>
               <Space wrap>
                 <Button
+                  className={actionButtonClass}
                   icon={<DownloadOutlined />}
                   loading={exportingKey === 'details'}
                   onClick={() =>
@@ -1234,11 +1335,13 @@ const StatisticsPage: React.FC = () => {
                   导出当前明细
                 </Button>
                 <Segmented
+                  className="statistics-page__segmented"
                   value={detailEntity}
                   options={DETAIL_ENTITY_OPTIONS.map((item) => ({ label: item.label, value: item.value }))}
                   onChange={(value) => setDetailEntity(value as DetailEntity)}
                 />
                 <Input
+                  className={inputControlClass}
                   allowClear
                   value={detailSearch}
                   onChange={(event) => {
@@ -1251,6 +1354,7 @@ const StatisticsPage: React.FC = () => {
                 />
                 {detailStatusOptions.length > 0 && (
                   <Select
+                    className="statistics-page__select"
                     allowClear
                     placeholder="状态"
                     value={detailStatus}
@@ -1264,6 +1368,7 @@ const StatisticsPage: React.FC = () => {
                 )}
                 {detailCategoryOptions.length > 0 && (
                   <Select
+                    className="statistics-page__select"
                     allowClear
                     placeholder="类别"
                     value={detailCategory}
@@ -1278,6 +1383,8 @@ const StatisticsPage: React.FC = () => {
               </Space>
             </div>
             <Table
+              className="statistics-table"
+              rowClassName={() => 'statistics-table__row'}
               rowKey="id"
               columns={detailColumns}
               dataSource={detailItems}
@@ -1299,13 +1406,14 @@ const StatisticsPage: React.FC = () => {
         </Col>
 
         <Col xs={24}>
-          <Card bordered style={panelStyle} styles={{ body: panelBodyStyle }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 18, flexWrap: 'wrap' }}>
-              <Title level={5} style={{ margin: 0, color: '#F0F6FC' }}>
+          <Card bordered={false} className={sectionCardClass} styles={{ body: sectionBodyStyle }}>
+            <div className="mb-[18px] flex flex-wrap items-center justify-between gap-3">
+              <Title level={5} className="!m-0 !text-slate-50">
                 管理员审计
               </Title>
               <Space wrap>
                 <Button
+                  className={actionButtonClass}
                   icon={<DownloadOutlined />}
                   loading={exportingKey === 'audit'}
                   onClick={() =>
@@ -1323,6 +1431,7 @@ const StatisticsPage: React.FC = () => {
                   导出审计
                 </Button>
                 <Input
+                  className={inputControlClass}
                   allowClear
                   value={auditSearch}
                   onChange={(event) => {
@@ -1334,6 +1443,7 @@ const StatisticsPage: React.FC = () => {
                   style={{ width: 240 }}
                 />
                 <Select
+                  className="statistics-page__select"
                   allowClear
                   placeholder="操作类型"
                   value={auditAction}
@@ -1347,6 +1457,8 @@ const StatisticsPage: React.FC = () => {
               </Space>
             </div>
             <Table
+              className="statistics-table"
+              rowClassName={() => 'statistics-table__row'}
               rowKey="id"
               columns={auditColumns}
               dataSource={auditItems}
@@ -1367,6 +1479,123 @@ const StatisticsPage: React.FC = () => {
           </Card>
         </Col>
       </Row>
+      <style>{`
+        .statistics-page .ant-empty-description {
+          color: rgb(100, 116, 139) !important;
+        }
+        .statistics-page__segmented {
+          background: rgba(255, 255, 255, 0.05) !important;
+          border: 1px solid rgba(255, 255, 255, 0.08) !important;
+          border-radius: 16px !important;
+          padding: 4px !important;
+        }
+        .statistics-page__segmented .ant-segmented-item {
+          color: rgb(148, 163, 184) !important;
+          border-radius: 12px !important;
+          transition: all 0.2s ease !important;
+        }
+        .statistics-page__segmented .ant-segmented-item-selected {
+          color: rgb(248, 250, 252) !important;
+          background: rgba(255, 255, 255, 0.08) !important;
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+        }
+        .statistics-page .ant-input-affix-wrapper,
+        .statistics-page__select .ant-select-selector {
+          background: rgba(255, 255, 255, 0.04) !important;
+          border: 1px solid rgba(255, 255, 255, 0.1) !important;
+          border-radius: 16px !important;
+          color: rgb(248, 250, 252) !important;
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+        }
+        .statistics-page .ant-input-affix-wrapper:hover,
+        .statistics-page__select .ant-select-selector:hover {
+          border-color: rgba(255, 255, 255, 0.14) !important;
+        }
+        .statistics-page .ant-input-affix-wrapper-focused,
+        .statistics-page .ant-input-affix-wrapper-focused:hover,
+        .statistics-page__select.ant-select-focused .ant-select-selector {
+          border-color: rgba(255, 255, 255, 0.2) !important;
+          background: rgba(255, 255, 255, 0.06) !important;
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 0 0 2px rgba(255, 255, 255, 0.04) !important;
+        }
+        .statistics-page .ant-input,
+        .statistics-page .ant-input-prefix,
+        .statistics-page__select .ant-select-selection-item,
+        .statistics-page__select .ant-select-arrow {
+          color: rgb(248, 250, 252) !important;
+          background: transparent !important;
+        }
+        .statistics-page .ant-input::placeholder,
+        .statistics-page__select .ant-select-selection-placeholder {
+          color: rgb(100, 116, 139) !important;
+        }
+        .statistics-page .ant-progress-bg {
+          box-shadow: 0 8px 18px rgba(15, 23, 42, 0.22) !important;
+        }
+        .statistics-table .ant-table {
+          background: transparent !important;
+        }
+        .statistics-table .ant-table-container::before,
+        .statistics-table .ant-table-container::after {
+          display: none !important;
+        }
+        .statistics-table .ant-table-thead > tr > th {
+          background: transparent !important;
+          border-bottom: none !important;
+          color: rgb(100, 116, 139) !important;
+          font-size: 10px !important;
+          font-weight: 700 !important;
+          letter-spacing: 0.18em !important;
+          padding: 0 16px 12px !important;
+          text-transform: uppercase !important;
+        }
+        .statistics-table .ant-table-tbody > tr > td {
+          background: transparent !important;
+          border-bottom: none !important;
+          padding: 14px 16px !important;
+          transition: background-color 0.2s ease, box-shadow 0.2s ease !important;
+        }
+        .statistics-table .ant-table-tbody > tr > td:first-child {
+          border-radius: 18px 0 0 18px !important;
+        }
+        .statistics-table .ant-table-tbody > tr > td:last-child {
+          border-radius: 0 18px 18px 0 !important;
+        }
+        .statistics-table .ant-table-tbody > tr.statistics-table__row:hover > td {
+          background: rgba(255, 255, 255, 0.05) !important;
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+        }
+        .statistics-table .ant-table-placeholder > td {
+          background: transparent !important;
+        }
+        .statistics-table .ant-pagination {
+          margin-top: 20px !important;
+        }
+        .statistics-table .ant-pagination .ant-pagination-item,
+        .statistics-table .ant-pagination .ant-pagination-prev,
+        .statistics-table .ant-pagination .ant-pagination-next {
+          border-color: rgba(255, 255, 255, 0.08) !important;
+          background: rgba(255, 255, 255, 0.04) !important;
+          border-radius: 12px !important;
+        }
+        .statistics-table .ant-pagination .ant-pagination-item a,
+        .statistics-table .ant-pagination .ant-pagination-prev button,
+        .statistics-table .ant-pagination .ant-pagination-next button,
+        .statistics-table .ant-pagination .ant-pagination-total-text {
+          color: rgb(148, 163, 184) !important;
+        }
+        .statistics-table .ant-pagination .ant-pagination-item-active {
+          background: rgba(255, 255, 255, 0.08) !important;
+          border-color: rgba(255, 255, 255, 0.12) !important;
+        }
+        .statistics-table .ant-pagination .ant-pagination-item-active a {
+          color: rgb(248, 250, 252) !important;
+        }
+        .statistics-table .ant-spin-nested-loading,
+        .statistics-table .ant-spin-container {
+          background: transparent !important;
+        }
+      `}</style>
     </div>
   )
 }

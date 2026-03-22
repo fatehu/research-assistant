@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { Outlet, useNavigate, useLocation, useParams } from 'react-router-dom'
-import { Layout, Menu, Input, Avatar, Dropdown, Button, Tooltip, Modal, Empty, Badge, Divider } from 'antd'
+import { Layout, Menu, Input, Avatar, Dropdown, Button, Modal, Badge } from 'antd'
 import {
   HomeOutlined,
   MessageOutlined,
@@ -62,28 +62,28 @@ const ConversationItem = ({
       initial={{ opacity: 0, x: -10 }}
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: -10 }}
-      className={`group relative flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all ${
+      className={`group relative flex items-center gap-3 rounded-2xl border px-3 py-2.5 cursor-pointer transition-all duration-200 ${
         isActive
-          ? 'bg-emerald-500/20 border border-emerald-500/30'
-          : 'hover:bg-white/5 border border-transparent'
+          ? 'border-white/10 bg-white/[0.08] shadow-[inset_0_1px_1px_rgba(255,255,255,0.05)]'
+          : 'border-transparent hover:border-white/6 hover:bg-white/[0.04]'
       }`}
       onClick={onClick}
       onMouseEnter={() => setShowActions(true)}
       onMouseLeave={() => setShowActions(false)}
     >
       {/* 图标 */}
-      <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-        isActive ? 'bg-emerald-500/30' : 'bg-slate-700/50'
+      <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border ${
+        isActive ? 'border-white/10 bg-white/[0.1]' : 'border-white/5 bg-white/[0.04]'
       }`}>
-        <MessageOutlined className={isActive ? 'text-emerald-400' : 'text-slate-400'} />
+        <MessageOutlined className={isActive ? 'text-white' : 'text-slate-500 transition-colors group-hover:text-slate-300'} />
       </div>
       
       {/* 标题和时间 */}
       <div className="flex-1 min-w-0">
-        <div className={`text-sm truncate ${isActive ? 'text-white font-medium' : 'text-slate-300'}`}>
+        <div className={`truncate text-sm ${isActive ? 'font-medium text-white' : 'text-slate-300'}`}>
           {conv.title || '新对话'}
         </div>
-        <div className="text-xs text-slate-500 mt-0.5">
+        <div className={`mt-0.5 text-xs ${isActive ? 'text-slate-400' : 'text-slate-500'}`}>
           {dayjs(conv.updated_at).fromNow()}
         </div>
       </div>
@@ -119,7 +119,7 @@ const ConversationItem = ({
                 size="small"
                 icon={<MoreOutlined />}
                 onClick={(e) => e.stopPropagation()}
-                className="text-slate-400 hover:text-white hover:bg-white/10"
+                className="!text-slate-500 hover:!bg-white/[0.08] hover:!text-white"
               />
             </Dropdown>
           </motion.div>
@@ -144,24 +144,26 @@ const CollapsibleGroup = ({
   const [expanded, setExpanded] = useState(defaultExpanded)
 
   return (
-    <div className="mb-2">
+    <div className="mb-3">
       <div
-        className="flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-white/5 transition-all"
+        className="flex cursor-pointer items-center gap-2 rounded-xl px-2 py-2 transition-colors hover:bg-white/[0.03]"
         onClick={() => setExpanded(!expanded)}
       >
         <motion.div
           animate={{ rotate: expanded ? 0 : -90 }}
           transition={{ duration: 0.2 }}
         >
-          <DownOutlined className="text-slate-500 text-xs" />
+          <DownOutlined className="text-[10px] text-slate-600" />
         </motion.div>
-        <span className="text-xs text-slate-500 flex-1">{title}</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">{title}</span>
+        <div className="h-px flex-1 bg-gradient-to-r from-white/10 via-white/[0.03] to-transparent" />
         <Badge 
           count={count} 
           size="small"
           style={{ 
-            backgroundColor: 'rgba(71, 85, 105, 0.5)',
-            color: 'rgba(148, 163, 184, 1)',
+            backgroundColor: 'rgba(255, 255, 255, 0.06)',
+            border: '1px solid rgba(255, 255, 255, 0.06)',
+            color: 'rgba(148, 163, 184, 0.92)',
             fontSize: '10px',
             boxShadow: 'none',
           }}
@@ -176,7 +178,7 @@ const CollapsibleGroup = ({
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
           >
-            <div className="space-y-1 mt-1">
+            <div className="mt-1 space-y-1.5">
               {children}
             </div>
           </motion.div>
@@ -189,15 +191,15 @@ const CollapsibleGroup = ({
 // 角色标签组件
 const RoleBadge = ({ role }: { role: string }) => {
   const roleConfig = {
-    admin: { label: '管理员', color: 'bg-gradient-to-r from-amber-500 to-orange-500', icon: <CrownOutlined /> },
-    mentor: { label: '导师', color: 'bg-gradient-to-r from-blue-500 to-indigo-500', icon: <SolutionOutlined /> },
-    student: { label: '学生', color: 'bg-gradient-to-r from-emerald-500 to-teal-500', icon: <UserOutlined /> },
+    admin: { label: '管理员', className: 'border border-amber-400/20 bg-amber-400/10 text-amber-400', icon: <CrownOutlined /> },
+    mentor: { label: '导师', className: 'border border-blue-400/20 bg-blue-400/10 text-blue-400', icon: <SolutionOutlined /> },
+    student: { label: '学生', className: 'border border-emerald-400/20 bg-emerald-400/10 text-emerald-400', icon: <UserOutlined /> },
   }
   const config = roleConfig[role as keyof typeof roleConfig] || roleConfig.student
   
   return (
-    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-white ${config.color}`}>
-      {config.icon}
+    <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium tracking-widest ${config.className}`}>
+      <span className="flex items-center text-[13px]">{config.icon}</span>
       <span>{config.label}</span>
     </div>
   )
@@ -424,9 +426,12 @@ const MainLayout = () => {
   const userMenuItems = [
     {
       key: 'role',
-      icon: <CrownOutlined />,
-      label: <RoleBadge role={user?.role || 'student'} />,
-      disabled: true,
+      type: 'group' as const,
+      label: (
+        <div className="py-0.5">
+          <RoleBadge role={user?.role || 'student'} />
+        </div>
+      ),
     },
     { type: 'divider' as const },
     {
@@ -517,6 +522,7 @@ const MainLayout = () => {
   }, [conversations])
   
   const groupOrder = ['今天', '昨天', '过去7天', '更早']
+  const userRoleLabel = user?.role === 'admin' ? '管理员' : user?.role === 'mentor' ? '导师' : '学生'
   
   // 获取当前选中的菜单键
   const selectedKey = useMemo(() => {
@@ -549,7 +555,7 @@ const MainLayout = () => {
         width={280}
         collapsedWidth={72}
         collapsed={collapsed}
-        className="bg-slate-900/95 border-r border-white/5 flex flex-col"
+        className="main-layout__sider flex flex-col overflow-hidden bg-[#05070b]"
         style={{ 
           height: '100vh',
           position: 'fixed',
@@ -559,24 +565,26 @@ const MainLayout = () => {
           zIndex: 100,
           display: 'flex',
           flexDirection: 'column',
+          background: 'linear-gradient(180deg, #0b1017 0%, #070b11 55%, #05070b 100%)',
+          boxShadow: 'inset -1px 0 0 rgba(255,255,255,0.04), 20px 0 48px rgba(0,0,0,0.28)',
         }}
       >
         {/* Logo区域 - 固定 */}
-        <div className="h-14 flex items-center justify-center px-4 border-b border-white/5 flex-shrink-0">
+        <div className="flex h-14 flex-shrink-0 items-center justify-center border-b border-white/[0.06] px-4">
           {!collapsed ? (
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               className="flex items-center gap-3"
             >
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center">
-                <span className="text-white font-bold text-lg">R</span>
+              <div className="flex h-9 w-9 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+                <span className="text-lg font-semibold text-white">R</span>
               </div>
-              <span className="text-white font-semibold text-lg tracking-tight">研究助手</span>
+              <span className="text-lg font-semibold tracking-tight text-white">研究助手</span>
             </motion.div>
           ) : (
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center">
-              <span className="text-white font-bold text-lg">R</span>
+            <div className="flex h-9 w-9 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+              <span className="text-lg font-semibold text-white">R</span>
             </div>
           )}
         </div>
@@ -584,10 +592,10 @@ const MainLayout = () => {
         {/* 新对话按钮 - 固定 */}
         <div className="p-3 flex-shrink-0">
           <Button
-            type="primary"
+            type="default"
             icon={<PlusOutlined />}
             onClick={handleNewChat}
-            className={`w-full h-10 bg-gradient-to-r from-emerald-500 to-cyan-500 border-0 rounded-xl font-medium ${
+            className={`h-10 w-full rounded-2xl border-white/10 bg-white/[0.04] font-medium text-slate-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] hover:!border-white/15 hover:!bg-white/[0.08] hover:!text-white ${
               collapsed ? 'px-0' : ''
             }`}
           >
@@ -597,11 +605,9 @@ const MainLayout = () => {
         
         {/* 可滚动区域 - 菜单 */}
         <div 
-          className="overflow-y-auto" 
+          className="main-layout__sider-scroll overflow-y-auto px-1" 
           style={{ 
             maxHeight: collapsed ? 'calc(100vh - 180px)' : 'calc(100vh - 400px)',
-            scrollbarWidth: 'thin',
-            scrollbarColor: 'rgba(100, 116, 139, 0.3) transparent',
           }}
         >
           {/* 导航菜单 */}
@@ -610,57 +616,119 @@ const MainLayout = () => {
             selectedKeys={[selectedKey]}
             onClick={handleMenuClick}
             items={menuItems}
-            className="bg-transparent border-none px-2"
+            className="main-layout__nav-menu bg-transparent border-none px-2"
             style={{
               '--ant-menu-item-bg': 'transparent',
-              '--ant-menu-item-active-bg': 'rgba(16, 185, 129, 0.1)',
-              '--ant-menu-item-selected-bg': 'rgba(16, 185, 129, 0.15)',
+              '--ant-menu-item-active-bg': 'rgba(255, 255, 255, 0.04)',
+              '--ant-menu-item-selected-bg': 'rgba(255, 255, 255, 0.08)',
               '--ant-menu-item-color': 'rgb(148, 163, 184)',
               '--ant-menu-item-hover-color': 'rgb(255, 255, 255)',
-              '--ant-menu-item-selected-color': 'rgb(52, 211, 153)',
+              '--ant-menu-item-selected-color': 'rgb(255, 255, 255)',
             } as React.CSSProperties}
           />
           {/* 菜单样式覆盖 */}
           <style>{`
-            .ant-menu-item-group-title {
-              color: rgb(100, 116, 139) !important;
-              font-size: 11px !important;
-              font-weight: 600 !important;
-              text-transform: uppercase !important;
-              letter-spacing: 0.05em !important;
-              padding: 12px 16px 4px !important;
+            .main-layout__nav-menu .ant-menu-item,
+            .main-layout__nav-menu .ant-menu-submenu-title {
+              margin-block: 4px !important;
+              width: 100% !important;
+              height: 44px !important;
+              line-height: 44px !important;
+              border-radius: 14px !important;
             }
-            .ant-menu-item-group-list .ant-menu-item {
+            .main-layout__nav-menu .ant-menu-item::after {
+              display: none !important;
+            }
+            .main-layout__nav-menu .ant-menu-item .anticon,
+            .main-layout__nav-menu .ant-menu-submenu-title .anticon {
+              color: rgba(148, 163, 184, 0.9) !important;
+              transition: color 0.2s ease !important;
+            }
+            .main-layout__nav-menu .ant-menu-item:hover,
+            .main-layout__nav-menu .ant-menu-submenu-title:hover {
+              color: rgb(255, 255, 255) !important;
+              background-color: rgba(255, 255, 255, 0.04) !important;
+            }
+            .main-layout__nav-menu .ant-menu-item:hover .anticon,
+            .main-layout__nav-menu .ant-menu-submenu-title:hover .anticon {
+              color: rgb(255, 255, 255) !important;
+            }
+            .main-layout__nav-menu .ant-menu-item-selected {
+              color: rgb(255, 255, 255) !important;
+              background-color: rgba(255, 255, 255, 0.08) !important;
+              box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05) !important;
+            }
+            .main-layout__nav-menu .ant-menu-item-selected .anticon {
+              color: rgb(255, 255, 255) !important;
+            }
+            .main-layout__nav-menu .ant-menu-item-group-title {
+              display: flex !important;
+              align-items: center !important;
+              gap: 10px !important;
+              color: rgb(100, 116, 139) !important;
+              font-size: 10px !important;
+              font-weight: 700 !important;
+              text-transform: uppercase !important;
+              letter-spacing: 0.2em !important;
+              padding: 14px 16px 6px !important;
+            }
+            .main-layout__nav-menu .ant-menu-item-group-title::after {
+              content: '' !important;
+              flex: 1 !important;
+              height: 1px !important;
+              background: linear-gradient(90deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0)) !important;
+            }
+            .main-layout__nav-menu .ant-menu-item-group-list .ant-menu-item {
               color: rgb(203, 213, 225) !important;
             }
-            .ant-menu-item-group-list .ant-menu-item:hover {
-              color: rgb(255, 255, 255) !important;
-              background-color: rgba(255, 255, 255, 0.05) !important;
-            }
-            .ant-menu-item-group-list .ant-menu-item-selected {
-              color: rgb(52, 211, 153) !important;
-              background-color: rgba(16, 185, 129, 0.15) !important;
-            }
-            .ant-menu-item-disabled {
+            .main-layout__nav-menu .ant-menu-item-disabled {
               color: rgb(200, 210, 225) !important;
               opacity: 1 !important;
               cursor: not-allowed !important;
             }
-            .ant-menu-item-disabled .anticon {
+            .main-layout__nav-menu .ant-menu-item-disabled .anticon {
               color: rgb(200, 210, 225) !important;
             }
-            .ant-menu-item-disabled span {
+            .main-layout__nav-menu .ant-menu-item-disabled span {
               color: rgb(200, 210, 225) !important;
+            }
+            .main-layout__sider-scroll,
+            .main-layout__history-scroll {
+              scrollbar-width: none;
+            }
+            .main-layout__sider-scroll::-webkit-scrollbar,
+            .main-layout__history-scroll::-webkit-scrollbar {
+              width: 0;
+              height: 0;
+            }
+            .main-layout__sider:hover .main-layout__sider-scroll,
+            .main-layout__sider:hover .main-layout__history-scroll {
+              scrollbar-width: thin;
+              scrollbar-color: rgba(148, 163, 184, 0.3) transparent;
+            }
+            .main-layout__sider:hover .main-layout__sider-scroll::-webkit-scrollbar,
+            .main-layout__sider:hover .main-layout__history-scroll::-webkit-scrollbar {
+              width: 6px;
+              height: 6px;
+            }
+            .main-layout__sider:hover .main-layout__sider-scroll::-webkit-scrollbar-track,
+            .main-layout__sider:hover .main-layout__history-scroll::-webkit-scrollbar-track {
+              background: transparent;
+            }
+            .main-layout__sider:hover .main-layout__sider-scroll::-webkit-scrollbar-thumb,
+            .main-layout__sider:hover .main-layout__history-scroll::-webkit-scrollbar-thumb {
+              background: rgba(148, 163, 184, 0.28);
+              border-radius: 999px;
             }
           `}</style>
         </div>
           
         {/* 对话历史 - 仅在展开时显示 */}
         {!collapsed && (
-          <div className="flex-1 flex flex-col min-h-0 border-t border-white/5 overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-t border-white/[0.06]">
             {/* 历史标题 */}
             <div 
-              className="flex items-center gap-2 px-4 py-2 text-slate-400 text-sm cursor-pointer hover:text-slate-300 transition-colors flex-shrink-0"
+              className="flex flex-shrink-0 cursor-pointer items-center gap-2 px-4 py-3 text-sm text-slate-400 transition-colors hover:text-slate-200"
               onClick={() => setHistoryExpanded(!historyExpanded)}
             >
               <motion.div
@@ -676,7 +744,8 @@ const MainLayout = () => {
                   size="small"
                   className="ml-auto"
                   style={{ 
-                    backgroundColor: 'rgba(71, 85, 105, 0.5)',
+                    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+                    border: '1px solid rgba(255, 255, 255, 0.06)',
                     color: 'rgba(148, 163, 184, 1)',
                     boxShadow: 'none',
                   }}
@@ -686,11 +755,7 @@ const MainLayout = () => {
               {/* 对话列表 - 关键滚动区域 */}
               {historyExpanded && (
                 <div 
-                  className="flex-1 overflow-y-auto pb-4"
-                  style={{
-                    scrollbarWidth: 'thin',
-                    scrollbarColor: 'rgba(100, 116, 139, 0.5) transparent',
-                  }}
+                  className="main-layout__history-scroll flex-1 overflow-y-auto pb-4"
                 >
                   {conversations.length === 0 ? (
                     <div className="flex flex-col items-center justify-center py-8 text-slate-500">
@@ -730,13 +795,65 @@ const MainLayout = () => {
           )}
         
         {/* 折叠按钮 - 固定在底部 */}
-        <div className="p-3 border-t border-white/5 flex-shrink-0">
-          <Button
-            type="text"
-            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-            onClick={() => setCollapsed(!collapsed)}
-            className="w-full text-slate-400 hover:text-white hover:bg-white/5"
-          />
+        <div className="flex-shrink-0 border-t border-white/[0.06] bg-white/[0.02] p-3">
+          {collapsed ? (
+            <div className="flex flex-col gap-2">
+              <Dropdown
+                menu={{ items: userMenuItems, onClick: handleUserMenuClick }}
+                placement="topRight"
+                trigger={['click']}
+              >
+                <button
+                  type="button"
+                  className="flex appearance-none outline-none h-10 w-full cursor-pointer items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] transition-all hover:border-white/15 hover:bg-white/[0.08]"
+                >
+                  <Avatar
+                    size={30}
+                    icon={<UserOutlined />}
+                    src={user?.avatar}
+                    className="bg-gradient-to-br from-slate-500 to-slate-300 text-slate-950"
+                  />
+                </button>
+              </Dropdown>
+              <Button
+                type="text"
+                icon={<MenuUnfoldOutlined />}
+                onClick={() => setCollapsed(false)}
+                className="h-10 rounded-2xl border border-white/10 !bg-white/[0.04] !text-slate-400 hover:!border-white/15 hover:!bg-white/[0.08] hover:!text-white"
+              />
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+              <Dropdown
+                menu={{ items: userMenuItems, onClick: handleUserMenuClick }}
+                placement="topRight"
+                trigger={['click']}
+              >
+                <button
+                  type="button"
+                  className="flex appearance-none outline-none border-none bg-transparent min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-2xl px-2 py-1.5 text-left transition-all hover:bg-white/[0.05]"
+                >
+                  <Avatar
+                    size={34}
+                    icon={<UserOutlined />}
+                    src={user?.avatar}
+                    className="bg-gradient-to-br from-slate-500 to-slate-300 text-slate-950"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm text-slate-200">{user?.username}</div>
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{userRoleLabel}</div>
+                  </div>
+                  <DownOutlined className="text-xs text-slate-500" />
+                </button>
+              </Dropdown>
+              <Button
+                type="text"
+                icon={<MenuFoldOutlined />}
+                onClick={() => setCollapsed(true)}
+                className="h-10 w-10 rounded-2xl border border-white/10 !bg-white/[0.04] !text-slate-400 hover:!border-white/15 hover:!bg-white/[0.08] hover:!text-white"
+              />
+            </div>
+          )}
         </div>
       </Sider>
       
@@ -746,7 +863,7 @@ const MainLayout = () => {
         style={{ marginLeft: collapsed ? 72 : 280, transition: 'margin-left 0.2s' }}
       >
         {/* 顶部栏 */}
-        <Header className="h-14 shrink-0 px-6 flex items-center justify-between bg-slate-900/50 border-b border-white/5 backdrop-blur-xl" style={{ zIndex: 100 }}>
+        <Header className="flex h-14 shrink-0 items-center justify-between border-b border-white/[0.06] bg-[#0b1017]/80 px-6 backdrop-blur-xl" style={{ zIndex: 100 }}>
           {/* 搜索 */}
           <div className="flex-1 max-w-md relative" ref={searchContainerRef}>
             <Input
@@ -756,7 +873,7 @@ const MainLayout = () => {
               value={searchValue}
               onChange={(e) => handleSearch(e.target.value)}
               onFocus={() => searchValue && searchResults.length > 0 && setShowSearchResults(true)}
-              className="bg-slate-800/50 border-slate-700/50 rounded-lg hover:border-slate-600"
+              className="!rounded-xl !border-white/10 !bg-white/[0.04] hover:!border-white/15"
               allowClear
             />
             {/* 搜索结果下拉 */}
@@ -834,29 +951,10 @@ const MainLayout = () => {
           {/* 右侧 */}
           <div className="flex items-center gap-4">
             {/* 模型状态 */}
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-emerald-400 text-sm">DeepSeek</span>
+            <div className="hidden items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 md:flex">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="text-sm text-slate-300">DeepSeek</span>
             </div>
-            
-            {/* 用户菜单 */}
-            <Dropdown
-              menu={{ items: userMenuItems, onClick: handleUserMenuClick }}
-              placement="bottomRight"
-            >
-              <div className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity">
-                <Avatar
-                  size={36}
-                  icon={<UserOutlined />}
-                  src={user?.avatar}
-                  className="bg-gradient-to-br from-blue-500 to-indigo-600"
-                />
-                <div className="hidden md:flex flex-col">
-                  <span className="text-slate-300 text-sm leading-tight">{user?.username}</span>
-                  <span className="text-slate-500 text-xs leading-tight">{user?.role === 'admin' ? '管理员' : user?.role === 'mentor' ? '导师' : '学生'}</span>
-                </div>
-              </div>
-            </Dropdown>
           </div>
         </Header>
         
