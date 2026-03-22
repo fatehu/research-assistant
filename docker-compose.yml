@@ -221,7 +221,7 @@ services:
     command: >
       sh -c 'set -eu;
       alembic upgrade head;
-      if [ "${BACKEND_UVICORN_RELOAD:-false}" = "true" ]; then
+      if [ "${BACKEND_UVICORN_RELOAD:-true}" = "true" ]; then
         exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
       fi;
       exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
