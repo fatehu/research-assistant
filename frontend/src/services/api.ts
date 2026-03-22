@@ -2297,6 +2297,31 @@ export interface LiteratureAskEvent {
   data: any
 }
 
+export interface ReaderExperienceBlockExplainTurn {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ReaderExperienceBlockExplainRequest {
+  page: number
+  block_id: string
+  explain_kind: 'simplify' | 'figure'
+  question: string
+  source_excerpt?: string
+  source_translation_zh?: string
+  explanation_text?: string
+  figure_label?: string
+  figure_caption?: string
+  figure_text?: string
+  figure_image_url?: string
+  history?: ReaderExperienceBlockExplainTurn[]
+}
+
+export interface ReaderExperienceBlockExplainEvent {
+  event: 'start' | 'token' | 'done' | 'error'
+  data: any
+}
+
 export interface LiteratureAskSession {
   id: number
   user_id: number
@@ -3025,6 +3050,61 @@ export const literatureApi = {
         if (!line.startsWith('data: ')) continue
         try {
           const parsed = JSON.parse(line.slice(6)) as LiteratureAskEvent
+          onEvent?.(parsed.event, parsed.data)
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+    }
+  },
+
+  explainExperienceBlockStream: async (
+    paperId: number,
+    payload: ReaderExperienceBlockExplainRequest,
+    onEvent?: (event: ReaderExperienceBlockExplainEvent['event'], data: any) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/experience-v2/block-explain/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as ReaderExperienceBlockExplainEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
           // ignore malformed chunk

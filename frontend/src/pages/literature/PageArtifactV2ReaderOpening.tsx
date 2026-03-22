@@ -24,7 +24,7 @@ export default function PageArtifactV2ReaderOpening(props: PageArtifactV2ReaderO
   return (
     <ProCard ghost className="page-artifact-v2__reader-opening" bodyStyle={{ padding: 0 }}>
       <div className="page-artifact-v2__reader-opening-copy">
-        <header className="page-artifact-v2__reader-opening-meta">
+        <header id="reader-opening" className="page-artifact-v2__reader-opening-meta">
           {props.pageNumber ? (
             <span className="page-artifact-v2__page-badge">PAGE {props.pageNumber}</span>
           ) : null}
@@ -52,7 +52,7 @@ export default function PageArtifactV2ReaderOpening(props: PageArtifactV2ReaderO
           {props.previousBridgeSummary || previousBridgePoints.length ? (
             <div className="page-artifact-v2__reader-opening-bridge">
               <span className="page-artifact-v2__hero-bridge-kicker">
-                {props.previousBridgeLabel || 'Context Bridge / 衔接前文'}
+                {props.previousBridgeLabel || '承接上一页'}
               </span>
               {props.previousBridgeSummary ? (
                 <Paragraph className="page-artifact-v2__hero-context">

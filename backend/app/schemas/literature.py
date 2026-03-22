@@ -2498,6 +2498,44 @@ class ReaderInlineQueryDonePayload(BaseModel):
     sources: List[ReaderInlineQuerySource] = Field(default_factory=list)
 
 
+class ReaderExperienceBlockExplainTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+class ReaderExperienceBlockExplainRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    block_id: str = Field(..., min_length=1, max_length=128)
+    explain_kind: Literal["simplify", "figure"]
+    question: str = Field(..., min_length=1, max_length=2000)
+    source_excerpt: Optional[str] = Field(None, max_length=6000)
+    source_translation_zh: Optional[str] = Field(None, max_length=6000)
+    explanation_text: Optional[str] = Field(None, max_length=6000)
+    figure_label: Optional[str] = Field(None, max_length=512)
+    figure_caption: Optional[str] = Field(None, max_length=6000)
+    figure_text: Optional[str] = Field(None, max_length=6000)
+    figure_image_url: Optional[str] = Field(None, max_length=2000000)
+    history: List[ReaderExperienceBlockExplainTurn] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_local_context(self):
+        if self.explain_kind == "simplify":
+            has_excerpt = bool(str(self.source_excerpt or "").strip())
+            has_explanation = bool(str(self.explanation_text or "").strip())
+            if not (has_excerpt or has_explanation):
+                raise ValueError("block_explain simplify requests require source_excerpt or explanation_text")
+        if self.explain_kind == "figure":
+            has_figure_context = any(
+                bool(str(value or "").strip())
+                for value in (self.figure_label, self.figure_caption, self.figure_text, self.figure_image_url)
+            )
+            if not has_figure_context:
+                raise ValueError("block_explain figure requests require figure context")
+        if len(self.history) > 12:
+            self.history = list(self.history[-12:])
+        return self
+
+
 ReaderComponentNode.model_rebuild()
 
 

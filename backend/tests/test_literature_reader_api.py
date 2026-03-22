@@ -5984,6 +5984,174 @@ def test_experience_session_v2_prompts_should_require_chinese_guided_copy():
     assert "provide translation_zh as a faithful Simplified Chinese translation" in draft_prompt
 
 
+def test_reader_experience_block_explain_request_should_require_local_context():
+    with pytest.raises(ValueError):
+        literature_api.ReaderExperienceBlockExplainRequest(
+            page=7,
+            block_id="seg-1",
+            explain_kind="simplify",
+            question="请讲得更通俗一点",
+        )
+
+    with pytest.raises(ValueError):
+        literature_api.ReaderExperienceBlockExplainRequest(
+            page=7,
+            block_id="seg-fig-1",
+            explain_kind="figure",
+            question="请解释这张图",
+        )
+
+
+def test_reader_experience_block_explain_prompt_should_use_local_block_materials():
+    payload = literature_api.ReaderExperienceBlockExplainRequest(
+        page=7,
+        block_id="seg-7-para",
+        explain_kind="simplify",
+        question="请把这一段讲得更通俗一点",
+        source_excerpt="We first examined the frequency of insight.",
+        source_translation_zh="我们首先考察了洞察出现的频率。",
+        explanation_text="这里在把 insight prevalence 作为质量评估的入口。",
+        history=[
+            literature_api.ReaderExperienceBlockExplainTurn(
+                role="assistant",
+                content="这段主要是在解释作者如何开始衡量洞察出现频率。",
+            )
+        ],
+    )
+
+    system_prompt = literature_api._reader_experience_block_explain_system_prompt(payload.explain_kind)
+    messages = literature_api._build_reader_experience_block_explain_messages(payload)
+
+    assert "不要提知识库" in system_prompt
+    assert "原文摘录：We first examined the frequency of insight." in messages[0]["content"]
+    assert "原文中文译文：我们首先考察了洞察出现的频率。" in messages[0]["content"]
+    assert "当前讲读：这里在把 insight prevalence 作为质量评估的入口。" in messages[0]["content"]
+    assert messages[1]["role"] == "assistant"
+    assert messages[-1]["content"] == "请把这一段讲得更通俗一点"
+
+
+def test_reader_experience_block_explain_messages_should_include_figure_image_payload():
+    payload = literature_api.ReaderExperienceBlockExplainRequest(
+        page=7,
+        block_id="seg-fig-3",
+        explain_kind="figure",
+        question="请只解释这张图",
+        figure_label="Fig 3",
+        figure_caption="Concordance and insight of ChatGPT on USMLE.",
+        figure_text="Fig 3",
+        figure_image_url="data:image/png;base64,ZmFrZQ==",
+    )
+
+    messages = literature_api._build_reader_experience_block_explain_messages(payload)
+
+    assert isinstance(messages[0]["content"], list)
+    assert messages[0]["content"][0]["type"] == "image_url"
+    assert messages[0]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert messages[0]["content"][1]["type"] == "text"
+    assert "图块标签：Fig 3" in messages[0]["content"][1]["text"]
+    assert messages[-1]["content"] == "请只解释这张图"
+
+
+@pytest.mark.asyncio
+async def test_normalize_reader_experience_block_explain_image_url_should_inline_local_figure_asset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    upload_dir = tmp_path / "uploads"
+    asset_dir = upload_dir / "reader_figure_assets" / "78" / "p7"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    asset_path = asset_dir / "asset-123.jpg"
+    asset_bytes = b"fake-jpeg-bytes"
+    asset_path.write_bytes(asset_bytes)
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+
+    paper = SimpleNamespace(id=78, user_id=1)
+    normalized = await literature_api._normalize_reader_experience_block_explain_image_url(
+        db=_FakeDB([]),
+        paper=paper,
+        raw_url="http://localhost:8888/api/v1/literature/reader/figure-assets/78/7/asset-123",
+    )
+
+    assert normalized.startswith("data:image/jpeg;base64,")
+    assert normalized.endswith("ZmFrZS1qcGVnLWJ5dGVz")
+
+
+@pytest.mark.asyncio
+async def test_normalize_reader_experience_block_explain_image_url_should_reject_cross_paper_asset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("UPLOAD_DIR", str(upload_dir))
+
+    paper = SimpleNamespace(id=78, user_id=1)
+    with pytest.raises(ValueError, match="与当前论文不匹配"):
+        await literature_api._normalize_reader_experience_block_explain_image_url(
+            db=_FakeDB([]),
+            paper=paper,
+            raw_url="http://localhost:8888/api/v1/literature/reader/figure-assets/99/7/asset-123",
+        )
+
+
+def test_friendly_reader_experience_block_explain_error_message_should_clarify_invalid_image_url():
+    error = Exception(
+        "Error code: 400 - {'error': {'message': '<400> InternalError.Algo.InvalidParameter: "
+        "The provided URL does not appear to be valid. Ensure it is correctly formatted.'}}"
+    )
+
+    message = literature_api._friendly_reader_experience_block_explain_error_message(error)
+
+    assert message == "当前图块图片地址无效，模型无法读取。请刷新当前页后重试。"
+
+
+@pytest.mark.asyncio
+async def test_create_reader_experience_block_explain_stream_should_disable_thinking_when_supported():
+    calls: list[dict[str, object]] = []
+    sentinel = object()
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(dict(kwargs))
+            return sentinel
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    stream = await literature_api._create_reader_experience_block_explain_stream(
+        client=fake_client,
+        request_kwargs={"model": "qwen3.5-plus", "messages": [], "stream": True},
+    )
+
+    assert stream is sentinel
+    assert len(calls) == 1
+    assert calls[0]["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.asyncio
+async def test_create_reader_experience_block_explain_stream_should_fallback_when_disable_thinking_unsupported():
+    calls: list[dict[str, object]] = []
+    sentinel = object()
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                raise Exception("invalid_request_error: enable_thinking is not supported")
+            return sentinel
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+
+    stream = await literature_api._create_reader_experience_block_explain_stream(
+        client=fake_client,
+        request_kwargs={"model": "qwen3.5-plus", "messages": [], "stream": True},
+    )
+
+    assert stream is sentinel
+    assert len(calls) == 2
+    assert calls[0]["extra_body"] == {"enable_thinking": False}
+    assert "extra_body" not in calls[1]
+
+
 def test_page_artifact_v2_compact_source_context_should_split_long_current_page_excerpt_candidates():
     dossier = _build_sample_reading_dossier_v2_for_session()
     long_text = (
@@ -6365,6 +6533,57 @@ async def test_run_reader_experience_v2_artifact_drafting_loop_should_support_mu
     assert authored_plan["external_resources"]
 
 
+@pytest.mark.asyncio
+async def test_execute_experience_v2_artifact_resource_requests_should_treat_empty_kb_result_as_nonfatal(monkeypatch):
+    paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
+    seed_bundle = {
+        "bundle_entries": [],
+        "external_resources": [],
+        "meta": {"retrieval_rounds": 0},
+    }
+
+    class _FakeRegistry:
+        async def execute(self, tool_name: str, **_kwargs):
+            assert tool_name == "knowledge_search"
+            return literature_api.ToolResult(
+                success=False,
+                output="在当前论文范围内未检索到可用片段。",
+                data={"results": [], "total": 0},
+                error="no_results",
+            )
+
+    async def _fake_build_registry(**_kwargs):
+        return _FakeRegistry(), {"knowledge_search", "paper_read", "web_search", "web_scrape"}
+
+    monkeypatch.setattr(literature_api, "_build_generative_reader_agent_tool_registry_for_paper", _fake_build_registry)
+
+    merged_bundle, tool_trace = await literature_api._execute_experience_v2_artifact_resource_requests(
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+        paper=paper,
+        selected_kb_id=84,
+        requests=[
+            {
+                "request_id": "req-kb-1",
+                "tool_name": "knowledge_search",
+                "query": "洞察密度 DOI",
+                "reason": "Need kb context",
+                "max_results": 3,
+            }
+        ],
+        resource_bundle=seed_bundle,
+    )
+
+    assert merged_bundle["meta"]["retrieval_rounds"] == 1
+    assert merged_bundle["bundle_entries"] == []
+    assert merged_bundle["external_resources"] == []
+    feedback = merged_bundle["meta"]["nonfatal_request_feedback"]
+    assert feedback[0]["tool_name"] == "knowledge_search"
+    assert feedback[0]["status"] == "no_results"
+    assert tool_trace[0]["tool_name"] == "knowledge_search"
+    assert tool_trace[0]["meta"]["nonfatal_empty_result"] is True
+
+
 def test_page_artifact_v2_authored_plan_should_keep_neighboring_continuity_latent():
     dossier = _build_sample_reading_dossier_v2_for_session()
     cache_key = literature_api._experience_session_v2_cache_key(
@@ -6603,7 +6822,19 @@ def test_page_artifact_v2_authored_plan_should_preserve_reader_opening_and_adjac
 
     assert authored_plan["meta"]["reader_opening"]["key_points"][0].startswith("本页先用 Fig 3")
     assert authored_plan["meta"]["reader_opening"]["previous_page_bridge"]["page"] == 6
+    assert authored_plan["meta"]["reader_opening"]["previous_page_preview"]["page"] == 6
+    assert authored_plan["meta"]["reader_opening"]["previous_page_preview"]["summary"] == "Previous page sets up the figure comparison."
+    assert any(
+        "Figure 焦点：Figure 2" in item
+        for item in authored_plan["meta"]["reader_opening"]["previous_page_preview"]["key_points"]
+    )
     assert authored_plan["meta"]["reader_outro"]["next_page_bridge"]["page"] == 8
+    assert authored_plan["meta"]["reader_outro"]["next_page_preview"]["page"] == 8
+    assert authored_plan["meta"]["reader_outro"]["next_page_preview"]["summary"] == "Next page expands the score table."
+    assert any(
+        "Table 焦点：Table 2" in item
+        for item in authored_plan["meta"]["reader_outro"]["next_page_preview"]["key_points"]
+    )
 
 
 def test_page_artifact_v2_should_follow_promoted_draft_node_sequence_order():

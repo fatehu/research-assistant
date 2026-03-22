@@ -1,7 +1,11 @@
-import { useMemo } from 'react'
-import { Alert, Collapse, Divider, Image, Layout, Space, Tag, Typography } from 'antd'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Alert, Button, Collapse, Divider, Image, Input, Layout, Space, Tag, Typography } from 'antd'
 import { ProCard } from '@ant-design/pro-components'
+import { Link } from 'react-router-dom'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
+import { literatureApi } from '@/services/api'
 import type { PageArtifactV2, PageArtifactV2ReadingBlock, PageArtifactV2SegmentKind } from '@/services/api'
 
 import PageArtifactV2ReaderOpening from './PageArtifactV2ReaderOpening'
@@ -13,6 +17,12 @@ const { Content, Sider } = Layout
 type PageArtifactV2RendererProps = {
   artifact: PageArtifactV2
   mode?: 'reader' | 'workbench'
+  navigation?: {
+    paperId: number
+    readerProfile?: string
+    selectedKbId?: number
+    userIntent?: string
+  }
 }
 
 type MediaBinding = {
@@ -35,6 +45,90 @@ type ReaderBridge = {
   keyPoints: string[]
   bridgeText: string
 }
+
+type ReaderNeighborPreview = {
+  page: number
+  summary: string
+  keyPoints: string[]
+}
+
+type ReaderActionChip = {
+  key: string
+  label: string
+  href?: string
+  kind: 'anchor' | 'preview'
+  tone: 'focus' | 'navigate'
+  previewKey?: 'previous' | 'next'
+  previewKicker?: string
+  previewSummary?: string
+  previewPoints?: string[]
+}
+
+type ReaderBlockAskChip = {
+  key: string
+  label: string
+  title: string
+  question: string
+  displayQuestion: string
+  placeholder: string
+  targetSegmentId: string
+  explainKind: 'simplify' | 'figure'
+  sourceExcerpt?: string
+  sourceTranslationZh?: string
+  explanationText?: string
+  figureLabel?: string
+  figureCaption?: string
+  figureText?: string
+  figureImageUrl?: string
+}
+
+type ReaderPreviewCue = {
+  key: string
+  label: string
+  tone: 'visual' | 'structure' | 'continuity'
+}
+
+type ReaderAskMessage = {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+}
+
+type ReaderAskThreadState = {
+  messages: ReaderAskMessage[]
+  draft: string
+  seeded: boolean
+}
+
+const MAX_BLOCK_EXPLAIN_HISTORY_MESSAGES = 12
+const READER_BLOCK_EXPLAIN_LOADING_HINTS = {
+  simplify: [
+    '正在解构长句结构…',
+    '正在换成更贴近日常的说法…',
+    '正在重组这一段的关键意思…',
+  ],
+  figure: [
+    '正在提取图例与标签…',
+    '正在对齐主要对比关系…',
+    '正在整理图证与本页结论的对应…',
+  ],
+} as const
+const READER_BLOCK_EXPLAIN_STREAMING_HINTS = {
+  simplify: '正在把这段重新讲清楚…',
+  figure: '正在把图里的证据串起来…',
+} as const
+const READER_BLOCK_EXPLAIN_CONTEXT_NOTES = {
+  simplify: '只基于当前原文摘录、当前 AI 解读和本地追问历史。',
+  figure: '只基于当前图块文本、真实图片 asset 和本地追问历史。',
+} as const
+const READER_BLOCK_EXPLAIN_LOADING_CUES = {
+  simplify: ['拆句', '换说法', '保重点'],
+  figure: ['锁定图例', '比较走势', '回扣结论'],
+} as const
+const READER_BLOCK_EXPLAIN_SKELETON_WIDTHS = {
+  simplify: ['42%', '78%', '64%', '51%'],
+  figure: ['30%', '84%', '58%', '69%'],
+} as const
 
 const SUPPORT_SEGMENT_KINDS = new Set<PageArtifactV2SegmentKind>([
   'term_annotation',
@@ -80,6 +174,35 @@ function trimTrailingSentencePunctuation(raw: string): string {
 
 function trimLeadingSentencePunctuation(raw: string): string {
   return String(raw || '').trim().replace(/^[。.!！?？:：;；、，,\s]+/g, '')
+}
+
+function normalizeAskMarkdown(raw: string): string {
+  return String(raw || '').replace(/\r\n/g, '\n').trim()
+}
+
+function renderAskAssistantMarkdown(content: string, explainKind: 'simplify' | 'figure') {
+  const normalized = normalizeAskMarkdown(content)
+  return (
+    <div
+      className={[
+        'page-artifact-v2__block-query-markdown',
+        `page-artifact-v2__block-query-markdown--${explainKind}`,
+      ].join(' ')}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {normalized}
+      </ReactMarkdown>
+    </div>
+  )
 }
 
 function getMetaToken(block: PageArtifactV2ReadingBlock, key: string): string {
@@ -189,6 +312,20 @@ function getReaderBridge(raw: unknown): ReaderBridge | null {
   }
 }
 
+function getReaderNeighborPreview(raw: unknown): ReaderNeighborPreview | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  const page = Number(record.page || 0)
+  const summary = compactText(String(record.summary || '').trim(), 240)
+  const keyPoints = getStringList(record.key_points, 4, 150)
+  if (!page && !summary && !keyPoints.length) return null
+  return {
+    page: Number.isFinite(page) ? page : 0,
+    summary,
+    keyPoints,
+  }
+}
+
 function buildReaderBridgeSummary(bridge: ReaderBridge | null, mode: 'previous' | 'next'): string {
   if (!bridge) return ''
   const prefix = bridge.page > 0
@@ -199,6 +336,52 @@ function buildReaderBridgeSummary(bridge: ReaderBridge | null, mode: 'previous' 
   if (bridgeText) return `${trimTrailingSentencePunctuation(prefix)}：${trimLeadingSentencePunctuation(bridgeText)}`
   if (lead) return `${trimTrailingSentencePunctuation(prefix)}：${trimLeadingSentencePunctuation(lead)}`
   return prefix
+}
+
+function splitReaderPreviewPoints(points: string[]): { cues: ReaderPreviewCue[]; notes: string[] } {
+  const cues: ReaderPreviewCue[] = []
+  const notes: string[] = []
+
+  for (const raw of points) {
+    const item = String(raw || '').trim()
+    if (!item) continue
+
+    const cueSpecs: Array<[prefix: string, tone: ReaderPreviewCue['tone']]> = [
+      ['Figure 焦点：', 'visual'],
+      ['Table 焦点：', 'visual'],
+      ['Equation 焦点：', 'visual'],
+      ['图注线索：', 'visual'],
+      ['章节落点：', 'structure'],
+    ]
+
+    const matched = cueSpecs.find(([prefix]) => item.startsWith(prefix))
+    if (matched) {
+      const [prefix, tone] = matched
+      const label = item.slice(prefix.length).trim() || item
+      cues.push({
+        key: `${tone}:${label}`,
+        label,
+        tone,
+      })
+      continue
+    }
+
+    if (item.includes('继续') || item.includes('承接') || item.includes('延伸') || item.includes('过渡')) {
+      cues.push({
+        key: `continuity:${item}`,
+        label: item,
+        tone: 'continuity',
+      })
+      continue
+    }
+
+    notes.push(item)
+  }
+
+  return {
+    cues: cues.slice(0, 3),
+    notes: notes.slice(0, 3),
+  }
 }
 
 function getMediaBinding(block: PageArtifactV2ReadingBlock): MediaBinding | null {
@@ -221,6 +404,82 @@ function getResourceHost(rawUrl: string): string {
   } catch {
     return rawUrl
   }
+}
+
+function buildReaderBlockAnchorId(segmentId: string): string {
+  return `reader-block-${segmentId}`
+}
+
+function buildExperienceV2PageHref(
+  navigation: NonNullable<PageArtifactV2RendererProps['navigation']>,
+  page: number,
+  options?: { cacheOnly?: boolean },
+): string {
+  const params = new URLSearchParams()
+  params.set('page', String(page))
+  if (navigation.readerProfile) params.set('reader', navigation.readerProfile)
+  if ((navigation.selectedKbId || 0) > 0) params.set('kb', String(navigation.selectedKbId))
+  if (navigation.userIntent) params.set('intent', navigation.userIntent)
+  if (options?.cacheOnly) params.set('cache_only', '1')
+  return `/literature/${navigation.paperId}/experience-v2?${params.toString()}`
+}
+
+function getReaderMediaChipLabel(block: PageArtifactV2ReadingBlock | undefined): string {
+  if (!block) return '只看图证'
+  const label = String(block.meta?.label || block.text || '').trim()
+  if (!label) return '只看图证'
+  if (/^(fig(?:ure)?\s*\d+[a-z]?|图\s*\d+)/i.test(label)) {
+    return `只看 ${compactText(label, 18)}`
+  }
+  return '只看图证'
+}
+
+function getReaderSupportChipLabel(block: PageArtifactV2ReadingBlock | undefined): string {
+  if (!block) return '查看页边补充'
+  const title = compactText(getReaderSupportTitle(block), 14)
+  if (!title || title === '页边提示' || title === '补充说明' || title === '衔接提示') {
+    return '查看页边补充'
+  }
+  return `查看${title}`
+}
+
+function buildReaderAskDisplayQuestion(kind: 'simplify' | 'figure', mediaBlock?: PageArtifactV2ReadingBlock): string {
+  if (kind === 'simplify') return '请把这一段讲得更通俗一点'
+  if (kind === 'figure') {
+    const mediaLabel = String(mediaBlock?.meta?.label || mediaBlock?.text || '').trim()
+    return mediaLabel ? `请只解释 ${mediaLabel}` : '请只解释这张图'
+  }
+  return ''
+}
+
+function buildReaderAskTitle(kind: 'simplify' | 'figure', mediaBlock?: PageArtifactV2ReadingBlock): string {
+  if (kind === 'simplify') return '更通俗地解释这一段'
+  if (kind === 'figure') {
+    const mediaLabel = String(mediaBlock?.meta?.label || mediaBlock?.text || '').trim()
+    return mediaLabel ? `只解释 ${mediaLabel}` : '只解释这张图'
+  }
+  return ''
+}
+
+function getInitialAskThreadState(): ReaderAskThreadState {
+  return {
+    messages: [],
+    draft: '',
+    seeded: false,
+  }
+}
+
+function getBlockExplainLoadingHint(kind: 'simplify' | 'figure', index: number): string {
+  const hints = READER_BLOCK_EXPLAIN_LOADING_HINTS[kind]
+  return hints[index % hints.length]
+}
+
+function getBlockExplainStreamingHint(kind: 'simplify' | 'figure'): string {
+  return READER_BLOCK_EXPLAIN_STREAMING_HINTS[kind]
+}
+
+function getBlockExplainContextNote(kind: 'simplify' | 'figure'): string {
+  return READER_BLOCK_EXPLAIN_CONTEXT_NOTES[kind]
 }
 
 function renderMediaVisual(block: PageArtifactV2ReadingBlock) {
@@ -289,7 +548,8 @@ function renderSupportCard(
 
   if (block.segment_kind === 'term_annotation') {
     return (
-      <ProCard key={block.segment_id} className={cardClassName} bodyStyle={{ padding: 16 }}>
+      <div key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className="page-artifact-v2__anchor-target">
+      <ProCard className={cardClassName} bodyStyle={{ padding: 16 }}>
         {mode === 'workbench' ? (
           <div className="page-artifact-v2__block-eyebrow">
             <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--term" />
@@ -301,13 +561,15 @@ function renderSupportCard(
         </Title>
         <Paragraph className="page-artifact-v2__support-note">{getReaderSupportCopy(block) || block.text}</Paragraph>
       </ProCard>
+      </div>
     )
   }
 
   if (block.segment_kind === 'external_resource') {
     const url = String(meta.url || '').trim()
     return (
-      <ProCard key={block.segment_id} className={cardClassName} bodyStyle={{ padding: 16 }}>
+      <div key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className="page-artifact-v2__anchor-target">
+      <ProCard className={cardClassName} bodyStyle={{ padding: 16 }}>
         {mode === 'workbench' ? (
           <div className="page-artifact-v2__block-eyebrow">
             <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--resource" />
@@ -328,11 +590,13 @@ function renderSupportCard(
           <Alert type="error" showIcon message="external resource binding unresolved" />
         )}
       </ProCard>
+      </div>
     )
   }
 
   return (
-    <ProCard key={block.segment_id} className={cardClassName} bodyStyle={{ padding: 16 }}>
+    <div key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className="page-artifact-v2__anchor-target">
+    <ProCard className={cardClassName} bodyStyle={{ padding: 16 }}>
       {mode === 'workbench' ? (
         <div className="page-artifact-v2__block-eyebrow">
           <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--support" />
@@ -346,6 +610,7 @@ function renderSupportCard(
         <Paragraph className="page-artifact-v2__support-note">{getReaderSupportCopy(block)}</Paragraph>
       ) : null}
     </ProCard>
+    </div>
   )
 }
 
@@ -385,7 +650,7 @@ function renderMainBlock(
     || block.segment_kind === 'equation_slot'
   ) {
     return (
-      <section key={block.segment_id} className={`page-artifact-v2__media ${blockClassName}`}>
+      <section key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className={`page-artifact-v2__media ${blockClassName} page-artifact-v2__anchor-target`}>
         <div className="page-artifact-v2__media-frame">
           <div className="page-artifact-v2__block-eyebrow">
             <span className={`page-artifact-v2__block-dot page-artifact-v2__block-dot--${block.segment_kind.includes('equation') ? 'media' : 'figure'}`} />
@@ -408,7 +673,13 @@ function renderMainBlock(
   if (block.segment_kind === 'original_excerpt') {
     const translationZh = getExcerptTranslation(block)
     return (
-      <section key={block.segment_id} className={`${blockClassName} page-artifact-v2__excerpt`}>
+      <section key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className={`${blockClassName} page-artifact-v2__excerpt page-artifact-v2__anchor-target`}>
+        {mode === 'reader' ? (
+          <div className="page-artifact-v2__source-strip">
+            <span className="page-artifact-v2__source-pill">SOURCE</span>
+            <span className="page-artifact-v2__source-note">原文摘录</span>
+          </div>
+        ) : null}
         {mode === 'workbench' ? (
           <div className="page-artifact-v2__block-eyebrow">
             <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--excerpt" />
@@ -448,7 +719,7 @@ function renderMainBlock(
 
   if (block.segment_kind === 'heading') {
     return (
-      <section key={block.segment_id} className={`${blockClassName} page-artifact-v2__heading-block`}>
+      <section key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className={`${blockClassName} page-artifact-v2__heading-block page-artifact-v2__anchor-target`}>
         {mode === 'workbench' ? (
           <div className="page-artifact-v2__block-eyebrow">
             <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--support" />
@@ -460,9 +731,15 @@ function renderMainBlock(
     )
   }
 
-  if (block.segment_kind === 'paragraph') {
+  if (block.segment_kind === 'paragraph' || block.segment_kind === 'authored_explanation') {
     return (
-      <section key={block.segment_id} className={blockClassName}>
+      <section key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className={`${blockClassName} page-artifact-v2__paragraph page-artifact-v2__anchor-target`}>
+        {mode === 'reader' ? (
+          <div className="page-artifact-v2__teaching-cue">
+            <span className="page-artifact-v2__teaching-badge">AI</span>
+            <span className="page-artifact-v2__teaching-label">讲读拆解</span>
+          </div>
+        ) : null}
         {mode === 'workbench' ? (
           <div className="page-artifact-v2__block-eyebrow">
             <span className="page-artifact-v2__block-dot" />
@@ -475,7 +752,7 @@ function renderMainBlock(
   }
 
   return (
-    <section key={block.segment_id} className={blockClassName}>
+    <section key={block.segment_id} id={buildReaderBlockAnchorId(block.segment_id)} className={`${blockClassName} page-artifact-v2__anchor-target`}>
       <div className="page-artifact-v2__block-eyebrow">
         <span className="page-artifact-v2__block-dot" />
         <span className="page-artifact-v2__block-label">讲解推进</span>
@@ -494,6 +771,14 @@ function renderMainBlock(
 export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProps) {
   const mode = props.mode || 'reader'
   const artifact = props.artifact
+  const [activePreviewKey, setActivePreviewKey] = useState<'previous' | 'next' | null>(null)
+  const [activeAskKey, setActiveAskKey] = useState<string | null>(null)
+  const [askThreads, setAskThreads] = useState<Record<string, ReaderAskThreadState>>({})
+  const [askLoadingKey, setAskLoadingKey] = useState<string | null>(null)
+  const [askStreamingAnswer, setAskStreamingAnswer] = useState('')
+  const [askError, setAskError] = useState('')
+  const [askLoadingHintIndex, setAskLoadingHintIndex] = useState(0)
+  const askAbortRef = useRef<AbortController | null>(null)
   const spineMeta = (artifact.current_page_spine?.meta || {}) as Record<string, unknown>
   const excerptCoverageMeta = (spineMeta.excerpt_coverage || {}) as Record<string, unknown>
   const artifactMeta = (artifact.meta || {}) as Record<string, unknown>
@@ -552,6 +837,21 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
       currentGroup.blocks.push(block)
     }
 
+    const localExcerptBySegmentId: Record<string, PageArtifactV2ReadingBlock | null> = {}
+    for (const group of mainBlockGroups) {
+      const groupFirstExcerpt = group.blocks.find((item) => item.segment_kind === 'original_excerpt') || null
+      let lastExcerpt: PageArtifactV2ReadingBlock | null = null
+      for (const block of group.blocks) {
+        if (block.segment_kind === 'original_excerpt') {
+          lastExcerpt = block
+          continue
+        }
+        if (block.segment_kind === 'paragraph' || block.segment_kind === 'authored_explanation') {
+          localExcerptBySegmentId[block.segment_id] = lastExcerpt || groupFirstExcerpt
+        }
+      }
+    }
+
     return {
       flowBlocks,
       mainBlockGroups,
@@ -567,9 +867,26 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
       firstExplanation,
       firstExcerpt,
       mainSegmentIds,
+      localExcerptBySegmentId,
       useSideRail,
     }
   }, [artifact])
+
+  useEffect(() => () => {
+    askAbortRef.current?.abort()
+  }, [])
+
+  useEffect(() => {
+    if (!askLoadingKey) {
+      setAskLoadingHintIndex(0)
+      return
+    }
+    setAskLoadingHintIndex(0)
+    const timerId = window.setInterval(() => {
+      setAskLoadingHintIndex((current) => current + 1)
+    }, 1500)
+    return () => window.clearInterval(timerId)
+  }, [askLoadingKey])
 
   const heroTitle =
     cleanLeadCopy(derived.firstHeading?.text || '')
@@ -579,6 +896,8 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
   const readerOpeningPoints = getStringList(readerOpeningMeta.key_points, 4, 180)
   const previousPageBridge = getReaderBridge(readerOpeningMeta.previous_page_bridge)
   const nextPageBridge = getReaderBridge(readerOutroMeta.next_page_bridge)
+  const previousPagePreview = getReaderNeighborPreview(readerOpeningMeta.previous_page_preview)
+  const nextPagePreview = getReaderNeighborPreview(readerOutroMeta.next_page_preview)
   const heroContext = buildReaderBridgeSummary(previousPageBridge, 'previous')
   const previousBridgeLabel = previousPageBridge?.page
     ? `承接第 ${previousPageBridge.page} 页`
@@ -616,6 +935,460 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     useGuidedFlow ? 'page-artifact-v2--guided-flow' : '',
       ].join(' ')
   const heroEyebrow = mode === 'workbench' ? 'Artifact Snapshot' : ''
+  const readerActionChips = useMemo(() => {
+    if (mode !== 'reader') return [] as ReaderActionChip[]
+
+    const chips: ReaderActionChip[] = []
+    const seen = new Set<string>()
+    const pushChip = (chip: ReaderActionChip | null) => {
+      if (!chip) return
+      const dedupeKey = chip.href || chip.key
+      if (seen.has(dedupeKey)) return
+      seen.add(dedupeKey)
+      chips.push(chip)
+    }
+
+    pushChip({
+      key: 'opening',
+      label: '回到本页要点',
+      href: '#reader-opening',
+      kind: 'anchor',
+      tone: 'focus',
+    })
+
+    if (derived.firstExplanation) {
+      pushChip({
+        key: 'teaching',
+        label: '进入讲读正文',
+        href: `#${buildReaderBlockAnchorId(derived.firstExplanation.segment_id)}`,
+        kind: 'anchor',
+        tone: 'focus',
+      })
+    }
+
+    if (derived.mediaBlocks[0]) {
+      pushChip({
+        key: 'media',
+        label: getReaderMediaChipLabel(derived.mediaBlocks[0]),
+        href: `#${buildReaderBlockAnchorId(derived.mediaBlocks[0].segment_id)}`,
+        kind: 'anchor',
+        tone: 'focus',
+      })
+    }
+
+    if (derived.firstExcerpt) {
+      pushChip({
+        key: 'excerpt',
+        label: '查看关键原文',
+        href: `#${buildReaderBlockAnchorId(derived.firstExcerpt.segment_id)}`,
+        kind: 'anchor',
+        tone: 'focus',
+      })
+    }
+
+    if (derived.railBlocks[0] || derived.supportBlocks[0]) {
+      const supportBlock = derived.railBlocks[0] || derived.supportBlocks[0]
+      pushChip({
+        key: 'support',
+        label: getReaderSupportChipLabel(supportBlock),
+        href: `#${buildReaderBlockAnchorId(supportBlock.segment_id)}`,
+        kind: 'anchor',
+        tone: 'focus',
+      })
+    }
+
+    const previousTargetPage = previousPagePreview?.page || previousPageBridge?.page || 0
+    if (props.navigation && previousTargetPage) {
+      pushChip({
+        key: 'previous-page',
+        label: `回看第 ${previousTargetPage} 页`,
+        previewKey: 'previous',
+        previewKicker: previousTargetPage ? `第 ${previousTargetPage} 页页面快照` : '上一页页面快照',
+        previewSummary: previousPagePreview?.summary || buildReaderBridgeSummary(previousPageBridge, 'previous'),
+        previewPoints: previousPagePreview?.keyPoints?.length ? previousPagePreview.keyPoints : previousPageBridge?.keyPoints,
+        href: buildExperienceV2PageHref(props.navigation, previousTargetPage, { cacheOnly: true }),
+        kind: 'preview',
+        tone: 'navigate',
+      })
+    }
+
+    const nextTargetPage = nextPagePreview?.page || nextPageBridge?.page || 0
+    if (props.navigation && nextTargetPage) {
+      pushChip({
+        key: 'next-page',
+        label: `预看第 ${nextTargetPage} 页`,
+        previewKey: 'next',
+        previewKicker: nextTargetPage ? `第 ${nextTargetPage} 页页面快照` : '下一页页面快照',
+        previewSummary: nextPagePreview?.summary || outroSummary,
+        previewPoints: nextPagePreview?.keyPoints?.length ? nextPagePreview.keyPoints : nextPageBridge?.keyPoints,
+        href: buildExperienceV2PageHref(props.navigation, nextTargetPage, { cacheOnly: true }),
+        kind: 'preview',
+        tone: 'navigate',
+      })
+    }
+
+    return chips.slice(0, 10)
+  }, [derived.firstExcerpt, derived.firstExplanation, derived.mediaBlocks, derived.railBlocks, derived.supportBlocks, mode, nextPageBridge, nextPagePreview, outroSummary, previousPageBridge, previousPagePreview, props.navigation])
+  const activePreviewChip = useMemo(
+    () => readerActionChips.find((chip) => chip.kind === 'preview' && chip.previewKey === activePreviewKey) || null,
+    [activePreviewKey, readerActionChips],
+  )
+  const activePreviewContent = useMemo(
+    () => splitReaderPreviewPoints(activePreviewChip?.previewPoints || []),
+    [activePreviewChip],
+  )
+  const activeAskThread = activeAskKey ? (askThreads[activeAskKey] || getInitialAskThreadState()) : null
+  const canUseAskActions = mode === 'reader' && Number(props.navigation?.paperId || 0) > 0
+
+  const getBlockAskChip = (block: PageArtifactV2ReadingBlock): ReaderBlockAskChip | null => {
+    if (!canUseAskActions) return null
+
+    if (block.segment_kind === 'paragraph' || block.segment_kind === 'authored_explanation') {
+      const excerptBlock = derived.localExcerptBySegmentId[block.segment_id] || null
+      return {
+        key: `ask-simplify-${block.segment_id}`,
+        label: '更通俗地解释',
+        title: '更通俗地解释这一段',
+        question: buildReaderAskDisplayQuestion('simplify', block),
+        displayQuestion: '请把这一段讲得更通俗一点',
+        placeholder: '继续追问这段里哪里还不够通俗…',
+        targetSegmentId: block.segment_id,
+        explainKind: 'simplify',
+        sourceExcerpt: excerptBlock?.text || '',
+        sourceTranslationZh: excerptBlock ? getExcerptTranslation(excerptBlock) : '',
+        explanationText: String(block.text || '').trim(),
+      }
+    }
+
+    if (
+      block.segment_kind === 'figure_slot'
+      || block.segment_kind === 'media_slot'
+      || block.segment_kind === 'table_slot'
+      || block.segment_kind === 'equation_slot'
+    ) {
+      const mediaBinding = getMediaBinding(block)
+      return {
+        key: `ask-figure-${block.segment_id}`,
+        label: block.segment_kind === 'table_slot' ? '只解释这个表' : '只解释这张图',
+        title: buildReaderAskTitle('figure', block),
+        question: buildReaderAskDisplayQuestion('figure', block),
+        displayQuestion: buildReaderAskDisplayQuestion('figure', block),
+        placeholder: '继续追问这个图表里某个细节…',
+        targetSegmentId: block.segment_id,
+        explainKind: 'figure',
+        figureLabel: String(block.meta?.label || block.text || '').trim(),
+        figureCaption: String(block.meta?.caption || block.meta?.description || '').trim(),
+        figureText: String(block.text || '').trim(),
+        figureImageUrl: String(mediaBinding?.page_asset_ref || mediaBinding?.page_image_url || '').trim(),
+      }
+    }
+
+    return null
+  }
+
+  const updateAskThread = (chipKey: string, updater: (prev: ReaderAskThreadState) => ReaderAskThreadState) => {
+    setAskThreads((prev) => {
+      const current = prev[chipKey] || getInitialAskThreadState()
+      return {
+        ...prev,
+        [chipKey]: updater(current),
+      }
+    })
+  }
+
+  const allReaderBlocks = useMemo(
+    () => derived.mainBlockGroups.flatMap((group) => group.blocks).concat(derived.railBlocks),
+    [derived.mainBlockGroups, derived.railBlocks],
+  )
+  const activeAskChip = activeAskKey
+    ? allReaderBlocks
+      .map((block) => getBlockAskChip(block))
+      .find((chip) => chip?.key === activeAskKey) || null
+    : null
+  const isFigureFocusMode = Boolean(
+    activeAskChip
+    && activeAskKey === activeAskChip.key
+    && activeAskChip.explainKind === 'figure',
+  )
+
+  const runAskChip = async (
+    chip: ReaderBlockAskChip,
+    question: string,
+    displayQuestion: string,
+  ) => {
+    const paperId = Number(props.navigation?.paperId || 0)
+    if (!chip.question || paperId <= 0) {
+      setAskError('当前页面尚未就绪，暂时无法发起局部讲解。')
+      return
+    }
+    if (chip.explainKind === 'figure' && !String(chip.figureImageUrl || '').trim()) {
+      setAskError('当前图块没有可用图片 asset，无法只解释这张图。')
+      return
+    }
+
+    const previousMessages = [...(askThreads[chip.key]?.messages || [])]
+    const outboundHistory = previousMessages.slice(-MAX_BLOCK_EXPLAIN_HISTORY_MESSAGES)
+    askAbortRef.current?.abort()
+    const controller = new AbortController()
+    askAbortRef.current = controller
+    setAskError('')
+    setAskStreamingAnswer('')
+    setAskLoadingKey(chip.key)
+
+    updateAskThread(chip.key, (prev) => ({
+      ...prev,
+      seeded: true,
+      draft: '',
+      messages: [
+        ...prev.messages,
+        {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: displayQuestion,
+        },
+      ],
+    }))
+
+    let aggregatedAnswer = ''
+
+    try {
+      const figureImageUrl = chip.explainKind === 'figure'
+        ? (chip.figureImageUrl || undefined)
+        : undefined
+      await literatureApi.explainExperienceBlockStream(
+        paperId,
+        {
+          page: Number(artifact.focus_page || 1),
+          block_id: chip.targetSegmentId,
+          explain_kind: chip.explainKind,
+          question,
+          source_excerpt: chip.sourceExcerpt || undefined,
+          source_translation_zh: chip.sourceTranslationZh || undefined,
+          explanation_text: chip.explanationText || undefined,
+          figure_label: chip.figureLabel || undefined,
+          figure_caption: chip.figureCaption || undefined,
+          figure_text: chip.figureText || undefined,
+          figure_image_url: figureImageUrl,
+          history: outboundHistory.map((item) => ({
+            role: item.role,
+            content: item.content,
+          })),
+        },
+        (event, data) => {
+          if (event === 'token') {
+            aggregatedAnswer += String(data?.text || '')
+            setAskStreamingAnswer(aggregatedAnswer)
+            return
+          }
+          if (event === 'done') {
+            const answer = aggregatedAnswer.trim() || String((data as { answer?: string })?.answer || '').trim() || '暂无回答，请稍后重试。'
+            updateAskThread(chip.key, (prev) => ({
+              ...prev,
+              messages: [
+                ...prev.messages,
+                {
+                  id: `assistant-${Date.now()}`,
+                  role: 'assistant',
+                  content: answer,
+                },
+              ],
+            }))
+            setAskStreamingAnswer('')
+            setAskLoadingKey((current) => (current === chip.key ? null : current))
+            return
+          }
+          if (event === 'error') {
+            const msg = String(data?.message || '局部讲解失败')
+            setAskError(msg)
+            setAskStreamingAnswer('')
+            setAskLoadingKey((current) => (current === chip.key ? null : current))
+          }
+        },
+        controller,
+      )
+    } catch (error: unknown) {
+      if ((error as { name?: string })?.name === 'AbortError') return
+      setAskError(error instanceof Error ? error.message : '局部讲解失败')
+      setAskStreamingAnswer('')
+      setAskLoadingKey((current) => (current === chip.key ? null : current))
+    }
+  }
+
+  const handleAskChipClick = (chip: ReaderBlockAskChip) => {
+    setActivePreviewKey(null)
+    if (activeAskKey === chip.key) {
+      setActiveAskKey(null)
+      return
+    }
+    setActiveAskKey(chip.key)
+    setAskError('')
+    const thread = askThreads[chip.key]
+      if (!thread?.seeded && chip.question) {
+        void runAskChip(chip, chip.question, chip.displayQuestion || chip.label)
+      }
+  }
+
+  const handleAskDraftChange = (chipKey: string, nextValue: string) => {
+    updateAskThread(chipKey, (prev) => ({
+      ...prev,
+      draft: nextValue,
+    }))
+  }
+
+  const handleAskFollowup = () => {
+    if (!activeAskKey || !activeAskThread) return
+    const nextDraft = String(activeAskThread.draft || '').trim()
+    if (!nextDraft || askLoadingKey === activeAskKey) return
+    const followupChip = derived.mainBlockGroups
+      .flatMap((group) => group.blocks)
+      .concat(derived.railBlocks)
+      .map((block) => getBlockAskChip(block))
+      .find((chip) => chip?.key === activeAskKey) || null
+    if (!followupChip) return
+    void runAskChip(followupChip, nextDraft, nextDraft)
+  }
+
+  const renderBlockAskSurface = (chip: ReaderBlockAskChip | null) => {
+    if (!chip) return null
+    const isActive = activeAskKey === chip.key
+    const isLoading = askLoadingKey === chip.key
+    const isStreaming = isLoading && Boolean(askStreamingAnswer)
+    const hasAssistantReply = Boolean(activeAskThread?.messages.some((item) => item.role === 'assistant'))
+    const queryStage = isLoading ? (isStreaming ? 'streaming' : 'loading') : (hasAssistantReply ? 'settled' : 'ready')
+    const loadingHint = getBlockExplainLoadingHint(chip.explainKind, askLoadingHintIndex)
+    const streamingHint = getBlockExplainStreamingHint(chip.explainKind)
+    const contextNote = getBlockExplainContextNote(chip.explainKind)
+    const loadingCues = READER_BLOCK_EXPLAIN_LOADING_CUES[chip.explainKind]
+    const skeletonWidths = READER_BLOCK_EXPLAIN_SKELETON_WIDTHS[chip.explainKind]
+    return (
+      <div
+        className={[
+          'page-artifact-v2__block-actions',
+          `page-artifact-v2__block-actions--${chip.explainKind}`,
+          isActive ? 'page-artifact-v2__block-actions--active' : '',
+        ].filter(Boolean).join(' ')}
+      >
+        <button
+          type="button"
+          aria-pressed={isActive}
+          onClick={() => handleAskChipClick(chip)}
+          className={[
+            'page-artifact-v2__inline-chip',
+            `page-artifact-v2__inline-chip--${chip.explainKind}`,
+            isLoading ? 'page-artifact-v2__inline-chip--busy' : '',
+          ].filter(Boolean).join(' ')}
+        >
+          {chip.label}
+        </button>
+        {isActive ? (
+          <div
+            className={[
+              'page-artifact-v2__block-query',
+              `page-artifact-v2__block-query--${chip.explainKind}`,
+              `page-artifact-v2__block-query--${queryStage}`,
+            ].join(' ')}
+          >
+            <div className="page-artifact-v2__block-query-head">
+              <div className="page-artifact-v2__block-query-kicker">{chip.title}</div>
+              <div className="page-artifact-v2__block-query-status">
+                {isLoading ? (isStreaming ? streamingHint : loadingHint) : contextNote}
+              </div>
+            </div>
+            {askError ? (
+              <Alert type="warning" showIcon message={askError} />
+            ) : null}
+            {activeAskThread?.messages.length ? (
+              <div className="page-artifact-v2__block-query-messages">
+                {activeAskThread.messages.map((messageItem) => (
+                  <div
+                    key={messageItem.id}
+                    className={[
+                      'page-artifact-v2__block-query-message',
+                      `page-artifact-v2__block-query-message--${messageItem.role}`,
+                      messageItem.role === 'assistant' ? `page-artifact-v2__block-query-message--assistant-${chip.explainKind}` : '',
+                    ].filter(Boolean).join(' ')}
+                  >
+                    <div className="page-artifact-v2__block-query-message-role">
+                      {messageItem.role === 'user' ? '你' : '讲读助手'}
+                    </div>
+                    {messageItem.role === 'assistant'
+                      ? renderAskAssistantMarkdown(messageItem.content, chip.explainKind)
+                      : (
+                        <Paragraph className="page-artifact-v2__block-query-message-text">
+                          {messageItem.content}
+                        </Paragraph>
+                      )}
+                  </div>
+                ))}
+                {isLoading ? (
+                  <div
+                    className={[
+                      'page-artifact-v2__block-query-message',
+                      'page-artifact-v2__block-query-message--assistant',
+                      'page-artifact-v2__block-query-message--pending',
+                      `page-artifact-v2__block-query-message--assistant-${chip.explainKind}`,
+                    ].join(' ')}
+                  >
+                    <div className="page-artifact-v2__block-query-message-role">讲读助手</div>
+                    {isStreaming ? (
+                      <Paragraph
+                        className={[
+                          'page-artifact-v2__block-query-message-text',
+                          'page-artifact-v2__block-query-message-text--streaming',
+                          `page-artifact-v2__block-query-message-text--${chip.explainKind}`,
+                        ].join(' ')}
+                      >
+                        {askStreamingAnswer}
+                      </Paragraph>
+                    ) : (
+                      <>
+                        <div className="page-artifact-v2__block-query-phase">{loadingHint}</div>
+                        <div className="page-artifact-v2__block-query-skeleton" aria-hidden="true">
+                          {skeletonWidths.map((width, index) => (
+                            <span
+                              key={`${chip.key}-skeleton-${index}`}
+                              className="page-artifact-v2__block-query-skeleton-line"
+                              style={{ width }}
+                            />
+                          ))}
+                        </div>
+                        <div className="page-artifact-v2__block-query-cues" aria-hidden="true">
+                          {loadingCues.map((cue) => (
+                            <span key={`${chip.key}-${cue}`} className="page-artifact-v2__block-query-cue">
+                              {cue}
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="page-artifact-v2__block-query-composer">
+              <Input.TextArea
+                value={activeAskThread?.draft || ''}
+                onChange={(event) => handleAskDraftChange(chip.key, event.target.value)}
+                autoSize={{ minRows: 2, maxRows: 4 }}
+                placeholder={chip.placeholder}
+                disabled={askLoadingKey === chip.key}
+              />
+              <div className="page-artifact-v2__block-query-actions">
+                <Button
+                  type="primary"
+                  onClick={handleAskFollowup}
+                  loading={askLoadingKey === chip.key}
+                  disabled={!String(activeAskThread?.draft || '').trim()}
+                >
+                  继续追问
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
   return (
     <section className={rootClassName}>
       {mode === 'reader' && !hasHeroRail ? (
@@ -758,11 +1531,27 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
                   })()}
 
                   <div className="page-artifact-v2__section-body">
-                    {group.blocks.map((block) => (
-                      <div key={block.segment_id} className="page-artifact-v2__main-item">
-                        {renderMainBlock(block, derived.mainSegmentIds.has(block.segment_id), mode)}
-                      </div>
-                    ))}
+                    {group.blocks.map((block) => {
+                      const askChip = mode === 'reader' ? getBlockAskChip(block) : null
+                      const isFigureTarget = Boolean(
+                        isFigureFocusMode
+                        && block.segment_id === activeAskChip?.targetSegmentId,
+                      )
+                      return (
+                        <div
+                          key={block.segment_id}
+                          className={[
+                            'page-artifact-v2__main-item',
+                            isFigureFocusMode && !isFigureTarget ? 'page-artifact-v2__main-item--figure-muted' : '',
+                            isFigureTarget ? 'page-artifact-v2__main-item--figure-focus' : '',
+                            isFigureTarget && askLoadingKey === activeAskChip?.key ? 'page-artifact-v2__main-item--figure-scanning' : '',
+                          ].filter(Boolean).join(' ')}
+                        >
+                          {renderMainBlock(block, derived.mainSegmentIds.has(block.segment_id), mode)}
+                          {mode === 'reader' ? renderBlockAskSurface(askChip) : null}
+                        </div>
+                      )
+                    })}
                   </div>
                 </section>
                 {useEditorialFlow && index < derived.mainBlockGroups.length - 1 ? <Divider className="page-artifact-v2__section-divider" /> : null}
@@ -784,31 +1573,110 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
                 </div>
               ) : null}
               <div className="page-artifact-v2__side-stack">
-                {derived.railBlocks.map((block) => renderSupportCard(block, mode, 'rail'))}
+                {derived.railBlocks.map((block) => {
+                  const askChip = mode === 'reader' ? getBlockAskChip(block) : null
+                  return (
+                    <div key={block.segment_id} className="page-artifact-v2__side-item">
+                      {renderSupportCard(block, mode, 'rail')}
+                      {mode === 'reader' ? renderBlockAskSurface(askChip) : null}
+                    </div>
+                  )
+                })}
               </div>
             </ProCard>
           </Sider>
         ) : null}
       </Layout>
 
-      {mode === 'reader' && nextPageBridge ? (
+      {mode === 'reader' && (nextPageBridge || readerActionChips.length) ? (
         <ProCard className="page-artifact-v2__outro" bodyStyle={{ padding: 18 }}>
-          <div className="page-artifact-v2__outro-kicker">
-            {nextPageBridge.page ? `下一页 · 第 ${nextPageBridge.page} 页` : '下一页接续'}
-          </div>
-          {outroSummary ? (
-            <Paragraph className="page-artifact-v2__outro-text">{outroSummary}</Paragraph>
-          ) : null}
-          {nextPageBridge.keyPoints.length ? (
-            <div className="page-artifact-v2__outro-points">
-              {nextPageBridge.keyPoints.map((item) => (
-                <div key={item} className="page-artifact-v2__hero-note">
-                  <span className="page-artifact-v2__hero-note-dot" />
-                  <span>{item}</span>
+          {nextPageBridge ? (
+            <>
+              <div className="page-artifact-v2__outro-kicker">
+                {nextPageBridge.page ? `下一页 · 第 ${nextPageBridge.page} 页` : '下一页接续'}
+              </div>
+              {outroSummary ? (
+                <Paragraph className="page-artifact-v2__outro-text">{outroSummary}</Paragraph>
+              ) : null}
+              {nextPageBridge.keyPoints.length ? (
+                <div className="page-artifact-v2__outro-points">
+                  {nextPageBridge.keyPoints.map((item) => (
+                    <div key={item} className="page-artifact-v2__hero-note">
+                      <span className="page-artifact-v2__hero-note-dot" />
+                      <span>{item}</span>
+                    </div>
+                  ))}
                 </div>
+              ) : null}
+            </>
+          ) : null}
+          {readerActionChips.length ? (
+            <div className="page-artifact-v2__outro-actions">
+              {readerActionChips.map((chip) => (
+                chip.kind === 'preview' ? (
+                  <button
+                    key={chip.key}
+                    type="button"
+                    aria-pressed={activePreviewKey === chip.previewKey}
+                    onClick={() => {
+                      setActiveAskKey(null)
+                      setActivePreviewKey((current) => current === chip.previewKey ? null : (chip.previewKey || null))
+                    }}
+                    className={`page-artifact-v2__action-chip page-artifact-v2__action-chip--${chip.tone}`}
+                  >
+                    {chip.label}
+                  </button>
+                ) : (
+                  <a
+                    key={chip.key}
+                    href={chip.href || '#'}
+                    className={`page-artifact-v2__action-chip page-artifact-v2__action-chip--${chip.tone}`}
+                  >
+                    {chip.label}
+                  </a>
+                )
               ))}
             </div>
           ) : null}
+          {activePreviewChip ? (
+            <div className="page-artifact-v2__outro-preview">
+              <div className="page-artifact-v2__outro-preview-kicker">
+                {activePreviewChip.previewKicker}
+              </div>
+              {activePreviewChip.previewSummary ? (
+                <Paragraph className="page-artifact-v2__outro-preview-text">
+                  {activePreviewChip.previewSummary}
+                </Paragraph>
+              ) : null}
+              {activePreviewContent.cues.length ? (
+                <div className="page-artifact-v2__outro-preview-cues">
+                  {activePreviewContent.cues.map((cue) => (
+                    <span
+                      key={cue.key}
+                      className={`page-artifact-v2__outro-preview-cue page-artifact-v2__outro-preview-cue--${cue.tone}`}
+                    >
+                      {cue.label}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {activePreviewContent.notes.length ? (
+                <div className="page-artifact-v2__outro-preview-points">
+                  {activePreviewContent.notes.map((item) => (
+                    <div key={item} className="page-artifact-v2__hero-note">
+                      <span className="page-artifact-v2__hero-note-dot" />
+                      <span>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {activePreviewChip.href ? (
+                <Link to={activePreviewChip.href} className="page-artifact-v2__outro-preview-link">
+                  打开这一页（只读缓存）
+                </Link>
+              ) : null}
+            </div>
+              ) : null}
         </ProCard>
       ) : null}
 

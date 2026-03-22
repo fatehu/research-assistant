@@ -1,6 +1,7 @@
 """
 文献管理 API 路由
 """
+import base64
 import hashlib
 import json
 import os
@@ -98,6 +99,8 @@ from app.schemas.literature import (
     ReaderComposeReviewSessionRequest,
     ReaderComposeReviewSnapshot,
     ReaderAdjacentPageContext,
+    ReaderExperienceBlockExplainRequest,
+    ReaderExperienceBlockExplainTurn,
     ReaderInlineQueryRequest,
     ReaderNodeActionRequest,
     ReaderNodeActionResponse,
@@ -157,6 +160,9 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 router = APIRouter(prefix="/literature", tags=["literature"])
 _READER_PLAN_CACHE_NAMESPACE_VERSION = "v33"
 _READING_DOSSIER_V2_NAMESPACE = "lit:reading_dossier:v2"
+_READER_FIGURE_ASSET_PATH_RE = re.compile(
+    r"^/api/v1/literature/reader/figure-assets/(?P<paper_id>\d+)/(?P<page>\d+)/(?P<asset_id>[0-9A-Za-z_.-]{1,96})$"
+)
 
 _PAGE_ARTIFACT_V2_SUPPORTED_NODE_KINDS = {
     "heading",
@@ -4719,9 +4725,87 @@ def _compact_reader_bridge_payload(raw_bridge: Any) -> Dict[str, Any]:
     return compact
 
 
-def _build_reader_frame_from_narrative_brief(narrative_brief: Mapping[str, Any]) -> Dict[str, Any]:
+def _build_reader_adjacent_preview_payload(raw_row: Any) -> Dict[str, Any]:
+    row = _jsonable_dict(raw_row or {})
+    if not row:
+        return {}
+
+    page = int(row.get("page") or 0)
+    page_summary = _compact_narrative_brief_text(
+        row.get("page_summary")
+        or row.get("summary")
+        or row.get("body_text")
+        or row.get("raw_text"),
+        max_chars=240,
+    )
+
+    continuation_points = [
+        _clean_reader_facing_excerpt_text(str(item), max_chars=140)
+        for item in list(row.get("continuation_hints") or [])
+        if str(item).strip()
+    ][:2]
+
+    anchor_points: List[str] = []
+    secondary_points: List[str] = []
+    for item in list(row.get("content_stream") or []):
+        payload = _jsonable_dict(item or {})
+        item_type = str(payload.get("type") or "").strip().lower()
+        label = _clean_reader_facing_excerpt_text(str(payload.get("label") or ""), max_chars=80)
+        caption = _clean_reader_facing_excerpt_text(str(payload.get("caption") or ""), max_chars=110)
+        text = _clean_reader_facing_excerpt_text(
+            str(
+                payload.get("text")
+                or payload.get("normalized_text")
+                or payload.get("description")
+                or payload.get("ocr_text")
+                or ""
+            ),
+            max_chars=110,
+        )
+        line = ""
+        if item_type in {"figure", "table", "equation"}:
+            anchor = label or caption or text
+            if anchor:
+                line = f"{item_type.title()} 焦点：{anchor}"
+        elif item_type == "header":
+            anchor = label or text
+            if anchor:
+                line = f"章节落点：{anchor}"
+        elif item_type == "caption":
+            anchor = caption or text
+            if anchor:
+                line = f"图注线索：{anchor}"
+        elif item_type == "paragraph" and text:
+            line = text
+        if not line or line in continuation_points or line in anchor_points or line in secondary_points:
+            continue
+        if item_type in {"figure", "table", "equation", "header", "caption"}:
+            anchor_points.append(line)
+        else:
+            secondary_points.append(line)
+        if len(anchor_points) >= 2 and len(secondary_points) >= 1:
+            break
+
+    key_points = (continuation_points + anchor_points + secondary_points)[:4]
+
+    preview: Dict[str, Any] = {}
+    if page > 0:
+        preview["page"] = page
+    if page_summary:
+        preview["summary"] = page_summary
+    if key_points:
+        preview["key_points"] = key_points
+    return preview
+
+
+def _build_reader_frame_from_narrative_brief(
+    narrative_brief: Mapping[str, Any],
+    *,
+    reading_dossier: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     brief = _jsonable_dict(narrative_brief or {})
     continuity = _jsonable_dict(brief.get("continuity_resolutions") or {})
+    dossier = _jsonable_dict(reading_dossier or {})
     opening_key_points = [
         _clean_reader_facing_excerpt_text(str(item), max_chars=180)
         for item in list(brief.get("opening_key_points") or [])
@@ -4744,6 +4828,17 @@ def _build_reader_frame_from_narrative_brief(narrative_brief: Mapping[str, Any])
         or continuity.get("to_next_page")
         or continuity.get("next_page")
     )
+    adjacent_rows = [
+        _jsonable_dict(item or {})
+        for item in list((_jsonable_dict(dossier.get("adjacent_pages") or {})).get("pages") or [])
+        if isinstance(item, Mapping)
+    ]
+    previous_page_preview = _build_reader_adjacent_preview_payload(
+        next((row for row in adjacent_rows if str(row.get("relation") or "").strip() == "previous_page"), {})
+    )
+    next_page_preview = _build_reader_adjacent_preview_payload(
+        next((row for row in adjacent_rows if str(row.get("relation") or "").strip() == "next_page"), {})
+    )
 
     reader_opening: Dict[str, Any] = {}
     summary = _compact_narrative_brief_text(brief.get("current_page_main_arc"), max_chars=320)
@@ -4753,10 +4848,14 @@ def _build_reader_frame_from_narrative_brief(narrative_brief: Mapping[str, Any])
         reader_opening["key_points"] = opening_key_points
     if previous_page_bridge:
         reader_opening["previous_page_bridge"] = previous_page_bridge
+    if previous_page_preview:
+        reader_opening["previous_page_preview"] = previous_page_preview
 
     reader_outro: Dict[str, Any] = {}
     if next_page_bridge:
         reader_outro["next_page_bridge"] = next_page_bridge
+    if next_page_preview:
+        reader_outro["next_page_preview"] = next_page_preview
 
     return {
         "reader_opening": reader_opening,
@@ -4937,6 +5036,261 @@ def _experience_session_v2_artifact_agent_config() -> Dict[str, Any]:
         "timeout_seconds": timeout_seconds,
         "max_tokens": max_tokens,
     }
+
+
+def _reader_experience_block_explain_system_prompt(explain_kind: str) -> str:
+    normalized_kind = str(explain_kind or "").strip().lower()
+    task_line = (
+        "你要把当前图块讲清楚。"
+        if normalized_kind == "figure"
+        else "你要把当前这段讲读内容讲得更通俗。"
+    )
+    shape_line = (
+        "7) 如果是在解释图表，尽量按三个短小标题分段：第一眼看什么 / 图里发现了什么 / 它支持了本页什么结论；每段 1-3 句，避免一整坨长段落。\n"
+        if normalized_kind == "figure"
+        else "7) 先用一句最直白的话点明核心意思，再用 2-3 小步把难点拆开讲，少堆术语。\n"
+    )
+    return (
+        "你是当前论文页里的讲读助手，只能基于用户提供的当前块局部材料回答。\n"
+        f"{task_line}\n"
+        "硬性要求：\n"
+        "1) 只使用当前块材料；不要检索知识库，不要提知识库、证据不足、检索结果、参考文献列表。\n"
+        "2) 不要扩展到整篇论文，也不要讲到无关页面。\n"
+        "3) 全部用简体中文回答，直接对读者说话。\n"
+        "4) 如果材料有限，也要先基于现有材料尽量解释清楚，再用一句话指出当前块里还看不到什么；不要拒答。\n"
+        "5) 语气像老师带着读，不要输出提示词、JSON、项目符号模板名或系统说明。\n"
+        "6) 如果是 follow-up，请延续前面的讲解，不要从头重复整段。\n"
+        f"{shape_line}"
+    )
+
+
+async def _create_reader_experience_block_explain_stream(
+    *,
+    client: AsyncOpenAI,
+    request_kwargs: Dict[str, Any],
+):
+    try:
+        return await client.chat.completions.create(
+            **request_kwargs,
+            extra_body={"enable_thinking": False},
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        disable_thinking_unsupported = (
+            "enable_thinking" in message
+            or "cannot unmarshal" in message
+            or "invalid_request_error" in message
+        )
+        if not disable_thinking_unsupported:
+            raise
+        return await client.chat.completions.create(**request_kwargs)
+
+
+def _reader_image_media_type(candidate_ext: str) -> str:
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(str(candidate_ext or "").strip().lower(), "application/octet-stream")
+
+
+def _locate_reader_figure_asset_candidate_file(paper_id: int, page: int, asset_id: str) -> tuple[Optional[str], str]:
+    normalized_asset_id = str(asset_id or "").strip()
+    if not normalized_asset_id or not re.fullmatch(r"[0-9A-Za-z_.-]{1,96}", normalized_asset_id):
+        return None, ""
+
+    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+    base_dir = os.path.abspath(
+        os.path.join(upload_dir, "reader_figure_assets", str(int(paper_id)), f"p{int(page)}")
+    )
+    if not os.path.isdir(base_dir):
+        return None, ""
+    for ext in ("jpg", "jpeg", "png", "webp"):
+        path = os.path.abspath(os.path.join(base_dir, f"{normalized_asset_id}.{ext}"))
+        if not path.startswith(base_dir + os.sep):
+            continue
+        if os.path.exists(path):
+            return path, ext
+    return None, ""
+
+
+async def _resolve_reader_figure_asset_candidate_file(
+    *,
+    db: AsyncSession,
+    paper: Paper,
+    page: int,
+    asset_id: str,
+) -> tuple[Optional[str], str]:
+    candidate_path, candidate_ext = _locate_reader_figure_asset_candidate_file(
+        paper_id=int(paper.id),
+        page=int(page),
+        asset_id=asset_id,
+    )
+    if candidate_path:
+        return candidate_path, candidate_ext
+
+    normalized_asset_id = str(asset_id or "").strip()
+    try:
+        cache_stmt = (
+            select(PaperReaderPageCache)
+            .where(
+                and_(
+                    PaperReaderPageCache.paper_id == int(paper.id),
+                    PaperReaderPageCache.page == int(page),
+                    PaperReaderPageCache.source_signature.like("compose_v3|%"),
+                )
+            )
+            .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
+            .limit(1)
+        )
+        cache_row = (await db.execute(cache_stmt)).scalar_one_or_none()
+        payload_json = dict(getattr(cache_row, "payload_json", None) or {}) if cache_row else {}
+        layouts = [
+            row
+            for row in list((payload_json.get("docmind_structure") or {}).get("layouts") or [])
+            if isinstance(row, dict) and str(row.get("type") or "").strip().lower() == "figure"
+        ]
+        pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
+        if layouts and pdf_path and os.path.exists(pdf_path):
+            compose_service = get_literature_reader_compose_service()
+            await asyncio.to_thread(
+                compose_service._build_figure_assets_sync,  # pylint: disable=protected-access
+                int(paper.id),
+                int(page),
+                str(pdf_path),
+                payload_json,
+                layouts,
+            )
+            candidate_path, candidate_ext = _locate_reader_figure_asset_candidate_file(
+                paper_id=int(paper.id),
+                page=int(page),
+                asset_id=normalized_asset_id,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[Literature API] figure asset lazy-build failed "
+            f"paper={paper.id} page={page} asset_id={normalized_asset_id}: {exc}"
+        )
+    return candidate_path, candidate_ext
+
+
+def _encode_local_image_file_as_data_url(path: str, media_type: str) -> str:
+    with open(path, "rb") as handle:
+        encoded = base64.b64encode(handle.read()).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
+
+
+async def _normalize_reader_experience_block_explain_image_url(
+    *,
+    db: AsyncSession,
+    paper: Paper,
+    raw_url: str,
+) -> str:
+    image_url = str(raw_url or "").strip()
+    if not image_url or image_url.startswith("data:image/"):
+        return image_url
+
+    parsed = urlparse(image_url)
+    candidate_path = str(parsed.path or image_url).strip() if parsed.scheme else image_url
+    match = _READER_FIGURE_ASSET_PATH_RE.fullmatch(candidate_path)
+    if not match:
+        return image_url
+
+    target_paper_id = int(match.group("paper_id") or 0)
+    target_page = int(match.group("page") or 0)
+    asset_id = str(match.group("asset_id") or "").strip()
+    if target_paper_id != int(paper.id):
+        raise ValueError("当前图块图片资源与当前论文不匹配，无法发起图解释。")
+    if target_page <= 0 or not asset_id:
+        raise ValueError("当前图块图片资源地址不完整，无法发起图解释。")
+
+    candidate_file, candidate_ext = await _resolve_reader_figure_asset_candidate_file(
+        db=db,
+        paper=paper,
+        page=target_page,
+        asset_id=asset_id,
+    )
+    if not candidate_file or not candidate_ext:
+        raise ValueError("当前图块图片资源不存在或尚未生成，无法只解释这张图。")
+
+    media_type = _reader_image_media_type(candidate_ext)
+    if not media_type.startswith("image/"):
+        raise ValueError(f"当前图块图片类型不可用：{candidate_ext or 'unknown'}")
+    try:
+        return _encode_local_image_file_as_data_url(candidate_file, media_type)
+    except Exception as exc:
+        raise ValueError(f"当前图块图片读取失败：{str(exc).strip() or 'unknown error'}") from exc
+
+
+def _friendly_reader_experience_block_explain_error_message(exc: Exception) -> str:
+    message = str(exc or "").strip() or "局部讲解失败"
+    lowered = message.lower()
+    if "provided url does not appear to be valid" in lowered:
+        return "当前图块图片地址无效，模型无法读取。请刷新当前页后重试。"
+    if "image length and width do not meet the model restrictions" in lowered:
+        return "当前图块图片尺寸不符合模型限制，无法发起图解释。"
+    return message
+
+
+def _build_reader_experience_block_explain_messages(
+    payload: ReaderExperienceBlockExplainRequest,
+) -> List[Dict[str, Any]]:
+    explain_kind = str(payload.explain_kind or "").strip().lower()
+    context_lines: List[str] = [f"当前页：第 {int(payload.page)} 页", f"当前块 ID：{str(payload.block_id).strip()}"]
+    initial_content: Any = ""
+
+    if explain_kind == "figure":
+        figure_label = str(payload.figure_label or "").strip()
+        figure_caption = str(payload.figure_caption or "").strip()
+        figure_text = str(payload.figure_text or "").strip()
+        figure_image_url = str(payload.figure_image_url or "").strip()
+        if figure_label:
+            context_lines.append(f"图块标签：{figure_label}")
+        if figure_caption:
+            context_lines.append(f"图块说明：{figure_caption}")
+        if figure_text and figure_text != figure_caption:
+            context_lines.append(f"图块正文：{figure_text}")
+        text_payload = (
+            "以下是当前图块的固定局部材料。后续回答只允许基于这些材料。\n\n"
+            + "\n".join(context_lines)
+        )
+        if figure_image_url:
+            initial_content = [
+                {"type": "image_url", "image_url": {"url": figure_image_url}},
+                {"type": "text", "text": text_payload},
+            ]
+        else:
+            initial_content = text_payload
+    else:
+        source_excerpt = str(payload.source_excerpt or "").strip()
+        source_translation = str(payload.source_translation_zh or "").strip()
+        explanation_text = str(payload.explanation_text or "").strip()
+        if source_excerpt:
+            context_lines.append(f"原文摘录：{source_excerpt}")
+        if source_translation:
+            context_lines.append(f"原文中文译文：{source_translation}")
+        if explanation_text:
+            context_lines.append(f"当前讲读：{explanation_text}")
+        initial_content = (
+            "以下是当前块的固定局部材料。后续回答只允许基于这些材料。\n\n"
+            + "\n".join(context_lines)
+        )
+
+    messages: List[Dict[str, str]] = [
+        {
+            "role": "user",
+            "content": initial_content,
+        }
+    ]
+    for turn in list(payload.history or [])[-12:]:
+        role = str(getattr(turn, "role", "") or "").strip().lower()
+        content = str(getattr(turn, "content", "") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": str(payload.question or "").strip()})
+    return messages
 
 
 def _build_reader_v2_seed_resource_bundle(
@@ -5466,6 +5820,8 @@ async def _execute_experience_v2_artifact_resource_requests(
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not list(requests or []):
         return _jsonable_dict(resource_bundle), []
+
+    nonfatal_empty_retrieval_errors = {"no_results", "no_completed_documents"}
     registry, allowed_tool_names = await _build_generative_reader_agent_tool_registry_for_paper(
         db=db,
         current_user=current_user,
@@ -5475,6 +5831,8 @@ async def _execute_experience_v2_artifact_resource_requests(
     if registry is None:
         raise ValueError("artifact draft generation blocked by missing retrieval result: tool registry unavailable")
     bundle = _jsonable_dict(resource_bundle)
+    bundle_meta = _jsonable_dict(bundle.get("meta") or {})
+    nonfatal_feedback = list(bundle_meta.get("nonfatal_request_feedback") or [])
     tool_trace: List[Dict[str, Any]] = []
     accumulated_entries: List[Dict[str, Any]] = []
     for round_index, raw_request in enumerate(list(requests or []), start=1):
@@ -5494,6 +5852,35 @@ async def _execute_experience_v2_artifact_resource_requests(
         result = await registry.execute(tool_name, **args)
         latency_ms = int(round((time.perf_counter() - started_at) * 1000))
         if not bool(result.success):
+            normalized_error = str(result.error or "").strip().lower()
+            if tool_name == "knowledge_search" and normalized_error in nonfatal_empty_retrieval_errors:
+                nonfatal_feedback.append(
+                    {
+                        "tool_name": tool_name,
+                        "request_id": str(request.get("request_id") or "").strip(),
+                        "query": str(request.get("query") or "").strip(),
+                        "status": normalized_error or "empty_result",
+                        "message": str(result.output or "knowledge_search returned no usable results").strip(),
+                    }
+                )
+                tool_trace.append(
+                    {
+                        "round_index": int(round_index),
+                        "tool_name": tool_name,
+                        "success": False,
+                        "latency_ms": latency_ms,
+                        "note": str(request.get("reason") or "").strip(),
+                        "meta": {
+                            "tool_identity": tool_name,
+                            "tool_arguments": args,
+                            "request_id": str(request.get("request_id") or "").strip(),
+                            "normalized_entry_count": 0,
+                            "nonfatal_empty_result": True,
+                            "error": normalized_error or "empty_result",
+                        },
+                    }
+                )
+                continue
             raise ValueError(
                 "artifact draft generation blocked by missing retrieval result: "
                 f"{tool_name} {str(result.error or 'failed').strip()}"
@@ -5503,6 +5890,34 @@ async def _execute_experience_v2_artifact_resource_requests(
             tool_result=result,
         )
         if not normalized_entries:
+            if tool_name == "knowledge_search":
+                nonfatal_feedback.append(
+                    {
+                        "tool_name": tool_name,
+                        "request_id": str(request.get("request_id") or "").strip(),
+                        "query": str(request.get("query") or "").strip(),
+                        "status": "empty_result",
+                        "message": "knowledge_search returned no normalized bundle entries",
+                    }
+                )
+                tool_trace.append(
+                    {
+                        "round_index": int(round_index),
+                        "tool_name": tool_name,
+                        "success": True,
+                        "latency_ms": latency_ms,
+                        "note": str(request.get("reason") or "").strip(),
+                        "meta": {
+                            "tool_identity": tool_name,
+                            "tool_arguments": args,
+                            "request_id": str(request.get("request_id") or "").strip(),
+                            "normalized_entry_count": 0,
+                            "nonfatal_empty_result": True,
+                            "error": "empty_result",
+                        },
+                    }
+                )
+                continue
             raise ValueError(
                 "artifact draft generation blocked by missing retrieval result: "
                 f"{tool_name} returned no normalized bundle entries"
@@ -5528,6 +5943,8 @@ async def _execute_experience_v2_artifact_resource_requests(
         new_entries=accumulated_entries,
     )
     merged_meta = _jsonable_dict(merged_bundle.get("meta") or {})
+    if nonfatal_feedback:
+        merged_meta["nonfatal_request_feedback"] = nonfatal_feedback[-8:]
     merged_meta["retrieval_rounds"] = int(merged_meta.get("retrieval_rounds") or 0) + 1
     merged_bundle["meta"] = merged_meta
     return merged_bundle, tool_trace
@@ -6091,7 +6508,7 @@ def _build_page_artifact_v2_authored_plan_from_session(
     resource_bundle: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     session = ExperienceSessionV2.model_validate(_jsonable_dict(session_payload)).model_dump(mode="json")
-    del paper, compose_payload, reading_dossier
+    del paper, compose_payload
     latest_narrative_brief = _find_latest_experience_session_v2_narrative_brief(session)
     if not latest_narrative_brief:
         raise ValueError("artifact draft generation failed: narrative brief layer missing in session execution")
@@ -6113,7 +6530,10 @@ def _build_page_artifact_v2_authored_plan_from_session(
         artifact_draft=resolved_artifact_draft,
         resource_bundle=resolved_resource_bundle,
     )
-    reader_frame = _build_reader_frame_from_narrative_brief(latest_narrative_brief)
+    reader_frame = _build_reader_frame_from_narrative_brief(
+        latest_narrative_brief,
+        reading_dossier=reading_dossier,
+    )
     authored_meta = _jsonable_dict(authored_plan.get("meta") or {})
     if _jsonable_dict(reader_frame.get("reader_opening") or {}):
         authored_meta["reader_opening"] = _jsonable_dict(reader_frame.get("reader_opening") or {})
@@ -9557,73 +9977,17 @@ async def stream_reader_figure_asset(
     if not normalized_asset_id or not re.fullmatch(r"[0-9A-Za-z_.-]{1,96}", normalized_asset_id):
         raise HTTPException(status_code=400, detail="asset_id 非法")
 
-    upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-    base_dir = os.path.abspath(
-        os.path.join(upload_dir, "reader_figure_assets", str(int(paper.id)), f"p{int(page)}")
+    candidate_path, candidate_ext = await _resolve_reader_figure_asset_candidate_file(
+        db=db,
+        paper=paper,
+        page=int(page),
+        asset_id=normalized_asset_id,
     )
-
-    def _locate_candidate_file() -> tuple[Optional[str], str]:
-        if not os.path.isdir(base_dir):
-            return None, ""
-        for ext in ("jpg", "jpeg", "png", "webp"):
-            path = os.path.abspath(os.path.join(base_dir, f"{normalized_asset_id}.{ext}"))
-            if not path.startswith(base_dir + os.sep):
-                continue
-            if os.path.exists(path):
-                return path, ext
-        return None, ""
-
-    candidate_path, candidate_ext = _locate_candidate_file()
-
-    # 兼容旧缓存：如果文件尚未生成，尝试基于该页已缓存 payload + 本地 PDF 现场补抽 figure 资产。
-    if not candidate_path:
-        try:
-            cache_stmt = (
-                select(PaperReaderPageCache)
-                .where(
-                    and_(
-                        PaperReaderPageCache.paper_id == int(paper.id),
-                        PaperReaderPageCache.page == int(page),
-                        PaperReaderPageCache.source_signature.like("compose_v3|%"),
-                    )
-                )
-                .order_by(PaperReaderPageCache.updated_at.desc(), PaperReaderPageCache.id.desc())
-                .limit(1)
-            )
-            cache_row = (await db.execute(cache_stmt)).scalar_one_or_none()
-            payload_json = dict(getattr(cache_row, "payload_json", None) or {}) if cache_row else {}
-            layouts = [
-                row
-                for row in list((payload_json.get("docmind_structure") or {}).get("layouts") or [])
-                if isinstance(row, dict) and str(row.get("type") or "").strip().lower() == "figure"
-            ]
-            pdf_path = _resolve_local_pdf_path(user_id=int(paper.user_id), paper=paper)
-            if layouts and pdf_path and os.path.exists(pdf_path):
-                compose_service = get_literature_reader_compose_service()
-                await asyncio.to_thread(
-                    compose_service._build_figure_assets_sync,  # pylint: disable=protected-access
-                    int(paper.id),
-                    int(page),
-                    str(pdf_path),
-                    payload_json,
-                    layouts,
-                )
-                candidate_path, candidate_ext = _locate_candidate_file()
-        except Exception as exc:
-            logger.warning(
-                "[Literature API] figure asset lazy-build failed "
-                f"paper={paper_id} page={page} asset_id={normalized_asset_id}: {exc}"
-            )
 
     if not candidate_path:
         raise HTTPException(status_code=404, detail="图片资源不存在")
 
-    media_type = {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp",
-    }.get(candidate_ext, "application/octet-stream")
+    media_type = _reader_image_media_type(candidate_ext)
 
     return FileResponse(path=candidate_path, media_type=media_type, filename=os.path.basename(candidate_path))
 
@@ -12628,6 +12992,106 @@ async def stream_reader_composed_inline_query(
         except Exception as exc:
             logger.exception(f"[Literature API] composed inline query failed paper={paper_id}: {exc}")
             yield _sse_payload("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/papers/{paper_id}/experience-v2/block-explain/stream")
+async def stream_reader_experience_v2_block_explain(
+    paper_id: int,
+    payload: ReaderExperienceBlockExplainRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user_for_stream),
+):
+    async def event_generator():
+        request_payload = payload
+        try:
+            async with async_session_factory() as db:
+                paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+                if str(request_payload.explain_kind or "").strip().lower() == "figure":
+                    if not str(request_payload.figure_image_url or "").strip():
+                        yield _sse_payload("error", {"message": "当前图块没有可用图片 asset，无法只解释这张图。"})
+                        return
+                    normalized_figure_image_url = await _normalize_reader_experience_block_explain_image_url(
+                        db=db,
+                        paper=paper,
+                        raw_url=str(request_payload.figure_image_url or "").strip(),
+                    )
+                    if normalized_figure_image_url != str(request_payload.figure_image_url or "").strip():
+                        request_payload = request_payload.model_copy(update={"figure_image_url": normalized_figure_image_url})
+
+            config = _experience_session_v2_artifact_agent_config()
+            client = AsyncOpenAI(api_key=config["api_key"], base_url=config["base_url"])
+            system_prompt = _reader_experience_block_explain_system_prompt(str(request_payload.explain_kind or ""))
+            messages = [{"role": "system", "content": system_prompt}] + _build_reader_experience_block_explain_messages(request_payload)
+
+            if await request.is_disconnected():
+                return
+
+            yield _sse_payload(
+                "start",
+                {
+                    "page": int(request_payload.page),
+                    "block_id": str(request_payload.block_id),
+                    "explain_kind": str(request_payload.explain_kind),
+                    "model": str(config["model"]),
+                },
+            )
+
+            request_kwargs = {
+                "model": str(config["model"]),
+                "messages": messages,
+                "temperature": 0.35,
+                "max_tokens": min(int(config["max_tokens"]), 2200),
+                "stream": True,
+            }
+            stream = await asyncio.wait_for(
+                _create_reader_experience_block_explain_stream(
+                    client=client,
+                    request_kwargs=request_kwargs,
+                ),
+                timeout=float(config["timeout_seconds"]),
+            )
+
+            chunks: List[str] = []
+            async for chunk in stream:
+                if await request.is_disconnected():
+                    return
+                delta = getattr((getattr(chunk, "choices", None) or [None])[0], "delta", None)
+                token = str(getattr(delta, "content", "") or "")
+                if not token:
+                    continue
+                chunks.append(token)
+                yield _sse_payload("token", {"text": token})
+
+            answer = "".join(chunks).strip()
+            if not answer:
+                if str(request_payload.explain_kind or "").strip().lower() == "figure":
+                    answer = "仅根据当前图块材料，可以先把它理解为这张图在用图注和标签提示读者先看重点证据，再看它支持的结论。你可以继续追问想看哪一部分。"
+                else:
+                    answer = "仅根据当前这段材料，可以先把它理解为作者在说明这一段的核心意思、关键指标和它为什么重要。你可以继续追问具体哪一句还不够通俗。"
+
+            yield _sse_payload(
+                "done",
+                {
+                    "page": int(request_payload.page),
+                    "block_id": str(request_payload.block_id),
+                    "explain_kind": str(request_payload.explain_kind),
+                    "model": str(config["model"]),
+                    "answer": answer,
+                },
+            )
+        except Exception as exc:
+            logger.exception(f"[Literature API] experience-v2 block explain failed paper={paper_id}: {exc}")
+            yield _sse_payload("error", {"message": _friendly_reader_experience_block_explain_error_message(exc)})
 
     return StreamingResponse(
         event_generator(),

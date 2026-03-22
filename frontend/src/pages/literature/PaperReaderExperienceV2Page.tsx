@@ -77,11 +77,45 @@ function buildRequest(searchParams: URLSearchParams): ReaderExperienceV2Request 
   }
 }
 
+function buildExperienceV2LocalCacheKey(paperId: number, request: ReaderExperienceV2Request) {
+  return `reader-experience-v2:${paperId}:${JSON.stringify(request)}`
+}
+
+function readLocalExperienceV2Snapshot(cacheKey: string): ReaderExperienceV2Response | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = window.sessionStorage.getItem(cacheKey)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as ReaderExperienceV2Response
+    if (parsed && typeof parsed === 'object' && parsed.status === 'ready' && parsed.artifact) {
+      return parsed
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function writeLocalExperienceV2Snapshot(cacheKey: string, response: ReaderExperienceV2Response) {
+  if (typeof window === 'undefined') return
+  if (response.status !== 'ready' || !response.artifact) return
+  try {
+    window.sessionStorage.setItem(cacheKey, JSON.stringify(response))
+  } catch {
+    // Ignore quota/storage errors and keep the in-memory UI path intact.
+  }
+}
+
 export default function PaperReaderExperienceV2Page() {
   const { paperId } = useParams()
   const [searchParams] = useSearchParams()
   const numericPaperId = Number(paperId || 0)
   const request = useMemo(() => buildRequest(searchParams), [searchParams])
+  const cacheOnly = searchParams.get('cache_only') === '1'
+  const localCacheKey = useMemo(
+    () => buildExperienceV2LocalCacheKey(numericPaperId, request),
+    [numericPaperId, request],
+  )
   const [response, setResponse] = useState<ReaderExperienceV2Response | null>(null)
   const [loading, setLoading] = useState(true)
   const [building, setBuilding] = useState(false)
@@ -98,24 +132,36 @@ export default function PaperReaderExperienceV2Page() {
     let cancelled = false
 
     async function run() {
-      setLoading(true)
+      const optimistic = readLocalExperienceV2Snapshot(localCacheKey)
+      if (optimistic && !cancelled) {
+        setResponse(optimistic)
+      }
+      setLoading(!optimistic?.artifact)
       setBuilding(false)
       setError(null)
-      setResponse(null)
       try {
         const cached = await literatureApi.getCachedReaderExperienceV2(numericPaperId, request)
         if (cancelled) return
         if (cached.status === 'ready' && cached.artifact) {
           setResponse(cached)
+          writeLocalExperienceV2Snapshot(localCacheKey, cached)
           setLoading(false)
           return
         }
 
-        setResponse(cached)
+        if (cacheOnly) {
+          setResponse((previous) => previous?.artifact ? previous : cached)
+          setError(cached.failure_detail || '当前只读取缓存，未触发重新生成。')
+          setLoading(false)
+          return
+        }
+
+        setResponse((previous) => previous?.artifact ? previous : cached)
         setBuilding(true)
         const live = await literatureApi.getReaderExperienceV2(numericPaperId, request)
         if (cancelled) return
         setResponse(live)
+        writeLocalExperienceV2Snapshot(localCacheKey, live)
         if (live.status !== 'ready' || !live.artifact) {
           setError(live.failure_detail || 'completed page_artifact_v2 not available')
         }
@@ -139,11 +185,13 @@ export default function PaperReaderExperienceV2Page() {
     return () => {
       cancelled = true
     }
-  }, [numericPaperId, request])
+  }, [cacheOnly, numericPaperId, request, localCacheKey])
 
   const query = searchParams.toString()
   const workbenchHref = `/literature/${numericPaperId}/workbench-v2${query ? `?${query}` : ''}`
   const readerHref = `/literature/${numericPaperId}/read${query ? `?${query}` : ''}`
+
+  const hasRenderableArtifact = Boolean(response?.artifact)
 
   return (
     <ConfigProvider theme={experienceV2ReaderTheme}>
@@ -157,6 +205,7 @@ export default function PaperReaderExperienceV2Page() {
             <Space wrap>
               <Tag color="blue">page {request.page}</Tag>
               <Tag>{request.reader_profile}</Tag>
+              {cacheOnly ? <Tag>cache only</Tag> : null}
               {response?.artifact_cache_hit ? <Tag color="green">artifact cache</Tag> : <Tag color="gold">fresh build</Tag>}
               {response?.status ? <Tag>{response.status}</Tag> : null}
             </Space>
@@ -168,19 +217,31 @@ export default function PaperReaderExperienceV2Page() {
         >
           <div className="experience-v2-page__frame">
             <Space direction="vertical" size={20} style={{ width: '100%' }}>
-              {loading || building ? (
+              {hasRenderableArtifact && (loading || building) ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  message={building ? '正在后台刷新这一页，先显示最近一次完成稿。' : '正在检查是否有更新的完成稿。'}
+                />
+              ) : null}
+
+              {(loading || building) && !hasRenderableArtifact ? (
                 <ProCard bordered className="experience-v2-page__shell" bodyStyle={{ padding: 28 }}>
                   <Space direction="vertical" size={12} style={{ width: '100%', alignItems: 'center' }}>
                     <Spin size="large" />
                     <Title level={4} className="experience-v2-page__shell-title">正在组织这一页的阅读体验</Title>
                     <Text type="secondary" className="experience-v2-page__shell-copy">
-                      {building ? '系统正在整理当前页主线、图表位点和必要补充。' : '正在检查是否已有可直接复用的完成稿。'}
+                      {cacheOnly
+                        ? '正在检查是否已有可直接复用的完成稿，不会自动重新生成。'
+                        : building
+                          ? '系统正在整理当前页主线、图表位点和必要补充。'
+                          : '正在检查是否已有可直接复用的完成稿。'}
                     </Text>
                   </Space>
                 </ProCard>
               ) : null}
 
-              {!loading && !building && error ? (
+              {!loading && !building && error && !hasRenderableArtifact ? (
                 <Result
                   status="error"
                   title="experience-v2 未能完成"
@@ -189,15 +250,24 @@ export default function PaperReaderExperienceV2Page() {
                 />
               ) : null}
 
-              {!loading && !building && !error && response?.artifact ? (
-                <PageArtifactV2Renderer artifact={response.artifact} mode="reader" />
+              {response?.artifact ? (
+                <PageArtifactV2Renderer
+                  artifact={response.artifact}
+                  mode="reader"
+                  navigation={{
+                    paperId: numericPaperId,
+                    readerProfile: request.reader_profile,
+                    selectedKbId: request.selected_kb_id,
+                    userIntent: request.user_intent,
+                  }}
+                />
               ) : null}
 
               {!loading && !building && !error && !response?.artifact ? (
                 <Empty description="completed page_artifact_v2 not available" />
               ) : null}
 
-              {response?.failure_detail && !error ? (
+              {response?.failure_detail && !error && !hasRenderableArtifact ? (
                 <Alert type="warning" showIcon message={response.failure_detail} />
               ) : null}
             </Space>
