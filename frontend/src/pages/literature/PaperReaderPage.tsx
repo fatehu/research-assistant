@@ -111,6 +111,48 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
+function fallbackComposeStageMessage(stage: string | undefined): string {
+  switch (String(stage || '').trim()) {
+    case 'page_payload':
+      return '正在解析页面并准备阅读骨架'
+    case 'compose_pipeline':
+      return '正在组织阅读流'
+    case 'text_normalization':
+      return '正在修复页面文本'
+    case 'grouping':
+      return '正在组织阅读流'
+    case 'table_refinement':
+      return '正在细化表格结构'
+    case 'equation_refinement':
+      return '正在细化公式表达'
+    case 'figure_refinement':
+      return '正在补充图像解读'
+    case 'ui_assembly':
+      return '正在装配阅读界面'
+    default:
+      return '正在生成阅读界面'
+  }
+}
+
+function formatComposeProgressLabel(input: {
+  stage?: string
+  message?: string
+  elapsed_ms?: number
+  stage_elapsed_ms?: number
+  status?: string
+}): string {
+  const base = String(input.message || '').trim() || fallbackComposeStageMessage(input.stage)
+  const status = String(input.status || '').trim().toLowerCase()
+  const durationMs = Number.isFinite(input.stage_elapsed_ms)
+    ? Number(input.stage_elapsed_ms)
+    : Number.isFinite(input.elapsed_ms)
+      ? Number(input.elapsed_ms)
+      : 0
+  const seconds = durationMs > 0 ? Math.max(1, Math.round(durationMs / 1000)) : 0
+  if (status === 'done' || seconds <= 0) return base
+  return `${base} · ${seconds}s`
+}
+
 function parsePositiveSearchParam(value: string | null): number | undefined {
   const parsed = Number(value || 0)
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined
@@ -2455,6 +2497,7 @@ export default function PaperReaderPage() {
   const [composedPayload, setComposedPayload] = useState<ReaderComposePayload | null>(null)
   const [composedQuality, setComposedQuality] = useState<ReaderComposeQualityReport | null>(null)
   const [composedCacheLabel, setComposedCacheLabel] = useState<string>('')
+  const [composedProgressLabel, setComposedProgressLabel] = useState<string>('')
   const [composeMaxIterations, setComposeMaxIterations] = useState<number>(DEFAULT_COMPOSE_MAX_ITERATIONS)
   const [composedRunSeed, setComposedRunSeed] = useState<number>(0)
   const [inlineQueryLoadingNodeId, setInlineQueryLoadingNodeId] = useState<string | null>(null)
@@ -2844,6 +2887,33 @@ export default function PaperReaderPage() {
     }
     return ''
   }, [composedPayload])
+  const composedAiReconstructed = useMemo(() => {
+    const groundingMode = String(composedPayload?.grounding_mode || '').trim().toLowerCase()
+    const policy = (composedPayload?.page_grounding_policy && typeof composedPayload.page_grounding_policy === 'object')
+      ? composedPayload.page_grounding_policy as Record<string, unknown>
+      : null
+    const policyMode = String(policy?.mode || '').trim().toLowerCase()
+    return groundingMode === 'ai_reconstructed'
+      || (composedPayload?.evidence_enabled === false && policyMode === 'ai_reconstructed')
+  }, [composedPayload])
+  const composedAiReconstructedReason = useMemo(() => {
+    const policy = (composedPayload?.page_grounding_policy && typeof composedPayload.page_grounding_policy === 'object')
+      ? composedPayload.page_grounding_policy as Record<string, unknown>
+      : null
+    const policyReason = String(policy?.reason || '').trim()
+    if (policyReason) return policyReason
+    const advice = (composedPayload?.layout_advice_v3 && typeof composedPayload.layout_advice_v3 === 'object')
+      ? composedPayload.layout_advice_v3 as Record<string, unknown>
+      : null
+    const reconstruction = (advice?.reconstruction && typeof advice.reconstruction === 'object')
+      ? advice.reconstruction as Record<string, unknown>
+      : null
+    return String(reconstruction?.reason || '').trim()
+  }, [composedPayload])
+  const composedAiReconstructedSidebarImageUrl = useMemo(() => {
+    if (!composedAiReconstructed || !validPaperId) return ''
+    return toAbsoluteApiUrl(`/api/v1/literature/reader/page-assets/${parsedPaperId}/${readPage}`)
+  }, [composedAiReconstructed, parsedPaperId, readPage, validPaperId])
   const composedPageStructureIndex = useMemo(
     () => buildPageStructureSpatialIndex(
       (composedPayload?.page_structure_v3 || {}) as Record<string, unknown>,
@@ -2915,6 +2985,48 @@ export default function PaperReaderPage() {
     }
     return items
   }, [activeComposedPlan, composedPayload])
+  useEffect(() => {
+    if (!composedAiReconstructed || !composedAiReconstructedSidebarImageUrl) return
+    const previewKey = `ai-reconstructed-page-${readPage}`
+    setAnchorPreview((prev) => {
+      if (
+        String(prev.preview_key || '') === previewKey
+        && prev.visible
+        && String(prev.image_data_url || '') === composedAiReconstructedSidebarImageUrl
+      ) {
+        return prev
+      }
+      return {
+        visible: true,
+        pinned: false,
+        loading: false,
+        preview_key: previewKey,
+        page: readPage,
+        text: composedAiReconstructedReason
+          || '当前页已切换为 AI 重建视图。DocMind grounding 质量过差，局部定位证据已禁用；右侧固定展示 PDF 原页渲染图。',
+        title: `Evidence · Page ${readPage}`,
+        anchors: [],
+        anchor_index: 0,
+        anchor_count: 0,
+        image_data_url: composedAiReconstructedSidebarImageUrl,
+        match_method: 'fallback',
+        match_confidence: 0.3,
+        fallback_used: true,
+      }
+    })
+  }, [composedAiReconstructed, composedAiReconstructedReason, composedAiReconstructedSidebarImageUrl, readPage])
+  useEffect(() => {
+    if (composedAiReconstructed) return
+    setAnchorPreview((prev) => {
+      if (!String(prev.preview_key || '').startsWith('ai-reconstructed-page-')) return prev
+      return {
+        ...prev,
+        visible: false,
+        loading: false,
+        image_data_url: null,
+      }
+    })
+  }, [composedAiReconstructed, readPage])
   const readerAutoSaveAtText = useMemo(() => {
     if (!readerAutoSaveAt) return '尚未同步'
     const ts = new Date(readerAutoSaveAt)
@@ -3468,6 +3580,7 @@ export default function PaperReaderPage() {
     setComposedLoading(true)
     setComposedError('')
     setComposedCacheLabel('')
+    setComposedProgressLabel('正在准备阅读骨架')
     setComposedPlan(null)
     setComposedAssets([])
     setComposedPayload(null)
@@ -3489,6 +3602,7 @@ export default function PaperReaderPage() {
         status: recoveredPayload.status,
         degradedReason: recoveredPayload.degraded_reason,
       }))
+      setComposedProgressLabel('')
       setComposedLoading(false)
     }
 
@@ -3515,6 +3629,7 @@ export default function PaperReaderPage() {
       if (controller.signal.aborted) return false
       setComposedError(failureMessage)
       setComposedCacheLabel('Failed')
+      setComposedProgressLabel('')
       setComposedLoading(false)
       return false
     }
@@ -3545,6 +3660,29 @@ export default function PaperReaderPage() {
               buildMode: startData.build_mode,
             })
             setComposedCacheLabel(cacheLabel)
+            setComposedProgressLabel('正在准备阅读骨架')
+            return
+          }
+
+          if (event === 'stage') {
+            const stageData = data as {
+              stage?: string
+              status?: string
+              message?: string
+              elapsed_ms?: number
+            }
+            setComposedProgressLabel(formatComposeProgressLabel(stageData))
+            return
+          }
+
+          if (event === 'heartbeat') {
+            const heartbeatData = data as {
+              stage?: string
+              message?: string
+              elapsed_ms?: number
+              stage_elapsed_ms?: number
+            }
+            setComposedProgressLabel(formatComposeProgressLabel(heartbeatData))
             return
           }
 
@@ -3643,6 +3781,7 @@ export default function PaperReaderPage() {
               status: doneData.status || doneData.payload?.status,
               degradedReason: doneData.degraded_reason || doneData.payload?.degraded_reason,
             }))
+            setComposedProgressLabel('')
             setComposedLoading(false)
             return
           }
@@ -4626,6 +4765,25 @@ export default function PaperReaderPage() {
   const hideAnchorPreview = () => {
     setAnchorPreview((prev) => {
       if (prev.pinned) return prev
+      if (composedAiReconstructed && composedAiReconstructedSidebarImageUrl) {
+        return {
+          visible: true,
+          pinned: false,
+          loading: false,
+          preview_key: `ai-reconstructed-page-${readPage}`,
+          page: readPage,
+          text: composedAiReconstructedReason
+            || '当前页已切换为 AI 重建视图。DocMind grounding 质量过差，局部定位证据已禁用；右侧固定展示 PDF 原页渲染图。',
+          title: `Evidence · Page ${readPage}`,
+          anchors: [],
+          anchor_index: 0,
+          anchor_count: 0,
+          image_data_url: composedAiReconstructedSidebarImageUrl,
+          match_method: 'fallback',
+          match_confidence: 0.3,
+          fallback_used: true,
+        }
+      }
       return { ...prev, visible: false, loading: false }
     })
   }
@@ -4734,7 +4892,9 @@ export default function PaperReaderPage() {
       >
         <div style={{ maxHeight: 'min(72vh, 760px)', overflowY: 'auto', paddingRight: 4 }}>
           <Text type="secondary" style={{ display: 'block', marginBottom: 8, fontSize: 13 }}>
-            悬停或点击左侧带锚点组件后，这里会显示 PDF 局部证据和命中区域。
+            {composedAiReconstructed
+              ? '当前页处于 AI 重建模式。由于 DocMind grounding 质量过差，右侧固定展示原始 PDF 整页渲染图，局部定位证据已禁用。'
+              : '悬停或点击左侧带锚点组件后，这里会显示 PDF 局部证据和命中区域。'}
           </Text>
           {!anchorPreview.visible ? (
             <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前暂无证据预览" />
@@ -4745,6 +4905,7 @@ export default function PaperReaderPage() {
           ) : (
             <Space direction="vertical" size={8} style={{ width: '100%' }}>
               <Space size={8} wrap>
+                {composedAiReconstructed ? <Tag color="purple">AI 重建页</Tag> : null}
                 <Tag color="blue">{methodLabelMap[method] || methodLabelMap.fallback}</Tag>
                 <Tag color={confidence >= 0.8 ? 'green' : confidence >= 0.6 ? 'gold' : 'red'}>
                   置信度: {Math.round(confidence * 100)}%
@@ -5324,9 +5485,18 @@ export default function PaperReaderPage() {
                     />
                   ) : null}
 
+                  {composedLoading && composedProgressLabel ? (
+                    <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+                      <Tag color="processing">{composedProgressLabel}</Tag>
+                    </div>
+                  ) : null}
+
                   {composedLoading && !hasComposedPlan ? (
                     <div className="h-[360px] flex items-center justify-center">
-                      <Spin />
+                      <Space direction="vertical" align="center" size="middle">
+                        <Spin />
+                        {composedProgressLabel ? <Text type="secondary">{composedProgressLabel}</Text> : null}
+                      </Space>
                     </div>
                   ) : null}
 

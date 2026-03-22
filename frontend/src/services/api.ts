@@ -1756,6 +1756,10 @@ export interface ReaderComposePayload {
   layout_advice_v3?: Record<string, unknown>
   qwen_plan_meta?: Record<string, unknown>
   assembly_meta?: Record<string, unknown>
+  grounding_mode?: string
+  evidence_enabled?: boolean
+  runtime_build_plan_evidence?: boolean
+  page_grounding_policy?: Record<string, unknown>
   component_registry_version?: string
   segment_map?: Record<string, unknown>
   segment_map_meta?: Record<string, unknown>
@@ -1846,6 +1850,21 @@ export interface ReaderComposeStreamEventMap {
       latency_budget_ms?: number
       quality_target?: number
     }
+  }
+  stage: {
+    stage: string
+    status: 'started' | 'done' | string
+    message?: string
+    page?: number
+    elapsed_ms?: number
+    model?: string
+  }
+  heartbeat: {
+    stage?: string
+    message?: string
+    page?: number
+    elapsed_ms?: number
+    stage_elapsed_ms?: number
   }
   plan_draft: {
     iteration: number

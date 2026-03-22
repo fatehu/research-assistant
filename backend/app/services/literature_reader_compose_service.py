@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -89,6 +89,7 @@ REDIS_TTL_SECONDS = 24 * 3600
 LOCK_TTL_SECONDS = 120
 LOCK_WAIT_SECONDS = 6.0
 LOCK_POLL_INTERVAL_SECONDS = 0.22
+LOCK_RESULT_WAIT_SECONDS = max(LOCK_WAIT_SECONDS, min(float(LOCK_TTL_SECONDS) * 3.0, 360.0))
 REDIS_KEY_PREFIX = "lit:reader:compose:v1"
 REDIS_LOCK_PREFIX = "lit:reader:compose:lock:v1"
 REDIS_REVIEW_PREFIX = "lit:reader:compose:review:v1"
@@ -311,6 +312,9 @@ class ReaderComposeBuildMeta:
     stop_reason: str = "unknown"
 
 
+ReaderComposeProgressCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
+
+
 class LiteratureReaderComposeService:
     def __init__(self) -> None:
         self._redis_client: Any = None
@@ -326,6 +330,24 @@ class LiteratureReaderComposeService:
             max_repair_rounds=max(0, int(getattr(settings, "reader_agent_max_repair_rounds", 2) or 2)),
         )
         self._panel_plan_agent = get_reader_panel_plan_agent_service()
+
+    @staticmethod
+    async def _emit_progress_event(
+        progress_callback: Optional[ReaderComposeProgressCallback],
+        *,
+        event: str,
+        data: Mapping[str, Any],
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            await progress_callback(str(event or "").strip() or "stage", dict(data or {}))
+        except Exception as exc:
+            logger.debug(
+                "[ReaderComposeService] progress callback failed event={} error={}",
+                str(event or "").strip() or "stage",
+                str(exc or "").strip() or type(exc).__name__,
+            )
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -494,6 +516,7 @@ class LiteratureReaderComposeService:
         compare_mode: Optional[bool] = None,
         citation_tldr: Optional[bool] = None,
         publish_ready_event_enabled: bool = False,
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
         page_num = max(1, int(page))
         parser_force_refresh = bool(force_refresh)
@@ -656,6 +679,36 @@ class LiteratureReaderComposeService:
                     stop_reason=str(quality_report.get("stop_reason") or "compatible_cache_hit"),
                 )
 
+        async def _reuse_waited_payload(
+            cached_payload: Mapping[str, Any],
+            *,
+            cache_layer: str,
+        ) -> Tuple[Dict[str, Any], ReaderComposeBuildMeta]:
+            repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
+            if cache_layer == "redis" and repaired_cached_payload != cached_payload:
+                await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+            payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer=cache_layer)
+            payload = await self._apply_overlay_for_user(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper.id),
+                page=page_num,
+                source_signature=source_signature,
+                payload=payload,
+            )
+            payload = self._ensure_payload_contract(page=page_num, payload=payload)
+            quality_report = payload.get("quality_report") or {}
+            return payload, ReaderComposeBuildMeta(
+                cache_hit=True,
+                cache_layer=cache_layer,
+                build_mode=str(payload.get("build_mode") or "compose_cache"),
+                source_signature=source_signature,
+                source_sig_hash=sig_hash,
+                iterations=int(quality_report.get("iterations") or 0),
+                degraded=bool(quality_report.get("degraded")),
+                stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
+            )
+
         lock_token = await self._acquire_lock(lock_key)
         logger.info(
             "[ReaderComposeService] compose lock attempt "
@@ -663,48 +716,53 @@ class LiteratureReaderComposeService:
         )
         if lock_token is None:
             waited = 0.0
-            while waited < LOCK_WAIT_SECONDS and lock_token is None:
+            wait_limit = LOCK_WAIT_SECONDS if compose_force_refresh else LOCK_RESULT_WAIT_SECONDS
+            waiting_notice_emitted = False
+            while waited < wait_limit and lock_token is None:
+                if not compose_force_refresh:
+                    cached_payload = await self._read_payload_from_redis(redis_key)
+                    if isinstance(cached_payload, dict):
+                        if self._should_rebuild_cached_payload(cached_payload):
+                            await self._delete_payload_from_redis(redis_key)
+                        else:
+                            return await _reuse_waited_payload(cached_payload, cache_layer="redis")
+                    compatible_cached_row = await self._read_compatible_payload_from_db(
+                        db=db,
+                        paper_id=int(paper.id),
+                        page=page_num,
+                        source_signature=source_signature,
+                        pipeline_version=pipeline_version,
+                    )
+                    if isinstance(compatible_cached_row, dict):
+                        compatible_payload = dict(compatible_cached_row)
+                        compatible_payload["source_signature"] = source_signature
+                        await self._write_payload_to_redis(redis_key, compatible_payload)
+                        return await _reuse_waited_payload(compatible_payload, cache_layer="db_compatible")
+                    if not waiting_notice_emitted:
+                        waiting_notice_emitted = True
+                        await self._emit_progress_event(
+                            progress_callback,
+                            event="stage",
+                            data={
+                                "stage": "compose_wait",
+                                "status": "started",
+                                "label": "等待同页结果",
+                                "message": "已有相同页面正在生成，等待复用结果",
+                                "page": int(page_num),
+                            },
+                        )
+                current_lock = await self._read_lock_token(lock_key)
+                if current_lock is None:
+                    lock_token = await self._acquire_lock(lock_key)
+                    if lock_token is not None:
+                        break
                 await asyncio.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 waited += LOCK_POLL_INTERVAL_SECONDS
-                lock_token = await self._acquire_lock(lock_key)
-                if lock_token is not None:
-                    break
-                if compose_force_refresh:
-                    continue
-                cached_payload = await self._read_payload_from_redis(redis_key)
-                if isinstance(cached_payload, dict):
-                    if self._should_rebuild_cached_payload(cached_payload):
-                        await self._delete_payload_from_redis(redis_key)
-                    else:
-                        repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
-                        if repaired_cached_payload != cached_payload:
-                            await self._write_payload_to_redis(redis_key, repaired_cached_payload)
-                        payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
-                        payload = await self._apply_overlay_for_user(
-                            db=db,
-                            user_id=int(user_id),
-                            paper_id=int(paper.id),
-                            page=page_num,
-                            source_signature=source_signature,
-                            payload=payload,
-                        )
-                        payload = self._ensure_payload_contract(page=page_num, payload=payload)
-                        quality_report = payload.get("quality_report") or {}
-                        return payload, ReaderComposeBuildMeta(
-                            cache_hit=True,
-                            cache_layer="redis",
-                            build_mode=str(payload.get("build_mode") or "compose_cache"),
-                            source_signature=source_signature,
-                            source_sig_hash=sig_hash,
-                            iterations=int(quality_report.get("iterations") or 0),
-                            degraded=bool(quality_report.get("degraded")),
-                            stop_reason=str(quality_report.get("stop_reason") or "cache_hit"),
-                        )
 
-            if lock_token is None and compose_force_refresh:
+            if lock_token is None:
                 logger.warning(
-                    "[ReaderComposeService] compose lock timeout fallback "
-                    f"paper={paper.id} page={page_num} waited={waited:.2f}s"
+                    "[ReaderComposeService] compose lock wait timeout without duplicate rebuild "
+                    f"paper={paper.id} page={page_num} waited={waited:.2f}s compose_force_refresh={compose_force_refresh}"
                 )
                 fallback_payload = await self._build_force_refresh_timeout_fallback_payload(
                     db=db,
@@ -737,11 +795,34 @@ class LiteratureReaderComposeService:
                     source_signature=source_signature,
                     source_sig_hash=sig_hash,
                     iterations=int(quality_report.get("iterations") or 0),
-                    degraded=True,
-                    stop_reason="force_refresh_lock_timeout",
+                    degraded=bool(quality_report.get("degraded") or compose_force_refresh),
+                    stop_reason="force_refresh_lock_timeout" if compose_force_refresh else "lock_wait_timeout",
                 )
 
+        lock_keepalive_stop: Optional[asyncio.Event] = None
+        lock_keepalive_task: Optional[asyncio.Task[Any]] = None
+        if lock_token is not None:
+            lock_keepalive_stop = asyncio.Event()
+            lock_keepalive_task = asyncio.create_task(
+                self._maintain_lock(
+                    lock_key=lock_key,
+                    token=lock_token,
+                    stop_event=lock_keepalive_stop,
+                )
+            )
+
         try:
+            page_payload_started_at = time.perf_counter()
+            await self._emit_progress_event(
+                progress_callback,
+                event="stage",
+                data={
+                    "stage": "page_payload",
+                    "status": "started",
+                    "message": "正在解析页面并准备阅读骨架",
+                    "page": int(page_num),
+                },
+            )
             logger.info(
                 "[ReaderComposeService] build base payload start "
                 f"paper={paper.id} page={page_num} parser_force_refresh={bool(parser_force_refresh)}"
@@ -761,11 +842,54 @@ class LiteratureReaderComposeService:
                 "[ReaderComposeService] build base payload done "
                 f"paper={paper.id} page={page_num}"
             )
+            page_payload_elapsed_ms = int(max(0.0, (time.perf_counter() - page_payload_started_at) * 1000.0))
+            await self._emit_progress_event(
+                progress_callback,
+                event="stage",
+                data={
+                    "stage": "page_payload",
+                    "status": "done",
+                    "message": "阅读骨架已准备",
+                    "page": int(page_num),
+                    "elapsed_ms": page_payload_elapsed_ms,
+                },
+            )
+            initial_ui_plan = self._build_initial_ui_plan(
+                paper=paper,
+                page=page_num,
+                base_payload=dict(base_payload or {}),
+                style_intent=style_intent,
+                theme_mode=normalized_theme,
+                detail_level=normalized_detail,
+                compare_mode=use_compare_mode,
+            )
+            if list((initial_ui_plan or {}).get("components") or []):
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="plan_draft",
+                    data={
+                        "iteration": 0,
+                        "ui_plan": initial_ui_plan,
+                        "phase": "skeleton",
+                        "layout_lock": True,
+                    },
+                )
             simplified_enabled = self._is_single_agent_v2_enabled(
                 paper_id=int(paper.id),
                 page=page_num,
             )
             if simplified_enabled:
+                compose_started_at = time.perf_counter()
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "compose_pipeline",
+                        "status": "started",
+                        "message": "正在组织阅读流",
+                        "page": int(page_num),
+                    },
+                )
                 logger.info(
                     "[ReaderComposeService] single_agent_v2 pipeline start "
                     f"paper={paper.id} page={page_num}"
@@ -804,6 +928,7 @@ class LiteratureReaderComposeService:
                         latency_budget_ms=latency_budget,
                         selected_kb_id=selected_kb_id,
                         pipeline_version=pipeline_version,
+                        progress_callback=progress_callback,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -823,10 +948,23 @@ class LiteratureReaderComposeService:
                         latency_budget_ms=latency_budget,
                         selected_kb_id=selected_kb_id,
                         pipeline_version=pipeline_version,
+                        progress_callback=progress_callback,
                     )
                 base_payload = dict(simplified_result.get("base_payload") or base_payload)
                 loop_result = dict(simplified_result.get("loop_result") or {})
                 assets = list(simplified_result.get("assets") or [])
+                compose_elapsed_ms = int(max(0.0, (time.perf_counter() - compose_started_at) * 1000.0))
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "compose_pipeline",
+                        "status": "done",
+                        "message": "阅读流组织完成",
+                        "page": int(page_num),
+                        "elapsed_ms": compose_elapsed_ms,
+                    },
+                )
                 logger.info(
                     "[ReaderComposeService] single_agent_v2 pipeline done "
                     f"paper={paper.id} page={page_num} build_mode={str(loop_result.get('build_mode') or '')}"
@@ -903,6 +1041,10 @@ class LiteratureReaderComposeService:
                 "build_mode": str(loop_result.get("build_mode") or "compose_agent"),
                 "ui_plan": dict(loop_result.get("ui_plan") or {}),
                 "assets": assets,
+                "grounding_mode": str(base_payload.get("grounding_mode") or ""),
+                "evidence_enabled": base_payload.get("evidence_enabled"),
+                "runtime_build_plan_evidence": base_payload.get("runtime_build_plan_evidence"),
+                "page_grounding_policy": dict(base_payload.get("page_grounding_policy") or {}),
                 "scheme_choice": dict(base_payload.get("scheme_choice") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("scheme_choice") or {})),
                 "decision_log": list(base_payload.get("decision_log") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("decision_log") or [])),
                 "omission_decisions": list(base_payload.get("omission_decisions") or (((loop_result.get("ui_plan") or {}).get("trace_meta") or {}).get("omission_decisions") or [])),
@@ -1028,6 +1170,13 @@ class LiteratureReaderComposeService:
                 stop_reason=str(quality_report.get("stop_reason") or "unknown"),
             )
         finally:
+            if lock_keepalive_stop is not None:
+                lock_keepalive_stop.set()
+            if lock_keepalive_task is not None:
+                try:
+                    await lock_keepalive_task
+                except Exception:
+                    pass
             if lock_token is not None:
                 await self._release_lock(lock_key, lock_token)
 
@@ -1046,6 +1195,7 @@ class LiteratureReaderComposeService:
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
         pipeline_version: Optional[str] = None,
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Dict[str, Any]:
         _ = pipeline_version
         return await self._build_simplified_pipeline_result_legacy(
@@ -1060,6 +1210,7 @@ class LiteratureReaderComposeService:
             compare_mode=compare_mode,
             latency_budget_ms=latency_budget_ms,
             selected_kb_id=selected_kb_id,
+            progress_callback=progress_callback,
         )
 
     @staticmethod
@@ -1078,6 +1229,17 @@ class LiteratureReaderComposeService:
             "header",
             "footer",
             "noise",
+        }
+
+    @staticmethod
+    def _layout_uid_ai_reconstruction_component_kinds() -> set[str]:
+        return {
+            "heading",
+            "paragraph",
+            "list",
+            "figure",
+            "table",
+            "equation",
         }
 
     def _build_layout_uid_prompt_payload(
@@ -1125,6 +1287,153 @@ class LiteratureReaderComposeService:
                 "no_layout_split": True,
                 "output_goal": "html_like_reading_flow",
                 "allow_group_kinds": sorted(self._layout_uid_group_kinds()),
+            },
+        }
+
+    @staticmethod
+    def _layout_uid_combined_system_prompt() -> str:
+        return (
+            "You plan a single PDF page for the /read reader in one pass. "
+            "The indivisible unit is layout_id (DocMind uniqueId). "
+            "Never split a layout_id, never invent ids, and never modify ownership or geometry. "
+            "Use the attached page image only as visual reference. "
+            "Do two things in one JSON response: "
+            "(1) return sparse text repairs only for layout_ids whose display text should change; "
+            "(2) assign every layout_id exactly once, either in groups or omissions. "
+            "Keep the source language; do not translate. "
+            "Do not summarize or paraphrase. "
+            "Prefer a clean HTML-like reading flow, not a complex generative UI page. "
+            "Keep tables and equations as dedicated reading islands; do not flatten them into prose. "
+            "For prose-like groups, preserve semantic paragraph boundaries. "
+            "If a paragraph or table_caption group contains multiple semantic paragraphs, return them in group.paragraphs. "
+            "Each paragraph item should look like {\"text\":\"...\",\"source_layout_ids\":[\"...\"]}. "
+            "paragraphs are optional, but when provided they are the reader-facing paragraph structure and should be faithful. "
+            "For footer-like link items, preserve the URL exactly and recover obvious leading markers when visually clear. "
+            "If a footer fragment is redundant, you may hide it by returning mode footer_hide_fragment. "
+            "If the provided DocMind grounding is clearly unusable for faithful grounded reading "
+            "(for example the main visual region is mislabeled, OCR/table extraction is badly corrupted, or semantic coverage is broken), "
+            "you may switch to an AI-only page reconstruction. "
+            "Only do this when DocMind quality is genuinely poor. "
+            "In that case set step_result.reconstruction = "
+            "{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\",\"reason\":\"...\",\"confidence\":0.82,"
+            "\"components\":[...],\"notes\":[...]}. "
+            "Allowed reconstruction component kinds are heading, paragraph, list, figure, table, equation. "
+            "paragraph components may include paragraphs:[\"...\", ...]. "
+            "figure components may include caption and source_label; the runtime will use the page image. "
+            "table components may include title, caption, headers:[...], rows:[[...],[...]] or row_objects:[{...}], raw_markdown. "
+            "step_result.text_items should include ONLY changed layout_ids. "
+            "Outside ai_reconstructed mode, step_result.groups and step_result.omissions together must cover every layout_id exactly once. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"text_items\":["
+            "{\"layout_id\":\"...\",\"normalized_text\":\"...\",\"reason\":\"...\",\"confidence\":0.94,\"mode\":\"ocr_cleanup\"}"
+            "],\"groups\":[{\"group_id\":\"g1\",\"group_kind\":\"paragraph\",\"source_layout_ids\":[\"layout_id\"],"
+            "\"paragraphs\":[{\"text\":\"...\",\"source_layout_ids\":[\"layout_id\"]}],\"rationale\":\"\"}],"
+            "\"omissions\":[{\"layout_id\":\"...\",\"reason\":\"header\"}],"
+            "\"reconstruction\":{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\",\"reason\":\"...\","
+            "\"confidence\":0.82,\"components\":[{\"kind\":\"paragraph\",\"text\":\"...\",\"paragraphs\":[\"...\"]}]},"
+            "\"notes\":[\"...\"]}}"
+        )
+
+    def _build_layout_uid_combined_prompt_payload(
+        self,
+        *,
+        paper: Paper,
+        page: int,
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        footer_bundles = self._build_layout_uid_footer_bundles(layout_atoms)
+        footer_bundle_by_layout_id: Dict[str, Dict[str, Any]] = {}
+        for bundle in footer_bundles:
+            bundle_id = str(bundle.get("bundle_id") or "").strip()
+            bundle_summary = {
+                "bundle_id": bundle_id,
+                "item_count": int(bundle.get("item_count") or 0),
+                "reading_order_start": int(bundle.get("reading_order_start") or 0),
+                "reading_order_end": int(bundle.get("reading_order_end") or 0),
+            }
+            for item in list(bundle.get("items") or []):
+                if not isinstance(item, Mapping):
+                    continue
+                layout_id = str(item.get("layout_id") or "").strip()
+                if layout_id:
+                    footer_bundle_by_layout_id[layout_id] = bundle_summary
+
+        compact_atoms: List[Dict[str, Any]] = []
+        for atom in sorted(layout_atoms, key=lambda item: int(item.get("reading_order") or 0)):
+            layout_id = str(atom.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            compact_atoms.append(
+                {
+                    "layout_id": layout_id,
+                    "reading_order": int(atom.get("reading_order") or 0),
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "node_kind": str(atom.get("node_kind") or "").strip().lower(),
+                    "source_text": str(atom.get("clean_text") or atom.get("raw_text") or "").strip(),
+                    "text": self._normalized_grounding_text(atom),
+                    "include_in_main_flow": bool(atom.get("include_in_main_flow")),
+                    "region_hint": str(atom.get("region_hint") or "").strip(),
+                    "layout_pos": list(atom.get("layout_pos") or []),
+                    "block_count": len(list(atom.get("blocks") or [])),
+                    "alignment": str(atom.get("alignment") or "").strip().lower(),
+                    "line_height": float(atom.get("line_height") or 0.0),
+                    "footer_bundle": dict(footer_bundle_by_layout_id.get(layout_id) or {}),
+                    "block_styles": [
+                        {
+                            "style_id": int(block.get("style_id") or 0),
+                            "text": str(block.get("text") or "").strip(),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        page_payload = dict(payload or {})
+        page_structure_v3 = dict(page_payload.get("page_structure_v3") or {})
+        return {
+            "page_meta": {
+                "paper_id": int(paper.id),
+                "page": int(page),
+                "paper_title": str(getattr(paper, "title", "") or "").strip(),
+                "reader_mode": "read_layout_uid_v1_combined",
+            },
+            "page_quality": {
+                "structure_confidence": round(float(page_payload.get("structure_confidence") or 0.0), 4),
+                "page_payload_build_mode": str(page_payload.get("build_mode") or "").strip(),
+                "repair_used": bool(page_payload.get("repair_used") or ((page_payload.get("repair_report") or {}).get("used"))),
+                "layout_count": len(compact_atoms),
+                "block_group_count": len(list(page_structure_v3.get("block_groups") or [])),
+            },
+            "layout_atoms": compact_atoms,
+            "footer_bundles": footer_bundles,
+            "rules": {
+                "indivisible_unit": "layout_id",
+                "exact_group_assignment": True,
+                "text_item_mode": "sparse_diff_only",
+                "no_layout_split": True,
+                "forbid_translation": True,
+                "forbid_geometry_mutation": True,
+                "forbid_ownership_mutation": True,
+                "output_goal": "html_like_reading_flow",
+                "allow_group_kinds": sorted(self._layout_uid_group_kinds()),
+                "allow_reconstruction_component_kinds": sorted(self._layout_uid_ai_reconstruction_component_kinds()),
+                "allowed_repairs": [
+                    "ocr_cleanup",
+                    "superscript_or_subscript_recovery",
+                    "spacing_repair",
+                    "hyphenation_repair",
+                    "heading_or_list_stitching",
+                    "citation_marker_cleanup",
+                    "footer_bundle_rewrite",
+                    "footer_bundle_hide_fragment",
+                ],
             },
         }
 
@@ -1427,6 +1736,106 @@ class LiteratureReaderComposeService:
         changed_items = [dict(item) for item in normalized_items if bool(item.get("changed"))]
         return {
             "items": changed_items,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    def _normalize_layout_uid_sparse_text_normalization_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        candidate_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+            and str(row.get("node_kind") or "").strip().lower() in self._layout_uid_text_normalization_allowed_node_kinds()
+            and str(row.get("layout_id") or "").strip()
+            and str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            and (
+                bool(row.get("include_in_main_flow"))
+                or str(row.get("node_kind") or "").strip().lower() in {"metadata", "doi", "header", "footer"}
+            )
+        ]
+        source_text_by_id = {
+            str(row.get("layout_id") or "").strip(): str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            for row in candidate_atoms
+        }
+        known_ids = set(source_text_by_id.keys())
+        used_ids: List[str] = []
+        normalized_items: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        raw_items = (
+            list((step_result or {}).get("text_items") or [])
+            or list((step_result or {}).get("normalizations") or [])
+            or list((step_result or {}).get("items") or [])
+        )
+        for raw_item in raw_items:
+            if not isinstance(raw_item, Mapping):
+                continue
+            layout_id = str(raw_item.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            if layout_id not in known_ids:
+                errors.append(f"unknown_layout_id:{layout_id}")
+                continue
+            used_ids.append(layout_id)
+            source_text = source_text_by_id.get(layout_id, "")
+            normalized_text = self._normalize_spaces(str(raw_item.get("normalized_text") or source_text))
+            reason = self._normalize_spaces(str(raw_item.get("reason") or ""))
+            mode = self._normalize_spaces(str(raw_item.get("mode") or "")) or "no_change"
+            allow_hidden_fragment = mode in {"footer_hide_fragment", "hide_fragment", "footer_fragment_hidden"}
+            if allow_hidden_fragment:
+                normalized_text = ""
+            confidence = 0.0
+            try:
+                confidence = max(0.0, min(1.0, float(raw_item.get("confidence") or 0.0)))
+            except Exception:
+                confidence = 0.0
+                errors.append(f"invalid_confidence:{layout_id}")
+            if len(normalized_text) > 1200:
+                errors.append(f"normalized_text_too_long:{layout_id}")
+                normalized_text = source_text
+            changed = allow_hidden_fragment or bool(normalized_text and normalized_text != source_text)
+            if not changed:
+                continue
+            normalized_items.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "normalized_text": normalized_text if allow_hidden_fragment else normalized_text,
+                    "reason": reason,
+                    "mode": mode,
+                    "confidence": confidence,
+                    "changed": True,
+                }
+            )
+
+        duplicates = sorted({layout_id for layout_id in used_ids if used_ids.count(layout_id) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_layout_id:{layout_id}" for layout_id in duplicates])
+
+        if errors:
+            return {
+                "items": [],
+                "notes": ["deterministic_text_normalization_fallback"],
+            }, {
+                "passed": False,
+                "errors": errors,
+                "fallback_used": True,
+            }
+
+        return {
+            "items": normalized_items,
             "notes": [
                 str(item).strip()
                 for item in list((step_result or {}).get("notes") or [])
@@ -3388,6 +3797,35 @@ class LiteratureReaderComposeService:
         normalized_groups: List[Dict[str, Any]] = []
         normalized_omissions: List[Dict[str, Any]] = []
 
+        def _normalize_group_paragraphs(
+            raw_rows: Any,
+            *,
+            source_layout_ids: Sequence[str],
+        ) -> List[Dict[str, Any]]:
+            if not isinstance(raw_rows, list):
+                return []
+            allowed_ids = {str(item).strip() for item in list(source_layout_ids or []) if str(item).strip()}
+            normalized_rows: List[Dict[str, Any]] = []
+            for raw_row in raw_rows:
+                if isinstance(raw_row, Mapping):
+                    text = self._normalize_spaces(str(raw_row.get("text") or ""))
+                    raw_para_layout_ids = list(raw_row.get("source_layout_ids") or [])
+                else:
+                    text = self._normalize_spaces(str(raw_row or ""))
+                    raw_para_layout_ids = []
+                if not text:
+                    continue
+                paragraph_row: Dict[str, Any] = {"text": text}
+                paragraph_layout_ids = [
+                    str(item).strip()
+                    for item in raw_para_layout_ids
+                    if str(item).strip() and str(item).strip() in allowed_ids
+                ]
+                if paragraph_layout_ids:
+                    paragraph_row["source_layout_ids"] = list(dict.fromkeys(paragraph_layout_ids))
+                normalized_rows.append(paragraph_row)
+            return normalized_rows
+
         for raw_group in list((step_result or {}).get("groups") or []):
             if not isinstance(raw_group, Mapping):
                 continue
@@ -3426,15 +3864,21 @@ class LiteratureReaderComposeService:
                     )
                     used_ids.append(layout_id)
                 continue
-            normalized_groups.append(
-                {
-                    "group_id": str(raw_group.get("group_id") or f"group_{len(normalized_groups) + 1}").strip()
-                    or f"group_{len(normalized_groups) + 1}",
-                    "group_kind": group_kind,
-                    "source_layout_ids": source_layout_ids,
-                    "rationale": str(raw_group.get("rationale") or raw_group.get("reason") or "").strip(),
-                }
-            )
+            normalized_group = {
+                "group_id": str(raw_group.get("group_id") or f"group_{len(normalized_groups) + 1}").strip()
+                or f"group_{len(normalized_groups) + 1}",
+                "group_kind": group_kind,
+                "source_layout_ids": source_layout_ids,
+                "rationale": str(raw_group.get("rationale") or raw_group.get("reason") or "").strip(),
+            }
+            if group_kind in {"paragraph", "table_caption"}:
+                paragraphs = _normalize_group_paragraphs(
+                    raw_group.get("paragraphs"),
+                    source_layout_ids=source_layout_ids,
+                )
+                if paragraphs:
+                    normalized_group["paragraphs"] = paragraphs
+            normalized_groups.append(normalized_group)
             used_ids.extend(source_layout_ids)
 
         for raw_omission in list((step_result or {}).get("omissions") or []):
@@ -3495,6 +3939,209 @@ class LiteratureReaderComposeService:
             "passed": True,
             "errors": [],
             "fallback_used": False,
+        }
+
+    def _normalize_layout_uid_ai_reconstruction_plan(
+        self,
+        *,
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        raw_plan = step_result.get("reconstruction") if isinstance(step_result, Mapping) else {}
+        if not isinstance(raw_plan, Mapping):
+            return {
+                "mode": "grounded",
+                "docmind_quality": "",
+                "reason": "",
+                "confidence": 0.0,
+                "components": [],
+                "notes": [],
+            }, {
+                "enabled": False,
+                "passed": True,
+                "errors": [],
+            }
+
+        mode = str(raw_plan.get("mode") or "").strip().lower()
+        quality = str(raw_plan.get("docmind_quality") or raw_plan.get("quality") or "").strip().lower()
+        enabled = mode in {"ai_reconstructed", "ai_only", "ungrounded"} and quality in {"poor", "bad", "broken", "low", "unusable"}
+        if not enabled:
+            return {
+                "mode": "grounded",
+                "docmind_quality": quality,
+                "reason": str(raw_plan.get("reason") or "").strip(),
+                "confidence": float(raw_plan.get("confidence") or 0.0) if str(raw_plan.get("confidence") or "").strip() else 0.0,
+                "components": [],
+                "notes": [str(item).strip() for item in list(raw_plan.get("notes") or []) if str(item).strip()],
+            }, {
+                "enabled": False,
+                "passed": True,
+                "errors": [],
+            }
+
+        allowed_kinds = self._layout_uid_ai_reconstruction_component_kinds()
+        normalized_components: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        def _normalize_paragraph_rows(value: Any) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for item in list(value or [])[:24]:
+                if isinstance(item, Mapping):
+                    text = self._normalize_spaces(str(item.get("text") or item.get("content") or ""))
+                else:
+                    text = self._normalize_spaces(str(item or ""))
+                if text:
+                    rows.append({"text": text})
+            return rows
+
+        for idx, raw_component in enumerate(list(raw_plan.get("components") or raw_plan.get("items") or [])[:20], start=1):
+            if not isinstance(raw_component, Mapping):
+                continue
+            kind = str(raw_component.get("kind") or raw_component.get("type") or raw_component.get("component") or "").strip().lower()
+            if kind not in allowed_kinds:
+                errors.append(f"unsupported_reconstruction_component:{kind or idx}")
+                continue
+            if kind == "heading":
+                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("title") or ""))
+                if not text:
+                    errors.append(f"reconstruction_heading_missing_text:{idx}")
+                    continue
+                normalized_components.append(
+                    {
+                        "kind": "heading",
+                        "text": text,
+                        "level": max(1, min(4, int(raw_component.get("level") or 2))),
+                    }
+                )
+                continue
+            if kind == "paragraph":
+                paragraphs = _normalize_paragraph_rows(raw_component.get("paragraphs"))
+                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("content") or ""))
+                if not text and paragraphs:
+                    text = "\n\n".join(str(row.get("text") or "").strip() for row in paragraphs if str(row.get("text") or "").strip())
+                if not text:
+                    errors.append(f"reconstruction_paragraph_missing_text:{idx}")
+                    continue
+                normalized_components.append(
+                    {
+                        "kind": "paragraph",
+                        "text": text,
+                        "paragraphs": paragraphs,
+                    }
+                )
+                continue
+            if kind == "list":
+                items = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("items") or raw_component.get("bullets") or [])[:20]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                if not items:
+                    errors.append(f"reconstruction_list_missing_items:{idx}")
+                    continue
+                normalized_components.append({"kind": "list", "items": items})
+                continue
+            if kind == "figure":
+                caption = self._normalize_spaces(str(raw_component.get("caption") or raw_component.get("text") or ""))
+                normalized_components.append(
+                    {
+                        "kind": "figure",
+                        "caption": caption,
+                        "source_label": self._normalize_spaces(str(raw_component.get("source_label") or raw_component.get("label") or "")),
+                    }
+                )
+                continue
+            if kind == "table":
+                headers = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("headers") or [])[:24]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                row_matrix: List[List[str]] = []
+                for row in list(raw_component.get("rows") or [])[:40]:
+                    if isinstance(row, Mapping):
+                        ordered_values = [self._normalize_spaces(str(value or "")) for value in list(row.values())]
+                        row_values = [value for value in ordered_values if value]
+                    else:
+                        row_values = [
+                            self._normalize_spaces(str(item or ""))
+                            for item in list(row or [])[:24]
+                            if self._normalize_spaces(str(item or ""))
+                        ]
+                    if row_values:
+                        row_matrix.append(row_values)
+                normalized_components.append(
+                    {
+                        "kind": "table",
+                        "title": self._normalize_spaces(str(raw_component.get("title") or "")),
+                        "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                        "headers": headers,
+                        "rows": row_matrix,
+                        "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
+                    }
+                )
+                continue
+            if kind == "equation":
+                latex = str(raw_component.get("latex") or "").strip()
+                transcript = self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("text") or latex))
+                if not latex and not transcript:
+                    errors.append(f"reconstruction_equation_missing_text:{idx}")
+                    continue
+                normalized_components.append(
+                    {
+                        "kind": "equation",
+                        "latex": latex,
+                        "transcript": transcript,
+                        "label": self._normalize_spaces(str(raw_component.get("label") or "")),
+                        "description": self._normalize_spaces(str(raw_component.get("description") or "")),
+                    }
+                )
+
+        confidence = 0.0
+        try:
+            confidence = max(0.0, min(1.0, float(raw_plan.get("confidence") or 0.0)))
+        except Exception:
+            errors.append("invalid_reconstruction_confidence")
+
+        if not normalized_components:
+            errors.append("empty_reconstruction_components")
+
+        return {
+            "mode": "ai_reconstructed",
+            "docmind_quality": quality or "poor",
+            "reason": self._normalize_spaces(str(raw_plan.get("reason") or "")),
+            "confidence": confidence,
+            "components": normalized_components,
+            "notes": [str(item).strip() for item in list(raw_plan.get("notes") or []) if str(item).strip()],
+        }, {
+            "enabled": not errors,
+            "passed": not errors,
+            "errors": errors,
+        }
+
+    def _normalize_layout_uid_combined_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        step_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        normalization_plan, text_validation = self._normalize_layout_uid_sparse_text_normalization_plan(
+            grounding=grounding,
+            step_result=step_result,
+        )
+        grouping_plan, grouping_validation = self._normalize_layout_uid_group_plan(
+            grounding=grounding,
+            step_result=step_result,
+        )
+        reconstruction_plan, reconstruction_validation = self._normalize_layout_uid_ai_reconstruction_plan(
+            step_result=step_result,
+        )
+        return {
+            "normalization_plan": normalization_plan,
+            "text_validation": text_validation,
+            "grouping_plan": grouping_plan,
+            "grouping_validation": grouping_validation,
+            "reconstruction_plan": reconstruction_plan,
+            "reconstruction_validation": reconstruction_validation,
         }
 
     async def _build_layout_uid_table_refinement_map(
@@ -3722,9 +4369,6 @@ class LiteratureReaderComposeService:
                 coalesced_groups.append(group)
                 index = lookahead
                 continue
-            if group_kind == "table_caption":
-                index += 1
-                continue
             coalesced_groups.append(group)
             index += 1
 
@@ -3747,6 +4391,25 @@ class LiteratureReaderComposeService:
             group_kind = str(group.get("group_kind") or "").strip().lower() or "paragraph"
             component = "ParagraphProse"
             props: Dict[str, Any] = {}
+            group_paragraphs: List[Dict[str, Any]] = []
+            for raw_paragraph in list(group.get("paragraphs") or []):
+                if isinstance(raw_paragraph, Mapping):
+                    text = self._normalize_spaces(str(raw_paragraph.get("text") or ""))
+                    raw_para_layout_ids = list(raw_paragraph.get("source_layout_ids") or [])
+                else:
+                    text = self._normalize_spaces(str(raw_paragraph or ""))
+                    raw_para_layout_ids = []
+                if not text:
+                    continue
+                paragraph_row: Dict[str, Any] = {"text": text}
+                paragraph_layout_ids = [
+                    str(item).strip()
+                    for item in raw_para_layout_ids
+                    if str(item).strip() and str(item).strip() in source_layout_ids
+                ]
+                if paragraph_layout_ids:
+                    paragraph_row["source_layout_ids"] = list(dict.fromkeys(paragraph_layout_ids))
+                group_paragraphs.append(paragraph_row)
             if group_kind == "title":
                 component = "SectionHeading"
                 props = {"text": " ".join(clean_texts).strip() or "Untitled", "level": 1}
@@ -3797,13 +4460,19 @@ class LiteratureReaderComposeService:
                     logical_row_plan=dict(refinement.get("logical_row_plan") or {}) if refinement else None,
                 )
             elif group_kind == "table_caption":
-                paragraphs = [{"text": text} for text in clean_texts if text]
-                merged_text = "\n\n".join(text for text in clean_texts if text).strip()
+                paragraphs = group_paragraphs or [{"text": text} for text in clean_texts if text]
+                merged_text = "\n\n".join(
+                    str(row.get("text") or "").strip()
+                    for row in paragraphs
+                    if str(row.get("text") or "").strip()
+                ).strip()
                 component = "ParagraphProse"
                 props = {
                     "text": merged_text or "[empty]",
                     "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}],
                 }
+                if group_paragraphs:
+                    props["paragraph_strategy"] = "model"
             elif group_kind == "equation":
                 component = "EquationBlock"
                 refinement = dict((equation_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
@@ -3812,10 +4481,16 @@ class LiteratureReaderComposeService:
                     equation_refinement=dict(refinement.get("normalization") or {}) if refinement else None,
                 )
             else:
-                paragraphs = [{"text": text} for text in clean_texts if text]
-                merged_text = "\n\n".join(text for text in clean_texts if text).strip()
+                paragraphs = group_paragraphs or [{"text": text} for text in clean_texts if text]
+                merged_text = "\n\n".join(
+                    str(row.get("text") or "").strip()
+                    for row in paragraphs
+                    if str(row.get("text") or "").strip()
+                ).strip()
                 component = "ParagraphProse"
                 props = {"text": merged_text or "[empty]", "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}]}
+                if group_paragraphs:
+                    props["paragraph_strategy"] = "model"
             nodes.append(
                 {
                     "node_id": str(group.get("group_id") or f"group_{order_key}").strip() or f"group_{order_key}",
@@ -3846,6 +4521,182 @@ class LiteratureReaderComposeService:
             },
         }
 
+    def _build_ai_reconstructed_panel_plan(
+        self,
+        *,
+        page: int,
+        reconstruction_plan: Mapping[str, Any],
+        page_image_url: str,
+    ) -> Dict[str, Any]:
+        nodes: List[Dict[str, Any]] = []
+        for idx, raw_component in enumerate(list(reconstruction_plan.get("components") or [])[:20], start=1):
+            if not isinstance(raw_component, Mapping):
+                continue
+            kind = str(raw_component.get("kind") or "").strip().lower()
+            node_id = f"ai_reconstructed_{idx}"
+            if kind == "heading":
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "SectionHeading",
+                        "source_layout_ids": [],
+                        "props": {
+                            "text": self._normalize_spaces(str(raw_component.get("text") or "")) or "Untitled",
+                            "level": max(1, min(4, int(raw_component.get("level") or 2))),
+                        },
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+            elif kind == "paragraph":
+                paragraphs = [
+                    {"text": self._normalize_spaces(str((row or {}).get("text") or ""))}
+                    for row in list(raw_component.get("paragraphs") or [])
+                    if self._normalize_spaces(str((row or {}).get("text") or ""))
+                ]
+                props: Dict[str, Any] = {
+                    "text": self._normalize_spaces(str(raw_component.get("text") or "")) or "[empty]",
+                }
+                if paragraphs:
+                    props["paragraphs"] = paragraphs
+                    props["paragraph_strategy"] = "model"
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "ParagraphProse",
+                        "source_layout_ids": [],
+                        "props": props,
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+            elif kind == "list":
+                items = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("items") or [])
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "ListBlock",
+                        "source_layout_ids": [],
+                        "props": {"items": items or ["[empty]"]},
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+            elif kind == "figure":
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "FigurePanel",
+                        "source_layout_ids": [],
+                        "props": {
+                            "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                            "image_url": str(page_image_url or "").strip(),
+                            "source_label": self._normalize_spaces(str(raw_component.get("source_label") or "")),
+                            "ai_insight": "",
+                        },
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+            elif kind == "table":
+                headers = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("headers") or [])
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                row_matrix = [
+                    [self._normalize_spaces(str(cell or "")) for cell in list(row or [])]
+                    for row in list(raw_component.get("rows") or [])
+                    if isinstance(row, list)
+                ]
+                row_matrix = [[cell for cell in row if cell] for row in row_matrix if any(cell for cell in row)]
+                column_count = max(len(headers), max((len(row) for row in row_matrix), default=0))
+                rows = [
+                    {
+                        f"col_{col_index + 1}": row[col_index] if col_index < len(row) else ""
+                        for col_index in range(column_count)
+                    }
+                    for row in row_matrix
+                ] if column_count > 0 else []
+                matrix: List[List[str]] = []
+                if headers:
+                    matrix.append(headers + [""] * max(0, column_count - len(headers)))
+                matrix.extend([row + [""] * max(0, column_count - len(row)) for row in row_matrix])
+                column_widths = ([1.0 / column_count] * column_count) if column_count > 0 else []
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "TablePanel",
+                        "source_layout_ids": [],
+                        "props": {
+                            "title": self._normalize_spaces(str(raw_component.get("title") or "")) or "Table",
+                            "headers": headers,
+                            "rows": rows,
+                            "matrix": matrix,
+                            "column_widths": column_widths,
+                            "table_cells": [],
+                            "header_row_count": 1 if headers else 0,
+                            "logical_rows": [],
+                            "logical_header_row_count": 0,
+                            "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                            "notes": [],
+                            "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
+                            "row_evidence": [],
+                            "cell_evidence": [],
+                            "reconstruction_mode": "ai_reconstructed",
+                            "reconstruction_notes": list(reconstruction_plan.get("notes") or []),
+                            "ai_insight": "",
+                        },
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+            elif kind == "equation":
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "component": "EquationBlock",
+                        "source_layout_ids": [],
+                        "props": {
+                            "latex": str(raw_component.get("latex") or "").strip() or self._normalize_spaces(str(raw_component.get("transcript") or "")) or "x = y",
+                            "label": self._normalize_spaces(str(raw_component.get("label") or "")),
+                            "description": self._normalize_spaces(str(raw_component.get("description") or "")),
+                            "render_mode": "math_first",
+                            "transcript": self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("latex") or "")),
+                        },
+                        "display": "default",
+                        "order_key": float(idx),
+                        "children": [],
+                    }
+                )
+        return {
+            "plan_id": f"layout_uid_ai_reconstructed_p{int(page)}",
+            "creative_direction": "AI-only page reconstruction when DocMind grounding is unusable",
+            "panels": [
+                {
+                    "panel_id": "layout_uid_ai_reconstructed_main",
+                    "nodes": nodes,
+                }
+            ],
+            "style_plan": {
+                "scheme_id": "layout_uid_ai_reconstructed",
+                "page_background": "#f6f4ef",
+                "panel_background": "rgba(255,255,255,0.92)",
+                "border_color": "rgba(120,145,170,0.24)",
+                "heading_color": "#10253d",
+                "body_color": "#21364a",
+            },
+        }
+
     async def _build_layout_uid_pipeline_result(
         self,
         *,
@@ -3861,6 +4712,7 @@ class LiteratureReaderComposeService:
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
         pipeline_version: Optional[str] = None,
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Dict[str, Any]:
         _ = (db, user_id, latency_budget_ms, selected_kb_id)
         started_at = time.perf_counter()
@@ -3900,91 +4752,229 @@ class LiteratureReaderComposeService:
                 latency_budget_ms=latency_budget_ms,
                 selected_kb_id=selected_kb_id,
                 pipeline_version=resolved_pipeline_version,
+                progress_callback=progress_callback,
             )
 
         page_image = dict(grounding.get("page_image") or {})
         rendered_page_image = str(page_image_asset.get("url") or page_image.get("url") or "").strip()
         rendered_page_image_path = str(page_image_asset.get("path") or page_image.get("path") or "").strip()
         text_normalization_map: Dict[str, Dict[str, Any]] = {}
+        model_name = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip() or "qwen-3.5-plus"
+        text_normalization_validation: Dict[str, Any] = {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+        grouping_validation: Dict[str, Any] = {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+        reconstruction_validation: Dict[str, Any] = {
+            "enabled": False,
+            "passed": True,
+            "errors": [],
+        }
+        model_result: Dict[str, Any] = {}
+        normalized_grouping_plan: Dict[str, Any] = {
+            "groups": [],
+            "omissions": [],
+            "notes": [],
+        }
+        ai_reconstruction_plan: Dict[str, Any] = {
+            "mode": "grounded",
+            "docmind_quality": "",
+            "reason": "",
+            "confidence": 0.0,
+            "components": [],
+            "notes": [],
+        }
         if rendered_page_image or rendered_page_image_path:
-            text_normalization_prompt_payload = self._build_layout_uid_text_normalization_prompt_payload(
+            combined_prompt_payload = self._build_layout_uid_combined_prompt_payload(
+                paper=paper,
                 page=page,
                 grounding=grounding,
+                payload=payload,
             )
-            if list(text_normalization_prompt_payload.get("layout_atoms") or []):
-                text_normalization_result = await self._invoke_single_agent_model(
-                    system_prompt=self._layout_uid_text_normalization_system_prompt(),
-                    user_prompt=text_normalization_prompt_payload,
+            if list(combined_prompt_payload.get("layout_atoms") or []):
+                planning_started_at = time.perf_counter()
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "grouping",
+                        "status": "started",
+                        "message": "正在修复页面文本并组织阅读流",
+                        "page": int(page),
+                        "model": model_name,
+                    },
+                )
+                model_result = await self._invoke_single_agent_model(
+                    system_prompt=self._layout_uid_combined_system_prompt(),
+                    user_prompt=combined_prompt_payload,
                     rendered_page_image=rendered_page_image,
                     rendered_page_image_path=rendered_page_image_path,
                     step=1,
-                    phase="layout_uid_text_normalization",
+                    phase="layout_uid_combined_plan",
                 )
-                normalized_text_plan, text_normalization_validation = self._normalize_layout_uid_text_normalization_plan(
+                combined_plan = self._normalize_layout_uid_combined_plan(
                     grounding=grounding,
-                    step_result=dict(text_normalization_result.get("step_result") or {}),
+                    step_result=dict(model_result.get("step_result") or {}),
                 )
+                normalized_text_plan = dict(combined_plan.get("normalization_plan") or {})
+                text_normalization_validation = dict(combined_plan.get("text_validation") or {})
+                normalized_grouping_plan = dict(combined_plan.get("grouping_plan") or {})
+                grouping_validation = dict(combined_plan.get("grouping_validation") or {})
+                ai_reconstruction_plan = dict(combined_plan.get("reconstruction_plan") or {})
+                reconstruction_validation = dict(combined_plan.get("reconstruction_validation") or {})
                 text_normalization_map = {
                     "normalization_plan": normalized_text_plan,
                     "validation": text_normalization_validation,
-                    "usage": dict(text_normalization_result.get("usage") or {}),
-                    "model_status": str(text_normalization_result.get("status") or "").strip().lower() or "done",
+                    "usage": dict(model_result.get("usage") or {}),
+                    "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+                    "planning_mode": "combined_once",
                 }
                 grounding = self._apply_layout_uid_text_normalization_to_grounding(
                     grounding=grounding,
                     normalization_plan=normalized_text_plan,
                 )
                 payload["page_grounding_v1"] = grounding
-        prompt_payload = self._build_layout_uid_prompt_payload(
-            paper=paper,
-            page=page,
-            grounding=grounding,
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "grouping",
+                        "status": "done",
+                        "message": "页面文本修复与阅读流组织完成",
+                        "page": int(page),
+                        "model": model_name,
+                        "elapsed_ms": int(max(0.0, (time.perf_counter() - planning_started_at) * 1000.0)),
+                    },
+                )
+        use_ai_reconstruction = (
+            str(ai_reconstruction_plan.get("mode") or "").strip().lower() == "ai_reconstructed"
+            and bool(reconstruction_validation.get("enabled"))
+            and bool(list(ai_reconstruction_plan.get("components") or []))
         )
-        model_result = await self._invoke_single_agent_model(
-            system_prompt=self._layout_uid_grouping_system_prompt(),
-            user_prompt=prompt_payload,
-            rendered_page_image=rendered_page_image,
-            rendered_page_image_path=rendered_page_image_path,
-            step=1,
-            phase="layout_uid_grouping",
+        if not use_ai_reconstruction and not list(normalized_grouping_plan.get("groups") or []):
+            normalized_grouping_plan = self._build_layout_uid_fallback_group_plan(grounding=grounding)
+            grouping_validation = {
+                "passed": False,
+                "errors": ["empty_groups"],
+                "fallback_used": True,
+            }
+        table_refinement_map: Dict[str, Any] = {}
+        equation_refinement_map: Dict[str, Any] = {}
+        if not use_ai_reconstruction:
+            table_groups = [
+                row for row in list(normalized_grouping_plan.get("groups") or [])
+                if isinstance(row, Mapping) and str(row.get("group_kind") or "").strip().lower() == "table"
+            ]
+            if table_groups:
+                table_started_at = time.perf_counter()
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "table_refinement",
+                        "status": "started",
+                        "message": "正在细化表格结构",
+                        "page": int(page),
+                        "group_count": len(table_groups),
+                    },
+                )
+            table_refinement_map = await self._build_layout_uid_table_refinement_map(
+                page=page,
+                grouping_plan=normalized_grouping_plan,
+                grounding=grounding,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+            )
+            if table_groups:
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "table_refinement",
+                        "status": "done",
+                        "message": "表格结构细化完成",
+                        "page": int(page),
+                        "group_count": len(table_groups),
+                        "elapsed_ms": int(max(0.0, (time.perf_counter() - table_started_at) * 1000.0)),
+                    },
+                )
+            equation_groups = [
+                row for row in list(normalized_grouping_plan.get("groups") or [])
+                if isinstance(row, Mapping) and str(row.get("group_kind") or "").strip().lower() == "equation"
+            ]
+            if equation_groups:
+                equation_started_at = time.perf_counter()
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "equation_refinement",
+                        "status": "started",
+                        "message": "正在细化公式表达",
+                        "page": int(page),
+                        "group_count": len(equation_groups),
+                    },
+                )
+            equation_refinement_map = await self._build_layout_uid_equation_refinement_map(
+                page=page,
+                grouping_plan=normalized_grouping_plan,
+                grounding=grounding,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+            )
+            if equation_groups:
+                await self._emit_progress_event(
+                    progress_callback,
+                    event="stage",
+                    data={
+                        "stage": "equation_refinement",
+                        "status": "done",
+                        "message": "公式表达细化完成",
+                        "page": int(page),
+                        "group_count": len(equation_groups),
+                        "elapsed_ms": int(max(0.0, (time.perf_counter() - equation_started_at) * 1000.0)),
+                    },
+                )
+        # /read no longer performs image-grounded figure explanation in the hot path.
+        # Keep figure nodes renderable, but leave ai_insight empty unless another surface
+        # (for example /experience or /workbench) enriches them separately.
+        figure_refinement_map: Dict[str, Any] = {}
+        assembly_started_at = time.perf_counter()
+        await self._emit_progress_event(
+            progress_callback,
+            event="stage",
+            data={
+                "stage": "ui_assembly",
+                "status": "started",
+                "message": "正在装配阅读界面",
+                "page": int(page),
+            },
         )
-        normalized_grouping_plan, grouping_validation = self._normalize_layout_uid_group_plan(
-            grounding=grounding,
-            step_result=dict(model_result.get("step_result") or {}),
-        )
-        table_refinement_map = await self._build_layout_uid_table_refinement_map(
-            page=page,
-            grouping_plan=normalized_grouping_plan,
-            grounding=grounding,
-            rendered_page_image=rendered_page_image,
-            rendered_page_image_path=rendered_page_image_path,
-        )
-        equation_refinement_map = await self._build_layout_uid_equation_refinement_map(
-            page=page,
-            grouping_plan=normalized_grouping_plan,
-            grounding=grounding,
-            rendered_page_image=rendered_page_image,
-            rendered_page_image_path=rendered_page_image_path,
-        )
-        figure_refinement_map = await self._build_layout_uid_figure_refinement_map(
-            page=page,
-            grouping_plan=normalized_grouping_plan,
-            grounding=grounding,
-            rendered_page_image=rendered_page_image,
-            rendered_page_image_path=rendered_page_image_path,
-        )
-        panel_plan = self._layout_uid_group_plan_to_panel_plan(
-            page=page,
-            grouping_plan=normalized_grouping_plan,
-            grounding=grounding,
-            figure_refinements=figure_refinement_map,
-            table_refinements=table_refinement_map,
-            equation_refinements=equation_refinement_map,
-        )
-        docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
-            page=page,
-            base_payload=payload,
-        )
+        if use_ai_reconstruction:
+            panel_plan = self._build_ai_reconstructed_panel_plan(
+                page=page,
+                reconstruction_plan=ai_reconstruction_plan,
+                page_image_url=rendered_page_image,
+            )
+            docmind_blocks, layout_to_block_ids = [], {}
+        else:
+            panel_plan = self._layout_uid_group_plan_to_panel_plan(
+                page=page,
+                grouping_plan=normalized_grouping_plan,
+                grounding=grounding,
+                figure_refinements=figure_refinement_map,
+                table_refinements=table_refinement_map,
+                equation_refinements=equation_refinement_map,
+            )
+            docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
+                page=page,
+                base_payload=payload,
+            )
         ui_plan = self._panel_plan_to_ui_plan(
             page=page,
             panel_plan=panel_plan,
@@ -3995,6 +4985,17 @@ class LiteratureReaderComposeService:
             theme_mode=theme_mode,
             detail_level=detail_level,
             compare_mode=compare_mode,
+        )
+        await self._emit_progress_event(
+            progress_callback,
+            event="stage",
+            data={
+                "stage": "ui_assembly",
+                "status": "done",
+                "message": "阅读界面装配完成",
+                "page": int(page),
+                "elapsed_ms": int(max(0.0, (time.perf_counter() - assembly_started_at) * 1000.0)),
+            },
         )
         used_layout_ids = self._collect_source_layout_ids_from_panel_plan(panel_plan=panel_plan)
         component_hints = self._collect_component_hints_from_panel_plan(panel_plan=panel_plan)
@@ -4019,8 +5020,10 @@ class LiteratureReaderComposeService:
         usage = dict(model_result.get("usage") or {})
         status_value = str(model_result.get("status") or "done").strip().lower() or "done"
         used_fallback = bool(grouping_validation.get("fallback_used"))
+        reconstruction_used = bool(use_ai_reconstruction)
         decision_log = [
-            "layout_uid_v1:unique_id_grouping",
+            "layout_uid_v1:combined_plan_once",
+            f"layout_uid_v1:reconstruction_mode={'ai_reconstructed' if reconstruction_used else 'grounded'}",
             f"layout_uid_v1:text_normalized={len(list(((text_normalization_map.get('normalization_plan') or {}).get('items') or [])))}",
             f"layout_uid_v1:groups={len(list(normalized_grouping_plan.get('groups') or []))}",
             f"layout_uid_v1:omissions={len(omissions)}",
@@ -4032,14 +5035,22 @@ class LiteratureReaderComposeService:
             for item in list(normalized_grouping_plan.get("notes") or [])
             if str(item).strip()
         ]
+        if reconstruction_used and str(ai_reconstruction_plan.get("reason") or "").strip():
+            decision_log.append(f"layout_uid_v1:reconstruction_reason={str(ai_reconstruction_plan.get('reason') or '').strip()}")
         validation_errors = [str(item).strip() for item in list(grouping_validation.get("errors") or []) if str(item).strip()]
+        if reconstruction_used:
+            validation_errors = []
 
         payload["scheme_choice"] = {
-            "scheme_id": "layout_uid_v1",
-            "label": "Layout unique-id grouping",
-            "rationale": "Group by DocMind uniqueId and materialize a lightweight /read flow.",
-            "source": "layout_uid_v1",
-            "candidate_ids": ["layout_uid_v1"],
+            "scheme_id": "layout_uid_ai_reconstructed" if reconstruction_used else "layout_uid_v1",
+            "label": "AI reconstruction" if reconstruction_used else "Layout unique-id grouping",
+            "rationale": (
+                "DocMind grounding was judged too poor, so /read was reconstructed directly from the page image."
+                if reconstruction_used else
+                "Group by DocMind uniqueId and materialize a lightweight /read flow."
+            ),
+            "source": "layout_uid_ai_reconstructed" if reconstruction_used else "layout_uid_v1",
+            "candidate_ids": ["layout_uid_ai_reconstructed" if reconstruction_used else "layout_uid_v1"],
         }
         payload["decision_log"] = decision_log
         payload["omission_decisions"] = omission_decisions
@@ -4047,6 +5058,17 @@ class LiteratureReaderComposeService:
             "template": f"/literature/{int(paper.id)}/read/review",
             "mode": "compose_review_v1",
         }
+        if reconstruction_used:
+            payload["grounding_mode"] = "ai_reconstructed"
+            payload["evidence_enabled"] = False
+            payload["runtime_build_plan_evidence"] = False
+            payload["page_grounding_policy"] = {
+                "mode": "ai_reconstructed",
+                "evidence_enabled": False,
+                "reason": str(ai_reconstruction_plan.get("reason") or "").strip(),
+                "docmind_quality": str(ai_reconstruction_plan.get("docmind_quality") or "").strip(),
+                "confidence": float(ai_reconstruction_plan.get("confidence") or 0.0),
+            }
         payload["qwen_plan_meta"] = {
             "used": True,
             "reason": "layout_uid_v1",
@@ -4056,18 +5078,21 @@ class LiteratureReaderComposeService:
             "total_tokens": int(usage.get("total_tokens") or 0),
             "pipeline_version": resolved_pipeline_version,
             "fallback_used": used_fallback,
+            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
         }
         payload["layout_advice_v3"] = {
-            "source": "layout_uid_v1",
+            "source": "layout_uid_ai_reconstructed" if reconstruction_used else "layout_uid_v1",
             "ordered_block_ids": used_layout_ids,
             "suggested_components": component_hints,
             "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
             "text_normalizations": text_normalization_map,
+            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
             "figure_refinements": figure_refinement_map,
             "table_refinements": table_refinement_map,
             "visual_hints": [],
             "notes": list(decision_log),
             "omitted_layout_ids": [str(row.get("layout_id") or "").strip() for row in omissions],
+            "reconstruction": dict(ai_reconstruction_plan),
         }
         payload["minimal_gate_report"] = {
             "passed": not validation_errors,
@@ -4087,27 +5112,39 @@ class LiteratureReaderComposeService:
             "pipeline": "reader_layout_uid_v1",
             "elapsed_ms": elapsed_ms,
             "text_normalization": text_normalization_map,
+            "text_normalization_validation": dict(text_normalization_validation),
             "grouping_validation": dict(grouping_validation),
+            "reconstruction_validation": dict(reconstruction_validation),
+            "reconstruction_plan": dict(ai_reconstruction_plan),
+            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
         }
+        quality_overall = 0.95 if not used_fallback and status_value == "done" else 0.76
+        if reconstruction_used:
+            quality_overall = max(0.68, min(0.9, float(ai_reconstruction_plan.get("confidence") or 0.74)))
         quality_report = {
-            "overall": 0.95 if not used_fallback and status_value == "done" else 0.76,
+            "overall": quality_overall,
             "hard_constraints_passed": not validation_errors,
             "validation_errors": validation_errors,
             "quality_target": 0.0,
             "elapsed_ms": elapsed_ms,
             "iterations": 1,
             "degraded": used_fallback or status_value != "done",
-            "stop_reason": "layout_uid_v1_fallback" if used_fallback else "layout_uid_v1_done",
+            "stop_reason": (
+                "layout_uid_v1_ai_reconstructed"
+                if reconstruction_used else
+                ("layout_uid_v1_fallback" if used_fallback else "layout_uid_v1_done")
+            ),
             "schema_valid": True,
             "whitelist_valid": True,
             "ownership_unchanged": True,
-            "full_coverage": not any(item.startswith("missing_layout_id:") for item in validation_errors),
+            "full_coverage": True if reconstruction_used else not any(item.startswith("missing_layout_id:") for item in validation_errors),
             "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
             "source_text_immutable": True,
             "pipeline_latency_ms": elapsed_ms,
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
+            "grounded_evidence_enabled": not reconstruction_used,
         }
         loop_result = {
             "ui_plan": ui_plan,
@@ -4117,7 +5154,7 @@ class LiteratureReaderComposeService:
             "iterations": 1,
             "degraded": bool(quality_report.get("degraded")),
             "stop_reason": str(quality_report.get("stop_reason") or "layout_uid_v1_done"),
-            "build_mode": "compose_agent_layout_uid_v1",
+            "build_mode": "compose_ai_reconstructed" if reconstruction_used else "compose_agent_layout_uid_v1",
         }
         assets = [
             row
@@ -4145,7 +5182,9 @@ class LiteratureReaderComposeService:
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
         pipeline_version: Optional[str] = None,
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Dict[str, Any]:
+        _ = progress_callback
         started_at = time.perf_counter()
         resolved_pipeline_version = self._pipeline_version(pipeline_version)
         logger.info(
@@ -6645,7 +7684,9 @@ class LiteratureReaderComposeService:
         compare_mode: bool,
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
     ) -> Dict[str, Any]:
+        _ = progress_callback
         started_at = time.perf_counter()
         payload = dict(base_payload or {})
         page_structure_v3 = dict(payload.get("page_structure_v3") or {})
@@ -14320,6 +15361,7 @@ class LiteratureReaderComposeService:
             rows[idx] = node
             for candidate_idx in reversed(consumed_indices):
                 rows.pop(candidate_idx)
+            idx += 1
             continue
 
         return rows
@@ -16137,6 +17179,12 @@ class LiteratureReaderComposeService:
 
     def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         cloned = dict(payload or {})
+        grounding_mode = str(
+            cloned.get("grounding_mode")
+            or ((cloned.get("page_grounding_policy") or {}).get("mode") if isinstance(cloned.get("page_grounding_policy"), Mapping) else "")
+            or ""
+        ).strip().lower()
+        evidence_disabled = grounding_mode == "ai_reconstructed" or bool(cloned.get("evidence_enabled") is False)
         cloned["paper_id"] = int(cloned.get("paper_id") or 0)
         cloned["page"] = max(1, int(cloned.get("page") or page))
         if str(cloned.get("status") or "").strip().lower() not in {"done", "fallback"}:
@@ -16183,7 +17231,13 @@ class LiteratureReaderComposeService:
                 quality_report=quality_report,
                 minimal_gate_report=dict(cloned.get("minimal_gate_report") or {}),
             )
-        no_drop_report = self._enforce_no_drop_blocks_fallback(
+        no_drop_report = {
+            "triggered": False,
+            "strategy": "",
+            "error_code": "",
+            "missing_block_ids": [],
+            "inserted_node_ids": [],
+        } if evidence_disabled else self._enforce_no_drop_blocks_fallback(
             page=page,
             payload=cloned,
             ui_plan=ui_plan,
@@ -16230,6 +17284,8 @@ class LiteratureReaderComposeService:
             ui_plan=ui_plan,
             quality_report=quality_report,
         )
+        if evidence_disabled:
+            quality_report["grounded_evidence_enabled"] = False
         cloned["quality_report"] = quality_report
         cloned["validation_report"] = validation_report
 
@@ -16340,6 +17396,7 @@ class LiteratureReaderComposeService:
                 props = dict(node.get("props") or {})
                 if node_type == "ParagraphProse":
                     text = self._repair_text_artifacts(self._normalize_spaces(str(props.get("text") or "")))
+                    paragraph_strategy = str(props.get("paragraph_strategy") or "").strip().lower()
                     if text in {"", "[empty]"} and not canonical_ids:
                         continue
                     if _only_page_chrome(canonical_ids):
@@ -16349,16 +17406,40 @@ class LiteratureReaderComposeService:
                         block_group_index=block_group_index,
                     )
                     raw_paragraphs = props.get("paragraphs")
-                    existing_paragraphs = [
-                        {"text": self._repair_text_artifacts(self._normalize_spaces(str((row or {}).get("text") if isinstance(row, Mapping) else row)))}
-                        for row in list(raw_paragraphs or [])
-                        if self._repair_text_artifacts(
-                            self._normalize_spaces(str((row or {}).get("text") if isinstance(row, Mapping) else row))
-                        )
-                    ] if isinstance(raw_paragraphs, list) else []
+                    existing_paragraphs: List[Dict[str, Any]] = []
+                    if isinstance(raw_paragraphs, list):
+                        for raw_row in raw_paragraphs:
+                            if isinstance(raw_row, Mapping):
+                                paragraph_text = self._repair_text_artifacts(
+                                    self._normalize_spaces(str(raw_row.get("text") or ""))
+                                )
+                                raw_para_layout_ids = list(raw_row.get("source_layout_ids") or [])
+                            else:
+                                paragraph_text = self._repair_text_artifacts(
+                                    self._normalize_spaces(str(raw_row or ""))
+                                )
+                                raw_para_layout_ids = []
+                            if not paragraph_text:
+                                continue
+                            paragraph_row: Dict[str, Any] = {"text": paragraph_text}
+                            paragraph_layout_ids = [
+                                str(item).strip()
+                                for item in raw_para_layout_ids
+                                if str(item).strip()
+                            ]
+                            if paragraph_layout_ids:
+                                paragraph_row["source_layout_ids"] = list(dict.fromkeys(paragraph_layout_ids))
+                            existing_paragraphs.append(paragraph_row)
                     if source_text and (text in {"", "[empty]"} or self._has_broken_words(text)):
                         text = source_text
-                    if len(canonical_ids) >= 2:
+                    if paragraph_strategy == "model" and existing_paragraphs:
+                        props["paragraphs"] = existing_paragraphs
+                        text = "\n\n".join(
+                            str(row.get("text") or "").strip()
+                            for row in existing_paragraphs
+                            if str(row.get("text") or "").strip()
+                        )
+                    elif len(canonical_ids) >= 2:
                         inferred = self._infer_paragraph_rows_from_block_groups(
                             canonical_ids=canonical_ids,
                             block_group_index=block_group_index,
@@ -17893,13 +18974,62 @@ class LiteratureReaderComposeService:
         except Exception:
             return None
 
+    async def _read_lock_token(self, lock_key: str) -> Optional[str]:
+        client = await self._resolve_redis_client()
+        if client is None:
+            return None
+        try:
+            value = await client.get(lock_key)
+        except Exception:
+            return None
+        if value is None:
+            return None
+        token = value.decode("utf-8") if isinstance(value, (bytes, bytearray)) else str(value)
+        token = str(token or "").strip()
+        return token or None
+
+    async def _refresh_lock(self, lock_key: str, token: str) -> bool:
+        client = await self._resolve_redis_client()
+        if client is None:
+            return False
+        try:
+            current = await client.get(lock_key)
+            current_token = current.decode("utf-8") if isinstance(current, (bytes, bytearray)) else str(current or "")
+            if str(current_token or "").strip() != str(token or "").strip():
+                return False
+            await client.expire(lock_key, max(1, LOCK_TTL_SECONDS))
+            return True
+        except Exception:
+            return False
+
+    async def _maintain_lock(
+        self,
+        *,
+        lock_key: str,
+        token: str,
+        stop_event: asyncio.Event,
+    ) -> None:
+        interval = max(5.0, min(float(LOCK_TTL_SECONDS) / 3.0, 30.0))
+        try:
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    break
+                except asyncio.TimeoutError:
+                    refreshed = await self._refresh_lock(lock_key, token)
+                    if not refreshed:
+                        break
+        except Exception:
+            return
+
     async def _release_lock(self, lock_key: str, token: str) -> None:
         client = await self._resolve_redis_client()
         if client is None:
             return
         try:
             current = await client.get(lock_key)
-            if current == token:
+            current_token = current.decode("utf-8") if isinstance(current, (bytes, bytearray)) else str(current or "")
+            if str(current_token or "").strip() == str(token or "").strip():
                 await client.delete(lock_key)
         except Exception:
             pass

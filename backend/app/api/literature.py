@@ -12221,6 +12221,76 @@ async def stream_reader_composed_page(
     page_num = max(1, int(payload.page))
 
     async def event_generator():
+        heartbeat_interval_seconds = 3.0
+        progress_state: Dict[str, Any] = {
+            "stage": "compose_pending",
+            "message": "正在准备阅读骨架",
+            "build_started_at": time.perf_counter(),
+            "stage_started_at": time.perf_counter(),
+        }
+        event_queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
+
+        async def enqueue_progress_event(event: str, data: Any) -> None:
+            if event == "stage" and isinstance(data, Mapping):
+                now = time.perf_counter()
+                stage_token = str(data.get("stage") or "").strip()
+                status_token = str(data.get("status") or "").strip().lower()
+                message_token = str(data.get("message") or "").strip()
+                if status_token == "started":
+                    progress_state["stage"] = stage_token or progress_state.get("stage") or "compose_pending"
+                    progress_state["message"] = message_token or progress_state.get("message") or "正在生成阅读界面"
+                    progress_state["stage_started_at"] = now
+                elif status_token == "done":
+                    if stage_token:
+                        progress_state["stage"] = stage_token
+                    if message_token:
+                        progress_state["message"] = message_token
+            await event_queue.put((str(event or "").strip() or "stage", data))
+
+        async def build_payload_in_background() -> None:
+            try:
+                async with async_session_factory() as db:
+                    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+                    composed_payload, meta = await service.build_or_get_composed_payload(
+                        db=db,
+                        user_id=int(current_user.id),
+                        paper=paper,
+                        page=page_num,
+                        selected_kb_id=payload.selected_kb_id,
+                        pipeline_version_override=getattr(payload, "pipeline_version", None),
+                        force_refresh=bool(payload.force_refresh),
+                        regenerate=bool(payload.regenerate),
+                        latency_budget_ms=payload.latency_budget_ms,
+                        quality_target=payload.quality_target,
+                        max_iterations=getattr(payload, "max_iterations", None),
+                        style_intent=payload.style_intent,
+                        theme_mode=getattr(payload, "theme_mode", None),
+                        detail_level=getattr(payload, "detail_level", None),
+                        compare_mode=getattr(payload, "compare_mode", None),
+                        citation_tldr=getattr(payload, "citation_tldr", None),
+                        publish_ready_event_enabled=False,
+                        progress_callback=enqueue_progress_event,
+                    )
+                await event_queue.put(
+                    (
+                        "__build_complete__",
+                        {
+                            "composed_payload": composed_payload,
+                            "meta": meta,
+                        },
+                    )
+                )
+            except RenderPipelineContractError as exc:
+                logger.warning(
+                    f"[Literature API] composed stream contract failed paper={paper_id}, page={page_num}: "
+                    f"stage={exc.stage} code={exc.code} message={exc.message}"
+                )
+                await event_queue.put(("__contract_error__", exc.to_dict()))
+            except Exception as exc:
+                logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
+                await event_queue.put(("__error__", {"message": str(exc)}))
+
+        build_task: Optional[asyncio.Task[Any]] = None
         try:
             logger.info(
                 "[Literature API] composed stream start "
@@ -12244,27 +12314,73 @@ async def stream_reader_composed_page(
                     },
                 },
             )
-            async with async_session_factory() as db:
-                paper = await _get_owned_paper_or_404(db, current_user, paper_id)
-                composed_payload, meta = await service.build_or_get_composed_payload(
-                    db=db,
-                    user_id=int(current_user.id),
-                    paper=paper,
-                    page=page_num,
-                    selected_kb_id=payload.selected_kb_id,
-                    pipeline_version_override=getattr(payload, "pipeline_version", None),
-                    force_refresh=bool(payload.force_refresh),
-                    regenerate=bool(payload.regenerate),
-                    latency_budget_ms=payload.latency_budget_ms,
-                    quality_target=payload.quality_target,
-                    max_iterations=getattr(payload, "max_iterations", None),
-                    style_intent=payload.style_intent,
-                    theme_mode=getattr(payload, "theme_mode", None),
-                    detail_level=getattr(payload, "detail_level", None),
-                    compare_mode=getattr(payload, "compare_mode", None),
-                    citation_tldr=getattr(payload, "citation_tldr", None),
-                    publish_ready_event_enabled=False,
-                )
+            build_task = asyncio.create_task(build_payload_in_background())
+
+            composed_payload: Optional[Dict[str, Any]] = None
+            meta = None
+            while True:
+                if await request.is_disconnected():
+                    logger.warning(
+                        f"[Literature API] composed stream client disconnected before emit done "
+                        f"paper={paper_id} page={page_num}"
+                    )
+                    if build_task is not None:
+                        build_task.cancel()
+                    return
+                try:
+                    event_name, event_data = await asyncio.wait_for(
+                        event_queue.get(),
+                        timeout=heartbeat_interval_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    if build_task is not None and build_task.done() and event_queue.empty():
+                        break
+                    now = time.perf_counter()
+                    yield _sse_payload(
+                        "heartbeat",
+                        {
+                            "page": int(page_num),
+                            "stage": str(progress_state.get("stage") or "compose_pending"),
+                            "message": str(progress_state.get("message") or "正在生成阅读界面"),
+                            "elapsed_ms": int(max(0.0, (now - float(progress_state.get("build_started_at") or now)) * 1000.0)),
+                            "stage_elapsed_ms": int(max(0.0, (now - float(progress_state.get("stage_started_at") or now)) * 1000.0)),
+                        },
+                    )
+                    continue
+                if event_name == "__build_complete__":
+                    composed_payload = dict((event_data or {}).get("composed_payload") or {})
+                    meta = (event_data or {}).get("meta")
+                    break
+                if event_name == "__contract_error__":
+                    error_payload = dict(event_data or {})
+                    yield _sse_payload(
+                        "component_error",
+                        {
+                            "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                            "stage": str(error_payload.get("stage") or ""),
+                            "code": str(error_payload.get("code") or ""),
+                            "details": dict(error_payload.get("details") or {}),
+                            "errors": [str(error_payload.get("code") or "")],
+                        },
+                    )
+                    yield _sse_payload(
+                        "error",
+                        {
+                            "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
+                            "stage": str(error_payload.get("stage") or ""),
+                            "code": str(error_payload.get("code") or ""),
+                        },
+                    )
+                    return
+                if event_name == "__error__":
+                    yield _sse_payload("error", {"message": str((event_data or {}).get("message") or "stream_build_failed")})
+                    return
+                yield _sse_payload(event_name, event_data)
+
+            if composed_payload is None or meta is None:
+                yield _sse_payload("error", {"message": "stream_build_incomplete"})
+                return
+
             logger.info(
                 "[Literature API] composed stream built "
                 f"paper={paper_id} page={page_num} cache_hit={bool(meta.cache_hit)} cache_layer={meta.cache_layer} "
@@ -12463,33 +12579,18 @@ async def stream_reader_composed_page(
             logger.info(
                 f"[Literature API] composed stream done emitted paper={paper_id} page={page_num}"
             )
-        except RenderPipelineContractError as exc:
-            logger.warning(
-                f"[Literature API] composed stream contract failed paper={paper_id}, page={page_num}: "
-                f"stage={exc.stage} code={exc.code} message={exc.message}"
-            )
-            error_payload = exc.to_dict()
-            yield _sse_payload(
-                "component_error",
-                {
-                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
-                    "stage": str(error_payload.get("stage") or ""),
-                    "code": str(error_payload.get("code") or ""),
-                    "details": dict(error_payload.get("details") or {}),
-                    "errors": [str(error_payload.get("code") or "")],
-                },
-            )
-            yield _sse_payload(
-                "error",
-                {
-                    "message": str(error_payload.get("message") or "render_pipeline_contract_error"),
-                    "stage": str(error_payload.get("stage") or ""),
-                    "code": str(error_payload.get("code") or ""),
-                },
-            )
         except Exception as exc:
             logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
             yield _sse_payload("error", {"message": str(exc)})
+        finally:
+            if build_task is not None and not build_task.done():
+                build_task.cancel()
+                try:
+                    await build_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
 
     return StreamingResponse(
         event_generator(),

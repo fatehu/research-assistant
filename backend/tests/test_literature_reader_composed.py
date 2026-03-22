@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import sys
 from types import SimpleNamespace
 from io import BytesIO
@@ -130,6 +131,97 @@ async def test_force_refresh_lock_contention_should_not_read_stale_cache(monkeyp
     assert str(payload.get("status") or "") == "fallback"
     assert str(payload.get("degraded_reason") or "") == "force_refresh_lock_timeout"
     assert reads["redis"] == 0
+
+
+@pytest.mark.asyncio
+async def test_waiting_request_should_reuse_redis_payload_without_duplicate_build(monkeypatch):
+    service = LiteratureReaderComposeService()
+    state = {"redis_reads": 0}
+
+    monkeypatch.setattr(compose_module, "LOCK_RESULT_WAIT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(compose_module, "LOCK_POLL_INTERVAL_SECONDS", 0.01, raising=False)
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-demo"
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_compatible_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_payload_from_redis(_key):
+        state["redis_reads"] += 1
+        if state["redis_reads"] < 3:
+            return None
+        return {
+            "paper_id": 1,
+            "page": 1,
+            "status": "done",
+            "pipeline_version": "layout_uid_v1",
+            "engine_version": "reader_compose_v15",
+            "source_signature": "sig-demo",
+            "build_mode": "compose_agent_layout_uid_v1",
+            "ui_plan": {
+                "plan_id": "done_plan",
+                "components": [
+                    {
+                        "id": "done_node_1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "reused"},
+                        "children": [],
+                        "source_anchor_refs": [],
+                        "source_block_ids": ["p1_b1"],
+                    }
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+            "assets": [],
+            "quality_report": {"overall": 0.9, "iterations": 1, "degraded": False, "stop_reason": "layout_uid_v1_done"},
+            "iteration_trace": [],
+            "main_block_ids": ["p1_b1"],
+            "aux_block_ids": [],
+            "validation_report": _validation_report_stub(True),
+            "generated_at": "2026-03-02T00:00:00Z",
+        }
+
+    async def _always_no_lock(_lock_key):
+        return None
+
+    async def _read_lock_token(_lock_key):
+        return "other-token"
+
+    async def _no_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _should_not_build(**_kwargs):
+        raise AssertionError("waiting request should not start a duplicate compose build")
+
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_read_compatible_payload_from_db", _read_compatible_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _always_no_lock)
+    monkeypatch.setattr(service, "_read_lock_token", _read_lock_token)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _no_overlay)
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _should_not_build)
+    monkeypatch.setattr(service, "_build_layout_uid_pipeline_result", _should_not_build)
+
+    payload, meta = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=1, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=False,
+    )
+
+    assert str(payload.get("status") or "") == "done"
+    assert str(payload.get("build_mode") or "") == "compose_agent_layout_uid_v1"
+    assert state["redis_reads"] >= 3
+    assert meta.cache_hit is True
+    assert meta.cache_layer == "redis"
 
 
 def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
@@ -861,13 +953,59 @@ def test_sanitize_components_for_runtime_should_clean_noisy_figure_meta_and_merg
         "for inputs encoded as open-ended questions or multiple choice single answer. "
         "answer without (MC-NJ) or with forced justification(MC-J)."
     )
-    assert "Open-Ended100-Accurate" not in str(figure_props.get("ai_insight") or "")
-    assert "Fig 2. Accuracy of ChatGPT on USMLE." in str(figure_props.get("ai_insight") or "")
+    assert str(figure_props.get("ai_insight") or "") == ""
     assert str(figure_props.get("source_label") or "") == "Fig 2"
     assert list(figure.get("source_block_ids") or []) == ["p6_fig_meta", "p6_cap_1", "p6_cap_2", "p6_cap_3"]
     assert str((sanitized[1] or {}).get("props", {}).get("text") or "") == (
         "We first examined the frequency (prevalence) of insight."
     )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signal timer unavailable on Windows")
+def test_reposition_and_caption_figure_panels_should_not_loop_on_single_figure_without_caption_candidates():
+    service = LiteratureReaderComposeService()
+    nodes = [
+        {
+            "id": "fig_only",
+            "type": "FigurePanel",
+            "props": {"caption": "", "image_url": "asset:layout_fig"},
+            "children": [],
+            "source_anchor_refs": [],
+            "source_block_ids": ["p14_dm_p14_l002_b001"],
+            "zone_type": "main_body",
+            "column_id": "main",
+        }
+    ]
+    block_group_index = {
+        "p14_dm_p14_l002_b001": {
+            "block_id": "dm_p14_l002_b001",
+            "text": "| The|The|The|The| | ---|---|---|---| | | |The|",
+            "layout_type": "table",
+            "layout_sub_type": "none",
+            "kind": "paragraph",
+            "layout_unique_id": "layout_fig",
+        }
+    }
+    layout_block_id_alias_map = {"layout_fig": ["p14_dm_p14_l002_b001"]}
+
+    def _timeout(_signum, _frame):
+        raise TimeoutError("reposition figure panels timed out")
+
+    previous_handler = signal.signal(signal.SIGALRM, _timeout)
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
+    try:
+        result = service._reposition_and_caption_figure_panels(  # pylint: disable=protected-access
+            page=14,
+            nodes=nodes,
+            block_group_index=block_group_index,
+            layout_block_id_alias_map=layout_block_id_alias_map,
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    assert len(result) == 1
+    assert str((result[0] or {}).get("id") or "") == "fig_only"
 
 
 def test_enforce_no_drop_blocks_fallback_should_ignore_intentional_omissions():
@@ -7318,21 +7456,19 @@ async def test_build_layout_uid_pipeline_result_should_not_overwrite_grounding_p
     )
     monkeypatch.setattr(
         service,
-        "_build_layout_uid_text_normalization_prompt_payload",
+        "_build_layout_uid_combined_prompt_payload",
         lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout_list_1"}]},
     )
+    call_counter = {"count": 0}
 
     async def _fake_invoke_single_agent_model(**kwargs):
+        call_counter["count"] += 1
         phase = str(kwargs.get("phase") or "")
-        if phase == "layout_uid_text_normalization":
-            return {
-                "status": "done",
-                "step_result": {"items": []},
-                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
-            }
+        assert phase == "layout_uid_combined_plan"
         return {
             "status": "done",
             "step_result": {
+                "text_items": [],
                 "groups": [
                     {
                         "group_id": "group_1",
@@ -7349,26 +7485,18 @@ async def test_build_layout_uid_pipeline_result_should_not_overwrite_grounding_p
     monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
     monkeypatch.setattr(
         service,
-        "_normalize_layout_uid_text_normalization_plan",
-        lambda **_kwargs: ({"items": []}, {"fallback_used": False, "errors": []}),
+        "_normalize_layout_uid_combined_plan",
+        lambda **_kwargs: {
+            "normalization_plan": {"items": []},
+            "text_validation": {"fallback_used": False, "errors": []},
+            "grouping_plan": {"groups": [{"group_id": "group_1", "group_kind": "list", "layout_ids": ["layout_list_1"]}], "omissions": [], "notes": []},
+            "grouping_validation": {"fallback_used": False, "errors": []},
+        },
     )
     monkeypatch.setattr(
         service,
         "_apply_layout_uid_text_normalization_to_grounding",
         lambda **kwargs: dict(kwargs.get("grounding") or {}),
-    )
-    monkeypatch.setattr(
-        service,
-        "_build_layout_uid_prompt_payload",
-        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout_list_1"}]},
-    )
-    monkeypatch.setattr(
-        service,
-        "_normalize_layout_uid_group_plan",
-        lambda **_kwargs: (
-            {"groups": [{"group_id": "group_1", "group_kind": "list", "layout_ids": ["layout_list_1"]}], "omissions": [], "notes": []},
-            {"fallback_used": False, "errors": []},
-        ),
     )
 
     async def _empty_map(**_kwargs):
@@ -7427,6 +7555,7 @@ async def test_build_layout_uid_pipeline_result_should_not_overwrite_grounding_p
     )
 
     page_image = dict((((result.get("base_payload") or {}).get("page_grounding_v1") or {}).get("page_image") or {}))
+    assert int(call_counter["count"]) == 1
     assert str(page_image.get("source") or "") == "docmind_page_image_localized"
     assert str(page_image.get("path") or "") == "/app/uploads/reader_page_assets/paper_85/grounding_pages/page_8.png"
     assert int(page_image.get("width") or 0) == 1483
@@ -7651,6 +7780,118 @@ def test_build_layout_uid_prompt_payload_should_only_emit_uniqueid_atoms():
     assert "blocks" not in compact_atoms[0]
     assert "canonical_block_ids" not in compact_atoms[0]
     assert str(((prompt_payload.get("rules") or {}).get("indivisible_unit")) or "") == "layout_id"
+
+
+def test_normalize_layout_uid_ai_reconstruction_plan_should_accept_poor_docmind_override():
+    service = LiteratureReaderComposeService()
+    plan, validation = service._normalize_layout_uid_ai_reconstruction_plan(  # pylint: disable=protected-access
+        step_result={
+            "reconstruction": {
+                "mode": "ai_reconstructed",
+                "docmind_quality": "poor",
+                "reason": "The page is mostly a corrupted visual and the grounded OCR is unusable.",
+                "confidence": 0.81,
+                "components": [
+                    {"kind": "heading", "text": "Figure 4", "level": 2},
+                    {
+                        "kind": "paragraph",
+                        "text": "Figure 4 visualizes attention heads.",
+                        "paragraphs": ["Figure 4 visualizes attention heads.", "Top and bottom panels compare head behaviors."],
+                    },
+                    {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                ],
+                "notes": ["ai_reconstructed_due_to_poor_docmind"],
+            }
+        },
+    )
+
+    assert bool(validation.get("enabled")) is True
+    assert bool(validation.get("passed")) is True
+    assert str(plan.get("mode") or "") == "ai_reconstructed"
+    assert str(plan.get("docmind_quality") or "") == "poor"
+    assert abs(float(plan.get("confidence") or 0.0) - 0.81) < 1e-6
+    assert len(list(plan.get("components") or [])) == 3
+    assert str(((plan.get("components") or [])[1].get("kind") or "")) == "paragraph"
+    assert len(list(((plan.get("components") or [])[1].get("paragraphs") or []))) == 2
+
+
+def test_build_ai_reconstructed_panel_plan_should_create_ungrounded_reader_nodes():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
+        page=14,
+        reconstruction_plan={
+            "mode": "ai_reconstructed",
+            "notes": ["poor_docmind"],
+            "components": [
+                {"kind": "heading", "text": "Figure 4", "level": 2},
+                {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+            ],
+        },
+        page_image_url="/api/v1/literature/reader/page-render-assets/86/14",
+    )
+
+    nodes = list(((panel_plan.get("panels") or [])[0].get("nodes") or []))
+    assert len(nodes) == 3
+    assert str((nodes[0] or {}).get("component") or "") == "SectionHeading"
+    assert list((nodes[1] or {}).get("source_layout_ids") or []) == []
+    assert str((nodes[1] or {}).get("component") or "") == "FigurePanel"
+    assert str((((nodes[1] or {}).get("props") or {}).get("image_url") or "")) == "/api/v1/literature/reader/page-render-assets/86/14"
+    assert str((((nodes[2] or {}).get("props") or {}).get("text") or "")) == "The visual compares multiple attention heads."
+
+
+def test_ensure_payload_contract_should_skip_no_drop_for_ai_reconstructed_pages():
+    service = LiteratureReaderComposeService()
+    ensured = service._ensure_payload_contract(  # pylint: disable=protected-access
+        page=14,
+        payload={
+            "paper_id": 86,
+            "page": 14,
+            "status": "done",
+            "build_mode": "compose_ai_reconstructed",
+            "grounding_mode": "ai_reconstructed",
+            "evidence_enabled": False,
+            "quality_report": {
+                "overall": 0.74,
+                "stop_reason": "layout_uid_v1_ai_reconstructed",
+                "validation_errors": [],
+            },
+            "ui_plan": {
+                "plan_id": "ai_reconstructed_p14",
+                "components": [
+                    {
+                        "id": "p1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "Reconstructed summary of the page."},
+                        "children": [],
+                        "source_block_ids": [],
+                        "source_anchor_refs": [],
+                    }
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+            "page_structure_v3": {
+                "block_groups": [
+                    {
+                        "block_id": "p14_dm_p14_l001_b001",
+                        "layout_unique_id": "L1",
+                        "kind": "paragraph",
+                        "zone_type": "main_body",
+                        "text": "Broken DocMind text",
+                    }
+                ]
+            },
+            "docmind_structure": {"layouts": [], "page_image_url": ""},
+            "assets": [],
+            "blocks": [],
+        },
+    )
+
+    assert str(ensured.get("status") or "") == "done"
+    assert str(ensured.get("degraded_reason") or "") == ""
+    assert bool(((ensured.get("quality_report") or {}).get("grounded_evidence_enabled"))) is False
 
 
 def test_normalize_layout_uid_group_plan_should_fallback_on_duplicate_or_missing_layout_ids():
@@ -7916,6 +8157,194 @@ def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equati
     assert str(equation_props.get("latex") or "") == "y = mx^2 + b"
     assert str(equation_props.get("render_mode") or "") == "image_first"
     assert str(equation_props.get("transcript") or "") == "y = mx^2 + b"
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_keep_standalone_table_caption_renderable():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=8,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "paragraph_1",
+                    "group_kind": "paragraph",
+                    "source_layout_ids": ["P1"],
+                },
+                {
+                    "group_id": "table_caption_1",
+                    "group_kind": "table_caption",
+                    "source_layout_ids": ["TC1"],
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "P1",
+                    "node_kind": "paragraph",
+                    "clean_text": "Quantization improves throughput under fixed memory budgets.",
+                    "raw_text": "Quantization improves throughput under fixed memory budgets.",
+                },
+                {
+                    "layout_id": "TC1",
+                    "node_kind": "table_caption",
+                    "clean_text": "Table 2 demonstrates the impact of various quantization methods on DeepSeek-R1's performance.",
+                    "raw_text": "Table 2 demonstrates the impact of various quantization methods on DeepSeek-R1's performance.",
+                },
+            ]
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 2
+    caption_node = dict(nodes[1] or {})
+    caption_props = dict(caption_node.get("props") or {})
+    assert str(caption_node.get("component") or "") == "ParagraphProse"
+    assert list(caption_node.get("source_layout_ids") or []) == ["TC1"]
+    assert (
+        str(caption_props.get("text") or "")
+        == "Table 2 demonstrates the impact of various quantization methods on DeepSeek-R1's performance."
+    )
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_preserve_model_paragraphs():
+    service = LiteratureReaderComposeService()
+    grounding = {
+        "layout_atoms": [
+            {
+                "layout_id": "P1",
+                "node_kind": "paragraph",
+                "clean_text": "MAA. American invitational mathematics examination - aime.",
+                "raw_text": "MAA. American invitational mathematics examination - aime.",
+            },
+            {
+                "layout_id": "P2",
+                "node_kind": "paragraph",
+                "clean_text": "In American Invitational Mathematics Examination - AIME 2024, February 2024.",
+                "raw_text": "In American Invitational Mathematics Examination - AIME 2024, February 2024.",
+            },
+            {
+                "layout_id": "P3",
+                "node_kind": "paragraph",
+                "clean_text": "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+                "raw_text": "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+            },
+        ]
+    }
+    grouping_plan, validation = service._normalize_layout_uid_group_plan(  # pylint: disable=protected-access
+        grounding=grounding,
+        step_result={
+            "groups": [
+                {
+                    "group_id": "g1",
+                    "group_kind": "paragraph",
+                    "source_layout_ids": ["P1", "P2", "P3"],
+                    "paragraphs": [
+                        {"text": "MAA. American invitational mathematics examination - aime.", "source_layout_ids": ["P1"]},
+                        {"text": "In American Invitational Mathematics Examination - AIME 2024, February 2024.", "source_layout_ids": ["P2"]},
+                        {
+                            "text": "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+                            "source_layout_ids": ["P3"],
+                        },
+                    ],
+                }
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+    )
+
+    assert validation["passed"] is True
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=12,
+        grouping_plan=grouping_plan,
+        grounding=grounding,
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    prose_node = dict(nodes[0] or {})
+    prose_props = dict(prose_node.get("props") or {})
+    assert str(prose_node.get("component") or "") == "ParagraphProse"
+    assert str(prose_props.get("paragraph_strategy") or "") == "model"
+    assert [str((row or {}).get("text") or "") for row in list(prose_props.get("paragraphs") or [])] == [
+        "MAA. American invitational mathematics examination - aime.",
+        "In American Invitational Mathematics Examination - AIME 2024, February 2024.",
+        "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+    ]
+
+
+def test_sanitize_components_for_runtime_should_preserve_model_paragraphs_without_reinference():
+    service = LiteratureReaderComposeService()
+    sanitized = service._sanitize_components_for_runtime(  # pylint: disable=protected-access
+        page=12,
+        payload={
+            "page_structure_v3": {
+                "block_groups": [
+                    {
+                        "block_id": "dm_p12_l006_b001",
+                        "layout_unique_id": "L1",
+                        "text": "MAA.",
+                        "layout_bbox_or_polygon": {"bbox": {"x0": 100, "x1": 150, "top": 100, "bottom": 120}},
+                    },
+                    {
+                        "block_id": "dm_p12_l006_b002",
+                        "layout_unique_id": "L1",
+                        "text": "American invitational mathematics examination - aime.",
+                        "layout_bbox_or_polygon": {"bbox": {"x0": 160, "x1": 500, "top": 100, "bottom": 120}},
+                    },
+                    {
+                        "block_id": "dm_p12_l006_b003",
+                        "layout_unique_id": "L1",
+                        "text": "In American Invitational Mathematics Examination - AIME 2024, February 2024.",
+                        "layout_bbox_or_polygon": {"bbox": {"x0": 100, "x1": 520, "top": 130, "bottom": 150}},
+                    },
+                    {
+                        "block_id": "dm_p12_l006_b004",
+                        "layout_unique_id": "L1",
+                        "text": "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+                        "layout_bbox_or_polygon": {"bbox": {"x0": 100, "x1": 560, "top": 160, "bottom": 180}},
+                    },
+                ]
+            }
+        },
+        nodes=[
+            {
+                "id": "n1",
+                "type": "ParagraphProse",
+                "props": {
+                    "text": "stale",
+                    "paragraph_strategy": "model",
+                    "paragraphs": [
+                        {"text": "MAA. American invitational mathematics examination - aime.", "source_layout_ids": ["L1"]},
+                        {"text": "In American Invitational Mathematics Examination - AIME 2024, February 2024.", "source_layout_ids": ["L1"]},
+                        {
+                            "text": "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+                            "source_layout_ids": ["L1"],
+                        },
+                    ],
+                },
+                "children": [],
+                "source_anchor_refs": [],
+                "source_block_ids": [
+                    "p12_dm_p12_l006_b001",
+                    "p12_dm_p12_l006_b002",
+                    "p12_dm_p12_l006_b003",
+                    "p12_dm_p12_l006_b004",
+                ],
+            }
+        ],
+    )
+
+    prose_node = dict(sanitized[0] or {})
+    prose_props = dict(prose_node.get("props") or {})
+    assert [str((row or {}).get("text") or "") for row in list(prose_props.get("paragraphs") or [])] == [
+        "MAA. American invitational mathematics examination - aime.",
+        "In American Invitational Mathematics Examination - AIME 2024, February 2024.",
+        "4. URL https://maa.org/math-competitions/american-invitational-mathematics-examination-aime",
+    ]
+    assert "stale" not in str(prose_props.get("text") or "")
 
 
 def test_build_layout_uid_equation_props_should_split_where_clause_into_description():
@@ -8370,6 +8799,107 @@ def test_build_layout_uid_text_normalization_prompt_payload_should_include_foote
     assert bool((bundle_items[0] or {}).get("is_marker_only")) is True
     assert bool((bundle_items[1] or {}).get("contains_url")) is True
     assert int((bundle_items[1] or {}).get("primary_style_id") or 0) == 6
+
+
+def test_build_layout_uid_combined_prompt_payload_should_union_grouping_and_normalization_fields():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=85, title="demo")
+    prompt_payload = service._build_layout_uid_combined_prompt_payload(  # pylint: disable=protected-access
+        paper=paper,
+        page=8,
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "p8_para",
+                    "reading_order": 1,
+                    "node_kind": "paragraph",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "clean_text": "A p p l e",
+                    "raw_text": "A p p l e",
+                    "include_in_main_flow": True,
+                    "region_hint": "main_body",
+                    "layout_pos": [{"x": 1, "y": 2}],
+                    "alignment": "left",
+                    "line_height": 12,
+                    "blocks": [{"style_id": 7, "text": "A p p l e"}],
+                },
+                {
+                    "layout_id": "p8_footer",
+                    "reading_order": 2,
+                    "node_kind": "footer",
+                    "layout_type": "corner_note",
+                    "layout_sub_type": "footer_note",
+                    "clean_text": "Shttps://api-docs.deepseek.com/",
+                    "raw_text": "Shttps://api-docs.deepseek.com/",
+                    "include_in_main_flow": False,
+                    "region_hint": "side_context",
+                    "layout_pos": [{"x": 3, "y": 4}],
+                    "alignment": "left",
+                    "line_height": 10,
+                    "blocks": [{"style_id": 9, "text": "Shttps://api-docs.deepseek.com/"}],
+                },
+            ]
+        },
+    )
+
+    atoms = list(prompt_payload.get("layout_atoms") or [])
+    assert len(atoms) == 2
+    first = dict(atoms[0] or {})
+    second = dict(atoms[1] or {})
+    assert str(first.get("source_text") or "") == "A p p l e"
+    assert str(first.get("text") or "") == "A p p l e"
+    assert bool(first.get("include_in_main_flow")) is True
+    assert str(first.get("region_hint") or "") == "main_body"
+    assert int(first.get("block_count") or 0) == 1
+    assert str(second.get("node_kind") or "") == "footer"
+    assert str((second.get("footer_bundle") or {}).get("bundle_id") or "") == "footer_bundle_1"
+    rules = dict(prompt_payload.get("rules") or {})
+    assert str(rules.get("text_item_mode") or "") == "sparse_diff_only"
+    assert bool(rules.get("exact_group_assignment")) is True
+
+
+def test_normalize_layout_uid_sparse_text_normalization_plan_should_accept_changed_subset_only():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_sparse_text_normalization_plan(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "L1",
+                    "node_kind": "paragraph",
+                    "clean_text": "A p p l e",
+                    "raw_text": "A p p l e",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "L2",
+                    "node_kind": "paragraph",
+                    "clean_text": "Banana",
+                    "raw_text": "Banana",
+                    "include_in_main_flow": True,
+                },
+            ]
+        },
+        step_result={
+            "text_items": [
+                {
+                    "layout_id": "L1",
+                    "normalized_text": "Apple",
+                    "reason": "spacing_repair",
+                    "confidence": 0.93,
+                    "mode": "spacing_repair",
+                }
+            ],
+            "notes": ["changed_subset_only"],
+        },
+    )
+
+    assert bool(validation.get("passed")) is True
+    assert bool(validation.get("fallback_used")) is False
+    items = list(normalized.get("items") or [])
+    assert len(items) == 1
+    assert str((items[0] or {}).get("layout_id") or "") == "L1"
+    assert str((items[0] or {}).get("normalized_text") or "") == "Apple"
 
 
 def test_layout_uid_text_normalization_system_prompt_should_mention_footer_links():
