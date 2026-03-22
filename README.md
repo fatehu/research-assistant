@@ -53,14 +53,15 @@
 
 ## 当前开发重点
 
-截至 2026-03-07，这个仓库最近一轮的主增量集中在论文阅读链路：
+截至 2026-03-22，这个仓库最近一轮的主增量集中在论文阅读链路和主页工作台体验：
 
 - `Reader Workbench V2` 已经从“PDF + 问答面板”升级成“结构化页面 + 组件编排 + 评审发布”的工作台。
 - 阅读链路支持 `single_agent_v2`、语义原子、流式 UI patch，以及更稳的证据锚点定位。
 - Review / Publish 工作流已经接通，支持观察、Patch、自动修复和发布快照。
-- Reader 页内联 PDF、工作台可读性和操作控件在最近一轮里继续收口。
+- Dashboard 首页已经升级为更聚焦的 `Premium Command Center`，强化了 Query Engine、统计卡、快捷入口和最近对话的层级与交互。
+- Dashboard 的角色逻辑也继续收口，管理员不会再看到无意义的“我的团队”入口。
 
-如果你是第一次进入仓库，可以先把这部分理解成：平台整体是稳定多模块结构，而目前最活跃的产品面是论文阅读工作台。
+如果你是第一次进入仓库，可以先把这部分理解成：平台整体是稳定多模块结构，而当前最活跃的产品面主要有两个，一个是论文阅读工作台，另一个是作为统一入口的 Dashboard 工作台。
 
 ## Reader Workbench V2
 
@@ -140,6 +141,12 @@ docker compose up -d --build backend frontend
 - `codelab-runner`
 - `backend`
 - `frontend`
+
+说明：
+
+- `frontend` 默认不是静态产物容器，而是 Docker 内运行的 Vite 开发服务器。
+- `frontend/` 下的代码改动会通过 Vite HMR / reload 直接反映到 `http://localhost:3000`。
+- 如果你只想验证生产构建，可额外执行 `docker compose exec frontend npm run build`。
 
 ### 3. 可选启用 MCP Profile
 
@@ -287,6 +294,7 @@ pytest tests/test_literature_reader_api.py \
 
 | 路由 | 说明 |
 |------|------|
+| `/` | Dashboard 首页 / Command Center |
 | `/chat` | AI 对话 |
 | `/knowledge` | 知识库主页 |
 | `/knowledge/:kbId/chunking` | Smart Chunking 配置页 |
