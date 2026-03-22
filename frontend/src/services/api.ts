@@ -4,6 +4,9 @@ import axios, { AxiosError } from 'axios'
 const VITE_ENV = ((import.meta as any).env || {}) as Record<string, string | undefined>
 const API_BASE_URL = VITE_ENV.VITE_API_BASE_URL || 'http://localhost:8888'
 export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
+// Let long-running reader/workbench v2 builds be bounded by backend/runtime policy
+// instead of a browser-side hard timeout that aborts valid cold-start executions.
+const LONG_RUNNING_READER_TIMEOUT_MS = 0
 
 export interface ApiErrorContract {
   code?: string
@@ -33,6 +36,25 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
+
+const inflightCachedExperienceRequests = new Map<string, Promise<ReaderExperiencePlanResponse>>()
+const inflightCachedExperienceV2Requests = new Map<string, Promise<ReaderExperienceV2Response>>()
+
+function reuseInflightRequest<T>(
+  inflight: Map<string, Promise<T>>,
+  key: string,
+  factory: () => Promise<T>,
+): Promise<T> {
+  const cached = inflight.get(key)
+  if (cached) return cached
+  const request = factory().finally(() => {
+    if (inflight.get(key) === request) {
+      inflight.delete(key)
+    }
+  })
+  inflight.set(key, request)
+  return request
+}
 
 // Request interceptor - attach token
 api.interceptors.request.use((config) => {
@@ -826,9 +848,17 @@ export interface PaperSearchResult {
 export interface PaperSearchResponse {
   total: number
   offset: number
+  has_more: boolean
   papers: PaperSearchResult[]
   query: string
   source: string
+}
+
+export interface ImportPaperByLinkResponse {
+  paper: Paper
+  already_exists: boolean
+  resolved_source: string
+  normalized_link: string
 }
 
 export interface PaperCollection {
@@ -974,6 +1004,7 @@ export interface ReaderGenerativePrefetchResponse {
 export interface ReaderComposeRequest {
   page: number
   selected_kb_id?: number
+  pipeline_version?: string
   force_refresh?: boolean
   regenerate?: boolean
   latency_budget_ms?: number
@@ -984,6 +1015,16 @@ export interface ReaderComposeRequest {
   detail_level?: 'concise' | 'standard' | 'deep'
   compare_mode?: boolean
   citation_tldr?: boolean
+}
+
+export interface ReaderGenerativePlanRequest extends ReaderComposeRequest {
+  user_intent?: string
+}
+
+export interface ReaderExperiencePlanRequest extends ReaderGenerativePlanRequest {
+  focus_page?: number
+  focus_section_ids?: string[]
+  reader_profile?: string
 }
 
 export interface ReaderComposeSchemeChoice {
@@ -1098,6 +1139,7 @@ export interface ReaderComponentSourceAnchor {
   segment_total?: number | null
   bbox_hint?: ReaderComponentBBoxHint | null
   canonical_block_id?: string | null
+  source_layout_id?: string | null
   coord_version?: 'anchor_v2' | string | null
   anchor_confidence?: number | null
   anchor_v2?: ReaderComponentAnchorV2 | null
@@ -1280,6 +1322,401 @@ export interface ReaderComposeAsset {
   tldr?: string | null
 }
 
+export interface ReaderEnrichmentTarget {
+  target_id: string
+  node_id: string
+  target_kind: 'section' | 'paragraph' | 'figure' | 'table' | 'equation' | 'structure'
+  component_type: string
+  title: string
+  excerpt: string
+  source_block_ids: string[]
+  source_atom_ids?: string[]
+  section_label?: string
+  figure_label?: string
+  suggested_resource_types?: string[]
+  meta?: Record<string, unknown>
+}
+
+export interface ReaderEnrichmentBundle {
+  version: string
+  targets: ReaderEnrichmentTarget[]
+  resource_modules: Array<Record<string, unknown>>
+  interaction_modules: Array<Record<string, unknown>>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderStoryClaim {
+  claim_id: string
+  text: string
+  display_text: string
+  source_target_ids: string[]
+  strength: 'primary' | 'supporting'
+}
+
+export interface ReaderStoryEvidenceUnit {
+  evidence_id: string
+  kind: 'figure' | 'paragraph' | 'table' | 'equation' | 'section'
+  role: string
+  title: string
+  source_target_ids: string[]
+}
+
+export interface ReaderStoryTermGap {
+  term: string
+  reason: string
+  source_target_ids: string[]
+}
+
+export interface ReaderStoryBackgroundGap {
+  topic: string
+  reason: string
+  suggested_resource_type: string
+}
+
+export interface ReaderStoryNarrativeTurn {
+  turn_id: string
+  kind: string
+  label: string
+  target_ids: string[]
+}
+
+export interface ReaderStorySubstrate {
+  version: string
+  page_id: string
+  main_claims: ReaderStoryClaim[]
+  evidence_units: ReaderStoryEvidenceUnit[]
+  terms_to_explain: ReaderStoryTermGap[]
+  background_gaps: ReaderStoryBackgroundGap[]
+  narrative_turns: ReaderStoryNarrativeTurn[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderPageBrief {
+  version: string
+  page_goal: string
+  reader_type: string
+  page_archetype: 'figure_explainer' | 'finding_digest' | 'methods_decoder' | 'concept_decoder' | 'context_builder'
+  hero_angle: string
+  primary_focus_target_id: string
+  secondary_support_target_ids: string[]
+  reading_path: string[]
+  interaction_opportunities: string[]
+  resource_gaps: string[]
+  experience_hooks: string[]
+  resource_strategy: string
+  storyboard: Array<Record<string, unknown>>
+  content_budget: Record<string, number>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeResourceModule {
+  module_id: string
+  module_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  links: Array<Record<string, unknown>>
+  source: 'agent' | 'paper_read' | 'knowledge_search' | 'web' | 'mcp' | 'fallback'
+  interaction_mode: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeInteractionModule {
+  module_id: string
+  module_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  display_summary: string
+  props: Record<string, unknown>
+  source: 'agent' | 'paper_read' | 'knowledge_search' | 'web' | 'mcp' | 'fallback'
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGenerativeJsWidgetPlan {
+  widget_id: string
+  widget_type: string
+  target_ids: string[]
+  title: string
+  display_title: string
+  display_summary: string
+  data_requirements: string[]
+  props: Record<string, unknown>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderAdjacentPageItem {
+  label: string
+  description: string
+}
+
+export interface ReaderAdjacentPageContext {
+  page: number
+  relation: string
+  reference_only: boolean
+  source: string
+  summary: string
+  body_text: string
+  figures: ReaderAdjacentPageItem[]
+  tables: ReaderAdjacentPageItem[]
+  equations: ReaderAdjacentPageItem[]
+  continuation_hints: string[]
+  raw_text: string
+}
+
+export interface ReaderGenerativePlan {
+  version: string
+  status: 'draft' | 'done' | 'fallback'
+  shell_mode: string
+  story_substrate: ReaderStorySubstrate
+  page_brief: ReaderPageBrief
+  rationale: string[]
+  resource_modules: ReaderGenerativeResourceModule[]
+  interaction_modules: ReaderGenerativeInteractionModule[]
+  js_widgets: ReaderGenerativeJsWidgetPlan[]
+  used_tools: string[]
+  tool_trace: Array<Record<string, unknown>>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceHero {
+  title: string
+  display_title: string
+  subtitle: string
+  display_subtitle: string
+  summary: string
+  display_summary: string
+  focus_label: string
+  target_ids: string[]
+  claim_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceUiAction {
+  action_id: string
+  action_type: string
+  label: string
+  target_ref: string
+  payload: Record<string, unknown>
+  event_name: string
+  agent_handoff: boolean
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceEventBinding {
+  event_id: string
+  event_name: string
+  event_source: 'user' | 'agent' | 'system'
+  event_type: string
+  action_ids: string[]
+  target_ref: string
+  payload: Record<string, unknown>
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceBlockRef {
+  block_id: string
+  block_type: 'resource_module' | 'interaction_module' | 'widget'
+  version: string
+  ref_id: string
+  variant: string
+  target_ids: string[]
+  priority: number
+  state: 'ready' | 'empty' | 'loading' | 'partial' | 'error'
+  data_requirements: string[]
+  fallback_policy: string
+  user_actions: string[]
+  agent_actions: string[]
+  ui_actions: ReaderExperienceUiAction[]
+  event_bindings: ReaderExperienceEventBinding[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceSection {
+  section_id: string
+  section_type: 'hero' | 'focus_stage' | 'reading_flow' | 'explainer_cluster' | 'supporting_resources' | 'question_lab' | 'story_map'
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  target_ids: string[]
+  section_region: 'main' | 'sidebar' | 'footer'
+  layout_variant: string
+  blocks: ReaderExperienceBlockRef[]
+  resource_module_ids: string[]
+  interaction_module_ids: string[]
+  widget_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceGuidedBeat {
+  beat_id: string
+  beat_type: string
+  section_type_hint: string
+  title: string
+  display_title: string
+  summary: string
+  display_summary: string
+  reader_goal: string
+  continuity_note: string
+  target_ids: string[]
+  tool_objectives: string[]
+  block_stack: ReaderExperienceBlockRef[]
+  drop_notes: string[]
+  importance: number
+  meta: Record<string, unknown>
+}
+
+export interface ReaderTeachingManuscriptReferenceLink {
+  label: string
+  href: string
+  note?: string
+}
+
+export interface ReaderTeachingManuscriptGlossaryItem {
+  term: string
+  note: string
+}
+
+export interface ReaderTeachingManuscriptSegment {
+  segment_id: string
+  segment_type: 'figure' | 'body' | 'bridge' | string
+  title: string
+  teaching_text: string
+  anchor_excerpt?: string
+  target_ids: string[]
+  glossary?: ReaderTeachingManuscriptGlossaryItem[]
+  adjacent_bridge?: string
+  reference_links?: ReaderTeachingManuscriptReferenceLink[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderTeachingManuscript {
+  version?: string
+  status?: 'done' | 'fallback' | 'seed' | string
+  title?: string
+  opening?: string
+  segments: ReaderTeachingManuscriptSegment[]
+}
+
+export interface ReaderExperiencePlan {
+  version: string
+  status: 'draft' | 'done' | 'fallback'
+  scope: 'paper' | 'section' | 'page_focus'
+  focus_page: number
+  reader_profile: string
+  layout_variant: string
+  page_story_title: string
+  page_story_subtitle: string
+  narrative_goal: string
+  hero: ReaderExperienceHero
+  main_sections: ReaderExperienceSection[]
+  guided_beats: ReaderExperienceGuidedBeat[]
+  teaching_manuscript?: ReaderTeachingManuscript | null
+  supporting_resources: ReaderGenerativeResourceModule[]
+  interactive_blocks: ReaderGenerativeInteractionModule[]
+  widget_blocks: ReaderGenerativeJsWidgetPlan[]
+  reading_path: string[]
+  used_tools: string[]
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingPoint {
+  x: number
+  y: number
+}
+
+export interface ReaderGroundingBlock {
+  block_index: number
+  text: string
+  pos: ReaderGroundingPoint[]
+  style_id: number
+}
+
+export interface ReaderGroundingTableCell {
+  cell_id: number
+  row_start: number
+  row_end: number
+  col_start: number
+  col_end: number
+  text: string
+  layout_ids: string[]
+  polygons: ReaderGroundingPoint[][]
+}
+
+export interface ReaderGroundingLayoutAtom {
+  layout_id: string
+  reading_order: number
+  layout_type: string
+  layout_sub_type: string
+  raw_text: string
+  clean_text: string
+  normalized_text: string
+  normalization_reason: string
+  normalization_mode: string
+  normalization_confidence?: number | null
+  alignment: string
+  line_height: number
+  layout_pos: ReaderGroundingPoint[]
+  blocks: ReaderGroundingBlock[]
+  table_cells: ReaderGroundingTableCell[]
+  canonical_block_ids: string[]
+  node_kind: string
+  include_in_main_flow: boolean
+  region_hint: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingReadingNode {
+  node_id: string
+  node_kind: string
+  raw_text: string
+  clean_text: string
+  normalized_text: string
+  normalization_reason: string
+  normalization_mode: string
+  normalization_confidence?: number | null
+  source_layout_ids: string[]
+  source_block_ids: string[]
+  include_in_main_flow: boolean
+  region_hint: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingEvidenceEntry {
+  evidence_id: string
+  source_layout_id: string
+  source_block_ids: string[]
+  layout_pos: ReaderGroundingPoint[]
+  block_positions: ReaderGroundingPoint[][]
+  table_cells: ReaderGroundingTableCell[]
+  geometry_source: string
+  highlight_strategy: string
+  meta: Record<string, unknown>
+}
+
+export interface ReaderGroundingPageImage {
+  url: string
+  path: string
+  width?: number | null
+  height?: number | null
+  source: string
+  origin_url?: string
+  local_cached?: boolean
+}
+
+export interface ReaderPageGrounding {
+  version: string
+  page: number
+  layout_atoms: ReaderGroundingLayoutAtom[]
+  reading_nodes: ReaderGroundingReadingNode[]
+  evidence_map: ReaderGroundingEvidenceEntry[]
+  page_image: ReaderGroundingPageImage
+  meta: Record<string, unknown>
+}
+
 export interface ReaderComposePayload {
   paper_id: number
   page: number
@@ -1326,6 +1763,9 @@ export interface ReaderComposePayload {
   toc_quality?: number
   phase1_compact_input?: Record<string, unknown>
   review_route_meta?: Record<string, unknown>
+  page_grounding_v1?: ReaderPageGrounding
+  enrichment_bundle?: ReaderEnrichmentBundle
+  generative_reader_plan?: ReaderGenerativePlan
   generated_at: string
   cache_hit?: boolean
   cache_layer?: 'redis' | 'db' | 'none' | string
@@ -1349,6 +1789,8 @@ export interface ReaderComposeReviewSnapshot {
   omission_decisions: ReaderComposeOmissionDecision[]
   diagnostics: ReaderComposeReviewDiagnostic[]
   phase1_compact_input?: Record<string, unknown>
+  enrichment_bundle?: ReaderEnrichmentBundle
+  generative_reader_plan?: ReaderGenerativePlan
   render_route: string
   render_image_url?: string
   observation_note?: string
@@ -1377,6 +1819,7 @@ export interface ReaderComposeReviewAutoPatchResponse {
 export interface ReaderComposePrefetchRequest {
   pages: number[]
   selected_kb_id?: number
+  pipeline_version?: string
   style_intent?: string
   latency_budget_ms?: number
   quality_target?: number
@@ -1481,6 +1924,149 @@ export type ReaderComposeStreamEvent = keyof ReaderComposeStreamEventMap
 export interface ReaderComposeFetchResponse {
   payload: ReaderComposePayload
   cache_meta?: Record<string, unknown>
+}
+
+export interface ReaderGenerativePlanResponse {
+  page: number
+  plan: ReaderGenerativePlan
+  enrichment_bundle: ReaderEnrichmentBundle
+  scheme_choice: ReaderComposeSchemeChoice
+  compose_status: 'done' | 'fallback'
+  compose_build_mode: string
+  compose_source_signature: string
+  source_sig_hash: string
+  cache_hit: boolean
+  cache_layer: string
+  plan_cache_hit: boolean
+  plan_cache_layer: string
+  adjacent_page_context: ReaderAdjacentPageContext[]
+  page_dossier: Record<string, unknown>
+}
+
+export interface ReaderExperiencePlanResponse {
+  focus_page: number
+  plan: ReaderExperiencePlan
+  generative_plan: ReaderGenerativePlan
+  compose_payload?: ReaderComposePayload | null
+  enrichment_bundle: ReaderEnrichmentBundle
+  compose_status: 'done' | 'fallback'
+  compose_build_mode: string
+  compose_source_signature: string
+  source_sig_hash: string
+  cache_hit: boolean
+  cache_layer: string
+  generative_plan_cache_hit: boolean
+  generative_plan_cache_layer: string
+  experience_cache_hit: boolean
+  experience_cache_layer: string
+  adjacent_page_context: ReaderAdjacentPageContext[]
+  page_dossier: Record<string, unknown>
+}
+
+export type PageArtifactV2SegmentKind =
+  | 'heading'
+  | 'paragraph'
+  | 'original_excerpt'
+  | 'authored_explanation'
+  | 'figure_slot'
+  | 'table_slot'
+  | 'equation_slot'
+  | 'media_slot'
+  | 'aside_content'
+  | 'term_annotation'
+  | 'external_resource'
+
+export interface PageArtifactV2ReadingBlock {
+  segment_id: string
+  segment_kind: PageArtifactV2SegmentKind
+  source_lane: 'current_page' | 'authoring_plan'
+  page: number
+  text: string
+  source_layout_ids: string[]
+  source_block_ids: string[]
+  evidence_ids: string[]
+  meta: Record<string, unknown>
+}
+
+export interface PageArtifactV2 {
+  version: 'page_artifact_v2'
+  artifact_contract_id: 'page_artifact_v2.contract.v1'
+  focus_page: number
+  reader_profile: string
+  dossier_signature: string
+  session_id?: string | null
+  template_id: string
+  layout_recipe: string
+  presentation_mode: string
+  widget_family: string
+  motion_preset: string
+  interaction_policy: string
+  reading_blocks: PageArtifactV2ReadingBlock[]
+  current_page_spine: {
+    page: number
+    owner: string
+    primary: boolean
+    reading_node_ids: string[]
+    layout_ids: string[]
+    block_ids: string[]
+    evidence_ids: string[]
+    main_segment_ids: string[]
+    meta: Record<string, unknown>
+  }
+  provenance: {
+    continuity_mode: string
+    adjacent_context_pages: number[]
+    include_adjacent_as_coequal_anchor: boolean
+    source_lanes: Record<string, unknown>
+    meta: Record<string, unknown>
+  }
+  meta: Record<string, unknown>
+}
+
+export interface ReaderExperienceV2Request {
+  page: number
+  selected_kb_id?: number
+  user_intent?: string
+  reader_profile?: string
+  force_refresh?: boolean
+  regenerate?: boolean
+}
+
+export interface ReaderExperienceV2Response {
+  focus_page: number
+  status: 'ready' | 'generating' | 'failed'
+  artifact?: PageArtifactV2 | null
+  compose_payload?: ReaderComposePayload | null
+  compose_status?: string
+  compose_build_mode?: string
+  compose_source_signature?: string
+  source_sig_hash?: string
+  artifact_cache_hit?: boolean
+  artifact_cache_layer?: string
+  session_cache_hit?: boolean
+  session_cache_layer?: string
+  session_id?: string
+  session_status?: string
+  failure_detail?: string
+  meta?: Record<string, unknown>
+}
+
+export interface ReaderWorkbenchV2Response {
+  focus_page: number
+  status: 'ready' | 'running' | 'failed' | 'empty'
+  compose_payload?: ReaderComposePayload | null
+  reading_dossier?: Record<string, unknown> | null
+  session?: Record<string, unknown> | null
+  artifact?: PageArtifactV2 | null
+  artifact_validation?: Record<string, unknown> | null
+  compose_source_signature?: string
+  source_sig_hash?: string
+  session_cache_hit?: boolean
+  session_cache_layer?: string
+  artifact_cache_hit?: boolean
+  artifact_cache_layer?: string
+  failure_detail?: string
+  meta?: Record<string, unknown>
 }
 
 export interface ReaderNodeActionRequest {
@@ -1711,6 +2297,31 @@ export interface LiteratureAskEvent {
   data: any
 }
 
+export interface ReaderExperienceBlockExplainTurn {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ReaderExperienceBlockExplainRequest {
+  page: number
+  block_id: string
+  explain_kind: 'simplify' | 'figure'
+  question: string
+  source_excerpt?: string
+  source_translation_zh?: string
+  explanation_text?: string
+  figure_label?: string
+  figure_caption?: string
+  figure_text?: string
+  figure_image_url?: string
+  history?: ReaderExperienceBlockExplainTurn[]
+}
+
+export interface ReaderExperienceBlockExplainEvent {
+  event: 'start' | 'token' | 'done' | 'error'
+  data: any
+}
+
 export interface LiteratureAskSession {
   id: number
   user_id: number
@@ -1806,6 +2417,14 @@ export const literatureApi = {
     collection_ids?: number[]
   }): Promise<Paper> => {
     const response = await api.post('/api/v1/literature/papers', data)
+    return response.data
+  },
+
+  importPaperByLink: async (data: {
+    link: string
+    collection_ids?: number[]
+  }): Promise<ImportPaperByLinkResponse> => {
+    const response = await api.post('/api/v1/literature/papers/import-link', data)
     return response.data
   },
 
@@ -2031,7 +2650,89 @@ export const literatureApi = {
     paperId: number,
     payload: ReaderComposeRequest,
   ): Promise<ReaderComposeFetchResponse> => {
-    const response = await api.post(`/api/v1/literature/papers/${paperId}/reader/composed`, payload)
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/reader/composed/cached`,
+      payload,
+      { timeout: 30000 },
+    )
+    return response.data
+  },
+
+  getReaderGenerativePlan: async (
+    paperId: number,
+    payload: ReaderGenerativePlanRequest,
+  ): Promise<ReaderGenerativePlanResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/reader/composed/generative-plan`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getReaderExperiencePlan: async (
+    paperId: number,
+    payload: ReaderExperiencePlanRequest,
+  ): Promise<ReaderExperiencePlanResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/experience/plan`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getCachedReaderExperiencePlan: async (
+    paperId: number,
+    payload: ReaderExperiencePlanRequest,
+  ): Promise<ReaderExperiencePlanResponse> => {
+    const requestKey = JSON.stringify(['experience_plan_cached', paperId, payload])
+    return reuseInflightRequest(inflightCachedExperienceRequests, requestKey, async () => {
+      const response = await api.post(
+        `/api/v1/literature/papers/${paperId}/experience/plan/cached`,
+        payload,
+        { timeout: 30000 },
+      )
+      return response.data
+    })
+  },
+
+  getCachedReaderExperienceV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderExperienceV2Response> => {
+    const requestKey = JSON.stringify(['experience_v2_cached', paperId, payload])
+    return reuseInflightRequest(inflightCachedExperienceV2Requests, requestKey, async () => {
+      const response = await api.post(
+        `/api/v1/literature/papers/${paperId}/experience-v2/cached`,
+        payload,
+        { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+      )
+      return response.data
+    })
+  },
+
+  getReaderExperienceV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderExperienceV2Response> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/experience-v2`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getReaderWorkbenchV2: async (
+    paperId: number,
+    payload: ReaderExperienceV2Request,
+  ): Promise<ReaderWorkbenchV2Response> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/workbench-v2`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
     return response.data
   },
 
@@ -2349,6 +3050,61 @@ export const literatureApi = {
         if (!line.startsWith('data: ')) continue
         try {
           const parsed = JSON.parse(line.slice(6)) as LiteratureAskEvent
+          onEvent?.(parsed.event, parsed.data)
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+    }
+  },
+
+  explainExperienceBlockStream: async (
+    paperId: number,
+    payload: ReaderExperienceBlockExplainRequest,
+    onEvent?: (event: ReaderExperienceBlockExplainEvent['event'], data: any) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/literature/papers/${paperId}/experience-v2/block-explain/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController?.signal,
+    })
+
+    if (!response.ok) {
+      let detail = '请求失败'
+      try {
+        const err = (await response.json()) as { detail?: ApiErrorDetail }
+        detail = extractApiErrorMessage(err?.detail, detail)
+      } catch {
+        // ignore json parse error for non-json body
+      }
+      throw new Error(detail)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error('无法读取响应流')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const parsed = JSON.parse(line.slice(6)) as ReaderExperienceBlockExplainEvent
           onEvent?.(parsed.event, parsed.data)
         } catch {
           // ignore malformed chunk
@@ -3980,7 +4736,3 @@ export const chunkingApi = {
     return response.data
   },
 }
-
-
-
-

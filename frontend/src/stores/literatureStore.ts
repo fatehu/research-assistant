@@ -4,7 +4,8 @@ import {
   Paper,
   PaperSearchResult,
   PaperCollection,
-  SearchHistory
+  SearchHistory,
+  ImportPaperByLinkResponse,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
@@ -60,6 +61,7 @@ interface LiteratureState {
     search?: string
   }) => Promise<void>
   savePaper: (paper: PaperSearchResult, collectionIds?: number[]) => Promise<Paper>
+  importPaperFromLink: (link: string, collectionIds?: number[]) => Promise<ImportPaperByLinkResponse>
   updatePaper: (paperId: number, data: Partial<Paper>) => Promise<void>
   deletePaper: (paperId: number) => Promise<void>
   selectPaper: (paper: Paper | null) => void
@@ -88,7 +90,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   papersLoading: false,
   searchResults: [],
   searchQuery: '',
-  searchSource: 'semantic_scholar',
+  searchSource: 'multi',
   searchTotal: 0,
   searchOffset: 0,
   searchLoading: false,
@@ -124,7 +126,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   },
 
   // 搜索论文
-  searchPapers: async (query, source = 'semantic_scholar', options = {}) => {
+  searchPapers: async (query, source = 'multi', options = {}) => {
     const limit = options.limit || 20
     set({ searchLoading: true, searchQuery: query, searchSource: source, searchOffset: 0 })
     try {
@@ -137,8 +139,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         year_end: options.year_end,
       })
       const newOffset = response.papers.length
-      // 只要还有更多数据且本次返回了数据就允许继续加载
-      const hasMore = newOffset < response.total && response.papers.length > 0
+      const hasMore = response.has_more && response.papers.length > 0
       set({
         searchResults: response.papers,
         searchTotal: response.total,
@@ -168,10 +169,10 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         offset: searchOffset,
       })
       const newOffset = searchOffset + response.papers.length
-      // 如果返回0条数据或已达到total，则没有更多
-      const hasMore = response.papers.length > 0 && newOffset < searchTotal
+      const hasMore = response.has_more && response.papers.length > 0
       set(state => ({
         searchResults: [...state.searchResults, ...response.papers],
+        searchTotal: response.total,
         searchOffset: newOffset,
         searchHasMore: hasMore,
         searchLoadingMore: false,
@@ -249,6 +250,31 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       return saved
     } catch (error) {
       handleApiError(error, '保存论文')
+      throw error
+    }
+  },
+
+  importPaperFromLink: async (link, collectionIds = []) => {
+    try {
+      const result = await literatureApi.importPaperByLink({
+        link,
+        collection_ids: collectionIds,
+      })
+
+      const visibleCollectionId = get().selectedCollectionId || undefined
+      await get().loadCollections()
+      await get().loadPapers({ collection_id: visibleCollectionId })
+
+      set(state => ({
+        selectedPaper: state.selectedPaper?.id === result.paper.id ? result.paper : state.selectedPaper,
+        papers: state.papers.some(p => p.id === result.paper.id)
+          ? state.papers.map(p => p.id === result.paper.id ? result.paper : p)
+          : [result.paper, ...state.papers],
+      }))
+
+      return result
+    } catch (error) {
+      handleApiError(error, '链接入库')
       throw error
     }
   },

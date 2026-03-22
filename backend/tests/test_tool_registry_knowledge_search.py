@@ -179,6 +179,56 @@ async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch)
     assert call_order == ["rewrite", "retrieve", "rerank", "compress"]
 
 
+@pytest.mark.asyncio
+async def test_knowledge_search_execute_with_db_returns_guided_reading_payload(monkeypatch):
+    tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
+    state = SimpleNamespace()
+
+    async def _rewrite(query):
+        return SimpleNamespace(enabled=True, vector_variants=[1], text_variants=[1])
+
+    async def _retrieve(db, query, rewrite_result, runtime):
+        return state
+
+    async def _rerank(query, payload):
+        return [("candidate", None)]
+
+    async def _compress(**kwargs):
+        return [
+            {
+                "content": "Figure 3 shows the strongest improvement on the reasoning benchmark.",
+                "score": 0.91,
+                "knowledge_base": "Exam KB",
+                "document": "demo-paper.pdf",
+                "chunk_index": 4,
+                "retrieval_mode": "hybrid",
+            }
+        ]
+
+    monkeypatch.setattr(tool, "_rewrite", _rewrite)
+    monkeypatch.setattr(tool, "_retrieve", _retrieve)
+    monkeypatch.setattr(tool, "_rerank", _rerank)
+    monkeypatch.setattr(tool, "_compress", _compress)
+    monkeypatch.setattr(tool, "_log_retrieval_metrics", lambda *args, **kwargs: None)
+
+    result = await tool._execute_with_db(
+        db=SimpleNamespace(),
+        query="figure 3 benchmark improvement",
+        top_k=3,
+        include_adjacent_chunks=False,
+        adjacent_window=1,
+    )
+
+    assert result.success is True
+    assert "知识库线索" in result.output
+    assert result.data["source_kind"] == "knowledge_base_search"
+    assert result.data["reader_summary"]
+    assert result.data["results"][0]["source_label"] == "Exam KB / demo-paper.pdf"
+    assert result.data["structured_content"]["results"][0]["rank"] == 1
+    assert result.data["structured_content"]["knowledge_base_hits"][0]["knowledge_base"] == "Exam KB"
+    assert result.data["provenance"]["tool_kind"] == "knowledge_search"
+
+
 def test_api_search_filters_embedding_dimension():
     knowledge_api = (
         Path(__file__).resolve().parents[1] / "app" / "api" / "knowledge.py"

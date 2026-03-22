@@ -10,8 +10,9 @@ import httpx
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol
+from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol, Mapping, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlparse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, or_, and_, tuple_
@@ -298,6 +299,408 @@ class MCPRemoteTool(Tool):
         )
 
 
+def _coerce_mcp_schema_properties(schema: Any) -> Dict[str, Dict[str, Any]]:
+    input_schema = getattr(schema, "input_schema", None)
+    if not isinstance(input_schema, Mapping):
+        return {}
+    properties = input_schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for key, value in properties.items():
+        if not str(key).strip():
+            continue
+        normalized[str(key)] = dict(value) if isinstance(value, Mapping) else {}
+    return normalized
+
+
+def _pick_mcp_property_name(properties: Mapping[str, Any], candidates: Sequence[str]) -> str:
+    lower_to_actual = {str(name).strip().lower(): str(name) for name in properties.keys() if str(name).strip()}
+    for candidate in candidates:
+        actual = lower_to_actual.get(str(candidate).strip().lower())
+        if actual:
+            return actual
+    return ""
+
+
+def _copy_matching_mcp_arguments(
+    *,
+    translated: Dict[str, Any],
+    original: Mapping[str, Any],
+    properties: Mapping[str, Any],
+) -> Dict[str, Any]:
+    for key in properties.keys():
+        normalized_key = str(key).strip()
+        if not normalized_key or normalized_key in translated:
+            continue
+        if normalized_key in original:
+            translated[normalized_key] = original[normalized_key]
+    return translated
+
+
+def _normalize_requested_formats(value: Any) -> List[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [str(item).strip().lower() for item in list(value) if str(item).strip()]
+
+
+def _choose_scrape_format_value(property_schema: Mapping[str, Any], formats: Sequence[str]) -> str:
+    normalized_formats = [str(item).strip().lower() for item in list(formats or []) if str(item).strip()]
+    enum_values = property_schema.get("enum")
+    if not isinstance(enum_values, Sequence) or isinstance(enum_values, (str, bytes)):
+        return normalized_formats[0] if normalized_formats else "markdown"
+
+    normalized_enum: Dict[str, str] = {
+        str(item).strip().lower(): str(item)
+        for item in list(enum_values)
+        if str(item).strip()
+    }
+    preferred = normalized_formats or ["markdown"]
+    for candidate in preferred:
+        actual = normalized_enum.get(candidate)
+        if actual:
+            return actual
+        if candidate == "markdown":
+            for fallback in ("text", "md", "markdown"):
+                actual = normalized_enum.get(fallback)
+                if actual:
+                    return actual
+        if candidate == "html":
+            for fallback in ("html", "raw"):
+                actual = normalized_enum.get(fallback)
+                if actual:
+                    return actual
+    for fallback in ("markdown", "text", "html"):
+        actual = normalized_enum.get(fallback)
+        if actual:
+            return actual
+    first_value = next(iter(normalized_enum.values()), "")
+    return first_value or (normalized_formats[0] if normalized_formats else "markdown")
+
+
+def _build_routed_scrape_prompt(*, formats: Sequence[str], only_main_content: bool) -> str:
+    preferred_format = "markdown" if "markdown" in formats else ("html" if "html" in formats else "text")
+    focus_clause = "Focus on the main article content." if only_main_content else "Include the full page context."
+    return (
+        "Extract reader-facing webpage content with headings, summaries, and important supporting links. "
+        f"{focus_clause} Prefer {preferred_format} output when possible."
+    )
+
+
+_AUTHORITATIVE_PUBLIC_DOMAIN_SUFFIXES = (
+    ".gov",
+    ".edu",
+    ".ac.uk",
+    "nih.gov",
+    "who.int",
+    "nature.com",
+    "nejm.org",
+    "thelancet.com",
+    "science.org",
+    "usmle.org",
+    "pubmed.ncbi.nlm.nih.gov",
+)
+
+
+def _extract_hostname(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    host = str(parsed.netloc or parsed.path or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _clean_reader_excerpt(value: Any, *, limit: int = 220) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    return text[:limit]
+
+
+def _is_authoritative_public_source(value: Any) -> bool:
+    host = _extract_hostname(value)
+    if not host:
+        return False
+    return any(host == suffix or host.endswith(suffix) for suffix in _AUTHORITATIVE_PUBLIC_DOMAIN_SUFFIXES)
+
+
+def _dedupe_public_links(rows: Sequence[Mapping[str, Any]], *, limit: int = 5) -> List[Dict[str, str]]:
+    links: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for row in list(rows or []):
+        href = str(row.get("url") or row.get("href") or "").strip()
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        item: Dict[str, str] = {
+            "label": str(row.get("title") or row.get("label") or href).strip()[:120],
+            "href": href,
+        }
+        snippet = _clean_reader_excerpt(row.get("reader_excerpt") or row.get("snippet") or row.get("summary") or "", limit=180)
+        if snippet:
+            item["snippet"] = snippet
+        links.append(item)
+        if len(links) >= limit:
+            break
+    return links
+
+
+def _summarize_ranked_reader_excerpts(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    empty_summary: str,
+    limit: int = 2,
+) -> str:
+    excerpts: List[str] = []
+    for row in list(rows or []):
+        excerpt = _clean_reader_excerpt(
+            row.get("reader_excerpt") or row.get("snippet") or row.get("summary") or "",
+            limit=140,
+        )
+        if not excerpt:
+            continue
+        title = _clean_reader_excerpt(row.get("title") or "", limit=80)
+        candidate = excerpt
+        if title and title.lower() not in excerpt.lower():
+            candidate = _clean_reader_excerpt(f"{title}: {excerpt}", limit=160)
+        if candidate and candidate not in excerpts:
+            excerpts.append(candidate)
+        if len(excerpts) >= limit:
+            break
+    return " | ".join(excerpts) if excerpts else empty_summary
+
+
+def _summarize_domain_distribution(rows: Sequence[Mapping[str, Any]], *, limit: int = 5) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    for row in list(rows or []):
+        domain = _extract_hostname(row.get("url") or row.get("href") or row.get("domain") or "")
+        if not domain:
+            continue
+        counts[domain] = counts.get(domain, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [
+        {
+            "domain": domain,
+            "count": count,
+            "authoritative": _is_authoritative_public_source(domain),
+        }
+        for domain, count in ranked[:limit]
+    ]
+
+
+def _build_tool_provenance(
+    *,
+    source: str,
+    execution_mode: str,
+    provider: str,
+    provider_route: str,
+    tool_kind: str,
+    local_tool_name: str,
+) -> Dict[str, Any]:
+    return {
+        "source": str(source or "").strip(),
+        "execution_mode": str(execution_mode or "").strip(),
+        "provider": str(provider or "").strip(),
+        "provider_route": str(provider_route or "").strip(),
+        "tool_kind": str(tool_kind or "").strip(),
+        "local_tool_name": str(local_tool_name or "").strip(),
+        "normalization_version": "guided_reading_v1",
+    }
+
+
+def _normalize_web_search_result_item(
+    item: Mapping[str, Any],
+    *,
+    provider: str,
+    rank: int,
+) -> Dict[str, Any]:
+    url = str(
+        item.get("url")
+        or item.get("link")
+        or item.get("href")
+        or item.get("source")
+        or ""
+    ).strip()
+    title = str(
+        item.get("title")
+        or item.get("name")
+        or item.get("label")
+        or item.get("answer")
+        or url
+        or "Public resource"
+    ).strip()
+    snippet = str(
+        item.get("snippet")
+        or item.get("summary")
+        or item.get("content")
+        or item.get("description")
+        or item.get("text")
+        or item.get("answer")
+        or ""
+    ).strip()
+    domain = _extract_hostname(url)
+    reader_excerpt = _clean_reader_excerpt(snippet or title, limit=220)
+    normalized: Dict[str, Any] = {
+        "rank": int(rank),
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "reader_excerpt": reader_excerpt,
+        "type": str(item.get("type") or ("organic" if url else "result")).strip() or "result",
+        "display_url": domain or url,
+        "domain": domain,
+        "is_authoritative_source": bool(domain and _is_authoritative_public_source(domain)),
+    }
+    for key in ("source", "date", "published_at", "score"):
+        if item.get(key) is not None:
+            normalized[key] = item.get(key)
+    if provider:
+        normalized["provider"] = provider
+    return normalized
+
+
+def _build_web_search_payload(
+    *,
+    query: str,
+    provider: str,
+    provider_route: str,
+    results: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    normalized_results = [
+        _normalize_web_search_result_item(item, provider=provider, rank=index)
+        for index, item in enumerate(list(results or []), start=1)
+        if isinstance(item, Mapping)
+    ]
+    public_links = _dedupe_public_links(normalized_results, limit=5)
+    result_types = [
+        str(item.get("type") or "").strip()
+        for item in normalized_results
+        if str(item.get("type") or "").strip()
+    ]
+    reader_summary = _summarize_ranked_reader_excerpts(
+        normalized_results,
+        empty_summary=f"No public web results found for '{query}'.",
+    )
+    structured_content = {
+        "query": str(query or "").strip(),
+        "provider": str(provider or "").strip(),
+        "total": len(normalized_results),
+        "results": normalized_results,
+        "reader_summary": reader_summary,
+        "result_types": list(dict.fromkeys(result_types)),
+        "domains": _summarize_domain_distribution(normalized_results),
+    }
+    provenance = _build_tool_provenance(
+        source="local",
+        execution_mode="direct",
+        provider=provider,
+        provider_route=provider_route,
+        tool_kind="web_search",
+        local_tool_name="web_search",
+    )
+    return {
+        "query": str(query or "").strip(),
+        "provider": str(provider or "").strip(),
+        "provider_route": str(provider_route or "").strip(),
+        "source_kind": "public_web_search",
+        "results": normalized_results,
+        "total": len(normalized_results),
+        "public_links": public_links,
+        "reader_summary": reader_summary,
+        "structured_content": structured_content,
+        "provenance": provenance,
+    }
+
+
+def _normalize_knowledge_search_result_item(
+    item: Mapping[str, Any],
+    *,
+    rank: int,
+) -> Dict[str, Any]:
+    normalized = dict(item)
+    content = str(item.get("content") or "").strip()
+    knowledge_base = str(item.get("knowledge_base") or "未知").strip()
+    document = str(item.get("document") or "未知").strip()
+    reader_excerpt = _clean_reader_excerpt(content, limit=240)
+    normalized.update(
+        {
+            "rank": int(rank),
+            "reader_excerpt": reader_excerpt,
+            "source_label": f"{knowledge_base} / {document}",
+            "citation_label": f"{document} · chunk {int(item.get('chunk_index') or 0)}",
+        }
+    )
+    return normalized
+
+
+def _build_knowledge_search_payload(
+    *,
+    query: str,
+    results: Sequence[Mapping[str, Any]],
+    search_time_ms: float,
+) -> Dict[str, Any]:
+    normalized_results = [
+        _normalize_knowledge_search_result_item(item, rank=index)
+        for index, item in enumerate(list(results or []), start=1)
+        if isinstance(item, Mapping)
+    ]
+    kb_hits: Dict[str, int] = {}
+    document_hits: Dict[str, int] = {}
+    retrieval_modes: List[str] = []
+    for row in normalized_results:
+        kb_name = str(row.get("knowledge_base") or "").strip()
+        document_name = str(row.get("document") or "").strip()
+        retrieval_mode = str(row.get("retrieval_mode") or "").strip()
+        if kb_name:
+            kb_hits[kb_name] = kb_hits.get(kb_name, 0) + 1
+        if document_name:
+            document_hits[document_name] = document_hits.get(document_name, 0) + 1
+        if retrieval_mode:
+            retrieval_modes.append(retrieval_mode)
+    reader_summary = _summarize_ranked_reader_excerpts(
+        normalized_results,
+        empty_summary=f"No knowledge-base passages found for '{query}'.",
+    )
+    structured_content = {
+        "query": str(query or "").strip(),
+        "provider": "local_pgvector",
+        "total": len(normalized_results),
+        "search_time_ms": round(float(search_time_ms or 0.0), 3),
+        "results": normalized_results,
+        "reader_summary": reader_summary,
+        "retrieval_modes": list(dict.fromkeys(retrieval_modes)),
+        "knowledge_base_hits": [
+            {"knowledge_base": name, "count": count}
+            for name, count in sorted(kb_hits.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "document_hits": [
+            {"document": name, "count": count}
+            for name, count in sorted(document_hits.items(), key=lambda item: (-item[1], item[0]))
+        ],
+    }
+    provenance = _build_tool_provenance(
+        source="knowledge_base",
+        execution_mode="direct",
+        provider="local_pgvector",
+        provider_route="local.knowledge_search.pgvector",
+        tool_kind="knowledge_search",
+        local_tool_name="knowledge_search",
+    )
+    return {
+        "query": str(query or "").strip(),
+        "provider": "local_pgvector",
+        "provider_route": "local.knowledge_search.pgvector",
+        "source_kind": "knowledge_base_search",
+        "results": normalized_results,
+        "total": len(normalized_results),
+        "search_time_ms": round(float(search_time_ms or 0.0), 3),
+        "reader_summary": reader_summary,
+        "structured_content": structured_content,
+        "provenance": provenance,
+    }
+
+
 class WebSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     max_results: int = Field(default=5, ge=1, le=10)
@@ -331,7 +734,11 @@ class WebSearchTool(ToolBase):
     def __init__(self):
         self.serper_api_key = os.getenv("SERPER_API_KEY", "").strip()
         self.tavily_api_key = (
-            str(getattr(settings, "tavily_api_key", "") or os.getenv("TAVILY_API_KEY", ""))
+            str(
+                getattr(settings, "tavily_api_key", "")
+                or os.getenv("TAVILY_API_KEY", "")
+                or os.getenv("MCP_TAVILY_API_KEY", "")
+            )
             .strip()
         )
         if self.serper_api_key:
@@ -368,6 +775,60 @@ class WebSearchTool(ToolBase):
             success=False,
             output=f"网络搜索失败，已尝试 Serper/Tavily/DDGS。错误: {'; '.join(errors)}",
             error="web_search_all_failed",
+        )
+
+
+class WebScrapeInput(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    formats: Optional[List[str]] = None
+    only_main_content: bool = True
+
+
+class WebScrapeTool(ToolBase):
+    """网页抓取工具壳：优先交给 MCP 路由（例如 Firecrawl）。"""
+
+    name = "web_scrape"
+    parallel_safe = True
+    description = "抓取网页正文、结构化内容或提取页面关键信息。优先由 MCP 抓取工具处理。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "要抓取的网页 URL",
+            },
+            "formats": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "期望的输出格式，例如 markdown、html、text",
+            },
+            "only_main_content": {
+                "type": "boolean",
+                "description": "是否尽量仅抓取正文区域",
+                "default": True,
+            },
+        },
+        "required": ["url"],
+    }
+    input_model = WebScrapeInput
+    timeout_seconds = 45
+    retry_count = 0
+
+    async def _execute(
+        self,
+        url: str,
+        formats: Optional[List[str]] = None,
+        only_main_content: bool = True,
+    ) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="web_scrape 当前依赖外部 MCP 抓取服务；请检查 Firecrawl MCP 路由是否已启用。",
+            error="web_scrape_mcp_required",
+            data={
+                "url": url,
+                "formats": formats or [],
+                "only_main_content": bool(only_main_content),
+            },
         )
 
     async def _safe_provider_call(
@@ -457,7 +918,12 @@ class WebSearchTool(ToolBase):
             return ToolResult(
                 success=True,
                 output=self._format_results(query, results),
-                data={"results": results, "query": query, "provider": "serper"},
+                data=_build_web_search_payload(
+                    query=query,
+                    provider="serper",
+                    provider_route="local.web_search.serper",
+                    results=results,
+                ),
             )
 
     async def _tavily_search(self, query: str, max_results: int) -> ToolResult:
@@ -496,7 +962,12 @@ class WebSearchTool(ToolBase):
             return ToolResult(
                 success=True,
                 output=self._format_results(query, results),
-                data={"results": results, "query": query, "provider": "tavily"},
+                data=_build_web_search_payload(
+                    query=query,
+                    provider="tavily",
+                    provider_route="local.web_search.tavily",
+                    results=results,
+                ),
             )
 
     async def _ddgs_search(self, query: str, max_results: int) -> ToolResult:
@@ -529,7 +1000,12 @@ class WebSearchTool(ToolBase):
             return ToolResult(
                 success=True,
                 output=self._format_results(query, results),
-                data={"results": results, "query": query, "provider": "ddgs"},
+                data=_build_web_search_payload(
+                    query=query,
+                    provider="ddgs",
+                    provider_route="local.web_search.ddgs",
+                    results=results,
+                ),
             )
         except Exception as exc:
             return ToolResult(
@@ -647,7 +1123,7 @@ class KnowledgeSearchTool(ToolBase):
         self.query_rewrite_service = get_query_rewrite_service()
     
     def _resolve_timeout_seconds(self) -> float:
-        primary_timeout = float(getattr(settings, "search_timeout_primary_ms", 300000)) / 1000.0
+        primary_timeout = float(getattr(settings, "knowledge_search_timeout_ms", 45000)) / 1000.0
         return max(primary_timeout, super()._resolve_timeout_seconds())
 
     async def _execute(
@@ -725,7 +1201,7 @@ class KnowledgeSearchTool(ToolBase):
             )
 
             search_time = (time.time() - start_time) * 1000
-            output = self._format_retrieval_output(results, search_time)
+            output = self._format_retrieval_output(query=query, results=results, search_time=search_time)
             self._log_retrieval_metrics(
                 query=query,
                 search_time=search_time,
@@ -736,7 +1212,11 @@ class KnowledgeSearchTool(ToolBase):
             return ToolResult(
                 success=True,
                 output=output,
-                data={"results": results, "total": len(results), "search_time_ms": search_time},
+                data=_build_knowledge_search_payload(
+                    query=query,
+                    results=results,
+                    search_time_ms=search_time,
+                ),
             )
 
         except Exception as e:
@@ -1225,13 +1705,17 @@ class KnowledgeSearchTool(ToolBase):
         return results
 
     @staticmethod
-    def _format_retrieval_output(results: list[dict[str, Any]], search_time: float) -> str:
-        output_parts = [f"找到 {len(results)} 条相关结果：\n"]
+    def _format_retrieval_output(*, query: str, results: list[dict[str, Any]], search_time: float) -> str:
+        output_parts = [f"找到 {len(results)} 条与“{query}”相关的知识库线索：\n"]
         for i, r in enumerate(results, 1):
+            reader_excerpt = str(r.get("reader_excerpt") or r.get("content") or "").strip()
+            retrieval_mode = str(r.get("retrieval_mode") or "").strip()
+            source_label = str(r.get("source_label") or f"{r.get('knowledge_base', '未知')} / {r.get('document', '未知')}").strip()
             output_parts.append(
-                f"\n【结果{i}】(相关度: {r['score']*100:.1f}%)\n"
-                f"来源: {r['knowledge_base']} / {r['document']}\n"
-                f"内容: {r['content'][:500]}{'...' if len(r['content']) > 500 else ''}"
+                f"\n【线索{i}】(相关度: {r['score']*100:.1f}%)\n"
+                f"来源: {source_label}\n"
+                f"检索方式: {retrieval_mode or 'vector'}\n"
+                f"要点: {reader_excerpt[:500]}{'...' if len(reader_excerpt) > 500 else ''}"
             )
         output_parts.append(f"\n\n(搜索耗时: {search_time:.2f}ms)")
         return "".join(output_parts)
@@ -1954,6 +2438,7 @@ class DefaultToolProvider:
         tools.extend(
             [
                 WebSearchTool(),
+                WebScrapeTool(),
                 CalculatorTool(),
                 DateTimeTool(),
                 TextAnalysisTool(),
@@ -2158,6 +2643,203 @@ class ToolRegistry:
             f"[MCP] circuit opened route={route_key}, open_seconds={open_seconds}, last_error={error}"
         )
 
+    async def _resolve_routed_mcp_schema(self, route_key: str) -> Any:
+        if not self._mcp_client_manager:
+            return None
+
+        resolve_schema = getattr(self._mcp_client_manager, "resolve_tool_schema", None)
+        schema = resolve_schema(route_key) if callable(resolve_schema) else None
+        if schema is not None:
+            return schema
+
+        discover_tools = getattr(self._mcp_client_manager, "discover_tools", None)
+        if callable(discover_tools):
+            maybe_awaitable = discover_tools(force_refresh=False)
+            if hasattr(maybe_awaitable, "__await__"):
+                await maybe_awaitable
+            schema = resolve_schema(route_key) if callable(resolve_schema) else None
+        return schema
+
+    def _translate_routed_web_search_arguments(
+        self,
+        *,
+        schema: Any,
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        properties = _coerce_mcp_schema_properties(schema)
+        translated: Dict[str, Any] = {}
+        query = str(arguments.get("query") or arguments.get("q") or "").strip()
+        if not query:
+            return dict(arguments)
+
+        query_key = _pick_mcp_property_name(
+            properties,
+            ["query", "q", "search_term", "searchTerm", "keywords", "keyword", "term", "input"],
+        )
+        translated[query_key or "query"] = query
+
+        max_results_value = arguments.get("max_results")
+        if max_results_value is not None:
+            count_key = _pick_mcp_property_name(
+                properties,
+                ["max_results", "maxResults", "limit", "count", "num_results", "numResults", "size", "top_k", "topK", "k"],
+            )
+            if count_key:
+                translated[count_key] = int(max_results_value)
+            elif "max_results" in arguments:
+                translated["max_results"] = int(max_results_value)
+
+        return _copy_matching_mcp_arguments(
+            translated=translated,
+            original=arguments,
+            properties=properties,
+        )
+
+    def _translate_routed_web_scrape_arguments(
+        self,
+        *,
+        schema: Any,
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        properties = _coerce_mcp_schema_properties(schema)
+        translated: Dict[str, Any] = {}
+        url = str(arguments.get("url") or arguments.get("href") or "").strip()
+        if not url:
+            return dict(arguments)
+
+        if "urls" in properties:
+            translated["urls"] = [url]
+        else:
+            url_key = _pick_mcp_property_name(properties, ["url", "href", "link"])
+            translated[url_key or "url"] = url
+
+        requested_formats = _normalize_requested_formats(arguments.get("formats"))
+        format_key = _pick_mcp_property_name(properties, ["formats", "format", "response_format", "output_format"])
+        if format_key:
+            if str(format_key).strip().lower() == "formats":
+                translated[format_key] = requested_formats or ["markdown"]
+            else:
+                translated[format_key] = _choose_scrape_format_value(properties.get(format_key) or {}, requested_formats)
+        else:
+            extract_key = _pick_mcp_property_name(properties, ["extract", "mode"])
+            if extract_key:
+                translated[extract_key] = _choose_scrape_format_value(properties.get(extract_key) or {}, requested_formats)
+
+        only_main_content = bool(arguments.get("only_main_content", True))
+        main_content_key = _pick_mcp_property_name(
+            properties,
+            ["only_main_content", "onlyMainContent", "main_content_only", "mainContentOnly"],
+        )
+        if main_content_key:
+            translated[main_content_key] = only_main_content
+
+        prompt_key = _pick_mcp_property_name(properties, ["prompt", "instruction", "instructions"])
+        if prompt_key and prompt_key not in translated and prompt_key not in arguments:
+            translated[prompt_key] = _build_routed_scrape_prompt(
+                formats=requested_formats,
+                only_main_content=only_main_content,
+            )
+
+        return _copy_matching_mcp_arguments(
+            translated=translated,
+            original=arguments,
+            properties=properties,
+        )
+
+    def _translate_routed_mcp_arguments(
+        self,
+        *,
+        tool_name: str,
+        route_key: str,
+        schema: Any,
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if tool_name == "web_search":
+            return self._translate_routed_web_search_arguments(schema=schema, arguments=arguments)
+        if tool_name == "web_scrape":
+            return self._translate_routed_web_scrape_arguments(schema=schema, arguments=arguments)
+        return dict(arguments)
+
+    def _decorate_routed_mcp_result(
+        self,
+        *,
+        tool_name: str,
+        route_key: str,
+        schema: Any,
+        original_arguments: Dict[str, Any],
+        routed_arguments: Dict[str, Any],
+        result: Any,
+    ) -> Dict[str, Any]:
+        base_data = result.data if isinstance(result.data, dict) else {"raw": result.data}
+        normalized_data = dict(base_data)
+        try:
+            from app.services.mcp.client import MCPClientManager
+
+            normalized_enrichment = MCPClientManager._normalize_enrichment_payload(
+                schema=schema,
+                arguments=dict(routed_arguments or original_arguments or {}),
+                raw_data=normalized_data,
+                structured=normalized_data.get("structured_content"),
+                fallback_output=str(getattr(result, "output", "") or ""),
+            )
+        except (ImportError, TypeError, ValueError):
+            normalized_enrichment = {}
+        if isinstance(normalized_enrichment, dict):
+            normalized_data.update(normalized_enrichment)
+        provenance = dict(normalized_data.get("provenance") or {})
+        provider = str(
+            normalized_data.get("provider")
+            or provenance.get("provider")
+            or getattr(schema, "server_name", "")
+            or ""
+        ).strip()
+        provider_route = str(
+            normalized_data.get("provider_route")
+            or provenance.get("provider_route")
+            or route_key
+        ).strip()
+        provenance.update(
+            {
+                "source": "mcp",
+                "execution_mode": "routed",
+                "provider": provider or str(provenance.get("provider") or "").strip(),
+                "provider_route": provider_route,
+                "local_tool_name": str(tool_name or "").strip(),
+                "remote_server_name": str(
+                    provenance.get("remote_server_name") or getattr(schema, "server_name", "") or ""
+                ).strip(),
+                "remote_tool_name": str(
+                    provenance.get("remote_tool_name") or getattr(schema, "tool_name", "") or ""
+                ).strip(),
+                "qualified_tool_name": str(
+                    provenance.get("qualified_tool_name") or getattr(schema, "qualified_name", "") or route_key
+                ).strip(),
+                "tool_kind": str(provenance.get("tool_kind") or tool_name or "").strip(),
+                "normalization_version": "guided_reading_v1",
+            }
+        )
+        if dict(original_arguments or {}) != dict(routed_arguments or {}):
+            provenance["argument_translation"] = {
+                "applied": True,
+                "original_arguments": dict(original_arguments or {}),
+                "translated_arguments": dict(routed_arguments or {}),
+            }
+        normalized_data["provenance"] = provenance
+        normalized_data["routed_via_mcp"] = True
+        normalized_data["local_tool_name"] = str(tool_name or "").strip()
+        normalized_data["provider_route"] = provider_route
+        normalized_data["remote_tool_name"] = str(
+            normalized_data.get("remote_tool_name") or getattr(schema, "tool_name", "") or ""
+        ).strip()
+        normalized_data["remote_server_name"] = str(
+            normalized_data.get("remote_server_name") or getattr(schema, "server_name", "") or ""
+        ).strip()
+        normalized_data["tool_kind"] = str(normalized_data.get("tool_kind") or tool_name or "").strip()
+        normalized_data["normalization_version"] = "guided_reading_v1"
+        if provider:
+            normalized_data["provider"] = provider
+        return normalized_data
+
     async def _call_mcp_tool_with_retry(self, route_key: str, arguments: Dict[str, Any]):
         if not self._mcp_client_manager:
             return None
@@ -2228,7 +2910,14 @@ class ToolRegistry:
             return None
 
         for route_key in candidates:
-            result = await self._call_mcp_tool_with_retry(route_key, arguments)
+            route_schema = await self._resolve_routed_mcp_schema(route_key)
+            routed_arguments = self._translate_routed_mcp_arguments(
+                tool_name=tool_name,
+                route_key=route_key,
+                schema=route_schema,
+                arguments=arguments,
+            )
+            result = await self._call_mcp_tool_with_retry(route_key, routed_arguments)
             if not result:
                 continue
             if result.success:
@@ -2236,7 +2925,14 @@ class ToolRegistry:
                 return ToolResult(
                     success=True,
                     output=str(result.output),
-                    data=result.data if isinstance(result.data, dict) else {"raw": result.data},
+                    data=self._decorate_routed_mcp_result(
+                        tool_name=tool_name,
+                        route_key=route_key,
+                        schema=route_schema,
+                        original_arguments=arguments,
+                        routed_arguments=routed_arguments,
+                        result=result,
+                    ),
                     error=result.error,
                 )
             logger.warning(

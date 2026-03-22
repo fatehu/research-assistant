@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import inspect
+from io import BytesIO
 import json
 import os
 import re
@@ -19,9 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from loguru import logger
 from openai import AsyncOpenAI
+from PIL import Image
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,12 +63,13 @@ except Exception:  # pragma: no cover
     redis_async = None
 
 
-COMPOSE_ENGINE_VERSION = "reader_compose_v3"
+COMPOSE_ENGINE_VERSION = "reader_compose_v15"
 COMPOSE_COMPONENT_SCHEMA_VERSION = "reader_components_v2"
 COMPOSE_AGENT_PROMPT_VERSION = "reader_compose_prompt_v2"
 COMPOSE_ASSET_POLICY_VERSION = "reader_asset_policy_v1"
 COMPOSE_LAYOUT_SCHEMA_VERSION = "layout_schema_v2"
-SIMPLIFIED_PIPELINE_VERSION_DEFAULT = "simplified_v2"
+SIMPLIFIED_PIPELINE_VERSION_DEFAULT = "layout_uid_v1"
+LAYOUT_UID_PIPELINE_VERSION = "layout_uid_v1"
 PIPELINE_MODE_LEGACY = "legacy"
 PIPELINE_MODE_SINGLE_AGENT_V2 = "single_agent_v2"
 
@@ -259,6 +264,8 @@ _GENERIC_HEADING_MARKERS = {
 }
 
 SIMPLIFIED_ALLOWED_COMPONENTS: List[str] = [
+    "PaperHeaderCard",
+    "MetadataSidebarCard",
     "SectionHeading",
     "ParagraphProse",
     "ListBlock",
@@ -277,6 +284,7 @@ SIMPLIFIED_ALLOWED_COMPONENTS: List[str] = [
     "CompareInsightsCard",
     "InsightClusterCard",
     "SectionBridgeCard",
+    "QualityPanel",
 ]
 
 INLINE_QUERY_SUPPORTED_NODE_TYPES = {
@@ -333,13 +341,17 @@ class LiteratureReaderComposeService:
         except Exception:
             return float(default)
 
-    def _pipeline_version(self) -> str:
-        token = str(getattr(settings, "reader_pipeline_version", SIMPLIFIED_PIPELINE_VERSION_DEFAULT) or "").strip()
+    def _pipeline_version(self, override: Optional[str] = None) -> str:
+        token = str(override or getattr(settings, "reader_pipeline_version", SIMPLIFIED_PIPELINE_VERSION_DEFAULT) or "").strip()
         return token or SIMPLIFIED_PIPELINE_VERSION_DEFAULT
 
-    def _use_semantic_atom_pipeline(self) -> bool:
-        token = self._pipeline_version().strip().lower()
+    def _use_semantic_atom_pipeline(self, pipeline_version: Optional[str] = None) -> bool:
+        token = self._pipeline_version(pipeline_version).strip().lower()
         return token in {"simplified_v2", "reader_workbench_v2_phase12", "phase12_semantic_v1"}
+
+    def _use_layout_uid_pipeline(self, pipeline_version: Optional[str] = None) -> bool:
+        token = self._pipeline_version(pipeline_version).strip().lower()
+        return token == LAYOUT_UID_PIPELINE_VERSION
 
     def _pipeline_mode(self) -> str:
         explicit = str(getattr(settings, "reader_pipeline_mode", PIPELINE_MODE_SINGLE_AGENT_V2) or "").strip().lower()
@@ -428,6 +440,9 @@ class LiteratureReaderComposeService:
     def _should_rebuild_cached_payload(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
+        payload_engine_version = str(payload.get("engine_version") or "").strip()
+        if payload_engine_version and payload_engine_version != COMPOSE_ENGINE_VERSION:
+            return True
         status_value = str(payload.get("status") or "").strip().lower()
         if status_value != "fallback":
             return False
@@ -467,6 +482,7 @@ class LiteratureReaderComposeService:
         paper: Paper,
         page: int,
         selected_kb_id: Optional[int] = None,
+        pipeline_version_override: Optional[str] = None,
         force_refresh: bool = False,
         regenerate: bool = False,
         latency_budget_ms: Optional[int] = None,
@@ -489,7 +505,7 @@ class LiteratureReaderComposeService:
             f"regenerate={bool(regenerate)}"
         )
         pipeline_mode = self._pipeline_mode()
-        pipeline_version = self._pipeline_version()
+        pipeline_version = self._pipeline_version(pipeline_version_override)
         latency_budget = self._normalize_latency_budget(latency_budget_ms)
         quality_goal = self._normalize_quality_target(quality_target)
         normalized_theme = self._normalize_theme_mode(theme_mode)
@@ -536,12 +552,15 @@ class LiteratureReaderComposeService:
             if isinstance(cached_payload, dict):
                 if self._should_rebuild_cached_payload(cached_payload):
                     logger.info(
-                        "[ReaderComposeService] skip stale fallback redis cache and rebuild "
-                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                        "[ReaderComposeService] skip stale redis compose cache and rebuild "
+                        f"paper={paper.id} page={page_num}"
                     )
                     await self._delete_payload_from_redis(redis_key)
                 else:
-                    payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                    repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
+                    if repaired_cached_payload != cached_payload:
+                        await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+                    payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
                     payload = await self._apply_overlay_for_user(
                         db=db,
                         user_id=int(user_id),
@@ -572,8 +591,8 @@ class LiteratureReaderComposeService:
             if isinstance(cached_row, dict):
                 if self._should_rebuild_cached_payload(cached_row):
                     logger.info(
-                        "[ReaderComposeService] skip stale fallback db cache and rebuild "
-                        f"paper={paper.id} page={page_num} reason=simplified_pipeline_no_atoms"
+                        "[ReaderComposeService] skip stale db compose cache and rebuild "
+                        f"paper={paper.id} page={page_num}"
                     )
                 else:
                     await self._write_payload_to_redis(redis_key, cached_row)
@@ -604,6 +623,7 @@ class LiteratureReaderComposeService:
                 paper_id=int(paper.id),
                 page=page_num,
                 source_signature=source_signature,
+                pipeline_version=pipeline_version,
             )
             if isinstance(compatible_cached_row, dict):
                 logger.info(
@@ -656,7 +676,10 @@ class LiteratureReaderComposeService:
                     if self._should_rebuild_cached_payload(cached_payload):
                         await self._delete_payload_from_redis(redis_key)
                     else:
-                        payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+                        repaired_cached_payload = self._ensure_payload_contract(page=page_num, payload=dict(cached_payload))
+                        if repaired_cached_payload != cached_payload:
+                            await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+                        payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
                         payload = await self._apply_overlay_for_user(
                             db=db,
                             user_id=int(user_id),
@@ -747,19 +770,26 @@ class LiteratureReaderComposeService:
                     "[ReaderComposeService] single_agent_v2 pipeline start "
                     f"paper={paper.id} page={page_num}"
                 )
-                use_semantic_atom_pipeline = self._use_semantic_atom_pipeline()
-                primary_builder = (
-                    self._build_simplified_pipeline_result
-                    if use_semantic_atom_pipeline
-                    else self._build_single_agent_v2_result
-                )
-                fallback_builder = (
-                    self._build_single_agent_v2_result
-                    if use_semantic_atom_pipeline
-                    else self._build_simplified_pipeline_result
-                )
-                primary_label = "semantic_atom_pipeline" if use_semantic_atom_pipeline else "single_agent_v2_controller"
-                fallback_label = "single_agent_v2_controller" if use_semantic_atom_pipeline else "semantic_atom_pipeline"
+                use_layout_uid_pipeline = self._use_layout_uid_pipeline(pipeline_version)
+                use_semantic_atom_pipeline = self._use_semantic_atom_pipeline(pipeline_version)
+                if use_layout_uid_pipeline:
+                    primary_builder = self._build_layout_uid_pipeline_result
+                    fallback_builder = self._build_single_agent_v2_result
+                    primary_label = "layout_uid_pipeline"
+                    fallback_label = "single_agent_v2_controller"
+                else:
+                    primary_builder = (
+                        self._build_simplified_pipeline_result
+                        if use_semantic_atom_pipeline
+                        else self._build_single_agent_v2_result
+                    )
+                    fallback_builder = (
+                        self._build_single_agent_v2_result
+                        if use_semantic_atom_pipeline
+                        else self._build_simplified_pipeline_result
+                    )
+                    primary_label = "semantic_atom_pipeline" if use_semantic_atom_pipeline else "single_agent_v2_controller"
+                    fallback_label = "single_agent_v2_controller" if use_semantic_atom_pipeline else "semantic_atom_pipeline"
                 try:
                     simplified_result = await primary_builder(
                         db=db,
@@ -773,6 +803,7 @@ class LiteratureReaderComposeService:
                         compare_mode=use_compare_mode,
                         latency_budget_ms=latency_budget,
                         selected_kb_id=selected_kb_id,
+                        pipeline_version=pipeline_version,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -791,6 +822,7 @@ class LiteratureReaderComposeService:
                         compare_mode=use_compare_mode,
                         latency_budget_ms=latency_budget,
                         selected_kb_id=selected_kb_id,
+                        pipeline_version=pipeline_version,
                     )
                 base_payload = dict(simplified_result.get("base_payload") or base_payload)
                 loop_result = dict(simplified_result.get("loop_result") or {})
@@ -1013,7 +1045,9 @@ class LiteratureReaderComposeService:
         compare_mode: bool,
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
+        pipeline_version: Optional[str] = None,
     ) -> Dict[str, Any]:
+        _ = pipeline_version
         return await self._build_simplified_pipeline_result_legacy(
             db=db,
             user_id=user_id,
@@ -1027,6 +1061,3074 @@ class LiteratureReaderComposeService:
             latency_budget_ms=latency_budget_ms,
             selected_kb_id=selected_kb_id,
         )
+
+    @staticmethod
+    def _layout_uid_group_kinds() -> set[str]:
+        return {
+            "title",
+            "section_heading",
+            "paragraph",
+            "list",
+            "figure",
+            "table",
+            "table_caption",
+            "equation",
+            "metadata",
+            "doi",
+            "header",
+            "footer",
+            "noise",
+        }
+
+    def _build_layout_uid_prompt_payload(
+        self,
+        *,
+        paper: Paper,
+        page: int,
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        compact_atoms: List[Dict[str, Any]] = []
+        for atom in sorted(layout_atoms, key=lambda item: int(item.get("reading_order") or 0)):
+            layout_id = str(atom.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            compact_atoms.append(
+                {
+                    "layout_id": layout_id,
+                    "reading_order": int(atom.get("reading_order") or 0),
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "node_kind": str(atom.get("node_kind") or "").strip().lower(),
+                    "text": self._normalized_grounding_text(atom),
+                    "include_in_main_flow": bool(atom.get("include_in_main_flow")),
+                    "region_hint": str(atom.get("region_hint") or "").strip(),
+                    "layout_pos": list(atom.get("layout_pos") or []),
+                    "block_count": len(list(atom.get("blocks") or [])),
+                }
+            )
+        return {
+            "page_meta": {
+                "paper_id": int(paper.id),
+                "page": int(page),
+                "paper_title": str(getattr(paper, "title", "") or "").strip(),
+                "reader_mode": "read_layout_uid_v1",
+            },
+            "layout_atoms": compact_atoms,
+            "rules": {
+                "indivisible_unit": "layout_id",
+                "exactly_once_assignment": True,
+                "no_layout_split": True,
+                "output_goal": "html_like_reading_flow",
+                "allow_group_kinds": sorted(self._layout_uid_group_kinds()),
+            },
+        }
+
+    @staticmethod
+    def _layout_uid_grouping_system_prompt() -> str:
+        return (
+            "You organize a single PDF page for the /read reader. "
+            "The indivisible unit is layout_id (DocMind uniqueId). "
+            "Never split a layout_id, never invent ids, and never modify ownership. "
+            "Use the attached page image only as visual reference. "
+            "Return JSON with status and step_result. "
+            "Each layout_id must be assigned exactly once, either in groups or omissions. "
+            "Prefer a clean HTML-like reading flow, not a complex generative UI page. "
+            "Keep tables and equations as dedicated reading islands; do not flatten them into prose. "
+            "Keep the source language; do not translate. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"groups\":[{\"group_id\":\"g1\",\"group_kind\":\"paragraph\","
+            "\"source_layout_ids\":[\"layout_id\"],\"rationale\":\"\"}],"
+            "\"omissions\":[{\"layout_id\":\"...\",\"reason\":\"header\"}],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _layout_uid_text_normalization_system_prompt() -> str:
+        return (
+            "You normalize display text for the /read reader. "
+            "The indivisible unit is layout_id (DocMind uniqueId). "
+            "Use the attached page image only as visual reference. "
+            "You may repair OCR and style artifacts such as superscripts, subscripts, broken spacing, broken list markers, "
+            "title stitching, citation-marker bleed, hyphenation leftovers, and footer/header link footnotes. "
+            "For footer-like link items, preserve the URL exactly and recover leading footnote/reference markers such as ^6, ^7, ^8, ^9 when visually obvious. "
+            "You may use footer_bundles context to normalize sequential footer items together, especially when marker-only layouts, noisy URLs, page numbers, and sibling footnotes appear in the same local group. "
+            "For footer bundles, you may keep one sibling as the readable final footnote/link and hide redundant fragments by returning an empty normalized_text with mode footer_hide_fragment. "
+            "Do not invent new URLs, but you may repair obvious OCR pollution around an existing URL or footnote marker by looking at the page image and nearby footer siblings. "
+            "Do not translate, do not summarize, do not paraphrase, do not change meaning, and do not change ownership or geometry. "
+            "Return JSON with status and step_result. "
+            "Each candidate layout_id must appear exactly once in items. "
+            "If no change is needed, return the source text unchanged and explain briefly. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"items\":["
+            "{\"layout_id\":\"...\",\"normalized_text\":\"...\",\"reason\":\"...\",\"confidence\":0.94,\"mode\":\"ocr_cleanup\"}"
+            "],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _layout_uid_text_normalization_allowed_node_kinds() -> Set[str]:
+        return {
+            "title",
+            "section_heading",
+            "paragraph",
+            "list",
+            "figure_caption",
+            "table_caption",
+            "metadata",
+            "doi",
+            "header",
+            "footer",
+        }
+
+    @staticmethod
+    def _normalized_grounding_text(atom: Mapping[str, Any]) -> str:
+        return str(
+            atom.get("normalized_text")
+            or atom.get("clean_text")
+            or atom.get("raw_text")
+            or ""
+        ).strip()
+
+    def _build_layout_uid_text_normalization_prompt_payload(
+        self,
+        *,
+        page: int,
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        footer_bundles = self._build_layout_uid_footer_bundles(layout_atoms)
+        footer_bundle_by_layout_id: Dict[str, Dict[str, Any]] = {}
+        for bundle in footer_bundles:
+            bundle_id = str(bundle.get("bundle_id") or "").strip()
+            bundle_summary = {
+                "bundle_id": bundle_id,
+                "item_count": int(bundle.get("item_count") or 0),
+                "reading_order_start": int(bundle.get("reading_order_start") or 0),
+                "reading_order_end": int(bundle.get("reading_order_end") or 0),
+            }
+            for item in list(bundle.get("items") or []):
+                if not isinstance(item, Mapping):
+                    continue
+                layout_id = str(item.get("layout_id") or "").strip()
+                if layout_id:
+                    footer_bundle_by_layout_id[layout_id] = bundle_summary
+        allowed_kinds = self._layout_uid_text_normalization_allowed_node_kinds()
+        candidates: List[Dict[str, Any]] = []
+        for atom in sorted(layout_atoms, key=lambda item: int(item.get("reading_order") or 0)):
+            layout_id = str(atom.get("layout_id") or "").strip()
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            if not layout_id or not source_text or node_kind not in allowed_kinds:
+                continue
+            if not bool(atom.get("include_in_main_flow")) and node_kind not in {"metadata", "doi", "header", "footer"}:
+                continue
+            candidates.append(
+                {
+                    "layout_id": layout_id,
+                    "reading_order": int(atom.get("reading_order") or 0),
+                    "node_kind": node_kind,
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "source_text": source_text,
+                    "alignment": str(atom.get("alignment") or "").strip().lower(),
+                    "line_height": float(atom.get("line_height") or 0.0),
+                    "footer_bundle": dict(footer_bundle_by_layout_id.get(layout_id) or {}),
+                    "block_styles": [
+                        {
+                            "style_id": int(block.get("style_id") or 0),
+                            "text": str(block.get("text") or "").strip(),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_text_normalization",
+            },
+            "layout_atoms": candidates,
+            "footer_bundles": footer_bundles,
+            "rules": {
+                "task": "normalize_display_text_only",
+                "exactly_once_assignment": True,
+                "forbid_translation": True,
+                "forbid_geometry_mutation": True,
+                "forbid_ownership_mutation": True,
+                "allowed_repairs": [
+                    "ocr_cleanup",
+                    "superscript_or_subscript_recovery",
+                    "spacing_repair",
+                    "hyphenation_repair",
+                    "heading_or_list_stitching",
+                    "citation_marker_cleanup",
+                    "footer_bundle_rewrite",
+                    "footer_bundle_hide_fragment",
+                ],
+            },
+        }
+
+    def _build_layout_uid_footer_bundles(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        footer_atoms = [
+            dict(atom)
+            for atom in list(layout_atoms or [])
+            if isinstance(atom, Mapping)
+            and str(atom.get("node_kind") or "").strip().lower() == "footer"
+            and str(atom.get("layout_id") or "").strip()
+        ]
+        if not footer_atoms:
+            return []
+        footer_atoms.sort(key=lambda item: int(item.get("reading_order") or 0))
+
+        bundles: List[List[Dict[str, Any]]] = []
+        current_bundle: List[Dict[str, Any]] = []
+        previous_order: Optional[int] = None
+        for atom in footer_atoms:
+            reading_order = int(atom.get("reading_order") or 0)
+            if current_bundle and previous_order is not None and reading_order - previous_order > 2:
+                bundles.append(current_bundle)
+                current_bundle = []
+            current_bundle.append(atom)
+            previous_order = reading_order
+        if current_bundle:
+            bundles.append(current_bundle)
+
+        result: List[Dict[str, Any]] = []
+        for idx, bundle in enumerate(bundles, start=1):
+            items: List[Dict[str, Any]] = []
+            for atom in bundle:
+                source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                text_for_url = source_text or str(atom.get("normalized_text") or "").strip()
+                primary_style_id = 0
+                block_styles = [
+                    dict(block)
+                    for block in list(atom.get("blocks") or [])
+                    if isinstance(block, Mapping)
+                ]
+                if block_styles:
+                    primary_style_id = int((block_styles[0] or {}).get("style_id") or 0)
+                items.append(
+                    {
+                        "layout_id": str(atom.get("layout_id") or "").strip(),
+                        "reading_order": int(atom.get("reading_order") or 0),
+                        "source_text": source_text,
+                        "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                        "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                        "primary_style_id": primary_style_id,
+                        "contains_url": bool(self._extract_url_from_footer_text(text_for_url)),
+                        "is_marker_only": bool(re.fullmatch(r"[\^\[\(]?[0-9]{1,3}[\]\)]?", source_text)),
+                    }
+                )
+            result.append(
+                {
+                    "bundle_id": f"footer_bundle_{idx}",
+                    "item_count": len(items),
+                    "reading_order_start": int((items[0] or {}).get("reading_order") or 0),
+                    "reading_order_end": int((items[-1] or {}).get("reading_order") or 0),
+                    "items": items,
+                }
+            )
+        return result
+
+    def _normalize_layout_uid_text_normalization_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        candidate_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+            and str(row.get("node_kind") or "").strip().lower() in self._layout_uid_text_normalization_allowed_node_kinds()
+            and str(row.get("layout_id") or "").strip()
+            and str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            and (
+                bool(row.get("include_in_main_flow"))
+                or str(row.get("node_kind") or "").strip().lower() in {"metadata", "doi", "header", "footer"}
+            )
+        ]
+        source_text_by_id = {
+            str(row.get("layout_id") or "").strip(): str(row.get("clean_text") or row.get("raw_text") or "").strip()
+            for row in candidate_atoms
+        }
+        known_ids = set(source_text_by_id.keys())
+        used_ids: List[str] = []
+        normalized_items: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        for raw_item in list((step_result or {}).get("items") or []):
+            if not isinstance(raw_item, Mapping):
+                continue
+            layout_id = str(raw_item.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            if layout_id not in known_ids:
+                errors.append(f"unknown_layout_id:{layout_id}")
+                continue
+            used_ids.append(layout_id)
+            source_text = source_text_by_id.get(layout_id, "")
+            normalized_text = self._normalize_spaces(str(raw_item.get("normalized_text") or source_text))
+            reason = self._normalize_spaces(str(raw_item.get("reason") or ""))
+            mode = self._normalize_spaces(str(raw_item.get("mode") or "")) or "no_change"
+            allow_hidden_fragment = mode in {"footer_hide_fragment", "hide_fragment", "footer_fragment_hidden"}
+            if allow_hidden_fragment:
+                normalized_text = ""
+            confidence = 0.0
+            try:
+                confidence = max(0.0, min(1.0, float(raw_item.get("confidence") or 0.0)))
+            except Exception:
+                confidence = 0.0
+                errors.append(f"invalid_confidence:{layout_id}")
+            if len(normalized_text) > 1200:
+                errors.append(f"normalized_text_too_long:{layout_id}")
+                normalized_text = source_text
+            changed = allow_hidden_fragment or bool(normalized_text and normalized_text != source_text)
+            normalized_items.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "normalized_text": normalized_text if changed else source_text,
+                    "reason": reason if changed else "",
+                    "mode": mode if changed else "no_change",
+                    "confidence": confidence if changed else 0.0,
+                    "changed": changed,
+                }
+            )
+
+        duplicates = sorted({layout_id for layout_id in used_ids if used_ids.count(layout_id) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_layout_id:{layout_id}" for layout_id in duplicates])
+        missing = [layout_id for layout_id in source_text_by_id if layout_id not in set(used_ids)]
+        if missing:
+            errors.extend([f"missing_layout_id:{layout_id}" for layout_id in missing])
+
+        if errors:
+            return {
+                "items": [],
+                "notes": ["deterministic_text_normalization_fallback"],
+            }, {
+                "passed": False,
+                "errors": errors,
+                "fallback_used": True,
+            }
+
+        changed_items = [dict(item) for item in normalized_items if bool(item.get("changed"))]
+        return {
+            "items": changed_items,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    def _apply_layout_uid_text_normalization_to_grounding(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        normalization_plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        next_grounding = dict(grounding or {})
+        items = [
+            dict(row)
+            for row in list((normalization_plan or {}).get("items") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        ]
+        if not items:
+            return next_grounding
+        item_by_id = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in items
+        }
+        updated_atoms: List[Dict[str, Any]] = []
+        for raw_atom in list((grounding or {}).get("layout_atoms") or []):
+            if not isinstance(raw_atom, Mapping):
+                continue
+            atom = dict(raw_atom)
+            layout_id = str(atom.get("layout_id") or "").strip()
+            normalized = dict(item_by_id.get(layout_id) or {})
+            if normalized:
+                atom["normalized_text"] = str(normalized.get("normalized_text") or "").strip()
+                atom["normalization_reason"] = str(normalized.get("reason") or "").strip()
+                atom["normalization_mode"] = str(normalized.get("mode") or "").strip()
+                atom["normalization_confidence"] = float(normalized.get("confidence") or 0.0)
+            updated_atoms.append(atom)
+        updated_atoms = self._backfill_footer_link_normalizations(updated_atoms)
+        atom_text_by_id = {
+            str(atom.get("layout_id") or "").strip(): str(atom.get("normalized_text") or "").strip()
+            for atom in updated_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        atom_reason_by_id = {
+            str(atom.get("layout_id") or "").strip(): {
+                "reason": str(atom.get("normalization_reason") or "").strip(),
+                "mode": str(atom.get("normalization_mode") or "").strip(),
+                "confidence": atom.get("normalization_confidence"),
+            }
+            for atom in updated_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        updated_nodes: List[Dict[str, Any]] = []
+        for raw_node in list((grounding or {}).get("reading_nodes") or []):
+            if not isinstance(raw_node, Mapping):
+                continue
+            node = dict(raw_node)
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            normalized_parts = [atom_text_by_id.get(layout_id, "").strip() for layout_id in source_layout_ids if atom_text_by_id.get(layout_id, "").strip()]
+            if normalized_parts:
+                node["normalized_text"] = "\n\n".join(normalized_parts).strip()
+                primary_layout_id = source_layout_ids[0]
+                node_meta = atom_reason_by_id.get(primary_layout_id) or {}
+                node["normalization_reason"] = str(node_meta.get("reason") or "").strip()
+                node["normalization_mode"] = str(node_meta.get("mode") or "").strip()
+                node["normalization_confidence"] = node_meta.get("confidence")
+            updated_nodes.append(node)
+        next_meta = dict(next_grounding.get("meta") or {})
+        next_grounding["layout_atoms"] = updated_atoms
+        next_grounding["reading_nodes"] = updated_nodes
+        normalization_summary = self._build_grounding_normalization_summary(updated_atoms)
+        if normalization_summary:
+            next_meta["normalization_summary"] = normalization_summary
+        next_grounding["meta"] = next_meta
+        return next_grounding
+
+    @staticmethod
+    def _extract_url_from_footer_text(text: str) -> str:
+        match = re.search(r"https?://\S+", str(text or "").strip(), flags=re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(0) or "").strip().rstrip(".,;:)]}>")
+
+    @staticmethod
+    def _extract_superscript_marker(text: str) -> Optional[int]:
+        match = re.match(r"^\^(\d{1,3})\b", str(text or "").strip())
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    def _backfill_footer_link_normalizations(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        updated_atoms = [dict(atom) for atom in list(layout_atoms or []) if isinstance(atom, Mapping)]
+        footer_atoms = sorted(
+            [
+                atom
+                for atom in updated_atoms
+                if str(atom.get("node_kind") or "").strip().lower() == "footer"
+            ],
+            key=lambda atom: int(atom.get("reading_order") or 0),
+        )
+        next_marker: Optional[int] = None
+        for atom in footer_atoms:
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            normalized_text = str(atom.get("normalized_text") or "").strip()
+            normalization_mode = str(atom.get("normalization_mode") or "").strip().lower()
+            if normalization_mode in {"footer_hide_fragment", "hide_fragment", "footer_fragment_hidden"}:
+                continue
+            known_marker = self._extract_superscript_marker(normalized_text)
+            if known_marker is not None:
+                next_marker = known_marker + 1
+                continue
+            canonical_url = self._extract_url_from_footer_text(source_text)
+            if not canonical_url:
+                continue
+            if normalized_text and normalized_text != source_text:
+                continue
+            fallback_text = canonical_url
+            if next_marker is not None:
+                fallback_text = f"^{next_marker} {canonical_url}"
+                next_marker += 1
+            atom["normalized_text"] = fallback_text
+            current_reason = str(atom.get("normalization_reason") or "").strip()
+            current_mode = str(atom.get("normalization_mode") or "").strip()
+            atom["normalization_reason"] = current_reason if current_reason and current_reason != "no_change" else "footer_link_cleanup"
+            atom["normalization_mode"] = current_mode if current_mode and current_mode != "no_change" else "footer_link_fallback"
+            atom["normalization_confidence"] = atom.get("normalization_confidence") if atom.get("normalization_confidence") not in (None, "", 0, 0.0) else 0.62
+        return updated_atoms
+
+    def _build_grounding_normalization_summary(
+        self,
+        layout_atoms: Sequence[Mapping[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        changed_items: List[Dict[str, Any]] = []
+        for atom in list(layout_atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            layout_id = str(atom.get("layout_id") or "").strip()
+            source_text = str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            normalized_text = str(atom.get("normalized_text") or "").strip()
+            if not layout_id or not source_text or not normalized_text or normalized_text == source_text:
+                continue
+            changed_items.append(
+                {
+                    "layout_id": layout_id,
+                    "source_text": source_text,
+                    "normalized_text": normalized_text,
+                    "reason": str(atom.get("normalization_reason") or "").strip(),
+                    "mode": str(atom.get("normalization_mode") or "").strip(),
+                    "confidence": float(atom.get("normalization_confidence") or 0.0),
+                }
+            )
+        if not changed_items:
+            return None
+        return {
+            "item_count": len(changed_items),
+            "items": changed_items[:24],
+        }
+
+    def _merge_existing_grounding_enrichments(
+        self,
+        *,
+        existing_grounding: Mapping[str, Any],
+        rebuilt_grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(rebuilt_grounding or {})
+        if not isinstance(existing_grounding, Mapping):
+            return merged
+
+        existing_page_image = dict((existing_grounding or {}).get("page_image") or {})
+        rebuilt_page_image = dict((rebuilt_grounding or {}).get("page_image") or {})
+        if rebuilt_page_image:
+            merged_page_image = dict(rebuilt_page_image)
+            for key in ("width", "height"):
+                if merged_page_image.get(key) in (None, "", 0, 0.0, False) and existing_page_image.get(key) not in (
+                    None,
+                    "",
+                    0,
+                    0.0,
+                    False,
+                ):
+                    merged_page_image[key] = existing_page_image.get(key)
+            merged["page_image"] = merged_page_image
+        elif existing_page_image:
+            merged["page_image"] = dict(existing_page_image)
+
+        rebuilt_evidence_map = [
+            dict(row)
+            for row in list((rebuilt_grounding or {}).get("evidence_map") or [])
+            if isinstance(row, Mapping)
+        ]
+        if rebuilt_evidence_map:
+            merged["evidence_map"] = rebuilt_evidence_map
+        else:
+            merged["evidence_map"] = [
+                dict(row)
+                for row in list((existing_grounding or {}).get("evidence_map") or [])
+                if isinstance(row, Mapping)
+            ]
+
+        existing_atoms_by_id: Dict[str, Dict[str, Any]] = {}
+        for atom in list((existing_grounding or {}).get("layout_atoms") or []):
+            if not isinstance(atom, Mapping):
+                continue
+            layout_id = str(atom.get("layout_id") or "").strip()
+            if layout_id:
+                existing_atoms_by_id[layout_id] = dict(atom)
+
+        merged_atoms: List[Dict[str, Any]] = []
+        rebuilt_atoms = [
+            dict(raw_atom)
+            for raw_atom in list((rebuilt_grounding or {}).get("layout_atoms") or [])
+            if isinstance(raw_atom, Mapping)
+        ]
+        if not rebuilt_atoms:
+            rebuilt_atoms = [
+                dict(raw_atom)
+                for raw_atom in list((existing_grounding or {}).get("layout_atoms") or [])
+                if isinstance(raw_atom, Mapping)
+            ]
+        for raw_atom in rebuilt_atoms:
+            if not isinstance(raw_atom, Mapping):
+                continue
+            atom = dict(raw_atom)
+            existing_atom = existing_atoms_by_id.get(str(atom.get("layout_id") or "").strip()) or {}
+            for field in (
+                "normalized_text",
+                "normalization_reason",
+                "normalization_mode",
+                "normalization_confidence",
+            ):
+                if field in existing_atom and existing_atom.get(field) not in (None, ""):
+                    atom[field] = existing_atom.get(field)
+            merged_atoms.append(atom)
+        merged["layout_atoms"] = merged_atoms
+
+        atom_text_by_id = {
+            str(atom.get("layout_id") or "").strip(): str(atom.get("normalized_text") or "").strip()
+            for atom in merged_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+        atom_meta_by_id = {
+            str(atom.get("layout_id") or "").strip(): {
+                "reason": str(atom.get("normalization_reason") or "").strip(),
+                "mode": str(atom.get("normalization_mode") or "").strip(),
+                "confidence": atom.get("normalization_confidence"),
+            }
+            for atom in merged_atoms
+            if str(atom.get("layout_id") or "").strip()
+        }
+
+        existing_nodes_by_source_ids: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        for node in list((existing_grounding or {}).get("reading_nodes") or []):
+            if not isinstance(node, Mapping):
+                continue
+            key = tuple(
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            )
+            if key:
+                existing_nodes_by_source_ids[key] = dict(node)
+
+        merged_nodes: List[Dict[str, Any]] = []
+        rebuilt_nodes = [
+            dict(raw_node)
+            for raw_node in list((rebuilt_grounding or {}).get("reading_nodes") or [])
+            if isinstance(raw_node, Mapping)
+        ]
+        if not rebuilt_nodes:
+            rebuilt_nodes = [
+                dict(raw_node)
+                for raw_node in list((existing_grounding or {}).get("reading_nodes") or [])
+                if isinstance(raw_node, Mapping)
+            ]
+        for raw_node in rebuilt_nodes:
+            if not isinstance(raw_node, Mapping):
+                continue
+            node = dict(raw_node)
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(node.get("source_layout_ids") or [])
+                if str(item).strip()
+            ]
+            existing_node = existing_nodes_by_source_ids.get(tuple(source_layout_ids)) or {}
+            if existing_node:
+                for field in (
+                    "normalized_text",
+                    "normalization_reason",
+                    "normalization_mode",
+                    "normalization_confidence",
+                ):
+                    if field in existing_node and existing_node.get(field) not in (None, ""):
+                        node[field] = existing_node.get(field)
+            if not str(node.get("normalized_text") or "").strip() and source_layout_ids:
+                normalized_parts = [
+                    atom_text_by_id.get(layout_id, "").strip()
+                    for layout_id in source_layout_ids
+                    if atom_text_by_id.get(layout_id, "").strip()
+                ]
+                if normalized_parts:
+                    node["normalized_text"] = "\n\n".join(normalized_parts).strip()
+                    primary_layout_id = source_layout_ids[0]
+                    node_meta = atom_meta_by_id.get(primary_layout_id) or {}
+                    node["normalization_reason"] = str(node_meta.get("reason") or "").strip()
+                    node["normalization_mode"] = str(node_meta.get("mode") or "").strip()
+                    node["normalization_confidence"] = node_meta.get("confidence")
+            merged_nodes.append(node)
+        merged["reading_nodes"] = merged_nodes
+
+        merged_meta = {
+            **dict((existing_grounding or {}).get("meta") or {}),
+            **dict(merged.get("meta") or {}),
+        }
+        normalization_summary = self._build_grounding_normalization_summary(merged_atoms)
+        if normalization_summary:
+            merged_meta["normalization_summary"] = normalization_summary
+        merged["meta"] = merged_meta
+        return merged
+
+    def _backfill_grounding_text_normalizations_from_payload(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        current_grounding = dict(grounding or {})
+        current_summary = dict((current_grounding.get("meta") or {}).get("normalization_summary") or {})
+        if int(current_summary.get("item_count") or 0) > 0:
+            return current_grounding
+        text_normalizations = dict(((payload or {}).get("layout_advice_v3") or {}).get("text_normalizations") or {})
+        normalization_plan = dict(text_normalizations.get("normalization_plan") or {})
+        if not list(normalization_plan.get("items") or []):
+            return current_grounding
+        return self._apply_layout_uid_text_normalization_to_grounding(
+            grounding=current_grounding,
+            normalization_plan=normalization_plan,
+        )
+
+    @staticmethod
+    def _layout_uid_table_logical_row_system_prompt() -> str:
+        return (
+            "You refine a single table for the /read reader. "
+            "DocMind already provides geometry truth and physical rows. "
+            "Your job is ONLY to group physical rows into logical rows. "
+            "Never rewrite cell text, never invent cells, never modify geometry, and never invent row indices. "
+            "Use the attached page image only as visual reference for whether adjacent physical rows belong to the same logical benchmark row. "
+            "Each physical row index must be assigned exactly once. "
+            "Important patterns: multi-line headers should usually become one logical header row; "
+            "a value row and its uncertainty row `(±...)` usually belong to the same logical data row; "
+            "a blank first-column continuation row that continues benchmark values from the row above should usually be merged upward; "
+            "rows with a benchmark label in the first column usually start a new logical row. "
+            "Return JSON with status and step_result. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"logical_rows\":["
+            "{\"logical_row_id\":\"lr1\",\"row_role\":\"header\",\"source_row_indices\":[0,1],\"rationale\":\"multi_line_header\"},"
+            "{\"logical_row_id\":\"lr2\",\"row_role\":\"data\",\"source_row_indices\":[2,3],\"rationale\":\"value_plus_uncertainty\"}"
+            "],\"notes\":[\"...\"]}}"
+        )
+
+    @staticmethod
+    def _layout_uid_equation_normalization_system_prompt() -> str:
+        return (
+            "You normalize a single formula-like layout for the /read reader. "
+            "DocMind geometry and evidence are already fixed. "
+            "Use the attached page image and the provided layout/style hints only to improve display-layer readability. "
+            "Never change layout_id, ownership, geometry, source ids, or evidence. "
+            "Return JSON with status and step_result. "
+            "If the OCR text is too unreliable, return empty normalized_latex and explain why. "
+            "Prefer concise normalized_text and normalized_latex that preserve the source language and symbols. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{"
+            "\"normalized_text\":\"...\","
+            "\"normalized_latex\":\"...\","
+            "\"reason\":\"...\","
+            "\"confidence\":0.82,"
+            "\"mode\":\"latex_reconstructed\","
+            "\"notes\":[\"...\"]"
+            "}}"
+        )
+
+    @staticmethod
+    def _looks_like_numeric_table_cell(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(
+            re.fullmatch(r"[-+±]?\d+(?:\.\d+)?%?", text)
+            or re.fullmatch(r"\(±?\d+(?:\.\d+)?\)", text)
+            or re.fullmatch(r"\d+(?:\.\d+)?", text)
+        )
+
+    @staticmethod
+    def _looks_like_uncertainty_table_cell(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"\(±?\d+(?:\.\d+)?\)", text) or "±" in text)
+
+    def _build_layout_uid_table_physical_row_hints(
+        self,
+        *,
+        row_index: int,
+        cells: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized_cells = [dict(cell) for cell in list(cells or []) if isinstance(cell, Mapping)]
+        first_col_text = ""
+        if normalized_cells:
+            first_cell = min(normalized_cells, key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)))
+            if int(first_cell.get("col_start") or 0) == 0:
+                first_col_text = self._normalize_spaces(str(first_cell.get("text") or ""))
+        texts = [self._normalize_spaces(str(cell.get("text") or "")) for cell in normalized_cells]
+        non_empty_texts = [text for text in texts if text]
+        non_empty_col_starts = sorted(
+            {
+                int(cell.get("col_start") or 0)
+                for cell in normalized_cells
+                if self._normalize_spaces(str(cell.get("text") or ""))
+            }
+        )
+        uncertainty_like_count = sum(1 for text in non_empty_texts if self._looks_like_uncertainty_table_cell(text))
+        numeric_like_count = sum(1 for text in non_empty_texts if self._looks_like_numeric_table_cell(text))
+        return {
+            "row_index": int(row_index),
+            "first_col_text": first_col_text,
+            "blank_first_column": not bool(first_col_text),
+            "non_empty_col_starts": non_empty_col_starts,
+            "numeric_like_count": int(numeric_like_count),
+            "uncertainty_like_count": int(uncertainty_like_count),
+            "contains_pm": any("±" in text for text in non_empty_texts),
+            "looks_like_uncertainty_row": bool(
+                non_empty_texts
+                and uncertainty_like_count >= max(1, len(non_empty_texts) // 2)
+                and not first_col_text
+            ),
+        }
+
+    def _build_layout_uid_table_physical_rows(
+        self,
+        table_cells: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        rows_map: Dict[int, List[Dict[str, Any]]] = {}
+        for raw_cell in list(table_cells or []):
+            if not isinstance(raw_cell, Mapping):
+                continue
+            row_start = max(0, int(raw_cell.get("row_start") or 0))
+            cell = {
+                "cell_id": int(raw_cell.get("cell_id") or 0),
+                "row_start": row_start,
+                "row_end": max(row_start, int(raw_cell.get("row_end") or row_start)),
+                "col_start": max(0, int(raw_cell.get("col_start") or 0)),
+                "col_end": max(0, int(raw_cell.get("col_end") or raw_cell.get("col_start") or 0)),
+                "text": LiteratureReaderComposeService._normalize_spaces(str(raw_cell.get("text") or "")),
+                "layout_ids": [
+                    str(item).strip()
+                    for item in list(raw_cell.get("layout_ids") or [])
+                    if str(item).strip()
+                ],
+            }
+            rows_map.setdefault(row_start, []).append(cell)
+        physical_rows: List[Dict[str, Any]] = []
+        for row_index in sorted(rows_map.keys()):
+            cells = sorted(
+                rows_map[row_index],
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            physical_rows.append(
+                {
+                    "row_index": int(row_index),
+                    "cells": cells,
+                    "hints": self._build_layout_uid_table_physical_row_hints(row_index=row_index, cells=cells),
+                }
+            )
+        return physical_rows
+
+    def _build_layout_uid_table_logical_row_prompt_payload(
+        self,
+        *,
+        page: int,
+        title: str,
+        caption: str,
+        table_cells: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        physical_rows = self._build_layout_uid_table_physical_rows(table_cells)
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_table_logical_rows",
+            },
+            "table_meta": {
+                "title": str(title or "").strip(),
+                "caption": str(caption or "").strip(),
+                "cell_count": len(list(table_cells or [])),
+                "physical_row_count": len(physical_rows),
+            },
+            "physical_rows": physical_rows,
+            "rules": {
+                "task": "group_physical_rows_into_logical_rows",
+                "preserve_row_order": True,
+                "exactly_once_assignment": True,
+                "forbid_text_rewrite": True,
+                "forbid_geometry_mutation": True,
+                "allowed_row_roles": ["header", "data", "note"],
+                "common_patterns": [
+                    "multi_line_header",
+                    "value_plus_uncertainty",
+                    "blank_first_column_continuation",
+                ],
+            },
+        }
+
+    def _normalize_layout_uid_table_logical_row_plan(
+        self,
+        *,
+        physical_rows: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        known_indices = [int(row.get("row_index") or 0) for row in list(physical_rows or []) if isinstance(row, Mapping)]
+        known_set = set(known_indices)
+        normalized_rows: List[Dict[str, Any]] = []
+        used_indices: List[int] = []
+        errors: List[str] = []
+        for raw_row in list((step_result or {}).get("logical_rows") or (step_result or {}).get("rows") or []):
+            if not isinstance(raw_row, Mapping):
+                continue
+            source_row_indices = []
+            for item in list(raw_row.get("source_row_indices") or []):
+                try:
+                    source_row_indices.append(int(item))
+                except Exception:
+                    continue
+            source_row_indices = list(dict.fromkeys(source_row_indices))
+            if not source_row_indices:
+                continue
+            unknown = [row_index for row_index in source_row_indices if row_index not in known_set]
+            if unknown:
+                errors.extend([f"unknown_physical_row:{row_index}" for row_index in unknown])
+                continue
+            row_role = str(raw_row.get("row_role") or raw_row.get("role") or "").strip().lower() or "data"
+            if row_role not in {"header", "data", "note"}:
+                errors.append(f"invalid_row_role:{row_role}")
+                row_role = "data"
+            normalized_rows.append(
+                {
+                    "logical_row_id": str(raw_row.get("logical_row_id") or f"lr{len(normalized_rows) + 1}").strip()
+                    or f"lr{len(normalized_rows) + 1}",
+                    "row_role": row_role,
+                    "source_row_indices": sorted(source_row_indices),
+                    "rationale": str(raw_row.get("rationale") or "").strip(),
+                }
+            )
+            used_indices.extend(source_row_indices)
+        duplicates = sorted({row_index for row_index in used_indices if used_indices.count(row_index) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_physical_row:{row_index}" for row_index in duplicates])
+        missing = [row_index for row_index in known_indices if row_index not in set(used_indices)]
+        if missing:
+            errors.extend([f"missing_physical_row:{row_index}" for row_index in missing])
+        if errors or not normalized_rows:
+            fallback_rows = [
+                {
+                    "logical_row_id": f"lr{index + 1}",
+                    "row_role": "data",
+                    "source_row_indices": [int(row_index)],
+                    "rationale": "deterministic_physical_row_fallback",
+                }
+                for index, row_index in enumerate(sorted(known_indices))
+            ]
+            return {
+                "logical_rows": fallback_rows,
+                "notes": ["deterministic_table_logical_row_fallback"],
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_logical_rows"],
+                "fallback_used": True,
+            }
+        normalized_rows = sorted(
+            normalized_rows,
+            key=lambda row: min(int(item) for item in list(row.get("source_row_indices") or [10**9])),
+        )
+        return {
+            "logical_rows": normalized_rows,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    def _build_layout_uid_equation_normalization_prompt_payload(
+        self,
+        *,
+        page: int,
+        group_id: str,
+        atoms: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        compact_atoms: List[Dict[str, Any]] = []
+        for atom in list(atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            compact_atoms.append(
+                {
+                    "layout_id": str(atom.get("layout_id") or "").strip(),
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "raw_text": str(atom.get("raw_text") or "").strip(),
+                    "clean_text": str(atom.get("clean_text") or "").strip(),
+                    "alignment": str(atom.get("alignment") or "").strip().lower(),
+                    "line_height": float(atom.get("line_height") or 0.0),
+                    "layout_pos": list(atom.get("layout_pos") or []),
+                    "blocks": [
+                        {
+                            "text": str(block.get("text") or "").strip(),
+                            "style_id": int(block.get("style_id") or 0),
+                            "pos": list(block.get("pos") or []),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        transcript_parts = [
+            self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            for atom in compact_atoms
+            if self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+        ]
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_equation_normalization",
+                "group_id": str(group_id or "").strip(),
+            },
+            "equation": {
+                "layout_count": len(compact_atoms),
+                "transcript": " ".join(transcript_parts).strip(),
+                "atoms": compact_atoms,
+            },
+            "rules": {
+                "task": "normalize_formula_display_text",
+                "preserve_geometry": True,
+                "preserve_source_ids": True,
+                "forbid_translation": True,
+                "forbid_evidence_rewrite": True,
+                "allow_empty_normalized_latex": True,
+            },
+        }
+
+    def _build_layout_uid_figure_insight_prompt_payload(
+        self,
+        *,
+        page: int,
+        group_id: str,
+        atoms: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        compact_atoms: List[Dict[str, Any]] = []
+        caption_parts: List[str] = []
+        focus_bboxes: List[Tuple[float, float, float, float]] = []
+        for atom in list(atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            raw_text = str(atom.get("raw_text") or "").strip()
+            clean_text = str(atom.get("clean_text") or "").strip()
+            if node_kind != "figure" and (clean_text or raw_text):
+                caption_parts.append(clean_text or raw_text)
+            layout_pos = list(atom.get("layout_pos") or [])
+            bbox = self._bbox_from_docmind_pos(layout_pos)
+            if bbox is not None and node_kind == "figure":
+                focus_bboxes.append(tuple(float(value) for value in bbox))
+            compact_atoms.append(
+                {
+                    "layout_id": str(atom.get("layout_id") or "").strip(),
+                    "node_kind": node_kind,
+                    "layout_type": str(atom.get("layout_type") or "").strip().lower(),
+                    "layout_sub_type": str(atom.get("layout_sub_type") or "").strip().lower(),
+                    "raw_text": raw_text,
+                    "clean_text": clean_text,
+                    "layout_pos": layout_pos,
+                    "blocks": [
+                        {
+                            "text": str(block.get("text") or "").strip(),
+                            "style_id": int(block.get("style_id") or 0),
+                            "pos": list(block.get("pos") or []),
+                        }
+                        for block in list(atom.get("blocks") or [])
+                        if isinstance(block, Mapping)
+                    ],
+                }
+            )
+        caption = self._strip_leading_figure_caption_noise(" ".join(part for part in caption_parts if part).strip())
+        source_label = ""
+        if caption:
+            label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption, flags=re.IGNORECASE)
+            if label_match:
+                source_label = self._normalize_spaces(str(label_match.group(1) or ""))
+        focus_bbox = {}
+        if focus_bboxes:
+            focus_bbox = {
+                "x0": min(item[0] for item in focus_bboxes),
+                "top": min(item[1] for item in focus_bboxes),
+                "x1": max(item[2] for item in focus_bboxes),
+                "bottom": max(item[3] for item in focus_bboxes),
+            }
+        return {
+            "page_meta": {
+                "page": int(page),
+                "reader_mode": "read_layout_uid_v1_figure_insight",
+                "group_id": str(group_id or "").strip(),
+            },
+            "figure": {
+                "caption": caption,
+                "source_label": source_label,
+                "focus_bbox": focus_bbox,
+                "layout_count": len(compact_atoms),
+                "atoms": compact_atoms,
+            },
+            "rules": {
+                "task": "explain_figure_for_read",
+                "preserve_geometry": True,
+                "preserve_source_ids": True,
+                "forbid_caption_rewrite": True,
+                "output_language": "zh-CN",
+                "insight_must_be_image_grounded": True,
+                "insight_should_be_brief": True,
+            },
+        }
+
+    @staticmethod
+    def _layout_uid_figure_insight_system_prompt() -> str:
+        return (
+            "You explain a single figure group for the /read reader. "
+            "Use the attached page image as the primary visual reference and the focus_bbox/caption only as grounding hints. "
+            "Write one concise Chinese insight sentence that helps a reader understand what the figure is showing. "
+            "Do not simply restate the caption, do not invent evidence, and do not modify caption/source ids/geometry. "
+            "If the visible figure content is too unclear, return an empty insight. "
+            "Return JSON with status and step_result. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"insight\":\"...\",\"reason\":\"...\",\"confidence\":0.84,\"mode\":\"image_grounded_summary\",\"notes\":[\"...\"]}}"
+        )
+
+    def _normalize_layout_uid_figure_refinement(
+        self,
+        *,
+        atoms: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        caption_parts = [
+            self._strip_leading_figure_caption_noise(
+                str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+            )
+            for atom in list(atoms or [])
+            if isinstance(atom, Mapping) and str(atom.get("node_kind") or "").strip().lower() != "figure"
+        ]
+        caption = " ".join(part for part in caption_parts if part).strip()
+        insight = self._normalize_spaces(
+            str((step_result or {}).get("insight") or (step_result or {}).get("ai_insight") or "")
+        )
+        reason = self._normalize_spaces(str((step_result or {}).get("reason") or ""))
+        mode = self._normalize_spaces(str((step_result or {}).get("mode") or "")) or "image_grounded_summary"
+        notes = [
+            self._normalize_spaces(str(item))
+            for item in list((step_result or {}).get("notes") or [])
+            if self._normalize_spaces(str(item))
+        ]
+        errors: List[str] = []
+        raw_confidence = (step_result or {}).get("confidence")
+        try:
+            confidence_value = float(raw_confidence)
+        except Exception:
+            confidence_value = 0.0
+            if raw_confidence is not None:
+                errors.append("invalid_confidence")
+        confidence_value = max(0.0, min(1.0, confidence_value))
+        if len(insight) > 220:
+            errors.append("insight_too_long")
+            insight = ""
+        if caption and insight and insight == caption:
+            errors.append("insight_duplicates_caption")
+            insight = ""
+        if not insight:
+            return {
+                "ai_insight": "",
+                "reason": "",
+                "confidence": 0.0,
+                "mode": "",
+                "notes": notes,
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_insight"],
+                "fallback_used": True,
+            }
+        return {
+            "ai_insight": insight,
+            "reason": reason,
+            "confidence": confidence_value,
+            "mode": mode,
+            "notes": notes,
+        }, {
+            "passed": not bool(errors),
+            "errors": errors,
+            "fallback_used": False,
+        }
+
+    def _normalize_layout_uid_equation_refinement(
+        self,
+        *,
+        atoms: Sequence[Mapping[str, Any]],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        transcript_parts = [
+            self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            for atom in list(atoms or [])
+            if isinstance(atom, Mapping)
+        ]
+        transcript = " ".join([part for part in transcript_parts if part]).strip()
+        normalized_text = self._normalize_spaces(str((step_result or {}).get("normalized_text") or ""))
+        normalized_latex = str((step_result or {}).get("normalized_latex") or "").strip()
+        reason = self._normalize_spaces(str((step_result or {}).get("reason") or ""))
+        mode = self._normalize_spaces(str((step_result or {}).get("mode") or "")) or "display_normalized"
+        notes = [
+            self._normalize_spaces(str(item))
+            for item in list((step_result or {}).get("notes") or [])
+            if self._normalize_spaces(str(item))
+        ]
+        errors: List[str] = []
+        confidence_value = 0.0
+        raw_confidence = (step_result or {}).get("confidence")
+        try:
+            confidence_value = float(raw_confidence)
+        except Exception:
+            confidence_value = 0.0
+            if raw_confidence is not None:
+                errors.append("invalid_confidence")
+        confidence_value = max(0.0, min(1.0, confidence_value))
+        if normalized_latex and len(normalized_latex) > 800:
+            errors.append("normalized_latex_too_long")
+            normalized_latex = ""
+        if normalized_text and len(normalized_text) > 800:
+            errors.append("normalized_text_too_long")
+            normalized_text = ""
+        if normalized_latex and "\n\n" in normalized_latex:
+            normalized_latex = normalized_latex.replace("\n\n", "\n").strip()
+        if normalized_text and transcript and normalized_text == transcript:
+            normalized_text = ""
+        if not normalized_text and normalized_latex:
+            normalized_text = normalized_latex
+        if not normalized_text and not normalized_latex:
+            return {
+                "normalized_text": "",
+                "normalized_latex": "",
+                "reason": "",
+                "confidence": 0.0,
+                "mode": "",
+                "notes": notes,
+            }, {
+                "passed": False,
+                "errors": errors or ["empty_normalization"],
+                "fallback_used": True,
+            }
+        return {
+            "normalized_text": normalized_text,
+            "normalized_latex": normalized_latex,
+            "reason": reason,
+            "confidence": confidence_value,
+            "mode": mode,
+            "notes": notes,
+        }, {
+            "passed": not bool(errors),
+            "errors": errors,
+            "fallback_used": False,
+        }
+
+    @staticmethod
+    def _looks_like_table_caption_text(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return bool(re.match(r"^table\s*\d+[a-z]?(?:[\s:.\-]|$)", normalized, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _looks_like_quantization_config_text(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        bullet_or_enumerated = bool(re.match(r"^(?:[•·\-*]\s*|\d+\.\s*)", normalized))
+        quantization_token_count = len(
+            re.findall(
+                r"\b(?:fp8|bf16|q\d(?:[._-]?[a-z0-9]+)*|\d-bit|llama\.cpp\d*|unsloth\d*|tencent api|reported|ours)\b",
+                lowered,
+            )
+        )
+        if quantization_token_count == 0:
+            return False
+        if bullet_or_enumerated:
+            return True
+        if ":" in normalized or " for " in lowered:
+            return True
+        return False
+
+    @classmethod
+    def _looks_like_equation_text(cls, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        if cls._looks_like_quantization_config_text(normalized):
+            return False
+        if any(
+            token in lowered
+            for token in (
+                "\\frac",
+                "\\sum",
+                "\\int",
+                "\\alpha",
+                "\\beta",
+                "\\gamma",
+                "\\lambda",
+                "\\theta",
+                "\\begin{",
+                "\\end{",
+                "\\left",
+                "\\right",
+                "\\mathrm",
+            )
+        ):
+            return True
+        if normalized.startswith("$$") or normalized.startswith("\\(") or normalized.startswith("\\["):
+            return True
+        math_symbol_count = len(re.findall(r"[=+*/^≤≥≈∑∫√±×÷]", normalized))
+        alpha_token_count = len(re.findall(r"[A-Za-z]{2,}", normalized))
+        if math_symbol_count >= 2 and alpha_token_count <= 10 and len(normalized) <= 240:
+            return True
+        if re.search(r"\b[A-Za-z]\s*=\s*[^=]", normalized) and len(normalized) <= 240:
+            return True
+        return False
+
+    @staticmethod
+    def _merge_layout_uid_table_cell_text(base: str, extra: str) -> str:
+        lines = [
+            *[item.strip() for item in str(base or "").split("\n") if item.strip()],
+            *[item.strip() for item in str(extra or "").split("\n") if item.strip()],
+        ]
+        if not lines:
+            return ""
+        return "\n".join(list(dict.fromkeys(lines)))
+
+    def _materialize_layout_uid_logical_table_rows(
+        self,
+        *,
+        normalized_cells: Sequence[Mapping[str, Any]],
+        logical_row_plan: Mapping[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        physical_rows: Dict[int, List[Dict[str, Any]]] = {}
+        for raw_cell in list(normalized_cells or []):
+            if not isinstance(raw_cell, Mapping):
+                continue
+            row_start = max(0, int(raw_cell.get("row_start") or 0))
+            physical_rows.setdefault(row_start, []).append(dict(raw_cell))
+
+        physical_to_logical: Dict[int, int] = {}
+        logical_rows: List[Dict[str, Any]] = []
+        for logical_index, raw_row in enumerate(list((logical_row_plan or {}).get("logical_rows") or [])):
+            if not isinstance(raw_row, Mapping):
+                continue
+            source_row_indices = [
+                int(item)
+                for item in list(raw_row.get("source_row_indices") or [])
+                if isinstance(item, int) or str(item).strip().isdigit()
+            ]
+            merged_cells: List[Dict[str, Any]] = []
+            for row_index in source_row_indices:
+                physical_to_logical[int(row_index)] = logical_index
+                row_cells = sorted(
+                    [dict(cell) for cell in list(physical_rows.get(int(row_index)) or [])],
+                    key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+                )
+                for cell in row_cells:
+                    existing = next(
+                        (
+                            item
+                            for item in merged_cells
+                            if int(item.get("col_start") or 0) == int(cell.get("col_start") or 0)
+                            and int(item.get("col_end") or 0) == int(cell.get("col_end") or 0)
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        merged_cells.append(dict(cell))
+                        continue
+                    existing["text"] = self._merge_layout_uid_table_cell_text(
+                        str(existing.get("text") or ""),
+                        str(cell.get("text") or ""),
+                    )
+                    existing["layout_ids"] = list(
+                        dict.fromkeys(
+                            [
+                                *[str(item).strip() for item in list(existing.get("layout_ids") or []) if str(item).strip()],
+                                *[str(item).strip() for item in list(cell.get("layout_ids") or []) if str(item).strip()],
+                            ]
+                        )
+                    )
+                    existing["row_end"] = max(
+                        int(existing.get("row_end") or existing.get("row_start") or 0),
+                        int(cell.get("row_end") or cell.get("row_start") or 0),
+                    )
+                    existing["rowspan"] = max(
+                        int(existing.get("rowspan") or 1),
+                        int(cell.get("rowspan") or 1),
+                    )
+                    for key in ("x0", "y0"):
+                        existing_value = existing.get(key)
+                        new_value = cell.get(key)
+                        if existing_value is None:
+                            existing[key] = new_value
+                        elif new_value is not None:
+                            existing[key] = min(float(existing_value), float(new_value))
+                    for key in ("x1", "y1"):
+                        existing_value = existing.get(key)
+                        new_value = cell.get(key)
+                        if existing_value is None:
+                            existing[key] = new_value
+                        elif new_value is not None:
+                            existing[key] = max(float(existing_value), float(new_value))
+            merged_cells = sorted(
+                merged_cells,
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            logical_rows.append(
+                {
+                    "row_index": int(logical_index),
+                    "row_role": str(raw_row.get("row_role") or "data").strip() or "data",
+                    "source_row_indices": source_row_indices,
+                    "cells": merged_cells,
+                }
+            )
+
+        logical_rows = self._normalize_layout_uid_logical_row_pairs(logical_rows)
+
+        for logical_index, logical_row in enumerate(logical_rows):
+            logical_row["row_index"] = int(logical_index)
+            for cell in list(logical_row.get("cells") or []):
+                physical_row_start = int(cell.get("row_start") or 0)
+                physical_row_end = int(cell.get("row_end") or physical_row_start)
+                logical_row_start = physical_to_logical.get(physical_row_start, logical_index)
+                logical_row_end = physical_to_logical.get(physical_row_end, logical_row_start)
+                cell["row_start"] = int(logical_row_start)
+                cell["row_end"] = int(logical_row_end)
+                cell["rowspan"] = max(1, int(logical_row_end) - int(logical_row_start) + 1)
+
+        logical_header_row_count = 0
+        for row in logical_rows:
+            if str(row.get("row_role") or "").strip().lower() == "header":
+                logical_header_row_count += 1
+            else:
+                break
+        return logical_rows, int(logical_header_row_count)
+
+    def _normalize_layout_uid_logical_row_pairs(
+        self,
+        logical_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized_rows: List[Dict[str, Any]] = []
+
+        def _cells_by_column(cells: Sequence[Mapping[str, Any]]) -> Dict[int, Dict[str, Any]]:
+            return {
+                int(cell.get("col_start") or 0): dict(cell)
+                for cell in list(cells or [])
+                if isinstance(cell, Mapping)
+            }
+
+        def _merge_rows(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+            previous_cells = [dict(cell) for cell in list(previous.get("cells") or []) if isinstance(cell, Mapping)]
+            previous_by_col = {int(cell.get("col_start") or 0): cell for cell in previous_cells}
+            current_cells = sorted(
+                [dict(cell) for cell in list(current.get("cells") or []) if isinstance(cell, Mapping)],
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+
+            for cell in current_cells:
+                col_start = int(cell.get("col_start") or 0)
+                existing = previous_by_col.get(col_start)
+                if existing is None:
+                    previous_cells.append(dict(cell))
+                    previous_by_col[col_start] = previous_cells[-1]
+                    continue
+                existing_text = self._normalize_spaces(str(existing.get("text") or ""))
+                incoming_text = self._normalize_spaces(str(cell.get("text") or ""))
+                if incoming_text and incoming_text != existing_text:
+                    existing["text"] = self._merge_layout_uid_table_cell_text(existing_text, incoming_text)
+                existing["layout_ids"] = list(
+                    dict.fromkeys(
+                        [
+                            *[str(item).strip() for item in list(existing.get("layout_ids") or []) if str(item).strip()],
+                            *[str(item).strip() for item in list(cell.get("layout_ids") or []) if str(item).strip()],
+                        ]
+                    )
+                )
+                for key in ("x0", "y0"):
+                    existing_value = existing.get(key)
+                    incoming_value = cell.get(key)
+                    if incoming_value is None:
+                        continue
+                    if existing_value is None:
+                        existing[key] = incoming_value
+                    else:
+                        existing[key] = min(float(existing_value), float(incoming_value))
+                for key in ("x1", "y1"):
+                    existing_value = existing.get(key)
+                    incoming_value = cell.get(key)
+                    if incoming_value is None:
+                        continue
+                    if existing_value is None:
+                        existing[key] = incoming_value
+                    else:
+                        existing[key] = max(float(existing_value), float(incoming_value))
+
+            previous["cells"] = sorted(
+                previous_cells,
+                key=lambda item: (int(item.get("col_start") or 0), int(item.get("cell_id") or 0)),
+            )
+            previous["source_row_indices"] = sorted(
+                {
+                    int(item)
+                    for item in [
+                        *list(previous.get("source_row_indices") or []),
+                        *list(current.get("source_row_indices") or []),
+                    ]
+                    if isinstance(item, int) or str(item).strip().isdigit()
+                }
+            )
+            return previous
+
+        def _should_merge(previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
+            if str(previous.get("row_role") or "").strip().lower() != "data":
+                return False
+            if str(current.get("row_role") or "").strip().lower() != "data":
+                return False
+
+            previous_by_col = _cells_by_column(previous.get("cells") or [])
+            current_by_col = _cells_by_column(current.get("cells") or [])
+            previous_label = self._normalize_spaces(str((previous_by_col.get(0) or {}).get("text") or ""))
+            current_label = self._normalize_spaces(str((current_by_col.get(0) or {}).get("text") or ""))
+            previous_first_metric = self._normalize_spaces(str((previous_by_col.get(1) or {}).get("text") or ""))
+            current_first_metric = self._normalize_spaces(str((current_by_col.get(1) or {}).get("text") or ""))
+
+            previous_numeric_cols = {
+                col_start
+                for col_start, cell in previous_by_col.items()
+                if col_start > 0
+                and self._looks_like_numeric_table_cell(str(cell.get("text") or ""))
+                and not self._looks_like_uncertainty_table_cell(str(cell.get("text") or ""))
+            }
+            current_uncertainty_cols = {
+                col_start
+                for col_start, cell in current_by_col.items()
+                if col_start > 0 and self._looks_like_uncertainty_table_cell(str(cell.get("text") or ""))
+            }
+            if not previous_numeric_cols or not current_uncertainty_cols:
+                return False
+
+            overlap = previous_numeric_cols & current_uncertainty_cols
+            if len(overlap) < max(2, len(current_uncertainty_cols) // 2):
+                return False
+
+            previous_blank_lead = not previous_label and not previous_first_metric
+            current_blank_lead = not current_label and not current_first_metric
+            return previous_blank_lead or current_blank_lead
+
+        for raw_row in list(logical_rows or []):
+            if not isinstance(raw_row, Mapping):
+                continue
+            current = {
+                "row_index": int(raw_row.get("row_index") or len(normalized_rows)),
+                "row_role": str(raw_row.get("row_role") or "data").strip() or "data",
+                "source_row_indices": [
+                    int(item)
+                    for item in list(raw_row.get("source_row_indices") or [])
+                    if isinstance(item, int) or str(item).strip().isdigit()
+                ],
+                "cells": [dict(cell) for cell in list(raw_row.get("cells") or []) if isinstance(cell, Mapping)],
+            }
+            if normalized_rows and _should_merge(normalized_rows[-1], current):
+                normalized_rows[-1] = _merge_rows(normalized_rows[-1], current)
+                continue
+            normalized_rows.append(current)
+
+        return normalized_rows
+
+    def _build_layout_uid_table_props(
+        self,
+        *,
+        page: int,
+        atoms: Sequence[Mapping[str, Any]],
+        logical_row_plan: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        caption_texts: List[str] = []
+        note_texts: List[str] = []
+        markdown_lines: List[str] = []
+        table_blocks: List[Dict[str, Any]] = []
+        table_cells: List[Dict[str, Any]] = []
+        table_layout_ids: List[str] = []
+        fallback_canonical_block_ids: List[str] = []
+
+        for atom in list(atoms or []):
+            if not isinstance(atom, Mapping):
+                continue
+            atom_layout_id = str(atom.get("layout_id") or "").strip()
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            clean_text = self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            if clean_text and ("|" in clean_text or "\t" in clean_text):
+                for line in str(clean_text).splitlines():
+                    normalized_line = self._normalize_spaces(line)
+                    if normalized_line and ("|" in normalized_line or "\t" in normalized_line):
+                        markdown_lines.append(normalized_line)
+            if node_kind == "table_caption" or self._looks_like_table_caption_text(clean_text):
+                if clean_text:
+                    caption_texts.append(clean_text)
+                continue
+            if node_kind in {"metadata", "paragraph"} and clean_text and re.match(r"^(note|notes|abbrev(?:iation)?s?)\b", clean_text, flags=re.IGNORECASE):
+                note_texts.append(clean_text)
+                continue
+            if node_kind != "table":
+                continue
+            if atom_layout_id and atom_layout_id not in table_layout_ids:
+                table_layout_ids.append(atom_layout_id)
+            for block_id in list(atom.get("canonical_block_ids") or []):
+                normalized_block_id = str(block_id or "").strip()
+                if normalized_block_id and normalized_block_id not in fallback_canonical_block_ids:
+                    fallback_canonical_block_ids.append(normalized_block_id)
+            for raw_cell in list(atom.get("table_cells") or []):
+                if not isinstance(raw_cell, Mapping):
+                    continue
+                table_cells.append(dict(raw_cell))
+            for block in list(atom.get("blocks") or []):
+                if not isinstance(block, Mapping):
+                    continue
+                block_text = self._normalize_spaces(str(block.get("text") or ""))
+                bbox = self._bbox_from_docmind_pos(list(block.get("pos") or []))
+                if not block_text or bbox is None:
+                    continue
+                x0, top, x1, bottom = bbox
+                table_blocks.append(
+                    {
+                        "text": block_text,
+                        "x0": float(x0),
+                        "x1": float(x1),
+                        "top": float(top),
+                        "bottom": float(bottom),
+                    }
+                )
+
+        matrix: List[List[str]] = []
+        header_row_count = 0
+        raw_markdown = "\n".join(markdown_lines).strip()
+        row_evidence: List[Dict[str, Any]] = []
+        cell_evidence: List[Dict[str, Any]] = []
+
+        def _build_row_anchor(*, row_index: int, row_cells: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+            polygons: List[Dict[str, Any]] = []
+            row_layout_ids: List[str] = []
+            row_quote_parts: List[str] = []
+            for cell in list(row_cells or []):
+                cell_text = self._normalize_spaces(str(cell.get("text") or ""))
+                if cell_text:
+                    row_quote_parts.append(cell_text)
+                for layout_id in list(cell.get("layout_ids") or []):
+                    token = str(layout_id or "").strip()
+                    if token and token not in row_layout_ids:
+                        row_layout_ids.append(token)
+                for poly_index, poly in enumerate(list(cell.get("polygons") or []), start=1):
+                    points = self._normalize_grounding_points(poly)
+                    if len(points) < 3:
+                        continue
+                    polygons.append(
+                        {
+                            "points": points,
+                            "source": "page_grounding_v1",
+                            "component_id": f"table_row_{row_index + 1}:{poly_index}",
+                        }
+                    )
+            if not polygons:
+                return None
+            all_points = [
+                point
+                for poly in polygons
+                for point in list(poly.get("points") or [])
+                if isinstance(point, Mapping)
+            ]
+            xs = [float(point.get("x") or 0.0) for point in all_points]
+            ys = [float(point.get("y") or 0.0) for point in all_points]
+            if not xs or not ys:
+                return None
+            quote_text = " | ".join(part for part in row_quote_parts if part).strip()
+            source_layout_id = table_layout_ids[0] if table_layout_ids else f"table_row_{row_index + 1}"
+            anchor = {
+                "page": int(page),
+                "start_char": 0,
+                "end_char": max(1, len(quote_text) or len(polygons)),
+                "quote": quote_text or None,
+                "quote_text": quote_text or None,
+                "anchor_id": f"layout_uid_v1:{source_layout_id}:row:{row_index + 1}",
+                "canonical_block_id": "",
+                "source_layout_id": f"{source_layout_id}:row:{row_index + 1}",
+                "coord_version": "layout_uid_v1",
+                "anchor_confidence": 0.98,
+                "bbox_hint": {
+                    "x0": min(xs),
+                    "x1": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "geometry_version": "poly_v1",
+                "geometry": {
+                    "polygons": polygons,
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "anchor_v2": {
+                    "page": int(page),
+                    "start_char": 0,
+                    "end_char": max(1, len(quote_text) or len(polygons)),
+                    "coord_version": "layout_uid_v1",
+                    "canonical_block_id": "",
+                },
+                "segment_index": 0,
+                "segment_total": 1,
+                "source_word_ids": [],
+                "source_char_ranges": [],
+            }
+            return {
+                "row_index": int(row_index),
+                "label": self._normalize_spaces(str(row_cells[0].get("text") or "")) or f"Row {row_index + 1}",
+                "source_atom_ids": row_layout_ids,
+                "anchor": anchor,
+            }
+
+        def _build_cell_anchor(*, cell: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+            points_sets = [self._normalize_grounding_points(poly) for poly in list(cell.get("polygons") or [])]
+            points_sets = [points for points in points_sets if len(points) >= 3]
+            if not points_sets:
+                return None
+            all_points = [point for points in points_sets for point in points]
+            xs = [float(point.get("x") or 0.0) for point in all_points]
+            ys = [float(point.get("y") or 0.0) for point in all_points]
+            if not xs or not ys:
+                return None
+            quote_text = self._normalize_spaces(str(cell.get("text") or ""))
+            source_layout_ids = [
+                str(layout_id or "").strip()
+                for layout_id in list(cell.get("layout_ids") or [])
+                if str(layout_id or "").strip()
+            ]
+            source_layout_id = source_layout_ids[0] if source_layout_ids else ""
+            polygons = [
+                {
+                    "points": points,
+                    "source": "page_grounding_v1",
+                    "component_id": f"{source_layout_id or 'table_cell'}:{index + 1}",
+                }
+                for index, points in enumerate(points_sets)
+            ]
+            anchor = {
+                "page": int(page),
+                "start_char": 0,
+                "end_char": max(1, len(quote_text) or len(polygons)),
+                "quote": quote_text or None,
+                "quote_text": quote_text or None,
+                "anchor_id": f"layout_uid_v1:{source_layout_id or 'table_cell'}:cell:{int(cell.get('cell_id') or 0)}",
+                "canonical_block_id": "",
+                "source_layout_id": source_layout_id or None,
+                "coord_version": "layout_uid_v1",
+                "anchor_confidence": 0.99,
+                "bbox_hint": {
+                    "x0": min(xs),
+                    "x1": max(xs),
+                    "top": min(ys),
+                    "bottom": max(ys),
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "geometry_version": "poly_v1",
+                "geometry": {
+                    "polygons": polygons,
+                    "page_width": None,
+                    "page_height": None,
+                },
+                "anchor_v2": {
+                    "page": int(page),
+                    "start_char": 0,
+                    "end_char": max(1, len(quote_text) or len(polygons)),
+                    "coord_version": "layout_uid_v1",
+                    "canonical_block_id": "",
+                },
+                "segment_index": 0,
+                "segment_total": 1,
+                "source_word_ids": [],
+                "source_char_ranges": [],
+            }
+            return {
+                "cell_id": int(cell.get("cell_id") or 0),
+                "row_start": int(cell.get("row_start") or 0),
+                "col_start": int(cell.get("col_start") or 0),
+                "label": quote_text or "Cell",
+                "source_atom_ids": source_layout_ids,
+                "anchor": anchor,
+            }
+
+        normalized_cells: List[Dict[str, Any]] = []
+        column_widths: List[float] = []
+
+        if table_cells:
+            max_row = max(
+                max(int(cell.get("row_start") or 0), int(cell.get("row_end") or 0))
+                for cell in table_cells
+            )
+            max_col = max(
+                max(int(cell.get("col_start") or 0), int(cell.get("col_end") or 0))
+                for cell in table_cells
+            )
+            matrix = [[""] * (max_col + 1) for _ in range(max_row + 1)]
+            row_cells_map: Dict[int, List[Dict[str, Any]]] = {}
+            for cell in table_cells:
+                row_start = max(0, int(cell.get("row_start") or 0))
+                row_end = max(row_start, int(cell.get("row_end") or row_start))
+                col_start = max(0, int(cell.get("col_start") or 0))
+                cell_text = self._normalize_spaces(str(cell.get("text") or ""))
+                cell_x0 = cell.get("x0")
+                cell_x1 = cell.get("x1")
+                cell_y0 = cell.get("y0")
+                cell_y1 = cell.get("y1")
+                if (
+                    cell_x0 is None
+                    or cell_x1 is None
+                    or cell_y0 is None
+                    or cell_y1 is None
+                ):
+                    points = [
+                        point
+                        for poly in list(cell.get("polygons") or [])
+                        for point in self._normalize_grounding_points(poly)
+                        if isinstance(point, Mapping)
+                    ]
+                    xs = [float(point.get("x") or 0.0) for point in points]
+                    ys = [float(point.get("y") or 0.0) for point in points]
+                    if xs and ys:
+                        cell_x0 = min(xs)
+                        cell_x1 = max(xs)
+                        cell_y0 = min(ys)
+                        cell_y1 = max(ys)
+                if cell_text:
+                    matrix[row_start][col_start] = cell_text
+                normalized_cells.append(
+                    {
+                        "cell_id": int(cell.get("cell_id") or len(normalized_cells)),
+                        "row_start": int(row_start),
+                        "row_end": int(row_end),
+                        "col_start": int(col_start),
+                        "col_end": int(max(col_start, int(cell.get("col_end") or col_start))),
+                        "rowspan": int(max(1, row_end - row_start + 1)),
+                        "colspan": int(max(1, int(max(col_start, int(cell.get("col_end") or col_start))) - col_start + 1)),
+                        "text": cell_text,
+                        "layout_ids": list(cell.get("layout_ids") or []),
+                        "x0": cell_x0,
+                        "x1": cell_x1,
+                        "y0": cell_y0,
+                        "y1": cell_y1,
+                        "polygons": list(cell.get("polygons") or []),
+                    }
+                )
+                cell_anchor = _build_cell_anchor(cell=cell)
+                if cell_anchor:
+                    cell_evidence.append(cell_anchor)
+                for row_index in range(row_start, row_end + 1):
+                    row_cells_map.setdefault(row_index, [])
+                    if cell not in row_cells_map[row_index]:
+                        row_cells_map[row_index].append(dict(cell))
+
+            matrix = [row for row in matrix if any(self._normalize_spaces(cell) for cell in row)]
+
+            if normalized_cells and max_col >= 0:
+                column_bounds: List[Optional[Tuple[float, float]]] = [None] * (max_col + 1)
+                global_x0: Optional[float] = None
+                global_x1: Optional[float] = None
+                for cell in normalized_cells:
+                    x0 = None
+                    x1 = None
+                    try:
+                        x0 = float(cell.get("x0")) if cell.get("x0") is not None else None
+                        x1 = float(cell.get("x1")) if cell.get("x1") is not None else None
+                    except Exception:
+                        x0 = None
+                        x1 = None
+                    if x0 is None or x1 is None or x1 <= x0:
+                        points = [
+                            point
+                            for poly in list(cell.get("polygons") or [])
+                            for point in self._normalize_grounding_points(poly)
+                            if isinstance(point, Mapping)
+                        ]
+                        xs = [float(point.get("x") or 0.0) for point in points]
+                        if xs:
+                            x0 = min(xs)
+                            x1 = max(xs)
+                    if x0 is None or x1 is None or x1 <= x0:
+                        continue
+                    global_x0 = x0 if global_x0 is None else min(global_x0, x0)
+                    global_x1 = x1 if global_x1 is None else max(global_x1, x1)
+                    col_start = int(cell.get("col_start") or 0)
+                    col_end = int(cell.get("col_end") or col_start)
+                    span = max(1, col_end - col_start + 1)
+                    segment_width = (x1 - x0) / span
+                    for offset, column_index in enumerate(range(col_start, col_end + 1)):
+                        seg_x0 = x0 + segment_width * offset
+                        seg_x1 = x0 + segment_width * (offset + 1)
+                        existing = column_bounds[column_index]
+                        if existing is None:
+                            column_bounds[column_index] = (seg_x0, seg_x1)
+                        else:
+                            column_bounds[column_index] = (
+                                min(existing[0], seg_x0),
+                                max(existing[1], seg_x1),
+                            )
+                if global_x0 is not None and global_x1 is not None and global_x1 > global_x0:
+                    total_width = max(1e-6, global_x1 - global_x0)
+                    raw_widths: List[float] = []
+                    for item in column_bounds:
+                        if item is None:
+                            raw_widths.append(0.0)
+                        else:
+                            raw_widths.append(max(0.0, (item[1] - item[0]) / total_width))
+                    raw_sum = sum(raw_widths)
+                    if raw_sum > 0:
+                        column_widths = [value / raw_sum for value in raw_widths]
+
+            def _looks_like_header_row(cells: Sequence[str]) -> bool:
+                values = [self._normalize_spaces(cell) for cell in list(cells or []) if self._normalize_spaces(cell)]
+                if len(values) < 2:
+                    return False
+                if max(len(value) for value in values) > 72:
+                    return False
+                numericish = sum(1 for value in values if re.fullmatch(r"[-+±]?\d+(?:\.\d+)?%?", value))
+                if numericish >= max(1, len(values) - 1):
+                    return False
+                return True
+
+            def _looks_like_data_row(cells: Sequence[str]) -> bool:
+                values = [self._normalize_spaces(cell) for cell in list(cells or []) if self._normalize_spaces(cell)]
+                if len(values) < 2:
+                    return False
+                numericish = sum(1 for value in values if re.search(r"\d", value) or "±" in value or "%" in value)
+                return numericish >= max(1, len(values) // 2)
+
+            if matrix and _looks_like_header_row(matrix[0]):
+                header_row_count = 1
+                if len(matrix) >= 3 and _looks_like_header_row(matrix[1]) and _looks_like_data_row(matrix[2]):
+                    header_row_count = 2
+            for row_index in sorted(row_cells_map.keys()):
+                row_anchor = _build_row_anchor(row_index=row_index, row_cells=row_cells_map[row_index])
+                if row_anchor:
+                    row_evidence.append(row_anchor)
+
+        markdown_matrix: List[List[str]] = []
+        saw_markdown_separator = False
+        if not matrix:
+            for line in markdown_lines:
+                pieces = [self._normalize_spaces(cell) for cell in re.split(r"\||\t", line.strip().strip("|"))]
+                if not any(pieces):
+                    continue
+                if all(not cell or re.fullmatch(r":?-{2,}:?", cell) for cell in pieces):
+                    saw_markdown_separator = True
+                    continue
+                markdown_matrix.append(pieces)
+        if not matrix and markdown_matrix:
+            matrix = markdown_matrix
+            header_row_count = 1 if saw_markdown_separator and len(markdown_matrix) >= 2 else 0
+
+        if not matrix and table_blocks:
+            sorted_blocks = sorted(table_blocks, key=lambda row: (float(row.get("top") or 0.0), float(row.get("x0") or 0.0)))
+            avg_height = sum(max(1.0, float(row.get("bottom") or 0.0) - float(row.get("top") or 0.0)) for row in sorted_blocks) / max(1, len(sorted_blocks))
+            row_threshold = max(10.0, avg_height * 0.72)
+            clustered_rows: List[List[Dict[str, Any]]] = []
+            row_centers: List[float] = []
+            for block in sorted_blocks:
+                top = float(block.get("top") or 0.0)
+                bottom = float(block.get("bottom") or 0.0)
+                center_y = (top + bottom) / 2.0
+                if clustered_rows and abs(center_y - row_centers[-1]) <= row_threshold:
+                    clustered_rows[-1].append(block)
+                    merged_centers = [
+                        (float(item.get("top") or 0.0) + float(item.get("bottom") or 0.0)) / 2.0
+                        for item in clustered_rows[-1]
+                    ]
+                    row_centers[-1] = sum(merged_centers) / max(1, len(merged_centers))
+                else:
+                    clustered_rows.append([block])
+                    row_centers.append(center_y)
+            matrix = [
+                [self._normalize_spaces(str(item.get("text") or "")) for item in sorted(row, key=lambda cell: float(cell.get("x0") or 0.0)) if self._normalize_spaces(str(item.get("text") or ""))]
+                for row in clustered_rows
+            ]
+            matrix = [row for row in matrix if row]
+
+            def _looks_like_header_row(cells: Sequence[str]) -> bool:
+                values = [self._normalize_spaces(cell) for cell in list(cells or []) if self._normalize_spaces(cell)]
+                if len(values) < 2:
+                    return False
+                if max(len(value) for value in values) > 72:
+                    return False
+                numericish = sum(1 for value in values if re.fullmatch(r"[-+±]?\d+(?:\.\d+)?%?", value))
+                if numericish >= max(1, len(values) - 1):
+                    return False
+                return True
+
+            def _looks_like_data_row(cells: Sequence[str]) -> bool:
+                values = [self._normalize_spaces(cell) for cell in list(cells or []) if self._normalize_spaces(cell)]
+                if len(values) < 2:
+                    return False
+                numericish = sum(1 for value in values if re.search(r"\d", value) or "±" in value or "%" in value)
+                return numericish >= max(1, len(values) // 2)
+
+            if matrix and _looks_like_header_row(matrix[0]):
+                header_row_count = 1
+                if len(matrix) >= 3 and _looks_like_header_row(matrix[1]) and _looks_like_data_row(matrix[2]):
+                    header_row_count = 2
+
+        column_count = max((len(row) for row in matrix), default=0)
+        matrix = [row + [""] * max(0, column_count - len(row)) for row in matrix]
+        header_rows = matrix[:header_row_count] if header_row_count > 0 else []
+        body_rows = matrix[header_row_count:] if header_row_count < len(matrix) else matrix
+
+        headers: List[str] = []
+        if header_rows:
+            for col_index in range(column_count):
+                parts = [
+                    self._normalize_spaces(row[col_index])
+                    for row in header_rows
+                    if col_index < len(row) and self._normalize_spaces(row[col_index])
+                ]
+                headers.append(" / ".join(parts) if parts else f"Column {col_index + 1}")
+        elif column_count > 0:
+            headers = [f"Column {col_index + 1}" for col_index in range(column_count)]
+
+        rows = [
+            {
+                f"col_{col_index + 1}": row[col_index] if col_index < len(row) else ""
+                for col_index in range(column_count)
+            }
+            for row in body_rows
+        ] if column_count > 0 else []
+
+        logical_rows: List[Dict[str, Any]] = []
+        logical_header_row_count = 0
+        reconstruction_mode = "deterministic"
+        reconstruction_notes: List[str] = []
+        if isinstance(logical_row_plan, Mapping) and list(logical_row_plan.get("logical_rows") or []):
+            logical_rows, logical_header_row_count = self._materialize_layout_uid_logical_table_rows(
+                normalized_cells=normalized_cells,
+                logical_row_plan=logical_row_plan,
+            )
+            reconstruction_mode = "ai_logical_rows"
+            reconstruction_notes = [
+                str(item).strip()
+                for item in list(logical_row_plan.get("notes") or [])
+                if str(item).strip()
+            ]
+
+        caption = " ".join(text for text in caption_texts if text).strip()
+        title = caption or f"Table · Page {int(page)}"
+        return {
+            "title": title,
+            "headers": headers,
+            "header_row_count": int(header_row_count),
+            "column_widths": column_widths,
+            "matrix": matrix,
+            "table_cells": normalized_cells,
+            "logical_rows": logical_rows,
+            "logical_header_row_count": int(logical_header_row_count),
+            "rows": rows,
+            "caption": caption,
+            "notes": note_texts,
+            "raw_markdown": raw_markdown,
+            "row_evidence": row_evidence,
+            "cell_evidence": cell_evidence,
+            "reconstruction_mode": reconstruction_mode,
+            "reconstruction_notes": reconstruction_notes,
+            "ai_insight": "",
+        }
+
+    def _build_layout_uid_equation_props(
+        self,
+        *,
+        atoms: Sequence[Mapping[str, Any]],
+        equation_refinement: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        clean_texts = [
+            self._normalize_spaces(str(atom.get("clean_text") or atom.get("raw_text") or ""))
+            for atom in list(atoms or [])
+            if isinstance(atom, Mapping)
+        ]
+        clean_texts = [text for text in clean_texts if text]
+        transcript = " ".join(clean_texts).strip() or "x = y"
+        merged = transcript
+        label = ""
+        match = re.match(
+            r"^\s*((?:eq(?:uation)?\.?\s*\(?\d+[A-Za-z]?\)?))\s*[:.\-]?\s*(.+)$",
+            merged,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            label = self._normalize_spaces(str(match.group(1) or ""))
+            merged = self._normalize_spaces(str(match.group(2) or "")) or merged
+        description = ""
+        where_match = re.search(r"\bwhere\b", merged, flags=re.IGNORECASE)
+        if where_match and where_match.start() > 0:
+            description = self._normalize_spaces(merged[where_match.start() :])
+            merged = self._normalize_spaces(merged[: where_match.start()])
+        if not label:
+            for atom in list(atoms or []):
+                if not isinstance(atom, Mapping):
+                    continue
+                for block in list(atom.get("blocks") or []):
+                    if not isinstance(block, Mapping):
+                        continue
+                    block_text = self._normalize_spaces(str(block.get("text") or ""))
+                    if re.fullmatch(r"\(\d+[A-Za-z]?\)", block_text):
+                        label = block_text
+                        break
+                if label:
+                    break
+        trailing_label = re.search(r"(\(\d+[A-Za-z]?\))\s*$", merged)
+        if trailing_label:
+            extracted_label = self._normalize_spaces(str(trailing_label.group(1) or ""))
+            if extracted_label and not label:
+                label = extracted_label
+            merged = self._normalize_spaces(merged[: trailing_label.start()])
+        latex = merged.replace("−", "-").replace("–", "-").strip()
+        normalized_refinement = dict(equation_refinement or {})
+        normalized_text = self._normalize_spaces(str(normalized_refinement.get("normalized_text") or ""))
+        normalized_latex = str(normalized_refinement.get("normalized_latex") or "").strip()
+        normalization_reason = self._normalize_spaces(str(normalized_refinement.get("reason") or ""))
+        normalization_mode = self._normalize_spaces(str(normalized_refinement.get("mode") or ""))
+        normalization_confidence = 0.0
+        try:
+            normalization_confidence = max(
+                0.0,
+                min(1.0, float(normalized_refinement.get("confidence") or 0.0)),
+            )
+        except Exception:
+            normalization_confidence = 0.0
+        props = {
+            "latex": latex or "x = y",
+            "label": label,
+            "description": description,
+            "render_mode": "math_first" if normalized_latex else "image_first",
+            "transcript": transcript,
+        }
+        if normalized_text:
+            props["normalized_text"] = normalized_text
+        if normalized_latex:
+            props["normalized_latex"] = normalized_latex
+        if normalization_reason:
+            props["normalization_reason"] = normalization_reason
+        if normalization_mode:
+            props["normalization_mode"] = normalization_mode
+        if normalized_text or normalized_latex:
+            props["normalization_confidence"] = float(normalization_confidence)
+        return props
+
+    def _build_layout_uid_fallback_group_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        layout_atoms = sorted(layout_atoms, key=lambda item: int(item.get("reading_order") or 0))
+        groups: List[Dict[str, Any]] = []
+        omissions: List[Dict[str, Any]] = []
+        index = 0
+        while index < len(layout_atoms):
+            atom = dict(layout_atoms[index])
+            layout_id = str(atom.get("layout_id") or "").strip()
+            node_kind = str(atom.get("node_kind") or "").strip().lower() or "paragraph"
+            include_in_main_flow = bool(atom.get("include_in_main_flow"))
+            if not layout_id:
+                index += 1
+                continue
+            if not include_in_main_flow or node_kind in {"metadata", "doi", "header", "footer", "noise"}:
+                omissions.append(
+                    {
+                        "layout_id": layout_id,
+                        "reason": node_kind or "omit",
+                    }
+                )
+                index += 1
+                continue
+            if node_kind == "figure":
+                source_layout_ids = [layout_id]
+                lookahead = index + 1
+                while lookahead < len(layout_atoms):
+                    candidate = dict(layout_atoms[lookahead])
+                    candidate_kind = str(candidate.get("node_kind") or "").strip().lower()
+                    candidate_id = str(candidate.get("layout_id") or "").strip()
+                    if (
+                        candidate_kind == "figure_caption"
+                        and bool(candidate.get("include_in_main_flow"))
+                        and candidate_id
+                    ):
+                        source_layout_ids.append(candidate_id)
+                        lookahead += 1
+                        continue
+                    break
+                groups.append(
+                    {
+                        "group_id": f"figure_{len(groups) + 1}",
+                        "group_kind": "figure",
+                        "source_layout_ids": source_layout_ids,
+                        "rationale": "deterministic_figure_with_adjacent_caption",
+                    }
+                )
+                index = lookahead
+                continue
+            if node_kind == "table":
+                source_layout_ids = [layout_id]
+                lookahead = index + 1
+                while lookahead < len(layout_atoms):
+                    candidate = dict(layout_atoms[lookahead])
+                    candidate_kind = str(candidate.get("node_kind") or "").strip().lower()
+                    candidate_id = str(candidate.get("layout_id") or "").strip()
+                    if (
+                        candidate_kind in {"table", "table_caption"}
+                        and bool(candidate.get("include_in_main_flow"))
+                        and candidate_id
+                    ):
+                        source_layout_ids.append(candidate_id)
+                        lookahead += 1
+                        continue
+                    break
+                groups.append(
+                    {
+                        "group_id": f"table_{len(groups) + 1}",
+                        "group_kind": "table",
+                        "source_layout_ids": source_layout_ids,
+                        "rationale": "deterministic_table_with_adjacent_caption",
+                    }
+                )
+                index = lookahead
+                continue
+            if node_kind == "equation":
+                groups.append(
+                    {
+                        "group_id": f"equation_{len(groups) + 1}",
+                        "group_kind": "equation",
+                        "source_layout_ids": [layout_id],
+                        "rationale": "deterministic_equation_node",
+                    }
+                )
+                index += 1
+                continue
+            if node_kind == "paragraph":
+                source_layout_ids = [layout_id]
+                lookahead = index + 1
+                while lookahead < len(layout_atoms):
+                    candidate = dict(layout_atoms[lookahead])
+                    candidate_kind = str(candidate.get("node_kind") or "").strip().lower()
+                    candidate_id = str(candidate.get("layout_id") or "").strip()
+                    if (
+                        candidate_kind == "paragraph"
+                        and bool(candidate.get("include_in_main_flow"))
+                        and candidate_id
+                    ):
+                        source_layout_ids.append(candidate_id)
+                        lookahead += 1
+                        if len(source_layout_ids) >= 3:
+                            break
+                        continue
+                    break
+                groups.append(
+                    {
+                        "group_id": f"paragraph_{len(groups) + 1}",
+                        "group_kind": "paragraph",
+                        "source_layout_ids": source_layout_ids,
+                        "rationale": "deterministic_adjacent_paragraph_merge",
+                    }
+                )
+                index = lookahead
+                continue
+            if node_kind == "list":
+                groups.append(
+                    {
+                        "group_id": f"list_{len(groups) + 1}",
+                        "group_kind": "list",
+                        "source_layout_ids": [layout_id],
+                        "rationale": "deterministic_list_node",
+                    }
+                )
+                index += 1
+                continue
+            normalized_kind = node_kind if node_kind in self._layout_uid_group_kinds() else "paragraph"
+            groups.append(
+                {
+                    "group_id": f"{normalized_kind}_{len(groups) + 1}",
+                    "group_kind": normalized_kind,
+                    "source_layout_ids": [layout_id],
+                    "rationale": "deterministic_single_layout_group",
+                }
+            )
+            index += 1
+
+        return {
+            "groups": groups,
+            "omissions": omissions,
+            "notes": ["deterministic_layout_uid_fallback"],
+        }
+
+    def _normalize_layout_uid_group_plan(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        step_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in layout_atoms
+            if str(row.get("layout_id") or "").strip()
+        }
+        known_ids = set(layout_index.keys())
+        used_ids: List[str] = []
+        errors: List[str] = []
+        normalized_groups: List[Dict[str, Any]] = []
+        normalized_omissions: List[Dict[str, Any]] = []
+
+        for raw_group in list((step_result or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            raw_source_layout_ids = [
+                str(item).strip()
+                for item in list(
+                    raw_group.get("source_layout_ids")
+                    or raw_group.get("layout_ids")
+                    or raw_group.get("target_layout_ids")
+                    or []
+                )
+                if str(item).strip()
+            ]
+            duplicate_ids = sorted({layout_id for layout_id in raw_source_layout_ids if raw_source_layout_ids.count(layout_id) > 1})
+            if duplicate_ids:
+                errors.extend([f"duplicate_layout_id:{layout_id}" for layout_id in duplicate_ids])
+            source_layout_ids = list(dict.fromkeys(raw_source_layout_ids))
+            if not source_layout_ids:
+                continue
+            unknown_ids = [layout_id for layout_id in source_layout_ids if layout_id not in known_ids]
+            if unknown_ids:
+                errors.extend([f"unknown_layout_id:{layout_id}" for layout_id in unknown_ids])
+                continue
+            group_kind = str(raw_group.get("group_kind") or raw_group.get("kind") or "").strip().lower()
+            if group_kind not in self._layout_uid_group_kinds():
+                first_atom = layout_index.get(source_layout_ids[0]) or {}
+                group_kind = str(first_atom.get("node_kind") or "").strip().lower() or "paragraph"
+            omit_from_main_flow = bool(raw_group.get("omit_from_main_flow"))
+            if group_kind in {"metadata", "doi", "header", "footer", "noise"} or omit_from_main_flow:
+                for layout_id in source_layout_ids:
+                    normalized_omissions.append(
+                        {
+                            "layout_id": layout_id,
+                            "reason": str(raw_group.get("reason") or group_kind or "omit").strip() or "omit",
+                        }
+                    )
+                    used_ids.append(layout_id)
+                continue
+            normalized_groups.append(
+                {
+                    "group_id": str(raw_group.get("group_id") or f"group_{len(normalized_groups) + 1}").strip()
+                    or f"group_{len(normalized_groups) + 1}",
+                    "group_kind": group_kind,
+                    "source_layout_ids": source_layout_ids,
+                    "rationale": str(raw_group.get("rationale") or raw_group.get("reason") or "").strip(),
+                }
+            )
+            used_ids.extend(source_layout_ids)
+
+        for raw_omission in list((step_result or {}).get("omissions") or []):
+            if not isinstance(raw_omission, Mapping):
+                continue
+            layout_id = str(raw_omission.get("layout_id") or "").strip()
+            if not layout_id:
+                continue
+            if layout_id not in known_ids:
+                errors.append(f"unknown_layout_id:{layout_id}")
+                continue
+            normalized_omissions.append(
+                {
+                    "layout_id": layout_id,
+                    "reason": str(raw_omission.get("reason") or "omit").strip() or "omit",
+                }
+            )
+            used_ids.append(layout_id)
+
+        duplicates = sorted({layout_id for layout_id in used_ids if used_ids.count(layout_id) > 1})
+        if duplicates:
+            errors.extend([f"duplicate_layout_id:{layout_id}" for layout_id in duplicates])
+        missing = [layout_id for layout_id in layout_index if layout_id not in set(used_ids)]
+        if missing:
+            errors.extend([f"missing_layout_id:{layout_id}" for layout_id in missing])
+
+        if errors or not normalized_groups:
+            fallback_plan = self._build_layout_uid_fallback_group_plan(grounding=grounding)
+            return fallback_plan, {
+                "passed": False,
+                "errors": errors or ["empty_groups"],
+                "fallback_used": True,
+            }
+
+        normalized_groups = sorted(
+            normalized_groups,
+            key=lambda row: min(
+                int((layout_index.get(layout_id) or {}).get("reading_order") or 10**9)
+                for layout_id in list(row.get("source_layout_ids") or [])
+            ),
+        )
+        normalized_omissions = list(
+            {
+                f"{str(row.get('layout_id') or '').strip()}::{str(row.get('reason') or '').strip()}": dict(row)
+                for row in normalized_omissions
+                if str(row.get("layout_id") or "").strip()
+            }.values()
+        )
+        return {
+            "groups": normalized_groups,
+            "omissions": normalized_omissions,
+            "notes": [
+                str(item).strip()
+                for item in list((step_result or {}).get("notes") or [])
+                if str(item).strip()
+            ],
+        }, {
+            "passed": True,
+            "errors": [],
+            "fallback_used": False,
+        }
+
+    async def _build_layout_uid_table_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "table":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            draft_table_props = self._build_layout_uid_table_props(page=page, atoms=atoms)
+            table_cells = [
+                dict(row)
+                for row in list(draft_table_props.get("table_cells") or [])
+                if isinstance(row, Mapping)
+            ]
+            physical_rows = self._build_layout_uid_table_physical_rows(table_cells)
+            if len(physical_rows) < 3:
+                continue
+            prompt_payload = self._build_layout_uid_table_logical_row_prompt_payload(
+                page=page,
+                title=str(draft_table_props.get("title") or ""),
+                caption=str(draft_table_props.get("caption") or ""),
+                table_cells=table_cells,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_table_logical_row_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_table_logical_rows:{group_id}",
+            )
+            normalized_plan, validation = self._normalize_layout_uid_table_logical_row_plan(
+                physical_rows=physical_rows,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "logical_row_plan": normalized_plan,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
+    async def _build_layout_uid_equation_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "equation":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            prompt_payload = self._build_layout_uid_equation_normalization_prompt_payload(
+                page=page,
+                group_id=group_id,
+                atoms=atoms,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_equation_normalization_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_equation_normalization:{group_id}",
+            )
+            normalized_refinement, validation = self._normalize_layout_uid_equation_refinement(
+                atoms=atoms,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "normalization": normalized_refinement,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
+    async def _build_layout_uid_figure_refinement_map(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        rendered_page_image: str,
+        rendered_page_image_path: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        refinement_map: Dict[str, Dict[str, Any]] = {}
+        if not (rendered_page_image or rendered_page_image_path):
+            return refinement_map
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        for raw_group in list((grouping_plan or {}).get("groups") or []):
+            if not isinstance(raw_group, Mapping):
+                continue
+            if str(raw_group.get("group_kind") or "").strip().lower() != "figure":
+                continue
+            group_id = str(raw_group.get("group_id") or "").strip()
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(raw_group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not group_id or not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            prompt_payload = self._build_layout_uid_figure_insight_prompt_payload(
+                page=page,
+                group_id=group_id,
+                atoms=atoms,
+            )
+            model_result = await self._invoke_single_agent_model(
+                system_prompt=self._layout_uid_figure_insight_system_prompt(),
+                user_prompt=prompt_payload,
+                rendered_page_image=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                step=2,
+                phase=f"layout_uid_figure_insight:{group_id}",
+            )
+            normalized_refinement, validation = self._normalize_layout_uid_figure_refinement(
+                atoms=atoms,
+                step_result=dict(model_result.get("step_result") or {}),
+            )
+            refinement_map[group_id] = {
+                "insight": normalized_refinement,
+                "validation": validation,
+                "usage": dict(model_result.get("usage") or {}),
+                "model_status": str(model_result.get("status") or "").strip().lower() or "done",
+            }
+        return refinement_map
+
+    def _layout_uid_group_plan_to_panel_plan(
+        self,
+        *,
+        page: int,
+        grouping_plan: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        figure_refinements: Optional[Mapping[str, Any]] = None,
+        table_refinements: Optional[Mapping[str, Any]] = None,
+        equation_refinements: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        layout_index = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        nodes: List[Dict[str, Any]] = []
+        grouped_rows = [
+            dict(row)
+            for row in list((grouping_plan or {}).get("groups") or [])
+            if isinstance(row, Mapping)
+        ]
+        coalesced_groups: List[Dict[str, Any]] = []
+        index = 0
+        while index < len(grouped_rows):
+            group = dict(grouped_rows[index] or {})
+            group_kind = str(group.get("group_kind") or "").strip().lower()
+            if group_kind == "table":
+                merged_layout_ids = [
+                    str(item).strip()
+                    for item in list(group.get("source_layout_ids") or [])
+                    if str(item).strip()
+                ]
+                lookahead = index + 1
+                while lookahead < len(grouped_rows):
+                    candidate = dict(grouped_rows[lookahead] or {})
+                    candidate_kind = str(candidate.get("group_kind") or "").strip().lower()
+                    if candidate_kind != "table_caption":
+                        break
+                    for layout_id in list(candidate.get("source_layout_ids") or []):
+                        token = str(layout_id).strip()
+                        if token and token not in merged_layout_ids:
+                            merged_layout_ids.append(token)
+                    lookahead += 1
+                group["source_layout_ids"] = merged_layout_ids
+                coalesced_groups.append(group)
+                index = lookahead
+                continue
+            if group_kind == "table_caption":
+                index += 1
+                continue
+            coalesced_groups.append(group)
+            index += 1
+
+        for order_key, group in enumerate(coalesced_groups, start=1):
+            if not isinstance(group, Mapping):
+                continue
+            source_layout_ids = [
+                str(item).strip()
+                for item in list(group.get("source_layout_ids") or [])
+                if str(item).strip() and str(item).strip() in layout_index
+            ]
+            if not source_layout_ids:
+                continue
+            atoms = [layout_index[layout_id] for layout_id in source_layout_ids if layout_id in layout_index]
+            clean_texts = [
+                self._normalized_grounding_text(atom)
+                for atom in atoms
+                if self._normalized_grounding_text(atom)
+            ]
+            group_kind = str(group.get("group_kind") or "").strip().lower() or "paragraph"
+            component = "ParagraphProse"
+            props: Dict[str, Any] = {}
+            if group_kind == "title":
+                component = "SectionHeading"
+                props = {"text": " ".join(clean_texts).strip() or "Untitled", "level": 1}
+            elif group_kind == "section_heading":
+                component = "SectionHeading"
+                props = {"text": " ".join(clean_texts).strip() or "Untitled", "level": 2}
+            elif group_kind == "list":
+                items: List[str] = []
+                for text in clean_texts:
+                    parts = [
+                        self._normalize_spaces(item)
+                        for item in re.split(r"\n+|[•\u2022]\s*", text)
+                        if self._normalize_spaces(item)
+                    ]
+                    for item in parts:
+                        if item not in items:
+                            items.append(item)
+                component = "ListBlock"
+                props = {"items": items or clean_texts or ["[empty]"]}
+            elif group_kind == "figure":
+                caption_parts = [
+                    str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                    for atom in atoms
+                    if str(atom.get("node_kind") or "").strip().lower() != "figure"
+                    and str(atom.get("clean_text") or atom.get("raw_text") or "").strip()
+                ]
+                caption = self._strip_leading_figure_caption_noise(" ".join(caption_parts).strip())
+                source_label = ""
+                if caption:
+                    label_match = re.match(r"^(Fig(?:ure)?\.?\s*\d+[A-Za-z]?)", caption, flags=re.IGNORECASE)
+                    if label_match:
+                        source_label = self._normalize_spaces(str(label_match.group(1) or ""))
+                refinement = dict((figure_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                insight = self._normalize_spaces(str((refinement.get("insight") or {}).get("ai_insight") or ""))
+                component = "FigurePanel"
+                props = {
+                    "caption": caption,
+                    "image_url": "",
+                    "source_label": source_label,
+                    "ai_insight": insight,
+                }
+            elif group_kind == "table":
+                component = "TablePanel"
+                refinement = dict((table_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                props = self._build_layout_uid_table_props(
+                    page=page,
+                    atoms=atoms,
+                    logical_row_plan=dict(refinement.get("logical_row_plan") or {}) if refinement else None,
+                )
+            elif group_kind == "table_caption":
+                paragraphs = [{"text": text} for text in clean_texts if text]
+                merged_text = "\n\n".join(text for text in clean_texts if text).strip()
+                component = "ParagraphProse"
+                props = {
+                    "text": merged_text or "[empty]",
+                    "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}],
+                }
+            elif group_kind == "equation":
+                component = "EquationBlock"
+                refinement = dict((equation_refinements or {}).get(str(group.get("group_id") or "").strip()) or {})
+                props = self._build_layout_uid_equation_props(
+                    atoms=atoms,
+                    equation_refinement=dict(refinement.get("normalization") or {}) if refinement else None,
+                )
+            else:
+                paragraphs = [{"text": text} for text in clean_texts if text]
+                merged_text = "\n\n".join(text for text in clean_texts if text).strip()
+                component = "ParagraphProse"
+                props = {"text": merged_text or "[empty]", "paragraphs": paragraphs or [{"text": merged_text or "[empty]"}]}
+            nodes.append(
+                {
+                    "node_id": str(group.get("group_id") or f"group_{order_key}").strip() or f"group_{order_key}",
+                    "component": component,
+                    "source_layout_ids": source_layout_ids,
+                    "props": props,
+                    "display": "default",
+                    "order_key": float(order_key),
+                    "children": [],
+                }
+            )
+        return {
+            "plan_id": f"layout_uid_v1_p{int(page)}",
+            "creative_direction": "Layout unique-id grouping for /read",
+            "panels": [
+                {
+                    "panel_id": "layout_uid_main",
+                    "nodes": nodes,
+                }
+            ],
+            "style_plan": {
+                "scheme_id": "layout_uid_v1",
+                "page_background": "#f6f4ef",
+                "panel_background": "rgba(255,255,255,0.92)",
+                "border_color": "rgba(120,145,170,0.24)",
+                "heading_color": "#10253d",
+                "body_color": "#21364a",
+            },
+        }
+
+    async def _build_layout_uid_pipeline_result(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        base_payload: Dict[str, Any],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: str,
+        compare_mode: bool,
+        latency_budget_ms: int,
+        selected_kb_id: Optional[int],
+        pipeline_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        _ = (db, user_id, latency_budget_ms, selected_kb_id)
+        started_at = time.perf_counter()
+        resolved_pipeline_version = self._pipeline_version(pipeline_version)
+        payload = self._ensure_payload_contract(page=page, payload=dict(base_payload or {}))
+        grounding = dict(payload.get("page_grounding_v1") or {})
+        docmind_structure = dict(payload.get("docmind_structure") or {})
+        pdf_path = self._reader_service._resolve_local_pdf_path(  # pylint: disable=protected-access
+            user_id=int(paper.user_id),
+            paper_id=int(paper.id),
+            paper_title=paper.title,
+            paper_pdf_path=paper.pdf_path,
+        )
+        page_image_asset = self._resolve_reader_page_image_asset(
+            paper_id=int(paper.id),
+            page=int(page),
+            pdf_path=str(pdf_path or ""),
+            docmind_page_image_url=str(docmind_structure.get("page_image_url") or "").strip(),
+            docmind_page_image_path=str(docmind_structure.get("page_image_path") or "").strip(),
+        )
+        layout_atoms = [
+            dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        if not layout_atoms:
+            return await self._build_single_agent_v2_result(
+                db=db,
+                user_id=user_id,
+                paper=paper,
+                page=page,
+                base_payload=payload,
+                style_intent=style_intent,
+                theme_mode=theme_mode,
+                detail_level=detail_level,
+                compare_mode=compare_mode,
+                latency_budget_ms=latency_budget_ms,
+                selected_kb_id=selected_kb_id,
+                pipeline_version=resolved_pipeline_version,
+            )
+
+        page_image = dict(grounding.get("page_image") or {})
+        rendered_page_image = str(page_image_asset.get("url") or page_image.get("url") or "").strip()
+        rendered_page_image_path = str(page_image_asset.get("path") or page_image.get("path") or "").strip()
+        text_normalization_map: Dict[str, Dict[str, Any]] = {}
+        if rendered_page_image or rendered_page_image_path:
+            text_normalization_prompt_payload = self._build_layout_uid_text_normalization_prompt_payload(
+                page=page,
+                grounding=grounding,
+            )
+            if list(text_normalization_prompt_payload.get("layout_atoms") or []):
+                text_normalization_result = await self._invoke_single_agent_model(
+                    system_prompt=self._layout_uid_text_normalization_system_prompt(),
+                    user_prompt=text_normalization_prompt_payload,
+                    rendered_page_image=rendered_page_image,
+                    rendered_page_image_path=rendered_page_image_path,
+                    step=1,
+                    phase="layout_uid_text_normalization",
+                )
+                normalized_text_plan, text_normalization_validation = self._normalize_layout_uid_text_normalization_plan(
+                    grounding=grounding,
+                    step_result=dict(text_normalization_result.get("step_result") or {}),
+                )
+                text_normalization_map = {
+                    "normalization_plan": normalized_text_plan,
+                    "validation": text_normalization_validation,
+                    "usage": dict(text_normalization_result.get("usage") or {}),
+                    "model_status": str(text_normalization_result.get("status") or "").strip().lower() or "done",
+                }
+                grounding = self._apply_layout_uid_text_normalization_to_grounding(
+                    grounding=grounding,
+                    normalization_plan=normalized_text_plan,
+                )
+                payload["page_grounding_v1"] = grounding
+        prompt_payload = self._build_layout_uid_prompt_payload(
+            paper=paper,
+            page=page,
+            grounding=grounding,
+        )
+        model_result = await self._invoke_single_agent_model(
+            system_prompt=self._layout_uid_grouping_system_prompt(),
+            user_prompt=prompt_payload,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+            step=1,
+            phase="layout_uid_grouping",
+        )
+        normalized_grouping_plan, grouping_validation = self._normalize_layout_uid_group_plan(
+            grounding=grounding,
+            step_result=dict(model_result.get("step_result") or {}),
+        )
+        table_refinement_map = await self._build_layout_uid_table_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
+        equation_refinement_map = await self._build_layout_uid_equation_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
+        figure_refinement_map = await self._build_layout_uid_figure_refinement_map(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            rendered_page_image=rendered_page_image,
+            rendered_page_image_path=rendered_page_image_path,
+        )
+        panel_plan = self._layout_uid_group_plan_to_panel_plan(
+            page=page,
+            grouping_plan=normalized_grouping_plan,
+            grounding=grounding,
+            figure_refinements=figure_refinement_map,
+            table_refinements=table_refinement_map,
+            equation_refinements=equation_refinement_map,
+        )
+        docmind_blocks, layout_to_block_ids = self._collect_docmind_blocks_for_single_agent(
+            page=page,
+            base_payload=payload,
+        )
+        ui_plan = self._panel_plan_to_ui_plan(
+            page=page,
+            panel_plan=panel_plan,
+            docmind_blocks=docmind_blocks,
+            layout_to_block_ids=layout_to_block_ids,
+            base_payload=payload,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+        )
+        used_layout_ids = self._collect_source_layout_ids_from_panel_plan(panel_plan=panel_plan)
+        component_hints = self._collect_component_hints_from_panel_plan(panel_plan=panel_plan)
+        omissions = [
+            dict(row)
+            for row in list(normalized_grouping_plan.get("omissions") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        ]
+        omission_decisions = [
+            {
+                "decision_id": f"omit_{idx}",
+                "decision": "hide",
+                "reason": str(row.get("reason") or "omit").strip() or "omit",
+                "recoverable": True,
+                "target_layout_ids": [str(row.get("layout_id") or "").strip()],
+                "target_block_ids": [],
+                "target_atom_ids": [str(row.get("layout_id") or "").strip()],
+            }
+            for idx, row in enumerate(omissions, start=1)
+        ]
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        usage = dict(model_result.get("usage") or {})
+        status_value = str(model_result.get("status") or "done").strip().lower() or "done"
+        used_fallback = bool(grouping_validation.get("fallback_used"))
+        decision_log = [
+            "layout_uid_v1:unique_id_grouping",
+            f"layout_uid_v1:text_normalized={len(list(((text_normalization_map.get('normalization_plan') or {}).get('items') or [])))}",
+            f"layout_uid_v1:groups={len(list(normalized_grouping_plan.get('groups') or []))}",
+            f"layout_uid_v1:omissions={len(omissions)}",
+            f"layout_uid_v1:figures_explained={sum(1 for item in list(figure_refinement_map.values()) if isinstance(item, Mapping) and str(((item.get('insight') or {}).get('ai_insight') or '')).strip())}",
+            f"layout_uid_v1:tables_refined={sum(1 for item in list(table_refinement_map.values()) if isinstance(item, Mapping) and list(((item.get('logical_row_plan') or {}).get('logical_rows') or [])))}",
+            f"layout_uid_v1:equations_normalized={sum(1 for item in list(equation_refinement_map.values()) if isinstance(item, Mapping) and (((item.get('normalization') or {}).get('normalized_text')) or ((item.get('normalization') or {}).get('normalized_latex'))))}",
+        ] + [
+            str(item).strip()
+            for item in list(normalized_grouping_plan.get("notes") or [])
+            if str(item).strip()
+        ]
+        validation_errors = [str(item).strip() for item in list(grouping_validation.get("errors") or []) if str(item).strip()]
+
+        payload["scheme_choice"] = {
+            "scheme_id": "layout_uid_v1",
+            "label": "Layout unique-id grouping",
+            "rationale": "Group by DocMind uniqueId and materialize a lightweight /read flow.",
+            "source": "layout_uid_v1",
+            "candidate_ids": ["layout_uid_v1"],
+        }
+        payload["decision_log"] = decision_log
+        payload["omission_decisions"] = omission_decisions
+        payload["review_route_meta"] = {
+            "template": f"/literature/{int(paper.id)}/read/review",
+            "mode": "compose_review_v1",
+        }
+        payload["qwen_plan_meta"] = {
+            "used": True,
+            "reason": "layout_uid_v1",
+            "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "pipeline_version": resolved_pipeline_version,
+            "fallback_used": used_fallback,
+        }
+        payload["layout_advice_v3"] = {
+            "source": "layout_uid_v1",
+            "ordered_block_ids": used_layout_ids,
+            "suggested_components": component_hints,
+            "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
+            "text_normalizations": text_normalization_map,
+            "figure_refinements": figure_refinement_map,
+            "table_refinements": table_refinement_map,
+            "visual_hints": [],
+            "notes": list(decision_log),
+            "omitted_layout_ids": [str(row.get("layout_id") or "").strip() for row in omissions],
+        }
+        payload["minimal_gate_report"] = {
+            "passed": not validation_errors,
+            "schema_valid": True,
+            "whitelist_valid": True,
+            "layout_contract": not validation_errors,
+            "ownership_unchanged": True,
+            "full_coverage": not any(item.startswith("missing_layout_id:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
+            "used_atom_count": len(used_layout_ids),
+            "usable_atom_count": len(layout_atoms),
+        }
+        payload["pipeline_contract_meta"] = {
+            **dict(payload.get("pipeline_contract_meta") or {}),
+            "used": True,
+            "pipeline": "reader_layout_uid_v1",
+            "elapsed_ms": elapsed_ms,
+            "text_normalization": text_normalization_map,
+            "grouping_validation": dict(grouping_validation),
+        }
+        quality_report = {
+            "overall": 0.95 if not used_fallback and status_value == "done" else 0.76,
+            "hard_constraints_passed": not validation_errors,
+            "validation_errors": validation_errors,
+            "quality_target": 0.0,
+            "elapsed_ms": elapsed_ms,
+            "iterations": 1,
+            "degraded": used_fallback or status_value != "done",
+            "stop_reason": "layout_uid_v1_fallback" if used_fallback else "layout_uid_v1_done",
+            "schema_valid": True,
+            "whitelist_valid": True,
+            "ownership_unchanged": True,
+            "full_coverage": not any(item.startswith("missing_layout_id:") for item in validation_errors),
+            "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
+            "source_text_immutable": True,
+            "pipeline_latency_ms": elapsed_ms,
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
+        loop_result = {
+            "ui_plan": ui_plan,
+            "quality_report": quality_report,
+            "node_gate_report": {},
+            "iteration_trace": [],
+            "iterations": 1,
+            "degraded": bool(quality_report.get("degraded")),
+            "stop_reason": str(quality_report.get("stop_reason") or "layout_uid_v1_done"),
+            "build_mode": "compose_agent_layout_uid_v1",
+        }
+        assets = [
+            row
+            for row in list(payload.get("assets") or [])
+            if isinstance(row, dict) and str(row.get("kind") or "") in {"link", "annotation", "image_hint"}
+        ]
+        return {
+            "base_payload": payload,
+            "loop_result": loop_result,
+            "assets": assets,
+        }
 
     async def _build_single_agent_v2_result(
         self,
@@ -1042,8 +4144,10 @@ class LiteratureReaderComposeService:
         compare_mode: bool,
         latency_budget_ms: int,
         selected_kb_id: Optional[int],
+        pipeline_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
+        resolved_pipeline_version = self._pipeline_version(pipeline_version)
         logger.info(
             "[ReaderComposeService] _build_single_agent_v2_result start "
             f"paper={paper.id} page={page}"
@@ -1144,7 +4248,7 @@ class LiteratureReaderComposeService:
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
-                "pipeline_version": self._pipeline_version(),
+                "pipeline_version": resolved_pipeline_version,
             }
             payload["minimal_gate_report"] = {
                 "passed": False,
@@ -1186,35 +4290,22 @@ class LiteratureReaderComposeService:
             paper_title=paper.title,
             paper_pdf_path=paper.pdf_path,
         )
-        rendered_page_image = str(
-            (((payload.get("docmind_structure") or {}).get("page_image_url") or ""))
-        ).strip()
-        rendered_page_image_path = ""
+        page_image_asset = self._resolve_reader_page_image_asset(
+            paper_id=int(paper.id),
+            page=int(page),
+            pdf_path=str(pdf_path or ""),
+            docmind_page_image_url=str((((payload.get("docmind_structure") or {}).get("page_image_url") or ""))).strip(),
+            docmind_page_image_path=str((((payload.get("docmind_structure") or {}).get("page_image_path") or ""))).strip(),
+        )
+        rendered_page_image = str(page_image_asset.get("url") or "").strip()
+        rendered_page_image_path = str(page_image_asset.get("path") or "").strip()
         if rendered_page_image and not self._is_safe_prompt_image_url(rendered_page_image):
             rendered_page_image = ""
-        if pdf_path and os.path.exists(pdf_path):
-            try:
-                fallback_image = await self.ensure_page_render_asset(
-                    paper_id=int(paper.id),
-                    page=int(page),
-                    pdf_path=str(pdf_path),
-                )
-                fallback_path = self._find_existing_page_render_asset_path(
-                    paper_id=int(paper.id),
-                    page=int(page),
-                )
-                if fallback_path and os.path.exists(fallback_path):
-                    rendered_page_image_path = str(fallback_path)
-                if fallback_image and self._is_safe_prompt_image_url(fallback_image):
-                    if not rendered_page_image:
-                        rendered_page_image = fallback_image
-                    mm_meta = dict(payload.get("mm_assist_meta") or {})
-                    mm_meta["stage1_prompt_image_source"] = "page_render_asset_url"
-                    payload["mm_assist_meta"] = mm_meta
-            except Exception as exc:
-                logger.debug(
-                    f"[ReaderComposeService] stage1 prompt image fallback failed paper={paper.id} page={page}: {exc}"
-                )
+        page_image_source = str(page_image_asset.get("source") or "").strip()
+        if rendered_page_image or rendered_page_image_path:
+            mm_meta = dict(payload.get("mm_assist_meta") or {})
+            mm_meta["stage1_prompt_image_source"] = page_image_source or "unknown"
+            payload["mm_assist_meta"] = mm_meta
         if pdf_path and os.path.exists(pdf_path):
             try:
                 payload = await self._ensure_figure_assets_for_payload(
@@ -1422,7 +4513,7 @@ class LiteratureReaderComposeService:
             "prompt_tokens": int(total_prompt_tokens),
             "completion_tokens": int(total_completion_tokens),
             "total_tokens": int(total_tokens),
-            "pipeline_version": self._pipeline_version(),
+            "pipeline_version": resolved_pipeline_version,
         }
         payload["layout_advice_v3"] = {
             "source": "single_agent_v2",
@@ -1635,18 +4726,21 @@ class LiteratureReaderComposeService:
                         page_images=page_images,
                         bbox_pdf=bbox_pdf,
                     )
-                    native_image = self._select_native_pdf_image(
-                        pypdf_images=pypdf_images,
-                        pypdf_image_map=pypdf_image_map,
-                        candidate_images=candidate_images,
-                    )
-                    if native_image is not None:
-                        target_path = self._write_native_pdf_image(
-                            out_dir=out_dir,
-                            asset_id=layout_uid,
-                            image_obj=native_image,
+                    prefer_region_render = len(candidate_images) >= 2
+                    if not target_path and not prefer_region_render:
+                        native_image = self._select_native_pdf_image(
+                            pypdf_images=pypdf_images,
+                            pypdf_image_map=pypdf_image_map,
+                            candidate_images=candidate_images,
+                            bbox_pdf=bbox_pdf,
                         )
-                        method = "native" if target_path else method
+                        if native_image is not None:
+                            target_path = self._write_native_pdf_image(
+                                out_dir=out_dir,
+                                asset_id=layout_uid,
+                                image_obj=native_image,
+                            )
+                            method = "native" if target_path else method
                     if not target_path and bbox_pdf is not None:
                         if rendered_page is None:
                             rendered_page = page_obj.to_image(resolution=220).original
@@ -1655,6 +4749,8 @@ class LiteratureReaderComposeService:
                             asset_id=layout_uid,
                             page_image=rendered_page,
                             bbox_pdf=bbox_pdf,
+                            pdf_width=pdf_width,
+                            pdf_height=pdf_height,
                         )
                         method = "clip" if target_path else method
 
@@ -1714,6 +4810,15 @@ class LiteratureReaderComposeService:
             return candidate
         return None
 
+    @staticmethod
+    def _find_existing_grounding_page_image_path(*, paper_id: int, page: int) -> Optional[str]:
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            candidate = os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        return None
+
     async def ensure_page_render_asset(
         self,
         *,
@@ -1736,6 +4841,105 @@ class LiteratureReaderComposeService:
         if created_path and os.path.exists(created_path):
             return self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page))
         return ""
+
+    def _resolve_reader_page_image_asset(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str = "",
+        docmind_page_image_url: str = "",
+        docmind_page_image_path: str = "",
+    ) -> Dict[str, str]:
+        existing_path = self._find_existing_page_render_asset_path(
+            paper_id=int(paper_id),
+            page=int(page),
+        )
+        if existing_path and os.path.exists(existing_path):
+            return {
+                "url": self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(existing_path),
+                "source": "page_render_asset",
+                "origin_url": "",
+                "local_cached": True,
+            }
+
+        local_pdf_path = str(pdf_path or "").strip()
+        if local_pdf_path and os.path.exists(local_pdf_path):
+            created_path = self._build_page_render_asset_sync(
+                paper_id=int(paper_id),
+                page=int(page),
+                pdf_path=local_pdf_path,
+            )
+            if created_path and os.path.exists(created_path):
+                return {
+                    "url": self._build_page_render_asset_url(paper_id=int(paper_id), page=int(page)),
+                    "path": str(created_path),
+                    "source": "page_render_asset",
+                    "origin_url": "",
+                    "local_cached": True,
+                }
+
+        remote_url = str(docmind_page_image_url or "").strip()
+        localized_path = self._ensure_local_grounding_page_image(
+            paper_id=int(paper_id),
+            page=int(page),
+            page_image_url=remote_url,
+            page_image_path=str(docmind_page_image_path or "").strip(),
+        )
+        if localized_path and os.path.exists(localized_path):
+            return {
+                "url": self._build_grounding_page_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(localized_path),
+                "source": "docmind_page_image_localized",
+                "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+                "local_cached": True,
+            }
+
+        return {
+            "url": "",
+            "path": "",
+            "source": "docmind_page_image_unlocalized" if self._is_safe_http_url(remote_url) else "",
+            "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+            "local_cached": False,
+        }
+
+    def _resolve_grounding_page_image_asset(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        pdf_path: str = "",
+        docmind_page_image_url: str = "",
+        docmind_page_image_path: str = "",
+    ) -> Dict[str, str]:
+        existing_grounding_path = self._find_existing_grounding_page_image_path(
+            paper_id=int(paper_id),
+            page=int(page),
+        )
+        remote_url = str(docmind_page_image_url or "").strip()
+        localized_path = self._ensure_local_grounding_page_image(
+            paper_id=int(paper_id),
+            page=int(page),
+            page_image_url=remote_url,
+            page_image_path=str(docmind_page_image_path or existing_grounding_path or "").strip(),
+        )
+        if localized_path and os.path.exists(localized_path):
+            return {
+                "url": self._build_grounding_page_asset_url(paper_id=int(paper_id), page=int(page)),
+                "path": str(localized_path),
+                "source": "docmind_page_image_localized",
+                "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+                "local_cached": True,
+            }
+
+        return {
+            "url": "",
+            "path": "",
+            "source": "docmind_page_image_unlocalized" if self._is_safe_http_url(remote_url) else "",
+            "origin_url": remote_url if self._is_safe_http_url(remote_url) else "",
+            "local_cached": False,
+        }
 
     def _infer_docmind_page_size(
         self,
@@ -1853,17 +5057,55 @@ class LiteratureReaderComposeService:
         pypdf_images: Sequence[Any],
         pypdf_image_map: Dict[str, Any],
         candidate_images: Sequence[Dict[str, Any]],
+        bbox_pdf: Optional[Tuple[float, float, float, float]] = None,
     ) -> Optional[Any]:
         images = list(pypdf_images or [])
         if not images:
             return None
+
+        def _image_aspect_ratio(image_obj: Any) -> Optional[float]:
+            pil_image = getattr(image_obj, "image", None)
+            size = getattr(pil_image, "size", None)
+            if not isinstance(size, tuple) or len(size) != 2:
+                return None
+            width = float(size[0] or 0.0)
+            height = float(size[1] or 0.0)
+            if width <= 1.0 or height <= 1.0:
+                return None
+            return width / height
+
+        def _bbox_aspect_ratio(bbox: Optional[Tuple[float, float, float, float]]) -> Optional[float]:
+            if bbox is None:
+                return None
+            x0, y0, x1, y1 = bbox
+            width = float(x1 - x0)
+            height = float(y1 - y0)
+            if width <= 1.0 or height <= 1.0:
+                return None
+            return width / height
+
+        def _is_reasonable_shape_match(image_obj: Any) -> bool:
+            bbox_ratio = _bbox_aspect_ratio(bbox_pdf)
+            image_ratio = _image_aspect_ratio(image_obj)
+            if bbox_ratio is None or image_ratio is None:
+                return True
+            larger = max(bbox_ratio, image_ratio)
+            smaller = min(bbox_ratio, image_ratio)
+            if smaller <= 0.0:
+                return False
+            # Avoid using a native PDF image when its shape clearly disagrees
+            # with the DocMind figure bbox; in that case page clip is safer.
+            return (larger / smaller) <= 1.35
+
         if len(images) == 1:
-            return images[0]
+            return images[0] if _is_reasonable_shape_match(images[0]) else None
         for row in list(candidate_images or []):
             name = self._normalize_pdf_image_name(str(row.get("name") or ""))
             if name and name in pypdf_image_map:
-                return pypdf_image_map[name]
-        return images[0] if len(images) == 1 else None
+                candidate = pypdf_image_map[name]
+                if _is_reasonable_shape_match(candidate):
+                    return candidate
+        return None
 
     @staticmethod
     def _normalize_pdf_image_name(raw: str) -> str:
@@ -1895,6 +5137,128 @@ class LiteratureReaderComposeService:
             fp.write(bytes(data))
         return target
 
+    def _write_composited_pdf_images(
+        self,
+        *,
+        out_dir: str,
+        asset_id: str,
+        page_images: Sequence[Dict[str, Any]],
+        pypdf_images: Sequence[Any],
+        page_render_size: Tuple[int, int],
+        pdf_width: float,
+        pdf_height: float,
+    ) -> Optional[str]:
+        if not page_images or not pypdf_images:
+            return None
+        if len(page_images) < 2:
+            return None
+        if len(page_images) != len(pypdf_images):
+            return None
+        if pdf_width <= 0 or pdf_height <= 0:
+            return None
+        try:
+            from PIL import Image
+        except Exception:
+            return None
+
+        def _content_bbox(image_obj: Any) -> Optional[Tuple[int, int, int, int]]:
+            pil_image = getattr(image_obj, "image", None)
+            if pil_image is None:
+                return None
+            sample = pil_image.convert("RGB")
+            width, height = sample.size
+            if width <= 4 or height <= 4:
+                return None
+            corners = [
+                sample.getpixel((0, 0)),
+                sample.getpixel((max(0, width - 1), 0)),
+                sample.getpixel((0, max(0, height - 1))),
+                sample.getpixel((max(0, width - 1), max(0, height - 1))),
+            ]
+            bg = tuple(int(sum(channel[i] for channel in corners) / len(corners)) for i in range(3))
+            tolerance = 18
+            xs: List[int] = []
+            ys: List[int] = []
+            pixels = sample.load()
+            for y in range(height):
+                for x in range(width):
+                    px = pixels[x, y]
+                    if any(abs(int(px[i]) - int(bg[i])) > tolerance for i in range(3)):
+                        xs.append(x)
+                        ys.append(y)
+            if not xs or not ys:
+                return None
+            left = max(0, min(xs))
+            top = max(0, min(ys))
+            right = min(width, max(xs) + 1)
+            bottom = min(height, max(ys) + 1)
+            if right <= left or bottom <= top:
+                return None
+            # Ignore negligible trims; keep full image in that case.
+            if (right - left) >= width * 0.96 and (bottom - top) >= height * 0.96:
+                return None
+            return left, top, right, bottom
+
+        rx = float(page_render_size[0]) / float(pdf_width)
+        ry = float(page_render_size[1]) / float(pdf_height)
+        boxes: List[Tuple[float, float, float, float]] = []
+        ordered_rows = sorted(
+            [dict(row) for row in list(page_images or []) if isinstance(row, Mapping)],
+            key=lambda item: (
+                self._safe_float(item.get("top"), 0.0),
+                self._safe_float(item.get("x0"), 0.0),
+            ),
+        )
+        if len(ordered_rows) != len(pypdf_images):
+            return None
+        content_images: List[Tuple[Any, Tuple[float, float, float, float]]] = []
+        for row, image_obj in zip(ordered_rows, list(pypdf_images or [])):
+            x0 = self._safe_float(row.get("x0"), 0.0) * rx
+            x1 = self._safe_float(row.get("x1"), 0.0) * rx
+            y0 = self._safe_float(row.get("top"), 0.0) * ry
+            y1 = self._safe_float(row.get("bottom"), 0.0) * ry
+            if x1 <= x0 or y1 <= y0:
+                return None
+            pil_image = getattr(image_obj, "image", None)
+            if pil_image is None:
+                return None
+            crop_box = _content_bbox(image_obj)
+            if crop_box is not None:
+                img_w, img_h = pil_image.size
+                cx0, cy0, cx1, cy1 = crop_box
+                width_ratio = (x1 - x0) / max(1.0, float(img_w))
+                height_ratio = (y1 - y0) / max(1.0, float(img_h))
+                x0 = x0 + cx0 * width_ratio
+                x1 = x0 + (cx1 - cx0) * width_ratio
+                y0 = y0 + cy0 * height_ratio
+                y1 = y0 + (cy1 - cy0) * height_ratio
+                pil_image = pil_image.crop(crop_box)
+            boxes.append((x0, y0, x1, y1))
+            content_images.append((pil_image, (x0, y0, x1, y1)))
+        union = (
+            min(item[0] for item in boxes),
+            min(item[1] for item in boxes),
+            max(item[2] for item in boxes),
+            max(item[3] for item in boxes),
+        )
+        canvas_width = max(1, int(round(union[2] - union[0])))
+        canvas_height = max(1, int(round(union[3] - union[1])))
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+        for pil_image, box in content_images:
+            target_w = max(1, int(round(box[2] - box[0])))
+            target_h = max(1, int(round(box[3] - box[1])))
+            resized = pil_image.resize((target_w, target_h))
+            canvas.paste(
+                resized,
+                (
+                    int(round(box[0] - union[0])),
+                    int(round(box[1] - union[1])),
+                ),
+            )
+        target = os.path.join(out_dir, f"{asset_id}.png")
+        canvas.save(target, format="PNG")
+        return target
+
     def _write_clipped_page_image(
         self,
         *,
@@ -1902,17 +5266,25 @@ class LiteratureReaderComposeService:
         asset_id: str,
         page_image: Any,
         bbox_pdf: Tuple[float, float, float, float],
+        pdf_width: Optional[float] = None,
+        pdf_height: Optional[float] = None,
     ) -> Optional[str]:
         if page_image is None:
             return None
         width, height = page_image.size  # PIL image
         x0, y0, x1, y1 = bbox_pdf
-        pad_x = max(2, int((x1 - x0) * 0.01))
-        pad_y = max(2, int((y1 - y0) * 0.01))
+        if pdf_width and pdf_height and pdf_width > 0 and pdf_height > 0:
+            scale_x = float(width) / float(pdf_width)
+            scale_y = float(height) / float(pdf_height)
+            x0, x1 = x0 * scale_x, x1 * scale_x
+            y0, y1 = y0 * scale_y, y1 * scale_y
+        pad_x = max(8, int((x1 - x0) * 0.05))
+        pad_top = max(10, int((y1 - y0) * 0.12))
+        pad_bottom = max(8, int((y1 - y0) * 0.06))
         left = max(0, int(round(x0 - pad_x)))
-        top = max(0, int(round(y0 - pad_y)))
+        top = max(0, int(round(y0 - pad_top)))
         right = min(int(width), int(round(x1 + pad_x)))
-        bottom = min(int(height), int(round(y1 + pad_y)))
+        bottom = min(int(height), int(round(y1 + pad_bottom)))
         if right <= left + 6 or bottom <= top + 6:
             return None
         cropped = page_image.crop((left, top, right, bottom))
@@ -2095,6 +5467,154 @@ class LiteratureReaderComposeService:
             for row in list(docmind_blocks or [])
             if isinstance(row, dict) and str(row.get("layout_id") or "")
         }
+        grounding = dict(base_payload.get("page_grounding_v1") or {})
+        grounding_layout_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        grounding_evidence_map = {
+            str(row.get("source_layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("evidence_map") or [])
+            if isinstance(row, Mapping) and str(row.get("source_layout_id") or "").strip()
+        }
+        grounding_page_image = dict(grounding.get("page_image") or {})
+
+        def _grounding_points(raw_points: Any) -> List[Dict[str, float]]:
+            output: List[Dict[str, float]] = []
+            for point in list(raw_points or []):
+                if not isinstance(point, Mapping):
+                    continue
+                x = float(point.get("x") or 0.0)
+                y = float(point.get("y") or 0.0)
+                output.append({"x": x, "y": y})
+            return output
+
+        def _points_bbox(points: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+            normalized = _grounding_points(points)
+            if len(normalized) < 3:
+                return None
+            xs = [float(point.get("x") or 0.0) for point in normalized]
+            ys = [float(point.get("y") or 0.0) for point in normalized]
+            x0 = min(xs)
+            x1 = max(xs)
+            top = min(ys)
+            bottom = max(ys)
+            if x1 <= x0 or bottom <= top:
+                return None
+            return {
+                "x0": x0,
+                "x1": x1,
+                "top": top,
+                "bottom": bottom,
+            }
+
+        def _grounding_page_dimensions() -> Tuple[Optional[float], Optional[float]]:
+            width = float(grounding_page_image.get("width") or 0.0) or 0.0
+            height = float(grounding_page_image.get("height") or 0.0) or 0.0
+            if width > 0 and height > 0:
+                return width, height
+            for atom in list(grounding_layout_map.values()):
+                for point in _grounding_points(atom.get("layout_pos")):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+                for block in list(atom.get("blocks") or []):
+                    if not isinstance(block, Mapping):
+                        continue
+                    for point in _grounding_points(block.get("pos")):
+                        width = max(width, float(point.get("x") or 0.0))
+                        height = max(height, float(point.get("y") or 0.0))
+            for evidence in list(grounding_evidence_map.values()):
+                for point in _grounding_points(evidence.get("layout_pos")):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+                for polygon in list(evidence.get("block_positions") or []):
+                    for point in _grounding_points(polygon):
+                        width = max(width, float(point.get("x") or 0.0))
+                        height = max(height, float(point.get("y") or 0.0))
+            return (width or None), (height or None)
+
+        grounding_page_width, grounding_page_height = _grounding_page_dimensions()
+
+        def _build_layout_anchor(layout_id: str) -> Optional[Dict[str, Any]]:
+            token = str(layout_id or "").strip()
+            if not token:
+                return None
+            atom = grounding_layout_map.get(token) or {}
+            evidence = grounding_evidence_map.get(token) or {}
+            quote_text = self._normalize_spaces(
+                str(atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
+            ) or self._normalize_spaces(str((docmind_map.get(token) or {}).get("source_text") or ""))
+            canonical_block_ids = [
+                self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                for item in list(atom.get("canonical_block_ids") or evidence.get("source_block_ids") or [])
+            ]
+            canonical_block_ids = [item for item in canonical_block_ids if item]
+            polygon_sets = [
+                _grounding_points(item)
+                for item in list(evidence.get("block_positions") or [])
+                if len(_grounding_points(item)) >= 3
+            ]
+            if not polygon_sets:
+                atom_blocks = list(atom.get("blocks") or [])
+                polygon_sets = [
+                    _grounding_points(block.get("pos"))
+                    for block in atom_blocks
+                    if isinstance(block, Mapping) and len(_grounding_points(block.get("pos"))) >= 3
+                ]
+            if not polygon_sets:
+                layout_points = _grounding_points(evidence.get("layout_pos") or atom.get("layout_pos"))
+                if len(layout_points) >= 3:
+                    polygon_sets = [layout_points]
+            if not polygon_sets:
+                return None
+
+            all_points = [point for polygon in polygon_sets for point in polygon]
+            bbox = _points_bbox(all_points)
+            geometry = {
+                "polygons": [
+                    {
+                        "points": polygon,
+                        "source": "page_grounding_v1",
+                        "component_id": f"{token}:{idx}",
+                    }
+                    for idx, polygon in enumerate(polygon_sets, start=1)
+                ],
+                "page_width": grounding_page_width,
+                "page_height": grounding_page_height,
+            }
+            quote_length = max(1, len(quote_text or token))
+            return {
+                "page": int(page),
+                "start_char": 0,
+                "end_char": int(quote_length),
+                "quote": quote_text or None,
+                "quote_text": quote_text or None,
+                "anchor_id": f"layout_uid_v1:{token}",
+                "segment_index": 1,
+                "segment_total": 1,
+                "bbox_hint": {
+                    **dict(bbox or {}),
+                    "page_width": grounding_page_width,
+                    "page_height": grounding_page_height,
+                } if isinstance(bbox, dict) else None,
+                "canonical_block_id": canonical_block_ids[0] if canonical_block_ids else None,
+                "source_layout_id": token,
+                "coord_version": "layout_uid_v1",
+                "anchor_confidence": 0.98,
+                "anchor_v2": {
+                    "coord_version": "layout_uid_v1",
+                    "canonical_block_id": canonical_block_ids[0] if canonical_block_ids else token,
+                    "page": int(page),
+                    "start_char": 0,
+                    "end_char": int(quote_length),
+                },
+                "geometry_version": "poly_v1",
+                "geometry": geometry,
+                "source_word_ids": [],
+                "source_char_ranges": [],
+            }
+
         figure_layout_to_image_token: Dict[str, str] = {}
         figure_image_fallback_token = ""
         for asset in list(base_payload.get("assets") or []):
@@ -2398,11 +5918,29 @@ class LiteratureReaderComposeService:
                     "text": str(props.get("text") or fb_text).strip() or "[empty]",
                 }
             if component == "EquationBlock":
-                return {
+                normalized_latex = str(props.get("normalized_latex") or "").strip()
+                normalized_text = str(props.get("normalized_text") or "").strip()
+                normalization_reason = str(props.get("normalization_reason") or "").strip()
+                normalization_mode = str(props.get("normalization_mode") or "").strip()
+                normalization_confidence = props.get("normalization_confidence")
+                payload = {
                     "latex": str(props.get("latex") or props.get("text") or fb_text).strip() or "x = y",
                     "label": str(props.get("label") or "").strip(),
                     "description": str(props.get("description") or "").strip(),
+                    "render_mode": str(props.get("render_mode") or "image_first").strip() or "image_first",
+                    "transcript": str(props.get("transcript") or props.get("text") or fb_text).strip(),
                 }
+                if normalized_text:
+                    payload["normalized_text"] = normalized_text
+                if normalized_latex:
+                    payload["normalized_latex"] = normalized_latex
+                if normalization_reason:
+                    payload["normalization_reason"] = normalization_reason
+                if normalization_mode:
+                    payload["normalization_mode"] = normalization_mode
+                if isinstance(normalization_confidence, (int, float)) and not isinstance(normalization_confidence, bool):
+                    payload["normalization_confidence"] = float(normalization_confidence)
+                return payload
             if component == "MethodologyCard":
                 steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
                 if not steps and fb_text:
@@ -2410,7 +5948,34 @@ class LiteratureReaderComposeService:
                 return {"title": str(props.get("title") or "").strip(), "steps": steps or ["N/A"], "participants": str(props.get("participants") or "").strip(), "tools": [str(item).strip() for item in list(props.get("tools") or []) if str(item).strip()]}
             if component == "TablePanel":
                 rows = props.get("rows")
-                return {"title": str(props.get("title") or fb_text or "Table").strip(), "rows": rows if isinstance(rows, list) else []}
+                matrix = props.get("matrix")
+                headers = props.get("headers")
+                column_widths = props.get("column_widths")
+                table_cells = props.get("table_cells")
+                notes = props.get("notes")
+                row_evidence = props.get("row_evidence")
+                cell_evidence = props.get("cell_evidence")
+                logical_rows = props.get("logical_rows")
+                reconstruction_notes = props.get("reconstruction_notes")
+                return {
+                    "title": str(props.get("title") or fb_text or "Table").strip(),
+                    "rows": rows if isinstance(rows, list) else [],
+                    "matrix": matrix if isinstance(matrix, list) else [],
+                    "headers": headers if isinstance(headers, list) else [],
+                    "column_widths": column_widths if isinstance(column_widths, list) else [],
+                    "table_cells": table_cells if isinstance(table_cells, list) else [],
+                    "header_row_count": int(props.get("header_row_count") or 0),
+                    "logical_rows": logical_rows if isinstance(logical_rows, list) else [],
+                    "logical_header_row_count": int(props.get("logical_header_row_count") or 0),
+                    "caption": str(props.get("caption") or "").strip(),
+                    "notes": notes if isinstance(notes, list) else [],
+                    "raw_markdown": str(props.get("raw_markdown") or "").strip(),
+                    "row_evidence": row_evidence if isinstance(row_evidence, list) else [],
+                    "cell_evidence": cell_evidence if isinstance(cell_evidence, list) else [],
+                    "reconstruction_mode": str(props.get("reconstruction_mode") or "").strip(),
+                    "reconstruction_notes": reconstruction_notes if isinstance(reconstruction_notes, list) else [],
+                    "ai_insight": str(props.get("ai_insight") or "").strip(),
+                }
             return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
 
         def convert_node(node: Dict[str, Any], panel_id: str) -> Optional[Dict[str, Any]]:
@@ -2424,7 +5989,14 @@ class LiteratureReaderComposeService:
                 display = "default"
             source_block_ids: List[str] = []
             source_anchor_refs: List[Dict[str, Any]] = []
+            seen_anchor_ids: set[str] = set()
             for layout_id in source_layout_ids:
+                layout_anchor = _build_layout_anchor(layout_id)
+                if isinstance(layout_anchor, dict):
+                    anchor_key = str(layout_anchor.get("anchor_id") or layout_id).strip() or str(layout_id).strip()
+                    if anchor_key and anchor_key not in seen_anchor_ids:
+                        source_anchor_refs.append(layout_anchor)
+                        seen_anchor_ids.add(anchor_key)
                 mapped = list(layout_alias_to_block_ids.get(layout_id) or [])
                 if not mapped:
                     normalized_layout_id = self._normalize_canonical_block_id(page=page, raw_id=layout_id)
@@ -2439,9 +6011,13 @@ class LiteratureReaderComposeService:
                     if known_block_set and block_token not in known_block_set:
                         continue
                     source_block_ids.append(block_token)
+                    if isinstance(layout_anchor, dict):
+                        continue
                     anchor = dict(block_anchor_map.get(block_token) or {})
-                    if anchor and anchor not in source_anchor_refs:
+                    anchor_key = str(anchor.get("anchor_id") or anchor.get("canonical_block_id") or block_token).strip()
+                    if anchor and anchor_key and anchor_key not in seen_anchor_ids:
                         source_anchor_refs.append(anchor)
+                        seen_anchor_ids.add(anchor_key)
 
             order_key += 1.0
             node_id = str(node.get("node_id") or f"{panel_id}_n{int(order_key)}").strip()
@@ -2459,7 +6035,7 @@ class LiteratureReaderComposeService:
                 "children": children,
                 "source_anchor_refs": source_anchor_refs,
                 "source_block_ids": source_block_ids,
-                "source_atom_ids": source_block_ids,
+                "source_atom_ids": source_layout_ids or source_block_ids,
                 "zone_type": zone_type,
                 "column_id": region,
                 "region": region,
@@ -2549,8 +6125,13 @@ class LiteratureReaderComposeService:
 
         request_timeout = max(2.0, float(int(getattr(settings, "reader_agent_timeout_ms", 90000) or 90000)) / 1000.0)
         max_tokens = max(512, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000))
+        localized_prompt_image_path = self._ensure_local_prompt_image_path(
+            image_url=str(rendered_page_image or "").strip(),
+            image_path=str(rendered_page_image_path or "").strip(),
+            cache_key=f"{phase}:{step}:{str(rendered_page_image or '').strip()}",
+        )
         local_image_paths = DashScopeMultimodalService.collect_local_file_uris(
-            str(rendered_page_image_path or "").strip(),
+            str(localized_prompt_image_path or "").strip(),
             limit=1,
         )
         if (
@@ -2558,39 +6139,39 @@ class LiteratureReaderComposeService:
             and bool(local_image_paths)
             and DashScopeMultimodalService.is_available()
         ):
-            try:
-                result = await DashScopeMultimodalService.chat_json(
-                    api_key=api_key,
-                    base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or base_url or "").strip(),
-                    model=model_name,
-                    system_prompt=str(system_prompt or ""),
-                    user_prompt=json.dumps(user_prompt, ensure_ascii=False),
-                    image_paths=local_image_paths,
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                )
-                parsed = dict(result.get("parsed") or {})
-                if not parsed:
-                    return {}
-                return {
-                    "status": str(parsed.get("status") or ""),
-                    "step_result": dict(parsed.get("step_result") or {}),
-                    "usage": dict(result.get("usage") or {}),
-                    "self_check": dict(parsed.get("self_check") or {}),
-                    "fixes_applied": list(parsed.get("fixes_applied") or []),
-                }
-            except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
-                logger.warning(
-                    f"[ReaderComposeService] single_agent_v2 dashscope call failed "
-                    f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
-                )
+            for attempt in range(1, 3):
+                try:
+                    result = await DashScopeMultimodalService.chat_json(
+                        api_key=api_key,
+                        base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or base_url or "").strip(),
+                        model=model_name,
+                        system_prompt=str(system_prompt or ""),
+                        user_prompt=json.dumps(user_prompt, ensure_ascii=False),
+                        image_paths=local_image_paths,
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                    )
+                    parsed = dict(result.get("parsed") or {})
+                    if not parsed:
+                        return {}
+                    return {
+                        "status": str(parsed.get("status") or ""),
+                        "step_result": dict(parsed.get("step_result") or {}),
+                        "usage": dict(result.get("usage") or {}),
+                        "self_check": dict(parsed.get("self_check") or {}),
+                        "fixes_applied": list(parsed.get("fixes_applied") or []),
+                    }
+                except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+                    logger.warning(
+                        f"[ReaderComposeService] single_agent_v2 dashscope call failed "
+                        f"step={step} phase={phase} model={model_name} attempt={attempt}: {type(exc).__name__}: {exc}"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.4)
 
         content_parts: List[Dict[str, Any]] = [
             {"type": "text", "text": json.dumps(user_prompt, ensure_ascii=False)}
         ]
-        image_token = str(rendered_page_image or "").strip()
-        if image_token and self._is_safe_prompt_image_url(image_token):
-            content_parts.append({"type": "image_url", "image_url": {"url": image_token}})
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         try:
@@ -3416,35 +6997,39 @@ class LiteratureReaderComposeService:
         for atom_id, block_id in atom_to_block.items():
             block_to_atoms.setdefault(block_id, []).append(atom_id)
 
-        components = []
-        used_atoms: set[str] = set()
-        for node in list(ui_plan.get("components") or []):
-            if not isinstance(node, dict):
-                continue
-            cloned = dict(node)
-            source_block_ids = [
-                str(item).strip()
-                for item in list(cloned.get("source_block_ids") or [])
-                if str(item).strip()
-            ]
-            if not source_block_ids:
+        def _attach_atom_ids_to_ui_plan(plan: Dict[str, Any]) -> set[str]:
+            components = []
+            used_atoms: set[str] = set()
+            for node in list((plan or {}).get("components") or []):
+                if not isinstance(node, dict):
+                    continue
+                cloned = dict(node)
                 source_block_ids = [
-                    str((row or {}).get("canonical_block_id") or "").strip()
-                    for row in list(cloned.get("source_anchor_refs") or [])
-                    if isinstance(row, dict) and str((row or {}).get("canonical_block_id") or "").strip()
+                    str(item).strip()
+                    for item in list(cloned.get("source_block_ids") or [])
+                    if str(item).strip()
                 ]
-            source_atom_ids: List[str] = []
-            for block_id in source_block_ids:
-                for atom_id in list(block_to_atoms.get(block_id) or []):
-                    if atom_id not in source_atom_ids:
-                        source_atom_ids.append(atom_id)
-                        used_atoms.add(atom_id)
-            if source_block_ids:
-                cloned["source_block_ids"] = source_block_ids
-            if source_atom_ids:
-                cloned["source_atom_ids"] = source_atom_ids
-            components.append(cloned)
-        ui_plan["components"] = components
+                if not source_block_ids:
+                    source_block_ids = [
+                        str((row or {}).get("canonical_block_id") or "").strip()
+                        for row in list(cloned.get("source_anchor_refs") or [])
+                        if isinstance(row, dict) and str((row or {}).get("canonical_block_id") or "").strip()
+                    ]
+                source_atom_ids: List[str] = []
+                for block_id in source_block_ids:
+                    for atom_id in list(block_to_atoms.get(block_id) or []):
+                        if atom_id not in source_atom_ids:
+                            source_atom_ids.append(atom_id)
+                            used_atoms.add(atom_id)
+                if source_block_ids:
+                    cloned["source_block_ids"] = source_block_ids
+                if source_atom_ids:
+                    cloned["source_atom_ids"] = source_atom_ids
+                components.append(cloned)
+            plan["components"] = components
+            return used_atoms
+
+        used_atoms = _attach_atom_ids_to_ui_plan(ui_plan)
         ui_plan.setdefault("trace_meta", {})
         ui_plan["trace_meta"]["scheme_choice"] = dict(scheme_choice)
         ui_plan["trace_meta"]["decision_log"] = []
@@ -3545,6 +7130,7 @@ class LiteratureReaderComposeService:
                 detail_level=detail_level,
                 compare_mode=compare_mode,
             )
+            used_atoms = _attach_atom_ids_to_ui_plan(ui_plan)
             gate_report = enforce_minimal_gates(
                 ui_plan=ui_plan,
                 usable_atom_ids=list(atom_bundle.usable_atom_ids or []),
@@ -5470,6 +9056,7 @@ class LiteratureReaderComposeService:
         paper: Paper,
         pages: Sequence[int],
         selected_kb_id: Optional[int] = None,
+        pipeline_version_override: Optional[str] = None,
         style_intent: Optional[str] = None,
         latency_budget_ms: Optional[int] = None,
         quality_target: Optional[float] = None,
@@ -5487,6 +9074,7 @@ class LiteratureReaderComposeService:
                     paper=paper,
                     page=int(page),
                     selected_kb_id=selected_kb_id,
+                    pipeline_version_override=pipeline_version_override,
                     force_refresh=False,
                     style_intent=style_intent,
                     latency_budget_ms=latency_budget_ms,
@@ -6089,6 +9677,73 @@ class LiteratureReaderComposeService:
         compare_mode: Optional[bool] = None,
         citation_tldr: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        prepared = await self.prepare_inline_query_answer(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            node_id=str(node_id),
+            question=str(question),
+            scope=str(scope),
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
+        )
+        if bool(prepared.get("disabled")):
+            return prepared
+        answer = await self._generate_inline_answer(
+            question=question,
+            context_text=str(prepared.get("context_text") or ""),
+            scope=scope,
+        )
+        anchor_refs = list(prepared.get("anchor_refs") or [])
+        source_block_ids = list(prepared.get("source_block_ids") or [])
+        answer_node = self._build_inline_answer_node(
+            question=str(question).strip(),
+            answer=answer,
+            anchor_refs=anchor_refs,
+            source_block_ids=source_block_ids,
+        )
+        sources = []
+        for anchor in anchor_refs[:3]:
+            if not isinstance(anchor, dict):
+                continue
+            sources.append(
+                {
+                    "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
+                    "start_char": self._safe_int(anchor.get("start_char"), 0),
+                    "end_char": self._safe_int(anchor.get("end_char"), 0),
+                    "quote": str(anchor.get("quote") or anchor.get("quote_text") or "")[:240] or None,
+                    "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
+                }
+            )
+        return {"node": answer_node, "sources": sources}
+
+    async def _load_payload_for_inline_query(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        selected_kb_id: Optional[int],
+        style_intent: Optional[str],
+        theme_mode: Optional[str],
+        detail_level: Optional[str],
+        compare_mode: Optional[bool],
+        citation_tldr: Optional[bool],
+    ) -> Dict[str, Any]:
+        cached_payload = await self.get_latest_cached_payload_only(
+            db=db,
+            user_id=int(user_id),
+            paper_id=int(paper.id),
+            page=int(page),
+        )
+        if isinstance(cached_payload, dict):
+            return cached_payload
         payload, _ = await self.build_or_get_composed_payload(
             db=db,
             user_id=int(user_id),
@@ -6103,6 +9758,37 @@ class LiteratureReaderComposeService:
             compare_mode=compare_mode,
             citation_tldr=citation_tldr,
             publish_ready_event_enabled=False,
+        )
+        return payload
+
+    async def prepare_inline_query_answer(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper: Paper,
+        page: int,
+        node_id: str,
+        question: str,
+        scope: str = "section",
+        selected_kb_id: Optional[int] = None,
+        style_intent: Optional[str] = None,
+        theme_mode: Optional[str] = None,
+        detail_level: Optional[str] = None,
+        compare_mode: Optional[bool] = None,
+        citation_tldr: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        payload = await self._load_payload_for_inline_query(
+            db=db,
+            user_id=int(user_id),
+            paper=paper,
+            page=int(page),
+            selected_kb_id=selected_kb_id,
+            style_intent=style_intent,
+            theme_mode=theme_mode,
+            detail_level=detail_level,
+            compare_mode=compare_mode,
+            citation_tldr=citation_tldr,
         )
 
         components = list(((payload.get("ui_plan") or {}).get("components") or []))
@@ -6154,42 +9840,74 @@ class LiteratureReaderComposeService:
             components=components,
             page=int(page),
         )
-        answer = await self._generate_inline_answer(
-            question=question,
-            context_text=context_text,
-            scope=scope,
+        return {
+            "disabled": False,
+            "question": str(question).strip(),
+            "scope": str(scope).strip() or "section",
+            "context_text": context_text,
+            "anchor_refs": anchor_refs[:3],
+            "source_block_ids": source_block_ids[:12],
+        }
+
+    @staticmethod
+    def _build_inline_answer_prompt(
+        *,
+        question: str,
+        context_text: str,
+        scope: str,
+    ) -> str:
+        compact_question = LiteratureReaderComposeService._normalize_spaces(question)
+        compact_context = LiteratureReaderComposeService._normalize_spaces(context_text)
+        if not compact_context:
+            compact_context = "当前段落缺少稳定证据，仅能做非常有限的局部追问。"
+        return (
+            "You are a literature reading assistant handling a paragraph follow-up question.\n"
+            "This is a local follow-up, not a full-paper QA task.\n"
+            "Answer only from the provided local context and nearby evidence.\n"
+            "Prefer a useful local answer when the evidence partially supports it.\n"
+            "If the support is local, tentative, or scope-limited, say that explicitly instead of refusing.\n"
+            "Only say 当前段落证据不足 when the context truly lacks the key fact required by the question.\n"
+            "Output in exactly two Chinese sentences:\n"
+            "1) 结论：...（可包含范围限制或不确定性）\n"
+            "2) 依据：...（概括当前节点与邻近证据，不要编造）\n"
+            f"问题：{compact_question}\n"
+            f"范围：{scope}\n"
+            f"上下文：{compact_context[:2200]}"
         )
-        answer_node = {
+
+    @staticmethod
+    def _fallback_inline_answer(question: str) -> str:
+        compact_question = LiteratureReaderComposeService._normalize_spaces(question)
+        return (
+            f"结论：当前段落暂时无法直接回答“{compact_question}”，但不代表全文没有答案。"
+            " 依据：当前只提供了本段与邻近证据，建议改问更具体的局部问题，或使用右侧“询问”做全文问答。"
+        )
+
+    def _build_inline_answer_node(
+        self,
+        *,
+        question: str,
+        answer: str,
+        anchor_refs: Sequence[Mapping[str, Any]],
+        source_block_ids: Sequence[str],
+    ) -> Dict[str, Any]:
+        return {
             "id": f"answer_{uuid.uuid4().hex[:12]}",
             "type": "AnswerCard",
             "props": {
                 "question": str(question).strip(),
-                "answer": answer,
+                "answer": str(answer).strip(),
                 "foldable": True,
             },
             "children": [],
-            "source_anchor_refs": anchor_refs[:3],
-            "source_block_ids": source_block_ids[:12],
+            "source_anchor_refs": [dict(anchor) for anchor in list(anchor_refs or [])[:3] if isinstance(anchor, Mapping)],
+            "source_block_ids": [str(item).strip() for item in list(source_block_ids or [])[:12] if str(item).strip()],
             "capabilities": ["copy", "jump_anchor", "drag_markdown"],
             "actions": [
                 {"key": "copy", "label": "Copy", "kind": "default", "payload": {}},
             ],
             "layout_slot": {"reserved_height": 220, "lock_height": False},
         }
-        sources = []
-        for anchor in anchor_refs[:3]:
-            if not isinstance(anchor, dict):
-                continue
-            sources.append(
-                {
-                    "page": self._safe_int(anchor.get("page"), self._safe_int(page, 1)),
-                    "start_char": self._safe_int(anchor.get("start_char"), 0),
-                    "end_char": self._safe_int(anchor.get("end_char"), 0),
-                    "quote": str(anchor.get("quote") or anchor.get("quote_text") or "")[:240] or None,
-                    "quote_text": str(anchor.get("quote_text") or "")[:240] or None,
-                }
-            )
-        return {"node": answer_node, "sources": sources}
 
     async def _generate_inline_answer(
         self,
@@ -6198,22 +9916,10 @@ class LiteratureReaderComposeService:
         context_text: str,
         scope: str,
     ) -> str:
-        compact_question = self._normalize_spaces(question)
-        compact_context = self._normalize_spaces(context_text)
-        if not compact_context:
-            compact_context = "当前段落缺少稳定证据，仅能做非常有限的局部追问。"
-        prompt = (
-            "You are a literature reading assistant handling a paragraph follow-up question.\n"
-            "This is a local follow-up, not a full-paper QA task.\n"
-            "Answer strictly from the provided context and nearby evidence. Do not fabricate.\n"
-            "Do not claim paper-wide conclusions unless the local context clearly supports them.\n"
-            "Output in exactly two Chinese sentences:\n"
-            "1) 结论：...\n"
-            "2) 证据：...\n"
-            "If evidence is insufficient, explicitly answer: 结论：当前段落证据不足以回答；请使用右侧“询问”进行全文问答。\n"
-            f"问题：{compact_question}\n"
-            f"范围：{scope}\n"
-            f"上下文：{compact_context[:2200]}"
+        prompt = self._build_inline_answer_prompt(
+            question=question,
+            context_text=context_text,
+            scope=scope,
         )
         try:
             llm = await get_llm_service()
@@ -6227,10 +9933,29 @@ class LiteratureReaderComposeService:
                 return content
         except Exception as exc:
             logger.debug(f"[ReaderComposeService] inline answer generation failed: {exc}")
-        return (
-            f"结论：当前段落证据不足以回答“{compact_question}”；请使用右侧“询问”进行全文问答。"
-            "证据：当前只提供了本段及邻近上下文，无法支持更大范围结论。"
+        return self._fallback_inline_answer(question)
+
+    async def _stream_inline_answer_tokens(
+        self,
+        *,
+        question: str,
+        context_text: str,
+        scope: str,
+    ) -> AsyncGenerator[str, None]:
+        prompt = self._build_inline_answer_prompt(
+            question=question,
+            context_text=context_text,
+            scope=scope,
         )
+        llm = await get_llm_service()
+        async for token in llm.chat_stream(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=420,
+        ):
+            normalized = str(token or "")
+            if normalized:
+                yield normalized
 
     async def _apply_overlay_for_user(
         self,
@@ -6471,7 +10196,7 @@ class LiteratureReaderComposeService:
             props["text"] = self._repair_text_artifacts(self._normalize_spaces(str(props.get("text") or "")))
         elif node_type == "SectionHeading":
             props["text"] = self._repair_heading_text(self._normalize_spaces(str(props.get("text") or "")))
-        elif node_type in {"FigurePanel", "TablePanel"}:
+        elif node_type == "TablePanel":
             insight = self._normalize_spaces(str(props.get("ai_insight") or ""))
             if not insight:
                 props["ai_insight"] = "该图表用于支撑本页关键结论，建议结合原文锚点核对。"
@@ -9616,6 +13341,43 @@ class LiteratureReaderComposeService:
             return True
         return False
 
+    @classmethod
+    def _is_public_prompt_image_url(cls, raw: str) -> bool:
+        value = str(raw or "").strip()
+        if not cls._is_safe_prompt_image_url(value):
+            return False
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            return False
+        hostname = str(parsed.hostname or "").strip().lower()
+        if not hostname:
+            return False
+        if hostname in {
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "backend",
+            "frontend",
+            "postgres",
+            "redis",
+            "research_backend",
+            "research_frontend",
+            "research_postgres",
+            "research_redis",
+        }:
+            return False
+        try:
+            host_ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            return True
+        return not (
+            host_ip.is_private
+            or host_ip.is_loopback
+            or host_ip.is_link_local
+            or host_ip.is_reserved
+        )
+
     @staticmethod
     def _asset_base_url() -> str:
         for raw in (
@@ -9661,6 +13423,12 @@ class LiteratureReaderComposeService:
             f"/api/v1/literature/reader/page-assets/{int(paper_id)}/{int(page)}"
         )
 
+    @classmethod
+    def _build_grounding_page_asset_url(cls, *, paper_id: int, page: int) -> str:
+        return cls._absolute_asset_url(
+            f"/api/v1/literature/reader/grounding-page-assets/{int(paper_id)}/{int(page)}"
+        )
+
     @staticmethod
     def _flatten_components(components: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         output: List[Dict[str, Any]] = []
@@ -9674,6 +13442,284 @@ class LiteratureReaderComposeService:
             if isinstance(children, list) and children:
                 stack[0:0] = children
         return output
+
+    @staticmethod
+    def _is_enrichment_target_component(component_type: str) -> bool:
+        return str(component_type or "").strip() in {
+            "SectionHeading",
+            "ParagraphProse",
+            "ListBlock",
+            "FigurePanel",
+            "TablePanel",
+            "EquationBlock",
+            "AbstractCard",
+            "MethodologyCard",
+            "CalloutBox",
+            "CompareInsightsCard",
+            "InsightClusterCard",
+            "SectionBridgeCard",
+        }
+
+    @staticmethod
+    def _enrichment_target_kind_for_component(component_type: str) -> str:
+        mapping = {
+            "SectionHeading": "section",
+            "ParagraphProse": "paragraph",
+            "ListBlock": "paragraph",
+            "FigurePanel": "figure",
+            "TablePanel": "table",
+            "EquationBlock": "equation",
+            "AbstractCard": "structure",
+            "MethodologyCard": "structure",
+            "CalloutBox": "structure",
+            "CompareInsightsCard": "structure",
+            "InsightClusterCard": "structure",
+            "SectionBridgeCard": "structure",
+        }
+        return str(mapping.get(str(component_type or "").strip(), "structure"))
+
+    def _extract_enrichment_text(self, node: Mapping[str, Any]) -> str:
+        props = dict(node.get("props") or {})
+        component_type = str(node.get("type") or "").strip()
+        if component_type == "ParagraphProse":
+            paragraphs = props.get("paragraphs")
+            if isinstance(paragraphs, list):
+                rows = [
+                    self._normalize_spaces(str((item or {}).get("text") or ""))
+                    for item in paragraphs
+                    if isinstance(item, Mapping)
+                ]
+                rows = [item for item in rows if item]
+                if rows:
+                    return " ".join(rows[:2]).strip()
+            return self._normalize_spaces(str(props.get("text") or ""))
+        if component_type == "ListBlock":
+            items = [self._normalize_spaces(str(item or "")) for item in list(props.get("items") or [])]
+            items = [item for item in items if item]
+            return " ".join(items[:4]).strip()
+        if component_type == "FigurePanel":
+            return self._normalize_spaces(
+                str(props.get("caption") or props.get("ai_insight") or props.get("source_label") or "")
+            )
+        if component_type == "MethodologyCard":
+            steps = [self._normalize_spaces(str(item or "")) for item in list(props.get("steps") or [])]
+            steps = [item for item in steps if item]
+            if steps:
+                return " ".join(steps[:4]).strip()
+        if component_type == "CompareInsightsCard":
+            rows = []
+            for item in list(props.get("items") or [])[:4]:
+                if isinstance(item, Mapping):
+                    rows.append(
+                        self._normalize_spaces(
+                            f"{str(item.get('title') or '').strip()} {str(item.get('content') or item.get('text') or '').strip()}"
+                        )
+                    )
+                else:
+                    rows.append(self._normalize_spaces(str(item or "")))
+            rows = [item for item in rows if item]
+            if rows:
+                return " ".join(rows).strip()
+        if component_type == "InsightClusterCard":
+            items = [self._normalize_spaces(str(item or "")) for item in list(props.get("items") or [])]
+            items = [item for item in items if item]
+            if items:
+                return " ".join(items[:4]).strip()
+        if component_type == "CalloutBox":
+            return self._normalize_spaces(str(props.get("content") or props.get("text") or ""))
+        if component_type == "AbstractCard":
+            return self._normalize_spaces(str(props.get("text") or ""))
+        if component_type == "SectionBridgeCard":
+            return self._normalize_spaces(str(props.get("text") or ""))
+        if component_type == "EquationBlock":
+            return self._normalize_spaces(str(props.get("description") or props.get("latex") or ""))
+        if component_type == "TablePanel":
+            return self._normalize_spaces(str(props.get("title") or ""))
+        if component_type == "SectionHeading":
+            return self._normalize_spaces(str(props.get("text") or props.get("title") or ""))
+        return self._normalize_spaces(str(props.get("text") or ""))
+
+    @staticmethod
+    def _truncate_enrichment_excerpt(text: str, limit: int = 280) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        clipped = value[:limit].rsplit(" ", 1)[0].strip()
+        return (clipped or value[:limit].strip()) + "..."
+
+    def _extract_enrichment_title(self, node: Mapping[str, Any], *, section_label: str) -> str:
+        props = dict(node.get("props") or {})
+        component_type = str(node.get("type") or "").strip()
+        if component_type == "SectionHeading":
+            return self._normalize_spaces(str(props.get("text") or props.get("title") or ""))
+        if component_type == "FigurePanel":
+            return self._normalize_spaces(str(props.get("source_label") or props.get("title") or ""))
+        if component_type in {"AbstractCard", "MethodologyCard", "CalloutBox", "CitationCard", "SectionBridgeCard"}:
+            return self._normalize_spaces(str(props.get("title") or ""))
+        if component_type == "CompareInsightsCard":
+            return "Compare insights"
+        if component_type == "InsightClusterCard":
+            return self._normalize_spaces(str(props.get("title") or ""))
+        return section_label
+
+    @staticmethod
+    def _suggest_enrichment_resource_types(component_type: str, target_kind: str) -> List[str]:
+        by_component = {
+            "FigurePanel": ["figure_explainer", "related_public_resource", "question_starter"],
+            "MethodologyCard": ["method_explainer", "related_public_resource"],
+            "CompareInsightsCard": ["contrast_module", "related_public_resource"],
+            "InsightClusterCard": ["glossary_panel", "question_starter"],
+            "SectionBridgeCard": ["background_note", "question_starter"],
+            "EquationBlock": ["equation_explainer", "glossary_panel"],
+        }
+        if str(component_type or "").strip() in by_component:
+            return list(by_component[str(component_type or "").strip()])
+        by_kind = {
+            "section": ["background_note", "question_starter"],
+            "paragraph": ["glossary_panel", "related_public_resource"],
+            "figure": ["figure_explainer", "related_public_resource"],
+            "table": ["data_note", "related_public_resource"],
+            "equation": ["equation_explainer", "glossary_panel"],
+            "structure": ["background_note", "question_starter"],
+        }
+        return list(by_kind.get(str(target_kind or "").strip(), ["related_public_resource"]))
+
+    def _build_enrichment_bundle(
+        self,
+        *,
+        page: int,
+        payload: Mapping[str, Any],
+        ui_plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        components = [row for row in list((ui_plan or {}).get("components") or []) if isinstance(row, dict)]
+        flat_nodes = self._flatten_components(components)
+        targets: List[Dict[str, Any]] = []
+        current_section_label = ""
+        for node in flat_nodes:
+            component_type = str(node.get("type") or "").strip()
+            if component_type == "SectionHeading":
+                current_section_label = self._normalize_spaces(
+                    str((node.get("props") or {}).get("text") or (node.get("props") or {}).get("title") or "")
+                )
+            if not self._is_enrichment_target_component(component_type):
+                continue
+            if str(node.get("zone_type") or "").strip() == "side_context":
+                continue
+            source_block_ids = [str(item).strip() for item in list(node.get("source_block_ids") or []) if str(item).strip()]
+            source_atom_ids = [str(item).strip() for item in list(node.get("source_atom_ids") or []) if str(item).strip()]
+            if not source_block_ids and not source_atom_ids:
+                continue
+            excerpt = self._truncate_enrichment_excerpt(self._extract_enrichment_text(node))
+            target_kind = self._enrichment_target_kind_for_component(component_type)
+            figure_label = ""
+            if component_type == "FigurePanel":
+                figure_label = self._normalize_spaces(str((node.get("props") or {}).get("source_label") or ""))
+            title = self._extract_enrichment_title(node, section_label=current_section_label)
+            targets.append(
+                {
+                    "target_id": f"p{int(page)}:{str(node.get('id') or '').strip()}",
+                    "node_id": str(node.get("id") or "").strip(),
+                    "target_kind": target_kind,
+                    "component_type": component_type,
+                    "title": title,
+                    "excerpt": excerpt,
+                    "source_block_ids": source_block_ids,
+                    "source_atom_ids": source_atom_ids,
+                    "section_label": current_section_label,
+                    "figure_label": figure_label,
+                    "suggested_resource_types": self._suggest_enrichment_resource_types(component_type, target_kind),
+                    "meta": {
+                        "page": int(page),
+                        "display": str(node.get("display") or "").strip(),
+                        "region": str(node.get("region") or "").strip(),
+                        "zone_type": str(node.get("zone_type") or "").strip(),
+                    },
+                }
+            )
+        target_kinds = sorted({str(item.get("target_kind") or "").strip() for item in targets if str(item.get("target_kind") or "").strip()})
+        return {
+            "version": "v1",
+            "targets": targets,
+            "resource_modules": [],
+            "interaction_modules": [],
+            "meta": {
+                "page": int(page),
+                "target_count": len(targets),
+                "target_kinds": target_kinds,
+                "source": "reader_compose_payload",
+                "body_first": True,
+            },
+        }
+
+    def _build_seed_generative_reader_plan(
+        self,
+        *,
+        page: int,
+        enrichment_bundle: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        targets = [row for row in list(enrichment_bundle.get("targets") or []) if isinstance(row, Mapping)]
+        figure_target = next((row for row in targets if str(row.get("target_kind") or "") == "figure"), None)
+        paragraph_target = next((row for row in targets if str(row.get("target_kind") or "") == "paragraph"), None)
+        resource_modules: List[Dict[str, Any]] = []
+        interaction_modules: List[Dict[str, Any]] = []
+        js_widgets: List[Dict[str, Any]] = []
+        rationale = [
+            "Treat the cleaned reading flow as the stable base layer.",
+            "Plan lightweight resource and interaction modules around body content without rewriting the page body.",
+        ]
+        if figure_target:
+            resource_modules.append(
+                {
+                    "module_id": f"seed_fig_{page}_1",
+                    "module_type": "FigureExplainPanel",
+                    "target_ids": [str(figure_target.get("target_id") or "")],
+                    "title": str(figure_target.get("figure_label") or "Figure explainer").strip() or "Figure explainer",
+                    "summary": "Explain the figure and connect it to relevant public resources.",
+                    "links": [],
+                    "source": "fallback",
+                    "interaction_mode": "expandable_sidecar",
+                    "meta": {"priority": "high"},
+                }
+            )
+            js_widgets.append(
+                {
+                    "widget_id": f"seed_widget_fig_{page}_1",
+                    "widget_type": "figure-focus-accordion",
+                    "target_ids": [str(figure_target.get("target_id") or "")],
+                    "title": "Figure exploration",
+                    "data_requirements": ["figure_explainer"],
+                    "props": {"collapsed": False},
+                    "meta": {"priority": "high"},
+                }
+            )
+        if paragraph_target:
+            interaction_modules.append(
+                {
+                    "module_id": f"seed_int_para_{page}_1",
+                    "module_type": "GlossaryPanel",
+                    "target_ids": [str(paragraph_target.get("target_id") or "")],
+                    "title": "Glossary and background",
+                    "props": {"mode": "inline_assist"},
+                    "source": "fallback",
+                    "meta": {"priority": "medium"},
+                }
+            )
+        return {
+            "version": "v1",
+            "status": "draft",
+            "shell_mode": "resource_augmented_reader",
+            "rationale": rationale,
+            "resource_modules": resource_modules,
+            "interaction_modules": interaction_modules,
+            "js_widgets": js_widgets,
+            "used_tools": [],
+            "tool_trace": [],
+            "meta": {
+                "page": int(page),
+                "target_count": len(targets),
+                "source": "seed_from_enrichment_bundle",
+            },
+        }
 
     @staticmethod
     def _normalize_spaces(value: str) -> str:
@@ -10613,6 +14659,7 @@ class LiteratureReaderComposeService:
         column_id = str(block_row.get("column_id") or group_row.get("column_id") or "").strip()
         if not column_id:
             column_id = "sidebar" if zone_type == "side_context" else "main"
+        layout_uid = str(group_row.get("layout_unique_id") or "").strip()
 
         fallback_title = "Recovered block"
         if zone_type == "side_context":
@@ -10620,12 +14667,20 @@ class LiteratureReaderComposeService:
         elif zone_type == "figure_meta":
             fallback_title = "Recovered figure metadata"
 
-        anchor = self._normalize_anchor_ref(
-            anchor=block_row.get("source_anchor"),
+        anchor = self._build_layout_uid_anchor_from_grounding(
             page=page,
+            payload=payload,
+            layout_id=layout_uid,
             quote_text=source_text,
-            source_block_id=canonical_block_id,
+            canonical_block_ids=[canonical_block_id],
         )
+        if not isinstance(anchor, dict):
+            anchor = self._normalize_anchor_ref(
+                anchor=block_row.get("source_anchor"),
+                page=page,
+                quote_text=source_text,
+                source_block_id=canonical_block_id,
+            )
         anchor_rows = [anchor] if anchor else []
 
         base_id = re.sub(r"[^0-9a-zA-Z_]+", "_", str(canonical_block_id)).strip("_") or f"b{int(seq)}"
@@ -10652,6 +14707,8 @@ class LiteratureReaderComposeService:
             "children": [],
             "source_anchor_refs": anchor_rows,
             "source_block_ids": [canonical_block_id],
+            "source_atom_ids": [layout_uid] if layout_uid else [],
+            "source_layout_ids": [layout_uid] if layout_uid else [],
             "zone_type": zone_type,
             "column_id": column_id,
             "display": "collapsed",
@@ -12038,6 +16095,8 @@ class LiteratureReaderComposeService:
         ui_plan: Dict[str, Any],
     ) -> Dict[str, Any]:
         cloned = dict(ui_plan or {})
+        if not str(cloned.get("plan_id") or "").strip():
+            cloned["plan_id"] = f"runtime_repaired_p{int(page)}"
         components = self._ensure_source_block_ids_on_nodes(
             page=page,
             nodes=[row for row in list(cloned.get("components") or []) if isinstance(row, dict)],
@@ -12065,10 +16124,33 @@ class LiteratureReaderComposeService:
             payload=self._build_runtime_payload_for_review_snapshot(cloned),
             ui_plan=dict(cloned.get("ui_plan") or {}),
         )
+        cloned["enrichment_bundle"] = self._build_enrichment_bundle(
+            page=page,
+            payload=cloned,
+            ui_plan=dict(cloned.get("ui_plan") or {}),
+        )
+        cloned["generative_reader_plan"] = self._build_seed_generative_reader_plan(
+            page=page,
+            enrichment_bundle=dict(cloned.get("enrichment_bundle") or {}),
+        )
         return cloned
 
     def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         cloned = dict(payload or {})
+        cloned["paper_id"] = int(cloned.get("paper_id") or 0)
+        cloned["page"] = max(1, int(cloned.get("page") or page))
+        if str(cloned.get("status") or "").strip().lower() not in {"done", "fallback"}:
+            cloned["status"] = "done"
+        if not str(cloned.get("pipeline_version") or "").strip():
+            cloned["pipeline_version"] = self._pipeline_version()
+        if not str(cloned.get("engine_version") or "").strip():
+            cloned["engine_version"] = COMPOSE_ENGINE_VERSION
+        if not str(cloned.get("source_signature") or "").strip():
+            cloned["source_signature"] = f"runtime_repaired|p{int(page)}"
+        if not str(cloned.get("build_mode") or "").strip():
+            cloned["build_mode"] = "compose_cache_repaired"
+        if not cloned.get("generated_at"):
+            cloned["generated_at"] = datetime.utcnow().isoformat()
         ui_plan = dict(cloned.get("ui_plan") or {})
         ui_plan = self._sanitize_ui_plan_for_runtime(
             page=page,
@@ -12158,6 +16240,33 @@ class LiteratureReaderComposeService:
         )
         cloned["main_block_ids"] = list(cloned.get("main_block_ids") or main_block_ids)
         cloned["aux_block_ids"] = list(cloned.get("aux_block_ids") or aux_block_ids)
+        rebuilt_grounding = self._build_page_grounding_v1(
+            page=page,
+            payload=cloned,
+        )
+        rebuilt_grounding = self._backfill_grounding_text_normalizations_from_payload(
+            payload=cloned,
+            grounding=rebuilt_grounding,
+        )
+        cloned["page_grounding_v1"] = self._merge_existing_grounding_enrichments(
+            existing_grounding=dict(cloned.get("page_grounding_v1") or {}),
+            rebuilt_grounding=rebuilt_grounding,
+        )
+        ui_plan = self._refresh_layout_uid_source_anchor_refs(
+            page=page,
+            payload=cloned,
+            ui_plan=ui_plan,
+        )
+        cloned["ui_plan"] = ui_plan
+        cloned["enrichment_bundle"] = self._build_enrichment_bundle(
+            page=page,
+            payload=cloned,
+            ui_plan=ui_plan,
+        )
+        cloned["generative_reader_plan"] = self._build_seed_generative_reader_plan(
+            page=page,
+            enrichment_bundle=dict(cloned.get("enrichment_bundle") or {}),
+        )
 
         status_value = str(cloned.get("status") or "").strip().lower()
         if bool(no_drop_report.get("triggered")):
@@ -12182,8 +16291,8 @@ class LiteratureReaderComposeService:
         payload: Dict[str, Any],
         nodes: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        docmind_structure = dict((payload or {}).get("docmind_structure") or {})
-        page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        grounding_page_image = dict((((payload or {}).get("page_grounding_v1") or {}).get("page_image") or {}))
+        page_image_url = str(grounding_page_image.get("url") or "").strip()
         style_cues = dict((payload or {}).get("style_cues") or {})
         block_group_index = self._build_block_group_index(page=page, payload=payload)
         layout_block_id_alias_map = self._build_layout_block_id_alias_map(page=page, base_payload=payload)
@@ -12488,6 +16597,861 @@ class LiteratureReaderComposeService:
                     alias_map[alias].append(canonical_block_id)
         return alias_map
 
+    def _normalize_grounding_points(self, value: Any) -> List[Dict[str, float]]:
+        points: List[Dict[str, float]] = []
+        for row in list(value or []):
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                x = round(float(row.get("x") or 0.0), 2)
+                y = round(float(row.get("y") or 0.0), 2)
+            except Exception:
+                continue
+            points.append({"x": x, "y": y})
+        return points
+
+    def _normalize_grounding_polygons(self, value: Any) -> List[List[Dict[str, float]]]:
+        polygons: List[List[Dict[str, float]]] = []
+        for row in list(value or []):
+            if isinstance(row, Mapping):
+                points = self._normalize_grounding_points([row])
+                if points:
+                    polygons.append(points)
+                continue
+            if isinstance(row, list):
+                if row and all(isinstance(item, Mapping) for item in row):
+                    points = self._normalize_grounding_points(row)
+                    if points:
+                        polygons.append(points)
+                    continue
+                numeric_points: List[Dict[str, float]] = []
+                raw = list(row)
+                if len(raw) >= 6 and len(raw) % 2 == 0:
+                    try:
+                        for idx in range(0, len(raw), 2):
+                            numeric_points.append(
+                                {
+                                    "x": round(float(raw[idx]), 2),
+                                    "y": round(float(raw[idx + 1]), 2),
+                                }
+                            )
+                    except Exception:
+                        numeric_points = []
+                if numeric_points:
+                    polygons.append(numeric_points)
+        return [poly for poly in polygons if len(poly) >= 3]
+
+    @staticmethod
+    def _grounding_points_bbox(points: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+        xs: List[float] = []
+        ys: List[float] = []
+        for row in list(points or []):
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                xs.append(float(row.get("x") or 0.0))
+                ys.append(float(row.get("y") or 0.0))
+            except Exception:
+                continue
+        if not xs or not ys:
+            return None
+        x0 = min(xs)
+        x1 = max(xs)
+        top = min(ys)
+        bottom = max(ys)
+        if x1 <= x0 or bottom <= top:
+            return None
+        return {
+            "x0": round(x0, 2),
+            "x1": round(x1, 2),
+            "top": round(top, 2),
+            "bottom": round(bottom, 2),
+        }
+
+    def _grounding_page_dimensions(
+        self,
+        *,
+        grounding_layout_map: Mapping[str, Mapping[str, Any]],
+        grounding_evidence_map: Mapping[str, Mapping[str, Any]],
+        page_image: Mapping[str, Any],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        width = float(page_image.get("width") or 0.0) or 0.0
+        height = float(page_image.get("height") or 0.0) or 0.0
+        if width > 0 and height > 0:
+            return width, height
+        for atom in list(grounding_layout_map.values()):
+            for point in self._normalize_grounding_points(atom.get("layout_pos")):
+                width = max(width, float(point.get("x") or 0.0))
+                height = max(height, float(point.get("y") or 0.0))
+            for block in list(atom.get("blocks") or []):
+                if not isinstance(block, Mapping):
+                    continue
+                for point in self._normalize_grounding_points(block.get("pos")):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+        for evidence in list(grounding_evidence_map.values()):
+            for point in self._normalize_grounding_points(evidence.get("layout_pos")):
+                width = max(width, float(point.get("x") or 0.0))
+                height = max(height, float(point.get("y") or 0.0))
+            for polygon in list(evidence.get("block_positions") or []):
+                for point in self._normalize_grounding_points(polygon):
+                    width = max(width, float(point.get("x") or 0.0))
+                    height = max(height, float(point.get("y") or 0.0))
+        return (width or None), (height or None)
+
+    def _resolve_grounding_page_image_size(
+        self,
+        *,
+        page_image_url: str,
+        page_image_path: str,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        local_path = str(page_image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            try:
+                with Image.open(local_path) as image:
+                    width, height = image.size
+                if width > 0 and height > 0:
+                    return int(width), int(height)
+            except Exception as exc:
+                logger.debug(f"[ReaderComposeService] failed to read local grounding page image size: {exc}")
+
+        return None, None
+
+    def _ensure_local_grounding_page_image(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        page_image_url: str,
+        page_image_path: str,
+    ) -> str:
+        local_path = str(page_image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            return local_path
+
+        remote_url = str(page_image_url or "").strip()
+        if not self._is_safe_http_url(remote_url):
+            return local_path
+
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, f"paper_{max(0, int(paper_id))}", "grounding_pages")
+        os.makedirs(out_dir, exist_ok=True)
+        parsed = urlparse(remote_url)
+        filename = os.path.basename(parsed.path)
+        fallback_target = os.path.join(out_dir, f"page_{max(1, int(page))}.png")
+        existing_targets = [
+            os.path.join(out_dir, f"page_{max(1, int(page))}.{ext}")
+            for ext in ("png", "jpg", "jpeg", "webp")
+        ]
+        for target in existing_targets:
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+
+        try:
+            with urlopen(remote_url, timeout=20) as response:  # nosec B310 - trusted DocMind image URL
+                data = response.read()
+                content_type = ""
+                try:
+                    content_type = str(response.info().get_content_type() or "").strip().lower()
+                except Exception:
+                    content_type = ""
+            if not data:
+                return local_path
+            extension = self._guess_image_extension(filename=filename, content_type=content_type)
+            target = os.path.join(out_dir, f"page_{max(1, int(page))}.{extension}")
+            with open(target, "wb") as fp:
+                fp.write(data)
+            return target if os.path.exists(target) and os.path.getsize(target) > 0 else fallback_target
+        except Exception as exc:
+            logger.warning(f"[ReaderComposeService] failed to localize grounding page image: {exc}")
+            return local_path
+
+    def _ensure_local_prompt_image_path(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        cache_key: str,
+    ) -> str:
+        local_path = str(image_path or "").strip()
+        if local_path and os.path.exists(local_path):
+            return local_path
+
+        remote_url = str(image_url or "").strip()
+        if not self._is_safe_http_url(remote_url):
+            return local_path
+
+        cache_token = str(cache_key or remote_url or "prompt_image").strip()
+        digest = hashlib.sha256(cache_token.encode("utf-8")).hexdigest()[:20]
+        out_dir = os.path.join(PAGE_RENDER_ASSET_DIR, "prompt_images")
+        os.makedirs(out_dir, exist_ok=True)
+        existing_targets = [
+            os.path.join(out_dir, f"{digest}.{ext}")
+            for ext in ("png", "jpg", "jpeg", "webp")
+        ]
+        for target in existing_targets:
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+
+        parsed = urlparse(remote_url)
+        filename = os.path.basename(parsed.path)
+        try:
+            with urlopen(remote_url, timeout=20) as response:  # nosec B310 - trusted DocMind image URL
+                data = response.read()
+                content_type = ""
+                try:
+                    content_type = str(response.info().get_content_type() or "").strip().lower()
+                except Exception:
+                    content_type = ""
+            if not data:
+                return local_path
+            extension = self._guess_image_extension(filename=filename, content_type=content_type)
+            target = os.path.join(out_dir, f"{digest}.{extension}")
+            with open(target, "wb") as fp:
+                fp.write(data)
+            return target if os.path.exists(target) and os.path.getsize(target) > 0 else local_path
+        except Exception as exc:
+            logger.warning(f"[ReaderComposeService] failed to localize prompt image: {exc}")
+            return local_path
+
+    def _build_layout_uid_anchor_from_grounding(
+        self,
+        *,
+        page: int,
+        payload: Mapping[str, Any],
+        layout_id: str,
+        quote_text: str = "",
+        canonical_block_ids: Optional[Sequence[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        token = str(layout_id or "").strip()
+        if not token:
+            return None
+        grounding = dict((payload or {}).get("page_grounding_v1") or {})
+        grounding_layout_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        grounding_evidence_map = {
+            str(row.get("source_layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("evidence_map") or [])
+            if isinstance(row, Mapping) and str(row.get("source_layout_id") or "").strip()
+        }
+        atom = grounding_layout_map.get(token) or {}
+        evidence = grounding_evidence_map.get(token) or {}
+        if not atom and not evidence:
+            return None
+        page_image = dict(grounding.get("page_image") or {})
+        grounding_page_width, grounding_page_height = self._grounding_page_dimensions(
+            grounding_layout_map=grounding_layout_map,
+            grounding_evidence_map=grounding_evidence_map,
+            page_image=page_image,
+        )
+        normalized_quote = self._normalize_spaces(
+            str(quote_text or atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
+        )
+        normalized_block_ids = [
+            self._normalize_canonical_block_id(page=page, raw_id=str(item))
+            for item in list(canonical_block_ids or atom.get("canonical_block_ids") or evidence.get("source_block_ids") or [])
+        ]
+        normalized_block_ids = [item for item in normalized_block_ids if item]
+        polygon_sets = [
+            self._normalize_grounding_points(item)
+            for item in list(evidence.get("block_positions") or [])
+            if len(self._normalize_grounding_points(item)) >= 3
+        ]
+        if not polygon_sets:
+            atom_blocks = [row for row in list(atom.get("blocks") or []) if isinstance(row, Mapping)]
+            polygon_sets = [
+                self._normalize_grounding_points(block.get("pos"))
+                for block in atom_blocks
+                if len(self._normalize_grounding_points(block.get("pos"))) >= 3
+            ]
+        if not polygon_sets:
+            layout_points = self._normalize_grounding_points(evidence.get("layout_pos") or atom.get("layout_pos"))
+            if len(layout_points) >= 3:
+                polygon_sets = [layout_points]
+        if not polygon_sets:
+            return None
+        all_points = [point for polygon in polygon_sets for point in polygon]
+        bbox = self._grounding_points_bbox(all_points)
+        geometry = {
+            "polygons": [
+                {
+                    "points": polygon,
+                    "source": "page_grounding_v1",
+                    "component_id": f"{token}:{idx}",
+                }
+                for idx, polygon in enumerate(polygon_sets, start=1)
+            ],
+            "page_width": grounding_page_width,
+            "page_height": grounding_page_height,
+        }
+        quote_length = max(1, len(normalized_quote or token))
+        return {
+            "page": int(page),
+            "start_char": 0,
+            "end_char": int(quote_length),
+            "quote": normalized_quote or None,
+            "quote_text": normalized_quote or None,
+            "anchor_id": f"layout_uid_v1:{token}",
+            "segment_index": 1,
+            "segment_total": 1,
+            "bbox_hint": {
+                **dict(bbox or {}),
+                "page_width": grounding_page_width,
+                "page_height": grounding_page_height,
+            } if isinstance(bbox, dict) else None,
+            "canonical_block_id": normalized_block_ids[0] if normalized_block_ids else None,
+            "source_layout_id": token,
+            "coord_version": "layout_uid_v1",
+            "anchor_confidence": 0.98,
+            "anchor_v2": {
+                "coord_version": "layout_uid_v1",
+                "canonical_block_id": normalized_block_ids[0] if normalized_block_ids else token,
+                "page": int(page),
+                "start_char": 0,
+                "end_char": int(quote_length),
+            },
+            "geometry_version": "poly_v1",
+            "geometry": geometry,
+            "source_word_ids": [],
+            "source_char_ranges": [],
+        }
+
+    def _refresh_layout_uid_source_anchor_refs(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        grounding = dict((payload or {}).get("page_grounding_v1") or {})
+        grounding_layout_map = {
+            str(row.get("layout_id") or "").strip(): dict(row)
+            for row in list(grounding.get("layout_atoms") or [])
+            if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+        }
+        if not grounding_layout_map:
+            return ui_plan
+
+        def _walk(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            output: List[Dict[str, Any]] = []
+            for raw in list(nodes or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                explicit_layout_ids = [
+                    str(item).strip()
+                    for item in list(node.get("source_atom_ids") or node.get("source_layout_ids") or [])
+                    if str(item).strip()
+                ]
+                anchor_layout_ids = [
+                    str((row.get("source_layout_id") or "")).strip()
+                    for row in list(node.get("source_anchor_refs") or [])
+                    if isinstance(row, Mapping) and str((row.get("source_layout_id") or "")).strip()
+                ]
+                source_layout_ids = [
+                    item
+                    for item in list(dict.fromkeys(explicit_layout_ids + anchor_layout_ids))
+                    if item in grounding_layout_map
+                ]
+                source_layout_ids = list(dict.fromkeys(source_layout_ids))
+                existing_refs = [
+                    dict(row)
+                    for row in list(node.get("source_anchor_refs") or [])
+                    if isinstance(row, Mapping)
+                ]
+                non_layout_refs = [
+                    row
+                    for row in existing_refs
+                    if str(row.get("coord_version") or ((row.get("anchor_v2") or {}).get("coord_version") if isinstance(row.get("anchor_v2"), Mapping) else "") or "").strip() != "layout_uid_v1"
+                ]
+                rebuilt_refs: List[Dict[str, Any]] = []
+                source_block_ids = [
+                    self._normalize_canonical_block_id(page=page, raw_id=str(item))
+                    for item in list(node.get("source_block_ids") or [])
+                ]
+                source_block_ids = [item for item in source_block_ids if item]
+                for layout_id in source_layout_ids:
+                    atom = grounding_layout_map.get(layout_id) or {}
+                    rebuilt = self._build_layout_uid_anchor_from_grounding(
+                        page=page,
+                        payload=payload,
+                        layout_id=layout_id,
+                        quote_text=self._normalize_spaces(
+                            str(atom.get("normalized_text") or atom.get("clean_text") or atom.get("raw_text") or "")
+                        ),
+                        canonical_block_ids=source_block_ids,
+                    )
+                    if isinstance(rebuilt, dict):
+                        rebuilt_refs.append(rebuilt)
+                if rebuilt_refs:
+                    node["source_anchor_refs"] = rebuilt_refs + non_layout_refs
+                if isinstance(node.get("children"), list):
+                    node["children"] = _walk(list(node.get("children") or []))
+                output.append(node)
+            return output
+
+        refreshed = dict(ui_plan or {})
+        refreshed["components"] = _walk(list(refreshed.get("components") or []))
+        return refreshed
+
+    def _extract_docmind_table_cells(self, row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        for idx, raw_cell in enumerate(list(row.get("cells") or []), start=1):
+            if not isinstance(raw_cell, Mapping):
+                continue
+            cell_layout_ids: List[str] = []
+            cell_text_fragments: List[str] = []
+            cell_block_positions: List[List[Dict[str, float]]] = []
+            for raw_layout in list(raw_cell.get("layouts") or []):
+                if not isinstance(raw_layout, Mapping):
+                    continue
+                cell_layout_id = str(
+                    raw_layout.get("uniqueId")
+                    or raw_layout.get("layoutId")
+                    or raw_layout.get("id")
+                    or ""
+                ).strip()
+                if cell_layout_id and cell_layout_id not in cell_layout_ids:
+                    cell_layout_ids.append(cell_layout_id)
+                layout_text = self._repair_text_artifacts(
+                    self._normalize_spaces(str(raw_layout.get("text") or ""))
+                )
+                if layout_text:
+                    cell_text_fragments.append(layout_text)
+                for raw_block in list(raw_layout.get("blocks") or []):
+                    if not isinstance(raw_block, Mapping):
+                        continue
+                    polygons = self._normalize_grounding_polygons(raw_block.get("pos"))
+                    if polygons:
+                        cell_block_positions.extend(polygons)
+                layout_pos = self._normalize_grounding_points(raw_layout.get("pos"))
+                if layout_pos:
+                    cell_block_positions.append(layout_pos)
+            polygons = self._normalize_grounding_polygons(raw_cell.get("pos"))
+            if not polygons and cell_block_positions:
+                polygons = list(cell_block_positions)
+            if not polygons:
+                continue
+            xs: List[float] = []
+            ys: List[float] = []
+            for poly in polygons:
+                for point in list(poly or []):
+                    if not isinstance(point, Mapping):
+                        continue
+                    try:
+                        xs.append(float(point.get("x") or 0.0))
+                        ys.append(float(point.get("y") or 0.0))
+                    except Exception:
+                        continue
+            text = self._merge_source_text_fragments(cell_text_fragments)
+            output.append(
+                {
+                    "cell_id": int(raw_cell.get("cellId") or idx),
+                    "row_start": int(raw_cell.get("ysc") or 0),
+                    "row_end": int(raw_cell.get("yec") or raw_cell.get("ysc") or 0),
+                    "col_start": int(raw_cell.get("xsc") or 0),
+                    "col_end": int(raw_cell.get("xec") or raw_cell.get("xsc") or 0),
+                    "text": text,
+                    "layout_ids": cell_layout_ids,
+                    "polygons": polygons,
+                    "x0": min(xs) if xs else None,
+                    "x1": max(xs) if xs else None,
+                    "y0": min(ys) if ys else None,
+                    "y1": max(ys) if ys else None,
+                }
+            )
+        return output
+
+    def _extract_docmind_layout_rows_for_page(
+        self,
+        *,
+        page: int,
+        docmind_structure: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        try:
+            digest = build_docmind_layout_digest(dict(docmind_structure or {}), int(page))
+        except RenderPipelineContractError:
+            return []
+
+        layouts = [
+            row
+            for row in list((docmind_structure or {}).get("layouts") or [])
+            if isinstance(row, Mapping)
+        ]
+        page_zero = max(0, int(page) - 1)
+        page_one = max(1, int(page))
+        seen_ids: set[str] = set()
+        output_rows: List[Dict[str, Any]] = []
+        for idx, raw in enumerate(layouts, start=1):
+            row = dict(raw)
+            page_num = row.get("pageNum")
+            if isinstance(page_num, list) and page_num:
+                page_values = []
+                for item in page_num:
+                    token = str(item or "").strip()
+                    if token.isdigit():
+                        page_values.append(int(token))
+                if page_values and page_zero not in page_values and page_one not in page_values:
+                    continue
+            elif isinstance(page_num, (int, float, str)):
+                token = str(page_num).strip()
+                if token.isdigit():
+                    value = int(token)
+                    if value not in {page_zero, page_one}:
+                        continue
+
+            layout_id = str(
+                row.get("uniqueId")
+                or row.get("layoutId")
+                or row.get("id")
+                or f"layout_{idx:04d}"
+            ).strip()
+            if not layout_id:
+                layout_id = f"layout_{idx:04d}"
+            if layout_id in seen_ids:
+                layout_id = f"{layout_id}__{idx:04d}"
+            seen_ids.add(layout_id)
+            if layout_id not in set(digest.known_layout_ids):
+                continue
+            output_rows.append(
+                {
+                    "layout_id": layout_id,
+                    "layout_index": int(digest.layout_index.get(layout_id, 10**9)),
+                    "row": row,
+                }
+            )
+        output_rows = sorted(
+            output_rows,
+            key=lambda item: (
+                int(item.get("layout_index") or 10**9),
+                str(item.get("layout_id") or ""),
+            ),
+        )
+        return output_rows
+
+    def _classify_grounding_node_kind(
+        self,
+        *,
+        layout_type: str,
+        layout_sub_type: str,
+        text: str,
+        block_rows: Sequence[Mapping[str, Any]],
+    ) -> str:
+        normalized_text = self._normalize_spaces(str(text or ""))
+        kind_candidates = [
+            str((row or {}).get("kind") or "").strip().lower()
+            for row in list(block_rows or [])
+            if str((row or {}).get("kind") or "").strip()
+        ]
+        zone_candidates = [
+            str((row or {}).get("zone_type") or "").strip().lower()
+            for row in list(block_rows or [])
+            if str((row or {}).get("zone_type") or "").strip()
+        ]
+        kind_set = set(kind_candidates)
+        layout_type = str(layout_type or "").strip().lower()
+        layout_sub_type = str(layout_sub_type or "").strip().lower()
+
+        if normalized_text and (
+            re.fullmatch(r"https?://(?:dx\.)?doi\.org/\S+", normalized_text, flags=re.IGNORECASE)
+            or re.fullmatch(r"doi:\s*10\.\S+", normalized_text, flags=re.IGNORECASE)
+        ):
+            return "doi"
+        if layout_sub_type in {"page_header", "running_header"} or layout_type in {"head", "header_line"}:
+            return "header"
+        if layout_sub_type in {"page_footer", "page"} or layout_type in {"foot", "footer_line", "foot_pagenum"}:
+            return "footer"
+        if (
+            layout_sub_type in {"footnote", "corner_note", "footer_note"}
+            or layout_type in {"corner_note", "footer_note", "footnote"}
+        ):
+            return "footer"
+        if layout_type == "title" or "heading" in kind_set:
+            return "title" if layout_type == "title" else "section_heading"
+        if layout_type in {"figure", "image", "picture"} or layout_sub_type in {"figure", "image", "picture"}:
+            return "figure"
+        if layout_type in {"table_caption"} or layout_sub_type in {"table_caption", "table_title"}:
+            return "table_caption"
+        if any(kind == "table_caption" for kind in kind_set) or self._looks_like_table_caption_text(normalized_text):
+            return "table_caption"
+        if any(kind in {"caption", "figure_caption"} for kind in kind_set):
+            return "figure_caption"
+        if layout_type in {"table"} or layout_sub_type in {"table", "table_body"}:
+            return "table"
+        if (
+            layout_type in {"equation", "formula", "math"}
+            or layout_sub_type in {"equation", "formula", "math"}
+            or any(kind in {"equation", "formula", "math"} for kind in kind_set)
+            or self._looks_like_equation_text(normalized_text)
+        ):
+            return "equation"
+        if layout_sub_type in {"author", "authors", "affiliation", "affiliations"}:
+            return "metadata"
+        if any(kind in {"list_item", "bullet", "enumeration"} for kind in kind_set):
+            return "list"
+        if layout_sub_type in {"page_header", "page_footer", "footnote", "corner_note"}:
+            return "noise"
+        if "side_context" in zone_candidates:
+            return "metadata"
+        if layout_type in {"text", "head"} and layout_sub_type in {"para", "none", "paragraph"}:
+            return "paragraph"
+        if layout_type in {"metadata", "header", "footer"}:
+            return "metadata"
+        return "paragraph" if normalized_text else "noise"
+
+    def _build_page_grounding_v1(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        docmind_structure = dict((payload or {}).get("docmind_structure") or {})
+        page_structure_v3 = dict((payload or {}).get("page_structure_v3") or {})
+        block_group_index = self._build_block_group_index(page=page, payload=payload)
+
+        layout_to_block_ids: Dict[str, List[str]] = {}
+        layout_to_block_rows: Dict[str, List[Dict[str, Any]]] = {}
+        for row in list(page_structure_v3.get("block_groups") or []):
+            if not isinstance(row, dict):
+                continue
+            layout_id = str(row.get("layout_unique_id") or "").strip()
+            canonical_block_id = self._normalize_canonical_block_id(
+                page=page,
+                raw_id=str(row.get("block_id") or ""),
+            )
+            if not layout_id or not canonical_block_id:
+                continue
+            layout_to_block_ids.setdefault(layout_id, [])
+            if canonical_block_id not in layout_to_block_ids[layout_id]:
+                layout_to_block_ids[layout_id].append(canonical_block_id)
+            layout_to_block_rows.setdefault(layout_id, [])
+            layout_to_block_rows[layout_id].append(row)
+
+        layout_atoms: List[Dict[str, Any]] = []
+        reading_nodes: List[Dict[str, Any]] = []
+        evidence_map: List[Dict[str, Any]] = []
+
+        for entry in self._extract_docmind_layout_rows_for_page(
+            page=page,
+            docmind_structure=docmind_structure,
+        ):
+            layout_id = str(entry.get("layout_id") or "").strip()
+            row = dict(entry.get("row") or {})
+            if not layout_id:
+                continue
+            raw_blocks = [item for item in list(row.get("blocks") or []) if isinstance(item, Mapping)]
+            layout_pos = self._normalize_grounding_points(row.get("pos"))
+            blocks: List[Dict[str, Any]] = []
+            merged_raw_fragments: List[str] = []
+            for block_idx, block in enumerate(raw_blocks, start=1):
+                text = self._repair_text_artifacts(
+                    self._normalize_spaces(str(block.get("text") or ""))
+                )
+                pos = self._normalize_grounding_points(block.get("pos"))
+                if text:
+                    merged_raw_fragments.append(text)
+                if text or pos:
+                    blocks.append(
+                        {
+                            "block_index": int(block_idx),
+                            "text": text,
+                            "pos": pos,
+                            "style_id": self._safe_int(block.get("styleId"), 0),
+                        }
+                    )
+            if not blocks:
+                fallback_text = self._repair_text_artifacts(
+                    self._normalize_spaces(str(row.get("text") or ""))
+                )
+                if fallback_text or layout_pos:
+                    blocks.append(
+                        {
+                            "block_index": 1,
+                            "text": fallback_text,
+                            "pos": list(layout_pos),
+                            "style_id": 0,
+                        }
+                    )
+                    if fallback_text:
+                        merged_raw_fragments.append(fallback_text)
+            if not layout_pos:
+                layout_pos = [
+                    point
+                    for block in blocks
+                    for point in list(block.get("pos") or [])
+                    if isinstance(point, Mapping)
+                ]
+            table_cells = self._extract_docmind_table_cells(row)
+
+            canonical_block_ids = list(layout_to_block_ids.get(layout_id) or [])
+            raw_text = self._merge_source_text_fragments(merged_raw_fragments) or self._repair_text_artifacts(
+                self._normalize_spaces(str(row.get("text") or ""))
+            )
+            clean_text = self._rebuild_text_from_block_groups(
+                canonical_ids=canonical_block_ids,
+                block_group_index=block_group_index,
+            ) if canonical_block_ids else ""
+            clean_text = clean_text or raw_text
+
+            block_rows = list(layout_to_block_rows.get(layout_id) or [])
+            node_kind = self._classify_grounding_node_kind(
+                layout_type=str(row.get("type") or ""),
+                layout_sub_type=str(row.get("subType") or ""),
+                text=clean_text or raw_text,
+                block_rows=block_rows,
+            )
+            include_in_main_flow = node_kind not in {"doi", "metadata", "header", "footer", "noise"}
+
+            region_hint = ""
+            for block_row in block_rows:
+                region_hint = str(
+                    block_row.get("zone_type")
+                    or block_row.get("region")
+                    or block_row.get("column_id")
+                    or ""
+                ).strip()
+                if region_hint:
+                    break
+            if not region_hint:
+                region_hint = "main_body" if include_in_main_flow else "side_context"
+            elif not include_in_main_flow and region_hint == "main_body":
+                region_hint = "side_context"
+
+            layout_atoms.append(
+                {
+                    "layout_id": layout_id,
+                    "reading_order": int((entry.get("layout_index") or 0) + 1),
+                    "layout_type": str(row.get("type") or "").strip().lower(),
+                    "layout_sub_type": str(row.get("subType") or "").strip().lower(),
+                    "raw_text": raw_text,
+                    "clean_text": clean_text,
+                    "normalized_text": "",
+                    "normalization_reason": "",
+                    "normalization_mode": "",
+                    "normalization_confidence": None,
+                    "alignment": str(row.get("alignment") or "").strip().lower(),
+                    "line_height": self._safe_float(row.get("lineHeight"), 0.0),
+                    "layout_pos": layout_pos,
+                    "blocks": blocks,
+                    "table_cells": table_cells,
+                    "canonical_block_ids": canonical_block_ids,
+                    "node_kind": node_kind,
+                    "include_in_main_flow": include_in_main_flow,
+                    "region_hint": region_hint,
+                    "meta": {
+                        "block_count": len(blocks),
+                        "table_cell_count": len(table_cells),
+                    },
+                }
+            )
+            reading_nodes.append(
+                {
+                    "node_id": f"layout:{layout_id}",
+                    "node_kind": node_kind,
+                    "raw_text": raw_text,
+                    "clean_text": clean_text,
+                    "normalized_text": "",
+                    "normalization_reason": "",
+                    "normalization_mode": "",
+                    "normalization_confidence": None,
+                    "source_layout_ids": [layout_id],
+                    "source_block_ids": canonical_block_ids,
+                    "include_in_main_flow": include_in_main_flow,
+                    "region_hint": region_hint,
+                    "meta": {
+                        "layout_type": str(row.get("type") or "").strip().lower(),
+                        "layout_sub_type": str(row.get("subType") or "").strip().lower(),
+                        "table_cell_count": len(table_cells),
+                    },
+                }
+            )
+            evidence_map.append(
+                {
+                    "evidence_id": f"layout:{layout_id}",
+                    "source_layout_id": layout_id,
+                    "source_block_ids": canonical_block_ids,
+                    "layout_pos": layout_pos,
+                    "block_positions": [list(block.get("pos") or []) for block in blocks],
+                    "table_cells": table_cells,
+                    "geometry_source": "docmind_layout_blocks",
+                    "highlight_strategy": "layout_block_union",
+                    "meta": {
+                        "block_count": len(blocks),
+                        "table_cell_count": len(table_cells),
+                    },
+                }
+            )
+
+        paper_id = int(payload.get("paper_id") or 0) or 0
+        docmind_page_image_url = str(docmind_structure.get("page_image_url") or "").strip()
+        docmind_page_image_path = str(docmind_structure.get("page_image_path") or "").strip()
+        page_image_asset = self._resolve_grounding_page_image_asset(
+            paper_id=paper_id,
+            page=page,
+            pdf_path="",
+            docmind_page_image_url=docmind_page_image_url,
+            docmind_page_image_path=docmind_page_image_path,
+        )
+        page_image_url = str(page_image_asset.get("url") or "").strip()
+        page_image_path = str(page_image_asset.get("path") or "").strip()
+        page_image_width = int(docmind_structure.get("page_image_width") or 0) or None
+        page_image_height = int(docmind_structure.get("page_image_height") or 0) or None
+        if not page_image_width or not page_image_height:
+            resolved_width, resolved_height = self._resolve_grounding_page_image_size(
+                page_image_url=page_image_url,
+                page_image_path=page_image_path,
+            )
+            page_image_width = page_image_width or resolved_width
+            page_image_height = page_image_height or resolved_height
+        if not page_image_width or not page_image_height:
+            inferred_width, inferred_height = self._grounding_page_dimensions(
+                grounding_layout_map={
+                    str(row.get("layout_id") or "").strip(): dict(row)
+                    for row in layout_atoms
+                    if isinstance(row, Mapping) and str(row.get("layout_id") or "").strip()
+                },
+                grounding_evidence_map={
+                    str(row.get("source_layout_id") or "").strip(): dict(row)
+                    for row in evidence_map
+                    if isinstance(row, Mapping) and str(row.get("source_layout_id") or "").strip()
+                },
+                page_image={},
+            )
+            if not page_image_width and inferred_width and inferred_width > 0:
+                page_image_width = int(inferred_width)
+            if not page_image_height and inferred_height and inferred_height > 0:
+                page_image_height = int(inferred_height)
+        counts_by_kind: Dict[str, int] = {}
+        for row in reading_nodes:
+            kind = str(row.get("node_kind") or "").strip() or "unknown"
+            counts_by_kind[kind] = int(counts_by_kind.get(kind) or 0) + 1
+
+        return {
+            "version": "page_grounding_v1",
+            "page": int(page),
+            "layout_atoms": layout_atoms,
+            "reading_nodes": reading_nodes,
+            "evidence_map": evidence_map,
+            "page_image": {
+                "url": page_image_url,
+                "path": page_image_path,
+                "width": page_image_width,
+                "height": page_image_height,
+                "source": str(page_image_asset.get("source") or ""),
+                "origin_url": str(page_image_asset.get("origin_url") or ""),
+                "local_cached": bool(page_image_asset.get("local_cached")),
+            },
+            "meta": {
+                "source": "docmind_layout_unique_id_v1",
+                "layout_count": len(layout_atoms),
+                "reading_node_count": len(reading_nodes),
+                "main_flow_node_count": sum(1 for row in reading_nodes if bool(row.get("include_in_main_flow"))),
+                "counts_by_kind": counts_by_kind,
+            },
+        }
+
     def _partition_main_aux_block_ids(
         self,
         *,
@@ -12648,7 +17612,42 @@ class LiteratureReaderComposeService:
             return None
         if not isinstance(row.payload_json, dict):
             return None
-        return dict(row.payload_json)
+        payload = dict(row.payload_json)
+        repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+        if repaired != payload:
+            row.payload_json = dict(repaired)
+            await db.commit()
+        return repaired
+
+    async def get_latest_cached_payload_only(
+        self,
+        *,
+        db: AsyncSession,
+        user_id: int,
+        paper_id: int,
+        page: int,
+        pipeline_version_override: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        latest_payload = await self._read_latest_payload_from_db(
+            db=db,
+            paper_id=int(paper_id),
+            page=int(page),
+            pipeline_version_override=pipeline_version_override,
+        )
+        if not isinstance(latest_payload, dict):
+            return None
+        source_signature = str(latest_payload.get("source_signature") or "").strip()
+        payload = self._with_cache_meta(latest_payload, cache_hit=True, cache_layer="db_latest")
+        if source_signature:
+            payload = await self._apply_overlay_for_user(
+                db=db,
+                user_id=int(user_id),
+                paper_id=int(paper_id),
+                page=int(page),
+                source_signature=source_signature,
+                payload=payload,
+            )
+        return self._ensure_payload_contract(page=int(page), payload=payload)
 
     async def _read_latest_payload_from_db(
         self,
@@ -12656,8 +17655,10 @@ class LiteratureReaderComposeService:
         db: AsyncSession,
         paper_id: int,
         page: int,
+        pipeline_version_override: Optional[str] = None,
         limit: int = 8,
     ) -> Optional[Dict[str, Any]]:
+        requested_pipeline_version = self._pipeline_version(pipeline_version_override)
         stmt = (
             select(PaperReaderPageCache)
             .where(
@@ -12674,9 +17675,16 @@ class LiteratureReaderComposeService:
             payload = dict(getattr(row, "payload_json", {}) or {})
             if not payload:
                 continue
+            payload_pipeline_version = self._pipeline_version(str(payload.get("pipeline_version") or "").strip())
+            if payload_pipeline_version != requested_pipeline_version:
+                continue
             if self._should_rebuild_cached_payload(payload):
                 continue
-            return payload
+            repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+            if repaired != payload:
+                row.payload_json = dict(repaired)
+                await db.commit()
+            return repaired
         return None
 
     async def _read_compatible_payload_from_db(
@@ -12686,11 +17694,13 @@ class LiteratureReaderComposeService:
         paper_id: int,
         page: int,
         source_signature: str,
+        pipeline_version: Optional[str] = None,
         limit: int = 8,
     ) -> Optional[Dict[str, Any]]:
         prefix = self._compatible_source_signature_prefix(source_signature)
         if not prefix:
             return None
+        requested_pipeline_version = self._pipeline_version(pipeline_version)
         stmt = (
             select(PaperReaderPageCache)
             .where(
@@ -12710,9 +17720,16 @@ class LiteratureReaderComposeService:
             payload = dict(getattr(row, "payload_json", {}) or {})
             if not payload:
                 continue
+            payload_pipeline_version = self._pipeline_version(str(payload.get("pipeline_version") or "").strip())
+            if payload_pipeline_version != requested_pipeline_version:
+                continue
             if self._should_rebuild_cached_payload(payload):
                 continue
-            return payload
+            repaired = self._ensure_payload_contract(page=int(page), payload=payload)
+            if repaired != payload:
+                row.payload_json = dict(repaired)
+                await db.commit()
+            return repaired
         return None
 
     async def _read_review_seed_payload_from_cache(
@@ -12741,7 +17758,10 @@ class LiteratureReaderComposeService:
                 "[ReaderComposeService] review session cloned exact redis cache "
                 f"paper={paper.id} page={page}"
             )
-            cached_payload = self._with_cache_meta(cached_payload, cache_hit=True, cache_layer="redis")
+            repaired_cached_payload = self._ensure_payload_contract(page=int(page), payload=dict(cached_payload))
+            if repaired_cached_payload != cached_payload:
+                await self._write_payload_to_redis(redis_key, repaired_cached_payload)
+            cached_payload = self._with_cache_meta(repaired_cached_payload, cache_hit=True, cache_layer="redis")
             cached_payload = await self._apply_overlay_for_user(
                 db=db,
                 user_id=int(user_id),
@@ -12835,7 +17855,7 @@ class LiteratureReaderComposeService:
         return datetime.now(timezone.utc).isoformat()
 
     async def _read_payload_from_redis(self, key: str) -> Optional[Dict[str, Any]]:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return None
         try:
@@ -12848,7 +17868,7 @@ class LiteratureReaderComposeService:
             return None
 
     async def _write_payload_to_redis(self, key: str, payload: Dict[str, Any]) -> None:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return
         try:
@@ -12861,7 +17881,7 @@ class LiteratureReaderComposeService:
             logger.warning(f"[ReaderComposeService] redis set failed: {exc}")
 
     async def _acquire_lock(self, lock_key: str) -> Optional[str]:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return None
         token = uuid.uuid4().hex
@@ -12874,7 +17894,7 @@ class LiteratureReaderComposeService:
             return None
 
     async def _release_lock(self, lock_key: str, token: str) -> None:
-        client = await self._get_redis_client()
+        client = await self._resolve_redis_client()
         if client is None:
             return
         try:
@@ -13029,5 +18049,3 @@ _literature_reader_compose_service = LiteratureReaderComposeService()
 
 def get_literature_reader_compose_service() -> LiteratureReaderComposeService:
     return _literature_reader_compose_service
-
-

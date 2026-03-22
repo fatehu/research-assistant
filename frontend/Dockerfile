@@ -1,18 +1,30 @@
-FROM node:20-alpine
+FROM node:20-alpine AS build
 
 WORKDIR /app
 
-# 复制 package.json 和 lock 文件
 COPY package*.json ./
-
-# 安装依赖
 RUN npm install
 
-# 复制源代码
 COPY . .
 
-# 暴露端口
+ARG VITE_API_BASE_URL=http://localhost:8888
+ARG VITE_WS_BASE_URL=ws://localhost:8888
+ARG VITE_SHOW_RAG_METRICS=false
+
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ENV VITE_WS_BASE_URL=$VITE_WS_BASE_URL
+ENV VITE_SHOW_RAG_METRICS=$VITE_SHOW_RAG_METRICS
+
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+
+RUN npm install -g serve
+
+COPY --from=build /app/dist ./dist
+
 EXPOSE 3000
 
-# 启动开发服务器
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+CMD ["serve", "-s", "dist", "-l", "3000"]

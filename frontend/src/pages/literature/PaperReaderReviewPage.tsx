@@ -240,6 +240,7 @@ export default function PaperReaderReviewPage() {
       headingFontFamily: pickTokenString(overlay, ['headingFontFamily', 'heading_font_family'], base.headingFontFamily),
       bodyFontSize: pickTokenNumber(overlay, ['bodyFontSize', 'body_font_size'], base.bodyFontSize),
       bodyLineHeight: pickTokenNumber(overlay, ['bodyLineHeight', 'body_line_height'], base.bodyLineHeight),
+      bodyLetterSpacing: pickTokenString(overlay, ['bodyLetterSpacing', 'body_letter_spacing'], base.bodyLetterSpacing),
     }
   }, [snapshot, styleKey, themeMode])
 

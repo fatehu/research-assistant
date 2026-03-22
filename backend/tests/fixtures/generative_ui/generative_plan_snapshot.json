@@ -1,0 +1,44 @@
+{
+  "contract_validation": {
+    "status": "validated",
+    "contract": "generative_plan_v1"
+  },
+  "page_archetype": "figure_explainer",
+  "reading_path": [
+    "hero_summary",
+    "focus_evidence",
+    "reading_flow",
+    "context_explainer",
+    "supporting_resources",
+    "explore_questions"
+  ],
+  "storyboard_section_types": [
+    "hero",
+    "focus_stage",
+    "reading_flow",
+    "explainer_cluster",
+    "supporting_resources",
+    "question_lab"
+  ],
+  "content_budget": {
+    "max_claim_cards": 2,
+    "max_hooks": 2,
+    "max_resource_modules": 2,
+    "max_explainer_modules": 2,
+    "max_question_modules": 1,
+    "max_widgets": 1
+  },
+  "resource_module_types": [
+    "RelatedResourceCard"
+  ],
+  "interaction_module_types": [
+    "GlossaryPanel"
+  ],
+  "widget_types": [
+    "figure-focus-accordion"
+  ],
+  "used_tools": [
+    "paper_read",
+    "web_search"
+  ]
+}

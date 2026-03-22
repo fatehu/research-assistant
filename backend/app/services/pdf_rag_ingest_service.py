@@ -27,7 +27,7 @@ _SYMBOL_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
 ACTION_SYSTEM = (
     "You classify one extracted PDF line. "
-    "Reply with one label only: KEEP, REPAIR, or OCR. "
+    "Reply with one label only: KEEP, REPAIR, or DROP. "
     "Do not explain."
 )
 ACTION_USER_TEMPLATE = """Classify this PDF line.
@@ -35,7 +35,7 @@ ACTION_USER_TEMPLATE = """Classify this PDF line.
 Return exactly one label:
 - KEEP
 - REPAIR
-- OCR
+- DROP
 
 Line:
 {text}"""
@@ -118,11 +118,13 @@ class ProcessedPdfLine:
 class _QwenAdapterRuntime:
     def __init__(self) -> None:
         self._lock = Lock()
-        self._loaded = False
+        self._ready = False
         self._load_error: Optional[str] = None
         self._model: Any = None
         self._tokenizer: Any = None
         self._device: str = "cpu"
+        self._current_task: str = ""
+        self._deps: dict[str, Any] = {}
 
     @staticmethod
     def _resolve_model_dir(path_value: str) -> Path:
@@ -140,21 +142,21 @@ class _QwenAdapterRuntime:
         }
 
     def available(self) -> bool:
-        self._ensure_loaded()
-        return self._model is not None
+        self._ensure_runtime_ready()
+        return self._load_error is None
 
     @property
     def load_error(self) -> Optional[str]:
-        self._ensure_loaded()
+        self._ensure_runtime_ready()
         return self._load_error
 
-    def _ensure_loaded(self) -> None:
-        if self._loaded:
+    def _ensure_runtime_ready(self) -> None:
+        if self._ready:
             return
         with self._lock:
-            if self._loaded:
+            if self._ready:
                 return
-            self._loaded = True
+            self._ready = True
             try:
                 import torch
                 from peft import PeftModel
@@ -167,12 +169,13 @@ class _QwenAdapterRuntime:
                     if not (model_dir / "adapter_config.json").exists():
                         raise FileNotFoundError(f"{task_name} adapter_config.json missing: {model_dir}")
 
-                adapter_config = json.loads(
-                    (model_paths["action"] / "adapter_config.json").read_text(encoding="utf-8")
-                )
-                base_model_name = str(adapter_config.get("base_model_name_or_path") or "").strip()
-                if not base_model_name:
-                    raise RuntimeError("action adapter missing base_model_name_or_path")
+                task_base_models: dict[str, str] = {}
+                for task_name, model_dir in model_paths.items():
+                    adapter_config = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+                    base_model_name = str(adapter_config.get("base_model_name_or_path") or "").strip()
+                    if not base_model_name:
+                        raise RuntimeError(f"{task_name} adapter missing base_model_name_or_path")
+                    task_base_models[task_name] = base_model_name
 
                 requested_device = str(getattr(settings, "pdf_rag_qwen_device", "auto") or "auto").lower()
                 if requested_device == "cuda":
@@ -186,48 +189,115 @@ class _QwenAdapterRuntime:
                 if self._device == "cuda":
                     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    str(model_paths["action"]),
-                    trust_remote_code=True,
-                )
-                if self._tokenizer.pad_token is None:
-                    self._tokenizer.pad_token = self._tokenizer.eos_token
-                self._tokenizer.padding_side = "left"
-
-                base_model = AutoModelForCausalLM.from_pretrained(
-                    base_model_name,
-                    torch_dtype=dtype,
-                    trust_remote_code=True,
-                )
-                model = PeftModel.from_pretrained(
-                    base_model,
-                    str(model_paths["action"]),
-                    adapter_name="action",
-                    is_trainable=False,
-                )
-                model.load_adapter(str(model_paths["clean"]), adapter_name="clean", is_trainable=False)
-                model.load_adapter(str(model_paths["chunk"]), adapter_name="chunk", is_trainable=False)
-                model.eval()
-                model.to(self._device)
-                self._model = model
+                self._deps = {
+                    "torch": torch,
+                    "PeftModel": PeftModel,
+                    "AutoModelForCausalLM": AutoModelForCausalLM,
+                    "AutoTokenizer": AutoTokenizer,
+                    "dtype": dtype,
+                    "task_base_models": task_base_models,
+                }
                 self._load_error = None
                 logger.info(
-                    f"[PdfRag] Qwen adapters loaded on device={self._device}: "
-                    f"action={model_paths['action'].name}, clean={model_paths['clean'].name}, chunk={model_paths['chunk'].name}"
+                    f"[PdfRag] Qwen adapter runtime ready on device={self._device}: "
+                    f"action={model_paths['action'].name}({task_base_models['action']}), "
+                    f"clean={model_paths['clean'].name}({task_base_models['clean']}), "
+                    f"chunk={model_paths['chunk'].name}({task_base_models['chunk']})"
                 )
             except Exception as exc:
+                self._deps = {}
                 self._model = None
                 self._tokenizer = None
+                self._current_task = ""
                 self._load_error = str(exc)
                 logger.warning(f"[PdfRag] Qwen adapter runtime unavailable: {exc}")
 
-    def _generate(self, *, adapter_name: str, messages: list[dict[str, str]], max_new_tokens: int) -> str:
-        self._ensure_loaded()
+    def release(self) -> None:
+        with self._lock:
+            self._release_loaded_model()
+
+    def _release_loaded_model(self) -> None:
+        model = self._model
+        tokenizer = self._tokenizer
+        if model is not None:
+            try:
+                del model
+            except Exception:
+                pass
+        if tokenizer is not None:
+            try:
+                del tokenizer
+            except Exception:
+                pass
+        self._model = None
+        self._tokenizer = None
+        self._current_task = ""
+        torch_module = self._deps.get("torch")
+        if torch_module is not None:
+            try:
+                import gc
+
+                gc.collect()
+                if self._device == "cuda" and torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _load_task_model(self, task_name: str) -> None:
+        self._ensure_runtime_ready()
+        if self._load_error:
+            raise RuntimeError(self._load_error)
+        if task_name == self._current_task and self._model is not None and self._tokenizer is not None:
+            return
+
+        with self._lock:
+            if task_name == self._current_task and self._model is not None and self._tokenizer is not None:
+                return
+            self._release_loaded_model()
+            model_paths = self._model_paths()
+            model_dir = model_paths[task_name]
+            base_model_name = str((self._deps.get("task_base_models") or {}).get(task_name) or "").strip()
+            if not base_model_name:
+                adapter_config = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
+                base_model_name = str(adapter_config.get("base_model_name_or_path") or "").strip()
+            torch = self._deps["torch"]
+            auto_model = self._deps["AutoModelForCausalLM"]
+            auto_tokenizer = self._deps["AutoTokenizer"]
+            peft_model = self._deps["PeftModel"]
+
+            try:
+                tokenizer = auto_tokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+            except Exception:
+                tokenizer = auto_tokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "left"
+
+            base_model = auto_model.from_pretrained(
+                base_model_name,
+                torch_dtype=self._deps["dtype"],
+                trust_remote_code=True,
+            )
+            model = peft_model.from_pretrained(
+                base_model,
+                str(model_dir),
+                adapter_name=task_name,
+                is_trainable=False,
+            )
+            model.eval()
+            model.to(self._device)
+
+            self._tokenizer = tokenizer
+            self._model = model
+            self._current_task = task_name
+            logger.info(f"[PdfRag] Loaded Qwen adapter task={task_name} on device={self._device}")
+
+    def _generate(self, *, task_name: str, messages: list[dict[str, str]], max_new_tokens: int) -> str:
+        self._load_task_model(task_name)
         if self._model is None or self._tokenizer is None:
             raise RuntimeError(self._load_error or "Qwen adapter runtime unavailable")
-        self._model.set_adapter(adapter_name)
 
-        import torch
+        torch = self._deps["torch"]
 
         prompt_text = self._tokenizer.apply_chat_template(
             messages,
@@ -249,24 +319,28 @@ class _QwenAdapterRuntime:
 
     def classify_action(self, text: str) -> str:
         raw = self._generate(
-            adapter_name="action",
+            task_name="action",
             messages=[
                 {"role": "system", "content": ACTION_SYSTEM},
                 {"role": "user", "content": ACTION_USER_TEMPLATE.format(text=text)},
             ],
             max_new_tokens=4,
         ).upper()
-        for label in ("KEEP", "REPAIR", "OCR"):
+        if raw.startswith("OCR"):
+            return "DROP"
+        for label in ("KEEP", "REPAIR", "DROP"):
             if raw.startswith(label):
                 return label
         for token in raw.replace("\n", " ").split():
-            if token in {"KEEP", "REPAIR", "OCR"}:
+            if token == "OCR":
+                return "DROP"
+            if token in {"KEEP", "REPAIR", "DROP"}:
                 return token
         return "KEEP"
 
     def clean_line(self, text: str) -> str:
         return self._generate(
-            adapter_name="clean",
+            task_name="clean",
             messages=[
                 {"role": "system", "content": CLEAN_SYSTEM},
                 {"role": "user", "content": CLEAN_USER_TEMPLATE.format(text=text)},
@@ -276,7 +350,7 @@ class _QwenAdapterRuntime:
 
     def classify_chunk(self, prev_line: str, curr_line: str) -> str:
         raw = self._generate(
-            adapter_name="chunk",
+            task_name="chunk",
             messages=[
                 {"role": "system", "content": CHUNK_SYSTEM},
                 {
@@ -325,59 +399,61 @@ class PdfRagIngestService:
                 "extractor": "pdfplumber_lines",
                 "report": {"line_count": len(lines)},
             }
+        try:
+            processed_lines, dropped_lines, report = await self._process_lines(
+                file_path=file_path,
+                lines=lines,
+            )
+            if not processed_lines:
+                if bool(settings.pdf_rag_fail_open):
+                    processed_lines = [
+                        ProcessedPdfLine(
+                            source=line,
+                            final_action="KEEP",
+                            normalized_text=line.source_text,
+                            debug={"fallback": "fail_open_keep_all"},
+                        )
+                        for line in lines
+                    ]
+                    report["fail_open_applied"] = True
+                    dropped_lines = []
+                else:
+                    return {
+                        "applied": False,
+                        "failure_reason": "no_accepted_lines",
+                        "document_text": raw_document_text,
+                        "chunks": [],
+                        "extractor": "pdfplumber_lines",
+                        "report": report,
+                    }
 
-        processed_lines, dropped_lines, report = await self._process_lines(
-            file_path=file_path,
-            lines=lines,
-        )
-        if not processed_lines:
-            if bool(settings.pdf_rag_fail_open):
-                processed_lines = [
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="KEEP",
-                        normalized_text=line.source_text,
-                        debug={"fallback": "fail_open_keep_all"},
-                    )
-                    for line in lines
-                ]
-                report["fail_open_applied"] = True
-                dropped_lines = []
-            else:
-                return {
-                    "applied": False,
-                    "failure_reason": "no_accepted_lines",
-                    "document_text": raw_document_text,
-                    "chunks": [],
+            chunks = await self._build_chunks(processed_lines)
+            chunks, coverage_report = self._validate_and_fill_coverage(chunks, processed_lines)
+
+            report.update(
+                {
+                    "pipeline": "pdf_line_rag_v1",
+                    "document_name": document_name or "",
                     "extractor": "pdfplumber_lines",
-                    "report": report,
+                    "line_count": len(lines),
+                    "accepted_line_count": len(processed_lines),
+                    "dropped_line_count": len(dropped_lines),
+                    "chunk_count": len(chunks),
+                    "coverage": coverage_report,
+                    "dropped_line_ids": [line.source.line_id for line in dropped_lines[:200]],
                 }
+            )
 
-        chunks = await self._build_chunks(processed_lines)
-        chunks, coverage_report = self._validate_and_fill_coverage(chunks, processed_lines)
-
-        report.update(
-            {
-                "pipeline": "pdf_line_rag_v1",
-                "document_name": document_name or "",
+            return {
+                "applied": True,
+                "failure_reason": None,
+                "document_text": raw_document_text,
+                "chunks": chunks,
                 "extractor": "pdfplumber_lines",
-                "line_count": len(lines),
-                "accepted_line_count": len(processed_lines),
-                "dropped_line_count": len(dropped_lines),
-                "chunk_count": len(chunks),
-                "coverage": coverage_report,
-                "dropped_line_ids": [line.source.line_id for line in dropped_lines[:200]],
+                "report": report,
             }
-        )
-
-        return {
-            "applied": True,
-            "failure_reason": None,
-            "document_text": raw_document_text,
-            "chunks": chunks,
-            "extractor": "pdfplumber_lines",
-            "report": report,
-        }
+        finally:
+            _runtime.release()
 
     def _extract_lines(self, file_path: str) -> tuple[list[PdfLineRecord], str]:
         import pdfplumber
@@ -489,10 +565,8 @@ class PdfRagIngestService:
     ) -> tuple[list[ProcessedPdfLine], list[ProcessedPdfLine], dict[str, Any]]:
         accepted: list[ProcessedPdfLine] = []
         dropped: list[ProcessedPdfLine] = []
-        action_counts = {"KEEP": 0, "REPAIR": 0, "OCR": 0, "DROP": 0}
+        action_counts = {"KEEP": 0, "REPAIR": 0, "DROP": 0}
         repair_count = 0
-        ocr_used_count = 0
-        ocr_recovered_count = 0
 
         for line in lines:
             rule_action = self._rule_action(line.source_text)
@@ -509,7 +583,9 @@ class PdfRagIngestService:
                 continue
 
             action = await asyncio.to_thread(_runtime.classify_action, line.source_text)
-            if action not in {"KEEP", "REPAIR", "OCR"}:
+            if action == "OCR":
+                action = "DROP"
+            if action not in {"KEEP", "REPAIR", "DROP"}:
                 action = "KEEP"
             action_counts[action] += 1
 
@@ -538,61 +614,20 @@ class PdfRagIngestService:
                 repair_count += 1
                 continue
 
-            recovered = await self._recover_with_ocr(file_path=file_path, line=line)
-            if not recovered:
-                dropped.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="DROP",
-                        normalized_text="",
-                        debug={"reason": "ocr_empty"},
-                    )
-                )
-                action_counts["DROP"] += 1
-                continue
-
-            ocr_used_count += 1
-            recovered_norm = _normalize_spaces(recovered)
-            recovered_action = await asyncio.to_thread(_runtime.classify_action, recovered_norm)
-            if recovered_action == "REPAIR":
-                cleaned = await asyncio.to_thread(_runtime.clean_line, recovered_norm)
-                recovered_norm = self._sanitize_clean_output(source_text=recovered_norm, cleaned_text=cleaned)
-                repair_used = True
-                repair_count += 1
-            else:
-                repair_used = False
-
-            if recovered_action == "OCR":
-                dropped.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="DROP",
-                        normalized_text="",
-                        ocr_used=True,
-                        ocr_text=recovered_norm,
-                        debug={"reason": "ocr_recheck_failed"},
-                    )
-                )
-                action_counts["DROP"] += 1
-                continue
-
-            accepted.append(
+            dropped.append(
                 ProcessedPdfLine(
                     source=line,
-                    final_action="OCR",
-                    normalized_text=recovered_norm,
-                    repair_used=repair_used,
-                    ocr_used=True,
-                    ocr_text=recovered_norm,
+                    final_action="DROP",
+                    normalized_text="",
+                    debug={"reason": "model_drop"},
                 )
             )
-            ocr_recovered_count += 1
 
         report = {
             "action_counts": action_counts,
             "repair_count": repair_count,
-            "ocr_used_count": ocr_used_count,
-            "ocr_recovered_count": ocr_recovered_count,
+            "ocr_used_count": 0,
+            "ocr_recovered_count": 0,
         }
         return accepted, dropped, report
 
@@ -602,7 +637,7 @@ class PdfRagIngestService:
         cleaned = _normalize_spaces(_clean_visible_text(cleaned_text))
         if not cleaned:
             return source
-        if cleaned.upper() in {"KEEP", "REPAIR", "OCR", "JOIN_PREV", "NEW_CHUNK"}:
+        if cleaned.upper() in {"KEEP", "REPAIR", "DROP", "OCR", "JOIN_PREV", "NEW_CHUNK"}:
             return source
         if len(cleaned) > max(len(source) * 2, len(source) + 80):
             return source

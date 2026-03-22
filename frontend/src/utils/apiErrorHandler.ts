@@ -80,7 +80,13 @@ export function parseApiError(error: unknown): ParsedApiError {
         return { type: ApiErrorType.RateLimited, message: '请求过于频繁，请稍后再试', status, detail, raw: error }
       default:
         if (status && status >= 500) {
-          return { type: ApiErrorType.Server, message: '服务器内部错误，请稍后重试', status, detail, raw: error }
+          return {
+            type: ApiErrorType.Server,
+            message: detail || '服务器内部错误，请稍后重试',
+            status,
+            detail,
+            raw: error,
+          }
         }
         return {
           type: ApiErrorType.Unknown,

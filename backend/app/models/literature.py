@@ -358,6 +358,39 @@ class PaperReaderComponentOverlay(Base):
     )
 
 
+class PaperReaderPlanCache(Base):
+    """论文阅读 experience/generative plan 持久化缓存"""
+    __tablename__ = "paper_reader_plan_caches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_kind = Column(String(32), nullable=False)
+    cache_key = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    page = Column(Integer, nullable=False, default=1, index=True)
+    compose_source_signature = Column(String(255), nullable=False)
+    payload_json = Column(JSON, default=dict)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+    paper = relationship("Paper")
+
+    __table_args__ = (
+        UniqueConstraint("cache_key", name="uq_reader_plan_cache_key"),
+        Index(
+            "idx_reader_plan_cache_user_paper_page_kind",
+            "user_id",
+            "paper_id",
+            "page",
+            "plan_kind",
+        ),
+        Index("idx_reader_plan_cache_expires_at", "expires_at"),
+        Index("idx_reader_plan_cache_updated_at", "updated_at"),
+    )
+
+
 class PaperAnnotation(Base):
     """论文批注"""
     __tablename__ = "paper_annotations"

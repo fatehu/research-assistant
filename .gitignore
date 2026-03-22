@@ -19,7 +19,23 @@ backend/*.py[cod]
 backend/$py.class
 backend/venv/
 backend/.venv/
+backend/venv*/
+backend/.venv*/
 backend/env/
+
+# 任意命名的本地 Python 虚拟环境
+.venv/
+.venv*/
+venv/
+venv*/
+env/
+env*/
+*/.venv/
+*/.venv*/
+*/venv/
+*/venv*/
+*/env/
+*/env*/
 
 # --- 前端相关 (React/Vue/Next.js) ---
 frontend/node_modules/
@@ -74,6 +90,13 @@ backend/docs/
 
 # Local snapshots / scratch files
 .snapshots/
+.env.bak*
+SESSION_RECOVERY.md
+_generate_experience_session_v2_narrative_brief
+experience-*.png
+tmp-*
+frontend/.vite/
+frontend/vite.config.js.timestamp-*.mjs
 
 # Temporary artifacts generated under docs
 docs/**/tmp/
@@ -88,3 +111,6 @@ backend/eval/results/**
 
 # Reader runtime artifacts
 backend/uploads/
+backend/.cache/
+backend/models/
+uploads/

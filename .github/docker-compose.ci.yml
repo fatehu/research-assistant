@@ -2,3 +2,6 @@ services:
   backend:
     # CI runner usually has no NVIDIA runtime; remove GPU requirement from base compose.
     gpus: !reset []
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu

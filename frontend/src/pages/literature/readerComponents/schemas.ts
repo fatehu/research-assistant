@@ -2,6 +2,7 @@ import { z } from 'zod'
 
 const stringArray = z.array(z.string()).default([])
 const recordArray = z.array(z.record(z.any())).default([])
+const stringMatrix = z.array(z.array(z.string())).default([])
 
 export const readerComponentSchemas = {
   PaperHeaderCard: z.object({
@@ -39,7 +40,21 @@ export const readerComponentSchemas = {
   }),
   TablePanel: z.object({
     title: z.string().optional(),
+    headers: stringArray.optional(),
+    header_row_count: z.number().optional(),
+    column_widths: z.array(z.number()).optional(),
+    matrix: stringMatrix.optional(),
+    table_cells: recordArray.optional(),
+    logical_rows: recordArray.optional(),
+    logical_header_row_count: z.number().optional(),
     rows: recordArray.optional(),
+    caption: z.string().optional(),
+    notes: stringArray.optional(),
+    raw_markdown: z.string().optional(),
+    row_evidence: recordArray.optional(),
+    cell_evidence: recordArray.optional(),
+    reconstruction_mode: z.string().optional(),
+    reconstruction_notes: stringArray.optional(),
     ai_insight: z.string().optional(),
   }),
   CitationLinks: z.object({
@@ -96,6 +111,13 @@ export const readerComponentSchemas = {
     latex: z.string().min(1),
     label: z.string().optional(),
     description: z.string().optional(),
+    render_mode: z.enum(['image_first', 'math_first', 'text_only']).optional(),
+    transcript: z.string().optional(),
+    normalized_text: z.string().optional(),
+    normalized_latex: z.string().optional(),
+    normalization_reason: z.string().optional(),
+    normalization_mode: z.string().optional(),
+    normalization_confidence: z.number().optional(),
   }),
   MethodologyCard: z.object({
     title: z.string().optional(),

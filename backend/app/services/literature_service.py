@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from loguru import logger
 import re
 import os
+from urllib.parse import quote
 
 
 @dataclass
@@ -566,6 +567,33 @@ class PubMedService:
         except Exception as e:
             logger.error(f"[PubMed] 搜索错误: {e}")
             return {"total": 0, "papers": [], "error": str(e)}
+
+    async def get_paper(self, pmid: str) -> Optional[PaperResult]:
+        """按 PMID 获取 PubMed 论文。"""
+        normalized_pmid = re.sub(r"\D", "", str(pmid or ""))
+        if not normalized_pmid:
+            return None
+
+        params = {
+            "db": "pubmed",
+            "id": normalized_pmid,
+            "retmode": "xml",
+        }
+        if self.api_key:
+            params["api_key"] = self.api_key
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(f"{self.BASE_URL}/efetch.fcgi", params=params)
+                if response.status_code != 200:
+                    logger.error(f"[PubMed] 获取论文失败: {response.status_code}")
+                    return None
+
+                papers = self._parse_pubmed_xml(response.text)
+                return papers[0] if papers else None
+        except Exception as e:
+            logger.error(f"[PubMed] 获取论文错误: {e}")
+            return None
     
     def _parse_pubmed_xml(self, xml_text: str) -> List[PaperResult]:
         """解析 PubMed XML"""
@@ -695,6 +723,55 @@ class OpenAlexService:
         except Exception as e:
             logger.error(f"[OpenAlex] 搜索错误: {e}")
             return {"total": 0, "papers": [], "error": str(e)}
+
+    async def get_paper(self, work_id: str) -> Optional[PaperResult]:
+        """按 OpenAlex Work ID 获取论文。"""
+        normalized = str(work_id or "").strip().upper()
+        if normalized.startswith("HTTPS://OPENALEX.ORG/"):
+            normalized = normalized.rsplit("/", 1)[-1]
+        if normalized.startswith("HTTPS://API.OPENALEX.ORG/WORKS/"):
+            normalized = normalized.rsplit("/", 1)[-1]
+        if not re.fullmatch(r"W\d+", normalized):
+            return None
+
+        params: Dict[str, Any] = {}
+        if self.email:
+            params["mailto"] = self.email
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(f"{self.BASE_URL}/works/{normalized}", params=params)
+                if response.status_code != 200:
+                    logger.error(f"[OpenAlex] 获取论文失败: {response.status_code}")
+                    return None
+                return self._parse_work(response.json())
+        except Exception as e:
+            logger.error(f"[OpenAlex] 获取论文错误: {e}")
+            return None
+
+    async def get_paper_by_doi(self, doi: str) -> Optional[PaperResult]:
+        """按 DOI 获取 OpenAlex 论文。"""
+        normalized = str(doi or "").strip()
+        normalized = re.sub(r"^(?:https?://)?(?:dx\.)?doi\.org/", "", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"^doi:\s*", "", normalized, flags=re.IGNORECASE)
+        if not normalized:
+            return None
+
+        params: Dict[str, Any] = {}
+        if self.email:
+            params["mailto"] = self.email
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                encoded = quote(f"https://doi.org/{normalized}", safe="")
+                response = await client.get(f"{self.BASE_URL}/works/{encoded}", params=params)
+                if response.status_code != 200:
+                    logger.error(f"[OpenAlex] DOI 获取论文失败: {response.status_code}")
+                    return None
+                return self._parse_work(response.json())
+        except Exception as e:
+            logger.error(f"[OpenAlex] DOI 获取论文错误: {e}")
+            return None
     
     def _parse_work(self, work: dict) -> PaperResult:
         """解析 OpenAlex 论文"""
@@ -709,13 +786,14 @@ class OpenAlexService:
                 authors.append({"name": author["display_name"]})
         
         # DOI
-        doi = work.get("doi", "")
+        ids = work.get("ids") or {}
+        doi = ids.get("doi") or work.get("doi", "")
         if doi:
             doi = doi.replace("https://doi.org/", "")
         
         # PDF URL
         pdf_url = None
-        oa = work.get("open_access", {})
+        oa = work.get("open_access") or {}
         if oa.get("is_oa") and oa.get("oa_url"):
             pdf_url = oa["oa_url"]
         
@@ -725,6 +803,9 @@ class OpenAlexService:
             if concept.get("display_name"):
                 fields.append(concept["display_name"])
         
+        primary_location = work.get("primary_location") or {}
+        primary_source = primary_location.get("source") or {}
+
         return PaperResult(
             source="openalex",
             external_id=openalex_id,
@@ -732,10 +813,10 @@ class OpenAlexService:
             abstract=work.get("abstract", None),  # OpenAlex 通常不返回摘要
             authors=authors,
             year=work.get("publication_year"),
-            venue=work.get("primary_location", {}).get("source", {}).get("display_name"),
+            venue=primary_source.get("display_name"),
             citation_count=work.get("cited_by_count", 0),
             reference_count=len(work.get("referenced_works", [])),
-            url=work.get("id"),
+            url=primary_location.get("landing_page_url") or work.get("id"),
             pdf_url=pdf_url,
             arxiv_id=None,
             doi=doi if doi else None,
@@ -792,6 +873,32 @@ class CrossRefService:
         except Exception as e:
             logger.error(f"[CrossRef] 搜索错误: {e}")
             return {"total": 0, "papers": [], "error": str(e)}
+
+    async def get_paper_by_doi(self, doi: str) -> Optional[PaperResult]:
+        """按 DOI 获取 CrossRef 元数据。"""
+        normalized = str(doi or "").strip()
+        normalized = re.sub(r"^(?:https?://)?(?:dx\.)?doi\.org/", "", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"^doi:\s*", "", normalized, flags=re.IGNORECASE)
+        if not normalized:
+            return None
+
+        headers = {}
+        if self.email:
+            headers["User-Agent"] = f"ResearchAssistant/1.0 (mailto:{self.email})"
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(f"{self.BASE_URL}/{quote(normalized, safe='')}", headers=headers)
+                if response.status_code != 200:
+                    logger.error(f"[CrossRef] DOI 获取论文失败: {response.status_code}")
+                    return None
+                message = response.json().get("message", {})
+                if not isinstance(message, dict) or not message:
+                    return None
+                return self._parse_item(message)
+        except Exception as e:
+            logger.error(f"[CrossRef] DOI 获取论文错误: {e}")
+            return None
     
     def _parse_item(self, item: dict) -> PaperResult:
         """解析 CrossRef 条目"""
@@ -823,11 +930,16 @@ class CrossRefService:
         # DOI
         doi = item.get("DOI", "")
         
+        abstract = item.get("abstract")
+        if isinstance(abstract, str) and "<" in abstract:
+            abstract = re.sub(r"<[^>]+>", " ", abstract)
+            abstract = re.sub(r"\s+", " ", abstract).strip()
+
         return PaperResult(
             source="crossref",
             external_id=doi,
             title=item.get("title", [""])[0] if item.get("title") else "",
-            abstract=item.get("abstract"),
+            abstract=abstract,
             authors=authors,
             year=year,
             venue=venue,
@@ -844,6 +956,12 @@ class CrossRefService:
 
 class LiteratureService:
     """统一文献服务"""
+
+    MULTI_SOURCE_PRIORITY = {
+        "semantic_scholar": 3,
+        "pubmed": 2,
+        "arxiv": 1,
+    }
     
     def __init__(self):
         self.s2 = SemanticScholarService()
@@ -895,39 +1013,69 @@ class LiteratureService:
     @staticmethod
     def _pick_better_paper(current: PaperResult, candidate: PaperResult) -> PaperResult:
         current_rank = (
+            1 if (current.abstract or "").strip() else 0,
+            1 if (current.pdf_url or "").strip() else 0,
+            1 if (current.doi or "").strip() else 0,
             int(current.citation_count or 0),
+            int(current.reference_count or 0),
             int(current.year or 0),
+            len(current.authors or []),
+            len(current.fields_of_study or []),
             len(current.abstract or ""),
         )
         candidate_rank = (
+            1 if (candidate.abstract or "").strip() else 0,
+            1 if (candidate.pdf_url or "").strip() else 0,
+            1 if (candidate.doi or "").strip() else 0,
             int(candidate.citation_count or 0),
+            int(candidate.reference_count or 0),
             int(candidate.year or 0),
+            len(candidate.authors or []),
+            len(candidate.fields_of_study or []),
             len(candidate.abstract or ""),
         )
         return candidate if candidate_rank > current_rank else current
+
+    @classmethod
+    def _multi_sort_key(cls, paper: PaperResult) -> tuple:
+        raw_data = paper.raw_data or {}
+        source_rank = int(raw_data.get("_multi_source_rank", 10_000))
+        return (
+            max(0, 10_000 - source_rank),
+            cls.MULTI_SOURCE_PRIORITY.get(paper.source, 0),
+            int(paper.citation_count or 0),
+            int(paper.year or 0),
+            1 if (paper.abstract or "").strip() else 0,
+            1 if (paper.pdf_url or "").strip() else 0,
+        )
 
     async def search_multi(
         self,
         query: str,
         limit_per_source: int = 5,
+        offset: int = 0,
         year_range: Optional[tuple] = None,
     ) -> Dict[str, Any]:
         """三源并行搜索并融合去重（Semantic Scholar + arXiv + PubMed）。"""
         limit_per_source = max(1, int(limit_per_source))
+        offset = max(0, int(offset))
+        fetch_limit = min(max(limit_per_source + offset, limit_per_source), 100)
 
         tasks = {
             "semantic_scholar": self.s2.search(
                 query,
-                limit=limit_per_source,
+                limit=fetch_limit,
+                offset=0,
                 year_range=year_range,
             ),
-            "arxiv": self.arxiv.search(query, limit=limit_per_source),
-            "pubmed": self.pubmed.search(query, limit=limit_per_source),
+            "arxiv": self.arxiv.search(query, limit=fetch_limit, offset=0),
+            "pubmed": self.pubmed.search(query, limit=fetch_limit, offset=0),
         }
         settled = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         merged: Dict[str, PaperResult] = {}
         source_totals: Dict[str, int] = {}
+        source_seen_counts: Dict[str, int] = {}
         errors: Dict[str, str] = {}
 
         for source_name, result in zip(tasks.keys(), settled):
@@ -942,27 +1090,42 @@ class LiteratureService:
                 continue
 
             papers: List[PaperResult] = [p for p in result.get("papers", []) if isinstance(p, PaperResult)]
-            source_totals[source_name] = len(papers)
+            source_totals[source_name] = int(result.get("total", len(papers)) or 0)
+            source_seen_counts[source_name] = len(papers)
             if result.get("error"):
                 errors[source_name] = str(result["error"])
 
-            for paper in papers:
+            for source_rank, paper in enumerate(papers):
+                raw_data = dict(paper.raw_data or {})
+                raw_data["_multi_source_rank"] = int(source_rank)
+                raw_data["_multi_fetch_limit"] = int(fetch_limit)
+                paper.raw_data = raw_data
                 key = self._paper_dedupe_key(paper)
                 existing = merged.get(key)
                 merged[key] = paper if existing is None else self._pick_better_paper(existing, paper)
 
         deduped = list(merged.values())
-        deduped.sort(
-            key=lambda p: (
-                int(p.citation_count or 0),
-                int(p.year or 0),
-            ),
-            reverse=True,
+        deduped.sort(key=self._multi_sort_key, reverse=True)
+        page = deduped[offset: offset + limit_per_source]
+        has_unfetched_candidates = any(
+            int(source_totals.get(source_name, 0) or 0) > int(source_seen_counts.get(source_name, 0) or 0)
+            for source_name in source_totals.keys()
+        )
+        estimated_total = (
+            max(len(deduped), sum(source_totals.values()))
+            if has_unfetched_candidates
+            else len(deduped)
+        )
+        has_more = (offset + limit_per_source) < len(deduped) or any(
+            int(source_totals.get(source_name, 0) or 0) > int(source_seen_counts.get(source_name, 0) or 0)
+            for source_name in source_totals.keys()
         )
 
         payload: Dict[str, Any] = {
-            "total": len(deduped),
-            "papers": deduped,
+            "total": estimated_total,
+            "offset": offset,
+            "has_more": has_more,
+            "papers": page,
             "sources": source_totals,
         }
         if errors:
@@ -998,26 +1161,43 @@ class LiteratureService:
         self,
         pdf_url: str,
         save_path: str
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """下载 PDF"""
         logger.info(f"[Literature] 下载 PDF: {pdf_url}")
         
         try:
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=60.0,
+                follow_redirects=True,
+                headers={"User-Agent": "ResearchAssistant/1.0"},
+            ) as client:
                 response = await client.get(pdf_url)
-                
-                if response.status_code == 200:
-                    with open(save_path, 'wb') as f:
-                        f.write(response.content)
-                    logger.info(f"[Literature] PDF 下载成功: {save_path}")
-                    return True
-                else:
-                    logger.error(f"[Literature] PDF 下载失败: {response.status_code}")
-                    return False
-                    
+
+                if response.status_code != 200:
+                    detail = f"PDF 下载失败，上游返回 {response.status_code}"
+                    logger.error(f"[Literature] {detail}: {pdf_url}")
+                    return False, detail
+
+                content = response.content or b""
+                content_type = str(response.headers.get("content-type") or "").strip().lower()
+                if not content.startswith(b"%PDF-"):
+                    detail = "下载链接未返回有效 PDF 文件"
+                    if content_type and "pdf" not in content_type:
+                        detail = f"{detail}（content-type: {content_type}）"
+                    logger.error(f"[Literature] {detail}: {pdf_url}")
+                    return False, detail
+
+                with open(save_path, 'wb') as f:
+                    f.write(content)
+                logger.info(f"[Literature] PDF 下载成功: {save_path}")
+                return True, ""
+        except httpx.TimeoutException:
+            detail = "PDF 下载超时，请稍后重试"
+            logger.error(f"[Literature] {detail}: {pdf_url}")
+            return False, detail
         except Exception as e:
             logger.error(f"[Literature] PDF 下载错误: {e}")
-            return False
+            return False, "PDF 下载请求失败，请稍后重试"
 
 
 # 单例

@@ -2,13 +2,16 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.api import literature as literature_api
 from app.config import settings
+from app.schemas.literature import ReaderComposePayload
 from app.services import literature_reader_compose_service as compose_module
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_compose_service import ReaderComposeBuildMeta
@@ -158,6 +161,18 @@ def test_should_rebuild_cached_payload_for_simplified_fallback_without_atoms():
     assert should_not_rebuild is False
 
 
+def test_should_rebuild_cached_payload_for_stale_engine_version():
+    service = LiteratureReaderComposeService()
+    should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
+        {
+            "status": "done",
+            "build_mode": "compose_agent_layout_uid_v1",
+            "engine_version": "reader_compose_v7",
+        }
+    )
+    assert should_rebuild is True
+
+
 def test_should_not_rebuild_cached_payload_for_simplified_fallback_with_meaningful_reading_flow():
     service = LiteratureReaderComposeService()
     should_rebuild = service._should_rebuild_cached_payload(  # pylint: disable=protected-access
@@ -191,6 +206,113 @@ def test_should_not_rebuild_cached_payload_for_simplified_fallback_with_meaningf
         }
     )
     assert should_rebuild is False
+
+
+def test_build_enrichment_bundle_should_include_reading_flow_targets_only():
+    service = LiteratureReaderComposeService()
+    bundle = service._build_enrichment_bundle(  # pylint: disable=protected-access
+        page=7,
+        payload={},
+        ui_plan={
+            "components": [
+                {
+                    "id": "sec-1",
+                    "type": "SectionHeading",
+                    "props": {"text": "Results"},
+                    "source_block_ids": ["p7_b1"],
+                    "source_anchor_refs": [],
+                    "children": [],
+                },
+                {
+                    "id": "p-1",
+                    "type": "ParagraphProse",
+                    "props": {
+                        "paragraphs": [
+                            {"text": "We first examined the frequency of insight."},
+                            {"text": "Insight frequency was generally consistent between exam type and format."},
+                        ]
+                    },
+                    "source_block_ids": ["p7_b2", "p7_b3"],
+                    "source_anchor_refs": [],
+                    "children": [],
+                },
+                {
+                    "id": "fig-1",
+                    "type": "FigurePanel",
+                    "props": {"source_label": "Fig 3", "caption": "Concordance and insight of ChatGPT on USMLE."},
+                    "source_block_ids": ["p7_fig"],
+                    "source_anchor_refs": [],
+                    "children": [],
+                },
+                {
+                    "id": "ctx-1",
+                    "type": "ContextRail",
+                    "props": {"title": "Context", "items": [{"text": "doi info"}]},
+                    "source_block_ids": ["p7_ctx"],
+                    "source_anchor_refs": [],
+                    "zone_type": "side_context",
+                    "children": [],
+                },
+            ]
+        },
+    )
+
+    targets = list(bundle.get("targets") or [])
+    assert [str(item.get("node_id") or "") for item in targets] == ["sec-1", "p-1", "fig-1"]
+    assert bundle.get("meta", {}).get("target_count") == 3
+    assert targets[1]["section_label"] == "Results"
+    assert targets[2]["figure_label"] == "Fig 3"
+    assert "figure_explainer" in list(targets[2].get("suggested_resource_types") or [])
+
+
+def test_ensure_payload_contract_should_attach_enrichment_bundle():
+    service = LiteratureReaderComposeService()
+    payload = service._ensure_payload_contract(  # pylint: disable=protected-access
+        page=6,
+        payload={
+            "paper_id": 78,
+            "page": 6,
+            "status": "done",
+            "degraded_reason": "",
+            "quality_report": _score(0.9, True, 0.86),
+            "validation_report": _validation_report_stub(True),
+            "ui_plan": {
+                "plan_id": "plan-1",
+                "components": [
+                    {
+                        "id": "abstract-1",
+                        "type": "AbstractCard",
+                        "props": {"text": "This study evaluates ChatGPT on USMLE style assessments."},
+                        "source_block_ids": ["p6_abs"],
+                        "source_anchor_refs": [],
+                        "children": [],
+                    },
+                    {
+                        "id": "meta-1",
+                        "type": "MetadataSidebarCard",
+                        "props": {"items": []},
+                        "source_block_ids": ["p6_meta"],
+                        "source_anchor_refs": [],
+                        "zone_type": "side_context",
+                        "children": [],
+                    },
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+        },
+    )
+
+    enrichment_bundle = dict(payload.get("enrichment_bundle") or {})
+    targets = list(enrichment_bundle.get("targets") or [])
+    assert len(targets) == 1
+    assert targets[0]["node_id"] == "abstract-1"
+    assert targets[0]["target_kind"] == "structure"
+    generative_reader_plan = dict(payload.get("generative_reader_plan") or {})
+    assert generative_reader_plan.get("shell_mode") == "resource_augmented_reader"
+    assert generative_reader_plan.get("status") == "draft"
+    assert isinstance(generative_reader_plan.get("interaction_modules"), list)
 
 
 def test_compatible_source_signature_prefix_should_strip_hash_only():
@@ -739,6 +861,8 @@ def test_sanitize_components_for_runtime_should_clean_noisy_figure_meta_and_merg
         "for inputs encoded as open-ended questions or multiple choice single answer. "
         "answer without (MC-NJ) or with forced justification(MC-J)."
     )
+    assert "Open-Ended100-Accurate" not in str(figure_props.get("ai_insight") or "")
+    assert "Fig 2. Accuracy of ChatGPT on USMLE." in str(figure_props.get("ai_insight") or "")
     assert str(figure_props.get("source_label") or "") == "Fig 2"
     assert list(figure.get("source_block_ids") or []) == ["p6_fig_meta", "p6_cap_1", "p6_cap_2", "p6_cap_3"]
     assert str((sanitized[1] or {}).get("props", {}).get("text") or "") == (
@@ -2356,6 +2480,190 @@ async def test_build_or_get_composed_payload_should_reuse_compatible_db_cache_be
 
 
 @pytest.mark.asyncio
+async def test_read_compatible_payload_from_db_should_ignore_other_pipeline_version(monkeypatch):
+    service = LiteratureReaderComposeService()
+    compatible_payload = {
+        "paper_id": 78,
+        "page": 7,
+        "status": "done",
+        "build_mode": "compose_agent_simplified",
+        "engine_version": "reader_compose_v8",
+        "pipeline_version": "simplified_v2",
+        "source_signature": (
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:simplified_v2|mode:auto/light/standard/0/0|h:oldhashvalue123456789012"
+        ),
+        "ui_plan": {"plan_id": "plan_cached", "components": []},
+    }
+
+    class _Rows:
+        def __init__(self, items):
+            self._items = items
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._items)
+
+    class _Db:
+        async def execute(self, _stmt):
+            return _Rows(
+                [
+                    SimpleNamespace(
+                        source_signature=str(compatible_payload.get("source_signature") or ""),
+                        payload_json=dict(compatible_payload),
+                    )
+                ]
+            )
+
+    payload = await service._read_compatible_payload_from_db(  # pylint: disable=protected-access
+        db=_Db(),
+        paper_id=78,
+        page=7,
+        source_signature=(
+            "compose_v3|p:78|kb:84|m:1772896437|s:1065400|pm:single_agent_v2|"
+            "pv:layout_uid_v1|mode:auto/light/standard/0/0|h:newhashvalue123456789012"
+        ),
+        pipeline_version="layout_uid_v1",
+    )
+
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_read_payload_from_db_should_persist_repaired_grounding_contract():
+    service = LiteratureReaderComposeService()
+    original_payload = {
+        "paper_id": 85,
+        "page": 8,
+        "status": "done",
+        "engine_version": "reader_compose_v15",
+        "pipeline_version": "layout_uid_v1",
+        "source_signature": "sig",
+        "build_mode": "compose_agent_layout_uid_v1",
+        "ui_plan": {
+            "plan_id": "plan_cached",
+            "components": [
+                {
+                    "id": "g3",
+                    "type": "ListBlock",
+                    "props": {"items": ["1. llama.cpp^6 for 4-bit (Q4_K_M)"]},
+                    "source_atom_ids": ["layout_list_1"],
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "source_anchor_refs": [
+                        {
+                            "anchor_id": "layout_uid_v1:layout_list_1",
+                            "coord_version": "layout_uid_v1",
+                            "source_layout_id": "layout_list_1",
+                            "quote_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                            "geometry": {"polygons": [], "page_width": 1232, "page_height": 1843},
+                            "bbox_hint": {"x0": 319, "x1": 1232, "top": 386, "bottom": 440, "page_width": 1232, "page_height": 1843},
+                        }
+                    ],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "page": 8,
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_list_1",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "node_kind": "list",
+                    "reading_order": 1,
+                    "raw_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "normalized_text": "1. llama.cpp^6 for 4-bit (Q4_K_M)",
+                    "canonical_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                            "pos": [
+                                {"x": 319, "y": 386},
+                                {"x": 1232, "y": 386},
+                                {"x": 1232, "y": 440},
+                                {"x": 319, "y": 440},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "evidence_map": [
+                {
+                    "source_layout_id": "layout_list_1",
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ],
+                    "block_positions": [[
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ]],
+                }
+                ],
+                "page_image": {
+                    "url": "https://example.com/docmind/page_8.png",
+                    "path": "",
+                    "width": 1360,
+                    "height": 1760,
+                    "source": "docmind_page_image_remote",
+                },
+            },
+        "docmind_structure": {"layouts": []},
+        "page_structure_v3": {"block_groups": []},
+    }
+
+    row = SimpleNamespace(payload_json=dict(original_payload), paper_id=85, page=8, source_signature="sig")
+
+    class _Result:
+        @staticmethod
+        def scalar_one_or_none():
+            return row
+
+    class _Db:
+        def __init__(self):
+            self.commits = 0
+
+        async def execute(self, _stmt):
+            return _Result()
+
+        async def commit(self):
+            self.commits += 1
+
+    db = _Db()
+    payload = await service._read_payload_from_db(  # pylint: disable=protected-access
+        db=db,
+        paper_id=85,
+        page=8,
+        source_signature="sig",
+    )
+
+    assert db.commits == 1
+    assert str((payload.get("ui_plan") or {}).get("components")[0]["source_anchor_refs"][0]["quote_text"]) == "1. llama.cpp^6 for 4-bit (Q4_K_M)"
+    assert int((((payload.get("ui_plan") or {}).get("components")[0]["source_anchor_refs"][0].get("geometry") or {}).get("page_width")) or 0) == 1360
+    assert str((row.payload_json.get("ui_plan") or {}).get("components")[0]["source_anchor_refs"][0]["quote_text"]) == "1. llama.cpp^6 for 4-bit (Q4_K_M)"
+
+
+@pytest.mark.asyncio
 async def test_reader_compose_react_stop_by_quality_threshold(monkeypatch):
     service = LiteratureReaderComposeService()
 
@@ -3363,6 +3671,11 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
     service = LiteratureReaderComposeService()
     captured: dict = {}
 
+    async def _fake_get_latest_cached_payload_only(**kwargs):
+        captured["theme_mode"] = kwargs.get("theme_mode")
+        captured["citation_tldr"] = kwargs.get("citation_tldr")
+        return None
+
     async def _fake_build_or_get(**kwargs):
         captured["theme_mode"] = kwargs.get("theme_mode")
         captured["citation_tldr"] = kwargs.get("citation_tldr")
@@ -3394,6 +3707,7 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
 
     async def _fake_answer(**_kwargs):
         return "Conclusion: answerable with current paragraph evidence."
+    monkeypatch.setattr(service, "get_latest_cached_payload_only", _fake_get_latest_cached_payload_only)
     monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build_or_get)
     monkeypatch.setattr(service, "_generate_inline_answer", _fake_answer)
 
@@ -3412,6 +3726,66 @@ async def test_reader_inline_query_should_forward_theme_and_citation_flags(monke
     assert captured["theme_mode"] == "dark"
     assert captured["citation_tldr"] is True
     assert isinstance(result.get("node"), dict)
+
+
+@pytest.mark.asyncio
+async def test_prepare_inline_query_answer_should_prefer_latest_cached_payload(monkeypatch):
+    service = LiteratureReaderComposeService()
+    captured: dict = {"cached_called": 0, "build_called": 0}
+
+    async def _fake_cached(**_kwargs):
+        captured["cached_called"] += 1
+        return {
+            "ui_plan": {
+                "components": [
+                    {
+                        "id": "n1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "Cached paragraph for inline query."},
+                        "children": [],
+                        "source_block_ids": ["p1_b1"],
+                        "source_anchor_refs": [
+                            {"page": 1, "start_char": 0, "end_char": 24, "quote_text": "Cached paragraph"}
+                        ],
+                    }
+                ]
+            }
+        }
+
+    async def _fake_build(**_kwargs):
+        captured["build_called"] += 1
+        raise AssertionError("should not rebuild when latest cached payload exists")
+
+    monkeypatch.setattr(service, "get_latest_cached_payload_only", _fake_cached)
+    monkeypatch.setattr(service, "build_or_get_composed_payload", _fake_build)
+
+    result = await service.prepare_inline_query_answer(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=1),
+        page=1,
+        node_id="n1",
+        question="what is this paragraph about?",
+        scope="section",
+    )
+
+    assert captured["cached_called"] == 1
+    assert captured["build_called"] == 0
+    assert bool(result.get("disabled")) is False
+    assert "Cached paragraph" in str(result.get("context_text") or "")
+
+
+def test_build_inline_answer_prompt_should_prefer_local_answer_over_hard_refusal():
+    service = LiteratureReaderComposeService()
+    prompt = service._build_inline_answer_prompt(
+        question="这里为什么这样做？",
+        context_text="当前节点：The model uses local calibration. 证据片段：local calibration reduces error.",
+        scope="section",
+    )
+
+    assert "Prefer a useful local answer" in prompt
+    assert "Only say 当前段落证据不足" in prompt
+    assert "请使用右侧“询问”进行全文问答" not in prompt
 
 
 @pytest.mark.asyncio
@@ -5604,6 +5978,3177 @@ def test_ensure_payload_contract_should_mark_layout_monotony_for_prose_heavy_str
     assert "flowy_layout_detected" in list(quality.get("warnings") or [])
 
 
+def test_ensure_payload_contract_should_build_page_grounding_v1_from_layout_unique_ids(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(
+        service,
+        "_resolve_grounding_page_image_size",
+        lambda **_kwargs: (1483, 1920),
+    )
+    payload = {
+        "paper_id": 85,
+        "page": 1,
+        "ui_plan": {
+            "plan_id": "plan_grounding",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.91, "validation_errors": []},
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-1.png",
+            "layouts": [
+                {
+                    "index": 12,
+                    "uniqueId": "f2c5fea143e04be47159e880ebe9037b",
+                    "type": "title",
+                    "subType": "none",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE\n",
+                    "alignment": "left",
+                    "lineHeight": 9,
+                    "pos": [
+                        {"x": 484, "y": 1338},
+                        {"x": 1367, "y": 1338},
+                        {"x": 1367, "y": 1398},
+                        {"x": 484, "y": 1398},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1334},
+                                {"x": 1366, "y": 1334},
+                                {"x": 1366, "y": 1367},
+                                {"x": 481, "y": 1367},
+                            ],
+                            "styleId": 16,
+                            "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                        },
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1370},
+                                {"x": 576, "y": 1370},
+                                {"x": 576, "y": 1396},
+                                {"x": 481, "y": 1396},
+                            ],
+                            "styleId": 17,
+                            "text": " USMLE",
+                        },
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p1_dm_p1_l012_b001",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                },
+                {
+                    "block_id": "p1_dm_p1_l012_b002",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "USMLE",
+                },
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=1, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    layout_atoms = list(grounding.get("layout_atoms") or [])
+    reading_nodes = list(grounding.get("reading_nodes") or [])
+    evidence_map = list(grounding.get("evidence_map") or [])
+
+    assert str(grounding.get("version") or "") == "page_grounding_v1"
+    assert len(layout_atoms) == 1
+    assert str(layout_atoms[0].get("layout_id") or "") == "f2c5fea143e04be47159e880ebe9037b"
+    assert len(list(layout_atoms[0].get("blocks") or [])) == 2
+    assert str(layout_atoms[0].get("clean_text") or "") == "ChatGPT yields moderate accuracy approaching passing performance on USMLE"
+    assert str(layout_atoms[0].get("alignment") or "") == "left"
+    assert float(layout_atoms[0].get("line_height") or 0.0) == 9.0
+    assert list(layout_atoms[0].get("canonical_block_ids") or []) == ["p1_dm_p1_l012_b001", "p1_dm_p1_l012_b002"]
+    assert str(layout_atoms[0].get("node_kind") or "") == "title"
+    assert bool(layout_atoms[0].get("include_in_main_flow")) is True
+    assert len(reading_nodes) == 1
+    assert list(reading_nodes[0].get("source_layout_ids") or []) == ["f2c5fea143e04be47159e880ebe9037b"]
+    assert len(evidence_map) == 1
+    assert len(list(evidence_map[0].get("block_positions") or [])) == 2
+    assert dict(grounding.get("page_image") or {}) == {
+        "url": "",
+        "path": "",
+        "width": 1483,
+        "height": 1920,
+        "source": "docmind_page_image_unlocalized",
+        "origin_url": "https://example.com/page-1.png",
+        "local_cached": False,
+    }
+    assert int(((layout_atoms[0].get("blocks") or [])[0].get("style_id") or 0)) == 16
+
+
+def test_ensure_payload_contract_should_preserve_grounding_text_normalization_enrichments():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 1,
+        "ui_plan": {
+            "plan_id": "plan_grounding_preserve_normalize",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.91, "validation_errors": []},
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-1.png",
+            "layouts": [
+                {
+                    "index": 12,
+                    "uniqueId": "f2c5fea143e04be47159e880ebe9037b",
+                    "type": "title",
+                    "subType": "none",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE\n",
+                    "alignment": "left",
+                    "lineHeight": 9,
+                    "pos": [
+                        {"x": 484, "y": 1338},
+                        {"x": 1367, "y": 1338},
+                        {"x": 1367, "y": 1398},
+                        {"x": 484, "y": 1398},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1334},
+                                {"x": 1366, "y": 1334},
+                                {"x": 1366, "y": 1367},
+                                {"x": 481, "y": 1367},
+                            ],
+                            "styleId": 16,
+                            "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                        },
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1370},
+                                {"x": 576, "y": 1370},
+                                {"x": 576, "y": 1396},
+                                {"x": 481, "y": 1396},
+                            ],
+                            "styleId": 17,
+                            "text": " USMLE",
+                        },
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p1_dm_p1_l012_b001",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                },
+                {
+                    "block_id": "p1_dm_p1_l012_b002",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "USMLE",
+                },
+            ]
+        },
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "layout_atoms": [
+                {
+                    "layout_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "clean_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE",
+                    "normalized_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1",
+                    "normalization_reason": "restore superscript marker",
+                    "normalization_mode": "ocr_cleanup",
+                    "normalization_confidence": 0.96,
+                }
+            ],
+            "reading_nodes": [
+                {
+                    "node_id": "layout:f2c5fea143e04be47159e880ebe9037b",
+                    "source_layout_ids": ["f2c5fea143e04be47159e880ebe9037b"],
+                    "normalized_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1",
+                    "normalization_reason": "restore superscript marker",
+                    "normalization_mode": "ocr_cleanup",
+                    "normalization_confidence": 0.96,
+                }
+            ],
+            "meta": {
+                "normalization_summary": {
+                    "item_count": 1,
+                    "items": [
+                        {
+                            "layout_id": "f2c5fea143e04be47159e880ebe9037b",
+                            "source_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE",
+                            "normalized_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1",
+                            "reason": "restore superscript marker",
+                            "mode": "ocr_cleanup",
+                            "confidence": 0.96,
+                        }
+                    ],
+                }
+            },
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=1, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    layout_atoms = list(grounding.get("layout_atoms") or [])
+    reading_nodes = list(grounding.get("reading_nodes") or [])
+    normalization_summary = dict((grounding.get("meta") or {}).get("normalization_summary") or {})
+
+    assert str(layout_atoms[0].get("normalized_text") or "") == "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1"
+    assert str(layout_atoms[0].get("normalization_reason") or "") == "restore superscript marker"
+    assert str(reading_nodes[0].get("normalized_text") or "") == "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1"
+    assert int(normalization_summary.get("item_count") or 0) == 1
+
+
+def test_ensure_payload_contract_should_backfill_grounding_text_normalizations_from_layout_advice():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 1,
+        "ui_plan": {
+            "plan_id": "plan_grounding_backfill_normalize",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.91, "validation_errors": []},
+        "layout_advice_v3": {
+            "text_normalizations": {
+                "normalization_plan": {
+                    "items": [
+                        {
+                            "layout_id": "f2c5fea143e04be47159e880ebe9037b",
+                            "source_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE",
+                            "normalized_text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1",
+                            "reason": "restore superscript marker",
+                            "mode": "ocr_cleanup",
+                            "confidence": 0.96,
+                            "changed": True,
+                        }
+                    ]
+                }
+            }
+        },
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-1.png",
+            "layouts": [
+                {
+                    "index": 12,
+                    "uniqueId": "f2c5fea143e04be47159e880ebe9037b",
+                    "type": "title",
+                    "subType": "none",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE\n",
+                    "alignment": "left",
+                    "lineHeight": 9,
+                    "pos": [
+                        {"x": 484, "y": 1338},
+                        {"x": 1367, "y": 1338},
+                        {"x": 1367, "y": 1398},
+                        {"x": 484, "y": 1398},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1334},
+                                {"x": 1366, "y": 1334},
+                                {"x": 1366, "y": 1367},
+                                {"x": 481, "y": 1367},
+                            ],
+                            "styleId": 16,
+                            "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                        },
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1370},
+                                {"x": 576, "y": 1370},
+                                {"x": 576, "y": 1396},
+                                {"x": 481, "y": 1396},
+                            ],
+                            "styleId": 17,
+                            "text": " USMLE",
+                        },
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p1_dm_p1_l012_b001",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                },
+                {
+                    "block_id": "p1_dm_p1_l012_b002",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "USMLE",
+                },
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=1, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    layout_atoms = list(grounding.get("layout_atoms") or [])
+    normalization_summary = dict((grounding.get("meta") or {}).get("normalization_summary") or {})
+
+    assert str(layout_atoms[0].get("normalized_text") or "") == "ChatGPT yields moderate accuracy approaching passing performance on USMLE^1"
+    assert str(layout_atoms[0].get("normalization_reason") or "") == "restore superscript marker"
+    assert int(normalization_summary.get("item_count") or 0) == 1
+
+
+def test_ensure_payload_contract_should_resolve_page_grounding_image_dimensions_when_missing(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(
+        service,
+        "_resolve_grounding_page_image_size",
+        lambda **_kwargs: (1483, 1920),
+    )
+    payload = {
+        "paper_id": 85,
+        "page": 3,
+        "ui_plan": {
+            "plan_id": "plan_grounding_image_dims",
+            "components": [
+                {
+                    "id": "p3_g1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Knowledge distillation paragraph."},
+                    "children": [],
+                    "source_block_ids": ["p3_dm_p3_l001_b001"],
+                    "source_anchor_refs": [],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-3.png",
+            "layouts": [
+                {
+                    "index": 1,
+                    "uniqueId": "layout_para_1",
+                    "type": "text",
+                    "subType": "para",
+                    "text": "Knowledge distillation paragraph.\n",
+                    "pos": [
+                        {"x": 256, "y": 254},
+                        {"x": 1220, "y": 254},
+                        {"x": 1220, "y": 286},
+                        {"x": 256, "y": 286},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 256, "y": 254},
+                                {"x": 1220, "y": 254},
+                                {"x": 1220, "y": 286},
+                                {"x": 256, "y": 286},
+                            ],
+                            "text": "Knowledge distillation paragraph.",
+                        }
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p3_dm_p3_l001_b001",
+                    "layout_unique_id": "layout_para_1",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "Knowledge distillation paragraph.",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=3, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    assert dict(grounding.get("page_image") or {}) == {
+        "url": "",
+        "path": "",
+        "width": 1483,
+        "height": 1920,
+        "source": "docmind_page_image_unlocalized",
+        "origin_url": "https://example.com/page-3.png",
+        "local_cached": False,
+    }
+
+    anchor = service._build_layout_uid_anchor_from_grounding(  # pylint: disable=protected-access
+        page=3,
+        payload=ensured,
+        layout_id="layout_para_1",
+        quote_text="Knowledge distillation paragraph.",
+        canonical_block_ids=["p3_dm_p3_l001_b001"],
+    )
+    assert isinstance(anchor, dict)
+    assert int((((anchor or {}).get("geometry") or {}).get("page_width") or 0)) == 1483
+    assert int((((anchor or {}).get("geometry") or {}).get("page_height") or 0)) == 1920
+    assert int((((anchor or {}).get("bbox_hint") or {}).get("page_width") or 0)) == 1483
+    assert int((((anchor or {}).get("bbox_hint") or {}).get("page_height") or 0)) == 1920
+
+
+def test_ensure_payload_contract_should_keep_doi_layout_outside_main_flow_in_page_grounding():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 78,
+        "page": 1,
+        "ui_plan": {
+            "plan_id": "plan_grounding_doi",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 7,
+                    "uniqueId": "0f87aa876d6a32d6bbc3a990d753f5d8",
+                    "type": "text",
+                    "subType": "para",
+                    "text": "https://doi.org/10.1371/journal.pdig.0000198.g003\n",
+                    "pos": [
+                        {"x": 110, "y": 1275},
+                        {"x": 477, "y": 1275},
+                        {"x": 477, "y": 1296},
+                        {"x": 110, "y": 1296},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 108, "y": 1274},
+                                {"x": 479, "y": 1274},
+                                {"x": 479, "y": 1294},
+                                {"x": 108, "y": 1294},
+                            ],
+                            "styleId": 8,
+                            "text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+                        }
+                    ],
+                }
+            ]
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p1_dm_p1_l007_b001",
+                    "layout_unique_id": "0f87aa876d6a32d6bbc3a990d753f5d8",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "https://doi.org/10.1371/journal.pdig.0000198.g003",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=1, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    reading_nodes = list(grounding.get("reading_nodes") or [])
+
+    assert len(reading_nodes) == 1
+    assert str(reading_nodes[0].get("node_kind") or "") == "doi"
+    assert bool(reading_nodes[0].get("include_in_main_flow")) is False
+    assert str(reading_nodes[0].get("region_hint") or "") == "side_context"
+
+
+def test_build_no_drop_fallback_node_should_preserve_layout_uid_evidence():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "blocks": [
+            {
+                "id": "p7_dm_p7_l004_b001",
+                "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                "source_anchor": None,
+            }
+        ],
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_l004_b001",
+                    "layout_unique_id": "layout_list_1",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                }
+            ]
+        },
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_list_1",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                    "canonical_block_ids": ["p7_dm_p7_l004_b001"],
+                    "layout_pos": [
+                        {"x": 120, "y": 200},
+                        {"x": 640, "y": 200},
+                        {"x": 640, "y": 248},
+                        {"x": 120, "y": 248},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M)",
+                            "pos": [
+                                {"x": 122, "y": 202},
+                                {"x": 638, "y": 202},
+                                {"x": 638, "y": 246},
+                                {"x": 122, "y": 246},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "evidence_map": [
+                {
+                    "source_layout_id": "layout_list_1",
+                    "source_block_ids": ["p7_dm_p7_l004_b001"],
+                    "layout_pos": [
+                        {"x": 120, "y": 200},
+                        {"x": 640, "y": 200},
+                        {"x": 640, "y": 248},
+                        {"x": 120, "y": 248},
+                    ],
+                    "block_positions": [[
+                        {"x": 122, "y": 202},
+                        {"x": 638, "y": 202},
+                        {"x": 638, "y": 246},
+                        {"x": 122, "y": 246},
+                    ]],
+                }
+            ],
+            "page_image": {
+                "width": 800,
+                "height": 1200,
+            },
+        },
+    }
+
+    node = service._build_no_drop_fallback_node(  # pylint: disable=protected-access
+        page=7,
+        payload=payload,
+        canonical_block_id="p7_dm_p7_l004_b001",
+        seq=1,
+        existing_node_ids=set(),
+    )
+
+    assert list(node.get("source_atom_ids") or []) == ["layout_list_1"]
+    assert list(node.get("source_layout_ids") or []) == ["layout_list_1"]
+    anchors = list(node.get("source_anchor_refs") or [])
+    assert len(anchors) == 1
+    assert str(anchors[0].get("coord_version") or "") == "layout_uid_v1"
+    assert str(anchors[0].get("source_layout_id") or "") == "layout_list_1"
+    assert "jump_anchor" in list(node.get("capabilities") or [])
+
+
+def test_ensure_payload_contract_should_preserve_docmind_table_cells_in_page_grounding():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 7,
+        "ui_plan": {
+            "plan_id": "plan_grounding_table_cells",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 2,
+                    "uniqueId": "table_layout_1",
+                    "type": "table",
+                    "subType": "none",
+                    "text": "| Model | Score |\n| Q8_0 | 71.68 |\n| Q4KM | 71.24 |\n",
+                    "pos": [
+                        {"x": 248, "y": 583},
+                        {"x": 1239, "y": 583},
+                        {"x": 1239, "y": 1302},
+                        {"x": 248, "y": 1302},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 248, "y": 583},
+                                {"x": 1239, "y": 583},
+                                {"x": 1239, "y": 1302},
+                                {"x": 248, "y": 1302},
+                            ],
+                            "styleId": 0,
+                            "text": "| Model | Score |\n| Q8_0 | 71.68 |\n| Q4KM | 71.24 |",
+                        }
+                    ],
+                    "cells": [
+                        {
+                            "cellId": 0,
+                            "xsc": 0,
+                            "xec": 0,
+                            "ysc": 0,
+                            "yec": 0,
+                            "pos": [[100, 100, 220, 100, 220, 124, 100, 124]],
+                            "layouts": [
+                                {
+                                    "uniqueId": "table_layout_1_r0c0",
+                                    "text": "Model\n",
+                                    "pos": [
+                                        {"x": 100, "y": 100},
+                                        {"x": 220, "y": 100},
+                                        {"x": 220, "y": 124},
+                                        {"x": 100, "y": 124},
+                                    ],
+                                    "blocks": [
+                                        {
+                                            "pos": [
+                                                {"x": 100, "y": 100},
+                                                {"x": 220, "y": 100},
+                                                {"x": 220, "y": 124},
+                                                {"x": 100, "y": 124},
+                                            ],
+                                            "text": "Model",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "cellId": 1,
+                            "xsc": 1,
+                            "xec": 1,
+                            "ysc": 0,
+                            "yec": 0,
+                            "pos": [[280, 100, 390, 100, 390, 124, 280, 124]],
+                            "layouts": [
+                                {
+                                    "uniqueId": "table_layout_1_r0c1",
+                                    "text": "Score\n",
+                                    "pos": [
+                                        {"x": 280, "y": 100},
+                                        {"x": 390, "y": 100},
+                                        {"x": 390, "y": 124},
+                                        {"x": 280, "y": 124},
+                                    ],
+                                    "blocks": [
+                                        {
+                                            "pos": [
+                                                {"x": 280, "y": 100},
+                                                {"x": 390, "y": 100},
+                                                {"x": 390, "y": 124},
+                                                {"x": 280, "y": 124},
+                                            ],
+                                            "text": "Score",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ]
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_l003_b001",
+                    "layout_unique_id": "table_layout_1",
+                    "kind": "table",
+                    "zone_type": "main_body",
+                    "text": "| Model | Score |",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=7, payload=payload)  # pylint: disable=protected-access
+    grounding = dict(ensured.get("page_grounding_v1") or {})
+    layout_atoms = list(grounding.get("layout_atoms") or [])
+    evidence_map = list(grounding.get("evidence_map") or [])
+
+    assert len(layout_atoms) == 1
+    table_atom = dict(layout_atoms[0] or {})
+    assert str(table_atom.get("node_kind") or "") == "table"
+    table_cells = list(table_atom.get("table_cells") or [])
+    assert len(table_cells) == 2
+    assert str(table_cells[0].get("text") or "") == "Model"
+    assert list(table_cells[0].get("layout_ids") or []) == ["table_layout_1_r0c0"]
+    assert len(list((evidence_map[0] or {}).get("table_cells") or [])) == 2
+
+
+def test_reader_compose_payload_schema_should_keep_grounding_table_cells():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 7,
+        "ui_plan": {
+            "plan_id": "plan_grounding_table_cells_schema",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "layouts": [
+                {
+                    "index": 2,
+                    "uniqueId": "table_layout_schema_1",
+                    "type": "table",
+                    "subType": "none",
+                    "text": "| Model | Score |",
+                    "pos": [
+                        {"x": 248, "y": 583},
+                        {"x": 1239, "y": 583},
+                        {"x": 1239, "y": 1302},
+                        {"x": 248, "y": 1302},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 248, "y": 583},
+                                {"x": 1239, "y": 583},
+                                {"x": 1239, "y": 1302},
+                                {"x": 248, "y": 1302},
+                            ],
+                            "styleId": 0,
+                            "text": "| Model | Score |",
+                        }
+                    ],
+                    "cells": [
+                        {
+                            "cellId": 0,
+                            "xsc": 0,
+                            "xec": 0,
+                            "ysc": 0,
+                            "yec": 0,
+                            "pos": [[100, 100, 220, 100, 220, 124, 100, 124]],
+                            "layouts": [
+                                {
+                                    "uniqueId": "table_layout_schema_1_r0c0",
+                                    "text": "Model\n",
+                                    "pos": [
+                                        {"x": 100, "y": 100},
+                                        {"x": 220, "y": 100},
+                                        {"x": 220, "y": 124},
+                                        {"x": 100, "y": 124},
+                                    ],
+                                    "blocks": [
+                                        {
+                                            "pos": [
+                                                {"x": 100, "y": 100},
+                                                {"x": 220, "y": 100},
+                                                {"x": 220, "y": 124},
+                                                {"x": 100, "y": 124},
+                                            ],
+                                            "text": "Model",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p7_dm_p7_l003_b001",
+                    "layout_unique_id": "table_layout_schema_1",
+                    "kind": "table",
+                    "zone_type": "main_body",
+                    "text": "| Model | Score |",
+                }
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=7, payload=payload)  # pylint: disable=protected-access
+    serialized = ReaderComposePayload.model_validate(ensured).model_dump(mode="python")
+    grounding = dict(serialized.get("page_grounding_v1") or {})
+    table_atom = dict((grounding.get("layout_atoms") or [])[0] or {})
+    evidence_row = dict((grounding.get("evidence_map") or [])[0] or {})
+
+    assert len(list(table_atom.get("table_cells") or [])) == 1
+    assert len(list(evidence_row.get("table_cells") or [])) == 1
+
+
+def test_pipeline_version_should_default_to_layout_uid_v1_when_unset(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_version", "")
+
+    assert service._pipeline_version() == "layout_uid_v1"  # pylint: disable=protected-access
+
+
+def test_build_page_grounding_v1_should_localize_remote_page_image_when_path_missing(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+
+    class _FakeHeaders:
+        @staticmethod
+        def get_content_type():
+            return "image/png"
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def info(self):
+            return _FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    image_bytes = BytesIO()
+    from PIL import Image
+    Image.new("RGB", (32, 48), color="white").save(image_bytes, format="PNG")
+
+    monkeypatch.setattr(compose_module, "urlopen", lambda *_args, **_kwargs: _FakeResponse(image_bytes.getvalue()))
+
+    grounding = service._build_page_grounding_v1(  # pylint: disable=protected-access
+        page=7,
+        payload={
+            "paper_id": 85,
+            "docmind_structure": {
+                "layouts": [],
+                "page_image_url": "https://example.com/docmind/page7.png",
+                "page_image_path": "",
+            },
+            "page_structure_v3": {"block_groups": []},
+        },
+    )
+
+    page_image = dict(grounding.get("page_image") or {})
+    localized_path = str(page_image.get("path") or "")
+    assert localized_path
+    assert os.path.exists(localized_path)
+    assert localized_path.endswith(".png")
+    assert str(page_image.get("source") or "") == "docmind_page_image_localized"
+    assert str(page_image.get("origin_url") or "") == "https://example.com/docmind/page7.png"
+    assert bool(page_image.get("local_cached")) is True
+    assert str(page_image.get("url") or "").endswith("/api/v1/literature/reader/grounding-page-assets/85/7")
+
+
+def test_build_page_grounding_v1_should_prefer_localized_docmind_image_over_render_asset(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+
+    render_dir = tmp_path / "85"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    render_path = render_dir / "page_7.jpg"
+    render_path.write_bytes(b"jpg-bytes")
+    grounding_dir = tmp_path / "paper_85" / "grounding_pages"
+    grounding_dir.mkdir(parents=True, exist_ok=True)
+    grounding_path = grounding_dir / "page_7.png"
+    grounding_path.write_bytes(b"png-bytes")
+
+    def _unexpected_urlopen(*_args, **_kwargs):
+        raise AssertionError("should not fetch remote page image when render asset exists")
+
+    monkeypatch.setattr(compose_module, "urlopen", _unexpected_urlopen)
+
+    grounding = service._build_page_grounding_v1(  # pylint: disable=protected-access
+        page=7,
+        payload={
+            "paper_id": 85,
+            "docmind_structure": {
+                "layouts": [],
+                "page_image_url": "https://example.com/docmind/page7.png",
+                "page_image_path": "",
+                "page_image_width": 1483,
+                "page_image_height": 1920,
+            },
+            "page_structure_v3": {"block_groups": []},
+        },
+    )
+
+    page_image = dict(grounding.get("page_image") or {})
+    assert str(page_image.get("source") or "") == "docmind_page_image_localized"
+    assert str(page_image.get("path") or "") == str(grounding_path)
+    assert str(page_image.get("url") or "").endswith("/api/v1/literature/reader/grounding-page-assets/85/7")
+    assert str(page_image.get("origin_url") or "") == "https://example.com/docmind/page7.png"
+    assert bool(page_image.get("local_cached")) is True
+    assert int(page_image.get("width") or 0) == 1483
+    assert int(page_image.get("height") or 0) == 1920
+
+
+def test_build_page_grounding_v1_should_not_fallback_to_render_asset_when_docmind_url_is_stale(
+    monkeypatch, tmp_path
+):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+
+    render_dir = tmp_path / "85"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    render_path = render_dir / "page_8.jpg"
+    from PIL import Image
+
+    Image.new("RGB", (1483, 1920), color="white").save(render_path, format="JPEG")
+
+    def _unexpected_urlopen(*_args, **_kwargs):
+        raise AssertionError("should not touch stale docmind page image url when render asset exists")
+
+    monkeypatch.setattr(compose_module, "urlopen", _unexpected_urlopen)
+
+    grounding = service._build_page_grounding_v1(  # pylint: disable=protected-access
+        page=8,
+        payload={
+            "paper_id": 85,
+            "docmind_structure": {
+                "layouts": [],
+                "page_image_url": "https://example.com/stale/docmind/page8.png?expires=123",
+                "page_image_path": "",
+                "page_image_width": 0,
+                "page_image_height": 0,
+            },
+            "page_structure_v3": {"block_groups": []},
+        },
+    )
+
+    page_image = dict(grounding.get("page_image") or {})
+    assert str(page_image.get("source") or "") == "docmind_page_image_unlocalized"
+    assert str(page_image.get("url") or "") == ""
+    assert str(page_image.get("path") or "") == ""
+    assert str(page_image.get("origin_url") or "") == "https://example.com/stale/docmind/page8.png?expires=123"
+    assert bool(page_image.get("local_cached")) is False
+    assert page_image.get("width") in (None, 0)
+    assert page_image.get("height") in (None, 0)
+
+
+def test_ensure_payload_contract_should_refresh_layout_uid_anchors_from_current_grounding():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 85,
+        "page": 8,
+        "engine_version": "reader_compose_v15",
+        "source_signature": "sig",
+        "build_mode": "compose_agent_layout_uid_v1",
+        "ui_plan": {
+            "plan_id": "plan_anchor_refresh",
+            "components": [
+                {
+                    "id": "g3",
+                    "type": "ListBlock",
+                    "props": {"items": ["1. llama.cpp^6 for 4-bit (Q4_K_M)"]},
+                    "source_atom_ids": ["layout_list_1"],
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "source_anchor_refs": [
+                        {
+                            "anchor_id": "layout_uid_v1:layout_list_1",
+                            "coord_version": "layout_uid_v1",
+                            "source_layout_id": "layout_list_1",
+                            "quote_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                            "geometry": {"polygons": [], "page_width": 1232, "page_height": 1843},
+                            "bbox_hint": {"x0": 319, "x1": 1232, "top": 386, "bottom": 440, "page_width": 1232, "page_height": 1843},
+                        }
+                    ],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "page": 8,
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_list_1",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "node_kind": "list",
+                    "reading_order": 1,
+                    "raw_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "normalized_text": "1. llama.cpp^6 for 4-bit (Q4_K_M)",
+                    "canonical_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                            "pos": [
+                                {"x": 319, "y": 386},
+                                {"x": 1232, "y": 386},
+                                {"x": 1232, "y": 440},
+                                {"x": 319, "y": 440},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "evidence_map": [
+                {
+                    "source_layout_id": "layout_list_1",
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ],
+                    "block_positions": [[
+                        {"x": 319, "y": 386},
+                        {"x": 1232, "y": 386},
+                        {"x": 1232, "y": 440},
+                        {"x": 319, "y": 440},
+                    ]],
+                }
+            ],
+            "page_image": {
+                "url": "https://example.com/docmind/page_8.png",
+                "path": "",
+                "width": 1360,
+                "height": 1760,
+                "source": "docmind_page_image_remote",
+            },
+        },
+        "docmind_structure": {"layouts": []},
+        "page_structure_v3": {"block_groups": []},
+    }
+
+    ensured = service._ensure_payload_contract(page=8, payload=payload)  # pylint: disable=protected-access
+    components = list((((ensured.get("ui_plan") or {}).get("components") or [])))
+    refs = list((components[0] or {}).get("source_anchor_refs") or [])
+    assert len(refs) == 1
+    ref = dict(refs[0] or {})
+    assert str(ref.get("quote_text") or "") == "1. llama.cpp^6 for 4-bit (Q4_K_M)"
+    assert int((((ref.get("geometry") or {}).get("page_width")) or 0)) == 1360
+    assert int((((ref.get("geometry") or {}).get("page_height")) or 0)) == 1760
+    assert int((((ref.get("bbox_hint") or {}).get("page_width")) or 0)) == 1360
+    assert int((((ref.get("bbox_hint") or {}).get("page_height")) or 0)) == 1760
+    page_image = dict(((ensured.get("page_grounding_v1") or {}).get("page_image") or {}))
+    assert str(page_image.get("path") or "") == ""
+    assert int(page_image.get("width") or 0) == 1360
+    assert int(page_image.get("height") or 0) == 1760
+
+
+@pytest.mark.asyncio
+async def test_invoke_single_agent_model_should_localize_remote_prompt_image_for_dashscope(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(compose_module.settings, "aliyun_api_key", "test-key")
+    monkeypatch.setattr(compose_module.settings, "aliyun_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setattr(compose_module.settings, "reader_agent_model", "qwen-3.5-plus")
+
+    class _FakeHeaders:
+        @staticmethod
+        def get_content_type():
+            return "image/png"
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def info(self):
+            return _FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    image_bytes = BytesIO()
+    from PIL import Image
+    Image.new("RGB", (48, 32), color="white").save(image_bytes, format="PNG")
+
+    monkeypatch.setattr(compose_module, "urlopen", lambda *_args, **_kwargs: _FakeResponse(image_bytes.getvalue()))
+    captured = {"image_paths": []}
+
+    async def _fake_chat_json(**kwargs):
+        captured["image_paths"] = list(kwargs.get("image_paths") or [])
+        return {
+            "parsed": {
+                "status": "done",
+                "step_result": {"ok": True},
+                "self_check": {},
+                "fixes_applied": [],
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        }
+
+    monkeypatch.setattr(DashScopeMultimodalService, "is_available", staticmethod(lambda: True))
+    monkeypatch.setattr(DashScopeMultimodalService, "chat_json", _fake_chat_json)
+
+    result = await service._invoke_single_agent_model(  # pylint: disable=protected-access
+        system_prompt="Group table rows.",
+        user_prompt={"rows": []},
+        rendered_page_image="https://example.com/docmind/page7.png",
+        rendered_page_image_path="",
+        step=2,
+        phase="layout_uid_table_logical_rows:table_1",
+    )
+
+    assert result["status"] == "done"
+    assert captured["image_paths"]
+    localized_uri = str(captured["image_paths"][0])
+    assert localized_uri.startswith("file://")
+    localized_path = localized_uri.removeprefix("file://")
+    assert os.path.exists(localized_path)
+    assert localized_path.endswith(".png")
+
+
+def test_is_public_prompt_image_url_should_reject_localhost_reader_assets():
+    service = LiteratureReaderComposeService()
+
+    assert service._is_public_prompt_image_url(  # pylint: disable=protected-access
+        "http://localhost:8888/api/v1/literature/reader/page-assets/85/8"
+    ) is False
+    assert service._is_public_prompt_image_url(  # pylint: disable=protected-access
+        "https://example.com/static/page8.png"
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_invoke_single_agent_model_should_skip_localhost_image_url_in_compatible_fallback(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module.settings, "reader_agent_provider", "aliyun")
+    monkeypatch.setattr(compose_module.settings, "aliyun_api_key", "test-key")
+    monkeypatch.setattr(compose_module.settings, "aliyun_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setattr(compose_module.settings, "reader_agent_model", "qwen-3.5-plus")
+    monkeypatch.setattr(DashScopeMultimodalService, "is_available", staticmethod(lambda: False))
+
+    captured = {"messages": []}
+
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            captured["messages"] = list(kwargs.get("messages") or [])
+
+            class _Usage:
+                prompt_tokens = 10
+                completion_tokens = 4
+                total_tokens = 14
+
+            class _Message:
+                content = '{"status":"done","step_result":{"items":[]},"self_check":{},"fixes_applied":[]}'
+
+            class _Choice:
+                message = _Message()
+
+            class _Response:
+                choices = [_Choice()]
+                usage = _Usage()
+
+            return _Response()
+
+    class _FakeChat:
+        completions = _FakeCompletions()
+
+    class _FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = _FakeChat()
+
+    monkeypatch.setattr(compose_module, "AsyncOpenAI", _FakeClient)
+
+    result = await service._invoke_single_agent_model(  # pylint: disable=protected-access
+        system_prompt="Normalize display text.",
+        user_prompt={"layout_atoms": []},
+        rendered_page_image="http://localhost:8888/api/v1/literature/reader/page-assets/85/8",
+        rendered_page_image_path="",
+        step=1,
+        phase="layout_uid_text_normalization",
+    )
+
+    assert result["status"] == "done"
+    assert len(captured["messages"]) == 2
+    user_message = dict(captured["messages"][1] or {})
+    user_content = list(user_message.get("content") or [])
+    assert len(user_content) == 1
+    assert str((user_content[0] or {}).get("type") or "") == "text"
+
+
+@pytest.mark.asyncio
+async def test_build_layout_uid_pipeline_result_should_not_overwrite_grounding_page_image_with_prompt_asset(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=85, user_id=1, title="demo", pdf_path="")
+    base_payload = {
+        "paper_id": 85,
+        "page": 8,
+        "docmind_structure": {
+            "page_image_url": "https://example.com/docmind/page8.png",
+            "page_image_path": "",
+        },
+        "page_structure_v3": {"block_groups": []},
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "page": 8,
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_list_1",
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "node_kind": "list",
+                    "reading_order": 1,
+                    "raw_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "normalized_text": "",
+                    "canonical_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 348, "y": 406},
+                        {"x": 1343, "y": 406},
+                        {"x": 1343, "y": 464},
+                        {"x": 348, "y": 464},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                            "pos": [
+                                {"x": 348, "y": 406},
+                                {"x": 1343, "y": 406},
+                                {"x": 1343, "y": 464},
+                                {"x": 348, "y": 464},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "reading_nodes": [
+                {
+                    "node_id": "layout:layout_list_1",
+                    "node_kind": "list",
+                    "raw_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "normalized_text": "",
+                    "source_layout_ids": ["layout_list_1"],
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "include_in_main_flow": True,
+                    "region_hint": "main_body",
+                    "meta": {},
+                }
+            ],
+            "evidence_map": [
+                {
+                    "evidence_id": "layout:layout_list_1",
+                    "source_layout_id": "layout_list_1",
+                    "source_block_ids": ["p8_dm_p8_l004_b001"],
+                    "layout_pos": [
+                        {"x": 348, "y": 406},
+                        {"x": 1343, "y": 406},
+                        {"x": 1343, "y": 464},
+                        {"x": 348, "y": 464},
+                    ],
+                    "block_positions": [[
+                        {"x": 348, "y": 406},
+                        {"x": 1343, "y": 406},
+                        {"x": 1343, "y": 464},
+                        {"x": 348, "y": 464},
+                    ]],
+                }
+            ],
+            "page_image": {
+                "url": "http://localhost:8888/api/v1/literature/reader/grounding-page-assets/85/8",
+                "path": "/app/uploads/reader_page_assets/paper_85/grounding_pages/page_8.png",
+                "width": 1483,
+                "height": 1920,
+                "source": "docmind_page_image_localized",
+                "origin_url": "https://example.com/docmind/page8.png",
+                "local_cached": True,
+            },
+        },
+        "assets": [],
+    }
+
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        service,
+        "_resolve_reader_page_image_asset",
+        lambda **_kwargs: {
+            "url": "http://localhost:8888/api/v1/literature/reader/page-assets/85/8",
+            "path": "/app/uploads/reader_page_assets/85/page_8.jpg",
+            "source": "page_render_asset",
+            "origin_url": "",
+            "local_cached": True,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_layout_uid_text_normalization_prompt_payload",
+        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout_list_1"}]},
+    )
+
+    async def _fake_invoke_single_agent_model(**kwargs):
+        phase = str(kwargs.get("phase") or "")
+        if phase == "layout_uid_text_normalization":
+            return {
+                "status": "done",
+                "step_result": {"items": []},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            }
+        return {
+            "status": "done",
+            "step_result": {
+                "groups": [
+                    {
+                        "group_id": "group_1",
+                        "group_kind": "list",
+                        "layout_ids": ["layout_list_1"],
+                    }
+                ],
+                "omissions": [],
+                "notes": [],
+            },
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+        }
+
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
+    monkeypatch.setattr(
+        service,
+        "_normalize_layout_uid_text_normalization_plan",
+        lambda **_kwargs: ({"items": []}, {"fallback_used": False, "errors": []}),
+    )
+    monkeypatch.setattr(
+        service,
+        "_apply_layout_uid_text_normalization_to_grounding",
+        lambda **kwargs: dict(kwargs.get("grounding") or {}),
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_layout_uid_prompt_payload",
+        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout_list_1"}]},
+    )
+    monkeypatch.setattr(
+        service,
+        "_normalize_layout_uid_group_plan",
+        lambda **_kwargs: (
+            {"groups": [{"group_id": "group_1", "group_kind": "list", "layout_ids": ["layout_list_1"]}], "omissions": [], "notes": []},
+            {"fallback_used": False, "errors": []},
+        ),
+    )
+
+    async def _empty_map(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(service, "_build_layout_uid_table_refinement_map", _empty_map)
+    monkeypatch.setattr(service, "_build_layout_uid_equation_refinement_map", _empty_map)
+    monkeypatch.setattr(
+        service,
+        "_layout_uid_group_plan_to_panel_plan",
+        lambda **_kwargs: {
+            "plan_id": "layout_uid_v1_p8",
+            "panels": [
+                {
+                    "panel_id": "layout_uid_main",
+                    "nodes": [
+                        {
+                            "node_id": "group_1",
+                            "component": "ListBlock",
+                            "source_layout_ids": ["layout_list_1"],
+                            "props": {"items": ["1. llama.cpp^6 for 4-bit (Q4_K_M)"]},
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+    )
+    monkeypatch.setattr(service, "_collect_docmind_blocks_for_single_agent", lambda **_kwargs: ([], {}))
+    monkeypatch.setattr(
+        service,
+        "_panel_plan_to_ui_plan",
+        lambda **_kwargs: {
+            "plan_id": "layout_uid_v1_p8",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+    )
+
+    result = await service._build_layout_uid_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=paper,
+        page=8,
+        base_payload=base_payload,
+        style_intent=None,
+        theme_mode=None,
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=1000,
+        selected_kb_id=84,
+        pipeline_version="layout_uid_v1",
+    )
+
+    page_image = dict((((result.get("base_payload") or {}).get("page_grounding_v1") or {}).get("page_image") or {}))
+    assert str(page_image.get("source") or "") == "docmind_page_image_localized"
+    assert str(page_image.get("path") or "") == "/app/uploads/reader_page_assets/paper_85/grounding_pages/page_8.png"
+    assert int(page_image.get("width") or 0) == 1483
+    assert int(page_image.get("height") or 0) == 1920
+
+
+def test_panel_plan_to_ui_plan_should_emit_layout_geometry_anchor_and_source_atom_ids():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
+        page=7,
+        panel_plan={
+            "plan_id": "panel_plan_layout_anchor",
+            "panels": [
+                {
+                    "panel_id": "main",
+                    "nodes": [
+                        {
+                            "node_id": "title_1",
+                            "component": "SectionHeading",
+                            "source_layout_ids": ["layout_title_1"],
+                            "props": {"text": "Quantization Performance Drop", "level": 1},
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "layout_title_1",
+                "source_text": "Quantization Performance Drop",
+                "type": "title",
+            }
+        ],
+        layout_to_block_ids={"layout_title_1": ["p7_dm_title_1"]},
+        base_payload={
+            "assets": [],
+            "blocks": [],
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout_title_1",
+                        "clean_text": "Quantization Performance Drop",
+                        "raw_text": "Quantization Performance Drop",
+                        "canonical_block_ids": ["p7_dm_title_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 120},
+                            {"x": 840, "y": 120},
+                            {"x": 840, "y": 188},
+                            {"x": 120, "y": 188},
+                        ],
+                        "blocks": [
+                            {
+                                "block_index": 1,
+                                "text": "Quantization Performance",
+                                "pos": [
+                                    {"x": 120, "y": 120},
+                                    {"x": 620, "y": 120},
+                                    {"x": 620, "y": 154},
+                                    {"x": 120, "y": 154},
+                                ],
+                            },
+                            {
+                                "block_index": 2,
+                                "text": "Drop",
+                                "pos": [
+                                    {"x": 120, "y": 156},
+                                    {"x": 240, "y": 156},
+                                    {"x": 240, "y": 188},
+                                    {"x": 120, "y": 188},
+                                ],
+                            },
+                        ],
+                    }
+                ],
+                "evidence_map": [
+                    {
+                        "source_layout_id": "layout_title_1",
+                        "source_block_ids": ["p7_dm_title_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 120},
+                            {"x": 840, "y": 120},
+                            {"x": 840, "y": 188},
+                            {"x": 120, "y": 188},
+                        ],
+                        "block_positions": [
+                            [
+                                {"x": 120, "y": 120},
+                                {"x": 620, "y": 120},
+                                {"x": 620, "y": 154},
+                                {"x": 120, "y": 154},
+                            ],
+                            [
+                                {"x": 120, "y": 156},
+                                {"x": 240, "y": 156},
+                                {"x": 240, "y": 188},
+                                {"x": 120, "y": 188},
+                            ],
+                        ],
+                    }
+                ],
+                "page_image": {"width": 1600, "height": 2200},
+            },
+        },
+        style_intent=None,
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list(ui_plan.get("components") or [])
+    assert len(components) == 1
+    node = dict(components[0] or {})
+    assert list(node.get("source_atom_ids") or []) == ["layout_title_1"]
+    anchors = list(node.get("source_anchor_refs") or [])
+    assert len(anchors) == 1
+    assert str(anchors[0].get("source_layout_id") or "") == "layout_title_1"
+    assert str(anchors[0].get("coord_version") or "") == "layout_uid_v1"
+    assert str(((anchors[0].get("geometry") or {}).get("polygons") or [])[0].get("source") or "") == "page_grounding_v1"
+    assert len(list((anchors[0].get("geometry") or {}).get("polygons") or [])) == 2
+
+
+def test_build_layout_uid_prompt_payload_should_only_emit_uniqueid_atoms():
+    service = LiteratureReaderComposeService()
+    payload = {
+        "paper_id": 78,
+        "page": 1,
+        "ui_plan": {
+            "plan_id": "plan_layout_uid_prompt",
+            "components": [],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+        "quality_report": {"overall": 0.9, "validation_errors": []},
+        "docmind_structure": {
+            "page_image_url": "https://example.com/page-1.png",
+            "layouts": [
+                {
+                    "index": 12,
+                    "uniqueId": "f2c5fea143e04be47159e880ebe9037b",
+                    "type": "title",
+                    "subType": "none",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE\n",
+                    "pos": [
+                        {"x": 484, "y": 1338},
+                        {"x": 1367, "y": 1338},
+                        {"x": 1367, "y": 1398},
+                        {"x": 484, "y": 1398},
+                    ],
+                    "pageNum": [0],
+                    "blocks": [
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1334},
+                                {"x": 1366, "y": 1334},
+                                {"x": 1366, "y": 1367},
+                                {"x": 481, "y": 1367},
+                            ],
+                            "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                        },
+                        {
+                            "pos": [
+                                {"x": 481, "y": 1370},
+                                {"x": 576, "y": 1370},
+                                {"x": 576, "y": 1396},
+                                {"x": 481, "y": 1396},
+                            ],
+                            "text": " USMLE",
+                        },
+                    ],
+                }
+            ],
+        },
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p1_dm_p1_l012_b001",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "ChatGPT yields moderate accuracy approaching passing performance on",
+                },
+                {
+                    "block_id": "p1_dm_p1_l012_b002",
+                    "layout_unique_id": "f2c5fea143e04be47159e880ebe9037b",
+                    "kind": "heading",
+                    "zone_type": "main_body",
+                    "text": "USMLE",
+                },
+            ]
+        },
+    }
+
+    ensured = service._ensure_payload_contract(page=1, payload=payload)  # pylint: disable=protected-access
+    prompt_payload = service._build_layout_uid_prompt_payload(  # pylint: disable=protected-access
+        paper=SimpleNamespace(id=78, title="demo"),
+        page=1,
+        grounding=dict(ensured.get("page_grounding_v1") or {}),
+    )
+
+    compact_atoms = list(prompt_payload.get("layout_atoms") or [])
+    assert len(compact_atoms) == 1
+    assert compact_atoms[0] == {
+        "layout_id": "f2c5fea143e04be47159e880ebe9037b",
+        "reading_order": 1,
+        "layout_type": "title",
+        "layout_sub_type": "none",
+        "node_kind": "title",
+        "text": "ChatGPT yields moderate accuracy approaching passing performance on USMLE",
+        "include_in_main_flow": True,
+        "region_hint": "main_body",
+        "layout_pos": [
+            {"x": 484.0, "y": 1338.0},
+            {"x": 1367.0, "y": 1338.0},
+            {"x": 1367.0, "y": 1398.0},
+            {"x": 484.0, "y": 1398.0},
+        ],
+        "block_count": 2,
+    }
+    assert "blocks" not in compact_atoms[0]
+    assert "canonical_block_ids" not in compact_atoms[0]
+    assert str(((prompt_payload.get("rules") or {}).get("indivisible_unit")) or "") == "layout_id"
+
+
+def test_normalize_layout_uid_group_plan_should_fallback_on_duplicate_or_missing_layout_ids():
+    service = LiteratureReaderComposeService()
+    grounding = {
+        "layout_atoms": [
+            {
+                "layout_id": "L1",
+                "reading_order": 1,
+                "node_kind": "title",
+                "clean_text": "Paper title",
+                "include_in_main_flow": True,
+            },
+            {
+                "layout_id": "L2",
+                "reading_order": 2,
+                "node_kind": "paragraph",
+                "clean_text": "Body paragraph",
+                "include_in_main_flow": True,
+            },
+        ]
+    }
+
+    plan, validation = service._normalize_layout_uid_group_plan(  # pylint: disable=protected-access
+        grounding=grounding,
+        step_result={
+            "groups": [
+                {
+                    "group_id": "g1",
+                    "group_kind": "title",
+                    "source_layout_ids": ["L1", "L1"],
+                }
+            ],
+            "omissions": [],
+        },
+    )
+
+    assert bool(validation.get("passed")) is False
+    assert bool(validation.get("fallback_used")) is True
+    assert any(str(item).startswith("duplicate_layout_id:") for item in list(validation.get("errors") or []))
+    assert any(str(item).startswith("missing_layout_id:") for item in list(validation.get("errors") or []))
+    assert len(list(plan.get("groups") or [])) == 2
+
+
+def test_build_layout_uid_fallback_group_plan_should_merge_figure_with_adjacent_caption():
+    service = LiteratureReaderComposeService()
+    plan = service._build_layout_uid_fallback_group_plan(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "F1",
+                    "reading_order": 1,
+                    "node_kind": "figure",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "C1",
+                    "reading_order": 2,
+                    "node_kind": "figure_caption",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "P1",
+                    "reading_order": 3,
+                    "node_kind": "paragraph",
+                    "include_in_main_flow": True,
+                },
+            ]
+        },
+    )
+
+    groups = list(plan.get("groups") or [])
+    assert groups[0]["group_kind"] == "figure"
+    assert groups[0]["source_layout_ids"] == ["F1", "C1"]
+    assert groups[1]["group_kind"] == "paragraph"
+
+
+def test_classify_grounding_node_kind_should_detect_table_caption_and_equation():
+    service = LiteratureReaderComposeService()
+
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="text",
+        layout_sub_type="para",
+        text="Table 2. Quantization comparison across evaluation suites",
+        block_rows=[{"kind": "table_caption", "zone_type": "main_body"}],
+    ) == "table_caption"
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="text",
+        layout_sub_type="none",
+        text="y = mx^2 + b",
+        block_rows=[{"kind": "paragraph", "zone_type": "main_body"}],
+    ) == "equation"
+
+
+def test_classify_grounding_node_kind_should_not_treat_quantization_config_lists_as_equations():
+    service = LiteratureReaderComposeService()
+
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="text",
+        layout_sub_type="para",
+        text="1. llama.cpp6 for 4-bit(Q4K_M), 3-bit(Q3_K_M), 2-bit (Q2_K), and 8-bit (Q8_0) configurations",
+        block_rows=[{"kind": "paragraph", "zone_type": "main_body"}],
+    ) == "paragraph"
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="text",
+        layout_sub_type="para",
+        text="·DeepSeek-R1 2-bit: Large-scale UD-Q2_K_XL (unsloth)",
+        block_rows=[{"kind": "paragraph", "zone_type": "main_body"}],
+    ) == "paragraph"
+
+
+def test_classify_grounding_node_kind_should_treat_footnote_like_layouts_as_footer():
+    service = LiteratureReaderComposeService()
+
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="text",
+        layout_sub_type="footnote",
+        text="6 https://github.com/ggml-org/llama.cpp",
+        block_rows=[{"kind": "paragraph", "zone_type": "main_body"}],
+    ) == "footer"
+    assert service._classify_grounding_node_kind(  # pylint: disable=protected-access
+        layout_type="corner_note",
+        layout_sub_type="none",
+        text="9 https://cloud.tencent.com/document/product/1772/115963",
+        block_rows=[{"kind": "paragraph", "zone_type": "side_context"}],
+    ) == "footer"
+
+
+def test_build_layout_uid_fallback_group_plan_should_merge_table_with_adjacent_caption():
+    service = LiteratureReaderComposeService()
+    plan = service._build_layout_uid_fallback_group_plan(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "T1",
+                    "reading_order": 1,
+                    "node_kind": "table",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "TC1",
+                    "reading_order": 2,
+                    "node_kind": "table_caption",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "P1",
+                    "reading_order": 3,
+                    "node_kind": "paragraph",
+                    "include_in_main_flow": True,
+                },
+            ]
+        },
+    )
+
+    groups = list(plan.get("groups") or [])
+    assert groups[0]["group_kind"] == "table"
+    assert groups[0]["source_layout_ids"] == ["T1", "TC1"]
+    assert groups[1]["group_kind"] == "paragraph"
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_materialize_table_and_equation():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=7,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "table_group_1",
+                    "group_kind": "table",
+                    "source_layout_ids": ["table_body_1", "table_caption_1"],
+                    "rationale": "test_table_bundle",
+                },
+                {
+                    "group_id": "equation_group_1",
+                    "group_kind": "equation",
+                    "source_layout_ids": ["equation_1"],
+                    "rationale": "test_equation_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "table_body_1",
+                    "node_kind": "table",
+                    "clean_text": "Model Score",
+                    "raw_text": "Model Score",
+                    "canonical_block_ids": ["p7_dm_p7_l003_b001"],
+                    "table_cells": [
+                        {"cell_id": 0, "row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0, "text": "Model", "layout_ids": ["table_r0c0"], "polygons": [[{"x": 100, "y": 100}, {"x": 220, "y": 100}, {"x": 220, "y": 124}, {"x": 100, "y": 124}]]},
+                        {"cell_id": 1, "row_start": 0, "row_end": 0, "col_start": 1, "col_end": 1, "text": "Score", "layout_ids": ["table_r0c1"], "polygons": [[{"x": 280, "y": 100}, {"x": 390, "y": 100}, {"x": 390, "y": 124}, {"x": 280, "y": 124}]]},
+                        {"cell_id": 2, "row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0, "text": "Q8_0", "layout_ids": ["table_r1c0"], "polygons": [[{"x": 100, "y": 136}, {"x": 220, "y": 136}, {"x": 220, "y": 160}, {"x": 100, "y": 160}]]},
+                        {"cell_id": 3, "row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1, "text": "71.68", "layout_ids": ["table_r1c1"], "polygons": [[{"x": 280, "y": 136}, {"x": 390, "y": 136}, {"x": 390, "y": 160}, {"x": 280, "y": 160}]]},
+                        {"cell_id": 4, "row_start": 2, "row_end": 2, "col_start": 0, "col_end": 0, "text": "Q4KM", "layout_ids": ["table_r2c0"], "polygons": [[{"x": 100, "y": 168}, {"x": 220, "y": 168}, {"x": 220, "y": 192}, {"x": 100, "y": 192}]]},
+                        {"cell_id": 5, "row_start": 2, "row_end": 2, "col_start": 1, "col_end": 1, "text": "71.24", "layout_ids": ["table_r2c1"], "polygons": [[{"x": 280, "y": 168}, {"x": 390, "y": 168}, {"x": 390, "y": 192}, {"x": 280, "y": 192}]]},
+                    ],
+                    "blocks": [
+                        {"block_index": 1, "text": "Model", "pos": [{"x": 100, "y": 100}, {"x": 220, "y": 100}, {"x": 220, "y": 124}, {"x": 100, "y": 124}]},
+                        {"block_index": 2, "text": "Score", "pos": [{"x": 280, "y": 100}, {"x": 390, "y": 100}, {"x": 390, "y": 124}, {"x": 280, "y": 124}]},
+                        {"block_index": 3, "text": "Q8_0", "pos": [{"x": 100, "y": 136}, {"x": 220, "y": 136}, {"x": 220, "y": 160}, {"x": 100, "y": 160}]},
+                        {"block_index": 4, "text": "71.68", "pos": [{"x": 280, "y": 136}, {"x": 390, "y": 136}, {"x": 390, "y": 160}, {"x": 280, "y": 160}]},
+                        {"block_index": 5, "text": "Q4KM", "pos": [{"x": 100, "y": 168}, {"x": 220, "y": 168}, {"x": 220, "y": 192}, {"x": 100, "y": 192}]},
+                        {"block_index": 6, "text": "71.24", "pos": [{"x": 280, "y": 168}, {"x": 390, "y": 168}, {"x": 390, "y": 192}, {"x": 280, "y": 192}]},
+                    ],
+                },
+                {
+                    "layout_id": "table_caption_1",
+                    "node_kind": "table_caption",
+                    "clean_text": "Table 2. Quantization comparison across evaluation suites",
+                    "raw_text": "Table 2. Quantization comparison across evaluation suites",
+                    "blocks": [
+                        {"block_index": 1, "text": "Table 2. Quantization comparison across evaluation suites", "pos": [{"x": 100, "y": 205}, {"x": 520, "y": 205}, {"x": 520, "y": 228}, {"x": 100, "y": 228}]}
+                    ],
+                },
+                {
+                    "layout_id": "equation_1",
+                    "node_kind": "equation",
+                    "clean_text": "y = mx^2 + b",
+                    "raw_text": "y = mx^2 + b",
+                    "blocks": [
+                        {"block_index": 1, "text": "y = mx^2 + b", "pos": [{"x": 100, "y": 260}, {"x": 340, "y": 260}, {"x": 340, "y": 284}, {"x": 100, "y": 284}]}
+                    ],
+                },
+            ]
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 2
+    table_node = dict(nodes[0] or {})
+    equation_node = dict(nodes[1] or {})
+
+    assert str(table_node.get("component") or "") == "TablePanel"
+    table_props = dict(table_node.get("props") or {})
+    assert str(table_props.get("title") or "") == "Table 2. Quantization comparison across evaluation suites"
+    assert int(table_props.get("header_row_count") or 0) == 1
+    assert list(table_props.get("headers") or []) == ["Model", "Score"]
+    column_widths = list(table_props.get("column_widths") or [])
+    assert len(column_widths) == 2
+    assert abs(sum(float(item or 0.0) for item in column_widths) - 1.0) < 1e-6
+    assert list(table_props.get("matrix") or [])[0] == ["Model", "Score"]
+    assert list(table_props.get("matrix") or [])[1] == ["Q8_0", "71.68"]
+    assert len(list(table_props.get("table_cells") or [])) == 6
+    assert float((table_props.get("table_cells") or [])[0].get("x0") or 0.0) == 100.0
+    assert float((table_props.get("table_cells") or [])[1].get("x1") or 0.0) == 390.0
+    assert list(table_props.get("rows") or [])[0]["col_1"] == "Q8_0"
+    assert str(table_props.get("caption") or "") == "Table 2. Quantization comparison across evaluation suites"
+    row_evidence = list(table_props.get("row_evidence") or [])
+    cell_evidence = list(table_props.get("cell_evidence") or [])
+    assert len(row_evidence) == 3
+    assert len(cell_evidence) == 6
+    assert str((((row_evidence[1] or {}).get("anchor") or {}).get("anchor_id") or "")) == "layout_uid_v1:table_body_1:row:2"
+    assert (((row_evidence[1] or {}).get("anchor") or {}).get("geometry") or {}).get("page_width") is None
+    assert (((row_evidence[1] or {}).get("anchor") or {}).get("bbox_hint") or {}).get("page_width") is None
+    assert str((((cell_evidence[1] or {}).get("anchor") or {}).get("source_layout_id") or "")) == "table_r0c1"
+    assert list(table_node.get("source_layout_ids") or []) == ["table_body_1", "table_caption_1"]
+
+    assert str(equation_node.get("component") or "") == "EquationBlock"
+    equation_props = dict(equation_node.get("props") or {})
+    assert str(equation_props.get("latex") or "") == "y = mx^2 + b"
+    assert str(equation_props.get("render_mode") or "") == "image_first"
+    assert str(equation_props.get("transcript") or "") == "y = mx^2 + b"
+
+
+def test_build_layout_uid_equation_props_should_split_where_clause_into_description():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": r"Eq. (1) \min_x D_{\mathrm{calib}}(x) - f_{\mathrm{quant}}(x) where D_{\mathrm{calib}} denotes the calibration dataset",
+            }
+        ]
+    )
+
+    assert str(props.get("label") or "") == "Eq. (1)"
+    assert str(props.get("latex") or "") == r"\min_x D_{\mathrm{calib}}(x) - f_{\mathrm{quant}}(x)"
+    assert str(props.get("description") or "") == "where D_{\\mathrm{calib}} denotes the calibration dataset"
+    assert str(props.get("render_mode") or "") == "image_first"
+    assert str(props.get("transcript") or "") == r"Eq. (1) \min_x D_{\mathrm{calib}}(x) - f_{\mathrm{quant}}(x) where D_{\mathrm{calib}} denotes the calibration dataset"
+
+
+def test_build_layout_uid_equation_props_should_include_ai_normalization_fields():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                "raw_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+            }
+        ],
+        equation_refinement={
+            "normalized_text": "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||",
+            "normalized_latex": r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert",
+            "reason": "Recovered theta and calibration subscript from the page image and style hints.",
+            "confidence": 0.84,
+            "mode": "latex_reconstructed",
+        },
+    )
+
+    assert str(props.get("render_mode") or "") == "math_first"
+    assert str(props.get("normalized_text") or "") == "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||"
+    assert str(props.get("normalized_latex") or "") == r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert"
+    assert str(props.get("normalization_reason") or "") == "Recovered theta and calibration subscript from the page image and style hints."
+    assert float(props.get("normalization_confidence") or 0.0) == 0.84
+    assert str(props.get("normalization_mode") or "") == "latex_reconstructed"
+
+
+def test_build_layout_uid_equation_props_should_extract_label_from_standalone_block():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": "QKT Attention(Q,K,V)=softmax( 一) (1) √dk",
+                "raw_text": "QKT Attention(Q,K,V)=softmax( 一) (1) √dk",
+                "blocks": [
+                    {"text": "QKT"},
+                    {"text": "Attention(Q,K,V)=softmax("},
+                    {"text": "一)"},
+                    {"text": "(1)"},
+                    {"text": "√dk"},
+                ],
+            }
+        ],
+        equation_refinement={
+            "normalized_text": "Attention(Q, K, V) = softmax(QK^T / √d_k)V",
+            "normalized_latex": r"\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V",
+            "reason": "Recovered the standard scaled dot-product attention equation from the page image.",
+            "confidence": 0.95,
+            "mode": "latex_reconstructed",
+        },
+    )
+
+    assert str(props.get("label") or "") == "(1)"
+    assert str(props.get("render_mode") or "") == "math_first"
+
+
+def test_build_layout_uid_equation_props_should_fallback_to_image_first_without_normalized_latex():
+    service = LiteratureReaderComposeService()
+    props = service._build_layout_uid_equation_props(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "eq1",
+                "clean_text": "x = y",
+                "raw_text": "x = y",
+            }
+        ],
+        equation_refinement={
+            "normalized_text": "x = y",
+            "reason": "transcript_cleanup",
+            "confidence": 0.61,
+            "mode": "display_normalized",
+        },
+    )
+
+    assert str(props.get("render_mode") or "") == "image_first"
+    assert str(props.get("normalized_latex") or "") == ""
+
+
+def test_normalize_layout_uid_figure_refinement_should_accept_short_insight():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_figure_refinement(  # pylint: disable=protected-access
+        atoms=[
+            {
+                "layout_id": "fig_1",
+                "node_kind": "figure",
+                "clean_text": "",
+                "raw_text": "",
+            },
+            {
+                "layout_id": "fig_caption_1",
+                "node_kind": "figure_caption",
+                "clean_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                "raw_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+            },
+        ],
+        step_result={
+            "insight": "左图给出缩放点积注意力流程，右图展示多头注意力把多个注意力分支并行组合。",
+            "reason": "image_grounded_summary",
+            "confidence": 0.91,
+            "mode": "image_grounded_summary",
+        },
+    )
+
+    assert validation.get("passed") is True
+    assert str(normalized.get("ai_insight") or "") == "左图给出缩放点积注意力流程，右图展示多头注意力把多个注意力分支并行组合。"
+    assert float(normalized.get("confidence") or 0.0) == 0.91
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_apply_figure_insight():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=4,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "figure_group_1",
+                    "group_kind": "figure",
+                    "source_layout_ids": ["figure_1", "figure_caption_1"],
+                    "rationale": "test_figure_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "figure_1",
+                    "node_kind": "figure",
+                    "clean_text": "",
+                    "raw_text": "",
+                    "layout_type": "figure",
+                    "layout_sub_type": "diagram",
+                },
+                {
+                    "layout_id": "figure_caption_1",
+                    "node_kind": "figure_caption",
+                    "clean_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                    "raw_text": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                    "layout_type": "text",
+                    "layout_sub_type": "caption",
+                },
+            ]
+        },
+        figure_refinements={
+            "figure_group_1": {
+                "insight": {
+                    "ai_insight": "右图强调多个注意力分支并行计算，再将结果拼接回统一输出。",
+                    "reason": "image_grounded_summary",
+                    "confidence": 0.88,
+                    "mode": "image_grounded_summary",
+                }
+            }
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 1
+    figure_props = dict((nodes[0] or {}).get("props") or {})
+    assert str(figure_props.get("source_label") or "") == "Figure 2"
+    assert str(figure_props.get("ai_insight") or "") == "右图强调多个注意力分支并行计算，再将结果拼接回统一输出。"
+
+
+def test_build_regenerated_node_should_not_inject_template_figure_insight():
+    service = LiteratureReaderComposeService()
+    regenerated = service._build_regenerated_node(  # pylint: disable=protected-access
+        node_before={
+            "id": "fig_1",
+            "type": "FigurePanel",
+            "props": {
+                "caption": "Figure 2: Multi-head attention consists of several attention layers running in parallel.",
+                "ai_insight": "",
+            },
+        }
+    )
+
+    props = dict(regenerated.get("props") or {})
+    assert str(props.get("ai_insight") or "") == ""
+
+
+def test_select_native_pdf_image_should_reject_shape_mismatch():
+    service = LiteratureReaderComposeService()
+    portrait = SimpleNamespace(image=SimpleNamespace(size=(405, 568)))
+    result = service._select_native_pdf_image(  # pylint: disable=protected-access
+        pypdf_images=[portrait],
+        pypdf_image_map={},
+        candidate_images=[],
+        bbox_pdf=(390.0, 171.0, 1120.0, 580.0),
+    )
+    assert result is None
+
+
+def test_select_native_pdf_image_should_accept_shape_match():
+    service = LiteratureReaderComposeService()
+    landscape = SimpleNamespace(image=SimpleNamespace(size=(730, 410)))
+    result = service._select_native_pdf_image(  # pylint: disable=protected-access
+        pypdf_images=[landscape],
+        pypdf_image_map={},
+        candidate_images=[],
+        bbox_pdf=(390.0, 171.0, 1120.0, 580.0),
+    )
+    assert result is landscape
+
+
+def test_write_composited_pdf_images_should_place_multiple_native_images(tmp_path):
+    service = LiteratureReaderComposeService()
+    left = SimpleNamespace(image=Image.new("RGB", (20, 40), "red"))
+    right = SimpleNamespace(image=Image.new("RGB", (40, 60), "blue"))
+    target = service._write_composited_pdf_images(  # pylint: disable=protected-access
+        out_dir=str(tmp_path),
+        asset_id="fig1",
+        page_images=[
+            {"x0": 10.0, "x1": 30.0, "top": 20.0, "bottom": 60.0},
+            {"x0": 40.0, "x1": 80.0, "top": 10.0, "bottom": 70.0},
+        ],
+        pypdf_images=[left, right],
+        page_render_size=(100, 100),
+        pdf_width=100.0,
+        pdf_height=100.0,
+    )
+    assert target is not None
+    image = Image.open(target)
+    assert image.size == (70, 60)
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_apply_equation_normalization():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=3,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "equation_group_1",
+                    "group_kind": "equation",
+                    "source_layout_ids": ["equation_1"],
+                    "rationale": "test_equation_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "equation_1",
+                    "node_kind": "equation",
+                    "clean_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                    "raw_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                    "alignment": "center",
+                    "line_height": 9.0,
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "text": "minEx~DcaliblfFp(x)-fquant(0x)||,",
+                            "style_id": 31,
+                            "pos": [{"x": 100, "y": 260}, {"x": 340, "y": 260}, {"x": 340, "y": 284}, {"x": 100, "y": 284}],
+                        }
+                    ],
+                },
+            ]
+        },
+        equation_refinements={
+            "equation_group_1": {
+                "normalization": {
+                    "normalized_text": "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||",
+                    "normalized_latex": r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert",
+                    "reason": "Recovered theta and calibration subscript from the page image and style hints.",
+                    "confidence": 0.84,
+                    "mode": "latex_reconstructed",
+                }
+            }
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 1
+    equation_props = dict((nodes[0] or {}).get("props") or {})
+    assert str(equation_props.get("normalized_text") or "") == "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||"
+    assert str(equation_props.get("normalized_latex") or "") == r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert"
+    assert str(equation_props.get("normalization_mode") or "") == "latex_reconstructed"
+
+
+def test_normalize_layout_uid_text_normalization_plan_should_require_exact_once_coverage():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_text_normalization_plan(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "L1",
+                    "node_kind": "paragraph",
+                    "clean_text": "A p p l e",
+                    "raw_text": "A p p l e",
+                    "include_in_main_flow": True,
+                },
+                {
+                    "layout_id": "L2",
+                    "node_kind": "section_heading",
+                    "clean_text": "Resu lts",
+                    "raw_text": "Resu lts",
+                    "include_in_main_flow": True,
+                },
+            ]
+        },
+        step_result={
+            "items": [
+                {
+                    "layout_id": "L1",
+                    "normalized_text": "Apple",
+                    "reason": "spacing_repair",
+                    "confidence": 0.93,
+                    "mode": "spacing_repair",
+                }
+            ],
+            "notes": ["missing_one_layout"],
+        },
+    )
+
+    assert bool(validation.get("passed")) is False
+    assert bool(validation.get("fallback_used")) is True
+    assert "missing_layout_id:L2" in list(validation.get("errors") or [])
+    assert list(normalized.get("items") or []) == []
+
+
+def test_build_layout_uid_text_normalization_prompt_payload_should_include_hidden_footer_like_kinds():
+    service = LiteratureReaderComposeService()
+    prompt_payload = service._build_layout_uid_text_normalization_prompt_payload(  # pylint: disable=protected-access
+        page=8,
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "p8_title",
+                    "reading_order": 1,
+                    "node_kind": "title",
+                    "clean_text": "4.2 Experimental Setting",
+                    "raw_text": "4.2 Experimental Setting",
+                    "include_in_main_flow": True,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 16, "text": "4.2 Experimental Setting"}],
+                },
+                {
+                    "layout_id": "p8_footer_link",
+                    "reading_order": 20,
+                    "node_kind": "footer",
+                    "clean_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "raw_text": "1. llama.cpp6 for 4-bit(Q4K_M)",
+                    "include_in_main_flow": False,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 8, "text": "1. llama.cpp6 for 4-bit(Q4K_M)"}],
+                },
+                {
+                    "layout_id": "p8_noise",
+                    "reading_order": 21,
+                    "node_kind": "noise",
+                    "clean_text": "Random separator",
+                    "raw_text": "Random separator",
+                    "include_in_main_flow": False,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 0, "text": "Random separator"}],
+                },
+            ]
+        },
+    )
+
+    items = list(prompt_payload.get("layout_atoms") or [])
+    item_ids = [str(item.get("layout_id") or "") for item in items]
+    assert "p8_title" in item_ids
+    assert "p8_footer_link" in item_ids
+    assert "p8_noise" not in item_ids
+    footer_bundles = list(prompt_payload.get("footer_bundles") or [])
+    assert len(footer_bundles) == 1
+    assert str((((footer_bundles[0] or {}).get("items") or [])[0] or {}).get("layout_id") or "") == "p8_footer_link"
+
+
+def test_build_layout_uid_text_normalization_prompt_payload_should_include_footer_bundle_context():
+    service = LiteratureReaderComposeService()
+    prompt_payload = service._build_layout_uid_text_normalization_prompt_payload(  # pylint: disable=protected-access
+        page=8,
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "f8_marker",
+                    "reading_order": 40,
+                    "node_kind": "footer",
+                    "layout_type": "corner_note",
+                    "layout_sub_type": "footer_note",
+                    "clean_text": "8",
+                    "raw_text": "8",
+                    "include_in_main_flow": False,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 15, "text": "8"}],
+                },
+                {
+                    "layout_id": "f8_url",
+                    "reading_order": 41,
+                    "node_kind": "footer",
+                    "layout_type": "corner_note",
+                    "layout_sub_type": "footer_note",
+                    "clean_text": "Shttps://api-docs.deepseek.com/",
+                    "raw_text": "Shttps://api-docs.deepseek.com/",
+                    "include_in_main_flow": False,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 6, "text": "Shttps://api-docs.deepseek.com/"}],
+                },
+                {
+                    "layout_id": "f9_url",
+                    "reading_order": 42,
+                    "node_kind": "footer",
+                    "layout_type": "corner_note",
+                    "layout_sub_type": "footer_note",
+                    "clean_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                    "raw_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                    "include_in_main_flow": False,
+                    "alignment": "left",
+                    "line_height": 0,
+                    "blocks": [{"style_id": 15, "text": "Yhttps://cloud.tencent.com/document/product/1772/115963"}],
+                },
+            ]
+        },
+    )
+
+    footer_bundles = list(prompt_payload.get("footer_bundles") or [])
+    assert len(footer_bundles) == 1
+    bundle = dict(footer_bundles[0] or {})
+    bundle_items = list(bundle.get("items") or [])
+    assert [str(item.get("layout_id") or "") for item in bundle_items] == ["f8_marker", "f8_url", "f9_url"]
+    assert bool((bundle_items[0] or {}).get("is_marker_only")) is True
+    assert bool((bundle_items[1] or {}).get("contains_url")) is True
+    assert int((bundle_items[1] or {}).get("primary_style_id") or 0) == 6
+
+
+def test_layout_uid_text_normalization_system_prompt_should_mention_footer_links():
+    service = LiteratureReaderComposeService()
+    prompt = service._layout_uid_text_normalization_system_prompt()  # pylint: disable=protected-access
+
+    assert "footer/header link footnotes" in prompt
+    assert "^6, ^7, ^8, ^9" in prompt
+    assert "footer_bundles" in prompt
+
+
+def test_apply_layout_uid_text_normalization_to_grounding_should_update_atoms_nodes_and_meta():
+    service = LiteratureReaderComposeService()
+    grounding = service._apply_layout_uid_text_normalization_to_grounding(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "L1",
+                    "node_kind": "paragraph",
+                    "clean_text": "A p p l e",
+                    "raw_text": "A p p l e",
+                    "include_in_main_flow": True,
+                    "source_block_ids": ["b1"],
+                },
+                {
+                    "layout_id": "L2",
+                    "node_kind": "section_heading",
+                    "clean_text": "Resu lts",
+                    "raw_text": "Resu lts",
+                    "include_in_main_flow": True,
+                    "source_block_ids": ["b2"],
+                },
+            ],
+            "reading_nodes": [
+                {
+                    "node_id": "n1",
+                    "node_kind": "paragraph",
+                    "clean_text": "A p p l e",
+                    "source_layout_ids": ["L1"],
+                },
+                {
+                    "node_id": "n2",
+                    "node_kind": "section_heading",
+                    "clean_text": "Resu lts",
+                    "source_layout_ids": ["L2"],
+                },
+            ],
+            "meta": {},
+        },
+        normalization_plan={
+            "items": [
+                {
+                    "layout_id": "L1",
+                    "source_text": "A p p l e",
+                    "normalized_text": "Apple",
+                    "reason": "spacing_repair",
+                    "mode": "spacing_repair",
+                    "confidence": 0.93,
+                    "changed": True,
+                }
+            ],
+            "notes": ["applied_spacing_repair"],
+        },
+    )
+
+    atoms = list(grounding.get("layout_atoms") or [])
+    nodes = list(grounding.get("reading_nodes") or [])
+    assert str((atoms[0] or {}).get("normalized_text") or "") == "Apple"
+    assert str((atoms[0] or {}).get("normalization_reason") or "") == "spacing_repair"
+    assert str((nodes[0] or {}).get("normalized_text") or "") == "Apple"
+    assert str((nodes[0] or {}).get("normalization_mode") or "") == "spacing_repair"
+    summary = dict((grounding.get("meta") or {}).get("normalization_summary") or {})
+    assert int(summary.get("item_count") or 0) == 1
+    assert str(((summary.get("items") or [])[0] or {}).get("layout_id") or "") == "L1"
+
+
+def test_apply_layout_uid_text_normalization_to_grounding_should_backfill_footer_link_urls():
+    service = LiteratureReaderComposeService()
+    grounding = service._apply_layout_uid_text_normalization_to_grounding(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "f6",
+                    "reading_order": 10,
+                    "node_kind": "footer",
+                    "clean_text": "ehttps://github.com/ggml-org/llama.cpp",
+                    "raw_text": "ehttps://github.com/ggml-org/llama.cpp",
+                },
+                {
+                    "layout_id": "f7",
+                    "reading_order": 11,
+                    "node_kind": "footer",
+                    "clean_text": "/https://unsloth.ai/blog/deepseekr1-dynamic",
+                    "raw_text": "/https://unsloth.ai/blog/deepseekr1-dynamic",
+                },
+                {
+                    "layout_id": "f8",
+                    "reading_order": 12,
+                    "node_kind": "footer",
+                    "clean_text": "Shttps://api-docs.deepseek.com/",
+                    "raw_text": "Shttps://api-docs.deepseek.com/",
+                },
+                {
+                    "layout_id": "f9",
+                    "reading_order": 13,
+                    "node_kind": "footer",
+                    "clean_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                    "raw_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                },
+            ],
+            "reading_nodes": [
+                {"node_id": "layout:f6", "source_layout_ids": ["f6"]},
+                {"node_id": "layout:f7", "source_layout_ids": ["f7"]},
+                {"node_id": "layout:f8", "source_layout_ids": ["f8"]},
+                {"node_id": "layout:f9", "source_layout_ids": ["f9"]},
+            ],
+        },
+        normalization_plan={
+            "items": [
+                {
+                    "layout_id": "f6",
+                    "source_text": "ehttps://github.com/ggml-org/llama.cpp",
+                    "normalized_text": "^6 https://github.com/ggml-org/llama.cpp",
+                    "reason": "footer_link_cleanup",
+                    "mode": "ocr_cleanup",
+                    "confidence": 0.95,
+                    "changed": True,
+                },
+                {
+                    "layout_id": "f7",
+                    "source_text": "/https://unsloth.ai/blog/deepseekr1-dynamic",
+                    "normalized_text": "^7 https://unsloth.ai/blog/deepseekr1-dynamic",
+                    "reason": "footer_link_cleanup",
+                    "mode": "ocr_cleanup",
+                    "confidence": 0.95,
+                    "changed": True,
+                },
+                {
+                    "layout_id": "f8",
+                    "source_text": "Shttps://api-docs.deepseek.com/",
+                    "normalized_text": "Shttps://api-docs.deepseek.com/",
+                    "reason": "",
+                    "mode": "no_change",
+                    "confidence": 0.0,
+                    "changed": False,
+                },
+                {
+                    "layout_id": "f9",
+                    "source_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                    "normalized_text": "Yhttps://cloud.tencent.com/document/product/1772/115963",
+                    "reason": "",
+                    "mode": "no_change",
+                    "confidence": 0.0,
+                    "changed": False,
+                },
+            ]
+        },
+    )
+
+    atoms = {
+        str(atom.get("layout_id") or ""): dict(atom)
+        for atom in list(grounding.get("layout_atoms") or [])
+    }
+    assert str(atoms["f8"].get("normalized_text") or "") == "^8 https://api-docs.deepseek.com/"
+    assert str(atoms["f9"].get("normalized_text") or "") == "^9 https://cloud.tencent.com/document/product/1772/115963"
+    assert str(atoms["f8"].get("normalization_mode") or "") == "footer_link_fallback"
+    assert str(atoms["f9"].get("normalization_reason") or "") == "footer_link_cleanup"
+
+
+def test_merge_existing_grounding_enrichments_should_not_keep_stale_render_asset_page_image():
+    service = LiteratureReaderComposeService()
+    merged = service._merge_existing_grounding_enrichments(  # pylint: disable=protected-access
+        existing_grounding={
+            "page_image": {
+                "url": "http://localhost:3000/api/v1/literature/reader/page-assets/85/5",
+                "path": "/app/uploads/reader_page_assets/85/page_5.jpg",
+                "width": 1360,
+                "height": 1760,
+                "source": "page_render_asset",
+                "origin_url": "",
+                "local_cached": True,
+            }
+        },
+        rebuilt_grounding={
+            "page_image": {
+                "url": "",
+                "path": "",
+                "width": None,
+                "height": None,
+                "source": "docmind_page_image_unlocalized",
+                "origin_url": "https://example.com/docmind/page5.png",
+                "local_cached": False,
+            }
+        },
+    )
+
+    page_image = dict(merged.get("page_image") or {})
+    assert str(page_image.get("source") or "") == "docmind_page_image_unlocalized"
+    assert str(page_image.get("url") or "") == ""
+    assert str(page_image.get("path") or "") == ""
+    assert bool(page_image.get("local_cached")) is False
+    assert int(page_image.get("width") or 0) == 1360
+    assert int(page_image.get("height") or 0) == 1760
+
+
+def test_build_layout_uid_prompt_payload_should_prefer_normalized_text():
+    service = LiteratureReaderComposeService()
+    payload = service._build_layout_uid_prompt_payload(  # pylint: disable=protected-access
+        paper=SimpleNamespace(id=85, title="demo"),
+        page=4,
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "L1",
+                    "reading_order": 1,
+                    "layout_type": "text",
+                    "layout_sub_type": "para",
+                    "node_kind": "paragraph",
+                    "clean_text": "A p p l e",
+                    "normalized_text": "Apple",
+                    "include_in_main_flow": True,
+                    "region_hint": "main",
+                    "layout_pos": [],
+                    "blocks": [],
+                }
+            ]
+        },
+    )
+
+    atoms = list(payload.get("layout_atoms") or [])
+    assert len(atoms) == 1
+    assert str((atoms[0] or {}).get("text") or "") == "Apple"
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_prefer_normalized_text_for_reading_nodes():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=4,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "title_1",
+                    "group_kind": "section_heading",
+                    "source_layout_ids": ["L1"],
+                },
+                {
+                    "group_id": "paragraph_1",
+                    "group_kind": "paragraph",
+                    "source_layout_ids": ["L2"],
+                },
+                {
+                    "group_id": "list_1",
+                    "group_kind": "list",
+                    "source_layout_ids": ["L3"],
+                },
+            ]
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "L1",
+                    "node_kind": "section_heading",
+                    "clean_text": "Experi mental Setting",
+                    "normalized_text": "Experimental Setting",
+                },
+                {
+                    "layout_id": "L2",
+                    "node_kind": "paragraph",
+                    "clean_text": "We eva luate model behavior.",
+                    "normalized_text": "We evaluate model behavior.",
+                },
+                {
+                    "layout_id": "L3",
+                    "node_kind": "list",
+                    "clean_text": "1. llama.cpp6\n2. Unsloth7",
+                    "normalized_text": "1. llama.cpp\n2. Unsloth",
+                },
+            ]
+        },
+    )
+
+    nodes = list((panel_plan.get("panels") or [])[0].get("nodes") or [])
+    assert len(nodes) == 3
+    assert str(((nodes[0] or {}).get("props") or {}).get("text") or "") == "Experimental Setting"
+    paragraph_props = dict((nodes[1] or {}).get("props") or {})
+    assert str(paragraph_props.get("text") or "") == "We evaluate model behavior."
+    list_props = dict((nodes[2] or {}).get("props") or {})
+    assert list(list_props.get("items") or []) == ["1. llama.cpp", "2. Unsloth"]
+
+
+def test_normalize_layout_uid_table_logical_row_plan_should_require_exact_once_coverage():
+    service = LiteratureReaderComposeService()
+    normalized, validation = service._normalize_layout_uid_table_logical_row_plan(  # pylint: disable=protected-access
+        physical_rows=[
+            {"row_index": 0, "cells": [{"col_start": 0, "text": "Header"}]},
+            {"row_index": 1, "cells": [{"col_start": 0, "text": "AIME 2024"}]},
+            {"row_index": 2, "cells": [{"col_start": 0, "text": "72.6"}]},
+        ],
+        step_result={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "header", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1, 1]},
+            ],
+            "notes": ["bad_plan"],
+        },
+    )
+
+    assert validation["passed"] is False
+    assert validation["fallback_used"] is True
+    assert "missing_physical_row:2" in list(validation.get("errors") or [])
+    assert list((normalized.get("logical_rows") or [])[0].get("source_row_indices") or []) == [0]
+    assert list((normalized.get("logical_rows") or [])[1].get("source_row_indices") or []) == [1]
+    assert list((normalized.get("logical_rows") or [])[2].get("source_row_indices") or []) == [2]
+
+
+def test_layout_uid_group_plan_to_panel_plan_should_apply_ai_table_logical_rows():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._layout_uid_group_plan_to_panel_plan(  # pylint: disable=protected-access
+        page=7,
+        grouping_plan={
+            "groups": [
+                {
+                    "group_id": "table_group_1",
+                    "group_kind": "table",
+                    "source_layout_ids": ["table_body_1", "table_caption_1"],
+                    "rationale": "test_table_bundle",
+                },
+            ],
+            "omissions": [],
+            "notes": [],
+        },
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "table_body_1",
+                    "node_kind": "table",
+                    "clean_text": "Model Score",
+                    "raw_text": "Model Score",
+                    "canonical_block_ids": ["p7_dm_p7_l003_b001"],
+                    "table_cells": [
+                        {"cell_id": 0, "row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0, "text": "DeepSeek-R1", "layout_ids": ["table_r0c0"], "polygons": [[{"x": 100, "y": 100}, {"x": 220, "y": 100}, {"x": 220, "y": 124}, {"x": 100, "y": 124}]]},
+                        {"cell_id": 1, "row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0, "text": "distill-Qwen-32B", "layout_ids": ["table_r1c0"], "polygons": [[{"x": 100, "y": 125}, {"x": 220, "y": 125}, {"x": 220, "y": 148}, {"x": 100, "y": 148}]]},
+                        {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 1, "col_end": 1, "text": "BF16", "layout_ids": ["table_r0c1"], "polygons": [[{"x": 260, "y": 100}, {"x": 360, "y": 100}, {"x": 360, "y": 124}, {"x": 260, "y": 124}]]},
+                        {"cell_id": 3, "row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1, "text": "(Reported)", "layout_ids": ["table_r1c1"], "polygons": [[{"x": 260, "y": 125}, {"x": 360, "y": 125}, {"x": 360, "y": 148}, {"x": 260, "y": 148}]]},
+                        {"cell_id": 4, "row_start": 2, "row_end": 2, "col_start": 0, "col_end": 0, "text": "AIME 2024", "layout_ids": ["table_r2c0"], "polygons": [[{"x": 100, "y": 160}, {"x": 220, "y": 160}, {"x": 220, "y": 184}, {"x": 100, "y": 184}]]},
+                        {"cell_id": 5, "row_start": 2, "row_end": 2, "col_start": 1, "col_end": 1, "text": "72.6", "layout_ids": ["table_r2c1"], "polygons": [[{"x": 260, "y": 160}, {"x": 360, "y": 160}, {"x": 360, "y": 184}, {"x": 260, "y": 184}]]},
+                        {"cell_id": 6, "row_start": 3, "row_end": 3, "col_start": 1, "col_end": 1, "text": "(±2.75)", "layout_ids": ["table_r3c1"], "polygons": [[{"x": 260, "y": 188}, {"x": 360, "y": 188}, {"x": 360, "y": 212}, {"x": 260, "y": 212}]]},
+                    ],
+                    "blocks": [],
+                },
+                {
+                    "layout_id": "table_caption_1",
+                    "node_kind": "table_caption",
+                    "clean_text": "Table 2. Quantization comparison across evaluation suites",
+                    "raw_text": "Table 2. Quantization comparison across evaluation suites",
+                    "blocks": [],
+                },
+            ]
+        },
+        table_refinements={
+            "table_group_1": {
+                "logical_row_plan": {
+                    "logical_rows": [
+                        {"logical_row_id": "lr1", "row_role": "header", "source_row_indices": [0, 1], "rationale": "multi_line_header"},
+                        {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [2, 3], "rationale": "value_plus_uncertainty"},
+                    ],
+                    "notes": ["ai_table_logical_rows"],
+                }
+            }
+        },
+    )
+
+    table_node = dict(((panel_plan.get("panels") or [])[0].get("nodes") or [])[0] or {})
+    table_props = dict(table_node.get("props") or {})
+    logical_rows = list(table_props.get("logical_rows") or [])
+    assert str(table_props.get("reconstruction_mode") or "") == "ai_logical_rows"
+    assert int(table_props.get("logical_header_row_count") or 0) == 1
+    assert len(logical_rows) == 2
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((((logical_rows[0] or {}).get("cells") or [])[0].get("text") or "")) == "DeepSeek-R1\ndistill-Qwen-32B"
+    assert list((logical_rows[1] or {}).get("source_row_indices") or []) == [2, 3]
+    assert str((((logical_rows[1] or {}).get("cells") or [])[1].get("text") or "")) == "72.6\n(±2.75)"
+
+
+def test_layout_uid_table_logical_row_system_prompt_should_describe_value_uncertainty_pairing():
+    service = LiteratureReaderComposeService()
+    prompt = service._layout_uid_table_logical_row_system_prompt()  # pylint: disable=protected-access
+
+    assert "value row and its uncertainty row `(±...)` usually belong to the same logical data row" in prompt
+    assert "blank first-column continuation row" in prompt
+    assert "multi-line headers" in prompt
+
+
+def test_build_layout_uid_table_logical_row_prompt_payload_should_include_pairing_hints():
+    service = LiteratureReaderComposeService()
+    payload = service._build_layout_uid_table_logical_row_prompt_payload(  # pylint: disable=protected-access
+        page=7,
+        title="Table 5",
+        caption="Benchmark results",
+        table_cells=[
+            {"cell_id": 1, "row_start": 2, "row_end": 2, "col_start": 0, "col_end": 0, "text": "AIME 2024"},
+            {"cell_id": 2, "row_start": 2, "row_end": 2, "col_start": 1, "col_end": 1, "text": "72.6"},
+            {"cell_id": 3, "row_start": 3, "row_end": 3, "col_start": 1, "col_end": 1, "text": "(±2.75)"},
+            {"cell_id": 4, "row_start": 3, "row_end": 3, "col_start": 2, "col_end": 2, "text": "(±4.71)"},
+        ],
+    )
+
+    rows = list(payload.get("physical_rows") or [])
+    assert len(rows) == 2
+    assert dict(rows[0].get("hints") or {}).get("blank_first_column") is False
+    assert dict(rows[1].get("hints") or {}).get("blank_first_column") is True
+    assert dict(rows[1].get("hints") or {}).get("looks_like_uncertainty_row") is True
+    assert "value_plus_uncertainty" in list((payload.get("rules") or {}).get("common_patterns") or [])
+
+
+def test_materialize_layout_uid_logical_table_rows_should_merge_sparse_value_row_with_uncertainty_row():
+    service = LiteratureReaderComposeService()
+    logical_rows, logical_header_row_count = service._materialize_layout_uid_logical_table_rows(  # pylint: disable=protected-access
+        normalized_cells=[
+            {"cell_id": 1, "row_start": 0, "row_end": 0, "col_start": 2, "col_end": 2, "text": "38.34", "layout_ids": ["r0c2"]},
+            {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 3, "col_end": 3, "text": "41.66", "layout_ids": ["r0c3"]},
+            {"cell_id": 3, "row_start": 1, "row_end": 1, "col_start": 0, "col_end": 0, "text": "AIME 2024", "layout_ids": ["r1c0"]},
+            {"cell_id": 4, "row_start": 1, "row_end": 1, "col_start": 1, "col_end": 1, "text": "39.2", "layout_ids": ["r1c1"]},
+            {"cell_id": 5, "row_start": 1, "row_end": 1, "col_start": 2, "col_end": 2, "text": "(±2.52)", "layout_ids": ["r1c2"]},
+            {"cell_id": 6, "row_start": 1, "row_end": 1, "col_start": 3, "col_end": 3, "text": "(±4.72)", "layout_ids": ["r1c3"]},
+        ],
+        logical_row_plan={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "data", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1]},
+            ]
+        },
+    )
+
+    assert logical_header_row_count == 0
+    assert len(logical_rows) == 1
+    cells = {int(cell.get("col_start") or 0): dict(cell) for cell in list((logical_rows[0] or {}).get("cells") or [])}
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((cells[0].get("text") or "")) == "AIME 2024"
+    assert str((cells[1].get("text") or "")) == "39.2"
+    assert str((cells[2].get("text") or "")) == "38.34\n(±2.52)"
+    assert str((cells[3].get("text") or "")) == "41.66\n(±4.72)"
+
+
+def test_materialize_layout_uid_logical_table_rows_should_merge_blank_lead_uncertainty_row_into_previous():
+    service = LiteratureReaderComposeService()
+    logical_rows, _ = service._materialize_layout_uid_logical_table_rows(  # pylint: disable=protected-access
+        normalized_cells=[
+            {"cell_id": 1, "row_start": 0, "row_end": 0, "col_start": 0, "col_end": 0, "text": "MBPP+", "layout_ids": ["r0c0"]},
+            {"cell_id": 2, "row_start": 0, "row_end": 0, "col_start": 2, "col_end": 2, "text": "73.35", "layout_ids": ["r0c2"]},
+            {"cell_id": 3, "row_start": 0, "row_end": 0, "col_start": 3, "col_end": 3, "text": "72.90", "layout_ids": ["r0c3"]},
+            {"cell_id": 4, "row_start": 1, "row_end": 1, "col_start": 2, "col_end": 2, "text": "(±1.21)", "layout_ids": ["r1c2"]},
+            {"cell_id": 5, "row_start": 1, "row_end": 1, "col_start": 3, "col_end": 3, "text": "(±0.66)", "layout_ids": ["r1c3"]},
+        ],
+        logical_row_plan={
+            "logical_rows": [
+                {"logical_row_id": "lr1", "row_role": "data", "source_row_indices": [0]},
+                {"logical_row_id": "lr2", "row_role": "data", "source_row_indices": [1]},
+            ]
+        },
+    )
+
+    assert len(logical_rows) == 1
+    cells = {int(cell.get("col_start") or 0): dict(cell) for cell in list((logical_rows[0] or {}).get("cells") or [])}
+    assert str((cells[2].get("text") or "")) == "73.35\n(±1.21)"
+    assert str((cells[3].get("text") or "")) == "72.90\n(±0.66)"
+
+
+def test_panel_plan_to_ui_plan_should_keep_ai_table_logical_row_fields():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
+        page=7,
+        panel_plan={
+            "plan_id": "panel_plan_keep_ai_table_rows",
+            "panels": [
+                {
+                    "panel_id": "main",
+                    "nodes": [
+                        {
+                            "node_id": "table_1",
+                            "component": "TablePanel",
+                            "source_layout_ids": ["layout_table_1"],
+                            "props": {
+                                "title": "Table 5",
+                                "rows": [["legacy"]],
+                                "logical_rows": [
+                                    {
+                                        "logical_row_id": "logical_row_0",
+                                        "row_role": "header",
+                                        "source_row_indices": [0, 1],
+                                        "cells": [
+                                            {
+                                                "text": "DeepSeek-R1\ndistill-Qwen-32B",
+                                                "col_start": 0,
+                                                "col_span": 1,
+                                            },
+                                            {
+                                                "text": "BF16\n(Reported)",
+                                                "col_start": 1,
+                                                "col_span": 1,
+                                            },
+                                        ],
+                                    }
+                                ],
+                                "logical_header_row_count": 1,
+                                "reconstruction_mode": "ai_logical_rows",
+                                "reconstruction_notes": ["ai_table_logical_rows"],
+                            },
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "layout_table_1",
+                "source_text": "Table 5",
+                "type": "table",
+            }
+        ],
+        layout_to_block_ids={"layout_table_1": ["p7_dm_table_1"]},
+        base_payload={
+            "assets": [],
+            "blocks": [],
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout_table_1",
+                        "clean_text": "Table 5",
+                        "raw_text": "Table 5",
+                        "canonical_block_ids": ["p7_dm_table_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 220},
+                            {"x": 920, "y": 220},
+                            {"x": 920, "y": 720},
+                            {"x": 120, "y": 720},
+                        ],
+                        "blocks": [
+                            {
+                                "block_index": 1,
+                                "text": "Table 5",
+                                "pos": [
+                                    {"x": 120, "y": 220},
+                                    {"x": 920, "y": 220},
+                                    {"x": 920, "y": 720},
+                                    {"x": 120, "y": 720},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "evidence_map": [
+                    {
+                        "source_layout_id": "layout_table_1",
+                        "source_block_ids": ["p7_dm_table_1"],
+                        "layout_pos": [
+                            {"x": 120, "y": 220},
+                            {"x": 920, "y": 220},
+                            {"x": 920, "y": 720},
+                            {"x": 120, "y": 720},
+                        ],
+                        "block_positions": [
+                            [
+                                {"x": 120, "y": 220},
+                                {"x": 920, "y": 220},
+                                {"x": 920, "y": 720},
+                                {"x": 120, "y": 720},
+                            ]
+                        ],
+                    }
+                ],
+                "page_image": {"width": 1600, "height": 2200},
+            },
+        },
+        style_intent=None,
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list(ui_plan.get("components") or [])
+    assert len(components) == 1
+    node = dict(components[0] or {})
+    props = dict(node.get("props") or {})
+    assert str(props.get("reconstruction_mode") or "") == "ai_logical_rows"
+    assert list(props.get("reconstruction_notes") or []) == ["ai_table_logical_rows"]
+    assert int(props.get("logical_header_row_count") or 0) == 1
+    logical_rows = list(props.get("logical_rows") or [])
+    assert len(logical_rows) == 1
+    assert list((logical_rows[0] or {}).get("source_row_indices") or []) == [0, 1]
+    assert str((((logical_rows[0] or {}).get("cells") or [])[0].get("text") or "")) == "DeepSeek-R1\ndistill-Qwen-32B"
+
+
+def test_panel_plan_to_ui_plan_should_keep_equation_normalization_fields():
+    service = LiteratureReaderComposeService()
+    ui_plan = service._panel_plan_to_ui_plan(  # pylint: disable=protected-access
+        page=3,
+        panel_plan={
+            "plan_id": "panel_plan_keep_equation_normalization",
+            "panels": [
+                {
+                    "panel_id": "main",
+                    "nodes": [
+                        {
+                            "node_id": "equation_1",
+                            "component": "EquationBlock",
+                            "source_layout_ids": ["layout_equation_1"],
+                            "props": {
+                                "latex": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                                "label": "(1)",
+                                "description": "",
+                                "render_mode": "math_first",
+                                "transcript": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                                "normalized_text": "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||",
+                                "normalized_latex": r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert",
+                                "normalization_reason": "Recovered theta and calibration subscript from the page image and style hints.",
+                                "normalization_mode": "latex_reconstructed",
+                                "normalization_confidence": 0.84,
+                            },
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+        docmind_blocks=[
+            {
+                "layout_id": "layout_equation_1",
+                "source_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                "type": "formula",
+            }
+        ],
+        layout_to_block_ids={"layout_equation_1": ["p3_dm_formula_1"]},
+        base_payload={
+            "assets": [],
+            "blocks": [],
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout_equation_1",
+                        "clean_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                        "raw_text": "minEx~DcaliblfFp(x)-fquant(0x)||, (1) 0",
+                        "canonical_block_ids": ["p3_dm_formula_1"],
+                        "layout_pos": [
+                            {"x": 100, "y": 260},
+                            {"x": 340, "y": 260},
+                            {"x": 340, "y": 284},
+                            {"x": 100, "y": 284},
+                        ],
+                        "blocks": [],
+                    }
+                ],
+                "page_image": {"width": 1483, "height": 1920},
+            },
+        },
+        style_intent=None,
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    components = list(ui_plan.get("components") or [])
+    assert len(components) == 1
+    props = dict((components[0] or {}).get("props") or {})
+    assert str(props.get("normalized_latex") or "") == r"\min_{x \sim D_{\mathrm{calib}}}\lVert f_P(x) - f_{\mathrm{quant}}(\theta, x)\rVert"
+    assert str(props.get("normalized_text") or "") == "min_{x\\sim D_{calib}} ||f_P(x) - f_{quant}(\\theta, x)||"
+    assert str(props.get("normalization_reason") or "") == "Recovered theta and calibration subscript from the page image and style hints."
+    assert str(props.get("normalization_mode") or "") == "latex_reconstructed"
+    assert float(props.get("normalization_confidence") or 0.0) == 0.84
+
+
+@pytest.mark.asyncio
+async def test_build_or_get_composed_payload_should_route_layout_uid_v1_pipeline(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(settings, "reader_pipeline_mode", "single_agent_v2")
+    monkeypatch.setattr(settings, "reader_pipeline_version", "layout_uid_v1")
+    calls = {"layout_uid": 0, "semantic": 0, "controller": 0}
+
+    async def _build_source_signature(**_kwargs):
+        return "sig-layout-uid"
+
+    async def _read_payload_from_redis(_key):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _apply_overlay(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _acquire_lock(_lock_key):
+        return "lock-token"
+
+    async def _release_lock(_lock_key, _token):
+        return None
+
+    async def _reader_payload(**_kwargs):
+        return (
+            {
+                "docmind_structure": {"layouts": []},
+                "page_structure_v3": {"block_groups": []},
+                "blocks": [],
+                "assets": [],
+            },
+            SimpleNamespace(),
+        )
+
+    async def _no_db_upsert(**_kwargs):
+        return None
+
+    async def _no_redis_write(_key, _payload):
+        return None
+
+    async def _layout_uid_result(**_kwargs):
+        calls["layout_uid"] += 1
+        return {
+            "base_payload": {
+                "pipeline_contract_meta": {"pipeline": "reader_layout_uid_v1"},
+                "minimal_gate_report": {},
+                "qwen_plan_meta": {"reason": "layout_uid_v1"},
+            },
+            "loop_result": {
+                "ui_plan": {
+                    "plan_id": "layout_uid_v1_p1",
+                    "components": [],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {"overall": 0.91, "hard_constraints_passed": True},
+                "iteration_trace": [],
+                "iterations": 1,
+                "degraded": False,
+                "stop_reason": "layout_uid_v1_done",
+                "build_mode": "compose_agent_layout_uid_v1",
+            },
+            "assets": [],
+        }
+
+    async def _semantic_result(**_kwargs):
+        calls["semantic"] += 1
+        raise AssertionError("semantic atom pipeline should not be used for layout_uid_v1")
+
+    async def _controller_result(**_kwargs):
+        calls["controller"] += 1
+        raise AssertionError("single_agent controller should not be used for layout_uid_v1")
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _acquire_lock)
+    monkeypatch.setattr(service, "_release_lock", _release_lock)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay)
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _no_db_upsert)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _no_redis_write)
+    monkeypatch.setattr(service, "_partition_main_aux_block_ids", lambda **_kwargs: ([], []))
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _reader_payload)
+    monkeypatch.setattr(service, "_build_layout_uid_pipeline_result", _layout_uid_result)
+    monkeypatch.setattr(service, "_build_simplified_pipeline_result", _semantic_result)
+    monkeypatch.setattr(service, "_build_single_agent_v2_result", _controller_result)
+
+    payload, _ = await service.build_or_get_composed_payload(
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=SimpleNamespace(id=82, user_id=1, title="demo", pdf_path=""),
+        page=1,
+        force_refresh=False,
+    )
+
+    assert calls["layout_uid"] == 1
+    assert calls["semantic"] == 0
+    assert calls["controller"] == 0
+    assert str(payload.get("build_mode") or "") == "compose_agent_layout_uid_v1"
+    assert str((payload.get("pipeline_contract_meta") or {}).get("pipeline") or "") == "reader_layout_uid_v1"
+
+
 def test_layout_plan_prompt_should_include_all_block_ids_without_truncation():
     service = ReaderMultimodalLayoutService()
     block_groups = [
@@ -6029,6 +9574,7 @@ async def test_simplified_pipeline_stage1_fail_should_use_deterministic_baseline
     full_coverage_passed = (payload.get("minimal_gate_report") or {}).get("full_coverage")
     assert isinstance(full_coverage_passed, bool)
     assert len(list(ui_plan.get("components") or [])) > 0
+    assert any(list((component or {}).get("source_atom_ids") or []) for component in list(ui_plan.get("components") or []))
 
 
 @pytest.mark.asyncio
@@ -6108,6 +9654,7 @@ async def test_simplified_pipeline_stage2_fail_should_use_deterministic_baseline
     assert str(((result.get("loop_result") or {}).get("build_mode") or "")) == "compose_agent_simplified"
     assert bool((((payload.get("pipeline_contract_meta") or {}).get("stage2") or {}).get("degraded"))) is True
     assert len(list(ui_plan.get("components") or [])) > 0
+    assert any(list((component or {}).get("source_atom_ids") or []) for component in list(ui_plan.get("components") or []))
 
 
 @pytest.mark.asyncio
@@ -6415,4 +9962,3 @@ async def test_reader_composed_soft_disabled_endpoints(monkeypatch):
                 data = json.loads(line[len("data: "):])
                 events.append(str(data.get("event") or ""))
     assert events[:2] == ["disabled", "done"]
-

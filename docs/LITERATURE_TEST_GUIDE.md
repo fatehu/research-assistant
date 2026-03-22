@@ -259,6 +259,52 @@ curl -X GET "http://localhost:8000/api/literature/search/history?limit=10" \
    - 提示 "论文已保存"
    - 切换到"我的文献库"可以看到该论文
 
+---
+
+## 第三部分：`/read` AI 阅读与证据链回归
+
+### 目标
+
+`/literature/:id/read` 当前承担的是：
+- AI 清洗正文
+- 简化 AI 排版
+- 证据核验与高光回溯
+
+它不再承担页面级 generative UI 产品设计，因此这部分测试优先关注：
+- 正文是否可读
+- 证据链是否稳定
+- 高光是否与 DocMind 几何一致
+
+### 核心实现约束
+
+- 高光真值来源是 DocMind；默认链路必须是 `uniqueId -> blocks[].pos`。
+- `layout_uid_v1` 是 `/read` 的默认 compose 主链。
+- 表格、公式、fallback 节点的局部修复不能修改全局 evidence preview 主路径。
+- `geometry.page_width/page_height` 必须对应真实 DocMind 页图尺寸，而不是推断出的内容边界。
+
+### 推荐回归页面
+
+- prose-heavy:
+  - `http://localhost:3000/literature/85/read?page=3&kb=84`
+- table-heavy:
+  - `http://localhost:3000/literature/85/read?page=7&kb=84`
+
+### 必验项
+
+1. 页面可正常进入，`重新生成` 不会把页面打成 fallback 异常态。
+2. 节点 `...` 菜单里仍然有 `证据`，而不是只剩 `复制 / 拖拽`。
+3. hover 某个正文段落、表格、公式时，右侧 `AI 上下文` 面板会出现 evidence preview。
+4. pinned evidence 与 hover evidence 指向同一 PDF 区域，不应整体右偏、右下偏。
+5. 表格修复不能让其他论文新生成页丢失证据定位功能。
+
+### 修改这些文件前必须额外回归
+
+- `frontend/src/pages/literature/PaperReaderPage.tsx`
+- `frontend/src/pages/literature/readerComponents/index.tsx`
+- `backend/app/services/literature_reader_compose_service.py`
+
+只要改到其中之一，就必须至少完成上面两页的回归。
+
 ### 测试 2.4：切换视图模式
 
 1. 点击右上角的视图切换按钮

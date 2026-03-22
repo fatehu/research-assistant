@@ -6,7 +6,7 @@ import {
 import {
   SearchOutlined, BookOutlined, AppstoreOutlined,
   UnorderedListOutlined, DownloadOutlined,
-  ClockCircleOutlined, FileTextOutlined
+  ClockCircleOutlined, FileTextOutlined, LinkOutlined
 } from '@ant-design/icons'
 import { useLiteratureStore } from '@/stores/literatureStore'
 import { PaperSearchResult } from '@/services/api'
@@ -32,16 +32,20 @@ export default function LiteraturePage() {
     selectedPaper, detailPanelOpen,
     viewMode,
     init, searchPapers,
-    savePaper, deletePaper, selectPaper,
+    savePaper, importPaperFromLink, deletePaper, selectPaper,
     createCollection, deleteCollection, selectCollection,
     setViewMode, toggleDetailPanel, downloadPdf
   } = useLiteratureStore()
 
   const [activeTab, setActiveTab] = useState<'library' | 'search'>('library')
   const [searchValue, setSearchValue] = useState('')
-  const [selectedSource, setSelectedSource] = useState('semantic_scholar')
+  const [selectedSource, setSelectedSource] = useState('multi')
   const [createModalOpen, setCreateModalOpen] = useState(false)
-  const [form] = Form.useForm()
+  const [linkImportModalOpen, setLinkImportModalOpen] = useState(false)
+  const [linkImportSubmitting, setLinkImportSubmitting] = useState(false)
+  const [createCollectionForm] = Form.useForm()
+  const [linkImportForm] = Form.useForm()
+  const selectedCollection = collections.find(collection => collection.id === selectedCollectionId) || null
 
   useEffect(() => {
     init()
@@ -100,9 +104,35 @@ export default function LiteraturePage() {
       await createCollection(values)
       message.success('收藏夹已创建')
       setCreateModalOpen(false)
-      form.resetFields()
+      createCollectionForm.resetFields()
     } catch {
       // Error handled by store
+    }
+  }
+
+  const handleImportPaperFromLink = async (values: { link: string }) => {
+    try {
+      setLinkImportSubmitting(true)
+      const result = await importPaperFromLink(
+        values.link,
+        selectedCollectionId ? [selectedCollectionId] : []
+      )
+      setActiveTab('library')
+      setLinkImportModalOpen(false)
+      linkImportForm.resetFields()
+      selectPaper(result.paper)
+      toggleDetailPanel(true)
+      if (result.already_exists) {
+        message.info(selectedCollection
+          ? `论文已存在，已同步到“${selectedCollection.name}”`
+          : '论文已存在，已定位到现有记录')
+      } else {
+        message.success('论文已通过链接入库')
+      }
+    } catch {
+      // Error handled by store
+    } finally {
+      setLinkImportSubmitting(false)
     }
   }
 
@@ -166,6 +196,14 @@ export default function LiteraturePage() {
             />
 
             <div className="flex-1" />
+
+            <Button
+              icon={<LinkOutlined />}
+              onClick={() => setLinkImportModalOpen(true)}
+              className="!bg-slate-800/50 !border-slate-600 !text-slate-200 hover:!border-emerald-500/50 hover:!text-emerald-400"
+            >
+              链接入库
+            </Button>
 
             {/* 视图切换 */}
             <div className="flex bg-slate-800/50 rounded-lg p-1 border border-slate-700/50">
@@ -377,11 +415,11 @@ export default function LiteraturePage() {
         }
         open={createModalOpen}
         onCancel={() => setCreateModalOpen(false)}
-        onOk={() => form.submit()}
+        onOk={() => createCollectionForm.submit()}
         okText="创建"
         cancelText="取消"
       >
-        <Form form={form} onFinish={handleCreateCollection} layout="vertical" className="mt-4">
+        <Form form={createCollectionForm} onFinish={handleCreateCollection} layout="vertical" className="mt-4">
           <Form.Item
             name="name"
             label={<span className="text-slate-300">名称</span>}
@@ -394,6 +432,52 @@ export default function LiteraturePage() {
           </Form.Item>
           <Form.Item name="color" label={<span className="text-slate-300">颜色</span>} initialValue="#10b981">
             <Input type="color" style={{ width: 60, height: 32 }} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={
+          <span className="flex items-center gap-2">
+            <LinkOutlined className="text-emerald-400" />
+            链接入库
+          </span>
+        }
+        open={linkImportModalOpen}
+        onCancel={() => {
+          setLinkImportModalOpen(false)
+          linkImportForm.resetFields()
+        }}
+        onOk={() => linkImportForm.submit()}
+        okText="导入"
+        cancelText="取消"
+        confirmLoading={linkImportSubmitting}
+      >
+        <Form
+          form={linkImportForm}
+          onFinish={handleImportPaperFromLink}
+          layout="vertical"
+          className="mt-4"
+        >
+          <Form.Item
+            name="link"
+            label={<span className="text-slate-300">论文链接或标识</span>}
+            rules={[
+              { required: true, message: '请输入论文链接、DOI、arXiv 或 PubMed 标识' },
+            ]}
+            extra={
+              <span className="text-slate-500">
+                支持 DOI、arXiv、PubMed、OpenAlex、Semantic Scholar 和期刊详情页。
+                {selectedCollection
+                  ? ` 导入成功后会自动加入当前收藏夹“${selectedCollection.name}”。`
+                  : ' 未选择收藏夹时将按默认规则入库。'}
+              </span>
+            }
+          >
+            <Input.TextArea
+              rows={4}
+              placeholder={'例如：10.1038/s41586-023-07042-4\nhttps://arxiv.org/abs/2401.12345\nhttps://pubmed.ncbi.nlm.nih.gov/12345678/'}
+            />
           </Form.Item>
         </Form>
       </Modal>

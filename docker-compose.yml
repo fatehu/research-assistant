@@ -38,6 +38,7 @@ services:
 
   # FastAPI 后端
   backend:
+    image: research-assistant-backend:latest
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -127,9 +128,9 @@ services:
       - PDF_RAG_LINE_PIPELINE_ENABLED=${PDF_RAG_LINE_PIPELINE_ENABLED:-true}
       - PDF_RAG_FAIL_OPEN=${PDF_RAG_FAIL_OPEN:-true}
       - PDF_RAG_QWEN_DEVICE=${PDF_RAG_QWEN_DEVICE:-auto}
-      - PDF_RAG_ACTION_MODEL_DIR=${PDF_RAG_ACTION_MODEL_DIR:-tmp/qwen_lora/qwen_action_lora_merged_v1}
-      - PDF_RAG_CLEAN_MODEL_DIR=${PDF_RAG_CLEAN_MODEL_DIR:-tmp/qwen_lora/qwen_clean_lora_merged_v1}
-      - PDF_RAG_CHUNK_MODEL_DIR=${PDF_RAG_CHUNK_MODEL_DIR:-tmp/qwen_lora/qwen_chunk_lora_merged_v1}
+      - PDF_RAG_ACTION_MODEL_DIR=${PDF_RAG_ACTION_MODEL_DIR:-models/runtime/qwen_action_lora_merged_v2_manual}
+      - PDF_RAG_CLEAN_MODEL_DIR=${PDF_RAG_CLEAN_MODEL_DIR:-models/runtime/qwen_clean_lora_merged_v1}
+      - PDF_RAG_CHUNK_MODEL_DIR=${PDF_RAG_CHUNK_MODEL_DIR:-models/runtime/qwen_chunk_lora_merged_v1}
       - PDF_RAG_OCR_ENABLED=${PDF_RAG_OCR_ENABLED:-true}
       - PDF_RAG_OCR_MODEL=${PDF_RAG_OCR_MODEL:-qwen3.5:0.8b-stable}
       - PDF_RAG_OCR_TIMEOUT_SECONDS=${PDF_RAG_OCR_TIMEOUT_SECONDS:-30}
@@ -161,7 +162,7 @@ services:
       - READER_PIPELINE_MODE=${READER_PIPELINE_MODE:-single_agent_v2}
       - READER_PIPELINE_ALLOWLIST_PAPERS=${READER_PIPELINE_ALLOWLIST_PAPERS:-}
       - READER_PIPELINE_ALLOWLIST_PAGES=${READER_PIPELINE_ALLOWLIST_PAGES:-}
-      - READER_PIPELINE_VERSION=${READER_PIPELINE_VERSION:-simplified_v2}
+      - READER_PIPELINE_VERSION=${READER_PIPELINE_VERSION:-layout_uid_v1}
       - READER_AGENT_MODEL=${READER_AGENT_MODEL:-qwen3.5-plus}
       - READER_AGENT_TIMEOUT_MS=${READER_AGENT_TIMEOUT_MS:-90000}
       - READER_AGENT_MAX_TOKENS=${READER_AGENT_MAX_TOKENS:-7000}
@@ -181,6 +182,11 @@ services:
       - MCP_CONFIG_PATH=${MCP_CONFIG_PATH:-mcp_servers.json}
       - MCP_SERVERS=${MCP_SERVERS:-[]}
       - MCP_TOOL_ROUTES=${MCP_TOOL_ROUTES:-{}}
+      - MCP_BRAVE_API_KEY=${MCP_BRAVE_API_KEY}
+      - MCP_TAVILY_API_KEY=${MCP_TAVILY_API_KEY}
+      - MCP_EXA_API_KEY=${MCP_EXA_API_KEY}
+      - MCP_FIRECRAWL_API_KEY=${MCP_FIRECRAWL_API_KEY}
+      - MCP_GITHUB_TOKEN=${MCP_GITHUB_TOKEN}
       - MCP_ROUTE_TIMEOUT_SECONDS=${MCP_ROUTE_TIMEOUT_SECONDS:-15}
       - MCP_ROUTE_RETRY_ATTEMPTS=${MCP_ROUTE_RETRY_ATTEMPTS:-2}
       - MCP_ROUTE_RETRY_BACKOFF_SECONDS=${MCP_ROUTE_RETRY_BACKOFF_SECONDS:-0.5}
@@ -213,17 +219,17 @@ services:
       codelab-runner:
         condition: service_started
     command: >
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --timeout-graceful-shutdown 5"
+      sh -c 'set -eu;
+      alembic upgrade head;
+      if [ "${BACKEND_UVICORN_RELOAD:-false}" = "true" ]; then
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
+      fi;
+      exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
     networks:
       - research_network
 
   codelab-runner:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-      args:
-        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    image: research-assistant-backend:latest
     container_name: research_codelab_runner
     environment:
       - APP_ENV=${APP_ENV:-development}
@@ -247,12 +253,7 @@ services:
   # React 前端
   # MCP web server (Phase 2, profile: mcp)
   mcp_web:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-      args:
-        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    image: research-assistant-backend:latest
     container_name: research_mcp_web
     environment:
       - SERPER_API_KEY=${SERPER_API_KEY}
@@ -273,12 +274,7 @@ services:
 
   # MCP literature server (Phase 2, profile: mcp)
   mcp_literature:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-      args:
-        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    image: research-assistant-backend:latest
     container_name: research_mcp_literature
     environment:
       - LANG=${CONTAINER_LANG:-C.UTF-8}
@@ -297,29 +293,32 @@ services:
       - research_network
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: node:20-alpine
     container_name: research_frontend
+    working_dir: /app
     environment:
       - LANG=${CONTAINER_LANG:-C.UTF-8}
       - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
       - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8888}
       - VITE_WS_BASE_URL=${VITE_WS_BASE_URL:-ws://localhost:8888}
       - VITE_SHOW_RAG_METRICS=${VITE_SHOW_RAG_METRICS:-false}
+      - VITE_PROXY_TARGET=${VITE_PROXY_TARGET:-http://backend:8000}
       - VITE_DEV_WATCH_POLLING=${VITE_DEV_WATCH_POLLING:-true}
       - VITE_DEV_WATCH_POLLING_INTERVAL=${VITE_DEV_WATCH_POLLING_INTERVAL:-300}
-      - CHOKIDAR_USEPOLLING=${CHOKIDAR_USEPOLLING:-true}
-      - CHOKIDAR_INTERVAL=${CHOKIDAR_INTERVAL:-300}
+      - VITE_DISABLE_HOST_MODULE_ALIASES=${VITE_DISABLE_HOST_MODULE_ALIASES:-true}
     ports:
       - "3000:3000"
     volumes:
       - ./frontend:/app
-      # 使用命名卷代替匿名卷，避免每次启动都创建新卷
       - frontend_node_modules:/app/node_modules
+    command: >
+      sh -c "if [ ! -d node_modules ] || [ -z \"$(ls -A node_modules 2>/dev/null)\" ]; then
+        npm install;
+      fi &&
+      rm -rf node_modules/.vite &&
+      npm run dev -- --config vite.docker.config.ts --host 0.0.0.0 --port 3000"
     depends_on:
       - backend
-    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
     networks:
       - research_network
 

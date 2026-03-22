@@ -1,0 +1,52 @@
+{
+  "contract_validation": {
+    "status": "validated",
+    "contract": "experience_plan_v1"
+  },
+  "layout_variant": "focus_figure_split",
+  "section_order": [
+    "hero",
+    "focus_stage",
+    "reading_flow",
+    "explainer_cluster",
+    "supporting_resources"
+  ],
+  "section_regions": {
+    "hero": "main",
+    "focus_stage": "main",
+    "reading_flow": "main",
+    "explainer_cluster": "sidebar",
+    "supporting_resources": "sidebar"
+  },
+  "display_copy_contract": "display_copy_v1",
+  "hero_focus_label": "Fig 3",
+  "block_protocol": {
+    "focus_stage": [
+      {
+        "block_type": "widget",
+        "ref_id": "widget_1",
+        "state": "ready",
+        "user_actions": ["expand_panel", "focus_target"],
+        "agent_actions": ["sync_focus_stage", "highlight_evidence_anchor"]
+      }
+    ],
+    "explainer_cluster": [
+      {
+        "block_type": "interaction_module",
+        "ref_id": "int_1",
+        "state": "ready",
+        "user_actions": ["expand_definition", "return_to_reader", "focus_target"],
+        "agent_actions": ["ground_term_definition", "preserve_reader_context", "sync_focus_stage"]
+      }
+    ],
+    "supporting_resources": [
+      {
+        "block_type": "resource_module",
+        "ref_id": "res_1",
+        "state": "ready",
+        "user_actions": ["inspect_source"],
+        "agent_actions": ["retrieve_supporting_resource", "summarize_resource_relevance", "sync_focus_stage"]
+      }
+    ]
+  }
+}

@@ -86,3 +86,28 @@ docker compose logs --tail 100 frontend
 
 ### 7.3 前端构建有 chunk warning
 - 属于性能告警，不阻塞构建通过；需在性能治理阶段继续拆包。
+
+## 8. `/read` 证据链回归约束
+
+以下规则适用于所有会影响 `/literature/:id/read` 证据预览、高光、锚点菜单、表格证据、公式证据的改动。
+
+### 8.1 不可破坏的实现约束
+- DocMind 几何是真值来源；`uniqueId -> blocks[].pos` 是 `/read` 高光与预览的默认主链。
+- 不要为了局部问题切换 `/read` 的全局预览坐标系；表格、公式等局部修复不能改写整页 evidence preview 主路径。
+- `geometry.page_width/page_height` 与 `bbox_hint.page_width/page_height` 必须对应真实 DocMind 页图尺寸，不能退回“最大内容边界”推断值。
+- `layout_uid_v1` 相关改动必须保留 `证据` 菜单、hover evidence preview、pinned evidence 三条行为链。
+- 表格重建、公式重建、fallback 节点注入，都不能绕开通用节点级证据链。
+
+### 8.2 必做回归
+- 任何改动触及以下文件之一，都必须执行 `/read` 证据链回归：
+  - `frontend/src/pages/literature/PaperReaderPage.tsx`
+  - `frontend/src/pages/literature/readerComponents/index.tsx`
+  - `backend/app/services/literature_reader_compose_service.py`
+- 至少验证一页 prose-heavy 和一页 table-heavy 页面：
+  - `http://localhost:3000/literature/85/read?page=3&kb=84`
+  - `http://localhost:3000/literature/85/read?page=7&kb=84`
+- 最低验收项：
+  - `...` 菜单里仍有 `证据`
+  - hover 能拉起 evidence preview
+  - pinned evidence 与 hover evidence 对齐到同一 PDF 区域
+  - 新生成 payload 的 `page_width/page_height` 与 DocMind 页图尺寸一致
