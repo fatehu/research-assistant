@@ -135,7 +135,7 @@ from app.services.contextual_compression_service import CompressionInput
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.generative_reader_agent_runtime import get_generative_reader_agent_runtime
 from app.services.literature_service import PaperResult, get_literature_service
-from app.services.literature_reader_compose_service import get_literature_reader_compose_service
+from app.services.literature_reader_compose_service import GROUNDED_FIGURE_ASSET_VERSION, get_literature_reader_compose_service
 from app.services.literature_reader_service import get_literature_reader_service
 from app.services.llm_service import get_llm_service
 from app.services.render_pipeline_contract import RenderPipelineContractError
@@ -5106,12 +5106,18 @@ def _locate_reader_figure_asset_candidate_file(paper_id: int, page: int, asset_i
     )
     if not os.path.isdir(base_dir):
         return None, ""
-    for ext in ("jpg", "jpeg", "png", "webp"):
-        path = os.path.abspath(os.path.join(base_dir, f"{normalized_asset_id}.{ext}"))
-        if not path.startswith(base_dir + os.sep):
-            continue
-        if os.path.exists(path):
-            return path, ext
+    candidate_asset_ids = [
+        normalized_asset_id
+        if normalized_asset_id.endswith(f"_{GROUNDED_FIGURE_ASSET_VERSION}")
+        else f"{normalized_asset_id}_{GROUNDED_FIGURE_ASSET_VERSION}"
+    ]
+    for candidate_asset_id in candidate_asset_ids:
+        for ext in ("jpg", "jpeg", "png", "webp"):
+            path = os.path.abspath(os.path.join(base_dir, f"{candidate_asset_id}.{ext}"))
+            if not path.startswith(base_dir + os.sep):
+                continue
+            if os.path.exists(path):
+                return path, ext
     return None, ""
 
 
@@ -12229,8 +12235,11 @@ async def stream_reader_composed_page(
             "stage_started_at": time.perf_counter(),
         }
         event_queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
+        stream_closed = False
 
         async def enqueue_progress_event(event: str, data: Any) -> None:
+            if stream_closed:
+                return
             if event == "stage" and isinstance(data, Mapping):
                 now = time.perf_counter()
                 stage_token = str(data.get("stage") or "").strip()
@@ -12271,6 +12280,8 @@ async def stream_reader_composed_page(
                         publish_ready_event_enabled=False,
                         progress_callback=enqueue_progress_event,
                     )
+                if stream_closed:
+                    return
                 await event_queue.put(
                     (
                         "__build_complete__",
@@ -12285,10 +12296,12 @@ async def stream_reader_composed_page(
                     f"[Literature API] composed stream contract failed paper={paper_id}, page={page_num}: "
                     f"stage={exc.stage} code={exc.code} message={exc.message}"
                 )
-                await event_queue.put(("__contract_error__", exc.to_dict()))
+                if not stream_closed:
+                    await event_queue.put(("__contract_error__", exc.to_dict()))
             except Exception as exc:
                 logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
-                await event_queue.put(("__error__", {"message": str(exc)}))
+                if not stream_closed:
+                    await event_queue.put(("__error__", {"message": str(exc)}))
 
         build_task: Optional[asyncio.Task[Any]] = None
         try:
@@ -12320,12 +12333,11 @@ async def stream_reader_composed_page(
             meta = None
             while True:
                 if await request.is_disconnected():
+                    stream_closed = True
                     logger.warning(
                         f"[Literature API] composed stream client disconnected before emit done "
                         f"paper={paper_id} page={page_num}"
                     )
-                    if build_task is not None:
-                        build_task.cancel()
                     return
                 try:
                     event_name, event_data = await asyncio.wait_for(
@@ -12389,6 +12401,7 @@ async def stream_reader_composed_page(
                 f"degraded_reason={str(composed_payload.get('degraded_reason') or '')}"
             )
             if await request.is_disconnected():
+                stream_closed = True
                 logger.warning(
                     f"[Literature API] composed stream client disconnected before emit done "
                     f"paper={paper_id} page={page_num}"
@@ -12582,15 +12595,6 @@ async def stream_reader_composed_page(
         except Exception as exc:
             logger.exception(f"[Literature API] composed stream failed paper={paper_id}, page={page_num}: {exc}")
             yield _sse_payload("error", {"message": str(exc)})
-        finally:
-            if build_task is not None and not build_task.done():
-                build_task.cancel()
-                try:
-                    await build_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
 
     return StreamingResponse(
         event_generator(),

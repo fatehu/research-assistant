@@ -123,6 +123,16 @@ function deriveFigureSourceLabel(caption: string, sourceLabel: string): string {
   return matched ? matched[1] : ''
 }
 
+function stripFigureSourceLabelFromCaption(caption: string, sourceLabel: string): string {
+  const text = asString(caption)
+  const label = asString(sourceLabel)
+  if (!text || !label) return text
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const matched = text.match(new RegExp(`^${escapedLabel}(?:\\s*[:.\\-]\\s*|\\s+)`, 'i'))
+  if (!matched) return text
+  return text.slice(matched[0].length).trim()
+}
+
 function asRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
@@ -1563,6 +1573,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
       const imageFit = asString(props.image_fit).toLowerCase() === 'cover' ? 'cover' : 'contain'
       const preferContain = imageFit !== 'cover'
       const sourceLabel = deriveFigureSourceLabel(caption, asString(props.source_label))
+      const displayCaption = stripFigureSourceLabelFromCaption(caption, sourceLabel)
       const aiInsight = asString(props.ai_insight)
       const darkMode = isDarkTheme(ctx)
       const mediaSurfaceBackground = darkMode ? 'rgba(255, 255, 255, 0.035)' : 'rgba(15, 23, 42, 0.03)'
@@ -1615,7 +1626,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                 />
               </div>
             ) : null}
-            {(caption || sourceLabel) ? (
+            {(displayCaption || sourceLabel) ? (
               <div
                 style={{
                   marginTop: 12,
@@ -1637,7 +1648,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                     {sourceLabel}
                   </Tag>
                 ) : null}
-                {caption ? (
+                {displayCaption ? (
                   <Paragraph
                     style={{
                       marginBottom: 0,
@@ -1647,7 +1658,7 @@ export function renderReaderNode(node: ReaderComponentNode, ctx: ReaderComponent
                       whiteSpace: 'pre-wrap',
                     }}
                   >
-                    {caption}
+                    {displayCaption}
                   </Paragraph>
                 ) : null}
               </div>

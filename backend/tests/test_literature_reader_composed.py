@@ -1,7 +1,9 @@
 import json
+import asyncio
 import os
 import signal
 import sys
+import types
 from types import SimpleNamespace
 from io import BytesIO
 
@@ -1797,23 +1799,44 @@ async def test_publish_review_snapshot_should_save_published_review_overlay(monk
     assert all(row["overlay_json"]["snapshot_id"] == "snapshot_publish" for row in captured)
 
 
-@pytest.mark.asyncio
-async def test_ensure_page_render_asset_should_return_asset_url_from_cached_file(monkeypatch, tmp_path):
+def test_ensure_page_render_asset_should_return_asset_url_from_cached_file(monkeypatch, tmp_path):
     service = LiteratureReaderComposeService()
     monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path))
 
     asset_dir = tmp_path / "78"
     asset_dir.mkdir(parents=True, exist_ok=True)
-    cached = asset_dir / "page_7.jpg"
+    cached = asset_dir / "page_7_r220_q92_v2.jpg"
     cached.write_bytes(b"cached-jpg")
 
-    url = await service.ensure_page_render_asset(
-        paper_id=78,
-        page=7,
-        pdf_path="D:/missing.pdf",
+    url = asyncio.run(
+        service.ensure_page_render_asset(
+            paper_id=78,
+            page=7,
+            pdf_path="D:/missing.pdf",
+        )
     )
 
     assert url.endswith("/api/v1/literature/reader/page-assets/78/7")
+
+
+def test_page_render_asset_filename_should_include_version():
+    assert LiteratureReaderComposeService._page_render_asset_filename(page=7) == "page_7_r220_q92_v2.jpg"  # pylint: disable=protected-access
+
+
+def test_find_existing_page_render_asset_path_should_ignore_legacy_filename_and_use_versioned_file(monkeypatch, tmp_path):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(compose_module, "PAGE_RENDER_ASSET_DIR", str(tmp_path))
+
+    asset_dir = tmp_path / "78"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    legacy = asset_dir / "page_7.jpg"
+    legacy.write_bytes(b"legacy-jpg")
+    assert service._find_existing_page_render_asset_path(paper_id=78, page=7) is None  # pylint: disable=protected-access
+
+    versioned = asset_dir / "page_7_r220_q92_v2.jpg"
+    versioned.write_bytes(b"versioned-jpg")
+    found = service._find_existing_page_render_asset_path(paper_id=78, page=7)  # pylint: disable=protected-access
+    assert str(found or "") == str(versioned)
 
 
 def test_reader_compose_runtime_direct_review_content_should_ignore_data_urls():
@@ -2615,6 +2638,279 @@ async def test_build_or_get_composed_payload_should_reuse_compatible_db_cache_be
     assert meta.cache_layer == "db_compatible"
     assert payload["source_signature"].endswith("h:newhashvalue123456789012")
     assert len(payload["ui_plan"]["components"]) == 2
+
+
+def test_cleanup_compose_sibling_caches_should_delete_same_prefix_redis_siblings_and_db_rows(monkeypatch):
+    service = LiteratureReaderComposeService()
+    current_key = "lit:reader:compose:v1:v2:single_agent_v2:layout_uid_v1:u1:p86:pg13:newhash"
+    sibling_key = "lit:reader:compose:v1:v2:single_agent_v2:layout_uid_v1:u1:p86:pg13:oldhash"
+    other_page_key = "lit:reader:compose:v1:v2:single_agent_v2:layout_uid_v1:u1:p86:pg14:otherhash"
+    other_mode_key = "lit:reader:compose:v1:v2:semantic_atom_pipeline:layout_uid_v1:u1:p86:pg13:modehash"
+
+    class _FakeRedis:
+        def __init__(self):
+            self.store = {
+                current_key: "current",
+                sibling_key: "sibling",
+                other_page_key: "other_page",
+                other_mode_key: "other_mode",
+            }
+            self.deleted_keys = []
+            self.scans = []
+
+        async def scan(self, cursor=0, match=None, count=None):
+            self.scans.append((cursor, match, count))
+            prefix = str(match or "")
+            if prefix.endswith("*"):
+                prefix = prefix[:-1]
+            keys = [key for key in self.store if key.startswith(prefix)]
+            return 0, keys
+
+        async def delete(self, *keys):
+            deleted = 0
+            for key in keys:
+                self.deleted_keys.append(key)
+                if key in self.store:
+                    deleted += 1
+                    self.store.pop(key, None)
+            return deleted
+
+    class _FakeDb:
+        def __init__(self):
+            self.statements = []
+            self.commits = 0
+            self.rollbacks = 0
+
+        async def execute(self, stmt):
+            self.statements.append(stmt)
+            return SimpleNamespace(rowcount=2)
+
+        async def commit(self):
+            self.commits += 1
+
+        async def rollback(self):
+            self.rollbacks += 1
+
+    fake_redis = _FakeRedis()
+    fake_db = _FakeDb()
+
+    async def _resolve_redis_client():
+        return fake_redis
+
+    monkeypatch.setattr(service, "_resolve_redis_client", _resolve_redis_client)
+
+    report = asyncio.run(
+        service._cleanup_compose_sibling_caches(  # pylint: disable=protected-access
+            db=fake_db,
+            redis_key=current_key,
+            paper_id=86,
+            page=13,
+            source_signature="newhash",
+            pipeline_mode="single_agent_v2",
+            pipeline_version="layout_uid_v1",
+        )
+    )
+
+    assert report["redis_deleted"] == 1
+    assert report["db_deleted"] == 2
+    assert current_key in fake_redis.store
+    assert sibling_key not in fake_redis.store
+    assert other_page_key in fake_redis.store
+    assert other_mode_key in fake_redis.store
+    assert len(fake_db.statements) == 1
+    compiled_sql = str(fake_db.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "paper_reader_page_caches" in compiled_sql
+    assert "paper_id = 86" in compiled_sql
+    assert "page = 13" in compiled_sql
+    assert "source_signature" in compiled_sql
+    assert "newhash" in compiled_sql
+    assert "!=" in compiled_sql or "<>" in compiled_sql
+    assert fake_db.commits == 1
+
+
+def test_build_or_get_composed_payload_should_cleanup_sibling_caches_only_after_successful_force_refresh(monkeypatch):
+    service = LiteratureReaderComposeService()
+    cleanup_calls = {"count": 0}
+    build_state = {"passed": True}
+
+    async def _build_source_signature(**_kwargs):
+        return "compose_v3|p:86|kb:84|m:1773304814|s:2215244|pm:single_agent_v2|pv:layout_uid_v1|mode:auto/light/standard/0/0|h:newhash"
+
+    async def _read_payload_from_redis(**_kwargs):
+        return None
+
+    async def _read_payload_from_db(**_kwargs):
+        return None
+
+    async def _read_compatible_payload_from_db(**_kwargs):
+        return None
+
+    async def _acquire_lock(_lock_key):
+        return "lock-token"
+
+    async def _maintain_lock(**_kwargs):
+        return None
+
+    async def _release_lock(*_args, **_kwargs):
+        return None
+
+    async def _build_page_payload(**_kwargs):
+        return (
+            {
+            "paper_id": 86,
+            "page": 13,
+            "grounding_mode": "grounded",
+            "evidence_enabled": False,
+            "runtime_build_plan_evidence": False,
+            "page_grounding_policy": {"mode": "grounded", "page_mode": "grounded"},
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout-1",
+                        "node_kind": "paragraph",
+                        "clean_text": "Grounded paragraph.",
+                        "normalized_text": "Grounded paragraph.",
+                    }
+                ],
+                "page_image": {"url": "/api/v1/literature/reader/page-assets/86/13", "path": ""},
+            },
+            "docmind_structure": {"page_image_url": "/api/v1/literature/reader/page-assets/86/13"},
+            "ui_plan": {"components": [], "layout": {}, "style_tokens": {}, "trace_meta": {}},
+            "minimal_gate_report": {},
+            },
+            SimpleNamespace(),
+        )
+
+    async def _build_layout_uid_pipeline_result(**kwargs):
+        base_payload = dict(kwargs.get("base_payload") or {})
+        page = int(kwargs.get("page") or 13)
+        status = "done" if build_state["passed"] else "fallback"
+        return {
+            "base_payload": base_payload,
+            "loop_result": {
+                "build_mode": "compose_ai_reconstructed",
+                "status": status,
+                "ui_plan": {
+                    "plan_id": f"ai_reconstructed_p{page}",
+                    "components": [
+                        {
+                            "id": "component-1",
+                            "type": "ParagraphProse",
+                            "props": {"text": "Reconstructed paragraph."},
+                            "children": [],
+                            "source_anchor_refs": [],
+                            "source_block_ids": ["p13_b1"],
+                        }
+                    ],
+                    "layout": {},
+                    "style_tokens": {},
+                    "trace_meta": {},
+                },
+                "quality_report": {
+                    "overall": 0.91 if build_state["passed"] else 0.42,
+                    "validation_errors": [] if build_state["passed"] else ["fallback"],
+                    "iterations": 1,
+                    "degraded": not build_state["passed"],
+                    "stop_reason": "layout_uid_v1_done" if build_state["passed"] else "validator_non_converged",
+                },
+                "iterations": 1,
+                "degraded": not build_state["passed"],
+                "stop_reason": "layout_uid_v1_done" if build_state["passed"] else "validator_non_converged",
+                "node_gate_report": {},
+                "iteration_trace": [],
+            },
+            "assets": [],
+        }
+
+    def _build_validation_report(**_kwargs):
+        return {
+            "passed": build_state["passed"],
+            "gates": {"non_empty_plan_for_non_empty_input": {"passed": build_state["passed"], "errors": []}},
+            "errors": [] if build_state["passed"] else ["fallback"],
+        }
+
+    def _partition_main_aux_block_ids(**_kwargs):
+        return ["p13_b1"], []
+
+    async def _upsert_payload_to_db(**_kwargs):
+        return None
+
+    async def _write_payload_to_redis(*_args, **_kwargs):
+        return None
+
+    async def _apply_overlay_for_user(**kwargs):
+        return dict(kwargs.get("payload") or {})
+
+    async def _cleanup_compose_sibling_caches(**_kwargs):
+        cleanup_calls["count"] += 1
+        return {"redis_deleted": 1, "db_deleted": 1}
+
+    def _build_initial_ui_plan(**_kwargs):
+        return {"components": [], "layout": {}, "style_tokens": {}, "trace_meta": {}}
+
+    monkeypatch.setattr(service, "_build_source_signature", _build_source_signature)
+    monkeypatch.setattr(service, "_read_payload_from_redis", _read_payload_from_redis)
+    monkeypatch.setattr(service, "_read_payload_from_db", _read_payload_from_db)
+    monkeypatch.setattr(service, "_read_compatible_payload_from_db", _read_compatible_payload_from_db)
+    monkeypatch.setattr(service, "_acquire_lock", _acquire_lock)
+    monkeypatch.setattr(service, "_maintain_lock", _maintain_lock)
+    monkeypatch.setattr(service, "_release_lock", _release_lock)
+    monkeypatch.setattr(service._reader_service, "build_or_get_page_payload", _build_page_payload)
+    monkeypatch.setattr(service, "_build_layout_uid_pipeline_result", _build_layout_uid_pipeline_result)
+    monkeypatch.setattr(service, "_build_validation_report", _build_validation_report)
+    monkeypatch.setattr(service, "_partition_main_aux_block_ids", _partition_main_aux_block_ids)
+    monkeypatch.setattr(service, "_upsert_payload_to_db", _upsert_payload_to_db)
+    monkeypatch.setattr(service, "_write_payload_to_redis", _write_payload_to_redis)
+    monkeypatch.setattr(service, "_apply_overlay_for_user", _apply_overlay_for_user)
+    monkeypatch.setattr(service, "_build_initial_ui_plan", _build_initial_ui_plan)
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(service, "_cleanup_compose_sibling_caches", _cleanup_compose_sibling_caches)
+
+    paper = SimpleNamespace(id=86, user_id=1, title="demo", pdf_path="")
+
+    payload, meta = asyncio.run(
+        service.build_or_get_composed_payload(
+            db=SimpleNamespace(),
+            user_id=1,
+            paper=paper,
+            page=13,
+            selected_kb_id=84,
+            force_refresh=True,
+            regenerate=False,
+            style_intent=None,
+            theme_mode=None,
+            detail_level="standard",
+            compare_mode=False,
+            citation_tldr=False,
+        )
+    )
+
+    assert cleanup_calls["count"] == 1
+    assert str(payload.get("status") or "") == "done"
+    assert meta.cache_hit is False
+    assert meta.degraded is False
+
+    build_state["passed"] = False
+    payload2, meta2 = asyncio.run(
+        service.build_or_get_composed_payload(
+            db=SimpleNamespace(),
+            user_id=1,
+            paper=paper,
+            page=13,
+            selected_kb_id=84,
+            force_refresh=True,
+            regenerate=False,
+            style_intent=None,
+            theme_mode=None,
+            detail_level="standard",
+            compare_mode=False,
+            citation_tldr=False,
+        )
+    )
+
+    assert cleanup_calls["count"] == 1
+    assert str(payload2.get("status") or "") == "fallback"
+    assert meta2.degraded is True
 
 
 @pytest.mark.asyncio
@@ -3726,6 +4022,131 @@ async def test_reader_compose_sse_event_order(monkeypatch):
     assert "assets" in events
     assert "quality" in events
     assert events[-1] == "done"
+
+
+def test_reader_composed_stream_disconnect_should_continue_background_build_and_stop_sse(monkeypatch):
+    async def _run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        disconnect_ready = asyncio.Event()
+        completed = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class _FakeDB:
+            pass
+
+        class _FakeSessionFactory:
+            async def __aenter__(self):
+                return _FakeDB()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeComposeService:
+            async def build_or_get_composed_payload(self, **kwargs):
+                progress_callback = kwargs["progress_callback"]
+                try:
+                    await progress_callback(
+                        "stage",
+                        {
+                            "stage": "compose_running",
+                            "status": "started",
+                            "message": "working",
+                        },
+                    )
+                    started.set()
+                    await release.wait()
+                    await progress_callback(
+                        "stage",
+                        {
+                            "stage": "compose_late",
+                            "status": "started",
+                            "message": "late progress should stay hidden",
+                        },
+                    )
+                    return (
+                        {
+                            "status": "done",
+                            "ui_plan": {
+                                "plan_id": "demo",
+                                "components": [],
+                                "layout": {},
+                                "style_tokens": {},
+                                "trace_meta": {},
+                            },
+                            "assets": [],
+                            "quality_report": {},
+                            "iteration_trace": [],
+                        },
+                        ReaderComposeBuildMeta(
+                            cache_hit=False,
+                            cache_layer="none",
+                            build_mode="compose_ai_reconstructed",
+                            source_signature="sig-x",
+                            source_sig_hash="hash-x",
+                            iterations=1,
+                            degraded=False,
+                            stop_reason="done",
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                finally:
+                    completed.set()
+
+        async def _fake_get_owned(_db, _user, _paper_id):
+            return SimpleNamespace(id=9, user_id=7, title="Demo")
+
+        class _FakeRequest:
+            async def is_disconnected(self):
+                return disconnect_ready.is_set()
+
+        monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+        monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+        monkeypatch.setattr(literature_api, "async_session_factory", lambda: _FakeSessionFactory())
+
+        response = await literature_api.stream_reader_composed_page(
+            paper_id=9,
+            payload=SimpleNamespace(
+                page=2,
+                selected_kb_id=None,
+                force_refresh=False,
+                regenerate=False,
+                latency_budget_ms=None,
+                quality_target=None,
+                style_intent=None,
+                theme_mode="light",
+                detail_level="standard",
+                compare_mode=False,
+                citation_tldr=False,
+            ),
+            request=_FakeRequest(),
+            current_user=SimpleNamespace(id=7),
+        )
+
+        events = []
+        async for chunk in response.body_iterator:
+            text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            for line in text.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                parsed = json.loads(line[len("data: "):])
+                event_name = str(parsed.get("event") or "")
+                if not event_name:
+                    continue
+                events.append(event_name)
+                if event_name == "stage":
+                    disconnect_ready.set()
+
+        assert events == ["start", "stage"]
+        assert started.is_set() is True
+
+        release.set()
+        await asyncio.wait_for(completed.wait(), timeout=1.0)
+        assert cancelled.is_set() is False
+
+    asyncio.run(_run())
 
 
 @pytest.mark.asyncio
@@ -7012,7 +7433,7 @@ def test_build_page_grounding_v1_should_prefer_localized_docmind_image_over_rend
 
     render_dir = tmp_path / "85"
     render_dir.mkdir(parents=True, exist_ok=True)
-    render_path = render_dir / "page_7.jpg"
+    render_path = render_dir / "page_7_r220_q92_v2.jpg"
     render_path.write_bytes(b"jpg-bytes")
     grounding_dir = tmp_path / "paper_85" / "grounding_pages"
     grounding_dir.mkdir(parents=True, exist_ok=True)
@@ -7815,6 +8236,1805 @@ def test_normalize_layout_uid_ai_reconstruction_plan_should_accept_poor_docmind_
     assert len(list(((plan.get("components") or [])[1].get("paragraphs") or []))) == 2
 
 
+def test_normalize_layout_uid_combined_plan_should_keep_partial_page_decision_with_reconstructed_components():
+    service = LiteratureReaderComposeService()
+    combined_plan = service._normalize_layout_uid_combined_plan(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {"layout_id": "layout-1", "reading_order": 1, "node_kind": "paragraph"},
+                {"layout_id": "layout-2", "reading_order": 2, "node_kind": "figure"},
+            ]
+        },
+        step_result={
+            "text_items": [],
+            "groups": [
+                {"group_id": "g1", "group_kind": "paragraph", "source_layout_ids": ["layout-1"], "rationale": "prose"},
+                {"group_id": "g2", "group_kind": "figure", "source_layout_ids": ["layout-2"], "rationale": "figure"},
+            ],
+            "omissions": [],
+            "page_decision": {
+                "mode": "partial_reconstructed",
+                "reason": "figure crop needs recrop guidance",
+                "confidence": 0.79,
+            },
+            "reconstructed_components": [
+                {
+                    "kind": "figure",
+                    "caption": "Figure 2",
+                    "source_label": "Figure 2",
+                    "visual_spec": {
+                        "seed_bbox_norm": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.8},
+                        "must_include": ["main curve"],
+                        "must_exclude": ["neighbor prose"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert str(((combined_plan.get("page_decision") or {}).get("mode") or "")) == "partial_reconstructed"
+    reconstructed_components = list(combined_plan.get("reconstructed_components") or [])
+    reconstructed_validation = dict(combined_plan.get("reconstructed_validation") or {})
+    assert len(reconstructed_components) == 1
+    assert str((reconstructed_components[0] or {}).get("kind") or "") == "figure"
+    assert bool(reconstructed_validation.get("enabled")) is True
+    assert bool(reconstructed_validation.get("passed")) is True
+
+
+def test_analyze_layout_uid_grounding_quality_should_flag_single_collapsed_garbled_table_page():
+    service = LiteratureReaderComposeService()
+    warning = service._analyze_layout_uid_grounding_quality(  # pylint: disable=protected-access
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_bad_1",
+                    "layout_type": "table",
+                    "node_kind": "table",
+                    "include_in_main_flow": True,
+                    "blocks": [
+                        {
+                            "text": "| <ped><ped><ped><SO3><SO3>ino!y!p iinoy!p eiou eiow sseoojd sseooud",
+                        }
+                    ],
+                }
+            ]
+        },
+        payload={
+            "page_structure_v3": {
+                "block_groups": [
+                    {
+                        "block_id": "p13_dm_p13_l001_b001",
+                        "layout_unique_id": "layout_bad_1",
+                        "kind": "paragraph",
+                        "text": "| <ped><ped><ped><SO3><SO3>ino!y!p iinoy!p eiou eiow sseoojd sseooud",
+                    }
+                ]
+            }
+        },
+    )
+
+    assert bool(warning.get("single_main_layout")) is True
+    assert bool(warning.get("collapsed_block_groups")) is True
+    assert bool(warning.get("suspicious_ocr")) is True
+    hint = dict(warning.get("reconstruction_hint") or {})
+    assert bool(hint.get("recommended")) is True
+    assert bool(hint.get("advisory_only")) is True
+    assert str(hint.get("reason") or "") == "single_main_layout_plus_collapsed_block_groups_plus_garbled_ocr"
+    assert bool(warning.get("should_force_reconstruction")) is False
+    assert "table" in list(warning.get("main_layout_types") or [])
+    assert list(warning.get("suspicious_text_examples") or [])
+
+
+def test_layout_uid_combined_system_prompt_should_emphasize_poor_grounding_signals():
+    prompt = LiteratureReaderComposeService._layout_uid_combined_system_prompt()  # pylint: disable=protected-access
+    assert "collapsed block groups" in prompt
+    assert "garbled OCR" in prompt
+    assert "advisory evidence" in prompt
+    assert "tight figure-only crop" in prompt
+    assert "region_description" in prompt
+    assert "without the caption unless the caption is visually required" in prompt
+
+
+def test_layout_uid_reconstruction_only_system_prompt_should_require_tight_figure_crops():
+    prompt = LiteratureReaderComposeService._layout_uid_reconstruction_only_system_prompt()  # pylint: disable=protected-access
+    assert "single collapsed block with garbled OCR" in prompt
+    assert "tight boundaries" in prompt
+    assert "region_description" in prompt
+    assert "exclude the caption unless the caption is required" in prompt
+
+
+def test_build_layout_uid_pipeline_result_should_not_force_ai_reconstruction_for_single_collapsed_garbled_page(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=86, user_id=1, title="demo", pdf_path="")
+    garbage_text = "| <ped><ped><ped><SO3><SO3>ino!y!p iinoy!p eiou eiow sseoojd sseooud"
+    base_payload = {
+        "paper_id": 86,
+        "page": 13,
+        "build_mode": "parser_fallback",
+        "structure_confidence": 0.76,
+        "page_structure_v3": {
+            "block_groups": [
+                {
+                    "block_id": "p13_dm_p13_l001_b001",
+                    "layout_unique_id": "layout_bad_1",
+                    "kind": "paragraph",
+                    "zone_type": "main_body",
+                    "text": garbage_text,
+                }
+            ]
+        },
+        "page_grounding_v1": {
+            "version": "page_grounding_v1",
+            "page": 13,
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_bad_1",
+                    "layout_type": "table",
+                    "layout_sub_type": "none",
+                    "node_kind": "table",
+                    "reading_order": 1,
+                    "raw_text": "",
+                    "clean_text": "",
+                    "normalized_text": "",
+                    "canonical_block_ids": ["p13_dm_p13_l001_b001"],
+                    "include_in_main_flow": True,
+                    "region_hint": "main_body",
+                    "layout_pos": [
+                        {"x": 238.0, "y": 233.0},
+                        {"x": 867.0, "y": 233.0},
+                        {"x": 867.0, "y": 1213.0},
+                        {"x": 238.0, "y": 1213.0},
+                    ],
+                    "blocks": [
+                        {
+                            "block_index": 1,
+                            "style_id": 1,
+                            "text": garbage_text,
+                            "pos": [
+                                {"x": 238.0, "y": 233.0},
+                                {"x": 867.0, "y": 233.0},
+                                {"x": 867.0, "y": 1213.0},
+                                {"x": 238.0, "y": 1213.0},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "page_image": {
+                "url": "http://localhost:8888/api/v1/literature/reader/grounding-page-assets/86/13",
+                "path": "/app/uploads/reader_page_assets/paper_86/grounding_pages/page_13.png",
+                "width": 1483,
+                "height": 1920,
+                "source": "docmind_page_image_localized",
+                "origin_url": "https://example.com/docmind/page13.png",
+                "local_cached": True,
+            },
+        },
+        "assets": [],
+    }
+
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(
+        service._reader_service,  # pylint: disable=protected-access
+        "_resolve_local_pdf_path",
+        lambda **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        service,
+        "_resolve_reader_page_image_asset",
+        lambda **_kwargs: {
+            "url": "http://localhost:8888/api/v1/literature/reader/page-assets/86/13",
+            "path": "/app/uploads/reader_page_assets/86/page_13.jpg",
+            "source": "page_render_asset",
+            "origin_url": "",
+            "local_cached": True,
+        },
+    )
+
+    phases: List[str] = []
+
+    async def _fake_invoke_single_agent_model(**kwargs):
+        phase = str(kwargs.get("phase") or "")
+        phases.append(phase)
+        if phase == "layout_uid_combined_plan":
+            return {
+                "status": "done",
+                "step_result": {
+                    "text_items": [],
+                    "groups": [
+                        {
+                            "group_id": "g1",
+                            "group_kind": "figure",
+                            "source_layout_ids": ["layout_bad_1"],
+                            "rationale": "single collapsed visual block",
+                        }
+                    ],
+                    "omissions": [],
+                    "notes": ["single_layout_collapsed_page"],
+                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        if phase == "layout_uid_reconstruction_retry":
+            return {
+                "status": "done",
+                "step_result": {
+                    "reconstruction": {
+                        "mode": "ai_reconstructed",
+                        "docmind_quality": "poor",
+                        "reason": "DocMind collapsed the page into one corrupted table-like OCR block.",
+                        "confidence": 0.88,
+                        "components": [
+                            {
+                                "kind": "paragraph",
+                                "text": "This page is a visual figure with heavily corrupted grounded OCR.",
+                                "paragraphs": [
+                                    {
+                                        "text": "This page is a visual figure with heavily corrupted grounded OCR.",
+                                        "bbox_norm": {"x0": 0.12, "y0": 0.18, "x1": 0.88, "y1": 0.3},
+                                    }
+                                ],
+                                "bbox_norm": {"x0": 0.12, "y0": 0.18, "x1": 0.88, "y1": 0.3},
+                            }
+                        ],
+                        "notes": ["forced_reconstruction_retry"],
+                    }
+                },
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            }
+        raise AssertionError(f"unexpected phase: {phase}")
+
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
+    monkeypatch.setattr(
+        service,
+        "_apply_layout_uid_text_normalization_to_grounding",
+        lambda **kwargs: dict(kwargs.get("grounding") or {}),
+    )
+
+    async def _empty_map(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(service, "_build_ai_reconstructed_figure_asset_map", _empty_map)
+
+    result = asyncio.run(
+        service._build_layout_uid_pipeline_result(  # pylint: disable=protected-access
+            db=SimpleNamespace(),
+            user_id=1,
+            paper=paper,
+            page=13,
+            base_payload=base_payload,
+            style_intent=None,
+            theme_mode=None,
+            detail_level="standard",
+            compare_mode=False,
+            latency_budget_ms=1000,
+            selected_kb_id=84,
+            pipeline_version="layout_uid_v1",
+        )
+    )
+
+    assert phases == ["layout_uid_combined_plan"]
+    loop_result = dict(result.get("loop_result") or {})
+    payload = dict(result.get("base_payload") or {})
+    assert str(loop_result.get("build_mode") or "") == "compose_agent_layout_uid_v1"
+    assert str(loop_result.get("stop_reason") or "") == "layout_uid_v1_done"
+    warning = dict((payload.get("layout_advice_v3") or {}).get("grounding_warning") or {})
+    hint = dict(warning.get("reconstruction_hint") or {})
+    assert bool(hint.get("recommended")) is True
+    assert bool(hint.get("advisory_only")) is True
+    qwen_meta = dict(payload.get("qwen_plan_meta") or {})
+    assert str(qwen_meta.get("planning_mode") or "") == "combined_once"
+    assert bool(qwen_meta.get("reconstruction_retry_used")) is False
+    assert int(qwen_meta.get("prompt_tokens") or 0) == 10
+    assert int(qwen_meta.get("completion_tokens") or 0) == 5
+    assert int(qwen_meta.get("total_tokens") or 0) == 15
+    assert str(qwen_meta.get("reconstruction_retry_reason") or "") == ""
+
+
+def test_build_layout_uid_pipeline_result_should_backfill_grounded_page_mode(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=86, user_id=1, title="demo", pdf_path="")
+    base_payload = {
+        "paper_id": 86,
+        "page": 8,
+        "assets": [],
+        "page_grounding_v1": {
+            "layout_atoms": [
+                {
+                    "layout_id": "layout-1",
+                    "node_kind": "paragraph",
+                    "clean_text": "Grounded paragraph.",
+                    "normalized_text": "Grounded paragraph.",
+                }
+            ],
+            "page_image": {"url": "/api/v1/literature/reader/grounding-page-assets/86/8", "path": ""},
+        },
+        "docmind_structure": {"page_image_url": "/api/v1/literature/reader/grounding-page-assets/86/8"},
+    }
+
+    async def _empty_map(**_kwargs):
+        return {}
+
+    async def _fake_invoke_single_agent_model(**kwargs):
+        assert str(kwargs.get("phase") or "") == "layout_uid_combined_plan"
+        return {
+            "status": "done",
+            "step_result": {
+                "text_items": [],
+                "groups": [
+                    {
+                        "group_id": "group_1",
+                        "group_kind": "paragraph",
+                        "layout_ids": ["layout-1"],
+                    }
+                ],
+                "omissions": [],
+                "notes": [],
+            },
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
+        }
+
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_kwargs: "")
+    monkeypatch.setattr(
+        service,
+        "_resolve_reader_page_image_asset",
+        lambda **_kwargs: {
+            "url": "/api/v1/literature/reader/page-assets/86/8",
+            "path": "",
+            "source": "page_render_asset",
+            "origin_url": "",
+            "local_cached": True,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_layout_uid_combined_prompt_payload",
+        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout-1"}], "page_quality": {}},
+    )
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
+    monkeypatch.setattr(
+        service,
+        "_normalize_layout_uid_combined_plan",
+        lambda **_kwargs: {
+            "normalization_plan": {"items": []},
+            "text_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "grouping_plan": {
+                "groups": [{"group_id": "group_1", "group_kind": "paragraph", "layout_ids": ["layout-1"]}],
+                "omissions": [],
+                "notes": [],
+            },
+            "grouping_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "reconstruction_plan": {"mode": "grounded", "components": [], "notes": []},
+            "reconstruction_validation": {"enabled": False, "passed": True, "errors": []},
+        },
+    )
+    monkeypatch.setattr(service, "_apply_layout_uid_text_normalization_to_grounding", lambda **kwargs: dict(kwargs.get("grounding") or {}))
+    monkeypatch.setattr(service, "_build_layout_uid_table_refinement_map", _empty_map)
+    monkeypatch.setattr(service, "_build_layout_uid_equation_refinement_map", _empty_map)
+    monkeypatch.setattr(
+        service,
+        "_layout_uid_group_plan_to_panel_plan",
+        lambda **_kwargs: {
+            "plan_id": "layout_uid_v1_p8",
+            "panels": [
+                {
+                    "panel_id": "layout_uid_main",
+                    "nodes": [
+                        {
+                            "node_id": "group_1",
+                            "component": "ParagraphProse",
+                            "props": {"text": "Grounded paragraph."},
+                            "children": [],
+                            "source_layout_ids": ["layout-1"],
+                        }
+                    ],
+                }
+            ],
+            "style_plan": {},
+        },
+    )
+    monkeypatch.setattr(service, "_collect_docmind_blocks_for_single_agent", lambda **_kwargs: ([], {}))
+    monkeypatch.setattr(
+        service,
+        "_panel_plan_to_ui_plan",
+        lambda **_kwargs: {
+            "plan_id": "layout_uid_v1_p8",
+            "components": [
+                {
+                    "id": "group_1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Grounded paragraph."},
+                    "children": [],
+                    "source_layout_ids": ["layout-1"],
+                    "source_anchor_refs": [],
+                }
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+    )
+
+    result = asyncio.run(service._build_layout_uid_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=paper,
+        page=8,
+        base_payload=base_payload,
+        style_intent=None,
+        theme_mode=None,
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=1000,
+        selected_kb_id=84,
+        pipeline_version="layout_uid_v1",
+    ))
+
+    payload = dict(result.get("base_payload") or {})
+    loop_result = dict(result.get("loop_result") or {})
+    assert str(payload.get("page_mode") or "") == "grounded"
+    assert str(((payload.get("page_grounding_policy") or {}).get("mode") or "")) == "grounded"
+    assert str(((payload.get("qwen_plan_meta") or {}).get("page_mode") or "")) == "grounded"
+    assert str(((payload.get("layout_advice_v3") or {}).get("page_mode") or "")) == "grounded"
+    assert str(((payload.get("pipeline_contract_meta") or {}).get("page_mode") or "")) == "grounded"
+    assert str((((loop_result.get("ui_plan") or {}).get("components") or [])[0].get("props") or {}).get("source_mode") or "") == "grounded"
+
+
+def test_build_layout_uid_pipeline_result_should_use_partial_reconstructed_mode_with_grounded_compat(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=86, user_id=1, title="demo", pdf_path="")
+    calls = {"grounded_panel": 0}
+    base_payload = {
+        "paper_id": 86,
+        "page": 8,
+        "assets": [],
+        "page_grounding_v1": {
+            "layout_atoms": [
+                {
+                    "layout_id": "layout-1",
+                    "reading_order": 1,
+                    "node_kind": "paragraph",
+                    "clean_text": "Grounded paragraph.",
+                    "normalized_text": "Grounded paragraph.",
+                },
+                {
+                    "layout_id": "layout-2",
+                    "reading_order": 2,
+                    "node_kind": "figure",
+                    "clean_text": "Figure 4: Two attention heads.",
+                    "normalized_text": "Figure 4: Two attention heads.",
+                },
+            ],
+            "page_image": {"url": "/api/v1/literature/reader/grounding-page-assets/86/8", "path": ""},
+        },
+        "docmind_structure": {"page_image_url": "/api/v1/literature/reader/grounding-page-assets/86/8"},
+    }
+
+    async def _empty_map(**_kwargs):
+        return {}
+
+    async def _fake_invoke_single_agent_model(**kwargs):
+        assert str(kwargs.get("phase") or "") == "layout_uid_combined_plan"
+        return {
+            "status": "done",
+            "step_result": {},
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+        }
+
+    async def _fake_figure_assets(**_kwargs):
+        return {
+            1: {
+                "image_url": "/api/v1/literature/reader/figure-assets/86/8/partial_1",
+                "status": "verified_crop",
+                "bbox_norm": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.8},
+                "verification": {"pass": True},
+            }
+        }
+
+    def _grounded_panel_plan(**_kwargs):
+        calls["grounded_panel"] += 1
+        return {
+            "plan_id": "layout_uid_v1_p8",
+            "panels": [
+                {
+                    "panel_id": "layout_uid_main",
+                    "nodes": [
+                        {
+                            "node_id": "group_1",
+                            "component": "ParagraphProse",
+                            "props": {"text": "Grounded paragraph."},
+                            "children": [],
+                            "source_layout_ids": ["layout-1"],
+                        },
+                        {
+                            "node_id": "group_2",
+                            "component": "FigurePanel",
+                            "props": {"caption": "Figure 4 old", "image_url": "", "source_label": "Figure 4"},
+                            "children": [],
+                            "source_layout_ids": ["layout-2"],
+                        },
+                    ],
+                }
+            ],
+            "style_plan": {},
+        }
+
+    def _should_not_inject_ai_evidence(**_kwargs):
+        raise AssertionError("partial_reconstructed should not run fully-reconstructed evidence injection")
+
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_kwargs: "")
+    monkeypatch.setattr(
+        service,
+        "_resolve_reader_page_image_asset",
+        lambda **_kwargs: {
+            "url": "/api/v1/literature/reader/page-assets/86/8",
+            "path": "",
+            "source": "page_render_asset",
+            "origin_url": "",
+            "local_cached": True,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_layout_uid_combined_prompt_payload",
+        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout-1"}, {"layout_id": "layout-2"}], "page_quality": {}},
+    )
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
+    monkeypatch.setattr(
+        service,
+        "_normalize_layout_uid_combined_plan",
+        lambda **_kwargs: {
+            "normalization_plan": {"items": []},
+            "text_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "grouping_plan": {
+                "groups": [
+                    {"group_id": "group_1", "group_kind": "paragraph", "source_layout_ids": ["layout-1"]},
+                    {"group_id": "group_2", "group_kind": "figure", "source_layout_ids": ["layout-2"]},
+                ],
+                "omissions": [],
+                "notes": [],
+            },
+            "grouping_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "page_decision": {
+                "mode": "partial_reconstructed",
+                "reason": "replace figure with partial reconstruction",
+                "confidence": 0.77,
+            },
+            "reconstructed_components": [
+                {
+                    "kind": "figure",
+                    "caption": "Figure 4 new",
+                    "source_label": "Figure 4",
+                    "visual_spec": {"seed_bbox_norm": {"x0": 0.1, "y0": 0.2, "x1": 0.9, "y1": 0.8}},
+                }
+            ],
+            "reconstructed_validation": {"enabled": True, "passed": True, "errors": []},
+            "reconstruction_plan": {"mode": "grounded", "components": [], "notes": []},
+            "reconstruction_validation": {"enabled": False, "passed": True, "errors": []},
+        },
+    )
+    monkeypatch.setattr(service, "_apply_layout_uid_text_normalization_to_grounding", lambda **kwargs: dict(kwargs.get("grounding") or {}))
+    monkeypatch.setattr(service, "_build_layout_uid_table_refinement_map", _empty_map)
+    monkeypatch.setattr(service, "_build_layout_uid_equation_refinement_map", _empty_map)
+    monkeypatch.setattr(service, "_select_ai_reconstructed_figure_crop_source_asset", lambda **_kwargs: {"url": "/api/v1/literature/reader/page-assets/86/8", "path": "", "source": "page_render_asset", "local_cached": True})
+    monkeypatch.setattr(service, "_resolve_grounding_page_image_size", lambda **_kwargs: (1200, 1600))
+    monkeypatch.setattr(service, "_build_ai_reconstructed_figure_asset_map", _fake_figure_assets)
+    monkeypatch.setattr(service, "_layout_uid_group_plan_to_panel_plan", _grounded_panel_plan)
+    monkeypatch.setattr(service, "_collect_docmind_blocks_for_single_agent", lambda **_kwargs: ([], {}))
+    monkeypatch.setattr(
+        service,
+        "_panel_plan_to_ui_plan",
+        lambda **_kwargs: {
+            "plan_id": "layout_uid_v1_p8",
+            "components": [
+                {
+                    "id": "group_1",
+                    "type": "ParagraphProse",
+                    "props": {"text": "Grounded paragraph."},
+                    "children": [],
+                    "source_layout_ids": ["layout-1"],
+                    "source_anchor_refs": [],
+                },
+                {
+                    "id": "group_2",
+                    "type": "FigurePanel",
+                    "props": {"caption": "Figure 4 old", "image_url": "", "source_label": "Figure 4"},
+                    "children": [],
+                    "source_layout_ids": ["layout-2"],
+                    "source_anchor_refs": [],
+                },
+            ],
+            "layout": {},
+            "style_tokens": {},
+            "trace_meta": {},
+        },
+    )
+    monkeypatch.setattr(service, "_inject_ai_reconstructed_evidence_source_anchor_refs", _should_not_inject_ai_evidence)
+
+    result = asyncio.run(service._build_layout_uid_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=paper,
+        page=8,
+        base_payload=base_payload,
+        style_intent=None,
+        theme_mode=None,
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=1000,
+        selected_kb_id=84,
+        pipeline_version="layout_uid_v1",
+    ))
+
+    payload = dict(result.get("base_payload") or {})
+    loop_result = dict(result.get("loop_result") or {})
+    components = [dict(row) for row in list(((loop_result.get("ui_plan") or {}).get("components") or [])) if isinstance(row, dict)]
+    assert calls["grounded_panel"] == 1
+    assert str(payload.get("page_mode") or "") == "partial_reconstructed"
+    assert str(payload.get("grounding_mode") or "") == "grounded"
+    assert str(payload.get("reconstruction_mode") or "") == "grounded"
+    assert any(str(((row.get("props") or {}).get("source_mode") or "")) == "partial_reconstructed" for row in components)
+
+
+def test_build_layout_uid_pipeline_result_should_backfill_fully_reconstructed_page_metadata(monkeypatch):
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=86, user_id=1, title="demo", pdf_path="")
+    base_payload = {
+        "paper_id": 86,
+        "page": 14,
+        "assets": [],
+        "page_grounding_v1": {
+            "layout_atoms": [
+                {
+                    "layout_id": "layout-1",
+                    "node_kind": "figure",
+                    "clean_text": "Figure 4: Two attention heads.",
+                    "normalized_text": "Figure 4: Two attention heads.",
+                }
+            ],
+            "page_image": {"url": "/api/v1/literature/reader/grounding-page-assets/86/14", "path": ""},
+        },
+        "docmind_structure": {"page_image_url": "/api/v1/literature/reader/grounding-page-assets/86/14"},
+    }
+
+    async def _fake_invoke_single_agent_model(**kwargs):
+        assert str(kwargs.get("phase") or "") == "layout_uid_combined_plan"
+        return {
+            "status": "done",
+            "step_result": {
+                "text_items": [],
+                "groups": [],
+                "omissions": [],
+                "notes": [],
+                "reconstruction": {
+                    "mode": "ai_reconstructed",
+                    "docmind_quality": "poor",
+                    "reason": "DocMind grounding is unusable.",
+                    "confidence": 0.84,
+                    "components": [
+                        {"kind": "heading", "text": "Figure 4", "level": 2},
+                        {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                        {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+                    ],
+                    "notes": ["ai_reconstructed_due_to_poor_docmind"],
+                },
+            },
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+        }
+
+    async def _empty_map(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(service, "_ensure_payload_contract", lambda **kwargs: dict(kwargs.get("payload") or {}))
+    monkeypatch.setattr(service._reader_service, "_resolve_local_pdf_path", lambda **_kwargs: "")
+    monkeypatch.setattr(
+        service,
+        "_resolve_reader_page_image_asset",
+        lambda **_kwargs: {
+            "url": "/api/v1/literature/reader/page-assets/86/14",
+            "path": "",
+            "source": "page_render_asset",
+            "origin_url": "",
+            "local_cached": True,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_layout_uid_combined_prompt_payload",
+        lambda **_kwargs: {"layout_atoms": [{"layout_id": "layout-1"}], "page_quality": {}},
+    )
+    monkeypatch.setattr(service, "_invoke_single_agent_model", _fake_invoke_single_agent_model)
+    monkeypatch.setattr(
+        service,
+        "_normalize_layout_uid_combined_plan",
+        lambda **_kwargs: {
+            "normalization_plan": {"items": []},
+            "text_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "grouping_plan": {"groups": [], "omissions": [], "notes": []},
+            "grouping_validation": {"passed": True, "errors": [], "fallback_used": False},
+            "page_decision": {
+                "mode": "fully_reconstructed",
+                "reason": "DocMind grounding is unusable.",
+                "confidence": 0.84,
+            },
+            "reconstructed_components": [
+                {"kind": "heading", "text": "Figure 4", "level": 2},
+                {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+            ],
+            "reconstructed_validation": {"enabled": True, "passed": True, "errors": []},
+            "reconstruction_plan": {
+                "mode": "ai_reconstructed",
+                "docmind_quality": "poor",
+                "reason": "DocMind grounding is unusable.",
+                "confidence": 0.84,
+                "components": [
+                    {"kind": "heading", "text": "Figure 4", "level": 2},
+                    {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                    {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+                ],
+                "notes": ["ai_reconstructed_due_to_poor_docmind"],
+            },
+            "reconstruction_validation": {"enabled": True, "passed": True, "errors": []},
+        },
+    )
+    monkeypatch.setattr(service, "_apply_layout_uid_text_normalization_to_grounding", lambda **kwargs: dict(kwargs.get("grounding") or {}))
+    monkeypatch.setattr(service, "_build_layout_uid_table_refinement_map", _empty_map)
+    monkeypatch.setattr(service, "_build_layout_uid_equation_refinement_map", _empty_map)
+    monkeypatch.setattr(
+        service,
+        "_select_ai_reconstructed_figure_crop_source_asset",
+        lambda **_kwargs: {
+            "url": "/api/v1/literature/reader/page-assets/86/14",
+            "path": "",
+            "source": "page_render_asset",
+            "local_cached": True,
+        },
+    )
+    monkeypatch.setattr(service, "_resolve_grounding_page_image_size", lambda **_kwargs: (1200, 1600))
+    monkeypatch.setattr(service, "_build_ai_reconstructed_figure_asset_map", _empty_map)
+    monkeypatch.setattr(
+        service,
+        "_inject_ai_reconstructed_evidence_source_anchor_refs",
+        lambda **kwargs: (dict(kwargs.get("ui_plan") or {}), {"enabled": False, "anchor_count": 0, "page": 14, "page_image_source": "page_render_asset", "nodes": []}),
+    )
+
+    result = asyncio.run(service._build_layout_uid_pipeline_result(  # pylint: disable=protected-access
+        db=SimpleNamespace(),
+        user_id=1,
+        paper=paper,
+        page=14,
+        base_payload=base_payload,
+        style_intent=None,
+        theme_mode=None,
+        detail_level="standard",
+        compare_mode=False,
+        latency_budget_ms=1000,
+        selected_kb_id=84,
+        pipeline_version="layout_uid_v1",
+    ))
+
+    payload = dict(result.get("base_payload") or {})
+    assert str(payload.get("page_mode") or "") == "fully_reconstructed"
+    assert str(payload.get("grounding_mode") or "") == "ai_reconstructed"
+    assert str(((payload.get("page_grounding_policy") or {}).get("page_mode") or "")) == "fully_reconstructed"
+    assert str(((payload.get("page_grounding_policy") or {}).get("mode") or "")) == "ai_reconstructed"
+
+
+def test_select_ai_reconstructed_figure_crop_source_asset_should_prefer_page_render_asset(tmp_path):
+    service = LiteratureReaderComposeService()
+    small_path = tmp_path / "small.jpg"
+    large_path = tmp_path / "large.jpg"
+    Image.new("RGB", (800, 1000), color="white").save(small_path, format="JPEG")
+    Image.new("RGB", (1200, 1400), color="white").save(large_path, format="JPEG")
+
+    selected = service._select_ai_reconstructed_figure_crop_source_asset(  # pylint: disable=protected-access
+        rendered_page_image_url="/api/v1/literature/reader/page-assets/86/13",
+        rendered_page_image_path=str(small_path),
+        grounding={
+            "page_image": {
+                "url": "/api/v1/literature/reader/grounding-page-assets/86/13",
+                "path": str(large_path),
+                "source": "docmind_page_image_localized",
+            }
+        },
+    )
+
+    assert str(selected.get("source") or "") == "page_render_asset"
+    assert str(selected.get("path") or "") == str(small_path)
+    assert int(selected.get("width") or 0) == 800
+    assert int(selected.get("height") or 0) == 1000
+
+
+def test_ai_reconstructed_figure_asset_id_should_include_version():
+    service = LiteratureReaderComposeService()
+    asset_id = service._ai_reconstructed_figure_asset_id(  # pylint: disable=protected-access
+        page=14,
+        idx=2,
+        signature="abc123def456",
+        round_index=3,
+    )
+
+    assert asset_id.startswith("ai_recon_p14_f2_abc123def456_r3_")
+    assert asset_id.endswith("v2_pr220_q92")
+
+
+def test_normalize_layout_uid_ai_reconstruction_plan_should_preserve_visual_spec_for_figure():
+    service = LiteratureReaderComposeService()
+    plan, validation = service._normalize_layout_uid_ai_reconstruction_plan(  # pylint: disable=protected-access
+        step_result={
+            "reconstruction": {
+                "mode": "ai_reconstructed",
+                "docmind_quality": "poor",
+                "reason": "Figure geometry is rough, so reconstruct the figure from the page image and coarse DocMind boundary.",
+                "confidence": 0.92,
+                "components": [
+                    {
+                        "kind": "paragraph",
+                        "text": "The reconstructed paragraph should stay split into model paragraphs.",
+                        "paragraphs": [
+                            "The reconstructed paragraph should stay split into model paragraphs.",
+                            "The second paragraph stays distinct for the runtime reader.",
+                        ],
+                    },
+                    {
+                        "kind": "figure",
+                        "caption": "Figure 4: Two attention heads.",
+                        "source_label": "Figure 4",
+                        "notes": [
+                            "use the page image and coarse DocMind boundary to estimate a rough figure crop",
+                            "keep the figure body and trim caption noise if needed",
+                        ],
+                        "partial_reconstruction": "keep the figure body with a rough crop around the visual region",
+                        "visual_spec": {
+                            "bbox_norm": {"x0": 0.08, "y0": 0.16, "x1": 0.92, "y1": 0.74},
+                            "must_include": ["attention heads", "full panels"],
+                            "must_exclude": ["header", "footer", "neighbor paragraph"],
+                            "region_description": "rough crop around the plotted attention map and node panels",
+                            "boundary_notes": "use the visible text positions and x/y boundaries to exclude page chrome and caption noise",
+                            "crop_strategy": "figure_only_with_caption_trimmed_if_possible",
+                            "require_full_boundary": True,
+                            "prefer_without_caption": True,
+                            "allow_caption_if_needed": False,
+                        },
+                    }
+                ],
+                "notes": ["figure_needs_verified_crop"],
+            }
+        },
+    )
+
+    assert bool(validation.get("enabled")) is True
+    assert bool(validation.get("passed")) is True
+    components = list(plan.get("components") or [])
+    assert len(components) == 2
+
+    paragraph = dict(components[0] or {})
+    assert str(paragraph.get("kind") or "") == "paragraph"
+    assert str(((paragraph.get("text") or ""))) == "The reconstructed paragraph should stay split into model paragraphs."
+    assert [str(row.get("text") or "") for row in list(paragraph.get("paragraphs") or [])] == [
+        "The reconstructed paragraph should stay split into model paragraphs.",
+        "The second paragraph stays distinct for the runtime reader.",
+    ]
+
+    figure = dict(components[1] or {})
+    assert str(figure.get("kind") or "") == "figure"
+    visual_spec = dict(figure.get("visual_spec") or {})
+    assert dict(visual_spec.get("seed_bbox_norm") or {}) == {"x0": 0.08, "y0": 0.16, "x1": 0.92, "y1": 0.74}
+    assert list(visual_spec.get("must_include") or []) == ["attention heads", "full panels"]
+    assert list(visual_spec.get("must_exclude") or []) == ["header", "footer", "neighbor paragraph"]
+    assert str(visual_spec.get("region_description") or "") == "rough crop around the plotted attention map and node panels"
+    assert str(visual_spec.get("boundary_notes") or "") == "use the visible text positions and x/y boundaries to exclude page chrome and caption noise"
+    assert bool(visual_spec.get("require_full_boundary")) is True
+    assert bool(visual_spec.get("prefer_without_caption")) is True
+    assert bool(visual_spec.get("allow_caption_if_needed")) is False
+    assert str(visual_spec.get("crop_strategy") or "") == "figure_only_with_caption_trimmed_if_possible"
+    assert list(figure.get("notes") or []) == [
+        "use the page image and coarse DocMind boundary to estimate a rough figure crop",
+        "keep the figure body and trim caption noise if needed",
+    ]
+    assert str(figure.get("partial_reconstruction") or "") == "keep the figure body with a rough crop around the visual region"
+
+
+def test_layout_uid_combined_system_prompt_should_request_coarse_bbox_guidance_for_reconstructed_figures():
+    service = LiteratureReaderComposeService()
+    prompt = service._layout_uid_combined_system_prompt()  # pylint: disable=protected-access
+
+    assert "coarse_visual_bbox_norm" in prompt
+    assert "preferred coarse boundary for figure crops on collapsed pages" in prompt
+    assert "mislabeled the region as a table" in prompt
+    assert "partial_reconstructed" in prompt
+    assert "fully_reconstructed" in prompt
+
+
+def test_derive_ai_reconstructed_figure_seed_bbox_norm_should_use_single_main_layout_bbox_even_when_layout_is_mislabeled_table():
+    service = LiteratureReaderComposeService()
+    seed_bbox = service._derive_ai_reconstructed_figure_seed_bbox_norm(  # pylint: disable=protected-access
+        visual_spec={},
+        grounding={
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_bad_1",
+                    "layout_type": "table",
+                    "node_kind": "table",
+                    "layout_pos": [
+                        {"x": 120.0, "y": 100.0},
+                        {"x": 1320.0, "y": 100.0},
+                        {"x": 1320.0, "y": 900.0},
+                        {"x": 120.0, "y": 900.0},
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert dict(seed_bbox or {}) == {"x0": 0.0909, "y0": 0.0758, "x1": 1.0, "y1": 0.6818}
+
+
+def test_expand_ai_reconstructed_figure_crop_bbox_norm_should_add_rough_margin_and_clamp_edges():
+    service = LiteratureReaderComposeService()
+    expanded = service._expand_ai_reconstructed_figure_crop_bbox_norm(  # pylint: disable=protected-access
+        {"x0": 0.005, "y0": 0.004, "x1": 0.13, "y1": 0.14}
+    )
+
+    assert dict(expanded or {}) == {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 0.14,
+        "y1": 0.15,
+    }
+
+
+def test_infer_docmind_page_size_should_prefer_anchor_geometry_over_layout_extent():
+    service = LiteratureReaderComposeService()
+    width, height = service._infer_docmind_page_size(  # pylint: disable=protected-access
+        payload={
+            "page_grounding_v1": {
+                "page_image": {
+                    "width": 999,
+                    "height": 944,
+                }
+            },
+            "ui_plan": {
+                "components": [
+                    {
+                        "id": "fig-3",
+                        "type": "FigurePanel",
+                        "source_anchor_refs": [
+                            {
+                                "geometry": {"page_width": 1483, "page_height": 1920},
+                                "bbox_hint": {"page_width": 1483, "page_height": 1920},
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+        layouts=[
+            {
+                "pos": [
+                    {"x": 100.0, "y": 100.0},
+                    {"x": 999.0, "y": 100.0},
+                    {"x": 999.0, "y": 944.0},
+                    {"x": 100.0, "y": 944.0},
+                ]
+            }
+        ],
+    )
+
+    assert int(width or 0) == 1483
+    assert int(height or 0) == 1920
+
+
+def test_build_figure_assets_sync_should_prefer_clipped_bbox_over_native_and_version_grounded_assets(
+    tmp_path, monkeypatch
+):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    pdf_path = tmp_path / "paper.pdf"
+    out_dir = tmp_path / "reader_figure_assets" / "85" / "p3"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=600, height=800)
+    writer.add_blank_page(width=600, height=800)
+    writer.add_blank_page(width=600, height=800)
+    with open(pdf_path, "wb") as handle:
+        writer.write(handle)
+
+    legacy_path = out_dir / "figure_3.jpg"
+    Image.new("RGB", (24, 24), "red").save(legacy_path, format="JPEG")
+    recorded = {}
+
+    class _FakePage:
+        width = 600
+        height = 800
+        images = []
+
+        @staticmethod
+        def to_image(resolution=220):  # noqa: ARG004
+            return SimpleNamespace(original=Image.new("RGB", (600, 800), "white"))
+
+    class _FakePdf:
+        pages = [_FakePage(), _FakePage(), _FakePage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ARG002
+            return False
+
+    fake_pdfplumber = types.ModuleType("pdfplumber")
+    fake_pdfplumber.open = lambda *_args, **_kwargs: _FakePdf()
+    monkeypatch.setitem(sys.modules, "pdfplumber", fake_pdfplumber)
+    monkeypatch.setattr(service, "_filter_page_images_by_bbox", lambda **_kwargs: [])
+    monkeypatch.setattr(service, "_select_native_pdf_image", lambda **_kwargs: SimpleNamespace(
+        data=b"native-image-bytes",
+        name="native-image.jpg",
+        image=Image.new("RGB", (80, 80), "white"),
+    ))
+
+    def _recording_convert_docmind_bbox_to_pdf(**kwargs):
+        recorded["convert"] = (
+            float(kwargs.get("docmind_width") or 0.0),
+            float(kwargs.get("docmind_height") or 0.0),
+        )
+        return tuple(kwargs.get("bbox") or ())
+
+    def _recording_write_native_pdf_image(**kwargs):
+        recorded["native_called"] = True
+        recorded["asset_id"] = str(kwargs.get("asset_id") or "")
+        target = out_dir / f"{recorded['asset_id']}.jpg"
+        Image.new("RGB", (64, 64), "blue").save(target, format="JPEG")
+        return str(target)
+
+    def _recording_write_clipped_page_image(**kwargs):
+        recorded["clip_called"] = True
+        recorded["asset_id"] = str(kwargs.get("asset_id") or "")
+        target = out_dir / f"{recorded['asset_id']}.png"
+        Image.new("RGB", (96, 96), "green").save(target, format="PNG")
+        return str(target)
+
+    monkeypatch.setattr(service, "_convert_docmind_bbox_to_pdf", _recording_convert_docmind_bbox_to_pdf)
+    monkeypatch.setattr(service, "_write_native_pdf_image", _recording_write_native_pdf_image)
+    monkeypatch.setattr(service, "_write_clipped_page_image", _recording_write_clipped_page_image)
+
+    assets = service._build_figure_assets_sync(  # pylint: disable=protected-access
+        paper_id=85,
+        page=3,
+        pdf_path=str(pdf_path),
+        payload={
+            "ui_plan": {
+                "components": [
+                    {
+                        "id": "fig-3",
+                        "type": "FigurePanel",
+                        "source_anchor_refs": [
+                            {
+                                "geometry": {"page_width": 1483, "page_height": 1920},
+                                "bbox_hint": {"page_width": 1483, "page_height": 1920},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "page_grounding_v1": {"page_image": {"width": 999, "height": 944}},
+        },
+        figure_layouts=[
+            {
+                "uniqueId": "figure_3",
+                "type": "figure",
+                "pos": [
+                    {"x": 100.0, "y": 100.0},
+                    {"x": 999.0, "y": 100.0},
+                    {"x": 999.0, "y": 944.0},
+                    {"x": 100.0, "y": 944.0},
+                ],
+                "text": "Figure 3",
+            }
+        ],
+    )
+
+    versioned_asset_id = service._grounded_figure_asset_id(layout_uid="figure_3")  # pylint: disable=protected-access
+    expected_convert = (1483.0, 1920.0)
+
+    assert str(recorded.get("asset_id") or "") == versioned_asset_id
+    assert recorded.get("convert") == expected_convert
+    assert bool(recorded.get("clip_called")) is True
+    assert bool(recorded.get("native_called")) is False
+    assert legacy_path.exists()
+    assert (out_dir / f"{versioned_asset_id}.png").exists()
+    assert len(assets) == 1
+    asset = dict(assets[0] or {})
+    meta = dict(asset.get("meta") or {})
+    assert str(meta.get("asset_id") or "") == versioned_asset_id
+    assert str(meta.get("layout_unique_id") or "") == "figure_3"
+    assert str(meta.get("asset_version") or "") == compose_module.GROUNDED_FIGURE_ASSET_VERSION
+    assert str(asset.get("href") or "").endswith(f"/figure-assets/85/3/{versioned_asset_id}")
+
+
+def test_locate_reader_figure_asset_candidate_file_should_ignore_legacy_grounded_asset_file(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    base_dir = tmp_path / "reader_figure_assets" / "85" / "p3"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    legacy_path = base_dir / "figure_3.jpg"
+    legacy_path.write_bytes(b"legacy")
+    versioned_asset_id = f"figure_3_{compose_module.GROUNDED_FIGURE_ASSET_VERSION}"
+    versioned_path = base_dir / f"{versioned_asset_id}.jpg"
+    versioned_path.write_bytes(b"versioned")
+
+    assert literature_api._locate_reader_figure_asset_candidate_file(85, 3, "figure_3") == (
+        str(versioned_path),
+        "jpg",
+    )
+    assert literature_api._locate_reader_figure_asset_candidate_file(85, 3, versioned_asset_id) == (
+        str(versioned_path),
+        "jpg",
+    )
+
+
+def test_build_ai_reconstructed_figure_asset_map_should_expand_ai_bbox_and_clamp_edges_before_crop(tmp_path, monkeypatch):
+    service = LiteratureReaderComposeService()
+    page_image_path = tmp_path / "page.jpg"
+    Image.new("RGB", (1200, 1600), "white").save(page_image_path, format="JPEG")
+    out_dir = tmp_path / "figure-assets"
+    crop_bboxes = []
+    verifier_calls = {"count": 0}
+
+    def _select_source_asset(*_args, **_kwargs):
+        return {
+            "url": "/api/v1/literature/reader/page-assets/86/13",
+            "path": str(page_image_path),
+            "source": "page_render_asset",
+        }
+
+    def _recording_write_clipped_page_image_norm(**kwargs):
+        crop_bboxes.append(dict(kwargs.get("bbox_norm") or {}))
+        asset_id = str(kwargs.get("asset_id") or "crop")
+        target = out_dir / f"{asset_id}.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1200, 1600), "white").save(target, format="JPEG")
+        return str(target)
+
+    async def _fail_if_called(*_args, **_kwargs):
+        verifier_calls["count"] += 1
+        raise AssertionError("direct crop flow should not invoke the VL verifier")
+
+    raw_component = {
+        "kind": "figure",
+        "caption": "Figure 3: Attention visualizations.",
+        "source_label": "Figure 3",
+        "bbox_norm": {"x0": 0.005, "y0": 0.004, "x1": 0.13, "y1": 0.14},
+        "visual_spec": {
+            "must_include": ["attention visualizations"],
+            "must_exclude": ["caption", "neighbor prose"],
+            "region_description": "rough crop around the figure body",
+            "boundary_notes": "use the AI bbox directly and add a small margin",
+            "require_full_boundary": True,
+            "prefer_without_caption": True,
+            "allow_caption_if_needed": False,
+        },
+    }
+
+    selected_bbox_norm, bbox_source, *_ = service._resolve_ai_reconstructed_figure_crop_bbox_norm(  # pylint: disable=protected-access
+        raw_component=raw_component,
+        grounding={"page_image": {"width": 1200, "height": 1600}, "layout_atoms": []},
+        payload={"page_structure_v3": {"block_groups": []}},
+    )
+
+    assert selected_bbox_norm is not None
+    assert dict(selected_bbox_norm or {}) == {"x0": 0.0, "y0": 0.0, "x1": 0.14, "y1": 0.15}
+    assert str(bbox_source or "") == "component_bbox_norm"
+
+    monkeypatch.setattr(service, "_select_ai_reconstructed_figure_crop_source_asset", _select_source_asset)
+    monkeypatch.setattr(service, "_reader_figure_asset_out_dir", lambda **_kwargs: str(out_dir))
+    monkeypatch.setattr(service, "_write_clipped_page_image_norm", _recording_write_clipped_page_image_norm)
+    monkeypatch.setattr(service, "_verify_ai_reconstructed_figure_crop", _fail_if_called)
+
+    payload = {"page_structure_v3": {"block_groups": []}}
+    assets = asyncio.run(
+        service._build_ai_reconstructed_figure_asset_map(  # pylint: disable=protected-access
+            paper_id=86,
+            page=13,
+            reconstruction_plan={
+                "mode": "partial_reconstructed",
+                "components": [raw_component],
+            },
+            page_image_url="/api/v1/literature/reader/page-assets/86/13",
+            page_image_path=str(page_image_path),
+            grounding={"page_image": {"width": 1200, "height": 1600}, "layout_atoms": []},
+            payload=payload,
+        )
+    )
+
+    entry = dict(assets.get(1) or {})
+    assert verifier_calls["count"] == 0
+    assert len(crop_bboxes) == 1
+    assert dict(crop_bboxes[0] or {}) == dict(selected_bbox_norm or {})
+    assert dict(crop_bboxes[0] or {}) != {"x0": 0.005, "y0": 0.004, "x1": 0.13, "y1": 0.14}
+    assert str(entry.get("status") or "") == "direct_ai_crop"
+    assert dict(entry.get("bbox_norm") or {}) == dict(selected_bbox_norm or {})
+    assert str(entry.get("crop_bbox_source") or "") == str(bbox_source or "")
+
+
+def test_build_ai_reconstructed_figure_asset_map_should_use_single_direct_ai_crop_from_coarse_bbox(tmp_path, monkeypatch):
+    service = LiteratureReaderComposeService()
+    page_image_path = tmp_path / "page.jpg"
+    Image.new("RGB", (1200, 1600), "white").save(page_image_path, format="JPEG")
+    out_dir = tmp_path / "figure-assets"
+    crop_bboxes = []
+    verifier_calls = {"count": 0}
+
+    def _select_source_asset(*_args, **_kwargs):
+        return {
+            "url": "/api/v1/literature/reader/page-assets/86/13",
+            "path": str(page_image_path),
+            "source": "page_render_asset",
+        }
+
+    def _recording_write_clipped_page_image_norm(**kwargs):
+        crop_bboxes.append(dict(kwargs.get("bbox_norm") or {}))
+        asset_id = str(kwargs.get("asset_id") or "crop")
+        target = out_dir / f"{asset_id}.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1200, 1600), "white").save(target, format="JPEG")
+        return str(target)
+
+    async def _fail_if_called(*_args, **_kwargs):
+        verifier_calls["count"] += 1
+        raise AssertionError("direct crop flow should not invoke the VL verifier")
+
+    raw_component = {
+        "kind": "figure",
+        "caption": "Figure 3: Attention visualizations.",
+        "source_label": "Figure 3",
+        "visual_spec": {
+            "must_include": ["attention visualizations"],
+            "must_exclude": ["caption", "neighbor prose"],
+            "region_description": "tight crop around the figure body",
+            "boundary_notes": "exclude caption and surrounding prose",
+            "require_full_boundary": True,
+            "prefer_without_caption": True,
+            "allow_caption_if_needed": False,
+        },
+    }
+    selected_bbox_norm, bbox_source, *_ = service._resolve_ai_reconstructed_figure_crop_bbox_norm(  # pylint: disable=protected-access
+        raw_component=raw_component,
+        grounding={
+            "page_image": {"width": 1200, "height": 1600},
+            "layout_atoms": [
+                {
+                    "layout_id": "layout_bad_1",
+                    "layout_type": "table",
+                    "node_kind": "table",
+                    "include_in_main_flow": True,
+                    "layout_pos": [
+                        {"x": 120.0, "y": 100.0},
+                        {"x": 1320.0, "y": 100.0},
+                        {"x": 1320.0, "y": 900.0},
+                        {"x": 120.0, "y": 900.0},
+                    ],
+                }
+            ],
+        },
+        payload={"page_structure_v3": {"block_groups": []}},
+    )
+    assert selected_bbox_norm is not None
+    assert str(bbox_source or "") == "docmind_coarse_bbox_norm"
+    grounding = {
+        "page_image": {"width": 1200, "height": 1600},
+        "layout_atoms": [
+            {
+                "layout_id": "layout_bad_1",
+                "layout_type": "table",
+                "node_kind": "table",
+                "include_in_main_flow": True,
+                "layout_pos": [
+                    {"x": 120.0, "y": 100.0},
+                    {"x": 1320.0, "y": 100.0},
+                    {"x": 1320.0, "y": 900.0},
+                    {"x": 120.0, "y": 900.0},
+                ],
+            }
+        ],
+    }
+
+    monkeypatch.setattr(service, "_select_ai_reconstructed_figure_crop_source_asset", _select_source_asset)
+    monkeypatch.setattr(service, "_reader_figure_asset_out_dir", lambda **_kwargs: str(out_dir))
+    monkeypatch.setattr(service, "_write_clipped_page_image_norm", _recording_write_clipped_page_image_norm)
+    monkeypatch.setattr(service, "_verify_ai_reconstructed_figure_crop", _fail_if_called)
+
+    payload = {"page_structure_v3": {"block_groups": []}}
+    assets = asyncio.run(
+        service._build_ai_reconstructed_figure_asset_map(  # pylint: disable=protected-access
+            paper_id=86,
+            page=13,
+            reconstruction_plan={
+                "mode": "partial_reconstructed",
+                "components": [raw_component],
+            },
+            page_image_url="/api/v1/literature/reader/page-assets/86/13",
+            page_image_path=str(page_image_path),
+            grounding=grounding,
+            payload=payload,
+        )
+    )
+
+    entry = dict(assets.get(1) or {})
+    assert verifier_calls["count"] == 0
+    assert len(crop_bboxes) == 1
+    assert dict(crop_bboxes[0] or {}) == dict(selected_bbox_norm or {})
+    assert str(entry.get("status") or "") == "direct_ai_crop"
+    assert dict(entry.get("bbox_norm") or {}) == dict(selected_bbox_norm or {})
+    assert str(entry.get("crop_bbox_source") or "") == str(bbox_source or "")
+
+
+def test_build_ai_reconstructed_figure_asset_map_should_fallback_to_page_image_when_bbox_is_missing_or_invalid(tmp_path, monkeypatch):
+    service = LiteratureReaderComposeService()
+    page_image_path = tmp_path / "page.jpg"
+    Image.new("RGB", (1200, 1600), "white").save(page_image_path, format="JPEG")
+    out_dir = tmp_path / "figure-assets"
+    crop_bboxes = []
+
+    def _select_source_asset(*_args, **_kwargs):
+        return {
+            "url": "/api/v1/literature/reader/page-assets/86/13",
+            "path": str(page_image_path),
+            "source": "page_render_asset",
+        }
+
+    def _recording_write_clipped_page_image_norm(**kwargs):
+        crop_bboxes.append(dict(kwargs.get("bbox_norm") or {}))
+        asset_id = str(kwargs.get("asset_id") or "crop")
+        target = out_dir / f"{asset_id}.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1200, 1600), "white").save(target, format="JPEG")
+        return str(target)
+
+    async def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("missing bbox should not reach the verifier")
+
+    monkeypatch.setattr(service, "_select_ai_reconstructed_figure_crop_source_asset", _select_source_asset)
+    monkeypatch.setattr(service, "_reader_figure_asset_out_dir", lambda **_kwargs: str(out_dir))
+    monkeypatch.setattr(service, "_write_clipped_page_image_norm", _recording_write_clipped_page_image_norm)
+    monkeypatch.setattr(
+        service,
+        "_resolve_ai_reconstructed_figure_crop_bbox_norm",
+        lambda **_kwargs: (None, "missing_bbox_norm", None, None),
+    )
+    monkeypatch.setattr(service, "_verify_ai_reconstructed_figure_crop", _fail_if_called)
+
+    payload = {"page_structure_v3": {"block_groups": []}}
+    assets = asyncio.run(
+        service._build_ai_reconstructed_figure_asset_map(  # pylint: disable=protected-access
+            paper_id=86,
+            page=13,
+            reconstruction_plan={
+                "mode": "partial_reconstructed",
+                "components": [
+                    {
+                        "kind": "figure",
+                        "caption": "Figure 3: Attention visualizations.",
+                        "source_label": "Figure 3",
+                        "visual_spec": {
+                            "seed_bbox_norm": {"x0": 0.15, "y0": 0.15, "x1": 0.85, "y1": 0.85},
+                            "must_include": ["attention visualizations"],
+                            "must_exclude": ["caption", "neighbor prose"],
+                            "region_description": "tight crop around the figure body",
+                            "boundary_notes": "exclude caption and surrounding prose",
+                            "require_full_boundary": True,
+                            "prefer_without_caption": True,
+                            "allow_caption_if_needed": False,
+                        },
+                    }
+                ],
+            },
+            page_image_url="/api/v1/literature/reader/page-assets/86/13",
+            page_image_path=str(page_image_path),
+            grounding={"page_image": {"width": 1200, "height": 1600}},
+            payload=payload,
+        )
+    )
+
+    entry = dict(assets.get(1) or {})
+    assert str(entry.get("status") or "") == "fallback_page"
+    assert str(entry.get("image_url") or "") == "/api/v1/literature/reader/page-assets/86/13"
+    assert len(crop_bboxes) == 0
+
+
+def test_ensure_payload_contract_should_retain_ai_evidence_and_anchor_refs_when_bbox_hint_exists():
+    service = LiteratureReaderComposeService()
+    bbox_hint = {"x0": 0.1, "x1": 0.9, "top": 0.15, "bottom": 0.75, "page_width": 1000, "page_height": 1200}
+    ensured = service._ensure_payload_contract(  # pylint: disable=protected-access
+        page=14,
+        payload={
+            "paper_id": 86,
+            "page": 14,
+            "status": "done",
+            "build_mode": "compose_ai_reconstructed",
+            "grounding_mode": "ai_reconstructed",
+            "evidence_enabled": True,
+            "runtime_build_plan_evidence": True,
+            "page_grounding_policy": {
+                "mode": "ai_reconstructed",
+                "evidence_enabled": True,
+                "reason": "DocMind grounding unusable for this page.",
+                "docmind_quality": "poor",
+                "confidence": 0.91,
+            },
+            "quality_report": {
+                "overall": 0.74,
+                "stop_reason": "layout_uid_v1_ai_reconstructed",
+                "validation_errors": [],
+            },
+            "ui_plan": {
+                "plan_id": "ai_reconstructed_p14",
+                "components": [
+                    {
+                        "id": "ai_reconstructed_1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "Reconstructed summary of the page."},
+                        "children": [],
+                        "source_block_ids": [],
+                        "source_anchor_refs": [
+                            {
+                                "page": 14,
+                                "start_char": 0,
+                                "end_char": 32,
+                                "quote_text": "Reconstructed summary of the page.",
+                                "anchor_id": "ai-bbox-1",
+                                "anchor_confidence": 0.94,
+                                "bbox_hint": bbox_hint,
+                                "coord_version": "ai_bbox_v1",
+                            }
+                        ],
+                    }
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+            "page_grounding_v1": {
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout-1",
+                        "node_kind": "paragraph",
+                        "clean_text": "Reconstructed summary of the page.",
+                        "normalized_text": "Reconstructed summary of the page.",
+                    }
+                ]
+            },
+        },
+    )
+
+    assert bool(ensured.get("evidence_enabled")) is True
+    assert bool(ensured.get("runtime_build_plan_evidence")) is True
+    assert str(((ensured.get("page_grounding_policy") or {}).get("mode") or "")) == "ai_reconstructed"
+    refs = list((((ensured.get("ui_plan") or {}).get("components") or [])[0].get("source_anchor_refs") or []))
+    assert len(refs) == 1
+    assert dict(refs[0].get("bbox_hint") or {}) == bbox_hint
+    assert str(refs[0].get("anchor_id") or "") == "ai-bbox-1"
+    assert bool(((ensured.get("quality_report") or {}).get("grounded_evidence_enabled"))) is True
+
+
+def test_ensure_payload_contract_should_preserve_partial_reconstructed_page_mode_and_component_source_modes(monkeypatch):
+    service = LiteratureReaderComposeService()
+    monkeypatch.setattr(
+        service,
+        "_enforce_no_drop_blocks_fallback",
+        lambda **_kwargs: {
+            "triggered": False,
+            "strategy": "",
+            "error_code": "",
+            "missing_block_ids": [],
+            "inserted_node_ids": [],
+        },
+    )
+    ensured = service._ensure_payload_contract(  # pylint: disable=protected-access
+        page=14,
+        payload={
+            "paper_id": 86,
+            "page": 14,
+            "page_mode": "partial_reconstructed",
+            "grounding_mode": "partial_reconstructed",
+            "reconstruction_mode": "partial_reconstructed",
+            "page_grounding_policy": {
+                "mode": "partial_reconstructed",
+                "page_mode": "partial_reconstructed",
+                "reconstruction_mode": "partial_reconstructed",
+                "evidence_enabled": False,
+            },
+            "ui_plan": {
+                "plan_id": "partial_reconstructed_p14",
+                "components": [
+                    {
+                        "id": "paragraph_1",
+                        "type": "ParagraphProse",
+                        "props": {"text": "Grounded paragraph.", "source_mode": "grounded"},
+                        "children": [],
+                        "source_block_ids": ["p14_b1"],
+                        "source_anchor_refs": [],
+                    },
+                    {
+                        "id": "figure_1",
+                        "type": "FigurePanel",
+                        "props": {
+                            "caption": "Figure 4: Two attention heads.",
+                            "image_url": "/api/v1/literature/reader/page-assets/86/14",
+                            "source_label": "Figure 4",
+                            "source_mode": "partial_reconstructed",
+                            "partial_reconstruction": "crop the figure body only",
+                        },
+                        "children": [],
+                        "source_block_ids": ["p14_b2"],
+                        "source_anchor_refs": [],
+                    },
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+            "page_grounding_v1": {
+                "page_image": {"url": "/api/v1/literature/reader/grounding-page-assets/86/14", "path": ""},
+                "layout_atoms": [
+                    {"layout_id": "layout-1", "node_kind": "paragraph", "clean_text": "Grounded paragraph.", "normalized_text": "Grounded paragraph."},
+                    {"layout_id": "layout-2", "node_kind": "figure", "clean_text": "Figure 4: Two attention heads.", "normalized_text": "Figure 4: Two attention heads."},
+                ],
+            },
+        },
+    )
+
+    components = list(((ensured.get("ui_plan") or {}).get("components") or []))
+    assert str(ensured.get("page_mode") or "") == "partial_reconstructed"
+    assert str(((ensured.get("page_grounding_policy") or {}).get("mode") or "")) == "partial_reconstructed"
+    assert str(((components[0] or {}).get("props") or {}).get("source_mode") or "") == "grounded"
+    assert str(((components[1] or {}).get("props") or {}).get("source_mode") or "") == "partial_reconstructed"
+    assert str(((components[1] or {}).get("props") or {}).get("partial_reconstruction") or "") == "crop the figure body only"
+
+
+def test_ensure_payload_contract_should_restore_ai_evidence_from_old_ai_reconstructed_payload():
+    service = LiteratureReaderComposeService()
+    figure_bbox = {"x0": 0.12, "y0": 0.18, "x1": 0.88, "y1": 0.76}
+    ensured = service._ensure_payload_contract(  # pylint: disable=protected-access
+        page=14,
+        payload={
+            "paper_id": 86,
+            "page": 14,
+            "status": "done",
+            "build_mode": "compose_ai_reconstructed",
+            "grounding_mode": "ai_reconstructed",
+            "evidence_enabled": False,
+            "runtime_build_plan_evidence": False,
+            "page_grounding_policy": {
+                "mode": "ai_reconstructed",
+                "reconstruction_mode": "ai_reconstructed",
+                "evidence_enabled": False,
+                "runtime_build_plan_evidence": False,
+            },
+            "layout_advice_v3": {
+                "reconstruction": {
+                    "mode": "ai_reconstructed",
+                    "docmind_quality": "poor",
+                    "reason": "DocMind figure evidence is unusable for this page.",
+                    "confidence": 0.91,
+                    "components": [
+                        {
+                            "kind": "figure",
+                            "caption": "Figure 4: Two attention heads.",
+                            "source_label": "Figure 4",
+                            "bbox_norm": figure_bbox,
+                        }
+                    ],
+                    "notes": ["old_ai_reconstructed_payload"],
+                },
+                "ai_reconstructed_figure_assets": json.dumps(
+                    {
+                        "1": {
+                            "asset_id": "ai_reconstructed_figure_1",
+                            "image_url": "/api/v1/literature/reader/figure-assets/86/14/ai_reconstructed_figure_1.png",
+                            "bbox_norm": figure_bbox,
+                            "verified": True,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            "pipeline_contract_meta": {
+                "ai_reconstructed_figure_assets": json.dumps(
+                    {
+                        "1": {
+                            "asset_id": "ai_reconstructed_figure_1",
+                            "image_url": "/api/v1/literature/reader/figure-assets/86/14/ai_reconstructed_figure_1.png",
+                            "bbox_norm": figure_bbox,
+                            "verified": True,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            "quality_report": {
+                "overall": 0.72,
+                "stop_reason": "layout_uid_v1_ai_reconstructed",
+                "validation_errors": [],
+            },
+            "page_grounding_v1": {
+                "page_image": {"width": 1360, "height": 1760, "url": "/api/v1/literature/reader/page-assets/86/14"},
+                "layout_atoms": [
+                    {
+                        "layout_id": "layout-figure-1",
+                        "node_kind": "figure",
+                        "clean_text": "Figure 4: Two attention heads.",
+                        "normalized_text": "Figure 4: Two attention heads.",
+                    }
+                ],
+            },
+            "ui_plan": {
+                "plan_id": "ai_reconstructed_p14",
+                "components": [
+                    {
+                        "id": "figure_1",
+                        "type": "FigurePanel",
+                        "props": {
+                            "caption": "Figure 4: Two attention heads.",
+                            "image_url": "/api/v1/literature/reader/page-assets/86/14",
+                            "source_label": "Figure 4",
+                            "ai_insight": "",
+                        },
+                        "children": [],
+                        "source_block_ids": [],
+                        "source_anchor_refs": [],
+                    }
+                ],
+                "layout": {},
+                "style_tokens": {},
+                "trace_meta": {},
+            },
+        },
+    )
+
+    assert bool(ensured.get("evidence_enabled")) is True
+    assert bool(ensured.get("runtime_build_plan_evidence")) is True
+    assert bool(ensured.get("ai_reconstructed_evidence_enabled")) is True
+    assert str(((ensured.get("page_grounding_policy") or {}).get("mode") or "")) == "ai_reconstructed"
+    refs = list((((ensured.get("ui_plan") or {}).get("components") or [])[0].get("source_anchor_refs") or []))
+    assert len(refs) == 1
+    assert dict(refs[0].get("bbox_hint") or {}) == {
+        "x0": 163.2,
+        "x1": 1196.8,
+        "top": 316.8,
+        "bottom": 1337.6,
+        "page_width": 1360,
+        "page_height": 1760,
+    }
+    assert str(((ensured.get("ui_plan") or {}).get("components") or [])[0].get("props", {}).get("image_url") or "") == "/api/v1/literature/reader/page-assets/86/14"
+    assert dict(((ensured.get("ui_plan") or {}).get("components") or [])[0].get("props") or {}).get("bbox_norm") == figure_bbox
+
+
+def test_sanitize_ui_plan_for_runtime_should_keep_injected_ai_bbox_anchor_refs_on_ai_reconstructed_components():
+    service = LiteratureReaderComposeService()
+    bbox_hint = {"x0": 0.12, "x1": 0.88, "top": 0.22, "bottom": 0.44, "page_width": 1000, "page_height": 1200}
+    geometry = {
+        "page_width": 1000,
+        "page_height": 1200,
+        "polygons": [
+            {
+                "points": [
+                    {"x": 120.0, "y": 220.0},
+                    {"x": 880.0, "y": 220.0},
+                    {"x": 880.0, "y": 440.0},
+                    {"x": 120.0, "y": 440.0},
+                ],
+                "source": "ai_bbox_v1",
+            }
+        ],
+    }
+    payload = {
+        "grounding_mode": "ai_reconstructed",
+        "evidence_enabled": True,
+        "page_grounding_policy": {"mode": "ai_reconstructed", "evidence_enabled": True},
+        "page_grounding_v1": {
+            "layout_atoms": [
+                {
+                    "layout_id": "layout-1",
+                    "node_kind": "paragraph",
+                    "clean_text": "Reconstructed summary of the page.",
+                    "normalized_text": "Reconstructed summary of the page.",
+                }
+            ]
+        },
+    }
+    ui_plan = {
+        "plan_id": "ai_reconstructed_p14",
+        "components": [
+            {
+                "id": "ai_reconstructed_1",
+                "type": "ParagraphProse",
+                "props": {"text": "Reconstructed summary of the page."},
+                "children": [],
+                "source_anchor_refs": [
+                    {
+                        "page": 14,
+                        "start_char": 0,
+                        "end_char": 32,
+                        "quote_text": "Reconstructed summary of the page.",
+                        "anchor_id": "ai-bbox-1",
+                        "anchor_confidence": 0.96,
+                        "bbox_hint": bbox_hint,
+                        "geometry": geometry,
+                        "coord_version": "ai_bbox_v1",
+                    }
+                ],
+            }
+        ],
+    }
+
+    sanitized = service._sanitize_ui_plan_for_runtime(  # pylint: disable=protected-access
+        page=14,
+        payload=payload,
+        ui_plan=ui_plan,
+    )
+    refs = list((((sanitized.get("components") or [])[0]).get("source_anchor_refs") or []))
+    assert len(refs) == 1
+    assert dict(refs[0].get("bbox_hint") or {}) == bbox_hint
+    assert dict(refs[0].get("geometry") or {}) == geometry
+    assert str(refs[0].get("coord_version") or "") == "ai_bbox_v1"
+
+
+def test_refresh_layout_uid_source_anchor_refs_should_keep_ai_bbox_anchors():
+    service = LiteratureReaderComposeService()
+    ai_anchor = {
+        "page": 14,
+        "start_char": 0,
+        "end_char": 32,
+        "quote_text": "Reconstructed summary of the page.",
+        "anchor_id": "ai-bbox-1",
+        "anchor_confidence": 0.94,
+        "bbox_hint": {"x0": 0.1, "x1": 0.9, "top": 0.15, "bottom": 0.75, "page_width": 1000, "page_height": 1200},
+        "coord_version": "ai_bbox_v1",
+    }
+    ui_plan = {
+        "components": [
+            {
+                "id": "ai_reconstructed_1",
+                "type": "ParagraphProse",
+                "props": {"text": "Reconstructed summary of the page."},
+                "children": [],
+                "source_layout_ids": ["layout-1"],
+                "source_anchor_refs": [ai_anchor],
+            }
+        ]
+    }
+    payload = {
+        "page_grounding_v1": {
+            "layout_atoms": [
+                {
+                    "layout_id": "layout-1",
+                    "node_kind": "paragraph",
+                    "clean_text": "Reconstructed summary of the page.",
+                    "normalized_text": "Reconstructed summary of the page.",
+                    "layout_pos": [{"x": 10.0, "y": 20.0}, {"x": 210.0, "y": 20.0}, {"x": 210.0, "y": 120.0}, {"x": 10.0, "y": 120.0}],
+                }
+            ]
+        }
+    }
+
+    refreshed = service._refresh_layout_uid_source_anchor_refs(  # pylint: disable=protected-access
+        page=14,
+        payload=payload,
+        ui_plan=ui_plan,
+    )
+
+    refs = list(((refreshed.get("components") or [])[0].get("source_anchor_refs") or []))
+    assert len(refs) == 2
+    assert any(str(ref.get("coord_version") or "") == "ai_bbox_v1" and dict(ref.get("bbox_hint") or {}) == ai_anchor["bbox_hint"] for ref in refs)
+    assert any(str(ref.get("coord_version") or "") == "layout_uid_v1" for ref in refs)
+
+
 def test_build_ai_reconstructed_panel_plan_should_create_ungrounded_reader_nodes():
     service = LiteratureReaderComposeService()
     panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
@@ -7838,6 +10058,121 @@ def test_build_ai_reconstructed_panel_plan_should_create_ungrounded_reader_nodes
     assert str((nodes[1] or {}).get("component") or "") == "FigurePanel"
     assert str((((nodes[1] or {}).get("props") or {}).get("image_url") or "")) == "/api/v1/literature/reader/page-render-assets/86/14"
     assert str((((nodes[2] or {}).get("props") or {}).get("text") or "")) == "The visual compares multiple attention heads."
+
+
+def test_build_ai_reconstructed_panel_plan_should_keep_figure_partial_reconstruction_notes():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
+        page=14,
+        reconstruction_plan={
+            "mode": "ai_reconstructed",
+            "notes": ["poor_docmind"],
+            "components": [
+                {"kind": "heading", "text": "Figure 4", "level": 2},
+                {
+                    "kind": "figure",
+                    "caption": "Figure 4: Two attention heads.",
+                    "source_label": "Figure 4",
+                    "notes": ["keep the figure body and trim caption noise"],
+                    "partial_reconstruction": "crop just the figure body and keep a short explanation",
+                },
+                {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+            ],
+        },
+        page_image_url="/api/v1/literature/reader/page-render-assets/86/14",
+    )
+
+    nodes = list(((panel_plan.get("panels") or [])[0].get("nodes") or []))
+    figure_props = dict((nodes[1] or {}).get("props") or {})
+    assert list(figure_props.get("reconstruction_notes") or []) == ["keep the figure body and trim caption noise"]
+    assert str(figure_props.get("partial_reconstruction") or "") == "crop just the figure body and keep a short explanation"
+
+
+def test_build_ai_reconstructed_panel_plan_should_prefer_verified_figure_assets_over_page_image():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
+        page=14,
+        reconstruction_plan={
+            "mode": "ai_reconstructed",
+            "notes": ["poor_docmind"],
+            "components": [
+                {"kind": "paragraph", "text": "Leading summary"},
+                {
+                    "kind": "figure",
+                    "caption": "Figure 4: Two attention heads.",
+                    "source_label": "Figure 4",
+                    "visual_spec": {
+                        "seed_bbox_norm": {"x0": 0.08, "y0": 0.16, "x1": 0.92, "y1": 0.74},
+                        "must_include": ["attention heads"],
+                        "must_exclude": ["header", "footer"],
+                        "require_full_boundary": True,
+                        "prefer_without_caption": False,
+                        "allow_caption_if_needed": True,
+                    },
+                },
+            ],
+        },
+        page_image_url="/api/v1/literature/reader/page-render-assets/86/14",
+        figure_assets={
+            2: {
+                "image_url": "/api/v1/literature/reader/figure-assets/86/14/ai_reconstructed_figure_2.png",
+                "asset_id": "ai_reconstructed_figure_2",
+                "verified": True,
+            }
+        },
+    )
+
+    nodes = list(((panel_plan.get("panels") or [])[0].get("nodes") or []))
+    assert len(nodes) == 2
+    figure_node = dict(nodes[1] or {})
+    assert str(figure_node.get("component") or "") == "FigurePanel"
+    assert str(((figure_node.get("props") or {}).get("image_url") or "")) == "/api/v1/literature/reader/figure-assets/86/14/ai_reconstructed_figure_2.png"
+
+
+def test_build_ai_reconstructed_panel_plan_should_fall_back_to_page_image_when_no_verified_figure_asset():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
+        page=14,
+        reconstruction_plan={
+            "mode": "ai_reconstructed",
+            "notes": ["poor_docmind"],
+            "components": [
+                {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"}
+            ],
+        },
+        page_image_url="/api/v1/literature/reader/page-render-assets/86/14",
+        figure_assets={},
+    )
+
+    nodes = list(((panel_plan.get("panels") or [])[0].get("nodes") or []))
+    assert len(nodes) == 1
+    figure_node = dict(nodes[0] or {})
+    assert str(figure_node.get("component") or "") == "FigurePanel"
+    assert str(((figure_node.get("props") or {}).get("image_url") or "")) == "/api/v1/literature/reader/page-render-assets/86/14"
+
+
+def test_build_ai_reconstructed_panel_plan_should_mark_all_nodes_fully_reconstructed():
+    service = LiteratureReaderComposeService()
+    panel_plan = service._build_ai_reconstructed_panel_plan(  # pylint: disable=protected-access
+        page=14,
+        reconstruction_plan={
+            "mode": "ai_reconstructed",
+            "notes": ["poor_docmind"],
+            "components": [
+                {"kind": "heading", "text": "Figure 4", "level": 2},
+                {"kind": "figure", "caption": "Figure 4: Two attention heads.", "source_label": "Figure 4"},
+                {"kind": "paragraph", "text": "The visual compares multiple attention heads."},
+            ],
+        },
+        page_image_url="/api/v1/literature/reader/page-render-assets/86/14",
+        figure_assets={},
+    )
+
+    nodes = list(((panel_plan.get("panels") or [])[0].get("nodes") or []))
+    assert len(nodes) == 3
+    assert str((((nodes[0] or {}).get("props") or {}).get("source_mode") or "")) == "fully_reconstructed"
+    assert str((((nodes[1] or {}).get("props") or {}).get("source_mode") or "")) == "fully_reconstructed"
+    assert str((((nodes[2] or {}).get("props") or {}).get("source_mode") or "")) == "fully_reconstructed"
 
 
 def test_ensure_payload_contract_should_skip_no_drop_for_ai_reconstructed_pages():

@@ -26,7 +26,7 @@ from urllib.request import urlopen
 from loguru import logger
 from openai import AsyncOpenAI
 from PIL import Image
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -97,6 +97,10 @@ CLEANUP_LOCK_KEY = "lit:reader:compose:cleanup:lock"
 LEGACY_CACHE_SCAN_MATCH = "lit:reader:compose*:*"
 UPLOAD_DIR = os.path.abspath(os.getenv("UPLOAD_DIR", "./uploads"))
 PAGE_RENDER_ASSET_DIR = os.path.join(UPLOAD_DIR, "reader_page_assets")
+PAGE_RENDER_ASSET_VERSION = "r220_q92_v2"
+PAGE_RENDER_ASSET_FILENAME_TEMPLATE = f"page_{{page}}_{PAGE_RENDER_ASSET_VERSION}.jpg"
+AI_RECONSTRUCTED_FIGURE_ASSET_VERSION = "v4_direct_ai_crop_q92"
+GROUNDED_FIGURE_ASSET_VERSION = "v3_grounded_bbox_clip"
 REVIEW_OBSERVATION_DIR = os.path.join(UPLOAD_DIR, "reader_review_observations")
 IMAGE_CONTENT_TYPE_TO_EXT = {
     "image/jpeg": "jpg",
@@ -1136,6 +1140,22 @@ class LiteratureReaderComposeService:
                 payload=payload,
             )
             await self._write_payload_to_redis(redis_key, payload)
+            if compose_force_refresh and current_status == "done":
+                cleanup_report = await self._cleanup_compose_sibling_caches(
+                    db=db,
+                    redis_key=redis_key,
+                    paper_id=int(paper.id),
+                    page=page_num,
+                    source_signature=source_signature,
+                    pipeline_mode=pipeline_mode,
+                    pipeline_version=pipeline_version,
+                )
+                logger.info(
+                    "[ReaderComposeService] compose sibling cache cleanup "
+                    f"paper={paper.id} page={page_num} "
+                    f"redis_deleted={int(cleanup_report.get('redis_deleted') or 0)} "
+                    f"db_deleted={int(cleanup_report.get('db_deleted') or 0)}"
+                )
             logger.info(
                 "[ReaderComposeService] compose payload persisted "
                 f"paper={paper.id} page={page_num}"
@@ -1297,6 +1317,9 @@ class LiteratureReaderComposeService:
             "The indivisible unit is layout_id (DocMind uniqueId). "
             "Never split a layout_id, never invent ids, and never modify ownership or geometry. "
             "Use the attached page image only as visual reference. "
+            "You must output step_result.page_decision as "
+            "{\"mode\":\"grounded\"|\"partial_reconstructed\"|\"fully_reconstructed\",\"reason\":\"...\",\"confidence\":0.0-1.0}. "
+            "The allowed page_decision.mode values are grounded, partial_reconstructed, and fully_reconstructed only. "
             "Do two things in one JSON response: "
             "(1) return sparse text repairs only for layout_ids whose display text should change; "
             "(2) assign every layout_id exactly once, either in groups or omissions. "
@@ -1308,31 +1331,271 @@ class LiteratureReaderComposeService:
             "If a paragraph or table_caption group contains multiple semantic paragraphs, return them in group.paragraphs. "
             "Each paragraph item should look like {\"text\":\"...\",\"source_layout_ids\":[\"...\"]}. "
             "paragraphs are optional, but when provided they are the reader-facing paragraph structure and should be faithful. "
+            "page_decision.mode grounded means return groups, omissions, and text_items. "
+            "page_decision.mode partial_reconstructed means return groups, omissions, text_items, and reconstructed_components. "
+            "page_decision.mode fully_reconstructed means return reconstructed_components, and groups may be omitted. "
+            "Non-figure bbox values are reference only and not strict evidence. "
+            "Figure bbox and visual_spec are for direct rough cropping, not later verification. "
+            "For figure reconstruction, estimate one practical crop directly from the page image using the DocMind coarse visual boundary, "
+            "the visible text positions, and approximate x/y relationships. "
+            "Prefer the smallest bbox that still keeps the figure body readable, and exclude caption and page number as much as possible. "
+            "Do not defer figure cropping to a later verifier; provide a usable rough crop immediately. "
             "For footer-like link items, preserve the URL exactly and recover obvious leading markers when visually clear. "
             "If a footer fragment is redundant, you may hide it by returning mode footer_hide_fragment. "
-            "If the provided DocMind grounding is clearly unusable for faithful grounded reading "
-            "(for example the main visual region is mislabeled, OCR/table extraction is badly corrupted, or semantic coverage is broken), "
-            "you may switch to an AI-only page reconstruction. "
-            "Only do this when DocMind quality is genuinely poor. "
-            "In that case set step_result.reconstruction = "
-            "{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\",\"reason\":\"...\",\"confidence\":0.82,"
-            "\"components\":[...],\"notes\":[...]}. "
+            "Classify DocMind as poor or unusable only when grounded reading would still require guesswork after OCR cleanup. "
+            "Treat single-main-layout pages with collapsed block groups, garbled OCR, table-like noise, repeated placeholder tokens, "
+            "or obvious semantic collapse as strong poor-grounding signals, but do not switch to reconstruction just because one of those signals appears in isolation. "
+            "Do not stay grounded merely because layout_ids exist or because the page has nominal coverage. "
+            "Use page_quality.grounding_warning as advisory evidence that deserves closer inspection, not as an automatic reconstruction trigger. "
+            "If page_quality.coarse_visual_bbox_norm is present, treat it as the preferred coarse boundary for figure crops on collapsed pages, even when DocMind mislabeled the region as a table. "
+            "For figure reconstruction, use the page image, the coarse DocMind boundary, and visible text positions to estimate one practical rough bbox. "
+            "Keep the crop conservative enough to preserve the figure body, but trim caption and page-number noise as much as possible. "
+            "If the warning suggests collapse or garble, classify DocMind as poor only when the page cannot still be read faithfully from the grounded layout. "
+            "In that case set step_result.page_decision.mode = fully_reconstructed and provide step_result.reconstructed_components. "
+            "If you also emit the legacy step_result.reconstruction field, keep it consistent with page_decision and reconstructed_components. "
             "Allowed reconstruction component kinds are heading, paragraph, list, figure, table, equation. "
-            "paragraph components may include paragraphs:[\"...\", ...]. "
-            "figure components may include caption and source_label; the runtime will use the page image. "
+            "Reconstruction components may optionally include bbox_norm in normalized page coordinates. "
+            "Paragraph components may include bbox_norm on the component itself and on individual paragraph rows. "
+            "Each paragraph row should look like {\"text\":\"...\",\"bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.3}}. "
+            "paragraph components may include paragraphs:[{\"text\":\"...\",\"bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.3}}, ...] and bbox_norm. "
+            "figure components may include caption, source_label, bbox_norm, and visual_spec. "
+            "Use bbox_norm as the practical rough crop to use directly; mirror the same practical crop in visual_spec.seed_bbox_norm when possible. "
+            "visual_spec should describe a practical rough figure-only crop that can be used directly without later verification. "
+            "visual_spec may include seed_bbox_norm {x0,y0,x1,y1} in normalized page coordinates, "
+            "must_include:[...], must_exclude:[...], region_description:\"...\", boundary_notes:\"...\", "
+            "require_full_boundary:true/false, prefer_without_caption:true/false, allow_caption_if_needed:true/false, target_kind:\"figure\". "
+            "Default to a practical rough figure crop with minimal whitespace and without the caption unless the caption is visually required to understand the figure. "
+            "Use visible text positions and approximate x/y relationships to explain where the crop should start and stop. "
+            "If the caption is needed, explain why and say exactly what part of the caption must remain inside the crop. "
+            "Be explicit about the visible figure region, the main plot or diagram elements that must be inside it, and the boundaries that should be excluded. "
+            "If the crop is only partially reconstructable, keep the figure body and add concise notes or partial_reconstruction guidance rather than pretending the crop is complete. "
+            "Figure components may also include notes or reconstruction_notes for partial reconstruction intent, for example to keep the figure body while trimming noisy caption or prose. "
+            "If the figure was misclassified as a table-like OCR artifact, do not flatten it into a table; keep a figure component with rough crop guidance and partial reconstruction notes. "
             "table components may include title, caption, headers:[...], rows:[[...],[...]] or row_objects:[{...}], raw_markdown. "
             "step_result.text_items should include ONLY changed layout_ids. "
-            "Outside ai_reconstructed mode, step_result.groups and step_result.omissions together must cover every layout_id exactly once. "
+            "Outside fully_reconstructed mode, step_result.groups and step_result.omissions together must cover every layout_id exactly once. "
             "Output format: "
-            "{\"status\":\"done\",\"step_result\":{\"text_items\":["
+            "{\"status\":\"done\",\"step_result\":{\"page_decision\":{\"mode\":\"partial_reconstructed\",\"reason\":\"...\",\"confidence\":0.82},\"text_items\":["
             "{\"layout_id\":\"...\",\"normalized_text\":\"...\",\"reason\":\"...\",\"confidence\":0.94,\"mode\":\"ocr_cleanup\"}"
             "],\"groups\":[{\"group_id\":\"g1\",\"group_kind\":\"paragraph\",\"source_layout_ids\":[\"layout_id\"],"
             "\"paragraphs\":[{\"text\":\"...\",\"source_layout_ids\":[\"layout_id\"]}],\"rationale\":\"\"}],"
             "\"omissions\":[{\"layout_id\":\"...\",\"reason\":\"header\"}],"
-            "\"reconstruction\":{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\",\"reason\":\"...\","
-            "\"confidence\":0.82,\"components\":[{\"kind\":\"paragraph\",\"text\":\"...\",\"paragraphs\":[\"...\"]}]},"
+            "\"reconstructed_components\":[{\"kind\":\"paragraph\",\"text\":\"...\",\"bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.3},"
+            "\"paragraphs\":[{\"text\":\"...\",\"bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.3}}]},"
+            "{\"kind\":\"figure\",\"caption\":\"...\",\"source_label\":\"Figure 4\",\"bbox_norm\":{\"x0\":0.08,\"y0\":0.16,\"x1\":0.92,\"y1\":0.74},"
+            "\"visual_spec\":{\"seed_bbox_norm\":{\"x0\":0.08,\"y0\":0.16,\"x1\":0.92,\"y1\":0.74},"
+            "\"must_include\":[\"all main plotted nodes\"],\"must_exclude\":[\"neighbor prose\"],"
+            "\"region_description\":\"practical rough crop around the plotted figure only\",\"boundary_notes\":\"use visible text positions and x/y relationships; exclude caption if possible\","
+            "\"require_full_boundary\":true,\"prefer_without_caption\":true,\"allow_caption_if_needed\":false,"
+            "\"target_kind\":\"figure\"}}],"
             "\"notes\":[\"...\"]}}"
         )
+
+    @staticmethod
+    def _layout_uid_reconstruction_only_system_prompt() -> str:
+        return (
+            "You reconstruct a single PDF page for the /read reader because the provided DocMind grounding appears unusable. "
+            "Use the attached page image as the primary evidence. "
+            "Do not try to preserve layout_id ownership. "
+            "Do not summarize the page; reconstruct a faithful reader-facing page. "
+            "Treat a single collapsed block with garbled OCR, placeholder tokens, or broken semantic coverage as poor grounding and reconstruct directly. "
+            "Keep the source language; do not translate. "
+            "Return JSON with status and step_result.reconstruction only. "
+            "Set step_result.reconstruction = "
+            "{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\",\"reason\":\"...\",\"confidence\":0.82,"
+            "\"components\":[...],\"notes\":[...]}. "
+            "Allowed reconstruction component kinds are heading, paragraph, list, figure, table, equation. "
+            "Reconstruction components may optionally include bbox_norm in normalized page coordinates. "
+            "Paragraph components may include paragraphs:[{\"text\":\"...\",\"bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.3}}, ...] "
+            "and bbox_norm on the component itself. "
+            "figure components may include caption, source_label, bbox_norm, and visual_spec. "
+            "Use bbox_norm as the practical rough crop to use directly; mirror the same practical crop in visual_spec.seed_bbox_norm when possible. "
+            "visual_spec may include seed_bbox_norm {x0,y0,x1,y1}, must_include:[...], must_exclude:[...], "
+            "region_description:\"...\", boundary_notes:\"...\", require_full_boundary:true/false, "
+            "prefer_without_caption:true/false, allow_caption_if_needed:true/false, target_kind:\"figure\". "
+            "Default to a practical rough figure-only crop with tight but safe boundaries. Exclude the caption unless the caption is required to keep the figure intelligible. "
+            "Use visible text positions and approximate x/y relationships to estimate the crop in the page image. "
+            "If the caption is needed, say so explicitly in the visual_spec and keep only the caption fragment that is visually required. "
+            "If the crop is only partially reconstructable, keep the figure body and add concise notes or partial_reconstruction guidance rather than treating the crop as complete. "
+            "If the figure was misclassified as a table-like OCR artifact, keep the figure as a figure component and add rough crop guidance; do not collapse it into a table. "
+            "If the page is mostly a figure or chart, prefer a FigurePanel plus concise supporting prose instead of dumping OCR garbage. "
+            "If the page is mostly a table, reconstruct the table semantically with title/caption/headers/rows instead of preserving corrupted OCR. "
+            "Output format: "
+            "{\"status\":\"done\",\"step_result\":{\"reconstruction\":{\"mode\":\"ai_reconstructed\",\"docmind_quality\":\"poor\","
+            "\"reason\":\"...\",\"confidence\":0.82,\"components\":[{\"kind\":\"paragraph\",\"text\":\"...\"}],\"notes\":[\"...\"]}}}"
+        )
+
+    @staticmethod
+    def _normalize_bbox_norm(raw_bbox: Any) -> Optional[Dict[str, float]]:
+        if isinstance(raw_bbox, Mapping):
+            source = raw_bbox
+        elif isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4:
+            source = {
+                "x0": raw_bbox[0],
+                "y0": raw_bbox[1],
+                "x1": raw_bbox[2],
+                "y1": raw_bbox[3],
+            }
+        else:
+            return None
+        try:
+            x0 = max(0.0, min(1.0, float(source.get("x0") or 0.0)))
+            y0 = max(0.0, min(1.0, float(source.get("y0") or source.get("top") or 0.0)))
+            x1 = max(0.0, min(1.0, float(source.get("x1") or 0.0)))
+            y1 = max(0.0, min(1.0, float(source.get("y1") or source.get("bottom") or 0.0)))
+        except Exception:
+            return None
+        if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+            return None
+        return {
+            "x0": round(x0, 4),
+            "y0": round(y0, 4),
+            "x1": round(x1, 4),
+            "y1": round(y1, 4),
+        }
+
+    @staticmethod
+    def _bbox_norm_union(bboxes: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+        normalized = [
+            {
+                "x0": float(bbox.get("x0") or 0.0),
+                "y0": float(bbox.get("y0") or 0.0),
+                "x1": float(bbox.get("x1") or 0.0),
+                "y1": float(bbox.get("y1") or 0.0),
+            }
+            for bbox in list(bboxes or [])
+            if isinstance(bbox, Mapping)
+        ]
+        if not normalized:
+            return None
+        try:
+            x0 = min(item["x0"] for item in normalized)
+            y0 = min(item["y0"] for item in normalized)
+            x1 = max(item["x1"] for item in normalized)
+            y1 = max(item["y1"] for item in normalized)
+        except Exception:
+            return None
+        if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+            return None
+        return {
+            "x0": round(max(0.0, min(1.0, x0)), 4),
+            "y0": round(max(0.0, min(1.0, y0)), 4),
+            "x1": round(max(0.0, min(1.0, x1)), 4),
+            "y1": round(max(0.0, min(1.0, y1)), 4),
+        }
+
+    @staticmethod
+    def _bbox_norm_to_absolute_hint(
+        *,
+        bbox_norm: Mapping[str, Any],
+        page_width: float,
+        page_height: float,
+    ) -> Optional[Dict[str, float]]:
+        if not isinstance(bbox_norm, Mapping):
+            return None
+        try:
+            x0 = float(bbox_norm.get("x0") or 0.0)
+            y0 = float(bbox_norm.get("y0") or bbox_norm.get("top") or 0.0)
+            x1 = float(bbox_norm.get("x1") or 0.0)
+            y1 = float(bbox_norm.get("y1") or bbox_norm.get("bottom") or 0.0)
+            if page_width > 0 and page_height > 0 and max(x0, y0, x1, y1) <= 1.5:
+                x0 *= page_width
+                x1 *= page_width
+                y0 *= page_height
+                y1 *= page_height
+        except Exception:
+            return None
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return {
+            "x0": round(x0, 2),
+            "x1": round(x1, 2),
+            "top": round(y0, 2),
+            "bottom": round(y1, 2),
+            "page_width": page_width or None,
+            "page_height": page_height or None,
+        }
+
+    @staticmethod
+    def _bbox_hint_rect_polygon(bbox_hint: Mapping[str, Any]) -> List[Dict[str, float]]:
+        try:
+            x0 = float(bbox_hint.get("x0") or 0.0)
+            x1 = float(bbox_hint.get("x1") or 0.0)
+            top = float(bbox_hint.get("top") or 0.0)
+            bottom = float(bbox_hint.get("bottom") or 0.0)
+        except Exception:
+            return []
+        if x1 <= x0 or bottom <= top:
+            return []
+        return [
+            {"x": x0, "y": top},
+            {"x": x1, "y": top},
+            {"x": x1, "y": bottom},
+            {"x": x0, "y": bottom},
+        ]
+
+    def _build_ai_reconstructed_component_anchor_ref(
+        self,
+        *,
+        page: int,
+        component_id: str,
+        component_kind: str,
+        text_hint: str,
+        bbox_norm: Optional[Mapping[str, Any]],
+        page_width: float,
+        page_height: float,
+        anchor_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_bbox_norm = self._normalize_bbox_norm(dict(bbox_norm or {})) if isinstance(bbox_norm, Mapping) else None
+        bbox_hint = self._bbox_norm_to_absolute_hint(
+            bbox_norm=normalized_bbox_norm or {},
+            page_width=float(page_width or 0.0),
+            page_height=float(page_height or 0.0),
+        ) if normalized_bbox_norm else None
+        if not bbox_hint:
+            return None
+        quote_text = self._normalize_spaces(str(text_hint or component_kind or ""))
+        anchor_id = f"ai_bbox_v1:{int(page)}:{component_id or anchor_index}"
+        canonical_block_id = f"ai_reconstructed_p{int(page)}_{component_id or anchor_index}"
+        start_char = max(0, int(anchor_index) * 100)
+        end_char = start_char + max(1, len(quote_text or component_kind or "anchor"))
+        geometry = {
+            "polygons": [
+                {
+                    "points": self._bbox_hint_rect_polygon(bbox_hint),
+                    "source": "ai_reconstructed",
+                    "component_id": str(component_id or f"comp_{anchor_index}"),
+                }
+            ],
+            "page_width": float(page_width or 0.0) or None,
+            "page_height": float(page_height or 0.0) or None,
+        }
+        return {
+            "page": int(page),
+            "start_char": start_char,
+            "end_char": end_char,
+            "quote": quote_text[:280] if quote_text else None,
+            "quote_text": quote_text[:280] if quote_text else None,
+            "anchor_id": anchor_id,
+            "segment_index": 1,
+            "segment_total": 1,
+            "bbox_hint": bbox_hint,
+            "canonical_block_id": canonical_block_id,
+            "source_layout_id": str(component_id or canonical_block_id),
+            "coord_version": "ai_bbox_v1",
+            "anchor_confidence": 0.91,
+            "anchor_v2": {
+                "coord_version": "ai_bbox_v1",
+                "canonical_block_id": canonical_block_id,
+                "page": int(page),
+                "start_char": start_char,
+                "end_char": end_char,
+            },
+            "geometry_version": "poly_v1",
+            "geometry": geometry,
+            "source_word_ids": [],
+            "source_char_ranges": [],
+        }
 
     def _build_layout_uid_combined_prompt_payload(
         self,
@@ -1397,6 +1660,16 @@ class LiteratureReaderComposeService:
             )
         page_payload = dict(payload or {})
         page_structure_v3 = dict(page_payload.get("page_structure_v3") or {})
+        grounding_warning = self._analyze_layout_uid_grounding_quality(
+            grounding=grounding,
+            payload=page_payload,
+        )
+        coarse_visual_bbox_norm = self._derive_layout_uid_coarse_visual_bbox_norm(
+            grounding=grounding,
+            payload=page_payload,
+        )
+        if coarse_visual_bbox_norm:
+            grounding_warning["coarse_visual_bbox_norm"] = dict(coarse_visual_bbox_norm)
         return {
             "page_meta": {
                 "paper_id": int(paper.id),
@@ -1410,6 +1683,8 @@ class LiteratureReaderComposeService:
                 "repair_used": bool(page_payload.get("repair_used") or ((page_payload.get("repair_report") or {}).get("used"))),
                 "layout_count": len(compact_atoms),
                 "block_group_count": len(list(page_structure_v3.get("block_groups") or [])),
+                "grounding_warning": grounding_warning,
+                "coarse_visual_bbox_norm": dict(coarse_visual_bbox_norm) if coarse_visual_bbox_norm else None,
             },
             "layout_atoms": compact_atoms,
             "footer_bundles": footer_bundles,
@@ -1435,6 +1710,247 @@ class LiteratureReaderComposeService:
                     "footer_bundle_hide_fragment",
                 ],
             },
+        }
+
+    def _collect_layout_uid_grounding_text_samples(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> List[str]:
+        samples: List[str] = []
+        seen: Set[str] = set()
+
+        def _push(value: Any) -> None:
+            text = self._normalize_spaces(str(value or ""))
+            if not text:
+                return
+            key = text.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            samples.append(text)
+
+        for atom in list((grounding or {}).get("layout_atoms") or []):
+            if not isinstance(atom, Mapping):
+                continue
+            _push(atom.get("normalized_text"))
+            _push(atom.get("clean_text"))
+            _push(atom.get("raw_text"))
+            for block in list(atom.get("blocks") or []):
+                if isinstance(block, Mapping):
+                    _push(block.get("text"))
+
+        page_structure_v3 = dict((payload or {}).get("page_structure_v3") or {})
+        for row in list(page_structure_v3.get("block_groups") or []):
+            if isinstance(row, Mapping):
+                _push(row.get("text"))
+
+        return samples[:24]
+
+    def _looks_like_layout_uid_ocr_garbage(self, text: Any) -> bool:
+        value = self._normalize_spaces(str(text or ""))
+        if len(value) < 24:
+            return False
+        lower = value.lower()
+        if any(token in lower for token in ("<ped>", "<pad>", "<eos>", "<sos>", "<so3>", "<s0")):
+            return True
+        compact = re.sub(r"\s+", "", value)
+        if not compact:
+            return False
+        weird_ratio = (
+            sum(1 for ch in compact if not (ch.isalnum() or ch in ".,;:!?()[]{}%+-=/&_#*'\"|:<>"))
+            / max(1, len(compact))
+        )
+        if weird_ratio >= 0.18:
+            return True
+        glitch_markers = len(re.findall(r"(?:<[^>]{2,8}>|[A-Za-z]{1,}![A-Za-z]{1,}|[A-Za-z]{1,}\^[A-Za-z]{1,})", value))
+        if glitch_markers >= 2:
+            return True
+        words = re.findall(r"[A-Za-z]{3,}", value)
+        if len(words) >= 6:
+            vowelish = [word for word in words if re.search(r"[aeiouAEIOU]", word)]
+            if (len(vowelish) / max(1, len(words))) < 0.45:
+                return True
+        return False
+
+    def _analyze_layout_uid_grounding_quality(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        main_atoms = [
+            row
+            for row in layout_atoms
+            if bool(row.get("include_in_main_flow"))
+        ] or list(layout_atoms)
+        page_payload = dict(payload or {})
+        page_structure_v3 = dict(page_payload.get("page_structure_v3") or {})
+        block_groups = [
+            dict(row)
+            for row in list(page_structure_v3.get("block_groups") or [])
+            if isinstance(row, Mapping)
+        ]
+        text_samples = self._collect_layout_uid_grounding_text_samples(
+            grounding=grounding,
+            payload=page_payload,
+        )
+        suspicious_text_samples = [
+            text[:220]
+            for text in text_samples
+            if self._looks_like_layout_uid_ocr_garbage(text)
+        ]
+        main_layout_types = {
+            str(row.get("layout_type") or "").strip().lower()
+            for row in main_atoms
+            if str(row.get("layout_type") or "").strip()
+        }
+        single_main_layout = len(main_atoms) <= 1
+        collapsed_block_groups = len(block_groups) <= 1
+        only_table_like_main = bool(single_main_layout and main_layout_types and main_layout_types.issubset({"table", "figure", "text"}))
+        should_force_reconstruction = bool(
+            suspicious_text_samples
+            and single_main_layout
+            and collapsed_block_groups
+            and only_table_like_main
+        )
+        return {
+            "single_main_layout": bool(single_main_layout),
+            "collapsed_block_groups": bool(collapsed_block_groups),
+            "main_layout_types": sorted(main_layout_types),
+            "suspicious_ocr": bool(suspicious_text_samples),
+            "suspicious_text_examples": suspicious_text_samples[:3],
+            "reconstruction_hint": {
+                "recommended": bool(should_force_reconstruction),
+                "advisory_only": True,
+                "reason": (
+                    "single_main_layout_plus_collapsed_block_groups_plus_garbled_ocr"
+                    if should_force_reconstruction else
+                    "no_strong_reconstruction_hint"
+                ),
+            },
+            "should_force_reconstruction": False,
+        }
+
+    def _build_layout_uid_reconstruction_only_prompt_payload(
+        self,
+        *,
+        paper: Paper,
+        page: int,
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]],
+        grouping_plan: Mapping[str, Any],
+        text_validation: Mapping[str, Any],
+        retry_reason: str,
+    ) -> Dict[str, Any]:
+        combined_payload = self._build_layout_uid_combined_prompt_payload(
+            paper=paper,
+            page=page,
+            grounding=grounding,
+            payload=payload,
+        )
+        page_quality = dict(combined_payload.get("page_quality") or {})
+        grounding_warning = dict(page_quality.get("grounding_warning") or {})
+        return {
+            "page_meta": dict(combined_payload.get("page_meta") or {}),
+            "page_quality": page_quality,
+            "layout_atoms": list(combined_payload.get("layout_atoms") or []),
+            "retry_reason": retry_reason,
+            "grounding_warning": grounding_warning,
+            "previous_grounded_attempt": {
+                "group_count": len(list((grouping_plan or {}).get("groups") or [])),
+                "group_kinds": [
+                    str(row.get("group_kind") or "").strip().lower()
+                    for row in list((grouping_plan or {}).get("groups") or [])
+                    if isinstance(row, Mapping) and str(row.get("group_kind") or "").strip()
+                ][:8],
+                "text_validation_errors": [
+                    str(item).strip()
+                    for item in list((text_validation or {}).get("errors") or [])
+                    if str(item).strip()
+                ][:8],
+                "suspicious_text_examples": list(grounding_warning.get("suspicious_text_examples") or [])[:3],
+            },
+            "rules": {
+                "mode": "reconstruction_only",
+                "allowed_component_kinds": sorted(self._layout_uid_ai_reconstruction_component_kinds()),
+                "prefer_faithful_reader_page": True,
+                "preserve_source_language": True,
+            },
+        }
+
+    def _select_ai_reconstructed_figure_crop_source_asset(
+        self,
+        *,
+        rendered_page_image_url: str,
+        rendered_page_image_path: str,
+        grounding: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        def _build_candidate(*, source: str, image_url: str, image_path: str) -> Optional[Dict[str, Any]]:
+            local_path = str(image_path or "").strip()
+            if not local_path or not os.path.exists(local_path):
+                return None
+            width, height = self._resolve_grounding_page_image_size(
+                page_image_url=str(image_url or "").strip(),
+                page_image_path=local_path,
+            )
+            if not width or not height:
+                return None
+            return {
+                "source": source,
+                "url": str(image_url or "").strip(),
+                "path": local_path,
+                "width": float(width),
+                "height": float(height),
+                "area": float(width) * float(height),
+                "local_cached": True,
+            }
+
+        page_render_candidate = _build_candidate(
+            source="page_render_asset",
+            image_url=rendered_page_image_url,
+            image_path=rendered_page_image_path,
+        )
+        if page_render_candidate:
+            return page_render_candidate
+        grounding_page_image = dict((grounding or {}).get("page_image") or {})
+        grounding_candidate = _build_candidate(
+            source=str(grounding_page_image.get("source") or "grounding_page_image").strip() or "grounding_page_image",
+            image_url=str(grounding_page_image.get("url") or "").strip(),
+            image_path=str(grounding_page_image.get("path") or "").strip(),
+        )
+        if grounding_candidate:
+            return grounding_candidate
+        return {
+            "source": "",
+            "url": "",
+            "path": "",
+            "width": 0.0,
+            "height": 0.0,
+            "local_cached": False,
+        }
+
+    @staticmethod
+    def _merge_usage_metrics(*usage_items: Mapping[str, Any]) -> Dict[str, int]:
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        for item in list(usage_items or []):
+            if not isinstance(item, Mapping):
+                continue
+            prompt_tokens += int(item.get("prompt_tokens") or 0)
+            completion_tokens += int(item.get("completion_tokens") or 0)
+            total_tokens += int(item.get("total_tokens") or 0)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
         }
 
     @staticmethod
@@ -3941,6 +4457,348 @@ class LiteratureReaderComposeService:
             "fallback_used": False,
         }
 
+    def _normalize_layout_uid_page_decision(
+        self,
+        *,
+        step_result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        raw_decision = step_result.get("page_decision") if isinstance(step_result, Mapping) else {}
+        if not isinstance(raw_decision, Mapping):
+            raw_decision = {}
+        legacy_reconstruction = step_result.get("reconstruction") if isinstance(step_result, Mapping) else {}
+        if not isinstance(legacy_reconstruction, Mapping):
+            legacy_reconstruction = {}
+        mode = self._normalize_spaces(
+            str(raw_decision.get("mode") or legacy_reconstruction.get("mode") or "")
+        ).strip().lower()
+        if mode in {"ai_reconstructed", "ai_only", "ungrounded"}:
+            mode = "fully_reconstructed"
+        if mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+            mode = "grounded"
+        reason = self._normalize_spaces(
+            str(
+                raw_decision.get("reason")
+                or raw_decision.get("rationale")
+                or legacy_reconstruction.get("reason")
+                or ""
+            )
+        )
+        try:
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    float(raw_decision.get("confidence") or legacy_reconstruction.get("confidence") or 0.0),
+                ),
+            )
+        except Exception:
+            confidence = 0.0
+        return {
+            "mode": mode,
+            "reason": reason,
+            "confidence": confidence,
+        }
+
+    def _normalize_layout_uid_reconstructed_component_items(
+        self,
+        *,
+        raw_components: Any,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        allowed_kinds = self._layout_uid_ai_reconstruction_component_kinds()
+        normalized_components: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        def _normalize_component_bbox_norm(raw_value: Any) -> Optional[Dict[str, float]]:
+            bbox = self._normalize_bbox_norm(raw_value)
+            if bbox:
+                return bbox
+            if isinstance(raw_value, Mapping):
+                visual_spec = raw_value.get("visual_spec")
+                if isinstance(visual_spec, Mapping):
+                    bbox = self._normalize_bbox_norm(
+                        visual_spec.get("bbox_norm")
+                        or visual_spec.get("seed_bbox_norm")
+                        or visual_spec.get("bbox")
+                    )
+                    if bbox:
+                        return bbox
+            return None
+
+        def _normalize_paragraph_rows(value: Any) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for item in list(value or [])[:24]:
+                if isinstance(item, Mapping):
+                    text = self._normalize_spaces(str(item.get("text") or item.get("content") or ""))
+                    bbox_norm = _normalize_component_bbox_norm(item.get("bbox_norm") or item.get("bbox"))
+                else:
+                    text = self._normalize_spaces(str(item or ""))
+                    bbox_norm = None
+                if text:
+                    paragraph_row: Dict[str, Any] = {"text": text}
+                    if bbox_norm:
+                        paragraph_row["bbox_norm"] = bbox_norm
+                    rows.append(paragraph_row)
+            return rows
+
+        def _normalize_visual_spec(raw_spec: Any) -> Dict[str, Any]:
+            spec = dict(raw_spec or {}) if isinstance(raw_spec, Mapping) else {}
+            normalized: Dict[str, Any] = {
+                "target_kind": "figure",
+                "require_full_boundary": bool(spec.get("require_full_boundary", True)),
+                "prefer_without_caption": bool(spec.get("prefer_without_caption", True)),
+                "allow_caption_if_needed": bool(spec.get("allow_caption_if_needed", False)),
+            }
+            seed_bbox_norm = self._normalize_bbox_norm(
+                spec.get("seed_bbox_norm")
+                or spec.get("bbox_norm")
+                or spec.get("bbox")
+            )
+            if seed_bbox_norm:
+                normalized["seed_bbox_norm"] = seed_bbox_norm
+            must_include = [
+                self._normalize_spaces(str(item or ""))
+                for item in list(spec.get("must_include") or [])[:8]
+                if self._normalize_spaces(str(item or ""))
+            ]
+            if must_include:
+                normalized["must_include"] = must_include
+            must_exclude = [
+                self._normalize_spaces(str(item or ""))
+                for item in list(spec.get("must_exclude") or [])[:8]
+                if self._normalize_spaces(str(item or ""))
+            ]
+            if must_exclude:
+                normalized["must_exclude"] = must_exclude
+            region_description = self._normalize_spaces(
+                str(
+                    spec.get("region_description")
+                    or spec.get("visual_description")
+                    or spec.get("crop_description")
+                    or ""
+                )
+            )
+            if region_description:
+                normalized["region_description"] = region_description
+            boundary_notes = self._normalize_spaces(str(spec.get("boundary_notes") or spec.get("notes") or ""))
+            if boundary_notes:
+                normalized["boundary_notes"] = boundary_notes
+            crop_strategy = self._normalize_spaces(str(spec.get("crop_strategy") or spec.get("caption_policy") or ""))
+            if crop_strategy:
+                normalized["crop_strategy"] = crop_strategy
+            return normalized
+
+        if isinstance(raw_components, Mapping):
+            component_rows = list(raw_components.get("components") or raw_components.get("items") or [])
+        else:
+            component_rows = list(raw_components or [])
+
+        for idx, raw_component in enumerate(component_rows[:20], start=1):
+            if not isinstance(raw_component, Mapping):
+                continue
+            kind = str(raw_component.get("kind") or raw_component.get("type") or raw_component.get("component") or "").strip().lower()
+            if kind not in allowed_kinds:
+                errors.append(f"unsupported_reconstruction_component:{kind or idx}")
+                continue
+            component_bbox_norm = _normalize_component_bbox_norm(raw_component.get("bbox_norm") or raw_component.get("bbox"))
+            if kind == "heading":
+                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("title") or ""))
+                if not text:
+                    errors.append(f"reconstruction_heading_missing_text:{idx}")
+                    continue
+                normalized_component = {
+                    "kind": "heading",
+                    "text": text,
+                    "level": max(1, min(4, int(raw_component.get("level") or 2))),
+                }
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                normalized_components.append(normalized_component)
+                continue
+            if kind == "paragraph":
+                paragraphs = _normalize_paragraph_rows(raw_component.get("paragraphs"))
+                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("content") or ""))
+                if not text and paragraphs:
+                    text = "\n\n".join(str(row.get("text") or "").strip() for row in paragraphs if str(row.get("text") or "").strip())
+                if not text:
+                    errors.append(f"reconstruction_paragraph_missing_text:{idx}")
+                    continue
+                normalized_component = {
+                    "kind": "paragraph",
+                    "text": text,
+                    "paragraphs": paragraphs,
+                }
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                else:
+                    row_bboxes = [
+                        _normalize_component_bbox_norm(row.get("bbox_norm"))
+                        for row in paragraphs
+                        if isinstance(row, Mapping)
+                    ]
+                    row_bboxes = [row for row in row_bboxes if isinstance(row, dict)]
+                    if row_bboxes:
+                        merged_bbox = self._bbox_norm_union(row_bboxes)
+                        if merged_bbox:
+                            normalized_component["bbox_norm"] = merged_bbox
+                normalized_components.append(normalized_component)
+                continue
+            if kind == "list":
+                items = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("items") or raw_component.get("bullets") or [])[:20]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                if not items:
+                    errors.append(f"reconstruction_list_missing_items:{idx}")
+                    continue
+                normalized_component = {"kind": "list", "items": items}
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                normalized_components.append(normalized_component)
+                continue
+            if kind == "figure":
+                caption = self._normalize_spaces(str(raw_component.get("caption") or raw_component.get("text") or ""))
+                raw_notes = raw_component.get("notes")
+                if not isinstance(raw_notes, list):
+                    raw_notes = raw_component.get("reconstruction_notes")
+                notes = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_notes or [])[:12]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                partial_reconstruction_raw = raw_component.get("partial_reconstruction")
+                if isinstance(partial_reconstruction_raw, str):
+                    partial_reconstruction: Any = self._normalize_spaces(partial_reconstruction_raw)
+                else:
+                    partial_reconstruction = bool(partial_reconstruction_raw) if partial_reconstruction_raw is not None else False
+                normalized_component = {
+                    "kind": "figure",
+                    "caption": caption,
+                    "source_label": self._normalize_spaces(str(raw_component.get("source_label") or raw_component.get("label") or "")),
+                    "visual_spec": _normalize_visual_spec(
+                        raw_component.get("visual_spec")
+                        or raw_component.get("image_spec")
+                        or raw_component.get("crop_spec")
+                    ),
+                }
+                if notes:
+                    normalized_component["notes"] = notes
+                    normalized_component["reconstruction_notes"] = notes
+                if partial_reconstruction:
+                    normalized_component["partial_reconstruction"] = partial_reconstruction
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                normalized_components.append(normalized_component)
+                continue
+            if kind == "table":
+                headers = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_component.get("headers") or [])[:24]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                row_matrix: List[List[str]] = []
+                for row in list(raw_component.get("rows") or [])[:40]:
+                    if isinstance(row, Mapping):
+                        ordered_values = [self._normalize_spaces(str(value or "")) for value in list(row.values())]
+                        row_values = [value for value in ordered_values if value]
+                    else:
+                        row_values = [
+                            self._normalize_spaces(str(item or ""))
+                            for item in list(row or [])[:24]
+                            if self._normalize_spaces(str(item or ""))
+                        ]
+                    if row_values:
+                        row_matrix.append(row_values)
+                normalized_component = {
+                    "kind": "table",
+                    "title": self._normalize_spaces(str(raw_component.get("title") or "")),
+                    "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                    "headers": headers,
+                    "rows": row_matrix,
+                    "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
+                }
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                normalized_components.append(normalized_component)
+                continue
+            if kind == "equation":
+                latex = str(raw_component.get("latex") or "").strip()
+                transcript = self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("text") or latex))
+                if not latex and not transcript:
+                    errors.append(f"reconstruction_equation_missing_text:{idx}")
+                    continue
+                normalized_component = {
+                    "kind": "equation",
+                    "latex": latex,
+                    "transcript": transcript,
+                    "label": self._normalize_spaces(str(raw_component.get("label") or "")),
+                    "description": self._normalize_spaces(str(raw_component.get("description") or "")),
+                }
+                if component_bbox_norm:
+                    normalized_component["bbox_norm"] = component_bbox_norm
+                normalized_components.append(normalized_component)
+
+        return normalized_components, errors
+
+    def _normalize_layout_uid_reconstructed_components(
+        self,
+        *,
+        step_result: Mapping[str, Any],
+        page_decision: Mapping[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        mode = self._normalize_spaces(str((page_decision or {}).get("mode") or "")).strip().lower()
+        if mode not in {"partial_reconstructed", "fully_reconstructed"}:
+            return [], {
+                "enabled": False,
+                "passed": True,
+                "errors": [],
+            }
+
+        raw_components: Any = []
+        if isinstance(step_result, Mapping):
+            raw_components = step_result.get("reconstructed_components") or []
+            if not raw_components:
+                legacy_reconstruction = step_result.get("reconstruction")
+                if isinstance(legacy_reconstruction, Mapping):
+                    raw_components = legacy_reconstruction.get("components") or legacy_reconstruction.get("items") or []
+
+        legacy_reconstruction = step_result.get("reconstruction") if isinstance(step_result, Mapping) else {}
+        if not isinstance(legacy_reconstruction, Mapping):
+            legacy_reconstruction = {}
+        reconstruction_payload = {
+            "reconstruction": {
+                "mode": mode,
+                "docmind_quality": str(legacy_reconstruction.get("docmind_quality") or legacy_reconstruction.get("quality") or "").strip(),
+                "reason": self._normalize_spaces(str((page_decision or {}).get("reason") or legacy_reconstruction.get("reason") or "")),
+                "confidence": self._safe_float(
+                    (page_decision or {}).get("confidence"),
+                    self._safe_float(legacy_reconstruction.get("confidence"), 0.0),
+                ),
+                "components": raw_components,
+                "notes": [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(legacy_reconstruction.get("notes") or [])
+                    if self._normalize_spaces(str(item or ""))
+                ],
+            }
+        }
+        normalized_plan, normalized_validation = self._normalize_layout_uid_ai_reconstruction_plan(
+            step_result=reconstruction_payload,
+        )
+        normalized_components = [
+            dict(row)
+            for row in list(normalized_plan.get("components") or [])
+            if isinstance(row, Mapping)
+        ]
+        errors = [str(item).strip() for item in list(normalized_validation.get("errors") or []) if str(item).strip()]
+        if not normalized_components:
+            errors.append("empty_reconstructed_components")
+        return normalized_components, {
+            "enabled": bool(normalized_validation.get("enabled")) and bool(normalized_components),
+            "passed": not errors,
+            "errors": errors,
+        }
+
     def _normalize_layout_uid_ai_reconstruction_plan(
         self,
         *,
@@ -3962,8 +4820,15 @@ class LiteratureReaderComposeService:
             }
 
         mode = str(raw_plan.get("mode") or "").strip().lower()
+        if mode in {"ai_only", "ungrounded"}:
+            mode = "ai_reconstructed"
+        if mode == "ai_reconstructed":
+            mode = "fully_reconstructed"
         quality = str(raw_plan.get("docmind_quality") or raw_plan.get("quality") or "").strip().lower()
-        enabled = mode in {"ai_reconstructed", "ai_only", "ungrounded"} and quality in {"poor", "bad", "broken", "low", "unusable"}
+        quality_gate = quality in {"poor", "bad", "broken", "low", "unusable"}
+        enabled = mode in {"partial_reconstructed", "fully_reconstructed"} and (
+            quality_gate or mode in {"partial_reconstructed", "fully_reconstructed"}
+        )
         if not enabled:
             return {
                 "mode": "grounded",
@@ -3978,124 +4843,9 @@ class LiteratureReaderComposeService:
                 "errors": [],
             }
 
-        allowed_kinds = self._layout_uid_ai_reconstruction_component_kinds()
-        normalized_components: List[Dict[str, Any]] = []
-        errors: List[str] = []
-
-        def _normalize_paragraph_rows(value: Any) -> List[Dict[str, Any]]:
-            rows: List[Dict[str, Any]] = []
-            for item in list(value or [])[:24]:
-                if isinstance(item, Mapping):
-                    text = self._normalize_spaces(str(item.get("text") or item.get("content") or ""))
-                else:
-                    text = self._normalize_spaces(str(item or ""))
-                if text:
-                    rows.append({"text": text})
-            return rows
-
-        for idx, raw_component in enumerate(list(raw_plan.get("components") or raw_plan.get("items") or [])[:20], start=1):
-            if not isinstance(raw_component, Mapping):
-                continue
-            kind = str(raw_component.get("kind") or raw_component.get("type") or raw_component.get("component") or "").strip().lower()
-            if kind not in allowed_kinds:
-                errors.append(f"unsupported_reconstruction_component:{kind or idx}")
-                continue
-            if kind == "heading":
-                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("title") or ""))
-                if not text:
-                    errors.append(f"reconstruction_heading_missing_text:{idx}")
-                    continue
-                normalized_components.append(
-                    {
-                        "kind": "heading",
-                        "text": text,
-                        "level": max(1, min(4, int(raw_component.get("level") or 2))),
-                    }
-                )
-                continue
-            if kind == "paragraph":
-                paragraphs = _normalize_paragraph_rows(raw_component.get("paragraphs"))
-                text = self._normalize_spaces(str(raw_component.get("text") or raw_component.get("content") or ""))
-                if not text and paragraphs:
-                    text = "\n\n".join(str(row.get("text") or "").strip() for row in paragraphs if str(row.get("text") or "").strip())
-                if not text:
-                    errors.append(f"reconstruction_paragraph_missing_text:{idx}")
-                    continue
-                normalized_components.append(
-                    {
-                        "kind": "paragraph",
-                        "text": text,
-                        "paragraphs": paragraphs,
-                    }
-                )
-                continue
-            if kind == "list":
-                items = [
-                    self._normalize_spaces(str(item or ""))
-                    for item in list(raw_component.get("items") or raw_component.get("bullets") or [])[:20]
-                    if self._normalize_spaces(str(item or ""))
-                ]
-                if not items:
-                    errors.append(f"reconstruction_list_missing_items:{idx}")
-                    continue
-                normalized_components.append({"kind": "list", "items": items})
-                continue
-            if kind == "figure":
-                caption = self._normalize_spaces(str(raw_component.get("caption") or raw_component.get("text") or ""))
-                normalized_components.append(
-                    {
-                        "kind": "figure",
-                        "caption": caption,
-                        "source_label": self._normalize_spaces(str(raw_component.get("source_label") or raw_component.get("label") or "")),
-                    }
-                )
-                continue
-            if kind == "table":
-                headers = [
-                    self._normalize_spaces(str(item or ""))
-                    for item in list(raw_component.get("headers") or [])[:24]
-                    if self._normalize_spaces(str(item or ""))
-                ]
-                row_matrix: List[List[str]] = []
-                for row in list(raw_component.get("rows") or [])[:40]:
-                    if isinstance(row, Mapping):
-                        ordered_values = [self._normalize_spaces(str(value or "")) for value in list(row.values())]
-                        row_values = [value for value in ordered_values if value]
-                    else:
-                        row_values = [
-                            self._normalize_spaces(str(item or ""))
-                            for item in list(row or [])[:24]
-                            if self._normalize_spaces(str(item or ""))
-                        ]
-                    if row_values:
-                        row_matrix.append(row_values)
-                normalized_components.append(
-                    {
-                        "kind": "table",
-                        "title": self._normalize_spaces(str(raw_component.get("title") or "")),
-                        "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
-                        "headers": headers,
-                        "rows": row_matrix,
-                        "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
-                    }
-                )
-                continue
-            if kind == "equation":
-                latex = str(raw_component.get("latex") or "").strip()
-                transcript = self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("text") or latex))
-                if not latex and not transcript:
-                    errors.append(f"reconstruction_equation_missing_text:{idx}")
-                    continue
-                normalized_components.append(
-                    {
-                        "kind": "equation",
-                        "latex": latex,
-                        "transcript": transcript,
-                        "label": self._normalize_spaces(str(raw_component.get("label") or "")),
-                        "description": self._normalize_spaces(str(raw_component.get("description") or "")),
-                    }
-                )
-
+        normalized_components, errors = self._normalize_layout_uid_reconstructed_component_items(
+            raw_components=raw_plan.get("components") or raw_plan.get("items") or [],
+        )
         confidence = 0.0
         try:
             confidence = max(0.0, min(1.0, float(raw_plan.get("confidence") or 0.0)))
@@ -4106,7 +4856,7 @@ class LiteratureReaderComposeService:
             errors.append("empty_reconstruction_components")
 
         return {
-            "mode": "ai_reconstructed",
+            "mode": mode if mode in {"partial_reconstructed", "fully_reconstructed"} else "fully_reconstructed",
             "docmind_quality": quality or "poor",
             "reason": self._normalize_spaces(str(raw_plan.get("reason") or "")),
             "confidence": confidence,
@@ -4132,14 +4882,52 @@ class LiteratureReaderComposeService:
             grounding=grounding,
             step_result=step_result,
         )
+        page_decision = self._normalize_layout_uid_page_decision(step_result=step_result)
+        reconstructed_components, reconstructed_validation = self._normalize_layout_uid_reconstructed_components(
+            step_result=step_result,
+            page_decision=page_decision,
+        )
         reconstruction_plan, reconstruction_validation = self._normalize_layout_uid_ai_reconstruction_plan(
             step_result=step_result,
         )
+        decision_mode = str(page_decision.get("mode") or "").strip().lower()
+        if decision_mode == "fully_reconstructed" and list(reconstructed_components or []):
+            confidence = self._safe_float(page_decision.get("confidence"), self._safe_float(reconstruction_plan.get("confidence"), 0.0))
+            reconstruction_plan = {
+                "mode": "ai_reconstructed",
+                "docmind_quality": str(reconstruction_plan.get("docmind_quality") or "poor").strip() or "poor",
+                "reason": str(page_decision.get("reason") or reconstruction_plan.get("reason") or "").strip(),
+                "confidence": confidence,
+                "components": list(reconstructed_components or []),
+                "notes": list(reconstruction_plan.get("notes") or []),
+            }
+            reconstruction_validation = {
+                "enabled": bool(reconstructed_validation.get("enabled")),
+                "passed": bool(reconstructed_validation.get("passed")),
+                "errors": [str(item).strip() for item in list(reconstructed_validation.get("errors") or []) if str(item).strip()],
+            }
+        elif decision_mode in {"grounded", "partial_reconstructed"}:
+            reconstruction_plan = {
+                "mode": "grounded",
+                "docmind_quality": str(reconstruction_plan.get("docmind_quality") or "").strip(),
+                "reason": str(page_decision.get("reason") or reconstruction_plan.get("reason") or "").strip(),
+                "confidence": self._safe_float(page_decision.get("confidence"), 0.0),
+                "components": list(reconstructed_components or []) if decision_mode == "partial_reconstructed" else [],
+                "notes": list(reconstruction_plan.get("notes") or []),
+            }
+            reconstruction_validation = {
+                "enabled": False,
+                "passed": True,
+                "errors": [],
+            }
         return {
             "normalization_plan": normalization_plan,
             "text_validation": text_validation,
             "grouping_plan": grouping_plan,
             "grouping_validation": grouping_validation,
+            "page_decision": page_decision,
+            "reconstructed_components": reconstructed_components,
+            "reconstructed_validation": reconstructed_validation,
             "reconstruction_plan": reconstruction_plan,
             "reconstruction_validation": reconstruction_validation,
         }
@@ -4527,23 +5315,90 @@ class LiteratureReaderComposeService:
         page: int,
         reconstruction_plan: Mapping[str, Any],
         page_image_url: str,
+        figure_assets: Optional[Mapping[int, Mapping[str, Any]]] = None,
+        source_mode: str = "fully_reconstructed",
+        default_reconstruction_reason: str = "",
     ) -> Dict[str, Any]:
         nodes: List[Dict[str, Any]] = []
+        normalized_source_mode = self._normalize_spaces(str(source_mode or "")).strip().lower()
+        if normalized_source_mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+            normalized_source_mode = "fully_reconstructed"
+        normalized_default_reconstruction_reason = self._normalize_spaces(str(default_reconstruction_reason or ""))
+
+        def _normalize_component_bbox_norm(raw_value: Any) -> Optional[Dict[str, float]]:
+            return self._normalize_bbox_norm(raw_value)
+
+        def _normalize_reconstruction_notes(raw_value: Any) -> List[str]:
+            if isinstance(raw_value, str):
+                text = self._normalize_spaces(raw_value)
+                return [text] if text else []
+            return [
+                self._normalize_spaces(str(item or ""))
+                for item in list(raw_value or [])
+                if self._normalize_spaces(str(item or ""))
+            ]
+
+        def _merge_reconstruction_props(props: Dict[str, Any], raw_component: Mapping[str, Any]) -> Dict[str, Any]:
+            merged = dict(props or {})
+            explicit_mode = self._normalize_spaces(
+                str(merged.get("source_mode") or raw_component.get("source_mode") or "")
+            ).strip().lower()
+            if explicit_mode in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+                merged.setdefault("source_mode", explicit_mode)
+            else:
+                merged.setdefault("source_mode", normalized_source_mode)
+
+            if "partial_reconstruction" not in merged:
+                partial_reconstruction_raw = raw_component.get("partial_reconstruction")
+                if isinstance(partial_reconstruction_raw, str):
+                    partial_reconstruction = self._normalize_spaces(partial_reconstruction_raw)
+                else:
+                    partial_reconstruction = (
+                        bool(partial_reconstruction_raw) if partial_reconstruction_raw is not None else False
+                    )
+                if partial_reconstruction:
+                    merged["partial_reconstruction"] = partial_reconstruction
+
+            if "reconstruction_notes" not in merged:
+                reconstruction_notes = _normalize_reconstruction_notes(raw_component.get("reconstruction_notes"))
+                if reconstruction_notes:
+                    merged["reconstruction_notes"] = reconstruction_notes
+
+            if "reconstruction_reason" not in merged:
+                reconstruction_reason = self._normalize_spaces(
+                    str(raw_component.get("reconstruction_reason") or normalized_default_reconstruction_reason or "")
+                )
+                if reconstruction_reason:
+                    merged["reconstruction_reason"] = reconstruction_reason
+
+            if "evidence_mode" not in merged:
+                evidence_mode = self._normalize_spaces(str(raw_component.get("evidence_mode") or ""))
+                if evidence_mode:
+                    merged["evidence_mode"] = evidence_mode
+
+            return merged
+
         for idx, raw_component in enumerate(list(reconstruction_plan.get("components") or [])[:20], start=1):
             if not isinstance(raw_component, Mapping):
                 continue
             kind = str(raw_component.get("kind") or "").strip().lower()
             node_id = f"ai_reconstructed_{idx}"
+            component_bbox_norm = _normalize_component_bbox_norm(raw_component.get("bbox_norm") or raw_component.get("bbox"))
             if kind == "heading":
+                props = {
+                    "text": self._normalize_spaces(str(raw_component.get("text") or "")) or "Untitled",
+                    "level": max(1, min(4, int(raw_component.get("level") or 2))),
+                    "source_mode": normalized_source_mode,
+                }
+                if component_bbox_norm:
+                    props["bbox_norm"] = component_bbox_norm
+                props = _merge_reconstruction_props(props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
                         "component": "SectionHeading",
                         "source_layout_ids": [],
-                        "props": {
-                            "text": self._normalize_spaces(str(raw_component.get("text") or "")) or "Untitled",
-                            "level": max(1, min(4, int(raw_component.get("level") or 2))),
-                        },
+                        "props": props,
                         "display": "default",
                         "order_key": float(idx),
                         "children": [],
@@ -4551,16 +5406,29 @@ class LiteratureReaderComposeService:
                 )
             elif kind == "paragraph":
                 paragraphs = [
-                    {"text": self._normalize_spaces(str((row or {}).get("text") or ""))}
+                    {
+                        "text": self._normalize_spaces(str((row or {}).get("text") or "")),
+                        **(
+                            {"bbox_norm": bbox}
+                            if (bbox := _normalize_component_bbox_norm((row or {}).get("bbox_norm") or (row or {}).get("bbox")))
+                            else {}
+                        ),
+                    }
                     for row in list(raw_component.get("paragraphs") or [])
                     if self._normalize_spaces(str((row or {}).get("text") or ""))
                 ]
                 props: Dict[str, Any] = {
                     "text": self._normalize_spaces(str(raw_component.get("text") or "")) or "[empty]",
+                    "source_mode": normalized_source_mode,
                 }
                 if paragraphs:
                     props["paragraphs"] = paragraphs
                     props["paragraph_strategy"] = "model"
+                if component_bbox_norm:
+                    props["bbox_norm"] = component_bbox_norm
+                elif len(paragraphs) == 1 and isinstance(paragraphs[0], Mapping) and paragraphs[0].get("bbox_norm"):
+                    props["bbox_norm"] = dict(paragraphs[0].get("bbox_norm") or {})
+                props = _merge_reconstruction_props(props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
@@ -4578,29 +5446,61 @@ class LiteratureReaderComposeService:
                     for item in list(raw_component.get("items") or [])
                     if self._normalize_spaces(str(item or ""))
                 ]
+                props = {"items": items or ["[empty]"]}
+                props["source_mode"] = normalized_source_mode
+                if component_bbox_norm:
+                    props["bbox_norm"] = component_bbox_norm
+                props = _merge_reconstruction_props(props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
                         "component": "ListBlock",
                         "source_layout_ids": [],
-                        "props": {"items": items or ["[empty]"]},
+                        "props": props,
                         "display": "default",
                         "order_key": float(idx),
                         "children": [],
                     }
                 )
             elif kind == "figure":
+                figure_asset = dict((figure_assets or {}).get(int(idx)) or {})
+                figure_bbox_norm = _normalize_component_bbox_norm(
+                    figure_asset.get("bbox_norm") or raw_component.get("bbox_norm") or raw_component.get("bbox")
+                )
+                raw_notes = raw_component.get("notes")
+                if not isinstance(raw_notes, list):
+                    raw_notes = raw_component.get("reconstruction_notes")
+                notes = [
+                    self._normalize_spaces(str(item or ""))
+                    for item in list(raw_notes or [])[:12]
+                    if self._normalize_spaces(str(item or ""))
+                ]
+                partial_reconstruction_raw = raw_component.get("partial_reconstruction")
+                if isinstance(partial_reconstruction_raw, str):
+                    partial_reconstruction: Any = self._normalize_spaces(partial_reconstruction_raw)
+                else:
+                    partial_reconstruction = bool(partial_reconstruction_raw) if partial_reconstruction_raw is not None else False
+                props = {
+                    "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                    "image_url": str(figure_asset.get("image_url") or page_image_url or "").strip(),
+                    "source_label": self._normalize_spaces(str(raw_component.get("source_label") or "")),
+                    "ai_insight": "",
+                    "source_mode": normalized_source_mode,
+                }
+                if notes:
+                    props["notes"] = notes
+                    props["reconstruction_notes"] = notes
+                if partial_reconstruction:
+                    props["partial_reconstruction"] = partial_reconstruction
+                if figure_bbox_norm:
+                    props["bbox_norm"] = figure_bbox_norm
+                props = _merge_reconstruction_props(props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
                         "component": "FigurePanel",
                         "source_layout_ids": [],
-                        "props": {
-                            "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
-                            "image_url": str(page_image_url or "").strip(),
-                            "source_label": self._normalize_spaces(str(raw_component.get("source_label") or "")),
-                            "ai_insight": "",
-                        },
+                        "props": props,
                         "display": "default",
                         "order_key": float(idx),
                         "children": [],
@@ -4631,48 +5531,59 @@ class LiteratureReaderComposeService:
                     matrix.append(headers + [""] * max(0, column_count - len(headers)))
                 matrix.extend([row + [""] * max(0, column_count - len(row)) for row in row_matrix])
                 column_widths = ([1.0 / column_count] * column_count) if column_count > 0 else []
+                table_props: Dict[str, Any] = {
+                    "title": self._normalize_spaces(str(raw_component.get("title") or "")) or "Table",
+                    "source_mode": normalized_source_mode,
+                    "headers": headers,
+                    "rows": rows,
+                    "matrix": matrix,
+                    "column_widths": column_widths,
+                    "table_cells": [],
+                    "header_row_count": 1 if headers else 0,
+                    "logical_rows": [],
+                    "logical_header_row_count": 0,
+                    "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
+                    "notes": [],
+                    "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
+                    "row_evidence": [],
+                    "cell_evidence": [],
+                    "reconstruction_mode": (
+                        "ai_reconstructed" if normalized_source_mode == "fully_reconstructed" else normalized_source_mode
+                    ),
+                    "reconstruction_notes": list(reconstruction_plan.get("notes") or []),
+                    "ai_insight": "",
+                    **({"bbox_norm": component_bbox_norm} if component_bbox_norm else {}),
+                }
+                table_props = _merge_reconstruction_props(table_props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
                         "component": "TablePanel",
                         "source_layout_ids": [],
-                        "props": {
-                            "title": self._normalize_spaces(str(raw_component.get("title") or "")) or "Table",
-                            "headers": headers,
-                            "rows": rows,
-                            "matrix": matrix,
-                            "column_widths": column_widths,
-                            "table_cells": [],
-                            "header_row_count": 1 if headers else 0,
-                            "logical_rows": [],
-                            "logical_header_row_count": 0,
-                            "caption": self._normalize_spaces(str(raw_component.get("caption") or "")),
-                            "notes": [],
-                            "raw_markdown": str(raw_component.get("raw_markdown") or "").strip(),
-                            "row_evidence": [],
-                            "cell_evidence": [],
-                            "reconstruction_mode": "ai_reconstructed",
-                            "reconstruction_notes": list(reconstruction_plan.get("notes") or []),
-                            "ai_insight": "",
-                        },
+                        "props": table_props,
                         "display": "default",
                         "order_key": float(idx),
                         "children": [],
                     }
                 )
             elif kind == "equation":
+                props = {
+                    "latex": str(raw_component.get("latex") or "").strip() or self._normalize_spaces(str(raw_component.get("transcript") or "")) or "x = y",
+                    "label": self._normalize_spaces(str(raw_component.get("label") or "")),
+                    "description": self._normalize_spaces(str(raw_component.get("description") or "")),
+                    "render_mode": "math_first",
+                    "transcript": self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("latex") or "")),
+                    "source_mode": normalized_source_mode,
+                }
+                if component_bbox_norm:
+                    props["bbox_norm"] = component_bbox_norm
+                props = _merge_reconstruction_props(props, raw_component)
                 nodes.append(
                     {
                         "node_id": node_id,
                         "component": "EquationBlock",
                         "source_layout_ids": [],
-                        "props": {
-                            "latex": str(raw_component.get("latex") or "").strip() or self._normalize_spaces(str(raw_component.get("transcript") or "")) or "x = y",
-                            "label": self._normalize_spaces(str(raw_component.get("label") or "")),
-                            "description": self._normalize_spaces(str(raw_component.get("description") or "")),
-                            "render_mode": "math_first",
-                            "transcript": self._normalize_spaces(str(raw_component.get("transcript") or raw_component.get("latex") or "")),
-                        },
+                        "props": props,
                         "display": "default",
                         "order_key": float(idx),
                         "children": [],
@@ -4696,6 +5607,1482 @@ class LiteratureReaderComposeService:
                 "body_color": "#21364a",
             },
         }
+
+    def _apply_layout_uid_partial_reconstructed_replacements(
+        self,
+        *,
+        page: int,
+        ui_plan: Mapping[str, Any],
+        reconstructed_components: Sequence[Mapping[str, Any]],
+        figure_assets: Optional[Mapping[int, Mapping[str, Any]]],
+        page_image_url: str,
+        page_decision: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        updated = dict(ui_plan or {})
+        top_nodes = [
+            dict(row)
+            for row in list(updated.get("components") or [])
+            if isinstance(row, Mapping)
+        ]
+        if not top_nodes or not list(reconstructed_components or []):
+            updated["components"] = top_nodes
+            return updated, {"applied": False, "figure_replaced": 0, "table_replaced": 0, "figure_inserted": 0}
+
+        partial_reconstruction_plan = {
+            "mode": "partial_reconstructed",
+            "reason": str((page_decision or {}).get("reason") or "").strip(),
+            "confidence": self._safe_float((page_decision or {}).get("confidence"), 0.0),
+            "components": [dict(row) for row in list(reconstructed_components or []) if isinstance(row, Mapping)],
+            "notes": [],
+        }
+        partial_panel_plan = self._build_ai_reconstructed_panel_plan(
+            page=page,
+            reconstruction_plan=partial_reconstruction_plan,
+            page_image_url=page_image_url,
+            figure_assets=figure_assets,
+            source_mode="partial_reconstructed",
+            default_reconstruction_reason=str((page_decision or {}).get("reason") or ""),
+        )
+        partial_nodes = [
+            dict(row)
+            for panel in list(partial_panel_plan.get("panels") or [])
+            if isinstance(panel, Mapping)
+            for row in list(panel.get("nodes") or [])
+            if isinstance(row, Mapping)
+        ]
+        figure_candidates = [row for row in partial_nodes if str(row.get("component") or "").strip() == "FigurePanel"]
+        table_candidates = [row for row in partial_nodes if str(row.get("component") or "").strip() == "TablePanel"]
+        if not figure_candidates and not table_candidates:
+            updated["components"] = top_nodes
+            return updated, {"applied": False, "figure_replaced": 0, "table_replaced": 0, "figure_inserted": 0}
+
+        decision_reason = self._normalize_spaces(str((page_decision or {}).get("reason") or ""))
+
+        def _first_index(rows: Sequence[Dict[str, Any]], node_type: str) -> Optional[int]:
+            for idx, row in enumerate(list(rows or [])):
+                if str((row or {}).get("type") or "").strip() == node_type:
+                    return idx
+            return None
+
+        def _inferred_reason(props: Mapping[str, Any]) -> str:
+            if decision_reason:
+                return decision_reason
+            note_candidates = list(props.get("reconstruction_notes") or props.get("notes") or [])
+            for item in note_candidates:
+                text = self._normalize_spaces(str(item or ""))
+                if text:
+                    return text
+            return ""
+
+        def _build_ui_node(
+            panel_node: Mapping[str, Any],
+            *,
+            fallback_node: Optional[Mapping[str, Any]],
+            suffix: str,
+            order_key: float,
+        ) -> Dict[str, Any]:
+            fallback = dict(fallback_node or {})
+            props = dict(panel_node.get("props") or {})
+            props["source_mode"] = "partial_reconstructed"
+            inferred_reason = _inferred_reason(props)
+            if inferred_reason:
+                props["reconstruction_reason"] = inferred_reason
+            component_type = str(panel_node.get("component") or "").strip() or "ParagraphProse"
+            if component_type != "FigurePanel" and props.get("bbox_norm"):
+                props["bbox_reference_only"] = True
+            return {
+                "id": str(panel_node.get("node_id") or f"partial_reconstructed_{suffix}_{uuid.uuid4().hex[:8]}").strip()
+                or f"partial_reconstructed_{suffix}_{uuid.uuid4().hex[:8]}",
+                "type": component_type,
+                "props": props,
+                "children": [],
+                "source_anchor_refs": [dict(row) for row in list(fallback.get("source_anchor_refs") or []) if isinstance(row, Mapping)],
+                "source_block_ids": [str(item).strip() for item in list(fallback.get("source_block_ids") or []) if str(item).strip()],
+                "source_atom_ids": [
+                    str(item).strip()
+                    for item in list(fallback.get("source_atom_ids") or fallback.get("source_block_ids") or [])
+                    if str(item).strip()
+                ],
+                "zone_type": str(fallback.get("zone_type") or "main_body").strip() or "main_body",
+                "column_id": str(fallback.get("column_id") or fallback.get("region") or "main").strip() or "main",
+                "region": str(fallback.get("region") or fallback.get("column_id") or "main").strip() or "main",
+                "display": str(fallback.get("display") or "default").strip() or "default",
+                "order_key": float(order_key),
+                "compat_filled": bool(fallback.get("compat_filled", True)),
+                "compat_filled_fields": list(fallback.get("compat_filled_fields") or ["zone_type", "column_id", "region", "display", "order_key"]),
+                "heading_prob": float(fallback.get("heading_prob") or 0.0),
+                "capabilities": list(fallback.get("capabilities") or []),
+                "actions": list(fallback.get("actions") or []),
+            }
+
+        figure_replaced = 0
+        figure_inserted = 0
+        table_replaced = 0
+
+        figure_index = _first_index(top_nodes, "FigurePanel")
+        if figure_candidates:
+            insertion_index = figure_index if figure_index is not None else len(top_nodes)
+            for candidate_idx, candidate in enumerate(figure_candidates, start=1):
+                if figure_index is not None and candidate_idx == 1:
+                    base = dict(top_nodes[figure_index] or {})
+                    replacement = _build_ui_node(
+                        candidate,
+                        fallback_node=base,
+                        suffix=f"figure_{candidate_idx}",
+                        order_key=self._safe_float(base.get("order_key"), float(figure_index + 1)),
+                    )
+                    top_nodes[figure_index] = replacement
+                    figure_replaced += 1
+                    insertion_index = figure_index + 1
+                else:
+                    base_for_insert = dict(top_nodes[insertion_index - 1]) if insertion_index > 0 and insertion_index <= len(top_nodes) else {}
+                    replacement = _build_ui_node(
+                        candidate,
+                        fallback_node=base_for_insert,
+                        suffix=f"figure_insert_{candidate_idx}",
+                        order_key=self._safe_float(base_for_insert.get("order_key"), float(insertion_index + 1)),
+                    )
+                    top_nodes.insert(insertion_index, replacement)
+                    insertion_index += 1
+                    figure_inserted += 1
+
+        table_index = _first_index(top_nodes, "TablePanel")
+        if table_candidates and table_index is not None:
+            base = dict(top_nodes[table_index] or {})
+            table_replacement = _build_ui_node(
+                table_candidates[0],
+                fallback_node=base,
+                suffix="table_1",
+                order_key=self._safe_float(base.get("order_key"), float(table_index + 1)),
+            )
+            top_nodes[table_index] = table_replacement
+            table_replaced += 1
+
+        updated["components"] = top_nodes
+        return updated, {
+            "applied": bool(figure_replaced or figure_inserted or table_replaced),
+            "figure_replaced": int(figure_replaced),
+            "figure_inserted": int(figure_inserted),
+            "table_replaced": int(table_replaced),
+        }
+
+    def _build_ai_reconstructed_bbox_hint(
+        self,
+        *,
+        bbox_norm: Any,
+        page_width: Optional[float],
+        page_height: Optional[float],
+    ) -> Optional[Dict[str, Any]]:
+        normalized = self._normalize_bbox_norm(bbox_norm)
+        if not normalized:
+            return None
+        width = float(page_width or 0.0) or 0.0
+        height = float(page_height or 0.0) or 0.0
+        if width <= 0 or height <= 0:
+            return None
+        x0 = max(0.0, min(width, float(normalized.get("x0") or 0.0) * width))
+        x1 = max(0.0, min(width, float(normalized.get("x1") or 0.0) * width))
+        top = max(0.0, min(height, float(normalized.get("y0") or 0.0) * height))
+        bottom = max(0.0, min(height, float(normalized.get("y1") or 0.0) * height))
+        if x1 <= x0 or bottom <= top:
+            return None
+        return {
+            "x0": round(x0, 2),
+            "x1": round(x1, 2),
+            "top": round(top, 2),
+            "bottom": round(bottom, 2),
+            "page_width": width,
+            "page_height": height,
+        }
+
+    def _build_ai_reconstructed_evidence_anchor(
+        self,
+        *,
+        page: int,
+        node_id: str,
+        anchor_index: int,
+        quote_text: str,
+        bbox_norm: Any,
+        page_width: Optional[float],
+        page_height: Optional[float],
+        anchor_confidence: float = 0.9,
+    ) -> Optional[Dict[str, Any]]:
+        bbox_hint = self._build_ai_reconstructed_bbox_hint(
+            bbox_norm=bbox_norm,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        if not bbox_hint:
+            return None
+        quote = self._normalize_spaces(str(quote_text or ""))[:280]
+        anchor_id = f"ai_reconstructed_bbox:{node_id}:{int(anchor_index)}"
+        normalized = self._normalize_anchor_ref(
+            anchor={
+                "page": int(page),
+                "start_char": 0,
+                "end_char": max(1, len(quote) or 1),
+                "quote": quote,
+                "quote_text": quote,
+                "anchor_id": anchor_id,
+                "anchor_confidence": max(0.0, min(1.0, float(anchor_confidence or 0.0))),
+                "coord_version": "ai_reconstructed_bbox_v1",
+                "bbox_hint": bbox_hint,
+                "geometry": {
+                    "polygons": [
+                        {
+                            "points": self._build_rect_polygon(
+                                x0=float(bbox_hint.get("x0") or 0.0),
+                                x1=float(bbox_hint.get("x1") or 0.0),
+                                top=float(bbox_hint.get("top") or 0.0),
+                                bottom=float(bbox_hint.get("bottom") or 0.0),
+                            ),
+                            "source": "ai_reconstructed_bbox",
+                            "component_id": node_id,
+                        }
+                    ],
+                    "page_width": bbox_hint.get("page_width"),
+                    "page_height": bbox_hint.get("page_height"),
+                },
+            },
+            page=page,
+            quote_text=quote,
+        )
+        if not normalized:
+            return None
+        normalized["anchor_id"] = anchor_id
+        normalized["anchor_confidence"] = max(0.0, min(1.0, float(anchor_confidence or 0.0)))
+        normalized["coord_version"] = "ai_reconstructed_bbox_v1"
+        normalized["bbox_hint"] = bbox_hint
+        normalized["geometry_version"] = "poly_v1"
+        normalized["geometry"] = {
+            "polygons": [
+                {
+                    "points": self._build_rect_polygon(
+                        x0=float(bbox_hint.get("x0") or 0.0),
+                        x1=float(bbox_hint.get("x1") or 0.0),
+                        top=float(bbox_hint.get("top") or 0.0),
+                        bottom=float(bbox_hint.get("bottom") or 0.0),
+                    ),
+                    "source": "ai_reconstructed_bbox",
+                    "component_id": node_id,
+                }
+            ],
+            "page_width": bbox_hint.get("page_width"),
+            "page_height": bbox_hint.get("page_height"),
+        }
+        return normalized
+
+    def _inject_ai_reconstructed_evidence_source_anchor_refs(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+        page_image_path: str,
+        page_image_url: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        page_width, page_height = self._resolve_grounding_page_image_size(
+            page_image_url=page_image_url,
+            page_image_path=page_image_path,
+        )
+        grounding = dict((payload or {}).get("page_grounding_v1") or {})
+        grounding_page_image = dict(grounding.get("page_image") or {})
+        if not page_width or not page_height:
+            page_width = self._safe_float(grounding_page_image.get("width"), 0.0) or None
+            page_height = self._safe_float(grounding_page_image.get("height"), 0.0) or None
+
+        debug_nodes: List[Dict[str, Any]] = []
+        anchor_total = 0
+
+        def _component_quote(node_type: str, props: Mapping[str, Any]) -> str:
+            if node_type == "FigurePanel":
+                return self._normalize_spaces(str(props.get("caption") or props.get("source_label") or ""))
+            if node_type == "TablePanel":
+                return self._normalize_spaces(str(props.get("caption") or props.get("title") or ""))
+            if node_type == "EquationBlock":
+                return self._normalize_spaces(str(props.get("transcript") or props.get("latex") or props.get("text") or ""))
+            if node_type == "ListBlock":
+                items = [self._normalize_spaces(str(item or "")) for item in list(props.get("items") or []) if self._normalize_spaces(str(item or ""))]
+                return "\n".join(items[:8]).strip()
+            if node_type == "SectionHeading":
+                return self._normalize_spaces(str(props.get("text") or ""))
+            return self._normalize_spaces(str(props.get("text") or ""))
+
+        def _walk(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            nonlocal anchor_total
+            output: List[Dict[str, Any]] = []
+            for raw in list(nodes or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                node_id = str(node.get("id") or "").strip() or f"ai_reconstructed_node_{len(output) + 1}"
+                node_type = str(node.get("type") or "").strip()
+                props = dict(node.get("props") or {})
+                node_bbox_norm = props.get("bbox_norm") if isinstance(props.get("bbox_norm"), (dict, list, tuple)) else None
+                children = _walk([row for row in list(node.get("children") or []) if isinstance(row, dict)])
+                node["children"] = children
+
+                existing_refs = [dict(row) for row in list(node.get("source_anchor_refs") or []) if isinstance(row, Mapping)]
+                anchor_refs: List[Dict[str, Any]] = []
+                seen_anchor_ids: set[str] = set()
+                for row in existing_refs:
+                    anchor_id = str(row.get("anchor_id") or "").strip()
+                    if anchor_id and anchor_id not in seen_anchor_ids:
+                        anchor_refs.append(row)
+                        seen_anchor_ids.add(anchor_id)
+
+                def _append_anchor(*, bbox_norm: Any, quote_text: str, anchor_index: int, confidence: float) -> None:
+                    nonlocal anchor_total
+                    anchor = self._build_ai_reconstructed_evidence_anchor(
+                        page=page,
+                        node_id=node_id,
+                        anchor_index=anchor_index,
+                        quote_text=quote_text,
+                        bbox_norm=bbox_norm,
+                        page_width=page_width,
+                        page_height=page_height,
+                        anchor_confidence=confidence,
+                    )
+                    if not anchor:
+                        return
+                    anchor_id = str(anchor.get("anchor_id") or "").strip()
+                    if not anchor_id or anchor_id in seen_anchor_ids:
+                        return
+                    anchor_refs.append(anchor)
+                    seen_anchor_ids.add(anchor_id)
+                    anchor_total += 1
+
+                if node_type == "ParagraphProse":
+                    paragraph_rows = [row for row in list(props.get("paragraphs") or []) if isinstance(row, Mapping)]
+                    row_anchor_count = 0
+                    for row_index, row in enumerate(paragraph_rows, start=1):
+                        row_bbox_norm = row.get("bbox_norm") if isinstance(row.get("bbox_norm"), (dict, list, tuple)) else None
+                        if not row_bbox_norm:
+                            continue
+                        row_quote = self._normalize_spaces(str(row.get("text") or ""))
+                        _append_anchor(
+                            bbox_norm=row_bbox_norm,
+                            quote_text=row_quote or _component_quote(node_type, props),
+                            anchor_index=row_index,
+                            confidence=0.9,
+                        )
+                        row_anchor_count += 1
+                    if not row_anchor_count and node_bbox_norm:
+                        _append_anchor(
+                            bbox_norm=node_bbox_norm,
+                            quote_text=_component_quote(node_type, props),
+                            anchor_index=1,
+                            confidence=0.9,
+                        )
+                else:
+                    if node_bbox_norm:
+                        confidence = 0.95 if node_type == "FigurePanel" else 0.88
+                        _append_anchor(
+                            bbox_norm=node_bbox_norm,
+                            quote_text=_component_quote(node_type, props),
+                            anchor_index=1,
+                            confidence=confidence,
+                        )
+
+                if anchor_refs:
+                    node["source_anchor_refs"] = anchor_refs
+
+                debug_nodes.append(
+                    {
+                        "node_id": node_id,
+                        "type": node_type,
+                        "anchor_count": len(anchor_refs),
+                        "anchor_ids": [str(row.get("anchor_id") or "").strip() for row in anchor_refs if str(row.get("anchor_id") or "").strip()],
+                        "has_bbox_norm": bool(node_bbox_norm),
+                        "paragraph_count": len([row for row in list(props.get("paragraphs") or []) if isinstance(row, Mapping)]),
+                    }
+                )
+                output.append(node)
+            return output
+
+        refreshed = dict(ui_plan or {})
+        refreshed["components"] = _walk(list(refreshed.get("components") or []))
+        debug_meta = {
+            "enabled": True,
+            "page": int(page),
+            "page_image_source": "page_render_asset",
+            "page_width": page_width,
+            "page_height": page_height,
+            "anchor_count": anchor_total,
+            "nodes": debug_nodes[:60],
+        }
+        return refreshed, debug_meta
+
+    def _repair_ai_reconstructed_evidence_runtime(
+        self,
+        *,
+        page: int,
+        payload: Dict[str, Any],
+        ui_plan: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        page_grounding_policy = (
+            dict(payload.get("page_grounding_policy") or {})
+            if isinstance(payload.get("page_grounding_policy"), Mapping)
+            else {}
+        )
+        grounding_mode = str(
+            (
+                page_grounding_policy.get("legacy_mode")
+                or payload.get("legacy_grounding_mode")
+                or payload.get("grounding_mode")
+                or page_grounding_policy.get("mode")
+            )
+            or ""
+        ).strip().lower()
+        reconstruction_mode = str(
+            (
+                page_grounding_policy.get("reconstruction_mode")
+                or page_grounding_policy.get("legacy_reconstruction_mode")
+                or page_grounding_policy.get("legacy_mode")
+                or payload.get("legacy_reconstruction_mode")
+                or payload.get("reconstruction_mode")
+                or payload.get("legacy_grounding_mode")
+                or payload.get("grounding_mode")
+                or page_grounding_policy.get("mode")
+            )
+            or ""
+        ).strip().lower()
+        if grounding_mode != "ai_reconstructed" and reconstruction_mode != "ai_reconstructed":
+            return dict(ui_plan or {}), {
+                "enabled": False,
+                "repaired": False,
+                "reason": "not_ai_reconstructed",
+                "anchor_count_before": 0,
+                "anchor_count_after": 0,
+            }
+
+        def _has_source_anchor_refs(nodes: Sequence[Dict[str, Any]]) -> bool:
+            for raw in list(nodes or []):
+                if not isinstance(raw, dict):
+                    continue
+                if list(raw.get("source_anchor_refs") or []):
+                    return True
+                if _has_source_anchor_refs([row for row in list(raw.get("children") or []) if isinstance(row, dict)]):
+                    return True
+            return False
+
+        def _coerce_json_mapping(raw: Any) -> Dict[str, Any]:
+            if isinstance(raw, Mapping):
+                return dict(raw)
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    return {}
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return {}
+                return dict(parsed) if isinstance(parsed, Mapping) else {}
+            return {}
+
+        current_ui_plan = dict(ui_plan or {})
+        current_components = [dict(node) for node in list(current_ui_plan.get("components") or []) if isinstance(node, dict)]
+        existing_anchor_count = sum(
+            len([row for row in list(node.get("source_anchor_refs") or []) if isinstance(row, Mapping)])
+            for node in current_components
+        )
+        if bool(payload.get("evidence_enabled")) and existing_anchor_count > 0:
+            return current_ui_plan, {
+                "enabled": True,
+                "repaired": False,
+                "reason": "evidence_already_present",
+                "anchor_count_before": existing_anchor_count,
+                "anchor_count_after": existing_anchor_count,
+            }
+        if _has_source_anchor_refs(current_components) and bool(payload.get("evidence_enabled") is not False):
+            return current_ui_plan, {
+                "enabled": True,
+                "repaired": False,
+                "reason": "source_anchor_refs_already_present",
+                "anchor_count_before": existing_anchor_count,
+                "anchor_count_after": existing_anchor_count,
+            }
+
+        layout_advice = _coerce_json_mapping(payload.get("layout_advice_v3"))
+        pipeline_contract_meta = _coerce_json_mapping(payload.get("pipeline_contract_meta"))
+        reconstruction_plan = dict(
+            _coerce_json_mapping(layout_advice.get("reconstruction"))
+            or _coerce_json_mapping(layout_advice.get("reconstruction_plan"))
+            or _coerce_json_mapping(payload.get("reconstruction_plan"))
+            or _coerce_json_mapping(pipeline_contract_meta.get("reconstruction_plan"))
+            or {}
+        )
+        components = [dict(row) for row in list(reconstruction_plan.get("components") or []) if isinstance(row, Mapping)]
+        if not components:
+            return current_ui_plan, {
+                "enabled": False,
+                "repaired": False,
+                "reason": "missing_reconstruction_plan",
+                "anchor_count_before": existing_anchor_count,
+                "anchor_count_after": existing_anchor_count,
+            }
+
+        figure_assets_raw = _coerce_json_mapping(layout_advice.get("ai_reconstructed_figure_assets"))
+        if not figure_assets_raw:
+            figure_assets_raw = _coerce_json_mapping(pipeline_contract_meta.get("ai_reconstructed_figure_assets"))
+        figure_assets: Dict[int, Dict[str, Any]] = {}
+        for key, value in figure_assets_raw.items():
+            try:
+                idx = int(str(key))
+            except Exception:
+                continue
+            if isinstance(value, Mapping):
+                figure_assets[idx] = dict(value)
+
+        def _component_bbox(component_index: int, component: Mapping[str, Any]) -> Optional[Dict[str, float]]:
+            bbox_norm = self._normalize_bbox_norm(component.get("bbox_norm") or component.get("bbox"))
+            if bbox_norm:
+                return bbox_norm
+            if str(component.get("kind") or "").strip().lower() == "figure":
+                asset = dict(figure_assets.get(component_index) or {})
+                bbox_norm = self._normalize_bbox_norm(asset.get("bbox_norm") or asset.get("bbox"))
+                if bbox_norm:
+                    return bbox_norm
+            if str(component.get("kind") or "").strip().lower() == "paragraph":
+                rows = [row for row in list(component.get("paragraphs") or []) if isinstance(row, Mapping)]
+                row_bboxes = [
+                    self._normalize_bbox_norm(row.get("bbox_norm") or row.get("bbox"))
+                    for row in rows
+                ]
+                row_bboxes = [row for row in row_bboxes if isinstance(row, Mapping)]
+                if row_bboxes:
+                    return self._bbox_norm_union(row_bboxes)
+            return None
+
+        fallback_index = 1
+
+        def _walk(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            nonlocal fallback_index
+            output: List[Dict[str, Any]] = []
+            for raw in list(nodes or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                node_id = str(node.get("node_id") or node.get("id") or "").strip()
+                component_index = 0
+                match = re.search(r"ai_reconstructed_(\d+)$", node_id)
+                if match:
+                    component_index = int(match.group(1) or 0)
+                    fallback_index = max(fallback_index, component_index + 1)
+                else:
+                    while fallback_index <= len(components):
+                        component_index = fallback_index
+                        fallback_index += 1
+                        break
+                props = dict(node.get("props") or {})
+                if component_index > 0:
+                    component = dict(components[component_index - 1] or {})
+                    component_bbox = _component_bbox(component_index, component)
+                    node_type = str(node.get("type") or "").strip()
+                    if node_type == "ParagraphProse":
+                        paragraphs = [dict(row) for row in list(props.get("paragraphs") or []) if isinstance(row, Mapping)]
+                        component_paragraphs = [dict(row) for row in list(component.get("paragraphs") or []) if isinstance(row, Mapping)]
+                        if component_paragraphs and paragraphs:
+                            for row_index, row in enumerate(paragraphs):
+                                row_bbox = self._normalize_bbox_norm(row.get("bbox_norm") or row.get("bbox"))
+                                if not row_bbox and row_index < len(component_paragraphs):
+                                    source_row = component_paragraphs[row_index]
+                                    row_bbox = self._normalize_bbox_norm(source_row.get("bbox_norm") or source_row.get("bbox"))
+                                if row_bbox:
+                                    row["bbox_norm"] = row_bbox
+                            props["paragraphs"] = paragraphs
+                        if component_bbox and not self._normalize_bbox_norm(props.get("bbox_norm")):
+                            props["bbox_norm"] = component_bbox
+                        elif paragraphs and not self._normalize_bbox_norm(props.get("bbox_norm")):
+                            paragraph_bboxes = [
+                                self._normalize_bbox_norm(row.get("bbox_norm"))
+                                for row in paragraphs
+                                if isinstance(row, Mapping)
+                            ]
+                            paragraph_bboxes = [row for row in paragraph_bboxes if isinstance(row, Mapping)]
+                            merged_bbox = self._bbox_norm_union(paragraph_bboxes)
+                            if merged_bbox:
+                                props["bbox_norm"] = merged_bbox
+                    else:
+                        if component_bbox and not self._normalize_bbox_norm(props.get("bbox_norm")):
+                            props["bbox_norm"] = component_bbox
+                    node["props"] = props
+                children = _walk([row for row in list(node.get("children") or []) if isinstance(row, dict)])
+                if children:
+                    node["children"] = children
+                output.append(node)
+            return output
+
+        repaired_ui_plan = dict(current_ui_plan)
+        repaired_ui_plan["components"] = _walk(current_components)
+        page_image = dict(((payload.get("page_grounding_v1") or {}).get("page_image") or {}))
+        page_image_url = str(page_image.get("url") or "").strip()
+        page_image_path = str(page_image.get("path") or "").strip()
+        repaired_ui_plan, evidence_meta = self._inject_ai_reconstructed_evidence_source_anchor_refs(
+            page=page,
+            payload=payload,
+            ui_plan=repaired_ui_plan,
+            page_image_path=page_image_path,
+            page_image_url=page_image_url,
+        )
+        anchor_count_after = int(evidence_meta.get("anchor_count") or 0)
+        return repaired_ui_plan, {
+            "enabled": True,
+            "repaired": bool(anchor_count_after > 0),
+            "reason": "ai_reconstructed_evidence_repair" if anchor_count_after > 0 else "ai_reconstructed_evidence_missing_bbox",
+            "anchor_count_before": existing_anchor_count,
+            "anchor_count_after": anchor_count_after,
+            "reconstruction_component_count": len(components),
+            "figure_asset_count": len(figure_assets),
+            "evidence_meta": dict(evidence_meta),
+        }
+
+    @staticmethod
+    def _reader_figure_asset_out_dir(*, paper_id: int, page: int) -> str:
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        return os.path.abspath(
+            os.path.join(upload_dir, "reader_figure_assets", str(int(paper_id)), f"p{int(page)}")
+        )
+
+    @staticmethod
+    def _bbox_norm_area(bbox_norm: Optional[Mapping[str, Any]]) -> float:
+        if not isinstance(bbox_norm, Mapping):
+            return 0.0
+        try:
+            width = max(0.0, float(bbox_norm.get("x1") or 0.0) - float(bbox_norm.get("x0") or 0.0))
+            height = max(0.0, float(bbox_norm.get("y1") or 0.0) - float(bbox_norm.get("y0") or 0.0))
+        except Exception:
+            return 0.0
+        return width * height
+
+    def _expand_bbox_norm(self, bbox_norm: Mapping[str, Any], *, pad: float) -> Optional[Dict[str, float]]:
+        if not isinstance(bbox_norm, Mapping):
+            return None
+        try:
+            x0 = float(bbox_norm.get("x0") or 0.0) - float(pad)
+            y0 = float(bbox_norm.get("y0") or 0.0) - float(pad)
+            x1 = float(bbox_norm.get("x1") or 1.0) + float(pad)
+            y1 = float(bbox_norm.get("y1") or 1.0) + float(pad)
+        except Exception:
+            return None
+        return self._normalize_bbox_norm({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+
+    @staticmethod
+    def _bbox_norm_almost_equal(a: Optional[Mapping[str, Any]], b: Optional[Mapping[str, Any]], *, tolerance: float = 0.02) -> bool:
+        if not isinstance(a, Mapping) or not isinstance(b, Mapping):
+            return False
+        keys = ("x0", "y0", "x1", "y1")
+        try:
+            return all(abs(float(a.get(key) or 0.0) - float(b.get(key) or 0.0)) <= tolerance for key in keys)
+        except Exception:
+            return False
+
+    def _normalize_docmind_raw_bbox_norm(
+        self,
+        raw_bbox: Any,
+        *,
+        page_width: Optional[float] = None,
+        page_height: Optional[float] = None,
+    ) -> Optional[Dict[str, float]]:
+        if isinstance(raw_bbox, Mapping):
+            source = raw_bbox
+        elif isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) >= 4:
+            source = {
+                "x0": raw_bbox[0],
+                "y0": raw_bbox[1],
+                "x1": raw_bbox[2],
+                "y1": raw_bbox[3],
+            }
+        else:
+            return None
+        try:
+            x0 = float(source.get("x0") or 0.0)
+            y0 = float(source.get("y0") or 0.0)
+            x1 = float(source.get("x1") or 0.0)
+            y1 = float(source.get("y1") or 0.0)
+        except Exception:
+            return None
+        if x1 <= x0 or y1 <= y0:
+            return None
+        max_coord = max(abs(x0), abs(y0), abs(x1), abs(y1))
+        if max_coord > 2.0 and page_width and page_height and page_width > 0 and page_height > 0:
+            x0 /= float(page_width)
+            x1 /= float(page_width)
+            y0 /= float(page_height)
+            y1 /= float(page_height)
+        elif max_coord > 2.0:
+            scale = max_coord
+            if scale <= 0:
+                return None
+            x0 /= scale
+            x1 /= scale
+            y0 /= scale
+            y1 /= scale
+        return self._normalize_bbox_norm({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+
+    def _derive_layout_uid_coarse_visual_bbox_norm(
+        self,
+        *,
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, float]]:
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        if not layout_atoms:
+            return None
+        main_atoms = [
+            row
+            for row in layout_atoms
+            if bool(row.get("include_in_main_flow"))
+        ] or list(layout_atoms)
+        page_payload = dict(payload or {})
+        page_structure_v3 = dict(page_payload.get("page_structure_v3") or {})
+        block_groups = [
+            dict(row)
+            for row in list(page_structure_v3.get("block_groups") or [])
+            if isinstance(row, Mapping)
+        ]
+        if len(main_atoms) > 1 and len(block_groups) > 1:
+            return None
+
+        page_image = dict((grounding or {}).get("page_image") or {})
+        page_width = self._safe_float(page_image.get("width"), 0.0) or None
+        page_height = self._safe_float(page_image.get("height"), 0.0) or None
+        if (not page_width or not page_height) and (page_image.get("url") or page_image.get("path")):
+            resolved_width, resolved_height = self._resolve_grounding_page_image_size(
+                page_image_url=str(page_image.get("url") or "").strip(),
+                page_image_path=str(page_image.get("path") or "").strip(),
+            )
+            page_width = page_width or resolved_width
+            page_height = page_height or resolved_height
+
+        raw_boxes: List[Tuple[float, float, float, float]] = []
+        for atom in main_atoms:
+            bbox = self._bbox_from_docmind_pos(atom.get("layout_pos"))
+            if bbox is not None:
+                raw_boxes.append(tuple(float(value) for value in bbox))
+            for block in list(atom.get("blocks") or []):
+                if not isinstance(block, Mapping):
+                    continue
+                block_bbox = self._bbox_from_docmind_pos(block.get("pos"))
+                if block_bbox is not None:
+                    raw_boxes.append(tuple(float(value) for value in block_bbox))
+
+        if not raw_boxes:
+            for row in block_groups:
+                layout_geo = dict(row.get("layout_bbox_or_polygon") or {})
+                layout_bbox = layout_geo.get("bbox") if isinstance(layout_geo.get("bbox"), Mapping) else None
+                if isinstance(layout_bbox, Mapping):
+                    candidate = self._normalize_docmind_raw_bbox_norm(
+                        {
+                            "x0": layout_bbox.get("x0"),
+                            "y0": layout_bbox.get("top"),
+                            "x1": layout_bbox.get("x1"),
+                            "y1": layout_bbox.get("bottom"),
+                        },
+                        page_width=page_width,
+                        page_height=page_height,
+                    )
+                    if candidate:
+                        return candidate
+                polygon = layout_geo.get("polygon")
+                if isinstance(polygon, list):
+                    points = self._normalize_grounding_points(polygon)
+                    bbox = self._grounding_points_bbox(points)
+                    if bbox:
+                        candidate = self._normalize_docmind_raw_bbox_norm(
+                            bbox,
+                            page_width=page_width,
+                            page_height=page_height,
+                        )
+                        if candidate:
+                            return candidate
+            return None
+
+        union = {
+            "x0": min(item[0] for item in raw_boxes),
+            "y0": min(item[1] for item in raw_boxes),
+            "x1": max(item[2] for item in raw_boxes),
+            "y1": max(item[3] for item in raw_boxes),
+        }
+        return self._normalize_docmind_raw_bbox_norm(
+            union,
+            page_width=page_width,
+            page_height=page_height,
+        )
+
+    def _tighten_bbox_norm_vertical(
+        self,
+        bbox_norm: Mapping[str, Any],
+        *,
+        top_trim: float,
+        bottom_trim: float,
+        x_pad: float = 0.0,
+    ) -> Optional[Dict[str, float]]:
+        normalized = self._normalize_bbox_norm(bbox_norm)
+        if not normalized:
+            return None
+        try:
+            x0 = max(0.0, float(normalized["x0"]) - max(0.0, float(x_pad)))
+            x1 = min(1.0, float(normalized["x1"]) + max(0.0, float(x_pad)))
+            y0 = max(0.0, float(normalized["y0"]) + max(0.0, float(top_trim)))
+            y1 = min(1.0, float(normalized["y1"]) - max(0.0, float(bottom_trim)))
+        except Exception:
+            return None
+        if x1 - x0 < 0.05 or y1 - y0 < 0.05:
+            return None
+        return self._normalize_bbox_norm({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+
+    def _expand_ai_reconstructed_figure_crop_bbox_norm(
+        self,
+        bbox_norm: Mapping[str, Any],
+    ) -> Optional[Dict[str, float]]:
+        normalized = self._normalize_bbox_norm(bbox_norm)
+        if not normalized:
+            return None
+        try:
+            width = max(0.0, float(normalized["x1"]) - float(normalized["x0"]))
+            height = max(0.0, float(normalized["y1"]) - float(normalized["y0"]))
+        except Exception:
+            return None
+        if width <= 0.0 or height <= 0.0:
+            return None
+        # Rough two-character margin: keep the crop conservative, but add a small
+        # relative padding on all sides so the AI-supplied box does not clip labels.
+        x_pad = max(width * 0.02, 0.01)
+        y_pad = max(height * 0.02, 0.01)
+        return self._normalize_bbox_norm(
+            {
+                "x0": float(normalized["x0"]) - x_pad,
+                "y0": float(normalized["y0"]) - y_pad,
+                "x1": float(normalized["x1"]) + x_pad,
+                "y1": float(normalized["y1"]) + y_pad,
+            }
+        )
+
+    def _build_ai_reconstructed_figure_candidate_bbox_norms(
+        self,
+        *,
+        seed_bbox_norm: Mapping[str, Any],
+        coarse_bbox_norm: Optional[Mapping[str, Any]],
+        visual_spec: Mapping[str, Any],
+    ) -> List[Dict[str, float]]:
+        candidates: List[Dict[str, float]] = []
+
+        def _append_candidate(raw_bbox: Any) -> None:
+            normalized = self._normalize_bbox_norm(raw_bbox)
+            if not normalized:
+                return
+            if any(self._bbox_norm_almost_equal(normalized, existing) for existing in candidates):
+                return
+            candidates.append(normalized)
+
+        source_bboxes: List[Dict[str, float]] = []
+        coarse_normalized = self._normalize_bbox_norm(coarse_bbox_norm)
+        seed_normalized = self._normalize_bbox_norm(seed_bbox_norm)
+        if coarse_normalized:
+            source_bboxes.append(coarse_normalized)
+        if seed_normalized and not any(self._bbox_norm_almost_equal(seed_normalized, existing) for existing in source_bboxes):
+            source_bboxes.append(seed_normalized)
+        if not source_bboxes:
+            return candidates[:5]
+
+        prefer_without_caption = bool(visual_spec.get("prefer_without_caption"))
+        allow_caption_if_needed = bool(visual_spec.get("allow_caption_if_needed"))
+        require_full_boundary = bool(visual_spec.get("require_full_boundary"))
+
+        trim_pairs: List[Tuple[float, float]] = [
+            (0.0, 0.05),
+            (0.02, 0.10),
+            (0.03, 0.16),
+        ]
+        if prefer_without_caption or not allow_caption_if_needed:
+            trim_pairs = [
+                (0.0, 0.08),
+                (0.02, 0.14),
+                (0.04, 0.22),
+            ]
+        if require_full_boundary:
+            trim_pairs = [
+                (0.0, 0.04),
+                (0.02, 0.08),
+                (0.03, 0.12),
+            ]
+
+        for base_bbox in source_bboxes:
+            _append_candidate(base_bbox)
+            for top_trim, bottom_trim in trim_pairs:
+                tightened = self._tighten_bbox_norm_vertical(
+                    base_bbox,
+                    top_trim=top_trim,
+                    bottom_trim=bottom_trim,
+                )
+                if tightened:
+                    _append_candidate(tightened)
+                if len(candidates) >= 5:
+                    return candidates[:5]
+
+        return candidates[:5]
+
+    def _derive_ai_reconstructed_figure_seed_bbox_norm(
+        self,
+        *,
+        visual_spec: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, float]:
+        seed_bbox = self._normalize_bbox_norm(dict(visual_spec or {}).get("seed_bbox_norm"))
+        if seed_bbox:
+            return seed_bbox
+        coarse_bbox = self._derive_layout_uid_coarse_visual_bbox_norm(
+            grounding=grounding,
+            payload=payload,
+        )
+        if coarse_bbox:
+            return coarse_bbox
+        layout_atoms = [
+            dict(row)
+            for row in list((grounding or {}).get("layout_atoms") or [])
+            if isinstance(row, Mapping)
+        ]
+        max_x = 0.0
+        max_y = 0.0
+        visual_candidates: List[Tuple[float, Dict[str, float]]] = []
+        for atom in layout_atoms:
+            bbox = self._bbox_from_docmind_pos(atom.get("layout_pos"))
+            if bbox is None:
+                continue
+            x0, y0, x1, y1 = bbox
+            max_x = max(max_x, x1)
+            max_y = max(max_y, y1)
+            node_kind = str(atom.get("node_kind") or "").strip().lower()
+            layout_type = str(atom.get("layout_type") or "").strip().lower()
+            if node_kind not in {"figure", "table"} and layout_type not in {"figure", "table", "image"}:
+                continue
+            area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+            if area <= 0.0:
+                continue
+            visual_candidates.append(
+                (
+                    area,
+                    {
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                    },
+                )
+            )
+        if visual_candidates and max_x > 0 and max_y > 0:
+            visual_candidates.sort(key=lambda item: item[0], reverse=True)
+            candidate = visual_candidates[0][1]
+            normalized = self._normalize_bbox_norm(
+                {
+                    "x0": float(candidate["x0"]) / max_x,
+                    "y0": float(candidate["y0"]) / max_y,
+                    "x1": float(candidate["x1"]) / max_x,
+                    "y1": float(candidate["y1"]) / max_y,
+                }
+            )
+            if normalized:
+                return normalized
+        return {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}
+
+    def _resolve_ai_reconstructed_figure_crop_bbox_norm(
+        self,
+        *,
+        raw_component: Mapping[str, Any],
+        grounding: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> Tuple[Optional[Dict[str, float]], str, Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        visual_spec = dict(raw_component.get("visual_spec") or {})
+        component_bbox_norm = self._normalize_bbox_norm(raw_component.get("bbox_norm") or raw_component.get("bbox"))
+        visual_seed_bbox_norm = self._normalize_bbox_norm(
+            visual_spec.get("seed_bbox_norm")
+            or visual_spec.get("bbox_norm")
+            or visual_spec.get("bbox")
+        )
+        coarse_bbox_norm = self._derive_layout_uid_coarse_visual_bbox_norm(
+            grounding=grounding,
+            payload=payload,
+        )
+        if component_bbox_norm:
+            return (
+                self._expand_ai_reconstructed_figure_crop_bbox_norm(component_bbox_norm) or component_bbox_norm,
+                "component_bbox_norm",
+                visual_seed_bbox_norm,
+                coarse_bbox_norm,
+            )
+        if visual_seed_bbox_norm:
+            return (
+                self._expand_ai_reconstructed_figure_crop_bbox_norm(visual_seed_bbox_norm) or visual_seed_bbox_norm,
+                "visual_spec_seed_bbox_norm",
+                visual_seed_bbox_norm,
+                coarse_bbox_norm,
+            )
+        if coarse_bbox_norm:
+            return (
+                self._expand_ai_reconstructed_figure_crop_bbox_norm(coarse_bbox_norm) or coarse_bbox_norm,
+                "docmind_coarse_bbox_norm",
+                visual_seed_bbox_norm,
+                coarse_bbox_norm,
+            )
+        return None, "missing_bbox_norm", visual_seed_bbox_norm, coarse_bbox_norm
+
+    def _write_clipped_page_image_norm(
+        self,
+        *,
+        out_dir: str,
+        asset_id: str,
+        page_image_path: str,
+        bbox_norm: Mapping[str, Any],
+    ) -> Optional[str]:
+        if not page_image_path or not os.path.exists(page_image_path):
+            return None
+        normalized_bbox = self._normalize_bbox_norm(bbox_norm)
+        if not normalized_bbox:
+            return None
+        try:
+            with Image.open(page_image_path) as opened:
+                page_image = opened.convert("RGB")
+                width, height = page_image.size
+                left = max(0, min(width - 1, int(round(float(normalized_bbox["x0"]) * width))))
+                top = max(0, min(height - 1, int(round(float(normalized_bbox["y0"]) * height))))
+                right = max(left + 1, min(width, int(round(float(normalized_bbox["x1"]) * width))))
+                bottom = max(top + 1, min(height, int(round(float(normalized_bbox["y1"]) * height))))
+                if right <= left + 6 or bottom <= top + 6:
+                    return None
+                cropped = page_image.crop((left, top, right, bottom))
+                if cropped.size[0] <= 6 or cropped.size[1] <= 6:
+                    return None
+                os.makedirs(out_dir, exist_ok=True)
+                target = os.path.join(out_dir, f"{asset_id}.jpg")
+                cropped.save(target, format="JPEG", quality=92, optimize=True)
+                return target
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ai_reconstructed_figure_verifier_system_prompt() -> str:
+        return (
+            "You validate whether a candidate figure crop from a PDF page is good enough for the /read reader. "
+            "Image 1 is the full page. Image 2 is the candidate crop. "
+            "Judge whether the crop captures the intended figure well enough for reading. "
+            "Follow the supplied visual_spec strictly, especially must_include, must_exclude, region_description, and require_full_boundary. "
+            "Prefer the tightest crop that still preserves the figure body, and fail crops that include too much caption, page margin, or neighbor prose. "
+            "Fail crops that look like misclassified table-like OCR or obvious non-figure table artifacts, crops that are blurry or unreadable, crops missing the main figure body or full boundary, "
+            "or crops dominated by surrounding prose/caption/page-margin noise. "
+            "When a crop fails, classify the issue explicitly with one or more canonical tags: misclassified_table, blurry_or_low_quality, incomplete_boundary, too_much_caption_or_prose_noise, needs_recrop. "
+            "Use needs_recrop whenever the crop should be tightened, expanded, or moved rather than accepted as-is. "
+            "If the figure body is still partly useful but the crop needs refinement, say so in the reason and keep the crop tight. "
+            "If a partial reconstruction is possible, describe that the figure body can be kept while the crop is recropped or the caption/prose is trimmed. "
+            "If the caption is not explicitly required by visual_spec, treat it as excluded content. "
+            "If the crop is not acceptable, suggest a refined_bbox_norm on the full-page image. "
+            "Return JSON only: "
+            "{\"status\":\"done\",\"step_result\":{\"pass\":true,\"confidence\":0.91,"
+            "\"reason\":\"...\",\"issues\":[\"...\"],"
+            "\"failure_category\":\"...\",\"needs_recrop\":false,"
+            "\"suggested_action\":\"accept\",\"refined_bbox_norm\":{\"x0\":0.1,\"y0\":0.2,\"x1\":0.9,\"y1\":0.8}}}"
+        )
+
+    @staticmethod
+    def _canonicalize_ai_reconstructed_figure_issue(text: str) -> Optional[str]:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not normalized:
+            return None
+        patterns = [
+            ("misclassified_table", (
+                "misclassified table",
+                "table-like",
+                "table like",
+                "table artifact",
+                "table-artifact",
+                "non-figure table",
+                "tabular artifact",
+                "spreadsheet",
+                "rows and columns",
+                "grid artifact",
+            )),
+            ("blurry_or_low_quality", (
+                "blurry",
+                "low quality",
+                "low-quality",
+                "unreadable",
+                "illegible",
+                "pixelated",
+                "washed out",
+                "fuzzy",
+                "out of focus",
+            )),
+            ("incomplete_boundary", (
+                "incomplete boundary",
+                "missing main figure",
+                "missing figure",
+                "cut off",
+                "cropped off",
+                "truncated",
+                "partial boundary",
+                "clipped",
+                "not fully captured",
+            )),
+            ("too_much_caption_or_prose_noise", (
+                "caption noise",
+                "prose noise",
+                "too much caption",
+                "too much prose",
+                "surrounding prose",
+                "neighbor prose",
+                "page margin",
+                "page-margin",
+                "header noise",
+                "footer noise",
+                "too much noise",
+            )),
+            ("needs_recrop", (
+                "needs recrop",
+                "need recrop",
+                "recrop",
+                "re-crop",
+                "refined bbox",
+                "tighten crop",
+                "tighten the crop",
+                "expand crop",
+                "adjust crop",
+                "crop again",
+            )),
+        ]
+        for category, terms in patterns:
+            if any(term in normalized for term in terms):
+                return category
+        return None
+
+    def _normalize_ai_reconstructed_figure_verifier_result(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        step_result = dict(payload.get("step_result") or payload or {})
+        confidence = 0.0
+        try:
+            confidence = max(0.0, min(1.0, float(step_result.get("confidence") or 0.0)))
+        except Exception:
+            confidence = 0.0
+        refined_bbox_norm = self._normalize_bbox_norm(step_result.get("refined_bbox_norm"))
+        raw_reason = self._normalize_spaces(str(step_result.get("reason") or ""))
+        raw_issues = [
+            self._normalize_spaces(str(item or ""))
+            for item in list(step_result.get("issues") or [])[:12]
+            if self._normalize_spaces(str(item or ""))
+        ]
+        canonical_issues: List[str] = []
+        seen: set[str] = set()
+        for candidate in [raw_reason, *raw_issues]:
+            canonical = self._canonicalize_ai_reconstructed_figure_issue(candidate)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            canonical_issues.append(canonical)
+        failure_category = self._normalize_spaces(str(step_result.get("failure_category") or "")).lower()
+        if not failure_category and canonical_issues:
+            failure_category = canonical_issues[0]
+        if failure_category and failure_category not in canonical_issues:
+            canonical_issues.insert(0, failure_category)
+        needs_recrop = bool(step_result.get("needs_recrop"))
+        if not bool(step_result.get("pass")) and (refined_bbox_norm or canonical_issues):
+            needs_recrop = True
+        suggested_action = self._normalize_spaces(str(step_result.get("suggested_action") or "")).lower()
+        if not suggested_action:
+            suggested_action = "accept" if bool(step_result.get("pass")) else ("recrop" if needs_recrop else "fallback_page")
+        return {
+            "pass": bool(step_result.get("pass")),
+            "confidence": confidence,
+            "reason": raw_reason,
+            "issues": canonical_issues,
+            "failure_category": failure_category,
+            "needs_recrop": needs_recrop,
+            "suggested_action": suggested_action,
+            "refined_bbox_norm": refined_bbox_norm,
+        }
+
+    @staticmethod
+    def _format_ai_reconstructed_figure_fallback_reason(verification: Mapping[str, Any]) -> str:
+        failure_category = str(verification.get("failure_category") or "").strip().lower()
+        issues = [
+            str(item).strip().lower()
+            for item in list(verification.get("issues") or [])
+            if str(item).strip()
+        ]
+        if not failure_category and issues:
+            failure_category = issues[0]
+        if failure_category:
+            if failure_category in {"misclassified_table", "blurry_or_low_quality", "incomplete_boundary", "too_much_caption_or_prose_noise"}:
+                return f"figure_crop_unverified:{failure_category}:need_recrop"
+            if failure_category == "needs_recrop":
+                return "figure_crop_unverified:need_recrop"
+            if failure_category == "vl_verifier_failed":
+                return "figure_crop_unverified:vl_verifier_failed"
+        if issues:
+            return f"figure_crop_unverified:{issues[0]}"
+        if bool(verification.get("needs_recrop")):
+            return "figure_crop_unverified:need_recrop"
+        return "figure_crop_unverified:unknown"
+
+    async def _verify_ai_reconstructed_figure_crop(
+        self,
+        *,
+        page_image_path: str,
+        crop_image_path: str,
+        visual_spec: Mapping[str, Any],
+        current_bbox_norm: Mapping[str, Any],
+        caption: str,
+        source_label: str,
+        page: int,
+        round_index: int,
+    ) -> Dict[str, Any]:
+        api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
+        base_url = str(getattr(settings, "aliyun_dashscope_api_base", "") or getattr(settings, "aliyun_base_url", "") or "").strip()
+        model_name = str(getattr(settings, "reader_mm_primary_model", "qwen3-vl-flash") or "qwen3-vl-flash").strip()
+        if not api_key or not base_url or not model_name:
+            return {
+                "pass": False,
+                "confidence": 0.0,
+                "reason": "vl_verifier_unavailable",
+                "issues": ["vl_verifier_unavailable"],
+                "refined_bbox_norm": None,
+            }
+        if not page_image_path or not crop_image_path:
+            return {
+                "pass": False,
+                "confidence": 0.0,
+                "reason": "missing_figure_crop_inputs",
+                "issues": ["missing_figure_crop_inputs"],
+                "refined_bbox_norm": None,
+            }
+        try:
+            result = await asyncio.wait_for(
+                DashScopeMultimodalService.chat_json(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model_name,
+                    system_prompt=self._ai_reconstructed_figure_verifier_system_prompt(),
+                    user_prompt=json.dumps(
+                        {
+                            "page": int(page),
+                            "round_index": int(round_index),
+                            "caption": self._normalize_spaces(caption),
+                            "source_label": self._normalize_spaces(source_label),
+                            "current_bbox_norm": dict(current_bbox_norm or {}),
+                            "visual_spec": dict(visual_spec or {}),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    image_paths=[str(page_image_path), str(crop_image_path)],
+                    max_tokens=max(800, min(2200, int(getattr(settings, "reader_mm_max_tokens", 2200) or 2200))),
+                    temperature=0.0,
+                ),
+                timeout=max(8.0, float(int(getattr(settings, "reader_mm_timeout_ms", 90000) or 90000)) / 1000.0 + 1.0),
+            )
+        except Exception as exc:  # pragma: no cover - provider/network failures expected at runtime
+            logger.warning(
+                "[ReaderComposeService] ai_reconstructed figure verification failed "
+                f"page={page} round={round_index} model={model_name}: {type(exc).__name__}: {exc}"
+            )
+            return {
+                "pass": False,
+                "confidence": 0.0,
+                "reason": f"vl_verifier_failed:{type(exc).__name__}",
+                "issues": [self._normalize_spaces(str(exc))] if str(exc).strip() else ["vl_verifier_failed"],
+                "failure_category": "vl_verifier_failed",
+                "needs_recrop": False,
+                "suggested_action": "fallback_page",
+                "refined_bbox_norm": None,
+            }
+        normalized = self._normalize_ai_reconstructed_figure_verifier_result(
+            dict(result.get("parsed") or {})
+        )
+        normalized["usage"] = dict(result.get("usage") or {})
+        normalized["model"] = str(result.get("model") or model_name)
+        return normalized
+
+    async def _build_ai_reconstructed_figure_asset_map(
+        self,
+        *,
+        paper_id: int,
+        page: int,
+        reconstruction_plan: Mapping[str, Any],
+        page_image_url: str,
+        page_image_path: str,
+        grounding: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        progress_callback: Optional[ReaderComposeProgressCallback] = None,
+    ) -> Dict[int, Dict[str, Any]]:
+        figure_components = [
+            (idx, dict(component))
+            for idx, component in enumerate(list(reconstruction_plan.get("components") or [])[:20], start=1)
+            if isinstance(component, Mapping) and str(component.get("kind") or "").strip().lower() == "figure"
+        ]
+        if not figure_components:
+            return {}
+        selected_page_image = self._select_ai_reconstructed_figure_crop_source_asset(
+            rendered_page_image_url=page_image_url,
+            rendered_page_image_path=page_image_path,
+            grounding=grounding,
+        )
+        crop_page_image_path = str(selected_page_image.get("path") or page_image_path or "").strip()
+        crop_page_image_source = str(selected_page_image.get("source") or "page_render_asset").strip() or "page_render_asset"
+        if not crop_page_image_path or not os.path.exists(crop_page_image_path):
+            return {
+                int(idx): {
+                    "image_url": str(page_image_url or "").strip(),
+                    "status": "fallback_page",
+                    "verification": {
+                        "mode": "direct_ai_crop",
+                        "pass": False,
+                        "confidence": 0.0,
+                        "reason": "missing_page_image_path",
+                        "issues": ["missing_page_image_path"],
+                        "failure_category": "missing_page_image_path",
+                        "needs_recrop": False,
+                        "suggested_action": "fallback_page",
+                        "selected_bbox_norm": None,
+                        "bbox_source": "missing_page_image_path",
+                        "page_image_source": crop_page_image_source,
+                        "crop_source": crop_page_image_source,
+                    },
+                }
+                for idx, _ in figure_components
+            }
+
+        await self._emit_progress_event(
+            progress_callback,
+            event="stage",
+            data={
+                "stage": "figure_crop",
+                "status": "started",
+                "message": "正在生成图像粗裁图",
+                "page": int(page),
+                "group_count": len(figure_components),
+            },
+        )
+
+        out_dir = self._reader_figure_asset_out_dir(paper_id=int(paper_id), page=int(page))
+        os.makedirs(out_dir, exist_ok=True)
+        figure_assets: Dict[int, Dict[str, Any]] = {}
+        for idx, raw_component in figure_components:
+            caption = self._normalize_spaces(str(raw_component.get("caption") or ""))
+            source_label = self._normalize_spaces(str(raw_component.get("source_label") or ""))
+            visual_spec = dict(raw_component.get("visual_spec") or {}) if isinstance(raw_component.get("visual_spec"), Mapping) else {}
+            selected_bbox_norm, bbox_source, seed_bbox_norm, coarse_bbox_norm = self._resolve_ai_reconstructed_figure_crop_bbox_norm(
+                raw_component=raw_component,
+                grounding=grounding,
+                payload=payload,
+            )
+            signature_payload = {
+                "page": int(page),
+                "idx": int(idx),
+                "caption": caption,
+                "source_label": source_label,
+                "visual_spec": visual_spec,
+                "bbox_source": bbox_source,
+                "selected_bbox_norm": selected_bbox_norm,
+            }
+            signature = hashlib.sha256(
+                json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            final_entry: Dict[str, Any] = {
+                "image_url": str(page_image_url or "").strip(),
+                "status": "fallback_page",
+                "crop_bbox_source": bbox_source,
+                "page_image_source": crop_page_image_source,
+                "verification": {
+                    "mode": "direct_ai_crop",
+                    "pass": False,
+                    "confidence": 0.0,
+                    "reason": "missing_bbox_norm",
+                    "issues": ["missing_bbox_norm"],
+                    "failure_category": "missing_bbox_norm",
+                    "needs_recrop": False,
+                    "suggested_action": "fallback_page",
+                    "selected_bbox_norm": None,
+                    "bbox_source": bbox_source,
+                    "page_image_source": crop_page_image_source,
+                    "crop_source": crop_page_image_source,
+                    "seed_bbox_norm": seed_bbox_norm,
+                    "coarse_bbox_norm": coarse_bbox_norm,
+                    "visual_spec": visual_spec,
+                },
+            }
+            if selected_bbox_norm:
+                asset_id = self._ai_reconstructed_figure_asset_id(
+                    page=int(page),
+                    idx=int(idx),
+                    signature=signature,
+                    round_index=1,
+                )
+                existing_path = self._find_existing_figure_asset_path(out_dir=out_dir, asset_id=asset_id)
+                candidate_path = existing_path or self._write_clipped_page_image_norm(
+                    out_dir=out_dir,
+                    asset_id=asset_id,
+                    page_image_path=crop_page_image_path,
+                    bbox_norm=selected_bbox_norm,
+                )
+                if candidate_path:
+                    final_entry = {
+                        "image_url": f"/api/v1/literature/reader/figure-assets/{int(paper_id)}/{int(page)}/{asset_id}",
+                        "asset_id": asset_id,
+                        "status": "direct_ai_crop",
+                        "bbox_norm": dict(selected_bbox_norm),
+                        "crop_bbox_source": bbox_source,
+                        "page_image_source": crop_page_image_source,
+                        "verification": {
+                            "mode": "direct_ai_crop",
+                            "pass": True,
+                            "confidence": 1.0,
+                            "reason": "direct_ai_crop",
+                            "issues": [],
+                            "failure_category": "",
+                            "needs_recrop": False,
+                            "suggested_action": "accept",
+                            "selected_bbox_norm": dict(selected_bbox_norm),
+                            "bbox_source": bbox_source,
+                            "page_image_source": crop_page_image_source,
+                            "crop_source": crop_page_image_source,
+                            "seed_bbox_norm": seed_bbox_norm,
+                            "coarse_bbox_norm": coarse_bbox_norm,
+                            "visual_spec": visual_spec,
+                        },
+                    }
+                else:
+                    final_entry["verification"] = {
+                        "mode": "direct_ai_crop",
+                        "pass": False,
+                        "confidence": 0.0,
+                        "reason": "crop_write_failed",
+                        "issues": ["crop_write_failed"],
+                        "failure_category": "crop_write_failed",
+                        "needs_recrop": False,
+                        "suggested_action": "fallback_page",
+                        "selected_bbox_norm": dict(selected_bbox_norm),
+                        "bbox_source": bbox_source,
+                        "page_image_source": crop_page_image_source,
+                        "crop_source": crop_page_image_source,
+                        "seed_bbox_norm": seed_bbox_norm,
+                        "coarse_bbox_norm": coarse_bbox_norm,
+                        "visual_spec": visual_spec,
+                    }
+            figure_assets[int(idx)] = final_entry
+
+        await self._emit_progress_event(
+            progress_callback,
+            event="stage",
+            data={
+                "stage": "figure_crop",
+                "status": "done",
+                "message": "图像粗裁图完成",
+                "page": int(page),
+                "group_count": len(figure_components),
+            },
+        )
+        return figure_assets
 
     async def _build_layout_uid_pipeline_result(
         self,
@@ -4758,6 +7145,8 @@ class LiteratureReaderComposeService:
         page_image = dict(grounding.get("page_image") or {})
         rendered_page_image = str(page_image_asset.get("url") or page_image.get("url") or "").strip()
         rendered_page_image_path = str(page_image_asset.get("path") or page_image.get("path") or "").strip()
+        figure_page_image_url = rendered_page_image
+        figure_page_image_path = rendered_page_image_path
         text_normalization_map: Dict[str, Dict[str, Any]] = {}
         model_name = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip() or "qwen-3.5-plus"
         text_normalization_validation: Dict[str, Any] = {
@@ -4789,6 +7178,21 @@ class LiteratureReaderComposeService:
             "components": [],
             "notes": [],
         }
+        page_decision: Dict[str, Any] = {
+            "mode": "grounded",
+            "reason": "",
+            "confidence": 0.0,
+        }
+        reconstructed_components: List[Dict[str, Any]] = []
+        reconstructed_validation: Dict[str, Any] = {
+            "enabled": False,
+            "passed": True,
+            "errors": [],
+        }
+        combined_prompt_payload: Dict[str, Any] = {}
+        reconstruction_retry_result: Dict[str, Any] = {}
+        reconstruction_retry_reason = ""
+        reconstruction_retry_used = False
         if rendered_page_image or rendered_page_image_path:
             combined_prompt_payload = self._build_layout_uid_combined_prompt_payload(
                 paper=paper,
@@ -4827,6 +7231,13 @@ class LiteratureReaderComposeService:
                 grouping_validation = dict(combined_plan.get("grouping_validation") or {})
                 ai_reconstruction_plan = dict(combined_plan.get("reconstruction_plan") or {})
                 reconstruction_validation = dict(combined_plan.get("reconstruction_validation") or {})
+                page_decision = dict(combined_plan.get("page_decision") or page_decision)
+                reconstructed_components = [
+                    dict(row)
+                    for row in list(combined_plan.get("reconstructed_components") or [])
+                    if isinstance(row, Mapping)
+                ]
+                reconstructed_validation = dict(combined_plan.get("reconstructed_validation") or reconstructed_validation)
                 text_normalization_map = {
                     "normalization_plan": normalized_text_plan,
                     "validation": text_normalization_validation,
@@ -4851,11 +7262,60 @@ class LiteratureReaderComposeService:
                         "elapsed_ms": int(max(0.0, (time.perf_counter() - planning_started_at) * 1000.0)),
                     },
                 )
-        use_ai_reconstruction = (
-            str(ai_reconstruction_plan.get("mode") or "").strip().lower() == "ai_reconstructed"
-            and bool(reconstruction_validation.get("enabled"))
-            and bool(list(ai_reconstruction_plan.get("components") or []))
-        )
+        page_mode = self._normalize_spaces(str(page_decision.get("mode") or "")).strip().lower()
+        if page_mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+            page_mode = "grounded"
+        reconstruction_plan_for_build: Dict[str, Any] = {
+            "mode": page_mode,
+            "docmind_quality": str(ai_reconstruction_plan.get("docmind_quality") or "").strip(),
+            "reason": str(page_decision.get("reason") or ai_reconstruction_plan.get("reason") or "").strip(),
+            "confidence": self._safe_float(page_decision.get("confidence"), self._safe_float(ai_reconstruction_plan.get("confidence"), 0.0)),
+            "components": [dict(row) for row in list(reconstructed_components or []) if isinstance(row, Mapping)],
+            "notes": [str(item).strip() for item in list(ai_reconstruction_plan.get("notes") or []) if str(item).strip()],
+        }
+        has_reconstructed_components = bool(list(reconstruction_plan_for_build.get("components") or []))
+        if page_mode in {"partial_reconstructed", "fully_reconstructed"} and (
+            not bool(reconstructed_validation.get("enabled")) or not has_reconstructed_components
+        ):
+            page_mode = "grounded"
+            page_decision = {
+                "mode": "grounded",
+                "reason": str(page_decision.get("reason") or "").strip(),
+                "confidence": self._safe_float(page_decision.get("confidence"), 0.0),
+            }
+            reconstruction_plan_for_build["mode"] = "grounded"
+            reconstruction_plan_for_build["components"] = []
+        else:
+            page_decision = {
+                "mode": page_mode,
+                "reason": str(page_decision.get("reason") or "").strip(),
+                "confidence": self._safe_float(page_decision.get("confidence"), 0.0),
+            }
+        use_ai_reconstruction = page_mode == "fully_reconstructed"
+        use_partial_reconstruction = page_mode == "partial_reconstructed"
+        if (use_ai_reconstruction or use_partial_reconstruction) and (rendered_page_image or rendered_page_image_path):
+            figure_image_asset = self._select_ai_reconstructed_figure_crop_source_asset(
+                rendered_page_image_url=rendered_page_image,
+                rendered_page_image_path=rendered_page_image_path,
+                grounding=grounding,
+            )
+            figure_page_image_url = str(figure_image_asset.get("url") or rendered_page_image or "").strip()
+            figure_page_image_path = str(figure_image_asset.get("path") or rendered_page_image_path or "").strip()
+            rendered_width, rendered_height = self._resolve_grounding_page_image_size(
+                page_image_url=figure_page_image_url,
+                page_image_path=figure_page_image_path,
+            )
+            if use_ai_reconstruction:
+                grounding["page_image"] = {
+                    "url": figure_page_image_url,
+                    "path": figure_page_image_path,
+                    "width": rendered_width,
+                    "height": rendered_height,
+                    "source": str(figure_image_asset.get("source") or "page_render_asset").strip() or "page_render_asset",
+                    "origin_url": str(page_image_asset.get("origin_url") or ""),
+                    "local_cached": bool(figure_image_asset.get("local_cached") if figure_image_asset else page_image_asset.get("local_cached")),
+                }
+                payload["page_grounding_v1"] = grounding
         if not use_ai_reconstruction and not list(normalized_grouping_plan.get("groups") or []):
             normalized_grouping_plan = self._build_layout_uid_fallback_group_plan(grounding=grounding)
             grouping_validation = {
@@ -4865,6 +7325,14 @@ class LiteratureReaderComposeService:
             }
         table_refinement_map: Dict[str, Any] = {}
         equation_refinement_map: Dict[str, Any] = {}
+        ai_reconstructed_figure_asset_map: Dict[int, Dict[str, Any]] = {}
+        ai_reconstructed_evidence_meta: Dict[str, Any] = {}
+        partial_replacement_meta: Dict[str, Any] = {
+            "applied": False,
+            "figure_replaced": 0,
+            "figure_inserted": 0,
+            "table_replaced": 0,
+        }
         if not use_ai_reconstruction:
             table_groups = [
                 row for row in list(normalized_grouping_plan.get("groups") or [])
@@ -4955,11 +7423,29 @@ class LiteratureReaderComposeService:
                 "page": int(page),
             },
         )
+        if (use_ai_reconstruction or use_partial_reconstruction) and any(
+            str((row or {}).get("kind") or "").strip().lower() == "figure"
+            for row in list(reconstruction_plan_for_build.get("components") or [])
+            if isinstance(row, Mapping)
+        ):
+            ai_reconstructed_figure_asset_map = await self._build_ai_reconstructed_figure_asset_map(
+                paper_id=int(paper.id),
+                page=int(page),
+                reconstruction_plan=reconstruction_plan_for_build,
+                page_image_url=figure_page_image_url,
+                page_image_path=figure_page_image_path,
+                grounding=grounding,
+                payload=payload,
+                progress_callback=progress_callback,
+            )
         if use_ai_reconstruction:
             panel_plan = self._build_ai_reconstructed_panel_plan(
                 page=page,
-                reconstruction_plan=ai_reconstruction_plan,
-                page_image_url=rendered_page_image,
+                reconstruction_plan=reconstruction_plan_for_build,
+                page_image_url=figure_page_image_url,
+                figure_assets=ai_reconstructed_figure_asset_map,
+                source_mode="fully_reconstructed",
+                default_reconstruction_reason=str(page_decision.get("reason") or ""),
             )
             docmind_blocks, layout_to_block_ids = [], {}
         else:
@@ -4985,6 +7471,49 @@ class LiteratureReaderComposeService:
             theme_mode=theme_mode,
             detail_level=detail_level,
             compare_mode=compare_mode,
+        )
+        if use_partial_reconstruction:
+            ui_plan, partial_replacement_meta = self._apply_layout_uid_partial_reconstructed_replacements(
+                page=page,
+                ui_plan=ui_plan,
+                reconstructed_components=[
+                    dict(row)
+                    for row in list(reconstruction_plan_for_build.get("components") or [])
+                    if isinstance(row, Mapping)
+                ],
+                figure_assets=ai_reconstructed_figure_asset_map,
+                page_image_url=figure_page_image_url,
+                page_decision=page_decision,
+            )
+        if use_ai_reconstruction:
+            ui_plan, ai_reconstructed_evidence_meta = self._inject_ai_reconstructed_evidence_source_anchor_refs(
+                page=page,
+                payload=payload,
+                ui_plan=ui_plan,
+                page_image_path=figure_page_image_path,
+                page_image_url=figure_page_image_url,
+            )
+        def _normalize_component_source_modes(rows: Sequence[Dict[str, Any]], *, default_mode: str) -> List[Dict[str, Any]]:
+            output: List[Dict[str, Any]] = []
+            for raw in list(rows or []):
+                if not isinstance(raw, dict):
+                    continue
+                node = dict(raw)
+                props = dict(node.get("props") or {})
+                explicit_mode = self._normalize_spaces(str(props.get("source_mode") or "")).strip().lower()
+                if explicit_mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+                    props["source_mode"] = default_mode
+                node["props"] = props
+                node["children"] = _normalize_component_source_modes(
+                    [row for row in list(node.get("children") or []) if isinstance(row, dict)],
+                    default_mode=default_mode,
+                )
+                output.append(node)
+            return output
+
+        ui_plan["components"] = _normalize_component_source_modes(
+            [row for row in list(ui_plan.get("components") or []) if isinstance(row, dict)],
+            default_mode="fully_reconstructed" if use_ai_reconstruction else "grounded",
         )
         await self._emit_progress_event(
             progress_callback,
@@ -5017,13 +7546,21 @@ class LiteratureReaderComposeService:
             for idx, row in enumerate(omissions, start=1)
         ]
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        usage = dict(model_result.get("usage") or {})
-        status_value = str(model_result.get("status") or "done").strip().lower() or "done"
+        usage = self._merge_usage_metrics(
+            dict(model_result.get("usage") or {}),
+            dict(reconstruction_retry_result.get("usage") or {}),
+        )
+        status_value = (
+            str(reconstruction_retry_result.get("status") or "done").strip().lower()
+            if reconstruction_retry_used else
+            str(model_result.get("status") or "done").strip().lower()
+        ) or "done"
         used_fallback = bool(grouping_validation.get("fallback_used"))
         reconstruction_used = bool(use_ai_reconstruction)
         decision_log = [
             "layout_uid_v1:combined_plan_once",
             f"layout_uid_v1:reconstruction_mode={'ai_reconstructed' if reconstruction_used else 'grounded'}",
+            f"layout_uid_v1:page_mode={page_mode}",
             f"layout_uid_v1:text_normalized={len(list(((text_normalization_map.get('normalization_plan') or {}).get('items') or [])))}",
             f"layout_uid_v1:groups={len(list(normalized_grouping_plan.get('groups') or []))}",
             f"layout_uid_v1:omissions={len(omissions)}",
@@ -5035,8 +7572,35 @@ class LiteratureReaderComposeService:
             for item in list(normalized_grouping_plan.get("notes") or [])
             if str(item).strip()
         ]
-        if reconstruction_used and str(ai_reconstruction_plan.get("reason") or "").strip():
-            decision_log.append(f"layout_uid_v1:reconstruction_reason={str(ai_reconstruction_plan.get('reason') or '').strip()}")
+        if reconstruction_retry_used:
+            decision_log.append("layout_uid_v1:reconstruction_retry_used=true")
+            if reconstruction_retry_reason:
+                decision_log.append(f"layout_uid_v1:reconstruction_retry_reason={reconstruction_retry_reason}")
+        if page_mode in {"partial_reconstructed", "fully_reconstructed"} and str(page_decision.get("reason") or "").strip():
+            decision_log.append(f"layout_uid_v1:reconstruction_reason={str(page_decision.get('reason') or '').strip()}")
+        if reconstruction_used:
+            direct_ai_crop_count = sum(
+                1
+                for item in list(ai_reconstructed_figure_asset_map.values())
+                if isinstance(item, Mapping) and str(item.get("status") or "").strip() == "direct_ai_crop"
+            )
+            fallback_crop_count = sum(
+                1
+                for item in list(ai_reconstructed_figure_asset_map.values())
+                if isinstance(item, Mapping) and str(item.get("status") or "").strip() != "direct_ai_crop"
+            )
+            decision_log.append(f"layout_uid_v1:ai_reconstructed_figures_direct_crop={direct_ai_crop_count}")
+            decision_log.append(f"layout_uid_v1:ai_reconstructed_figures_fallback={fallback_crop_count}")
+            decision_log.append(
+                f"layout_uid_v1:ai_reconstructed_evidence_anchors={int((ai_reconstructed_evidence_meta or {}).get('anchor_count') or 0)}"
+            )
+        if page_mode == "partial_reconstructed":
+            decision_log.append(
+                "layout_uid_v1:partial_replacement="
+                f"figure_replaced:{int(partial_replacement_meta.get('figure_replaced') or 0)},"
+                f"figure_inserted:{int(partial_replacement_meta.get('figure_inserted') or 0)},"
+                f"table_replaced:{int(partial_replacement_meta.get('table_replaced') or 0)}"
+            )
         validation_errors = [str(item).strip() for item in list(grouping_validation.get("errors") or []) if str(item).strip()]
         if reconstruction_used:
             validation_errors = []
@@ -5058,17 +7622,41 @@ class LiteratureReaderComposeService:
             "template": f"/literature/{int(paper.id)}/read/review",
             "mode": "compose_review_v1",
         }
+        payload["page_mode"] = page_mode
+        payload["grounding_mode"] = "ai_reconstructed" if reconstruction_used else "grounded"
+        payload["reconstruction_mode"] = "ai_reconstructed" if reconstruction_used else "grounded"
         if reconstruction_used:
-            payload["grounding_mode"] = "ai_reconstructed"
-            payload["evidence_enabled"] = False
-            payload["runtime_build_plan_evidence"] = False
+            ai_reconstructed_evidence_enabled = bool(int((ai_reconstructed_evidence_meta or {}).get("anchor_count") or 0))
+            ai_reconstructed_evidence_mode = "bbox_anchor_v1" if ai_reconstructed_evidence_enabled else "bbox_anchor_v1_pending"
+            payload["legacy_grounding_mode"] = "ai_reconstructed"
+            payload["legacy_reconstruction_mode"] = "ai_reconstructed"
+            payload["evidence_enabled"] = ai_reconstructed_evidence_enabled
+            payload["runtime_build_plan_evidence"] = ai_reconstructed_evidence_enabled
+            payload["ai_reconstructed_evidence_enabled"] = ai_reconstructed_evidence_enabled
             payload["page_grounding_policy"] = {
                 "mode": "ai_reconstructed",
-                "evidence_enabled": False,
+                "page_mode": page_mode,
+                "legacy_mode": "ai_reconstructed",
+                "reconstruction_mode": "ai_reconstructed",
+                "legacy_reconstruction_mode": "ai_reconstructed",
+                "evidence_enabled": ai_reconstructed_evidence_enabled,
+                "runtime_build_plan_evidence": ai_reconstructed_evidence_enabled,
+                "ai_reconstructed_evidence_enabled": ai_reconstructed_evidence_enabled,
+                "ai_reconstructed_evidence_mode": ai_reconstructed_evidence_mode,
                 "reason": str(ai_reconstruction_plan.get("reason") or "").strip(),
                 "docmind_quality": str(ai_reconstruction_plan.get("docmind_quality") or "").strip(),
                 "confidence": float(ai_reconstruction_plan.get("confidence") or 0.0),
+                "evidence_image_source": "page_render_asset",
+                "evidence_image_url": rendered_page_image,
             }
+        else:
+            page_grounding_policy = dict(payload.get("page_grounding_policy") or {})
+            legacy_mode = self._normalize_spaces(str(page_grounding_policy.get("mode") or "")).strip()
+            if legacy_mode and legacy_mode != "grounded":
+                page_grounding_policy["legacy_mode"] = legacy_mode
+            page_grounding_policy["mode"] = "grounded"
+            page_grounding_policy["page_mode"] = page_mode
+            payload["page_grounding_policy"] = page_grounding_policy
         payload["qwen_plan_meta"] = {
             "used": True,
             "reason": "layout_uid_v1",
@@ -5078,7 +7666,14 @@ class LiteratureReaderComposeService:
             "total_tokens": int(usage.get("total_tokens") or 0),
             "pipeline_version": resolved_pipeline_version,
             "fallback_used": used_fallback,
-            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
+            "planning_mode": (
+                "combined_plus_reconstruction_retry_ai_reconstructed"
+                if reconstruction_retry_used and reconstruction_used else
+                ("combined_once_ai_reconstructed" if reconstruction_used else "combined_once")
+            ),
+            "page_mode": page_mode,
+            "reconstruction_retry_used": reconstruction_retry_used,
+            "reconstruction_retry_reason": reconstruction_retry_reason,
         }
         payload["layout_advice_v3"] = {
             "source": "layout_uid_ai_reconstructed" if reconstruction_used else "layout_uid_v1",
@@ -5086,13 +7681,28 @@ class LiteratureReaderComposeService:
             "suggested_components": component_hints,
             "grouping_hints": list(normalized_grouping_plan.get("groups") or []),
             "text_normalizations": text_normalization_map,
-            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
+            "planning_mode": (
+                "combined_plus_reconstruction_retry_ai_reconstructed"
+                if reconstruction_retry_used and reconstruction_used else
+                ("combined_once_ai_reconstructed" if reconstruction_used else "combined_once")
+            ),
             "figure_refinements": figure_refinement_map,
             "table_refinements": table_refinement_map,
             "visual_hints": [],
+            "ai_reconstructed_figure_assets": dict(ai_reconstructed_figure_asset_map),
+            "ai_reconstructed_evidence_anchors": dict(ai_reconstructed_evidence_meta),
+            "ai_reconstructed_evidence_enabled": bool((ai_reconstructed_evidence_meta or {}).get("anchor_count")),
+            "ai_reconstructed_evidence_mode": "bbox_anchor_v1" if reconstruction_used else "",
+            "grounding_warning": dict((combined_prompt_payload.get("page_quality") or {}).get("grounding_warning") or {}),
+            "reconstruction_retry_used": reconstruction_retry_used,
+            "reconstruction_retry_reason": reconstruction_retry_reason,
             "notes": list(decision_log),
             "omitted_layout_ids": [str(row.get("layout_id") or "").strip() for row in omissions],
+            "page_decision": dict(page_decision),
+            "reconstructed_components": [dict(row) for row in list(reconstruction_plan_for_build.get("components") or []) if isinstance(row, Mapping)],
+            "reconstructed_validation": dict(reconstructed_validation),
             "reconstruction": dict(ai_reconstruction_plan),
+            "page_mode": page_mode,
         }
         payload["minimal_gate_report"] = {
             "passed": not validation_errors,
@@ -5103,7 +7713,7 @@ class LiteratureReaderComposeService:
             "full_coverage": not any(item.startswith("missing_layout_id:") for item in validation_errors),
             "non_empty_plan_for_non_empty_input": bool((ui_plan.get("components") or [])),
             "source_text_immutable": True,
-            "used_atom_count": len(used_layout_ids),
+            "used_atom_count": len(list(ai_reconstruction_plan.get("components") or [])) if reconstruction_used else len(used_layout_ids),
             "usable_atom_count": len(layout_atoms),
         }
         payload["pipeline_contract_meta"] = {
@@ -5116,7 +7726,23 @@ class LiteratureReaderComposeService:
             "grouping_validation": dict(grouping_validation),
             "reconstruction_validation": dict(reconstruction_validation),
             "reconstruction_plan": dict(ai_reconstruction_plan),
-            "planning_mode": "combined_once_ai_reconstructed" if reconstruction_used else "combined_once",
+            "page_decision": dict(page_decision),
+            "reconstructed_components": [dict(row) for row in list(reconstruction_plan_for_build.get("components") or []) if isinstance(row, Mapping)],
+            "reconstructed_validation": dict(reconstructed_validation),
+            "ai_reconstructed_figure_assets": dict(ai_reconstructed_figure_asset_map),
+            "ai_reconstructed_evidence_anchors": dict(ai_reconstructed_evidence_meta),
+            "ai_reconstructed_evidence_enabled": bool((ai_reconstructed_evidence_meta or {}).get("anchor_count")),
+            "ai_reconstructed_evidence_mode": "bbox_anchor_v1" if reconstruction_used else "",
+            "planning_mode": (
+                "combined_plus_reconstruction_retry_ai_reconstructed"
+                if reconstruction_retry_used and reconstruction_used else
+                ("combined_once_ai_reconstructed" if reconstruction_used else "combined_once")
+            ),
+            "grounding_warning": dict((combined_prompt_payload.get("page_quality") or {}).get("grounding_warning") or {}),
+            "reconstruction_retry_used": reconstruction_retry_used,
+            "reconstruction_retry_reason": reconstruction_retry_reason,
+            "reconstruction_retry_usage": dict(reconstruction_retry_result.get("usage") or {}),
+            "page_mode": page_mode,
         }
         quality_overall = 0.95 if not used_fallback and status_value == "done" else 0.76
         if reconstruction_used:
@@ -5144,8 +7770,14 @@ class LiteratureReaderComposeService:
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
-            "grounded_evidence_enabled": not reconstruction_used,
+            "grounded_evidence_enabled": bool(ai_reconstructed_evidence_meta.get("anchor_count")) if reconstruction_used else True,
         }
+        if reconstruction_used:
+            anchor_count = int(ai_reconstructed_evidence_meta.get("anchor_count") or 0)
+            quality_report["anchors_valid"] = bool(anchor_count)
+            quality_report["anchor_gate_passed"] = bool(anchor_count)
+            quality_report["anchor_coverage_ratio"] = 1.0 if anchor_count else 0.0
+            quality_report["evidence_image_ready"] = 1.0 if rendered_page_image else 0.0
         loop_result = {
             "ui_plan": ui_plan,
             "quality_report": quality_report,
@@ -5682,7 +8314,7 @@ class LiteratureReaderComposeService:
             kind = str(item.get("kind") or "").strip().lower()
             href = str(item.get("href") or "").strip()
             meta = dict(item.get("meta") or {})
-            aid = str(meta.get("asset_id") or meta.get("layout_unique_id") or "").strip()
+            aid = str(meta.get("layout_unique_id") or meta.get("layout_id") or meta.get("asset_id") or "").strip()
             return f"{kind}|{aid}|{href}"
 
         dedup: Dict[str, Dict[str, Any]] = {}
@@ -5748,7 +8380,10 @@ class LiteratureReaderComposeService:
                     continue
                 if str(layout.get("subType") or "").strip().lower() in {"icon", "logo"}:
                     continue
-                existing_path = self._find_existing_figure_asset_path(out_dir=out_dir, asset_id=layout_uid)
+                asset_id = self._grounded_figure_asset_id(layout_uid=layout_uid)
+                if not asset_id:
+                    continue
+                existing_path = self._find_existing_figure_asset_path(out_dir=out_dir, asset_id=asset_id)
                 method = "cached"
                 target_path = existing_path
 
@@ -5765,6 +8400,18 @@ class LiteratureReaderComposeService:
                         page_images=page_images,
                         bbox_pdf=bbox_pdf,
                     )
+                    if not target_path and bbox_pdf is not None:
+                        if rendered_page is None:
+                            rendered_page = page_obj.to_image(resolution=220).original
+                        target_path = self._write_clipped_page_image(
+                            out_dir=out_dir,
+                            asset_id=asset_id,
+                            page_image=rendered_page,
+                            bbox_pdf=bbox_pdf,
+                            pdf_width=pdf_width,
+                            pdf_height=pdf_height,
+                        )
+                        method = "clip" if target_path else method
                     prefer_region_render = len(candidate_images) >= 2
                     if not target_path and not prefer_region_render:
                         native_image = self._select_native_pdf_image(
@@ -5776,26 +8423,14 @@ class LiteratureReaderComposeService:
                         if native_image is not None:
                             target_path = self._write_native_pdf_image(
                                 out_dir=out_dir,
-                                asset_id=layout_uid,
+                                asset_id=asset_id,
                                 image_obj=native_image,
                             )
                             method = "native" if target_path else method
-                    if not target_path and bbox_pdf is not None:
-                        if rendered_page is None:
-                            rendered_page = page_obj.to_image(resolution=220).original
-                        target_path = self._write_clipped_page_image(
-                            out_dir=out_dir,
-                            asset_id=layout_uid,
-                            page_image=rendered_page,
-                            bbox_pdf=bbox_pdf,
-                            pdf_width=pdf_width,
-                            pdf_height=pdf_height,
-                        )
-                        method = "clip" if target_path else method
 
                 if not target_path:
                     continue
-                href = f"/api/v1/literature/reader/figure-assets/{int(paper_id)}/{int(page)}/{layout_uid}"
+                href = f"/api/v1/literature/reader/figure-assets/{int(paper_id)}/{int(page)}/{asset_id}"
                 label = self._normalize_spaces(str(layout.get("text") or ""))[:220] or f"Figure {layout_uid[:8]}"
                 assets.append(
                     {
@@ -5804,11 +8439,12 @@ class LiteratureReaderComposeService:
                         "source": "pdf",
                         "href": href,
                         "meta": {
-                            "asset_id": layout_uid,
+                            "asset_id": asset_id,
                             "layout_unique_id": layout_uid,
                             "page": int(page),
                             "method": method,
                             "source_signature_hash": sig_hash,
+                            "asset_version": GROUNDED_FIGURE_ASSET_VERSION,
                         },
                     }
                 )
@@ -5831,20 +8467,20 @@ class LiteratureReaderComposeService:
         page_index = max(0, int(page) - 1)
         out_dir = os.path.abspath(os.path.join(PAGE_RENDER_ASSET_DIR, str(int(paper_id))))
         os.makedirs(out_dir, exist_ok=True)
-        target_path = os.path.join(out_dir, f"page_{int(page)}.jpg")
+        target_path = os.path.join(out_dir, self._page_render_asset_filename(page=int(page)))
 
         with pdfplumber.open(pdf_path) as pdf:
             if page_index >= len(pdf.pages):
                 return None
             page_obj = pdf.pages[page_index]
-            rendered = page_obj.to_image(resolution=160).original
-            rendered.save(target_path, format="JPEG", quality=86, optimize=True)
+            rendered = page_obj.to_image(resolution=220).original
+            rendered.save(target_path, format="JPEG", quality=92, optimize=True)
         return target_path if os.path.exists(target_path) else None
 
     @staticmethod
     def _find_existing_page_render_asset_path(*, paper_id: int, page: int) -> Optional[str]:
         out_dir = os.path.abspath(os.path.join(PAGE_RENDER_ASSET_DIR, str(int(paper_id))))
-        candidate = os.path.join(out_dir, f"page_{int(page)}.jpg")
+        candidate = os.path.join(out_dir, LiteratureReaderComposeService._page_render_asset_filename(page=int(page)))
         if os.path.exists(candidate):
             return candidate
         return None
@@ -5986,6 +8622,55 @@ class LiteratureReaderComposeService:
         payload: Dict[str, Any],
         layouts: Sequence[Dict[str, Any]],
     ) -> Tuple[float, float]:
+        authoritative_sizes: List[Tuple[float, float]] = []
+
+        def _collect_size(raw_width: Any, raw_height: Any) -> None:
+            width = self._safe_float(raw_width, 0.0)
+            height = self._safe_float(raw_height, 0.0)
+            if width > 0 and height > 0:
+                authoritative_sizes.append((width, height))
+
+        def _collect_anchor_sizes(anchor_refs: Any) -> None:
+            for ref in list(anchor_refs or []):
+                if not isinstance(ref, Mapping):
+                    continue
+                geometry = dict(ref.get("geometry") or {})
+                bbox_hint = dict(ref.get("bbox_hint") or {})
+                anchor_v2 = dict(ref.get("anchor_v2") or {})
+                anchor_geometry = dict(anchor_v2.get("geometry") or {})
+                anchor_bbox_hint = dict(anchor_v2.get("bbox_hint") or {})
+                _collect_size(geometry.get("page_width"), geometry.get("page_height"))
+                _collect_size(bbox_hint.get("page_width"), bbox_hint.get("page_height"))
+                _collect_size(anchor_geometry.get("page_width"), anchor_geometry.get("page_height"))
+                _collect_size(anchor_bbox_hint.get("page_width"), anchor_bbox_hint.get("page_height"))
+
+        docmind_structure = dict(payload.get("docmind_structure") or {})
+        _collect_size(docmind_structure.get("page_image_width"), docmind_structure.get("page_image_height"))
+        page_grounding = dict(payload.get("page_grounding_v1") or {})
+        page_image = dict(page_grounding.get("page_image") or {})
+        _collect_size(page_image.get("width"), page_image.get("height"))
+        _collect_size(page_grounding.get("page_image_width"), page_grounding.get("page_image_height"))
+        _collect_size(payload.get("page_image_width"), payload.get("page_image_height"))
+        _collect_size(payload.get("grounding_page_width"), payload.get("grounding_page_height"))
+
+        ui_plan = dict(payload.get("ui_plan") or {})
+        for component in self._flatten_components(list(ui_plan.get("components") or [])):
+            if not isinstance(component, Mapping):
+                continue
+            _collect_anchor_sizes(component.get("source_anchor_refs"))
+
+        for block in list(payload.get("blocks") or []):
+            if not isinstance(block, Mapping):
+                continue
+            source_anchor = dict(block.get("source_anchor") or {})
+            bbox_hint = dict(source_anchor.get("bbox_hint") or {})
+            geometry = dict(source_anchor.get("geometry") or {})
+            _collect_size(bbox_hint.get("page_width"), bbox_hint.get("page_height"))
+            _collect_size(geometry.get("page_width"), geometry.get("page_height"))
+
+        if authoritative_sizes:
+            return max(authoritative_sizes, key=lambda item: float(item[0]) * float(item[1]))
+
         for block in list(payload.get("blocks") or []):
             if not isinstance(block, dict):
                 continue
@@ -6007,12 +8692,31 @@ class LiteratureReaderComposeService:
         return (max_x, max_y) if max_x > 0 and max_y > 0 else (0.0, 0.0)
 
     @staticmethod
+    def _grounded_figure_asset_id(*, layout_uid: str) -> str:
+        token = LiteratureReaderComposeService._normalize_figure_layout_uid(str(layout_uid or ""))
+        if not token:
+            return ""
+        return LiteratureReaderComposeService._normalize_figure_layout_uid(
+            f"{token}_{GROUNDED_FIGURE_ASSET_VERSION}"
+        )
+
+    @staticmethod
     def _normalize_figure_layout_uid(raw: str) -> str:
         token = str(raw or "").strip()
         if not token:
             return ""
         token = re.sub(r"[^0-9a-zA-Z_.-]+", "_", token).strip("_.-")
         return token[:96]
+
+    @staticmethod
+    def _page_render_asset_filename(*, page: int) -> str:
+        return PAGE_RENDER_ASSET_FILENAME_TEMPLATE.format(page=int(page))
+
+    @staticmethod
+    def _ai_reconstructed_figure_asset_id(*, page: int, idx: int, signature: str, round_index: int) -> str:
+        return LiteratureReaderComposeService._normalize_figure_layout_uid(
+            f"ai_recon_p{int(page)}_f{int(idx)}_{signature}_r{int(round_index)}_{AI_RECONSTRUCTED_FIGURE_ASSET_VERSION}"
+        )
 
     @staticmethod
     def _bbox_from_docmind_pos(pos: Any) -> Optional[Tuple[float, float, float, float]]:
@@ -6835,6 +9539,8 @@ class LiteratureReaderComposeService:
         def normalize_props(component: str, raw_props: Any, source_layout_ids: Sequence[str]) -> Dict[str, Any]:
             props = dict(raw_props) if isinstance(raw_props, dict) else {}
             fb_text = fallback_text(source_layout_ids)
+            bbox_norm = props.get("bbox_norm")
+            bbox_norm = self._normalize_bbox_norm(bbox_norm) if isinstance(bbox_norm, (dict, list, tuple)) else None
             if component == "ParagraphProse":
                 paragraph_rows: List[Dict[str, Any]] = []
                 raw_paragraphs = props.get("paragraphs")
@@ -6851,6 +9557,10 @@ class LiteratureReaderComposeService:
                             if not para_text:
                                 continue
                             para_item: Dict[str, Any] = {"text": para_text}
+                            row_bbox_norm = item.get("bbox_norm")
+                            row_bbox_norm = self._normalize_bbox_norm(row_bbox_norm) if isinstance(row_bbox_norm, (dict, list, tuple)) else None
+                            if row_bbox_norm:
+                                para_item["bbox_norm"] = row_bbox_norm
                             raw_ranges = item.get("source_char_ranges")
                             if isinstance(raw_ranges, list):
                                 ranges = [
@@ -6867,28 +9577,46 @@ class LiteratureReaderComposeService:
                                     para_item["source_char_ranges"] = ranges
                             paragraph_rows.append(para_item)
                 paragraph_rows = [row for row in paragraph_rows if str(row.get("text") or "").strip()]
+                if not bbox_norm and len(paragraph_rows) == 1 and isinstance(paragraph_rows[0], Mapping):
+                    single_bbox = paragraph_rows[0].get("bbox_norm")
+                    bbox_norm = self._normalize_bbox_norm(single_bbox) if isinstance(single_bbox, (dict, list, tuple)) else None
                 if paragraph_rows:
                     merged_text = "\n\n".join(str(row.get("text") or "").strip() for row in paragraph_rows if str(row.get("text") or "").strip())
-                    return {"text": merged_text or (fb_text or "[empty]"), "paragraphs": paragraph_rows}
+                    result = {"text": merged_text or (fb_text or "[empty]"), "paragraphs": paragraph_rows}
+                    if bbox_norm:
+                        result["bbox_norm"] = bbox_norm
+                    return result
                 text = str(props.get("text") or fb_text).strip()
                 fallback_rows = fallback_paragraph_rows(source_layout_ids, text)
                 if fallback_rows:
                     merged_text = "\n\n".join(str(row.get("text") or "").strip() for row in fallback_rows if str(row.get("text") or "").strip())
-                    return {"text": merged_text or (text or "[empty]"), "paragraphs": fallback_rows}
-                return {"text": text or "[empty]"}
+                    result = {"text": merged_text or (text or "[empty]"), "paragraphs": fallback_rows}
+                    if bbox_norm:
+                        result["bbox_norm"] = bbox_norm
+                    return result
+                result = {"text": text or "[empty]"}
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "SectionHeading":
                 text = str(props.get("text") or fb_text).strip() or "Untitled"
                 level = int(props.get("level") or 2)
                 level = max(1, min(4, level))
-                return {"text": text, "level": level}
+                result = {"text": text, "level": level}
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "ListBlock":
                 items = props.get("items")
                 rows = [str(item).strip() for item in list(items or []) if str(item).strip()] if isinstance(items, list) else []
                 if not rows and fb_text:
                     rows = [fb_text]
-                return {"items": rows}
+                result = {"items": rows}
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "FigurePanel":
-                return {
+                result = {
                     "caption": str(props.get("caption") or fb_text).strip(),
                     "image_url": resolve_figure_image_token(
                         raw_token=str(props.get("image_url") or props.get("image_src") or "").strip(),
@@ -6897,6 +9625,9 @@ class LiteratureReaderComposeService:
                     "source_label": str(props.get("source_label") or "").strip(),
                     "ai_insight": str(props.get("ai_insight") or "").strip(),
                 }
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "ContextRail":
                 title = str(props.get("title") or "Context").strip()
                 items = props.get("items")
@@ -6937,7 +9668,10 @@ class LiteratureReaderComposeService:
                                 normalized_items.append({"title": f"Insight {idx}", "content": content})
                 if not normalized_items and fb_text:
                     normalized_items = [{"title": "Insight 1", "content": fb_text}]
-                return {"items": normalized_items}
+                result = {"items": normalized_items}
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "InsightClusterCard":
                 raw_items = props.get("items")
                 items = [str(item).strip() for item in list(raw_items or []) if str(item).strip()] if isinstance(raw_items, list) else []
@@ -6946,16 +9680,22 @@ class LiteratureReaderComposeService:
                 tone = str(props.get("tone") or "finding").strip().lower()
                 if tone not in {"finding", "claim", "implication"}:
                     tone = "finding"
-                return {
+                result = {
                     "title": str(props.get("title") or "").strip(),
                     "items": items or [fb_text or "[empty]"],
                     "tone": tone,
                 }
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "SectionBridgeCard":
-                return {
+                result = {
                     "title": str(props.get("title") or "").strip(),
                     "text": str(props.get("text") or fb_text).strip() or "[empty]",
                 }
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "EquationBlock":
                 normalized_latex = str(props.get("normalized_latex") or "").strip()
                 normalized_text = str(props.get("normalized_text") or "").strip()
@@ -6979,12 +9719,17 @@ class LiteratureReaderComposeService:
                     payload["normalization_mode"] = normalization_mode
                 if isinstance(normalization_confidence, (int, float)) and not isinstance(normalization_confidence, bool):
                     payload["normalization_confidence"] = float(normalization_confidence)
+                if bbox_norm:
+                    payload["bbox_norm"] = bbox_norm
                 return payload
             if component == "MethodologyCard":
                 steps = [str(item).strip() for item in list(props.get("steps") or []) if str(item).strip()]
                 if not steps and fb_text:
                     steps = [fb_text]
-                return {"title": str(props.get("title") or "").strip(), "steps": steps or ["N/A"], "participants": str(props.get("participants") or "").strip(), "tools": [str(item).strip() for item in list(props.get("tools") or []) if str(item).strip()]}
+                result = {"title": str(props.get("title") or "").strip(), "steps": steps or ["N/A"], "participants": str(props.get("participants") or "").strip(), "tools": [str(item).strip() for item in list(props.get("tools") or []) if str(item).strip()]}
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             if component == "TablePanel":
                 rows = props.get("rows")
                 matrix = props.get("matrix")
@@ -6996,7 +9741,7 @@ class LiteratureReaderComposeService:
                 cell_evidence = props.get("cell_evidence")
                 logical_rows = props.get("logical_rows")
                 reconstruction_notes = props.get("reconstruction_notes")
-                return {
+                result = {
                     "title": str(props.get("title") or fb_text or "Table").strip(),
                     "rows": rows if isinstance(rows, list) else [],
                     "matrix": matrix if isinstance(matrix, list) else [],
@@ -7015,6 +9760,9 @@ class LiteratureReaderComposeService:
                     "reconstruction_notes": reconstruction_notes if isinstance(reconstruction_notes, list) else [],
                     "ai_insight": str(props.get("ai_insight") or "").strip(),
                 }
+                if bbox_norm:
+                    result["bbox_norm"] = bbox_norm
+                return result
             return {"text": str(props.get("text") or fb_text).strip() or "[empty]"}
 
         def convert_node(node: Dict[str, Any], panel_id: str) -> Optional[Dict[str, Any]]:
@@ -17179,12 +19927,51 @@ class LiteratureReaderComposeService:
 
     def _ensure_payload_contract(self, *, page: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         cloned = dict(payload or {})
+        page_grounding_policy = (
+            dict(cloned.get("page_grounding_policy") or {})
+            if isinstance(cloned.get("page_grounding_policy"), Mapping)
+            else {}
+        )
         grounding_mode = str(
-            cloned.get("grounding_mode")
-            or ((cloned.get("page_grounding_policy") or {}).get("mode") if isinstance(cloned.get("page_grounding_policy"), Mapping) else "")
+            page_grounding_policy.get("legacy_mode")
+            or cloned.get("legacy_grounding_mode")
+            or cloned.get("grounding_mode")
+            or page_grounding_policy.get("mode")
             or ""
         ).strip().lower()
-        evidence_disabled = grounding_mode == "ai_reconstructed" or bool(cloned.get("evidence_enabled") is False)
+        reconstruction_mode = str(
+            page_grounding_policy.get("reconstruction_mode")
+            or page_grounding_policy.get("legacy_reconstruction_mode")
+            or page_grounding_policy.get("legacy_mode")
+            or cloned.get("legacy_reconstruction_mode")
+            or cloned.get("reconstruction_mode")
+            or cloned.get("legacy_grounding_mode")
+            or cloned.get("grounding_mode")
+            or ""
+        ).strip().lower()
+        if reconstruction_mode == "ai_reconstructed" or grounding_mode == "ai_reconstructed":
+            page_mode = self._normalize_spaces(
+                str(cloned.get("page_mode") or page_grounding_policy.get("page_mode") or "")
+            ).strip().lower()
+            if page_mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+                page_mode = "fully_reconstructed"
+            cloned["page_mode"] = page_mode
+            cloned["grounding_mode"] = "ai_reconstructed"
+            cloned["reconstruction_mode"] = "ai_reconstructed"
+            cloned["legacy_grounding_mode"] = "ai_reconstructed"
+            cloned["legacy_reconstruction_mode"] = "ai_reconstructed"
+            page_grounding_policy["mode"] = "ai_reconstructed"
+            page_grounding_policy["page_mode"] = page_mode
+            page_grounding_policy["legacy_mode"] = "ai_reconstructed"
+            page_grounding_policy["reconstruction_mode"] = "ai_reconstructed"
+            page_grounding_policy["legacy_reconstruction_mode"] = "ai_reconstructed"
+            cloned["page_grounding_policy"] = page_grounding_policy
+        evidence_disabled = bool(cloned.get("evidence_enabled") is False)
+        skip_no_drop_blocks = bool(
+            reconstruction_mode == "ai_reconstructed"
+            or bool(cloned.get("ai_reconstructed_evidence_enabled"))
+            or grounding_mode == "ai_reconstructed"
+        )
         cloned["paper_id"] = int(cloned.get("paper_id") or 0)
         cloned["page"] = max(1, int(cloned.get("page") or page))
         if str(cloned.get("status") or "").strip().lower() not in {"done", "fallback"}:
@@ -17206,6 +19993,64 @@ class LiteratureReaderComposeService:
             ui_plan=ui_plan,
         )
         cloned["ui_plan"] = ui_plan
+        ai_reconstructed_repair_meta: Dict[str, Any] = {}
+        if reconstruction_mode == "ai_reconstructed" or grounding_mode == "ai_reconstructed":
+            evidence_missing = bool(cloned.get("evidence_enabled") is False) or not any(
+                list(node.get("source_anchor_refs") or [])
+                for node in list(ui_plan.get("components") or [])
+                if isinstance(node, Mapping)
+            )
+            if evidence_missing:
+                ui_plan, ai_reconstructed_repair_meta = self._repair_ai_reconstructed_evidence_runtime(
+                    page=page,
+                    payload=cloned,
+                    ui_plan=ui_plan,
+                )
+                cloned["ui_plan"] = ui_plan
+                if bool(ai_reconstructed_repair_meta.get("repaired")):
+                    page_mode = self._normalize_spaces(
+                        str(cloned.get("page_mode") or page_grounding_policy.get("page_mode") or page_grounding_policy.get("mode") or "")
+                    ).strip().lower()
+                    if page_mode not in {"grounded", "partial_reconstructed", "fully_reconstructed"}:
+                        page_mode = "fully_reconstructed"
+                    cloned["evidence_enabled"] = True
+                    cloned["runtime_build_plan_evidence"] = True
+                    cloned["ai_reconstructed_evidence_enabled"] = True
+                    cloned["grounding_mode"] = "ai_reconstructed"
+                    cloned["reconstruction_mode"] = "ai_reconstructed"
+                    cloned["legacy_grounding_mode"] = "ai_reconstructed"
+                    cloned["legacy_reconstruction_mode"] = "ai_reconstructed"
+                    page_grounding_policy = dict(cloned.get("page_grounding_policy") or {})
+                    page_grounding_policy["mode"] = "ai_reconstructed"
+                    page_grounding_policy["page_mode"] = page_mode
+                    page_grounding_policy["legacy_mode"] = "ai_reconstructed"
+                    page_grounding_policy["reconstruction_mode"] = "ai_reconstructed"
+                    page_grounding_policy["legacy_reconstruction_mode"] = "ai_reconstructed"
+                    page_grounding_policy["evidence_enabled"] = True
+                    page_grounding_policy["runtime_build_plan_evidence"] = True
+                    page_grounding_policy["ai_reconstructed_evidence_enabled"] = True
+                    page_grounding_policy["ai_reconstructed_evidence_mode"] = "bbox_anchor_v1"
+                    cloned["page_grounding_policy"] = page_grounding_policy
+                    layout_advice_v3 = dict(cloned.get("layout_advice_v3") or {})
+                    layout_advice_v3["ai_reconstructed_evidence_enabled"] = True
+                    layout_advice_v3["ai_reconstructed_evidence_mode"] = "bbox_anchor_v1"
+                    layout_advice_v3["ai_reconstructed_evidence_anchors"] = dict(ai_reconstructed_repair_meta.get("evidence_meta") or {})
+                    layout_advice_v3["ai_reconstructed_evidence_repair"] = {
+                        "applied": True,
+                        "reason": str(ai_reconstructed_repair_meta.get("reason") or ""),
+                        "anchor_count_before": int(ai_reconstructed_repair_meta.get("anchor_count_before") or 0),
+                        "anchor_count_after": int(ai_reconstructed_repair_meta.get("anchor_count_after") or 0),
+                        "reconstruction_component_count": int(ai_reconstructed_repair_meta.get("reconstruction_component_count") or 0),
+                        "figure_asset_count": int(ai_reconstructed_repair_meta.get("figure_asset_count") or 0),
+                    }
+                    cloned["layout_advice_v3"] = layout_advice_v3
+                    pipeline_contract_meta = dict(cloned.get("pipeline_contract_meta") or {})
+                    pipeline_contract_meta["ai_reconstructed_evidence_enabled"] = True
+                    pipeline_contract_meta["ai_reconstructed_evidence_mode"] = "bbox_anchor_v1"
+                    pipeline_contract_meta["ai_reconstructed_evidence_anchors"] = dict(ai_reconstructed_repair_meta.get("evidence_meta") or {})
+                    pipeline_contract_meta["ai_reconstructed_evidence_repair"] = dict(layout_advice_v3["ai_reconstructed_evidence_repair"])
+                    cloned["pipeline_contract_meta"] = pipeline_contract_meta
+        evidence_disabled = bool(cloned.get("evidence_enabled") is False)
         trace_meta = dict(ui_plan.get("trace_meta") or {})
         if not isinstance(cloned.get("scheme_choice"), dict):
             cloned["scheme_choice"] = dict(trace_meta.get("scheme_choice") or {})
@@ -17237,7 +20082,7 @@ class LiteratureReaderComposeService:
             "error_code": "",
             "missing_block_ids": [],
             "inserted_node_ids": [],
-        } if evidence_disabled else self._enforce_no_drop_blocks_fallback(
+        } if (evidence_disabled or skip_no_drop_blocks) else self._enforce_no_drop_blocks_fallback(
             page=page,
             payload=cloned,
             ui_plan=ui_plan,
@@ -17278,14 +20123,20 @@ class LiteratureReaderComposeService:
                 **dict(no_drop_report or {}),
                 "applied_at": self._utcnow_iso(),
             }
+            if skip_no_drop_blocks:
+                pipeline_contract_meta["no_drop_blocks_skipped"] = {
+                    "applied": True,
+                    "reason": "ai_reconstructed_bbox_anchor",
+                    "reconstruction_mode": reconstruction_mode or "ai_reconstructed",
+                    "grounding_mode": grounding_mode or "",
+                }
             cloned["pipeline_contract_meta"] = pipeline_contract_meta
         quality_report = self._annotate_layout_monotony_quality_report(
             payload=cloned,
             ui_plan=ui_plan,
             quality_report=quality_report,
         )
-        if evidence_disabled:
-            quality_report["grounded_evidence_enabled"] = False
+        quality_report["grounded_evidence_enabled"] = not evidence_disabled
         cloned["quality_report"] = quality_report
         cloned["validation_report"] = validation_report
 
@@ -17422,6 +20273,10 @@ class LiteratureReaderComposeService:
                             if not paragraph_text:
                                 continue
                             paragraph_row: Dict[str, Any] = {"text": paragraph_text}
+                            row_bbox_norm = raw_row.get("bbox_norm") if isinstance(raw_row, Mapping) else None
+                            row_bbox_norm = self._normalize_bbox_norm(row_bbox_norm) if isinstance(row_bbox_norm, (dict, list, tuple)) else None
+                            if row_bbox_norm:
+                                paragraph_row["bbox_norm"] = row_bbox_norm
                             paragraph_layout_ids = [
                                 str(item).strip()
                                 for item in raw_para_layout_ids
@@ -18960,6 +21815,71 @@ class LiteratureReaderComposeService:
             )
         except Exception as exc:
             logger.warning(f"[ReaderComposeService] redis set failed: {exc}")
+
+    async def _cleanup_compose_sibling_caches(
+        self,
+        *,
+        db: AsyncSession,
+        redis_key: str,
+        paper_id: int,
+        page: int,
+        source_signature: str,
+        pipeline_mode: str,
+        pipeline_version: str,
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "redis_deleted": 0,
+            "db_deleted": 0,
+        }
+        redis_client = await self._resolve_redis_client()
+        redis_prefix = str(redis_key or "").rsplit(":", 1)[0].rstrip(":")
+        redis_match = f"{redis_prefix}:*"
+        if redis_client is not None and redis_prefix:
+            try:
+                cursor = 0
+                sibling_keys: List[str] = []
+                while True:
+                    cursor, keys = await redis_client.scan(cursor=cursor, match=redis_match, count=200)
+                    for raw in list(keys or []):
+                        key = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                        if key and key != redis_key:
+                            sibling_keys.append(key)
+                    if cursor == 0:
+                        break
+                if sibling_keys:
+                    deleted = await redis_client.delete(*sibling_keys)
+                    report["redis_deleted"] = int(deleted or 0)
+            except Exception as exc:
+                logger.warning(
+                    "[ReaderComposeService] compose sibling redis cleanup failed "
+                    f"paper={paper_id} page={page} err={exc}"
+                )
+
+        try:
+            stmt = (
+                delete(PaperReaderPageCache)
+                .where(
+                    and_(
+                        PaperReaderPageCache.paper_id == int(paper_id),
+                        PaperReaderPageCache.page == int(page),
+                        PaperReaderPageCache.source_signature != str(source_signature),
+                    )
+                )
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            report["db_deleted"] = int(getattr(result, "rowcount", 0) or 0)
+        except Exception as exc:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[ReaderComposeService] compose sibling db cleanup failed "
+                f"paper={paper_id} page={page} err={exc}"
+            )
+
+        return report
 
     async def _acquire_lock(self, lock_key: str) -> Optional[str]:
         client = await self._resolve_redis_client()

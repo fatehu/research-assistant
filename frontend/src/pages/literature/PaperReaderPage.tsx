@@ -1124,7 +1124,7 @@ function isActionableAnchor(anchor: ReaderComponentSourceAnchor): boolean {
   const sourceLayoutId = String(anchor.source_layout_id || '').trim()
   const coordVersion = String(anchor.coord_version || anchor.anchor_v2?.coord_version || '').trim()
   const hasGeometryPolygons = Array.isArray(anchor.geometry?.polygons) && anchor.geometry.polygons.length > 0
-  if (coordVersion === 'layout_uid_v1') {
+  if (coordVersion === 'layout_uid_v1' || coordVersion === 'ai_bbox_v1' || coordVersion === 'ai_reconstructed_bbox_v1') {
     if (!sourceLayoutId && !hasGeometryPolygons) return false
   } else if (coordVersion === 'anchor_v2') {
     if (!canonicalBlockId) return false
@@ -2914,6 +2914,34 @@ export default function PaperReaderPage() {
     if (!composedAiReconstructed || !validPaperId) return ''
     return toAbsoluteApiUrl(`/api/v1/literature/reader/page-assets/${parsedPaperId}/${readPage}`)
   }, [composedAiReconstructed, parsedPaperId, readPage, validPaperId])
+  const composedAiReconstructedEvidenceExists = useMemo(() => {
+    if (!composedAiReconstructed || !Array.isArray(activeComposedPlan?.components)) return false
+    const stack: ReaderComponentNode[] = [...activeComposedPlan.components]
+    while (stack.length > 0) {
+      const node = stack.shift()
+      if (!node) continue
+      const nodeRecord = node as unknown as Record<string, unknown>
+      const anchors = Array.isArray(nodeRecord.source_anchor_refs) ? nodeRecord.source_anchor_refs : []
+      for (const rawAnchor of anchors) {
+        if (!rawAnchor || typeof rawAnchor !== 'object') continue
+        const anchor = rawAnchor as Record<string, unknown>
+        const bbox = (anchor.bbox_hint && typeof anchor.bbox_hint === 'object')
+          ? anchor.bbox_hint as Record<string, unknown>
+          : null
+        if (!bbox) continue
+        const x0 = Number(bbox.x0 || 0)
+        const x1 = Number(bbox.x1 || 0)
+        const top = Number(bbox.top || 0)
+        const bottom = Number(bbox.bottom || 0)
+        if (Number.isFinite(x0) && Number.isFinite(x1) && Number.isFinite(top) && Number.isFinite(bottom) && x1 > x0 && bottom > top) {
+          return true
+        }
+      }
+      const children = Array.isArray(nodeRecord.children) ? (nodeRecord.children as ReaderComponentNode[]) : []
+      stack.push(...children)
+    }
+    return false
+  }, [activeComposedPlan, composedAiReconstructed])
   const composedPageStructureIndex = useMemo(
     () => buildPageStructureSpatialIndex(
       (composedPayload?.page_structure_v3 || {}) as Record<string, unknown>,
@@ -2987,6 +3015,20 @@ export default function PaperReaderPage() {
   }, [activeComposedPlan, composedPayload])
   useEffect(() => {
     if (!composedAiReconstructed || !composedAiReconstructedSidebarImageUrl) return
+    if (composedAiReconstructedEvidenceExists) {
+      setAnchorPreview((prev) => {
+        if (!String(prev.preview_key || '').startsWith(`ai-reconstructed-page-${readPage}`)) return prev
+        if (!prev.visible && !prev.fallback_used && !String(prev.image_data_url || '')) return prev
+        return {
+          ...prev,
+          visible: false,
+          pinned: false,
+          loading: false,
+          image_data_url: null,
+        }
+      })
+      return
+    }
     const previewKey = `ai-reconstructed-page-${readPage}`
     setAnchorPreview((prev) => {
       if (
@@ -3014,7 +3056,7 @@ export default function PaperReaderPage() {
         fallback_used: true,
       }
     })
-  }, [composedAiReconstructed, composedAiReconstructedReason, composedAiReconstructedSidebarImageUrl, readPage])
+  }, [composedAiReconstructed, composedAiReconstructedEvidenceExists, composedAiReconstructedReason, composedAiReconstructedSidebarImageUrl, readPage])
   useEffect(() => {
     if (composedAiReconstructed) return
     setAnchorPreview((prev) => {
@@ -4765,7 +4807,7 @@ export default function PaperReaderPage() {
   const hideAnchorPreview = () => {
     setAnchorPreview((prev) => {
       if (prev.pinned) return prev
-      if (composedAiReconstructed && composedAiReconstructedSidebarImageUrl) {
+      if (composedAiReconstructed && composedAiReconstructedSidebarImageUrl && !composedAiReconstructedEvidenceExists) {
         return {
           visible: true,
           pinned: false,
@@ -4782,6 +4824,14 @@ export default function PaperReaderPage() {
           match_method: 'fallback',
           match_confidence: 0.3,
           fallback_used: true,
+        }
+      }
+      if (composedAiReconstructed && composedAiReconstructedEvidenceExists) {
+        return {
+          ...prev,
+          visible: false,
+          pinned: false,
+          loading: false,
         }
       }
       return { ...prev, visible: false, loading: false }
