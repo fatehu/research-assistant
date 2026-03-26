@@ -14,6 +14,7 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
   - BAAI/bge-large-zh-v1.5: 中文优化, 1024维
 """
 import asyncio
+import gc
 import hashlib
 import re
 import threading
@@ -186,6 +187,22 @@ class LocalEmbeddingModel:
         self._device = None
         self._loaded = False
 
+    def _release_runtime_device_resources(self) -> None:
+        """在运行时设备回退前尽量释放显存，避免 GPU/CPU 双占用。"""
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
     def _encode_with_runtime_fallback(
         self,
         texts: List[str],
@@ -217,6 +234,7 @@ class LocalEmbeddingModel:
                 )
                 self._runtime_device_override = "cpu"
                 self._reset_loaded_model()
+                self._release_runtime_device_resources()
                 self._load_model()
                 return self._model.encode(
                     texts,

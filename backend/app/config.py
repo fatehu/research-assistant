@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     aliyun_embedding_model: str = "text-embedding-v2"
     local_embedding_model: str = "BAAI/bge-m3"
     local_embedding_device: str = "auto"
-    local_embedding_batch_size: int = 32
+    local_embedding_batch_size: int = 8
     local_embedding_max_length: int = 8192
     local_embedding_cache_dir: str = ""
     local_embedding_normalize: bool = True
