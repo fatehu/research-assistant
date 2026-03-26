@@ -8837,6 +8837,36 @@ def _mark_stale_document_timeout(doc: Optional[Document]) -> bool:
     return True
 
 
+async def _sync_link_status_from_document(
+    db: AsyncSession,
+    link: PaperKnowledgeLink,
+) -> tuple[bool, bool]:
+    """
+    以 document 为权威来源，修正文档超时与 link 状态。
+    返回: (document_changed, link_changed)
+    """
+    if not link.document_id:
+        return False, False
+
+    doc = await db.get(Document, int(link.document_id))
+    if not doc:
+        return False, False
+
+    document_changed = _mark_stale_document_timeout(doc)
+    next_status, next_error, resolved_doc_id = _derive_link_status_from_document(doc)
+
+    link_changed = False
+    if link.status != next_status or (link.error_message or None) != (next_error or None):
+        link.status = next_status
+        link.error_message = next_error
+        link_changed = True
+    if resolved_doc_id is not None and link.document_id != resolved_doc_id:
+        link.document_id = resolved_doc_id
+        link_changed = True
+
+    return document_changed, link_changed
+
+
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
     """
     论文入库后台任务：
@@ -9564,6 +9594,20 @@ async def get_collection_knowledge_readiness(
         )
     )
     links = list((await db.execute(link_stmt)).scalars().all())
+    changed_link_ids: set[int] = set()
+    need_commit = False
+    for link in links:
+        document_changed, link_changed = await _sync_link_status_from_document(db, link)
+        if document_changed or link_changed:
+            need_commit = True
+        if link_changed:
+            changed_link_ids.add(int(link.id))
+    if need_commit:
+        await db.commit()
+        for link in links:
+            if int(link.id) in changed_link_ids:
+                await db.refresh(link)
+                await _publish_paper_link_status_event(link)
     link_by_paper_id = {int(item.paper_id): item for item in links}
 
     counts = {
@@ -13691,18 +13735,10 @@ async def list_paper_knowledge_links(
     need_commit = False
     changed_link_ids: set[int] = set()
     for link in links:
-        if not link.document_id:
-            continue
-        doc = await db.get(Document, int(link.document_id))
-        if not doc:
-            continue
-        if _mark_stale_document_timeout(doc):
+        document_changed, link_changed = await _sync_link_status_from_document(db, link)
+        if document_changed or link_changed:
             need_commit = True
-        next_status, next_error, _ = _derive_link_status_from_document(doc)
-        if link.status != next_status or (link.error_message or None) != (next_error or None):
-            link.status = next_status
-            link.error_message = next_error
-            need_commit = True
+        if link_changed:
             changed_link_ids.add(int(link.id))
 
     if need_commit:

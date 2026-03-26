@@ -1,6 +1,7 @@
 """
 知识库 API 路由 - 支持共享知识库访问（可选）
 """
+import asyncio
 import os
 import json
 import re
@@ -9,7 +10,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any, List, Optional, Set
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_, tuple_
@@ -37,6 +38,9 @@ from app.schemas.knowledge import (
     SearchResponse,
     SearchResultItem,
     ProcessingStatus,
+    DocumentUploadMode,
+    DocumentExtractProfile,
+    DocumentExtractGranularity,
 )
 from app.services.document_service import get_document_processor
 from app.services.embedding_service import (
@@ -94,6 +98,9 @@ router = APIRouter()
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+_ACTIVE_DOCUMENT_TASKS: Set[int] = set()
+_ACTIVE_DOCUMENT_TASKS_LOCK: Optional[asyncio.Lock] = None
+
 
 def _sse_payload(event: str, data: Any) -> str:
     return f"data: {json.dumps({'event': event, 'data': data}, ensure_ascii=False)}\n\n"
@@ -120,6 +127,33 @@ async def _publish_document_status_event(
         await publish_status_event(build_status_channel_for_user(int(user_id)), payload)
     except Exception as exc:  # pragma: no cover - push failures should not break main path
         logger.warning(f"[Knowledge API] 发布文档状态事件失败 doc={doc.id}: {exc}")
+
+
+def _get_active_document_tasks_lock() -> asyncio.Lock:
+    global _ACTIVE_DOCUMENT_TASKS_LOCK
+    if _ACTIVE_DOCUMENT_TASKS_LOCK is None:
+        _ACTIVE_DOCUMENT_TASKS_LOCK = asyncio.Lock()
+    return _ACTIVE_DOCUMENT_TASKS_LOCK
+
+
+async def _claim_document_task_slot(doc_id: int) -> bool:
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        normalized_doc_id = int(doc_id)
+        if normalized_doc_id in _ACTIVE_DOCUMENT_TASKS:
+            return False
+        _ACTIVE_DOCUMENT_TASKS.add(normalized_doc_id)
+        return True
+
+
+async def _release_document_task_slot(doc_id: int) -> None:
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        _ACTIVE_DOCUMENT_TASKS.discard(int(doc_id))
+
+
+def _is_document_task_active(doc_id: int) -> bool:
+    return int(doc_id) in _ACTIVE_DOCUMENT_TASKS
 
 
 def _build_error_detail(
@@ -169,11 +203,178 @@ async def _document_file_has_other_references(db: AsyncSession, doc: Document) -
     return int(linked_paper_count or 0) > 0
 
 
+async def _recompute_kb_statistics(db: AsyncSession, kb_id: int) -> Optional[KnowledgeBase]:
+    kb = await db.get(KnowledgeBase, kb_id)
+    if not kb:
+        return None
+
+    stats_row = (
+        await db.execute(
+            select(
+                func.count(Document.id),
+                func.coalesce(func.sum(Document.chunk_count), 0),
+                func.coalesce(func.sum(Document.token_count), 0),
+            ).where(Document.knowledge_base_id == kb_id)
+        )
+    ).one()
+
+    kb.document_count = int(stats_row[0] or 0)
+    kb.total_chunks = int(stats_row[1] or 0)
+    kb.total_tokens = int(stats_row[2] or 0)
+    return kb
+
+
 def _should_run_chunk_quality_gate(*, gate_enabled: bool, used_pdf_rag_ingest: bool) -> bool:
     if not gate_enabled:
         return False
     if used_pdf_rag_ingest:
         return False
+    return True
+
+
+_DOCUMENT_UPLOAD_MODES: Set[str] = {"local_fast", "online_mm", "auto"}
+_DOCUMENT_EXTRACT_PROFILES: Set[str] = {"general", "academic_formula", "table_first"}
+_DOCUMENT_EXTRACT_GRANULARITIES: Set[str] = {"fine", "medium", "coarse"}
+
+
+def _normalize_document_upload_mode(raw: Optional[str]) -> DocumentUploadMode:
+    token = str(raw or settings.kb_online_mm_default_mode or "local_fast").strip().lower()
+    if token not in _DOCUMENT_UPLOAD_MODES:
+        raise HTTPException(status_code=400, detail=f"不支持的 ingest_mode: {token}")
+    return token  # type: ignore[return-value]
+
+
+def _normalize_document_extract_profile(raw: Optional[str]) -> DocumentExtractProfile:
+    token = str(raw or "general").strip().lower()
+    if token not in _DOCUMENT_EXTRACT_PROFILES:
+        raise HTTPException(status_code=400, detail=f"不支持的 extract_profile: {token}")
+    return token  # type: ignore[return-value]
+
+
+def _normalize_document_extract_granularity(raw: Optional[str]) -> DocumentExtractGranularity:
+    token = str(raw or "medium").strip().lower()
+    if token not in _DOCUMENT_EXTRACT_GRANULARITIES:
+        raise HTTPException(status_code=400, detail=f"不支持的 extract_granularity: {token}")
+    return token  # type: ignore[return-value]
+
+
+def _document_ingest_request(doc: Document) -> dict[str, Any]:
+    metadata = dict(doc.metadata_ or {})
+    request = metadata.get("ingest_request")
+    if isinstance(request, dict):
+        return dict(request)
+    return {}
+
+
+def _document_processing_mode(doc: Document) -> DocumentUploadMode:
+    request = _document_ingest_request(doc)
+    token = str(request.get("mode") or settings.kb_online_mm_default_mode or "local_fast").strip().lower()
+    if token not in _DOCUMENT_UPLOAD_MODES:
+        token = "local_fast"
+    return token  # type: ignore[return-value]
+
+
+def _document_extract_profile(doc: Document) -> DocumentExtractProfile:
+    request = _document_ingest_request(doc)
+    token = str(request.get("extract_profile") or "general").strip().lower()
+    if token not in _DOCUMENT_EXTRACT_PROFILES:
+        token = "general"
+    return token  # type: ignore[return-value]
+
+
+def _document_extract_granularity(doc: Document) -> DocumentExtractGranularity:
+    request = _document_ingest_request(doc)
+    token = str(request.get("extract_granularity") or "medium").strip().lower()
+    if token not in _DOCUMENT_EXTRACT_GRANULARITIES:
+        token = "medium"
+    return token  # type: ignore[return-value]
+
+
+def _build_document_response(doc: Document) -> DocumentResponse:
+    return DocumentResponse(
+        id=doc.id,
+        knowledge_base_id=doc.knowledge_base_id,
+        filename=doc.filename,
+        original_filename=doc.original_filename,
+        file_size=doc.file_size,
+        file_type=doc.file_type,
+        status=doc.status,
+        processing_mode=_document_processing_mode(doc),
+        extract_profile=_document_extract_profile(doc),
+        extract_granularity=_document_extract_granularity(doc),
+        error_message=doc.error_message,
+        chunk_count=doc.chunk_count,
+        token_count=doc.token_count,
+        char_count=doc.char_count,
+        created_at=doc.created_at,
+        updated_at=doc.updated_at,
+        processed_at=doc.processed_at,
+    )
+
+
+def _document_has_resume_cache(doc: Document) -> bool:
+    metadata = dict(doc.metadata_ or {})
+    block_cache = dict(metadata.get("online_mm_block_cache") or {})
+    window_cache = dict(metadata.get("online_mm_window_cache") or {})
+    return bool(block_cache.get("blocks") or window_cache.get("windows"))
+
+
+def _document_retry_metadata(doc: Document) -> dict[str, Any]:
+    metadata = dict(doc.metadata_ or {})
+    return dict(metadata.get("retry_request") or {})
+
+
+def _document_retry_requested_recently(
+    doc: Document,
+    *,
+    minimum_interval_seconds: int = 45,
+) -> bool:
+    retry_request = _document_retry_metadata(doc)
+    raw_requested_at = str(retry_request.get("requested_at") or "").strip()
+    if not raw_requested_at:
+        return False
+    try:
+        requested_at = datetime.fromisoformat(raw_requested_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    requested_at_ts = requested_at.timestamp()
+    now_ts = datetime.utcnow().timestamp()
+    return (now_ts - requested_at_ts) < max(1, int(minimum_interval_seconds or 45))
+
+
+def _mark_document_retry_requested(
+    doc: Document,
+    *,
+    reason: str,
+    trigger: str,
+) -> None:
+    metadata = dict(doc.metadata_ or {})
+    retry_request = dict(metadata.get("retry_request") or {})
+    retry_request["count"] = max(0, int(retry_request.get("count") or 0)) + 1
+    retry_request["reason"] = str(reason or "manual_retry").strip() or "manual_retry"
+    retry_request["trigger"] = str(trigger or "manual").strip() or "manual"
+    retry_request["requested_at"] = datetime.utcnow().isoformat()
+    metadata["retry_request"] = retry_request
+    doc.metadata_ = metadata
+
+
+def _mark_stale_document_timeout(doc: Document) -> bool:
+    stale_timeout_seconds = max(
+        int(getattr(settings, "document_processing_stale_timeout_seconds", 7200)),
+        60,
+    )
+    last_updated_at = doc.updated_at or doc.created_at
+    if not is_stale_processing_status(
+        status=doc.status,
+        last_updated_at=last_updated_at,
+        timeout_seconds=stale_timeout_seconds,
+    ):
+        return False
+
+    previous_error = (doc.error_message or "").strip()
+    timeout_error = build_timeout_error_message(stale_timeout_seconds)
+    doc.status = DocumentStatus.TIMEOUT.value
+    doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
     return True
 
 
@@ -424,6 +625,10 @@ async def list_knowledge_bases(
     )
     result = await db.execute(query)
     items = result.scalars().all()
+
+    for item in items:
+        await _recompute_kb_statistics(db, int(item.id))
+    await db.commit()
     
     return KnowledgeBaseListResponse(
         items=[KnowledgeBaseResponse.model_validate(item) for item in items],
@@ -535,6 +740,10 @@ async def get_knowledge_base(
     
     if not kb or kb.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="知识库不存在")
+
+    await _recompute_kb_statistics(db, kb_id)
+    await db.commit()
+    await db.refresh(kb)
     
     return KnowledgeBaseResponse.model_validate(kb)
 
@@ -631,9 +840,20 @@ async def list_documents(
     )
     result = await db.execute(query)
     items = result.scalars().all()
+
+    changed_docs = [doc for doc in items if _mark_stale_document_timeout(doc)]
+    if changed_docs:
+        await db.commit()
+        for doc in changed_docs:
+            await db.refresh(doc)
+            await _publish_document_status_event(
+                user_id=int(current_user.id),
+                kb_id=int(kb_id),
+                doc=doc,
+            )
     
     return DocumentListResponse(
-        items=[DocumentResponse.model_validate(item) for item in items],
+        items=[_build_document_response(item) for item in items],
         total=total
     )
 
@@ -699,6 +919,9 @@ async def upload_document(
     kb_id: int,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    ingest_mode: str = Form(default="local_fast"),
+    extract_profile: str = Form(default="general"),
+    extract_granularity: str = Form(default="medium"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -717,6 +940,15 @@ async def upload_document(
             status_code=400, 
             detail=f"不支持的文件类型: {file_type}，支持: {', '.join(allowed_types)}"
         )
+
+    normalized_ingest_mode = _normalize_document_upload_mode(ingest_mode)
+    normalized_extract_profile = _normalize_document_extract_profile(extract_profile)
+    normalized_extract_granularity = _normalize_document_extract_granularity(extract_granularity)
+    if normalized_ingest_mode == "online_mm":
+        if file_type != "pdf":
+            raise HTTPException(status_code=400, detail="online_mm 仅支持 PDF 文件")
+        if not bool(settings.kb_online_mm_ingest_enabled):
+            raise HTTPException(status_code=400, detail="在线多模态入库当前未启用")
     
     # 保存文件
     file_id = str(uuid.uuid4())
@@ -751,9 +983,20 @@ async def upload_document(
         file_type=file_type,
         mime_type=file.content_type,
         status=DocumentStatus.PENDING.value,
+        metadata_={
+            "ingest_request": {
+                "mode": normalized_ingest_mode,
+                "extract_profile": normalized_extract_profile,
+                "extract_granularity": normalized_extract_granularity,
+                "requested_by": int(current_user.id),
+                "requested_at": datetime.utcnow().isoformat(),
+            }
+        },
     )
     db.add(doc)
     try:
+        await db.flush()
+        await _recompute_kb_statistics(db, kb_id)
         await db.commit()
     except SQLAlchemyError as exc:
         await db.rollback()
@@ -791,6 +1034,9 @@ async def upload_document(
         file_size=doc.file_size,
         file_type=doc.file_type,
         status=doc.status,
+        processing_mode=normalized_ingest_mode,
+        extract_profile=normalized_extract_profile,
+        extract_granularity=normalized_extract_granularity,
         message="文件上传成功，正在处理中..."
     )
 
@@ -798,7 +1044,11 @@ async def upload_document(
 async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int):
     """后台处理文档任务"""
     from app.core.database import async_session_factory
-    
+
+    if not await _claim_document_task_slot(doc_id):
+        logger.info(f"[Knowledge API] 跳过重复文档任务: doc_id={doc_id}")
+        return
+
     async with async_session_factory() as db:
         task_trace_id = uuid.uuid4().hex[:8]
         task_started_at = time.perf_counter()
@@ -857,12 +1107,167 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 return
 
             kb_config = kb.chunking_config
+            ingest_request = _document_ingest_request(doc)
+            requested_ingest_mode = _document_processing_mode(doc)
+            requested_extract_profile = _document_extract_profile(doc)
+            requested_extract_granularity = _document_extract_granularity(doc)
             text = ""
             primary_chunks = []
             context_chunks = []
             used_pdf_rag_ingest = False
 
-            if doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
+            if doc.file_type.lower() == "pdf" and requested_ingest_mode == "online_mm":
+                if not bool(settings.kb_online_mm_ingest_enabled):
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = "在线多模态入库未启用"
+                    await db.commit()
+                    await _emit_status()
+                    return
+
+                extract_started_at = time.perf_counter()
+                logger.info(
+                    f"[doc:{task_trace_id}] 开始在线多模态 PDF 入库链路: {doc_id}, "
+                    f"profile={requested_extract_profile}, granularity={requested_extract_granularity}"
+                )
+                try:
+                    from app.services.online_mm_ingest_service import get_online_mm_ingest_service
+                except Exception as exc:
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = f"在线多模态入库服务不可用: {exc}"[:2000]
+                    await db.commit()
+                    await _emit_status()
+                    return
+
+                online_mm_service = get_online_mm_ingest_service()
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                cache_key = "online_mm_block_cache"
+                window_cache_key = "online_mm_window_cache"
+                cached_extract = dict(current_metadata.get(cache_key) or {})
+                cached_window_extract = dict(current_metadata.get(window_cache_key) or {})
+                cached_blocks = list(cached_extract.get("blocks") or [])
+                cached_report = dict(cached_extract.get("report") or {})
+                cached_windows = list(cached_window_extract.get("windows") or [])
+                cache_matches = (
+                    str(cached_extract.get("document_name") or "").strip() == str(doc.original_filename or doc.filename or "").strip()
+                    and str(cached_extract.get("extract_profile") or "").strip() == str(requested_extract_profile or "").strip()
+                    and str(cached_extract.get("extract_granularity") or "").strip() == str(requested_extract_granularity or "").strip()
+                    and bool(cached_blocks)
+                )
+                window_cache_matches = (
+                    str(cached_window_extract.get("document_name") or "").strip() == str(doc.original_filename or doc.filename or "").strip()
+                    and str(cached_window_extract.get("extract_profile") or "").strip() == str(requested_extract_profile or "").strip()
+                    and str(cached_window_extract.get("extract_granularity") or "").strip() == str(requested_extract_granularity or "").strip()
+                    and bool(cached_windows)
+                )
+                supports_staged_online_mm = all(
+                    hasattr(online_mm_service, attr)
+                    for attr in ("extract_pdf_blocks", "finalize_blocks")
+                )
+
+                if not supports_staged_online_mm:
+                    online_mm_result = await online_mm_service.ingest_pdf(
+                        file_path=doc.file_path,
+                        document_name=doc.original_filename or doc.filename or "",
+                        extract_profile=requested_extract_profile,
+                        extract_granularity=requested_extract_granularity,
+                    )
+                elif cache_matches:
+                    logger.info(
+                        f"[doc:{task_trace_id}] 复用在线多模态抽取缓存: blocks={len(cached_blocks)}, "
+                        f"elapsed={_task_elapsed_ms():.2f}ms"
+                    )
+                    online_mm_result = await online_mm_service.finalize_blocks(
+                        blocks=cached_blocks,
+                        document_name=doc.original_filename or doc.filename or "",
+                        extract_profile=requested_extract_profile,
+                        extract_granularity=requested_extract_granularity,
+                        extract_report=cached_report,
+                    )
+                else:
+                    extract_result = await online_mm_service.extract_pdf_blocks(
+                        file_path=doc.file_path,
+                        document_name=doc.original_filename or doc.filename or "",
+                        extract_profile=requested_extract_profile,
+                        extract_granularity=requested_extract_granularity,
+                        cached_windows=cached_windows if window_cache_matches else None,
+                    )
+                    current_metadata["online_mm_ingest"] = dict(extract_result.get("report") or {})
+                    current_metadata["ingest_request"] = {
+                        **ingest_request,
+                        "mode": requested_ingest_mode,
+                        "extract_profile": requested_extract_profile,
+                        "extract_granularity": requested_extract_granularity,
+                    }
+                    extracted_window_cache = list(extract_result.get("window_cache") or [])
+                    if extracted_window_cache:
+                        current_metadata[window_cache_key] = {
+                            "document_name": doc.original_filename or doc.filename or "",
+                            "extract_profile": requested_extract_profile,
+                            "extract_granularity": requested_extract_granularity,
+                            "cached_at": datetime.utcnow().isoformat(),
+                            "windows": extracted_window_cache,
+                        }
+                    else:
+                        current_metadata.pop(window_cache_key, None)
+                    if bool(extract_result.get("ok")):
+                        current_metadata[cache_key] = {
+                            "document_name": doc.original_filename or doc.filename or "",
+                            "extract_profile": requested_extract_profile,
+                            "extract_granularity": requested_extract_granularity,
+                            "cached_at": datetime.utcnow().isoformat(),
+                            "report": dict(extract_result.get("report") or {}),
+                            "blocks": list(extract_result.get("blocks") or []),
+                        }
+                        current_metadata.pop(window_cache_key, None)
+                        doc.metadata_ = current_metadata
+                        await db.commit()
+                        await _emit_status()
+                        online_mm_result = await online_mm_service.finalize_blocks(
+                            blocks=list(extract_result.get("blocks") or []),
+                            document_name=doc.original_filename or doc.filename or "",
+                            extract_profile=requested_extract_profile,
+                            extract_granularity=requested_extract_granularity,
+                            extract_report=dict(extract_result.get("report") or {}),
+                        )
+                    else:
+                        online_mm_result = {
+                            "applied": False,
+                            "failure_reason": str(extract_result.get("failure_reason") or "online_mm_ingest_failed"),
+                            "document_text": "",
+                            "chunks": [],
+                            "context_chunks": [],
+                            "report": dict(extract_result.get("report") or {}),
+                        }
+                text = str(online_mm_result.get("document_text") or "")
+                current_metadata["online_mm_ingest"] = dict(online_mm_result.get("report") or {})
+                current_metadata["ingest_request"] = {
+                    **ingest_request,
+                    "mode": requested_ingest_mode,
+                    "extract_profile": requested_extract_profile,
+                    "extract_granularity": requested_extract_granularity,
+                }
+                if bool(online_mm_result.get("applied")):
+                    current_metadata.pop(cache_key, None)
+                    current_metadata.pop(window_cache_key, None)
+                doc.metadata_ = current_metadata
+                if not bool(online_mm_result.get("applied")):
+                    reason = str(online_mm_result.get("failure_reason") or "online_mm_ingest_failed").strip()
+                    doc.status = DocumentStatus.FAILED.value
+                    doc.error_message = f"在线多模态入库失败: {reason}"[:2000]
+                    await db.commit()
+                    await _emit_status()
+                    return
+
+                primary_chunks = list(online_mm_result.get("chunks") or [])
+                context_chunks = list(online_mm_result.get("context_chunks") or [])
+                logger.info(
+                    f"[doc:{task_trace_id}] 在线多模态 PDF 链路完成: chars={len(text)}, "
+                    f"chunks={len(primary_chunks)}, context_chunks={len(context_chunks)}, "
+                    f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
+
+            elif doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
                 extract_started_at = time.perf_counter()
                 logger.info(f"[doc:{task_trace_id}] 开始 PDF 行级 RAG 入库链路: {doc_id}")
                 pdf_rag_service = get_pdf_rag_ingest_service()
@@ -1265,9 +1670,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
             should_schedule_rebuild = False
             if kb:
-                kb.document_count = (kb.document_count or 0) + 1
-                kb.total_chunks = (kb.total_chunks or 0) + len(chunks_to_save)
-                kb.total_tokens = (kb.total_tokens or 0) + doc.token_count
+                await _recompute_kb_statistics(db, int(doc.knowledge_base_id))
                 kb.embedding_model = embedding_model
                 kb.embedding_dimension = int(decision.target_dimension)
                 kb_meta = dict(kb.metadata_ or {})
@@ -1337,6 +1740,56 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                         )
             except Exception as persist_exc:
                 logger.error(f"[doc:{task_trace_id}] 文档失败状态写回异常 {doc_id}: {persist_exc}")
+        finally:
+            await _release_document_task_slot(doc_id)
+
+
+async def resume_interrupted_document_tasks_on_startup() -> dict[str, Any]:
+    if not bool(getattr(settings, "knowledge_resume_running_documents_on_startup", True)):
+        return {"enabled": False, "scheduled": 0, "marked_failed": 0, "documents": []}
+
+    startup_limit = max(
+        1,
+        int(getattr(settings, "knowledge_resume_running_documents_limit", 20) or 20),
+    )
+    scheduled: list[tuple[int, int, int]] = []
+    marked_failed = 0
+    recovered_doc_ids: list[int] = []
+
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Document, KnowledgeBase)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+            .where(Document.status == DocumentStatus.RUNNING.value)
+            .order_by(Document.updated_at.asc().nullslast(), Document.id.asc())
+            .limit(startup_limit)
+        )
+        rows = list(result.all())
+        for doc, kb in rows:
+            if _is_document_task_active(int(doc.id)):
+                continue
+            if not doc.file_path or not os.path.exists(doc.file_path):
+                doc.status = DocumentStatus.FAILED.value
+                doc.error_message = "处理在服务重启后无法恢复：源文件不存在"
+                marked_failed += 1
+                continue
+            resume_reason = "startup_resume_from_cache" if _document_has_resume_cache(doc) else "startup_resume_restart"
+            _mark_document_retry_requested(doc, reason=resume_reason, trigger="startup")
+            scheduled.append((int(doc.id), int(kb.chunk_size or 500), int(kb.chunk_overlap or 50)))
+            recovered_doc_ids.append(int(doc.id))
+
+        if rows:
+            await db.commit()
+
+    for doc_id, chunk_size, chunk_overlap in scheduled:
+        asyncio.create_task(process_document_task(doc_id=doc_id, chunk_size=chunk_size, chunk_overlap=chunk_overlap))
+
+    return {
+        "enabled": True,
+        "scheduled": len(scheduled),
+        "marked_failed": int(marked_failed),
+        "documents": recovered_doc_ids,
+    }
 
 
 @router.get("/knowledge-bases/{kb_id}/documents/{doc_id}", response_model=DocumentDetailResponse)
@@ -1364,6 +1817,9 @@ async def get_document(
         file_size=doc.file_size,
         file_type=doc.file_type,
         status=doc.status,
+        processing_mode=_document_processing_mode(doc),
+        extract_profile=_document_extract_profile(doc),
+        extract_granularity=_document_extract_granularity(doc),
         error_message=doc.error_message,
         chunk_count=doc.chunk_count,
         token_count=doc.token_count,
@@ -1400,12 +1856,9 @@ async def delete_document(
     elif preserve_file:
         logger.info(f"[Knowledge API] 保留共享文件: doc={doc_id}, path={doc.file_path}")
     
-    # 更新知识库统计
-    kb.document_count = max(0, (kb.document_count or 0) - 1)
-    kb.total_chunks = max(0, (kb.total_chunks or 0) - (doc.chunk_count or 0))
-    kb.total_tokens = max(0, (kb.total_tokens or 0) - (doc.token_count or 0))
-    
     await db.delete(doc)
+    await db.flush()
+    await _recompute_kb_statistics(db, kb_id)
     await db.commit()
     
     logger.info(f"用户 {current_user.id} 删除文档: {doc_id}")
@@ -1433,20 +1886,7 @@ async def get_document_status(
     progress = 0
     message = "等待处理"
     
-    stale_timeout_seconds = max(
-        int(getattr(settings, "document_processing_stale_timeout_seconds", 7200)),
-        60,
-    )
-    last_updated_at = doc.updated_at or doc.created_at
-    if is_stale_processing_status(
-        status=doc.status,
-        last_updated_at=last_updated_at,
-        timeout_seconds=stale_timeout_seconds,
-    ):
-        previous_error = (doc.error_message or "").strip()
-        timeout_error = build_timeout_error_message(stale_timeout_seconds)
-        doc.status = DocumentStatus.TIMEOUT.value
-        doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
+    if _mark_stale_document_timeout(doc):
         await db.commit()
         await db.refresh(doc)
         await _publish_document_status_event(
@@ -1456,8 +1896,43 @@ async def get_document_status(
         )
         logger.warning(
             "文档状态因处理超时自动失败: "
-            f"doc_id={doc.id}, kb_id={kb_id}, last_updated_at={last_updated_at}, "
-            f"timeout_seconds={stale_timeout_seconds}"
+            f"doc_id={doc.id}, kb_id={kb_id}, last_updated_at={doc.updated_at or doc.created_at}, "
+            f"timeout_seconds={max(int(getattr(settings, 'document_processing_stale_timeout_seconds', 7200)), 60)}"
+        )
+
+    if (
+        doc.status == DocumentStatus.RUNNING.value
+        and not _is_document_task_active(int(doc.id))
+        and bool(doc.file_path)
+        and os.path.exists(str(doc.file_path))
+        and not _document_retry_requested_recently(doc, minimum_interval_seconds=45)
+    ):
+        _mark_document_retry_requested(
+            doc,
+            reason="status_poll_resume_from_cache" if _document_has_resume_cache(doc) else "status_poll_resume_restart",
+            trigger="status_poll",
+        )
+        doc.status = DocumentStatus.PENDING.value
+        doc.error_message = None
+        await db.commit()
+        await db.refresh(doc)
+        await _publish_document_status_event(
+            user_id=int(current_user.id),
+            kb_id=int(kb_id),
+            doc=doc,
+        )
+        asyncio.create_task(
+            process_document_task(
+                doc_id=int(doc.id),
+                chunk_size=int(kb.chunk_size or 500),
+                chunk_overlap=int(kb.chunk_overlap or 50),
+            )
+        )
+        logger.info(
+            "[KnowledgeResume] status poll resumed interrupted document: doc_id={}, kb_id={}, reason={}",
+            int(doc.id),
+            int(kb_id),
+            str(_document_retry_metadata(doc).get("reason") or ""),
         )
 
     if doc.status == DocumentStatus.PENDING.value:
@@ -1484,6 +1959,68 @@ async def get_document_status(
         status=doc.status,
         progress=progress,
         message=message,
+        chunk_count=doc.chunk_count or 0,
+        error=doc.error_message,
+    )
+
+
+@router.post("/knowledge-bases/{kb_id}/documents/{doc_id}/retry", response_model=ProcessingStatus)
+async def retry_document_processing(
+    kb_id: int,
+    doc_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """重试/恢复文档处理任务"""
+    kb = await db.get(KnowledgeBase, kb_id)
+    if not kb or kb.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    doc = await db.get(Document, doc_id)
+    if not doc or doc.knowledge_base_id != kb_id:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    if not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=400, detail="源文件不存在，无法重试")
+
+    if doc.status == DocumentStatus.RUNNING.value and _is_document_task_active(int(doc.id)):
+        return ProcessingStatus(
+            document_id=doc.id,
+            status=doc.status,
+            progress=50,
+            message="文档已在处理中",
+            chunk_count=doc.chunk_count or 0,
+            error=doc.error_message,
+        )
+
+    _mark_document_retry_requested(
+        doc,
+        reason="manual_retry_from_cache" if _document_has_resume_cache(doc) else "manual_retry_restart",
+        trigger="manual",
+    )
+    doc.status = DocumentStatus.PENDING.value
+    doc.error_message = None
+    doc.processed_at = None
+    await db.commit()
+    await _publish_document_status_event(
+        user_id=int(current_user.id),
+        kb_id=int(kb_id),
+        doc=doc,
+    )
+
+    background_tasks.add_task(
+        process_document_task,
+        doc.id,
+        kb.chunk_size,
+        kb.chunk_overlap,
+    )
+
+    return ProcessingStatus(
+        document_id=doc.id,
+        status=doc.status,
+        progress=0,
+        message="已加入重试队列",
         chunk_count=doc.chunk_count or 0,
         error=doc.error_message,
     )

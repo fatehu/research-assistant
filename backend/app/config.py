@@ -127,6 +127,8 @@ class Settings(BaseSettings):
 
     # Document processing safety guard
     document_processing_stale_timeout_seconds: int = 7200
+    knowledge_resume_running_documents_on_startup: bool = True
+    knowledge_resume_running_documents_limit: int = 20
 
     # Chunk quality gate (RAG ingestion)
     chunk_quality_gate_enabled: bool = False
@@ -162,6 +164,25 @@ class Settings(BaseSettings):
     pdf_rag_ocr_timeout_seconds: int = 30
     pdf_rag_ocr_dpi: int = 180
     pdf_rag_ocr_padding: float = 4.0
+
+    # Knowledge base online multimodal ingestion
+    kb_online_mm_ingest_enabled: bool = False
+    kb_online_mm_default_mode: Literal["local_fast", "online_mm", "auto"] = "local_fast"
+    kb_online_mm_primary_model: str = "qwen3-vl-flash"
+    kb_online_mm_fallback_model: str = "qwen-vl-ocr-latest"
+    kb_online_mm_chunk_planner_model: str = "qwen3.5-plus"
+    kb_online_mm_timeout_ms: int = 300000
+    kb_online_mm_render_dpi: int = 200
+    kb_online_mm_trim_whitespace: bool = True
+    kb_online_mm_trim_padding_px: int = 24
+    kb_online_mm_image_max_side: int = 1920
+    kb_online_mm_image_max_pixels: int = 2600000
+    kb_online_mm_pages_per_call: int = 1
+    kb_online_mm_window_overlap: int = 0
+    kb_online_mm_extract_max_concurrency: int = 6
+    kb_online_mm_extract_max_tokens: int = 20000
+    kb_online_mm_max_pages_soft_limit: int = 80
+    kb_online_mm_max_estimated_cost_rmb: float = 1.0
 
     # LLM runtime
     llm_temperature: float = 0.7

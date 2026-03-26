@@ -288,6 +288,19 @@ export interface Document {
   updated_at: string
   processed_at?: string
   content?: string
+  processing_mode?: DocumentIngestMode
+  extract_profile?: DocumentExtractProfile
+  extract_granularity?: DocumentExtractGranularity
+}
+
+export type DocumentIngestMode = 'local_fast' | 'online_mm' | 'auto'
+export type DocumentExtractProfile = 'general' | 'academic_formula' | 'table_first'
+export type DocumentExtractGranularity = 'fine' | 'medium' | 'coarse'
+
+export interface DocumentUploadOptions {
+  ingestMode?: DocumentIngestMode
+  extractProfile?: DocumentExtractProfile
+  extractGranularity?: DocumentExtractGranularity
 }
 
 export interface DocumentChunk {
@@ -363,54 +376,97 @@ async function streamJsonSse<TEvent extends string = string>(
   onEvent?: SseEventHandler<TEvent>,
   abortController?: AbortController,
 ): Promise<void> {
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${getToken()}`,
-    },
-    signal: abortController?.signal,
-  })
-
-  if (!response.ok) {
-    let detail = `订阅失败 (${response.status})`
-    try {
-      const err = (await response.json()) as { detail?: ApiErrorDetail }
-      detail = extractApiErrorMessage(err?.detail, detail)
-    } catch {
-      // ignore json parse error for non-json body
-    }
-    throw new Error(detail)
-  }
-
-  const reader = response.body?.getReader()
-  if (!reader) {
-    throw new Error('无法读取状态流')
-  }
-
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() || ''
-
-    for (const line of lines) {
-      const normalized = line.trim()
-      if (!normalized.startsWith('data:')) continue
-      const raw = normalized.slice(5).trim()
-      if (!raw) continue
-      try {
-        const parsed = JSON.parse(raw) as { event?: string; data?: any }
-        const event = String(parsed?.event || '')
-        if (!event) continue
-        onEvent?.(event as TEvent, parsed?.data)
-      } catch {
-        // ignore malformed chunk
+  const sleep = async (ms: number): Promise<void> => {
+    if (abortController?.signal.aborted) return
+    await new Promise<void>((resolve) => {
+      const timer = window.setTimeout(resolve, ms)
+      if (!abortController) return
+      const onAbort = () => {
+        window.clearTimeout(timer)
+        abortController.signal.removeEventListener('abort', onAbort)
+        resolve()
       }
+      abortController.signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  let reconnectAttempt = 0
+  while (!abortController?.signal.aborted) {
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${getToken()}`,
+        },
+        signal: abortController?.signal,
+      })
+
+      if (!response.ok) {
+        let detail = `订阅失败 (${response.status})`
+        try {
+          const err = (await response.json()) as { detail?: ApiErrorDetail }
+          detail = extractApiErrorMessage(err?.detail, detail)
+        } catch {
+          // ignore json parse error for non-json body
+        }
+        const retryableStatus = response.status >= 500
+        if (!retryableStatus) {
+          throw new Error(detail)
+        }
+        reconnectAttempt += 1
+        await sleep(Math.min(5000, 800 * reconnectAttempt))
+        continue
+      }
+
+      const reader = response.body?.getReader()
+      if (!reader) {
+        throw new Error('无法读取状态流')
+      }
+
+      reconnectAttempt = 0
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (!abortController?.signal.aborted) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const normalized = line.trim()
+          if (!normalized.startsWith('data:')) continue
+          const raw = normalized.slice(5).trim()
+          if (!raw) continue
+          try {
+            const parsed = JSON.parse(raw) as { event?: string; data?: any }
+            const event = String(parsed?.event || '')
+            if (!event) continue
+            onEvent?.(event as TEvent, parsed?.data)
+          } catch {
+            // ignore malformed chunk
+          }
+        }
+      }
+
+      if (abortController?.signal.aborted) return
+      reconnectAttempt += 1
+      await sleep(Math.min(5000, 800 * reconnectAttempt))
+    } catch (error) {
+      if (abortController?.signal.aborted) return
+      reconnectAttempt += 1
+      const message = String((error as Error)?.message || '')
+      const isRetryableNetworkError =
+        message.includes('Failed to fetch') ||
+        message.includes('NetworkError') ||
+        message.includes('Load failed') ||
+        message.includes('fetch')
+      if (!isRetryableNetworkError) {
+        throw error
+      }
+      await sleep(Math.min(5000, 800 * reconnectAttempt))
     }
   }
 }
@@ -685,9 +741,22 @@ export const knowledgeApi = {
     return response.data
   },
 
-  uploadDocument: async (kbId: number, file: File): Promise<Document> => {
+  uploadDocument: async (
+    kbId: number,
+    file: File,
+    options: DocumentUploadOptions = {},
+  ): Promise<Document> => {
     const formData = new FormData()
     formData.append('file', file)
+    if (options.ingestMode) {
+      formData.append('ingest_mode', options.ingestMode)
+    }
+    if (options.extractProfile) {
+      formData.append('extract_profile', options.extractProfile)
+    }
+    if (options.extractGranularity) {
+      formData.append('extract_granularity', options.extractGranularity)
+    }
 
     const response = await api.post(
       `/api/v1/knowledge/knowledge-bases/${kbId}/documents/upload`,
@@ -708,6 +777,11 @@ export const knowledgeApi = {
 
   deleteDocument: async (kbId: number, docId: number): Promise<void> => {
     await api.delete(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}`)
+  },
+
+  retryDocument: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
+    const response = await api.post(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/retry`)
+    return response.data
   },
 
   getDocumentStatus: async (kbId: number, docId: number): Promise<ProcessingStatus> => {

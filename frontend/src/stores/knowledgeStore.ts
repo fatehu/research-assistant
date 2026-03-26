@@ -3,6 +3,7 @@ import {
   knowledgeApi,
   KnowledgeBase,
   Document,
+  DocumentUploadOptions,
   DocumentChunk,
   SearchResult,
   SearchResponse,
@@ -12,6 +13,8 @@ import {
   isApiTimeoutError,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
+
+const inflightDocumentStatusRequests = new Map<string, Promise<ProcessingStatus | undefined>>()
 
 interface KnowledgeState {
   // 知识库列表
@@ -46,9 +49,10 @@ interface KnowledgeState {
   deleteKnowledgeBase: (kbId: number) => Promise<void>
 
   fetchDocuments: (kbId: number) => Promise<void>
-  uploadDocument: (kbId: number, file: File) => Promise<Document>
+  uploadDocument: (kbId: number, file: File, options?: DocumentUploadOptions) => Promise<Document>
   selectDocument: (kbId: number, docId: number) => Promise<void>
   deleteDocument: (kbId: number, docId: number) => Promise<void>
+  retryDocument: (kbId: number, docId: number) => Promise<ProcessingStatus>
   refreshDocumentStatus: (kbId: number, docId: number) => Promise<ProcessingStatus | undefined>
   applyDocumentStatusPatch: (
     docId: number,
@@ -164,10 +168,10 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     }
   },
 
-  uploadDocument: async (kbId: number, file: File) => {
+  uploadDocument: async (kbId: number, file: File, options?: DocumentUploadOptions) => {
     set({ isUploading: true })
     try {
-      const doc = await knowledgeApi.uploadDocument(kbId, file)
+      const doc = await knowledgeApi.uploadDocument(kbId, file, options)
       set((state) => ({
         documents: [doc, ...state.documents],
         totalDocuments: state.totalDocuments + 1,
@@ -204,18 +208,47 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     await get().selectKnowledgeBase(kbId)
   },
 
+  retryDocument: async (kbId: number, docId: number) => {
+    const status = await knowledgeApi.retryDocument(kbId, docId)
+    get().applyDocumentStatusPatch(docId, {
+      status: status.status as Document['status'],
+      chunk_count: status.chunk_count,
+      error_message: status.error,
+    })
+    return status
+  },
+
   refreshDocumentStatus: async (kbId: number, docId: number) => {
-    try {
-      const status = await knowledgeApi.getDocumentStatus(kbId, docId)
-      get().applyDocumentStatusPatch(docId, {
-        status: status.status as Document['status'],
-        chunk_count: status.chunk_count,
-        error_message: status.error,
-      })
-      return status
-    } catch (error) {
-      handleApiError(error, '获取文档状态')
+    const requestKey = `${kbId}:${docId}`
+    const existing = inflightDocumentStatusRequests.get(requestKey)
+    if (existing) {
+      return existing
     }
+
+    const request = (async () => {
+      try {
+        const status = await knowledgeApi.getDocumentStatus(kbId, docId)
+        get().applyDocumentStatusPatch(docId, {
+          status: status.status as Document['status'],
+          chunk_count: status.chunk_count,
+          error_message: status.error,
+        })
+        return status
+      } catch (error: any) {
+        const statusCode = Number(error?.response?.status || 0)
+        if (statusCode === 429) {
+          console.warn(`[KnowledgeStore] 文档状态轮询触发限流，已静默退避: kb=${kbId}, doc=${docId}`)
+          return undefined
+        }
+        handleApiError(error, '获取文档状态')
+        return undefined
+      } finally {
+        inflightDocumentStatusRequests.delete(requestKey)
+      }
+    })()
+
+    inflightDocumentStatusRequests.set(requestKey, request)
+    return request
   },
 
   applyDocumentStatusPatch: (docId, patch) => {

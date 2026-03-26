@@ -38,8 +38,15 @@ import {
   CloseOutlined,
 } from '@ant-design/icons'
 import { useKnowledgeStore } from '@/stores/knowledgeStore'
-import type { KnowledgeDocumentStatusEventData, SearchResult } from '@/services/api'
-import { isApiCanceledError, isApiTimeoutError, knowledgeApi, normalizeDocumentStatus } from '@/services/api'
+import type {
+  DocumentExtractGranularity,
+  DocumentExtractProfile,
+  DocumentIngestMode,
+  DocumentUploadOptions,
+  KnowledgeDocumentStatusEventData,
+  SearchResult,
+} from '@/services/api'
+import { isApiCanceledError, isApiTimeoutError, knowledgeApi } from '@/services/api'
 import dayjs from 'dayjs'
 import { KnowledgeBaseCard, SharedKnowledgeBaseCard, SearchResultCard } from './components'
 import {
@@ -48,6 +55,7 @@ import {
   formatFileSize,
   type SharedKnowledgeBase,
 } from './utils'
+import { handleApiError } from '@/utils/apiErrorHandler'
 
 const { TextArea } = Input
 
@@ -73,6 +81,31 @@ const getSearchLogClassName = (level: SearchLogLevel): string => {
   if (level === 'error') return 'text-rose-300'
   return 'text-slate-300'
 }
+
+const PDF_UPLOAD_OPTIONS = [
+  {
+    label: '本地快速',
+    value: 'local_fast' as DocumentIngestMode,
+    description: '沿用当前本地提取链路，速度更快，适合普通 PDF。',
+  },
+  {
+    label: '在线多模态精读',
+    value: 'online_mm' as DocumentIngestMode,
+    description: '直接看页图提取正文、公式和表格，适合科研论文。',
+  },
+]
+
+const PDF_EXTRACT_PROFILE_OPTIONS = [
+  { label: '通用', value: 'general' as DocumentExtractProfile },
+  { label: '论文/公式优先', value: 'academic_formula' as DocumentExtractProfile },
+  { label: '表格优先', value: 'table_first' as DocumentExtractProfile },
+]
+
+const PDF_EXTRACT_GRANULARITY_OPTIONS = [
+  { label: '细', value: 'fine' as DocumentExtractGranularity, description: '更细的语义分块，适合精准检索和公式问答。' },
+  { label: '中', value: 'medium' as DocumentExtractGranularity, description: '平衡质量与分块数量，适合通用 RAG。' },
+  { label: '粗', value: 'coarse' as DocumentExtractGranularity, description: '更大的语义块，适合长上下文总结与综述。' },
+]
 
 /**
  * KnowledgePage - 知识库管理页面（重构版）
@@ -105,7 +138,7 @@ const KnowledgePage = () => {
     fetchDocuments,
     uploadDocument,
     deleteDocument,
-    refreshDocumentStatus,
+    retryDocument,
     applyDocumentStatusPatch,
     search,
     clearSearch,
@@ -136,6 +169,11 @@ const KnowledgePage = () => {
   const [searchFallbackUsed, setSearchFallbackUsed] = useState(false)
   const [searchFallbackReason, setSearchFallbackReason] = useState('')
   const [searchLogs, setSearchLogs] = useState<SearchLogEntry[]>([])
+  const [uploadOptionsVisible, setUploadOptionsVisible] = useState(false)
+  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null)
+  const [uploadIngestMode, setUploadIngestMode] = useState<DocumentIngestMode>('local_fast')
+  const [uploadExtractProfile, setUploadExtractProfile] = useState<DocumentExtractProfile>('general')
+  const [uploadExtractGranularity, setUploadExtractGranularity] = useState<DocumentExtractGranularity>('medium')
   const knowledgeStreamWarnedRef = useRef(false)
 
   const buildSearchLogEntry = useCallback((level: SearchLogLevel, message: string): SearchLogEntry => {
@@ -190,7 +228,12 @@ const KnowledgePage = () => {
       .streamStatusEvents(
         { kb_id: currentKnowledgeBase.id },
         (event, payload) => {
+          if (event === 'connected' || event === 'heartbeat') {
+            knowledgeStreamWarnedRef.current = false
+            return
+          }
           if (event !== 'document_status') return
+          knowledgeStreamWarnedRef.current = false
           const data = payload as KnowledgeDocumentStatusEventData
           const docId = Number(data?.document_id || 0)
           if (!Number.isFinite(docId) || docId <= 0) return
@@ -207,7 +250,7 @@ const KnowledgePage = () => {
         if (!knowledgeStreamWarnedRef.current) {
           knowledgeStreamWarnedRef.current = true
           console.warn('[KnowledgePage] 状态流订阅失败，降级低频轮询', error)
-          message.warning('实时状态流连接失败，已降级为低频轮询')
+          message.warning('实时状态流连接失败，正在自动重连')
         }
       })
 
@@ -215,26 +258,6 @@ const KnowledgePage = () => {
       streamController.abort()
     }
   }, [applyDocumentStatusPatch, currentKnowledgeBase])
-
-  // 低频回退轮询：仅在存在处理中/待处理文档时触发
-  useEffect(() => {
-    if (!currentKnowledgeBase) return
-    const processingDocs = documents.filter(
-      (d) => {
-        const normalized = normalizeDocumentStatus(d.status)
-        return normalized === 'running' || normalized === 'pending'
-      }
-    )
-    if (processingDocs.length === 0) return
-
-    const interval = setInterval(() => {
-      processingDocs.forEach((doc) => {
-        refreshDocumentStatus(currentKnowledgeBase.id, doc.id)
-      })
-    }, 30000)
-
-    return () => clearInterval(interval)
-  }, [documents, currentKnowledgeBase, refreshDocumentStatus])
 
   useEffect(() => {
     if (!isSearching) {
@@ -284,14 +307,50 @@ const KnowledgePage = () => {
     }
   }
 
-  const handleUpload = async (file: File) => {
+  const isPdfFile = (file: File) => {
+    const name = String(file.name || '').toLowerCase()
+    const type = String(file.type || '').toLowerCase()
+    return name.endsWith('.pdf') || type === 'application/pdf'
+  }
+
+  const executeUpload = async (file: File, options?: DocumentUploadOptions) => {
     if (!currentKnowledgeBase) return
     try {
-      await uploadDocument(currentKnowledgeBase.id, file)
+      await uploadDocument(currentKnowledgeBase.id, file, options)
       message.success('上传成功，正在处理...')
     } catch (error: any) {
-      // Error handled by store
+      handleApiError(error, '上传文档')
     }
+  }
+
+  const resetUploadOptions = () => {
+    setPendingUploadFile(null)
+    setUploadOptionsVisible(false)
+    setUploadIngestMode('local_fast')
+    setUploadExtractProfile('general')
+    setUploadExtractGranularity('medium')
+  }
+
+  const handleUpload = async (file: File) => {
+    if (!currentKnowledgeBase) return
+    if (!isPdfFile(file)) {
+      await executeUpload(file)
+      return
+    }
+    setPendingUploadFile(file)
+    setUploadOptionsVisible(true)
+  }
+
+  const handleConfirmPdfUpload = async () => {
+    if (!pendingUploadFile) return
+    const file = pendingUploadFile
+    const options: DocumentUploadOptions = {
+      ingestMode: uploadIngestMode,
+      extractProfile: uploadExtractProfile,
+      extractGranularity: uploadExtractGranularity,
+    }
+    resetUploadOptions()
+    await executeUpload(file, options)
   }
 
   const handleDelete = async () => {
@@ -309,6 +368,16 @@ const KnowledgePage = () => {
       setDeleteTarget(null)
     } catch {
       // Error handled by store
+    }
+  }
+
+  const handleRetryDocument = async (docId: number) => {
+    if (!currentKnowledgeBase) return
+    try {
+      const status = await retryDocument(currentKnowledgeBase.id, docId)
+      message.success(status.message || '已重新开始处理')
+    } catch (error) {
+      handleApiError(error, '重试文档处理')
     }
   }
 
@@ -639,9 +708,19 @@ const KnowledgePage = () => {
                 {
                   title: '操作',
                   key: 'action',
-                  width: 80,
+                  width: 140,
                   render: (_: any, record: any) => (
                     <Space>
+                      {['failed', 'timeout', 'cancelled', 'canceled', 'running'].includes(String(record.status || '').toLowerCase()) && (
+                        <Tooltip title={String(record.status || '').toLowerCase() === 'running' ? '继续处理' : '重试'}>
+                          <Button
+                            type="text"
+                            icon={<ReloadOutlined />}
+                            className="text-sky-400 hover:text-sky-300"
+                            onClick={() => handleRetryDocument(record.id)}
+                          />
+                        </Tooltip>
+                      )}
                       <Tooltip title="删除">
                         <Button
                           type="text"
@@ -926,6 +1005,71 @@ const KnowledgePage = () => {
             ? '确定要删除这个知识库吗？所有关联的文档和分片都将被删除。'
             : '确定要删除这个文档吗？此操作不可撤销。'}
         </p>
+      </Modal>
+
+      <Modal
+        title="PDF 处理方式"
+        open={uploadOptionsVisible}
+        onCancel={resetUploadOptions}
+        onOk={() => { void handleConfirmPdfUpload() }}
+        okText="开始上传"
+        cancelText="取消"
+        confirmLoading={isUploading}
+        destroyOnHidden
+      >
+        <div className="space-y-5">
+          <div>
+            <div className="mb-3 text-sm text-slate-300">处理模式</div>
+            <div className="space-y-2">
+              {PDF_UPLOAD_OPTIONS.map((option) => {
+                const active = uploadIngestMode === option.value
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => setUploadIngestMode(option.value)}
+                    className={`w-full rounded-lg border px-4 py-3 text-left transition ${
+                      active
+                        ? 'border-emerald-500 bg-emerald-500/10'
+                        : 'border-slate-700 bg-slate-900/60 hover:border-slate-500'
+                    }`}
+                  >
+                    <div className="text-sm font-medium text-white">{option.label}</div>
+                    <div className="mt-1 text-xs text-slate-400">{option.description}</div>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-2 text-sm text-slate-300">提取目标</div>
+            <Select
+              className="w-full"
+              value={uploadExtractProfile}
+              onChange={(value) => setUploadExtractProfile(value)}
+              options={PDF_EXTRACT_PROFILE_OPTIONS}
+            />
+          </div>
+
+          <div>
+            <div className="mb-2 text-sm text-slate-300">提取颗粒度</div>
+            <Select
+              className="w-full"
+              value={uploadExtractGranularity}
+              onChange={(value) => setUploadExtractGranularity(value)}
+              options={PDF_EXTRACT_GRANULARITY_OPTIONS.map((option) => ({
+                label: `${option.label}：${option.description}`,
+                value: option.value,
+              }))}
+            />
+          </div>
+
+          <div className="rounded-lg border border-slate-700 bg-slate-900/60 px-4 py-3 text-xs text-slate-400">
+            当前文件：
+            <span className="ml-1 text-slate-200">{pendingUploadFile?.name || '-'}</span>
+          </div>
+        </div>
       </Modal>
     </div>
   )

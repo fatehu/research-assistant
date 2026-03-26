@@ -48,16 +48,17 @@ class DashScopeMultimodalService:
         return resolved.as_uri()
 
     @classmethod
-    def collect_local_file_uris(cls, *raw_paths: str, limit: int = 3) -> List[str]:
+    def collect_local_file_uris(cls, *raw_paths: str, limit: Optional[int] = None) -> List[str]:
         uris: List[str] = []
         seen: set[str] = set()
+        max_items = None if limit is None else max(1, int(limit))
         for raw in raw_paths:
             uri = cls.normalize_file_uri(str(raw or "").strip())
             if not uri or uri in seen:
                 continue
             uris.append(uri)
             seen.add(uri)
-            if len(uris) >= max(1, int(limit)):
+            if max_items is not None and len(uris) >= max_items:
                 break
         return uris
 
@@ -114,7 +115,8 @@ class DashScopeMultimodalService:
     ) -> Dict[str, Any]:
         if not cls.is_available():
             raise RuntimeError("dashscope_sdk_unavailable")
-        file_uris = cls.collect_local_file_uris(*[str(item or "").strip() for item in list(image_paths or [])])
+        normalized_paths = [str(item or "").strip() for item in list(image_paths or [])]
+        file_uris = cls.collect_local_file_uris(*normalized_paths, limit=len(normalized_paths) or None)
         if not file_uris:
             raise RuntimeError("dashscope_local_image_missing")
 

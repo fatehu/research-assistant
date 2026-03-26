@@ -79,6 +79,15 @@ async def lifespan(app: FastAPI):
             int(cleanup_report.get("remaining_old_keys") or 0),
         )
 
+    recovery_report = await knowledge.resume_interrupted_document_tasks_on_startup()
+    logger.info(
+        "[KnowledgeResume] enabled={} scheduled={} marked_failed={} documents={}",
+        bool(recovery_report.get("enabled")),
+        int(recovery_report.get("scheduled") or 0),
+        int(recovery_report.get("marked_failed") or 0),
+        list(recovery_report.get("documents") or []),
+    )
+
     yield
     
     logger.info("👋 应用关闭")

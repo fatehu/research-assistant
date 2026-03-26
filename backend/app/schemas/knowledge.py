@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+DocumentUploadMode = Literal["local_fast", "online_mm", "auto"]
+DocumentExtractProfile = Literal["general", "academic_formula", "table_first"]
+DocumentExtractGranularity = Literal["fine", "medium", "coarse"]
+
+
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
@@ -55,6 +60,9 @@ class DocumentUploadResponse(BaseModel):
     file_size: int
     file_type: str
     status: str
+    processing_mode: DocumentUploadMode = "local_fast"
+    extract_profile: DocumentExtractProfile = "general"
+    extract_granularity: DocumentExtractGranularity = "medium"
     message: str
 
 
@@ -66,6 +74,9 @@ class DocumentResponse(BaseModel):
     file_size: int
     file_type: str
     status: str
+    processing_mode: DocumentUploadMode = "local_fast"
+    extract_profile: DocumentExtractProfile = "general"
+    extract_granularity: DocumentExtractGranularity = "medium"
     error_message: Optional[str]
     chunk_count: int
     token_count: int

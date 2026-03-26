@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.api import knowledge as knowledge_api
 from app.api import literature as literature_api
 from app.models.knowledge import DocumentStatus
 from app.models.literature import KnowledgeLinkStatus
@@ -26,6 +27,9 @@ class _FakeResult:
     def __init__(self, *, row=None, rows=None):
         self._row = row
         self._rows = list(rows or [])
+
+    def scalar(self):
+        return self._row
 
     def scalar_one_or_none(self):
         return self._row
@@ -3632,6 +3636,166 @@ def test_mark_stale_document_timeout_marks_processing_doc_as_timeout(monkeypatch
     assert changed is True
     assert doc.status == DocumentStatus.TIMEOUT.value
     assert "文档处理超时" in doc.error_message
+
+
+def test_list_documents_should_mark_stale_running_doc_as_timeout(monkeypatch):
+    stale_doc = SimpleNamespace(
+        id=301,
+        knowledge_base_id=41,
+        filename="stale.pdf",
+        original_filename="stale.pdf",
+        file_size=128,
+        file_type="application/pdf",
+        metadata_={},
+        status=DocumentStatus.RUNNING.value,
+        processing_mode="local_fast",
+        extract_profile="general",
+        error_message=None,
+        chunk_count=0,
+        token_count=0,
+        char_count=0,
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        processed_at=None,
+    )
+    kb = SimpleNamespace(id=41, user_id=7)
+    published: list[tuple[int, int, str]] = []
+
+    class _FakeDocumentListDB:
+        def __init__(self):
+            self.committed = False
+            self.refreshed: list[int] = []
+            self._results = [
+                _FakeResult(row=1),
+                _FakeResult(rows=[stale_doc]),
+            ]
+
+        async def get(self, model, ident):
+            if model is knowledge_api.KnowledgeBase and ident == 41:
+                return kb
+            return None
+
+        async def execute(self, _query):
+            return self._results.pop(0)
+
+        async def commit(self):
+            self.committed = True
+
+        async def refresh(self, doc):
+            self.refreshed.append(int(doc.id))
+
+    async def _fake_publish_document_status_event(*, user_id: int, kb_id: int, doc):
+        published.append((user_id, kb_id, int(doc.id)))
+
+    monkeypatch.setattr(knowledge_api.settings, "document_processing_stale_timeout_seconds", 60)
+    monkeypatch.setattr(knowledge_api, "_publish_document_status_event", _fake_publish_document_status_event)
+
+    db = _FakeDocumentListDB()
+    async def _run():
+        return await knowledge_api.list_documents(
+            kb_id=41,
+            skip=0,
+            limit=20,
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.total == 1
+    assert len(response.items) == 1
+    assert response.items[0].status == DocumentStatus.TIMEOUT.value
+    assert "文档处理超时" in str(response.items[0].error_message or "")
+    assert stale_doc.status == DocumentStatus.TIMEOUT.value
+    assert db.committed is True
+    assert db.refreshed == [301]
+    assert published == [(7, 41, 301)]
+
+
+def test_collection_knowledge_readiness_should_treat_stale_running_link_as_timeout(monkeypatch):
+    stale_doc = SimpleNamespace(
+        id=911,
+        status=DocumentStatus.RUNNING.value,
+        error_message=None,
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    link = SimpleNamespace(
+        id=612,
+        paper_id=501,
+        document_id=911,
+        status=KnowledgeLinkStatus.RUNNING.value,
+        error_message=None,
+    )
+    paper = SimpleNamespace(
+        id=501,
+        title="Timeout Candidate",
+        created_at=datetime.now(timezone.utc),
+    )
+    published: list[int] = []
+
+    class _FakeCollectionReadinessDB:
+        def __init__(self):
+            self.committed = False
+            self.refreshed: list[int] = []
+            self._results = [
+                _FakeResult(rows=[paper]),
+                _FakeResult(rows=[link]),
+            ]
+
+        async def execute(self, _query):
+            return self._results.pop(0)
+
+        async def get(self, model, ident):
+            if model is literature_api.Document and ident == 911:
+                return stale_doc
+            return None
+
+        async def commit(self):
+            self.committed = True
+
+        async def refresh(self, obj):
+            self.refreshed.append(int(obj.id))
+
+    async def _fake_get_owned_collection(_db, _current_user, _collection_id):
+        return SimpleNamespace(id=88, user_id=3)
+
+    async def _fake_get_owned_kb(_db, _current_user, _kb_id):
+        return SimpleNamespace(id=77, user_id=3)
+
+    async def _fake_publish_paper_link_status_event(item):
+        published.append(int(item.id))
+
+    monkeypatch.setattr(literature_api.settings, "document_processing_stale_timeout_seconds", 60)
+    monkeypatch.setattr(literature_api, "_get_owned_collection_or_404", _fake_get_owned_collection)
+    monkeypatch.setattr(literature_api, "_get_owned_kb_or_404", _fake_get_owned_kb)
+    monkeypatch.setattr(literature_api, "_resolve_local_pdf_path", lambda _user_id, _paper: "/tmp/fake.pdf")
+    monkeypatch.setattr(literature_api, "_publish_paper_link_status_event", _fake_publish_paper_link_status_event)
+
+    db = _FakeCollectionReadinessDB()
+    async def _run():
+        return await literature_api.get_collection_knowledge_readiness(
+            collection_id=88,
+            knowledge_base_id=77,
+            db=db,
+            current_user=SimpleNamespace(id=3),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.total_papers == 1
+    assert response.running_papers == 0
+    assert response.timeout_papers == 1
+    assert response.can_cross_paper_answer is False
+    assert len(response.papers) == 1
+    assert response.papers[0].status == KnowledgeLinkStatus.TIMEOUT.value
+    assert response.papers[0].document_id == 911
+    assert "文档处理超时" in str(response.papers[0].error_message or "")
+    assert stale_doc.status == DocumentStatus.TIMEOUT.value
+    assert link.status == KnowledgeLinkStatus.TIMEOUT.value
+    assert "文档处理超时" in str(link.error_message or "")
+    assert db.committed is True
+    assert published == [612]
 
 
 def test_normalize_collection_name_repairs_known_mojibake_tokens():
