@@ -565,6 +565,8 @@ class PdfRagIngestService:
     ) -> tuple[list[ProcessedPdfLine], list[ProcessedPdfLine], dict[str, Any]]:
         accepted: list[ProcessedPdfLine] = []
         dropped: list[ProcessedPdfLine] = []
+        pending_repairs: list[tuple[PdfLineRecord, str]] = []
+        staged_actions: list[tuple[PdfLineRecord, str]] = []
         action_counts = {"KEEP": 0, "REPAIR": 0, "DROP": 0}
         repair_count = 0
 
@@ -589,6 +591,29 @@ class PdfRagIngestService:
                 action = "KEEP"
             action_counts[action] += 1
 
+            if action == "DROP":
+                dropped.append(
+                    ProcessedPdfLine(
+                        source=line,
+                        final_action="DROP",
+                        normalized_text="",
+                        debug={"reason": "model_drop"},
+                    )
+                )
+                continue
+
+            staged_actions.append((line, action))
+            if action == "REPAIR":
+                pending_repairs.append((line, action))
+
+        repair_results: dict[str, tuple[str, str]] = {}
+        for line, _action in pending_repairs:
+            cleaned = await asyncio.to_thread(_runtime.clean_line, line.source_text)
+            normalized = self._sanitize_clean_output(source_text=line.source_text, cleaned_text=cleaned)
+            repair_results[line.line_uid] = (cleaned, normalized)
+            repair_count += 1
+
+        for line, action in staged_actions:
             if action == "KEEP":
                 accepted.append(
                     ProcessedPdfLine(
@@ -599,27 +624,17 @@ class PdfRagIngestService:
                 )
                 continue
 
-            if action == "REPAIR":
-                cleaned = await asyncio.to_thread(_runtime.clean_line, line.source_text)
-                normalized = self._sanitize_clean_output(source_text=line.source_text, cleaned_text=cleaned)
-                accepted.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="REPAIR",
-                        normalized_text=normalized,
-                        repair_used=True,
-                        debug={"cleaned_text": cleaned},
-                    )
-                )
-                repair_count += 1
-                continue
-
-            dropped.append(
+            cleaned_text, normalized_text = repair_results.get(
+                line.line_uid,
+                (line.source_text, line.source_text),
+            )
+            accepted.append(
                 ProcessedPdfLine(
                     source=line,
-                    final_action="DROP",
-                    normalized_text="",
-                    debug={"reason": "model_drop"},
+                    final_action="REPAIR",
+                    normalized_text=normalized_text,
+                    repair_used=True,
+                    debug={"cleaned_text": cleaned_text},
                 )
             )
 

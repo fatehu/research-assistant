@@ -68,6 +68,35 @@ class _UnavailableRuntime:
         return None
 
 
+class _PhaseRecordingRuntime:
+    load_error = None
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def release(self) -> None:
+        return None
+
+    def classify_action(self, text: str) -> str:
+        self.calls.append(f"action:{text}")
+        if "repair" in text.lower():
+            return "REPAIR"
+        return "KEEP"
+
+    def clean_line(self, text: str) -> str:
+        self.calls.append(f"clean:{text}")
+        return text.replace("repair", "cleaned")
+
+    def classify_chunk(self, prev_line: str, curr_line: str) -> str:
+        self.calls.append(f"chunk:{curr_line}")
+        if curr_line.startswith("Methods"):
+            return "NEW_CHUNK"
+        return "JOIN_PREV"
+
+
 @pytest.mark.asyncio
 async def test_ingest_pdf_builds_line_chunks_with_raw_and_normalized_metadata(monkeypatch):
     service = PdfRagIngestService()
@@ -193,3 +222,32 @@ async def test_ingest_pdf_returns_unapplied_when_runtime_unavailable(monkeypatch
     assert result["applied"] is False
     assert str(result["failure_reason"]).startswith("qwen_runtime_unavailable:")
     assert result["report"]["line_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_pdf_runs_action_phase_before_clean_phase(monkeypatch):
+    service = PdfRagIngestService()
+    runtime = _PhaseRecordingRuntime()
+    lines = [
+        _line(order=0, page=1, text="Introduction", start=0, end=12),
+        _line(order=1, page=1, text="Needs repair alpha", start=13, end=31),
+        _line(order=2, page=1, text="Needs repair beta", start=32, end=49),
+        _line(order=3, page=1, text="Methods", start=50, end=57),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_extract_lines",
+        lambda _file_path: (lines, "\n".join(item.raw_text for item in lines)),
+    )
+    monkeypatch.setattr(pdf_rag_module, "_runtime", runtime)
+
+    result = await service.ingest_pdf(file_path="dummy.pdf", document_name="paper.pdf")
+
+    assert result["applied"] is True
+    action_positions = [idx for idx, call in enumerate(runtime.calls) if call.startswith("action:")]
+    clean_positions = [idx for idx, call in enumerate(runtime.calls) if call.startswith("clean:")]
+    assert len(action_positions) == 4
+    assert len(clean_positions) == 2
+    assert max(action_positions) < min(clean_positions)
+    assert "Needs cleaned alpha" in result["chunks"][0]["content"]
+    assert "Needs cleaned beta" in result["chunks"][0]["content"]
