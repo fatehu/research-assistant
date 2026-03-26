@@ -1,0 +1,25 @@
+{
+  "manifest_version": "local_structured_pdf_external_suites_v1",
+  "generated_at": "2026-03-25T15:59:35Z",
+  "notes": [
+    "This manifest is for external validation suites only.",
+    "READoc is the first recommended external suite because it is document-level PDF -> Markdown and aligns with the local_structured_pdf pipeline.",
+    "Keep opendataloader-bench as the final scoring gate; use external suites to shape general heuristics."
+  ],
+  "suites": [
+    {
+      "name": "readoc_holdout",
+      "description": "External READoc holdout. Expected folder structure: backend/tmp/external/readoc/pdfs + backend/tmp/external/readoc/markdown.",
+      "input_dir": "tmp/external/readoc/pdfs",
+      "ground_truth_dir": "tmp/external/readoc/markdown",
+      "enabled": false
+    },
+    {
+      "name": "readoc_arxiv_sample",
+      "description": "Small READoc arXiv sample built from direct PDF downloads and GT markdown.",
+      "input_dir": "tmp/external/readoc_arxiv_sample/pdfs",
+      "ground_truth_dir": "tmp/external/readoc_arxiv_sample/markdown",
+      "enabled": true
+    }
+  ]
+}

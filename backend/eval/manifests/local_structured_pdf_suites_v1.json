@@ -1,0 +1,20 @@
+{
+  "manifest_version": "local_structured_pdf_suites_v1",
+  "generated_at": "2026-03-25T00:00:00Z",
+  "suites": [
+    {
+      "name": "opendataloader_bench_full",
+      "description": "Full 200-document regression suite based on opendataloader-bench.",
+      "input_dir": "tmp/local-bench/pdfs",
+      "ground_truth_dir": "tmp/local-bench/ground-truth/markdown",
+      "enabled": true
+    },
+    {
+      "name": "benchmark_smoke",
+      "description": "Tiny frozen smoke subset for fast iteration and sanity checks.",
+      "input_dir": "tmp/benchmark_smoke_pdfs",
+      "ground_truth_dir": "tmp/local-bench/ground-truth/markdown",
+      "enabled": true
+    }
+  ]
+}
