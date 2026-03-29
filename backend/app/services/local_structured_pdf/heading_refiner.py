@@ -120,6 +120,8 @@ class LocalPdfHeadingRefiner:
         text = _SPACE_RE.sub(" ", str(block.text or "").strip())
         if not text or int(block.page_start) != int(block.page_end):
             return False
+        if not list(block.line_ids or []):
+            return False
         if _CAPTION_PREFIX_RE.match(text) or _FOOTNOTE_PREFIX_RE.match(text):
             return False
         if self._looks_table_like_text(text):

@@ -189,3 +189,66 @@ def test_run_eval_suite_checks_pipeline_runtime_before_export(tmp_path: Path, mo
         assert "missing parser backend" in str(exc)
     else:  # pragma: no cover - defensive guard
         raise AssertionError("Expected runtime preflight failure")
+
+
+def test_run_eval_suite_uses_hybrid_pipeline_and_writes_trace(tmp_path: Path, monkeypatch):
+    input_dir = tmp_path / "pdfs"
+    input_dir.mkdir()
+    (input_dir / "demo.pdf").write_bytes(b"%PDF-1.4")
+    output_root = tmp_path / "results"
+
+    class _Trace:
+        def __init__(self) -> None:
+            self.document = object()
+
+        def to_dict(self) -> dict:
+            return {"mode": "auto", "backend_used_pages": [1]}
+
+    class _Pipeline:
+        def __init__(self, *, heuristic_profile: str):
+            self.heuristic_profile = heuristic_profile
+
+        def ensure_runtime_ready(self) -> None:
+            return None
+
+        async def parse_document_with_trace(self, *, pdf_path: str, page_limit: int | None = None, mode: str = "auto"):
+            assert pdf_path.endswith("demo.pdf")
+            assert page_limit == 1
+            assert mode == "full"
+            return _Trace()
+
+    class _Renderer:
+        def render_document(self, *, document):
+            assert document is not None
+            return "# demo"
+
+    monkeypatch.setattr(
+        "app.services.local_structured_pdf.eval_suite_runner.LocalStructuredPdfCompatHybridPipeline",
+        _Pipeline,
+    )
+    monkeypatch.setattr(
+        "app.services.local_structured_pdf.eval_suite_runner.LocalPdfMarkdownRenderer",
+        lambda: _Renderer(),
+    )
+
+    suite = LocalPdfEvalSuite(name="hybrid", input_dir=input_dir)
+    report = run_eval_suite(
+        suite=suite,
+        project_root=tmp_path,
+        output_root=output_root,
+        engine_name="local-structured-pdf",
+        heuristic_profile="balanced",
+        pipeline_mode="hybrid",
+        hybrid_mode="full",
+        write_trace=True,
+        page_limit=1,
+        evaluator_python=None,
+        evaluator_script=None,
+    )
+
+    trace_path = output_root / "balanced" / "hybrid" / "trace" / "local-structured-pdf" / "demo.json"
+    markdown_path = output_root / "balanced" / "hybrid" / "prediction" / "local-structured-pdf" / "markdown" / "demo.md"
+    assert report["pipeline_mode"] == "hybrid"
+    assert report["hybrid_mode"] == "full"
+    assert trace_path.is_file()
+    assert markdown_path.read_text(encoding="utf-8") == "# demo"

@@ -39,6 +39,7 @@ aiofiles==23.2.1
 sse-starlette==2.1.0
 
 # PDF parsing
+docling==2.82.0
 pypdf==4.0.0
 pdfplumber==0.10.3
 Pillow==11.2.1

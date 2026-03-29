@@ -1,0 +1,35 @@
+{
+  "manifest_version": "local_structured_pdf_eval_suites_v1",
+  "generated_at": "2026-03-27T00:00:00Z",
+  "suites": [
+    {
+      "name": "bm20_hybrid_20260327",
+      "description": "Temporary 20-document hybrid auto subset for Java-aligned local structured PDF validation.",
+      "input_dir": "tmp/local-bench/pdfs",
+      "ground_truth_dir": "tmp/local-bench/ground-truth/markdown",
+      "enabled": true,
+      "doc_ids": [
+        "01030000000001",
+        "01030000000029",
+        "01030000000165",
+        "01030000000147",
+        "01030000000189",
+        "01030000000190",
+        "01030000000200",
+        "01030000000141",
+        "01030000000172",
+        "01030000000107",
+        "01030000000121",
+        "01030000000196",
+        "01030000000038",
+        "01030000000181",
+        "01030000000199",
+        "01030000000039",
+        "01030000000148",
+        "01030000000163",
+        "01030000000110",
+        "01030000000182"
+      ]
+    }
+  ]
+}

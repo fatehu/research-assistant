@@ -68,9 +68,26 @@
    - [markdown_renderer.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/markdown_renderer.py)
    - 输出 Markdown，用于 benchmark 和人工 review
 
+8. `hybrid plan`
+   - [page_triage_service.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/page_triage_service.py)
+   - [hybrid_planner.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/hybrid_planner.py)
+   - 先产出 `local/backend` 页级路由清单，为 selective hybrid 做入口层
+
+9. `hybrid execute`
+   - [ollama_page_parser.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/ollama_page_parser.py)
+   - [hybrid_backend_transformer.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/hybrid_backend_transformer.py)
+   - [hybrid_fusion_service.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/hybrid_fusion_service.py)
+   - [hybrid_pipeline.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/hybrid_pipeline.py)
+   - 只对 triage 判成 `backend` 的页调用本地 `Ollama Qwen VL`
+   - 模型不直接输出最终内部 schema，而是先输出更松的 docling 风格 backend 结果
+   - Python 侧 `hybrid_backend_transformer` 再把 backend 结果转成内部块，并统一走后处理
+   - backend 文本家具项 `page_header / page_footer` 会在 transformer 层直接过滤
+   - backend 页内对象会按 `bbox` 重排阅读顺序，不盲信模型给出的顺序
+
 总入口：
 
 - [pipeline.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/pipeline.py)
+- [hybrid_pipeline.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/hybrid_pipeline.py)
 
 ## 4. 当前已完成的工作
 
@@ -133,6 +150,54 @@
 - [run_local_structured_pdf_eval_suites.py](/mnt/d/codefield/agent-platform/research-assistant/backend/scripts/run_local_structured_pdf_eval_suites.py)
 - [external_holdout_builder.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/external_holdout_builder.py)
 - [readoc_holdout_builder.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/readoc_holdout_builder.py)
+
+### 4.6 Hybrid v1 入口
+
+已经完成：
+
+- 页级 `triage`
+- 本地 `Ollama Qwen VL` 页级结构解析器
+- backend-like loose output -> transformer
+- backend 页失败自动回退本地结果
+- backend 页与本地结果的保守 merge
+- merge 后继续复用本地后处理，而不是让模型直接写最终 Markdown
+
+当前 Hybrid v1 的边界：
+
+- 只做页级 selective hybrid，不做整篇全量多模态
+- 模型优先返回更松的 `texts / tables / pictures / elements`
+- prompt 不再让模型输出内部 `line_id`
+- 内部锚点只留在程序侧使用，模型主协议改成 `label/text/bbox/prov`
+- 最终 Markdown 仍然由本地程序渲染
+- 当前还没有把 hybrid 接入旧知识库主链
+
+### 4.7 Hybrid 当前模型策略
+
+当前默认策略是：
+
+1. `page triage` 先决定哪些页走 backend
+2. backend 优先使用本地 `Ollama` 上的 `qwen3.5:0.8b`
+3. 如有需要，可按链式升级到 `2b / 4b`
+
+当前推荐配置：
+
+- `LOCAL_STRUCTURED_PDF_HYBRID_MODEL_CHAIN=qwen3.5:0.8b,qwen3.5:2b-q4_K_M,qwen3.5:4b-q4_K_M`
+- `LOCAL_STRUCTURED_PDF_HYBRID_ENABLE_NATIVE_FALLBACK=false`
+- `LOCAL_STRUCTURED_PDF_HYBRID_DISABLE_THINKING=true`
+
+这条链的意图不是默认把所有页都交给更大模型，而是：
+
+- 先让 `0.8b` 处理大多数可解释难页
+- 只有结果明显不足时，再升级到 `2b / 4b`
+- 默认优先走 Ollama 的 `/v1/chat/completions`
+- `native /api/chat` 只保留为显式开启的 fallback，不再作为默认路径
+- 当前对文档解析任务推荐保持 non-thinking，避免小模型在 JSON 输出上发散
+
+这和 `opendataloader-pdf` 的 hybrid 思路保持一致：
+
+- 本地规则链仍是主干
+- backend 只负责难页
+- backend 输出先经过 transformer，再进入本地后处理
 
 ## 5. 当前评测状态
 
@@ -292,7 +357,7 @@
 
 ## 9. 本地模式与 hybrid 的关系
 
-当前阶段已经适合进入 hybrid 准备，但不建议立刻把整条链改成全量多模态。
+当前阶段已经进入 hybrid v1，但不建议立刻把整条链改成全量多模态。
 
 更合理的路线是：
 
@@ -302,7 +367,130 @@
 4. 多模态只负责复杂页的区域理解、顺序补强和特殊块识别。
 5. 最终 Markdown / chunk 仍尽量由本地程序生成。
 
+当前已经落地的是：
+
+- 页级 triage
+- `Ollama Qwen VL` 页级 parser
+- backend 页失败自动回退本地
+- backend 页与本地结果的保守 merge
+- benchmark/export 脚本已支持 `--pipeline-mode hybrid --hybrid-mode auto|full --write-trace`
+
+当前需要特别澄清的一点：
+
+- `opendataloader-pdf` 的 hybrid 主体并不是“让一个 256M 小视觉模型直接输出整页结构 schema”
+- 它的主 backend 是 `docling-fast` 这类文档解析服务，客户端只请求 `JSON`，再由 Java 侧 transformer 转成内部对象
+- 官方文档里提到的 `SmolVLM (256M)` 只用于 `picture description`，不是 hybrid 主解析器
+- 因此，本仓库当前这条 `Ollama Qwen 0.8B` 本地 hybrid，只能视为“页级辅助解析实验线”，不能把它等同于 Java hybrid backend
+
+这也解释了为什么小参数本地模型不适合承担过重职责：
+
+- 它更适合返回松一点的 `elements/type/line_ids`，再由程序做 transform
+- 不适合直接承担 OCR、复杂表格重建、整页自由结构生成
+- 对 `visual_or_scanned` 这类弱文本页，当前 anchored parser 仍然不是最终方案
+
+当前可调的 hybrid 关键环境变量：
+
+- `OLLAMA_BASE_URL`
+- `LOCAL_STRUCTURED_PDF_HYBRID_MODEL`
+- `LOCAL_STRUCTURED_PDF_HYBRID_TIMEOUT_SECONDS`
+- `LOCAL_STRUCTURED_PDF_HYBRID_RENDER_DPI`
+- `LOCAL_STRUCTURED_PDF_HYBRID_MAX_IMAGE_SIDE`
+- `LOCAL_STRUCTURED_PDF_HYBRID_MAX_LINES_PER_PAGE`
+
+注意：
+
+- `hybrid` 不再自动复用通用 `OLLAMA_MODEL`
+- 必须显式设置 `LOCAL_STRUCTURED_PDF_HYBRID_MODEL`
+- 这样可以避免把普通文本模型误当作视觉模型去解析 PDF 页图
+
+当前还没有落地的是：
+
+- 与知识库上传主链的接线
+- `hybrid` benchmark 专项评测
+- 多模态页结果的更细粒度 table/formula 专用后处理
+
 也就是说，本地模式不是 hybrid 的过渡废案，而是 hybrid 的主干和兜底。
+
+### 9.1 Upstream 兼容 hybrid backend
+
+为了对齐 `opendataloader-pdf` 仓库的整体 hybrid 架构，而不只是对齐 Java 侧 orchestration，
+当前仓库额外提供了一个 upstream 兼容 backend：
+
+- [opendataloader_compat_server.py](/mnt/d/codefield/agent-platform/research-assistant/backend/app/services/local_structured_pdf/opendataloader_compat_server.py)
+
+它复用了 upstream Python backend 的基本服务形态：
+
+- `GET /health`
+- `POST /v1/convert/file`
+- `status/document/errors/failed_pages` 响应 envelope
+
+当前实现策略是：
+
+- 保留 upstream 风格服务接口
+- 用本仓库的本地/混合解析 adapter 替代 upstream 的 `DocumentConverter`
+- 把结果转成 docling-like `pages/texts/tables/pictures` JSON
+
+Docker Compose 已提供独立服务：
+
+```bash
+docker compose up -d pdf-hybrid-backend
+```
+
+默认端口：
+
+- `http://localhost:5002/health`
+- `http://localhost:5002/v1/convert/file`
+
+默认模型链：
+
+- `qwen3.5:0.8b`
+- `qwen3.5:2b-q4_K_M`
+- `qwen3.5:4b-q4_K_M`
+
+可通过 `.env` 覆盖：
+
+- `LOCAL_STRUCTURED_PDF_HYBRID_MODEL`
+- `LOCAL_STRUCTURED_PDF_HYBRID_MODEL_CHAIN`
+- `PDF_HYBRID_BACKEND_FORCE_OCR`
+- `PDF_HYBRID_BACKEND_OCR_LANG`
+- `PDF_HYBRID_BACKEND_ENRICH_FORMULA`
+- `PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION`
+- `PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT`
+
+当前 compat backend 的 `force_ocr / enrich_formula / enrich_picture_description` 已经映射到 Qwen 路径里的任务提示，不再依赖 upstream 的 `EasyOCR / SmolVLM / docling-fast` 模型位下载。也就是说，独立 `pdf-hybrid-backend` 服务继续复用本仓库 backend 镜像与本地 Ollama Qwen 链，不额外引入这些 upstream 依赖。
+
+### 9.2 当前可直接使用的命令
+
+单 PDF 人工 review bundle：
+
+```bash
+docker compose exec -T backend sh -lc '
+  PYTHONPATH=/app python scripts/export_local_structured_pdf_review.py \
+    --pdf /app/tmp/local-bench/pdfs/01030000000001.pdf \
+    --pipeline-mode hybrid \
+    --hybrid-mode auto \
+    --page-limit 1
+'
+```
+
+这会在 `backend/tmp/manual_review/<pdf-stem>/` 下输出：
+
+- `parsed.md`
+- `document.json`
+- `trace.json`（仅 hybrid）
+- `summary.json`
+- `page-0001.png`
+
+跑 suite / benchmark 导出：
+
+```bash
+docker compose exec -T backend sh -lc '
+  PYTHONPATH=/app python scripts/run_local_structured_pdf_eval_suites.py \
+    --pipeline-mode hybrid \
+    --hybrid-mode auto \
+    --write-trace
+'
+```
 
 ## 10. 配套文档
 

@@ -232,7 +232,7 @@ def _should_run_chunk_quality_gate(*, gate_enabled: bool, used_pdf_rag_ingest: b
     return True
 
 
-_DOCUMENT_UPLOAD_MODES: Set[str] = {"local_fast", "online_mm", "auto"}
+_DOCUMENT_UPLOAD_MODES: Set[str] = {"local_fast", "local_hybrid", "online_mm", "auto"}
 _DOCUMENT_EXTRACT_PROFILES: Set[str] = {"general", "academic_formula", "table_first"}
 _DOCUMENT_EXTRACT_GRANULARITIES: Set[str] = {"fine", "medium", "coarse"}
 
@@ -288,6 +288,10 @@ def _document_extract_granularity(doc: Document) -> DocumentExtractGranularity:
     if token not in _DOCUMENT_EXTRACT_GRANULARITIES:
         token = "medium"
     return token  # type: ignore[return-value]
+
+
+def _resolve_pdf_rag_structured_mode(requested_ingest_mode: DocumentUploadMode) -> str:
+    return "hybrid" if requested_ingest_mode == "local_hybrid" else "fast"
 
 
 def _build_document_response(doc: Document) -> DocumentResponse:
@@ -1269,11 +1273,12 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
 
             elif doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
                 extract_started_at = time.perf_counter()
-                logger.info(f"[doc:{task_trace_id}] 开始 PDF 行级 RAG 入库链路: {doc_id}")
+                logger.info(f"[doc:{task_trace_id}] 开始 PDF 结构化 RAG 入库链路: {doc_id}")
                 pdf_rag_service = get_pdf_rag_ingest_service()
                 pdf_result = await pdf_rag_service.ingest_pdf(
                     file_path=doc.file_path,
                     document_name=doc.original_filename or doc.filename or "",
+                    mode=_resolve_pdf_rag_structured_mode(requested_ingest_mode),
                 )
                 text = str(pdf_result.get("document_text") or "")
                 current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
@@ -1285,13 +1290,13 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     primary_chunks = list(pdf_result.get("chunks") or [])
                     used_pdf_rag_ingest = True
                     logger.info(
-                        f"[doc:{task_trace_id}] PDF 行级 RAG 链路完成: chars={len(text)}, chunks={len(primary_chunks)}, "
+                        f"[doc:{task_trace_id}] PDF 结构化 RAG 链路完成: chars={len(text)}, chunks={len(primary_chunks)}, "
                         f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
                         f"elapsed={_task_elapsed_ms():.2f}ms"
                     )
                 else:
                     logger.warning(
-                        f"[doc:{task_trace_id}] PDF 行级 RAG 链路未启用成功，回退旧链路: "
+                        f"[doc:{task_trace_id}] PDF 结构化 RAG 链路未启用成功，回退旧链路: "
                         f"reason={pdf_result.get('failure_reason')}, elapsed={_task_elapsed_ms():.2f}ms"
                     )
 

@@ -1,859 +1,283 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import io
-import json
 import re
-from dataclasses import dataclass, field
-from difflib import SequenceMatcher
-from pathlib import Path
-from threading import Lock
 from typing import Any, Optional
 
-import httpx
 from loguru import logger
 
 from app.config import settings
+from app.services.local_structured_pdf.contracts import (
+    PdfBBox,
+    PdfHybridExecutionResult,
+    PdfSemanticBlock,
+    PdfStructuredDocument,
+)
+from app.services.local_structured_pdf.docling_fast_hybrid_pipeline import (
+    LocalStructuredPdfDoclingFastHybridPipeline,
+)
+from app.services.local_structured_pdf.markdown_renderer import LocalPdfMarkdownRenderer
+from app.services.local_structured_pdf.pipeline import LocalStructuredPdfPipeline
 from app.services.smart_chunking.types import ChunkLevel, generate_chunk_id
 
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SPACE_RE = re.compile(r"\s+")
-_PAGE_NO_RE = re.compile(r"^(?:page\s*)?\d+(?:\s*/\s*\d+)?$", re.IGNORECASE)
-_SYMBOL_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
-
-
-ACTION_SYSTEM = (
-    "You classify one extracted PDF line. "
-    "Reply with one label only: KEEP, REPAIR, or DROP. "
-    "Do not explain."
-)
-ACTION_USER_TEMPLATE = """Classify this PDF line.
-
-Return exactly one label:
-- KEEP
-- REPAIR
-- DROP
-
-Line:
-{text}"""
-
-CLEAN_SYSTEM = (
-    "You clean one extracted PDF line. "
-    "Reply with the cleaned text only. "
-    "Do not explain. "
-    "Do not add information that is not present in the line."
-)
-CLEAN_USER_TEMPLATE = """Clean this extracted PDF line.
-
-Return only the cleaned text.
-
-Original line:
-{text}"""
-
-CHUNK_SYSTEM = (
-    "You decide whether the current line should join the previous line in the same retrieval chunk. "
-    "Reply with one label only: JOIN_PREV or NEW_CHUNK. "
-    "Do not explain."
-)
-CHUNK_USER_TEMPLATE = """Decide whether the current line should stay in the same chunk as the previous line.
-
-Return exactly one label:
-- JOIN_PREV
-- NEW_CHUNK
-
-Previous line:
-{prev_line}
-
-Current line:
-{curr_line}"""
-
-
-def _normalize_spaces(text: str) -> str:
-    return _SPACE_RE.sub(" ", str(text or "")).strip()
-
-
-def _clean_visible_text(text: str) -> str:
-    cleaned = _CONTROL_CHARS.sub("", str(text or ""))
-    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = cleaned.replace("\u00a0", " ")
-    return cleaned.strip()
-
-
-def _safe_similarity(a: str, b: str) -> float:
-    try:
-        return float(SequenceMatcher(None, a or "", b or "").ratio())
-    except Exception:
-        return 0.0
-
-
-@dataclass
-class PdfLineRecord:
-    source_order: int
-    page: int
-    page_line_index: int
-    line_id: str
-    line_uid: str
-    raw_text: str
-    source_text: str
-    bbox: dict[str, float]
-    column_slot: str
-    raw_doc_start: int = 0
-    raw_doc_end: int = 0
-
-
-@dataclass
-class ProcessedPdfLine:
-    source: PdfLineRecord
-    final_action: str
-    normalized_text: str
-    repair_used: bool = False
-    ocr_used: bool = False
-    ocr_text: Optional[str] = None
-    debug: dict[str, Any] = field(default_factory=dict)
-
-
-class _QwenAdapterRuntime:
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._ready = False
-        self._load_error: Optional[str] = None
-        self._model: Any = None
-        self._tokenizer: Any = None
-        self._device: str = "cpu"
-        self._current_task: str = ""
-        self._deps: dict[str, Any] = {}
-
-    @staticmethod
-    def _resolve_model_dir(path_value: str) -> Path:
-        path = Path(str(path_value or "").strip())
-        if path.is_absolute():
-            return path
-        backend_root = Path(__file__).resolve().parents[2]
-        return (backend_root / path).resolve()
-
-    def _model_paths(self) -> dict[str, Path]:
-        return {
-            "action": self._resolve_model_dir(settings.pdf_rag_action_model_dir),
-            "clean": self._resolve_model_dir(settings.pdf_rag_clean_model_dir),
-            "chunk": self._resolve_model_dir(settings.pdf_rag_chunk_model_dir),
-        }
-
-    def available(self) -> bool:
-        self._ensure_runtime_ready()
-        return self._load_error is None
-
-    @property
-    def load_error(self) -> Optional[str]:
-        self._ensure_runtime_ready()
-        return self._load_error
-
-    def _ensure_runtime_ready(self) -> None:
-        if self._ready:
-            return
-        with self._lock:
-            if self._ready:
-                return
-            self._ready = True
-            try:
-                import torch
-                from peft import PeftModel
-                from transformers import AutoModelForCausalLM, AutoTokenizer
-
-                model_paths = self._model_paths()
-                for task_name, model_dir in model_paths.items():
-                    if not model_dir.exists():
-                        raise FileNotFoundError(f"{task_name} model dir missing: {model_dir}")
-                    if not (model_dir / "adapter_config.json").exists():
-                        raise FileNotFoundError(f"{task_name} adapter_config.json missing: {model_dir}")
-
-                task_base_models: dict[str, str] = {}
-                for task_name, model_dir in model_paths.items():
-                    adapter_config = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
-                    base_model_name = str(adapter_config.get("base_model_name_or_path") or "").strip()
-                    if not base_model_name:
-                        raise RuntimeError(f"{task_name} adapter missing base_model_name_or_path")
-                    task_base_models[task_name] = base_model_name
-
-                requested_device = str(getattr(settings, "pdf_rag_qwen_device", "auto") or "auto").lower()
-                if requested_device == "cuda":
-                    self._device = "cuda"
-                elif requested_device == "cpu":
-                    self._device = "cpu"
-                else:
-                    self._device = "cuda" if torch.cuda.is_available() else "cpu"
-
-                dtype = torch.float32
-                if self._device == "cuda":
-                    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-                self._deps = {
-                    "torch": torch,
-                    "PeftModel": PeftModel,
-                    "AutoModelForCausalLM": AutoModelForCausalLM,
-                    "AutoTokenizer": AutoTokenizer,
-                    "dtype": dtype,
-                    "task_base_models": task_base_models,
-                }
-                self._load_error = None
-                logger.info(
-                    f"[PdfRag] Qwen adapter runtime ready on device={self._device}: "
-                    f"action={model_paths['action'].name}({task_base_models['action']}), "
-                    f"clean={model_paths['clean'].name}({task_base_models['clean']}), "
-                    f"chunk={model_paths['chunk'].name}({task_base_models['chunk']})"
-                )
-            except Exception as exc:
-                self._deps = {}
-                self._model = None
-                self._tokenizer = None
-                self._current_task = ""
-                self._load_error = str(exc)
-                logger.warning(f"[PdfRag] Qwen adapter runtime unavailable: {exc}")
-
-    def release(self) -> None:
-        with self._lock:
-            self._release_loaded_model()
-
-    def _release_loaded_model(self) -> None:
-        model = self._model
-        tokenizer = self._tokenizer
-        if model is not None:
-            try:
-                del model
-            except Exception:
-                pass
-        if tokenizer is not None:
-            try:
-                del tokenizer
-            except Exception:
-                pass
-        self._model = None
-        self._tokenizer = None
-        self._current_task = ""
-        torch_module = self._deps.get("torch")
-        if torch_module is not None:
-            try:
-                import gc
-
-                gc.collect()
-                if self._device == "cuda" and torch_module.cuda.is_available():
-                    torch_module.cuda.empty_cache()
-            except Exception:
-                pass
-
-    def _load_task_model(self, task_name: str) -> None:
-        self._ensure_runtime_ready()
-        if self._load_error:
-            raise RuntimeError(self._load_error)
-        if task_name == self._current_task and self._model is not None and self._tokenizer is not None:
-            return
-
-        with self._lock:
-            if task_name == self._current_task and self._model is not None and self._tokenizer is not None:
-                return
-            self._release_loaded_model()
-            model_paths = self._model_paths()
-            model_dir = model_paths[task_name]
-            base_model_name = str((self._deps.get("task_base_models") or {}).get(task_name) or "").strip()
-            if not base_model_name:
-                adapter_config = json.loads((model_dir / "adapter_config.json").read_text(encoding="utf-8"))
-                base_model_name = str(adapter_config.get("base_model_name_or_path") or "").strip()
-            torch = self._deps["torch"]
-            auto_model = self._deps["AutoModelForCausalLM"]
-            auto_tokenizer = self._deps["AutoTokenizer"]
-            peft_model = self._deps["PeftModel"]
-
-            try:
-                tokenizer = auto_tokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-            except Exception:
-                tokenizer = auto_tokenizer.from_pretrained(base_model_name, trust_remote_code=True)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.padding_side = "left"
-
-            base_model = auto_model.from_pretrained(
-                base_model_name,
-                torch_dtype=self._deps["dtype"],
-                trust_remote_code=True,
-            )
-            model = peft_model.from_pretrained(
-                base_model,
-                str(model_dir),
-                adapter_name=task_name,
-                is_trainable=False,
-            )
-            model.eval()
-            model.to(self._device)
-
-            self._tokenizer = tokenizer
-            self._model = model
-            self._current_task = task_name
-            logger.info(f"[PdfRag] Loaded Qwen adapter task={task_name} on device={self._device}")
-
-    def _generate(self, *, task_name: str, messages: list[dict[str, str]], max_new_tokens: int) -> str:
-        self._load_task_model(task_name)
-        if self._model is None or self._tokenizer is None:
-            raise RuntimeError(self._load_error or "Qwen adapter runtime unavailable")
-
-        torch = self._deps["torch"]
-
-        prompt_text = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        batch = self._tokenizer(prompt_text, return_tensors="pt")
-        batch = {key: value.to(self._device) for key, value in batch.items()}
-        with torch.no_grad():
-            output_ids = self._model.generate(
-                **batch,
-                max_new_tokens=int(max_new_tokens),
-                do_sample=False,
-                pad_token_id=self._tokenizer.pad_token_id,
-                eos_token_id=self._tokenizer.eos_token_id,
-            )
-        generated_ids = output_ids[0][batch["input_ids"].shape[1]:]
-        return str(self._tokenizer.decode(generated_ids, skip_special_tokens=True) or "").strip()
-
-    def classify_action(self, text: str) -> str:
-        raw = self._generate(
-            task_name="action",
-            messages=[
-                {"role": "system", "content": ACTION_SYSTEM},
-                {"role": "user", "content": ACTION_USER_TEMPLATE.format(text=text)},
-            ],
-            max_new_tokens=4,
-        ).upper()
-        if raw.startswith("OCR"):
-            return "DROP"
-        for label in ("KEEP", "REPAIR", "DROP"):
-            if raw.startswith(label):
-                return label
-        for token in raw.replace("\n", " ").split():
-            if token == "OCR":
-                return "DROP"
-            if token in {"KEEP", "REPAIR", "DROP"}:
-                return token
-        return "KEEP"
-
-    def clean_line(self, text: str) -> str:
-        return self._generate(
-            task_name="clean",
-            messages=[
-                {"role": "system", "content": CLEAN_SYSTEM},
-                {"role": "user", "content": CLEAN_USER_TEMPLATE.format(text=text)},
-            ],
-            max_new_tokens=96,
-        )
-
-    def classify_chunk(self, prev_line: str, curr_line: str) -> str:
-        raw = self._generate(
-            task_name="chunk",
-            messages=[
-                {"role": "system", "content": CHUNK_SYSTEM},
-                {
-                    "role": "user",
-                    "content": CHUNK_USER_TEMPLATE.format(prev_line=prev_line, curr_line=curr_line),
-                },
-            ],
-            max_new_tokens=4,
-        ).upper()
-        for label in ("JOIN_PREV", "NEW_CHUNK"):
-            if raw.startswith(label):
-                return label
-        for token in raw.replace("\n", " ").split():
-            if token in {"JOIN_PREV", "NEW_CHUNK"}:
-                return token
-        return "JOIN_PREV"
-
-
-_runtime = _QwenAdapterRuntime()
+_CITATION_RE = re.compile(r"\[[0-9,\-\s]+\]|\([12][0-9]{3}[a-z]?\)")
 
 
 class PdfRagIngestService:
+    def __init__(
+        self,
+        *,
+        fast_pipeline: LocalStructuredPdfPipeline | None = None,
+        hybrid_pipeline: LocalStructuredPdfDoclingFastHybridPipeline | None = None,
+        renderer: LocalPdfMarkdownRenderer | None = None,
+    ) -> None:
+        self._fast_pipeline = fast_pipeline
+        self._hybrid_pipeline = hybrid_pipeline
+        self._renderer = renderer or LocalPdfMarkdownRenderer()
+
     async def ingest_pdf(
         self,
         *,
         file_path: str,
         document_name: str = "",
+        mode: str | None = None,
     ) -> dict[str, Any]:
-        lines, raw_document_text = self._extract_lines(file_path)
-        if not lines or not raw_document_text.strip():
+        selected_mode = self._normalize_mode(mode or settings.pdf_rag_structured_mode)
+        extractor_name = f"local_structured_pdf_{selected_mode}"
+        try:
+            document, execution = await self._parse_structured_document(
+                file_path=file_path,
+                mode=selected_mode,
+            )
+        except Exception as exc:
+            logger.exception(f"[PdfRag] structured ingest failed mode={selected_mode}: {exc}")
             return {
                 "applied": False,
-                "failure_reason": "no_pdf_lines",
+                "failure_reason": f"structured_ingest_failed:{exc}",
                 "document_text": "",
                 "chunks": [],
-                "extractor": "pdfplumber_lines",
-                "report": {"line_count": 0},
+                "extractor": extractor_name,
+                "report": {
+                    "pipeline": "pdf_structured_rag_v2",
+                    "mode": selected_mode,
+                    "document_name": document_name or "",
+                },
             }
 
-        if not _runtime.available():
+        document_text = self._renderer.render_document(document=document)
+        chunks = self._build_chunks_from_document(document=document, mode=selected_mode)
+        if not document_text.strip() or not chunks:
             return {
                 "applied": False,
-                "failure_reason": f"qwen_runtime_unavailable:{_runtime.load_error or 'unknown'}",
-                "document_text": raw_document_text,
+                "failure_reason": "no_structured_content",
+                "document_text": document_text,
                 "chunks": [],
-                "extractor": "pdfplumber_lines",
-                "report": {"line_count": len(lines)},
+                "extractor": extractor_name,
+                "report": self._build_report(
+                    document=document,
+                    chunks=[],
+                    mode=selected_mode,
+                    document_name=document_name,
+                    execution=execution,
+                ),
             }
-        try:
-            processed_lines, dropped_lines, report = await self._process_lines(
-                file_path=file_path,
-                lines=lines,
-            )
-            if not processed_lines:
-                if bool(settings.pdf_rag_fail_open):
-                    processed_lines = [
-                        ProcessedPdfLine(
-                            source=line,
-                            final_action="KEEP",
-                            normalized_text=line.source_text,
-                            debug={"fallback": "fail_open_keep_all"},
-                        )
-                        for line in lines
-                    ]
-                    report["fail_open_applied"] = True
-                    dropped_lines = []
-                else:
-                    return {
-                        "applied": False,
-                        "failure_reason": "no_accepted_lines",
-                        "document_text": raw_document_text,
-                        "chunks": [],
-                        "extractor": "pdfplumber_lines",
-                        "report": report,
-                    }
 
-            chunks = await self._build_chunks(processed_lines)
-            chunks, coverage_report = self._validate_and_fill_coverage(chunks, processed_lines)
+        return {
+            "applied": True,
+            "failure_reason": None,
+            "document_text": document_text,
+            "chunks": chunks,
+            "extractor": extractor_name,
+            "report": self._build_report(
+                document=document,
+                chunks=chunks,
+                mode=selected_mode,
+                document_name=document_name,
+                execution=execution,
+            ),
+        }
 
-            report.update(
-                {
-                    "pipeline": "pdf_line_rag_v1",
-                    "document_name": document_name or "",
-                    "extractor": "pdfplumber_lines",
-                    "line_count": len(lines),
-                    "accepted_line_count": len(processed_lines),
-                    "dropped_line_count": len(dropped_lines),
-                    "chunk_count": len(chunks),
-                    "coverage": coverage_report,
-                    "dropped_line_ids": [line.source.line_id for line in dropped_lines[:200]],
-                }
-            )
-
-            return {
-                "applied": True,
-                "failure_reason": None,
-                "document_text": raw_document_text,
-                "chunks": chunks,
-                "extractor": "pdfplumber_lines",
-                "report": report,
-            }
-        finally:
-            _runtime.release()
-
-    def _extract_lines(self, file_path: str) -> tuple[list[PdfLineRecord], str]:
-        import pdfplumber
-
-        extracted: list[PdfLineRecord] = []
-        source_order = 0
-        with pdfplumber.open(file_path) as pdf:
-            for page_index, page in enumerate(pdf.pages, start=1):
-                raw_lines = page.extract_text_lines(strip=True, return_chars=True) or []
-                page_width = float(page.width or 0.0)
-                for line_index, line in enumerate(raw_lines):
-                    chars = list(line.get("chars") or [])
-                    text = self._rebuild_text_from_chars(chars) or _clean_visible_text(line.get("text") or "")
-                    text = _clean_visible_text(text)
-                    if not text:
-                        continue
-                    source_text = _normalize_spaces(text)
-                    if not source_text:
-                        continue
-                    x0 = float(line.get("x0") or 0.0)
-                    top = float(line.get("top") or 0.0)
-                    x1 = float(line.get("x1") or x0)
-                    bottom = float(line.get("bottom") or top)
-                    column_slot = self._infer_column_slot(x0=x0, x1=x1, page_width=page_width)
-                    line_id = f"p{page_index}_l{line_index:03d}_{column_slot}"
-                    line_uid = hashlib.sha256(
-                        f"{page_index}|{x0:.2f}|{top:.2f}|{x1:.2f}|{bottom:.2f}|{source_text}".encode("utf-8")
-                    ).hexdigest()[:24]
-                    extracted.append(
-                        PdfLineRecord(
-                            source_order=source_order,
-                            page=page_index,
-                            page_line_index=line_index,
-                            line_id=line_id,
-                            line_uid=line_uid,
-                            raw_text=text,
-                            source_text=source_text,
-                            bbox={"x0": x0, "top": top, "x1": x1, "bottom": bottom},
-                            column_slot=column_slot,
-                        )
-                    )
-                    source_order += 1
-
-        raw_document_parts: list[str] = []
-        offset = 0
-        for line in extracted:
-            line.raw_doc_start = offset
-            raw_document_parts.append(line.raw_text)
-            offset += len(line.raw_text)
-            line.raw_doc_end = offset
-            offset += 1
-        return extracted, "\n".join(raw_document_parts)
-
-    @staticmethod
-    def _rebuild_text_from_chars(chars: list[dict[str, Any]]) -> str:
-        if not chars:
-            return ""
-        ordered = sorted(
-            (ch for ch in chars if str(ch.get("text") or "").strip() or ch.get("text") == " "),
-            key=lambda item: (float(item.get("x0") or 0.0), float(item.get("top") or 0.0)),
-        )
-        out: list[str] = []
-        prev: Optional[dict[str, Any]] = None
-        for ch in ordered:
-            current_text = str(ch.get("text") or "")
-            if not current_text:
-                continue
-            if prev is not None:
-                gap = float(ch.get("x0") or 0.0) - float(prev.get("x1") or 0.0)
-                width = max(float(prev.get("width") or 0.0), float(ch.get("width") or 0.0), 1.0)
-                size = max(float(prev.get("size") or 0.0), float(ch.get("size") or 0.0), 1.0)
-                if gap > max(width * 0.45, size * 0.08) and out and out[-1] != " ":
-                    out.append(" ")
-            out.append(current_text)
-            prev = ch
-        return _clean_visible_text("".join(out))
-
-    @staticmethod
-    def _infer_column_slot(*, x0: float, x1: float, page_width: float) -> str:
-        if page_width <= 0:
-            return "main"
-        if x0 <= page_width * 0.12 and x1 >= page_width * 0.88:
-            return "main"
-        center = (x0 + x1) / 2.0
-        if center < page_width * 0.45:
-            return "main_left"
-        if center > page_width * 0.55:
-            return "main_right"
-        return "main"
-
-    @staticmethod
-    def _rule_action(text: str) -> Optional[str]:
-        normalized = _normalize_spaces(text)
-        if not normalized:
-            return "DROP"
-        if _PAGE_NO_RE.fullmatch(normalized):
-            return "DROP"
-        if len(normalized) <= 2 and _SYMBOL_ONLY_RE.fullmatch(normalized):
-            return "DROP"
-        if _SYMBOL_ONLY_RE.fullmatch(normalized) and len(normalized) >= 3:
-            return "DROP"
-        return None
-
-    async def _process_lines(
+    async def _parse_structured_document(
         self,
         *,
         file_path: str,
-        lines: list[PdfLineRecord],
-    ) -> tuple[list[ProcessedPdfLine], list[ProcessedPdfLine], dict[str, Any]]:
-        accepted: list[ProcessedPdfLine] = []
-        dropped: list[ProcessedPdfLine] = []
-        pending_repairs: list[tuple[PdfLineRecord, str]] = []
-        staged_actions: list[tuple[PdfLineRecord, str]] = []
-        action_counts = {"KEEP": 0, "REPAIR": 0, "DROP": 0}
-        repair_count = 0
-
-        for line in lines:
-            rule_action = self._rule_action(line.source_text)
-            if rule_action == "DROP":
-                dropped.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="DROP",
-                        normalized_text="",
-                        debug={"reason": "hard_rule_drop"},
-                    )
-                )
-                action_counts["DROP"] += 1
-                continue
-
-            action = await asyncio.to_thread(_runtime.classify_action, line.source_text)
-            if action == "OCR":
-                action = "DROP"
-            if action not in {"KEEP", "REPAIR", "DROP"}:
-                action = "KEEP"
-            action_counts[action] += 1
-
-            if action == "DROP":
-                dropped.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="DROP",
-                        normalized_text="",
-                        debug={"reason": "model_drop"},
-                    )
-                )
-                continue
-
-            staged_actions.append((line, action))
-            if action == "REPAIR":
-                pending_repairs.append((line, action))
-
-        repair_results: dict[str, tuple[str, str]] = {}
-        for line, _action in pending_repairs:
-            cleaned = await asyncio.to_thread(_runtime.clean_line, line.source_text)
-            normalized = self._sanitize_clean_output(source_text=line.source_text, cleaned_text=cleaned)
-            repair_results[line.line_uid] = (cleaned, normalized)
-            repair_count += 1
-
-        for line, action in staged_actions:
-            if action == "KEEP":
-                accepted.append(
-                    ProcessedPdfLine(
-                        source=line,
-                        final_action="KEEP",
-                        normalized_text=line.source_text,
-                    )
-                )
-                continue
-
-            cleaned_text, normalized_text = repair_results.get(
-                line.line_uid,
-                (line.source_text, line.source_text),
+        mode: str,
+    ) -> tuple[PdfStructuredDocument, PdfHybridExecutionResult | None]:
+        if mode == "hybrid":
+            pipeline = self._get_hybrid_pipeline()
+            execution = await pipeline.parse_document_with_trace(
+                pdf_path=file_path,
+                mode="auto",
             )
-            accepted.append(
-                ProcessedPdfLine(
-                    source=line,
-                    final_action="REPAIR",
-                    normalized_text=normalized_text,
-                    repair_used=True,
-                    debug={"cleaned_text": cleaned_text},
-                )
-            )
+            return execution.document, execution
 
-        report = {
-            "action_counts": action_counts,
-            "repair_count": repair_count,
-            "ocr_used_count": 0,
-            "ocr_recovered_count": 0,
-        }
-        return accepted, dropped, report
-
-    @staticmethod
-    def _sanitize_clean_output(*, source_text: str, cleaned_text: str) -> str:
-        source = _normalize_spaces(source_text)
-        cleaned = _normalize_spaces(_clean_visible_text(cleaned_text))
-        if not cleaned:
-            return source
-        if cleaned.upper() in {"KEEP", "REPAIR", "DROP", "OCR", "JOIN_PREV", "NEW_CHUNK"}:
-            return source
-        if len(cleaned) > max(len(source) * 2, len(source) + 80):
-            return source
-        if _safe_similarity(source, cleaned) < 0.35:
-            return source
-        return cleaned
-
-    async def _recover_with_ocr(self, *, file_path: str, line: PdfLineRecord) -> Optional[str]:
-        if not bool(settings.pdf_rag_ocr_enabled):
-            return None
-        image_bytes = await asyncio.to_thread(self._render_line_crop, file_path, line)
-        if not image_bytes:
-            return None
-        prompt = (
-            "Extract the main text from this cropped PDF line image. "
-            "Return plain text only. Do not explain. "
-            "Use the hint only if it matches the image.\n\n"
-            f"Hint extracted text: {line.source_text}"
+        pipeline = self._get_fast_pipeline()
+        document = await asyncio.to_thread(
+            pipeline.parse_document,
+            pdf_path=file_path,
         )
-        payload = {
-            "model": settings.pdf_rag_ocr_model,
-            "stream": False,
-            "think": False,
-            "messages": [
+        return document, None
+
+    def _get_fast_pipeline(self) -> LocalStructuredPdfPipeline:
+        if self._fast_pipeline is None:
+            self._fast_pipeline = LocalStructuredPdfPipeline(heuristic_profile="balanced")
+        return self._fast_pipeline
+
+    def _get_hybrid_pipeline(self) -> LocalStructuredPdfDoclingFastHybridPipeline:
+        if self._hybrid_pipeline is None:
+            self._hybrid_pipeline = LocalStructuredPdfDoclingFastHybridPipeline(
+                heuristic_profile="balanced",
+            )
+        return self._hybrid_pipeline
+
+    def _build_chunks_from_document(
+        self,
+        *,
+        document: PdfStructuredDocument,
+        mode: str,
+    ) -> list[dict[str, Any]]:
+        chunkable_blocks = [block for block in list(document.blocks or []) if self._render_block(block)]
+        if not chunkable_blocks:
+            return []
+
+        chunks: list[dict[str, Any]] = []
+        cursor = 0
+        total_blocks = max(1, len(chunkable_blocks))
+        for index, block in enumerate(chunkable_blocks):
+            block_content = self._build_chunk_content(block)
+            if not block_content:
+                continue
+            start_char = cursor
+            end_char = start_char + len(block_content)
+            cursor = end_char + 2
+
+            section_titles = [str(item).strip() for item in list(block.section_titles or []) if str(item).strip()]
+            section_title = self._resolve_section_title(block=block, section_titles=section_titles)
+            pages = list(range(int(block.page_start), int(block.page_end) + 1))
+            extra = {
+                "source_kind": "pdf_structured_rag_v2",
+                "structured_mode": mode,
+                "block_id": block.block_id,
+                "block_type": block.block_type,
+                "raw_block_content": self._render_block(block),
+                "pages": pages,
+                "bbox": self._bbox_to_dict(block.bbox),
+                "line_ids": list(block.line_ids or []),
+                "page_span": [int(block.page_start), int(block.page_end)],
+                "section_path_titles": section_titles,
+                "section_path": str(block.section_path or ""),
+                "heading_level": int(block.heading_level) if block.heading_level else None,
+                "table_row_count": len(list(block.table_rows or [])),
+            }
+            meta = {
+                "level": (
+                    ChunkLevel.SECTION.value
+                    if str(block.block_type or "").strip().lower() == "heading"
+                    else ChunkLevel.PARAGRAPH.value
+                ),
+                "section_type": str(block.block_type or "paragraph"),
+                "section_title": section_title,
+                "has_citations": bool(_CITATION_RE.search(block_content)),
+                "position_ratio": float(index + 1) / float(total_blocks),
+                "keywords": [],
+                "extra": extra,
+            }
+            chunks.append(
                 {
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image_bytes).decode("ascii")],
+                    "id": generate_chunk_id(block_content, start_char),
+                    "content": block_content,
+                    "start_char": start_char,
+                    "end_char": end_char,
+                    "metadata": meta,
                 }
-            ],
-            "options": {"temperature": 0},
+            )
+        return chunks
+
+    def _build_report(
+        self,
+        *,
+        document: PdfStructuredDocument,
+        chunks: list[dict[str, Any]],
+        mode: str,
+        document_name: str,
+        execution: PdfHybridExecutionResult | None,
+    ) -> dict[str, Any]:
+        block_counts: dict[str, int] = {}
+        for block in list(document.blocks or []):
+            key = str(block.block_type or "unknown").strip().lower() or "unknown"
+            block_counts[key] = int(block_counts.get(key, 0)) + 1
+
+        report: dict[str, Any] = {
+            "pipeline": "pdf_structured_rag_v2",
+            "mode": mode,
+            "document_name": document_name or "",
+            "page_count": len(list(document.pages or [])),
+            "block_count": len(list(document.blocks or [])),
+            "chunk_count": len(chunks),
+            "block_type_counts": block_counts,
         }
-        url = f"{str(settings.ollama_base_url).rstrip('/')}/api/chat"
-        timeout = max(5, int(settings.pdf_rag_ocr_timeout_seconds or 30))
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-        except Exception as exc:
-            logger.warning(f"[PdfRag] OCR request failed for {line.line_id}: {exc}")
-            return None
-        message = data.get("message") if isinstance(data, dict) else {}
-        text = ""
-        if isinstance(message, dict):
-            text = str(message.get("content") or "").strip()
-        if not text:
-            return None
-        return _clean_visible_text(text)
+        if execution is not None:
+            report.update(
+                {
+                    "triage_mode": str(execution.mode or "auto"),
+                    "backend_attempted_pages": list(execution.backend_attempted_pages or []),
+                    "backend_used_pages": list(execution.backend_used_pages or []),
+                    "backend_fallback_pages": list(execution.backend_fallback_pages or []),
+                    "triage_backend_page_count": len(list(execution.triage.backend_pages or [])),
+                    "triage_local_page_count": len(list(execution.triage.local_pages or [])),
+                }
+            )
+        return report
+
+    def _build_chunk_content(self, block: PdfSemanticBlock) -> str:
+        rendered = self._render_block(block)
+        if not rendered:
+            return ""
+        if str(block.block_type or "").strip().lower() == "heading":
+            return rendered
+
+        section_titles = [str(item).strip() for item in list(block.section_titles or []) if str(item).strip()]
+        if not section_titles:
+            return rendered
+        section_path = " > ".join(section_titles)
+        return f"Section: {section_path}\n\n{rendered}".strip()
+
+    def _render_block(self, block: PdfSemanticBlock) -> str:
+        return self._renderer.render_document(
+            document=PdfStructuredDocument(blocks=[block]),
+        ).strip()
 
     @staticmethod
-    def _render_line_crop(file_path: str, line: PdfLineRecord) -> bytes:
-        import fitz
-        from PIL import Image
+    def _resolve_section_title(*, block: PdfSemanticBlock, section_titles: list[str]) -> Optional[str]:
+        block_type = str(block.block_type or "").strip().lower()
+        if block_type == "heading":
+            text = _normalize_spaces(block.text)
+            return text or (section_titles[-1] if section_titles else None)
+        if section_titles:
+            return section_titles[-1]
+        return None
 
-        doc = fitz.open(file_path)
-        try:
-            page = doc[line.page - 1]
-            padding = float(settings.pdf_rag_ocr_padding or 4.0)
-            dpi = max(72, int(settings.pdf_rag_ocr_dpi or 180))
-            scale = dpi / 72.0
-            rect = fitz.Rect(
-                max(0.0, float(line.bbox["x0"]) - padding),
-                max(0.0, float(line.bbox["top"]) - padding),
-                min(float(page.rect.width), float(line.bbox["x1"]) + padding),
-                min(float(page.rect.height), float(line.bbox["bottom"]) + padding),
-            )
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=rect, alpha=False)
-            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            return buffer.getvalue()
-        finally:
-            doc.close()
+    @staticmethod
+    def _normalize_mode(value: str | None) -> str:
+        normalized = str(value or "fast").strip().lower()
+        if normalized not in {"fast", "hybrid"}:
+            return "fast"
+        return normalized
 
-    async def _build_chunks(self, accepted_lines: list[ProcessedPdfLine]) -> list[dict[str, Any]]:
-        if not accepted_lines:
-            return []
-        groups: list[list[ProcessedPdfLine]] = []
-        current_group: list[ProcessedPdfLine] = []
-        prev_line: Optional[ProcessedPdfLine] = None
-
-        for line in accepted_lines:
-            if not current_group:
-                current_group = [line]
-                prev_line = line
-                continue
-
-            must_split = False
-            if prev_line is None:
-                must_split = True
-            elif line.source.page != prev_line.source.page:
-                must_split = True
-            elif line.source.source_order != prev_line.source.source_order + 1:
-                must_split = True
-
-            if not must_split:
-                decision = await asyncio.to_thread(
-                    _runtime.classify_chunk,
-                    prev_line.normalized_text,
-                    line.normalized_text,
-                )
-                must_split = decision != "JOIN_PREV"
-
-            if must_split:
-                groups.append(current_group)
-                current_group = [line]
-            else:
-                current_group.append(line)
-            prev_line = line
-
-        if current_group:
-            groups.append(current_group)
-
-        total_lines = max(1, len(accepted_lines))
-        return [self._build_chunk_from_group(group, total_lines=total_lines) for group in groups if group]
-
-    def _build_chunk_from_group(
-        self,
-        group: list[ProcessedPdfLine],
-        *,
-        total_lines: int,
-    ) -> dict[str, Any]:
-        normalized_text = "\n".join(item.normalized_text for item in group if item.normalized_text).strip()
-        raw_text = "\n".join(item.source.raw_text for item in group if item.source.raw_text).strip()
-        pages = sorted({item.source.page for item in group})
-        page_boxes: list[dict[str, Any]] = []
-        for page in pages:
-            page_lines = [item for item in group if item.source.page == page]
-            page_boxes.append(
-                {
-                    "page": page,
-                    "bbox": {
-                        "x0": min(item.source.bbox["x0"] for item in page_lines),
-                        "top": min(item.source.bbox["top"] for item in page_lines),
-                        "x1": max(item.source.bbox["x1"] for item in page_lines),
-                        "bottom": max(item.source.bbox["bottom"] for item in page_lines),
-                    },
-                }
-            )
-
-        start_char = group[0].source.raw_doc_start
-        end_char = group[-1].source.raw_doc_end
-        chunk_id = generate_chunk_id(normalized_text or raw_text, start_char)
-        meta = {
-            "level": ChunkLevel.PARAGRAPH.value,
-            "section_type": "pdf_line_chunk",
-            "section_title": None,
-            "has_citations": bool(re.search(r"\[[0-9,\-\s]+\]|\([12][0-9]{3}\)", normalized_text)),
-            "position_ratio": float(group[-1].source.source_order + 1) / float(total_lines),
-            "keywords": [],
-            "extra": {
-                "source_kind": "pdf_line_rag_v1",
-                "raw_text": raw_text,
-                "normalized_text": normalized_text,
-                "line_ids": [item.source.line_id for item in group],
-                "line_uids": [item.source.line_uid for item in group],
-                "pages": pages,
-                "page_bboxes": page_boxes,
-                "line_count": len(group),
-                "ocr_used": any(item.ocr_used for item in group),
-                "repair_used": any(item.repair_used for item in group),
-                "actions": [item.final_action for item in group],
-            },
-        }
+    @staticmethod
+    def _bbox_to_dict(bbox: PdfBBox) -> dict[str, float]:
         return {
-            "id": chunk_id,
-            "content": normalized_text or raw_text,
-            "start_char": start_char,
-            "end_char": end_char,
-            "metadata": meta,
+            "x0": float(bbox.x0),
+            "top": float(bbox.top),
+            "x1": float(bbox.x1),
+            "bottom": float(bbox.bottom),
         }
 
-    def _validate_and_fill_coverage(
-        self,
-        chunks: list[dict[str, Any]],
-        accepted_lines: list[ProcessedPdfLine],
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        seen: set[str] = set()
-        duplicate_line_uids: list[str] = []
-        for chunk in chunks:
-            line_uids = list((((chunk.get("metadata") or {}).get("extra") or {}).get("line_uids") or []))
-            for line_uid in line_uids:
-                if line_uid in seen:
-                    duplicate_line_uids.append(line_uid)
-                seen.add(line_uid)
 
-        missing_lines = [line for line in accepted_lines if line.source.line_uid not in seen]
-        if missing_lines:
-            for line in missing_lines:
-                chunks.append(self._build_chunk_from_group([line], total_lines=max(1, len(accepted_lines))))
-            chunks.sort(key=lambda item: int(item.get("start_char") or 0))
-
-        report = {
-            "assigned_line_count": len(seen),
-            "missing_line_count": len(missing_lines),
-            "duplicate_line_uid_count": len(duplicate_line_uids),
-            "missing_line_ids": [line.source.line_id for line in missing_lines[:200]],
-            "duplicate_line_uids": duplicate_line_uids[:200],
-        }
-        return chunks, report
+def _normalize_spaces(text: str) -> str:
+    return _SPACE_RE.sub(" ", str(text or "")).strip()
 
 
 _pdf_rag_ingest_service = PdfRagIngestService()

@@ -293,7 +293,7 @@ export interface Document {
   extract_granularity?: DocumentExtractGranularity
 }
 
-export type DocumentIngestMode = 'local_fast' | 'online_mm' | 'auto'
+export type DocumentIngestMode = 'local_fast' | 'local_hybrid' | 'online_mm' | 'auto'
 export type DocumentExtractProfile = 'general' | 'academic_formula' | 'table_first'
 export type DocumentExtractGranularity = 'fine' | 'medium' | 'coarse'
 

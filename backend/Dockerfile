@@ -20,32 +20,12 @@ RUN apt-get update && apt-get install -y \
 
 COPY requirements.txt .
 
-# Torch wheel source is configurable at build time.
-# CPU default:
-#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-# CUDA example (NVIDIA):
-#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-ARG TORCH_PACKAGE=torch
-RUN set -eu; \
-    attempt=1; \
-    max_attempts=3; \
-    while [ "$attempt" -le "$max_attempts" ]; do \
-      echo "Installing ${TORCH_PACKAGE} from ${TORCH_INDEX_URL} (attempt ${attempt}/${max_attempts})"; \
-      if pip install --no-cache-dir --default-timeout=1000 --retries 10 --progress-bar off --no-deps "${TORCH_PACKAGE}" --index-url "${TORCH_INDEX_URL}"; then \
-        exit 0; \
-      fi; \
-      if [ "$attempt" -eq "$max_attempts" ]; then \
-        echo "Torch installation failed after ${max_attempts} attempts"; \
-        exit 1; \
-      fi; \
-      attempt=$((attempt + 1)); \
-      echo "Retrying torch installation after transient failure..."; \
-      sleep 5; \
-    done
-
 ARG PIP_INDEX_URL=https://pypi.org/simple
-RUN pip install --no-cache-dir --default-timeout=120 --retries 10 --index-url ${PIP_INDEX_URL} -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=120 --retries 10 --index-url ${PIP_INDEX_URL} -r requirements.txt && \
+    python - <<'PY'
+import docling
+print(docling.__file__)
+PY
 
 COPY . .
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     aliyun_model: str = "qwen-plus"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
+    local_structured_pdf_hybrid_model: str = ""
+    local_structured_pdf_hybrid_model_chain: str = ""
+    local_structured_pdf_hybrid_timeout_seconds: int = 90
+    local_structured_pdf_hybrid_render_dpi: int = 144
+    local_structured_pdf_hybrid_max_image_side: int = 1600
+    local_structured_pdf_hybrid_ocr_max_image_side: int = 1024
+    local_structured_pdf_hybrid_max_lines_per_page: int = 80
+    local_structured_pdf_hybrid_enable_native_fallback: bool = False
+    local_structured_pdf_hybrid_disable_thinking: bool = True
 
     # Embedding
     embedding_provider: str = "local"  # local / mock / aliyun / openai / ollama
@@ -148,6 +157,7 @@ class Settings(BaseSettings):
 
     # PDF line-level RAG ingestion
     pdf_rag_line_pipeline_enabled: bool = True
+    pdf_rag_structured_mode: Literal["fast", "hybrid"] = "fast"
     pdf_rag_fail_open: bool = True
     pdf_rag_qwen_device: Literal["auto", "cpu", "cuda"] = "auto"
     pdf_rag_action_model_dir: str = str(

@@ -207,6 +207,54 @@ def test_resolve_document_promotes_large_title_before_table():
     assert resolved.blocks[1].heading_level == 2
 
 
+def test_resolve_document_does_not_promote_unanchored_backend_paragraph():
+    resolver = LocalPdfHeadingRefiner()
+    page_meta = PdfPageMeta(page=1, page_width=1000.0, page_height=2000.0, rotation=0)
+    blocks = [
+        _block(
+            block_id="title",
+            block_type="heading",
+            text="TOP TITLE",
+            top=30.0,
+            bottom=80.0,
+            avg_font_size=24.0,
+            reading_order=1,
+        ),
+        PdfSemanticBlock(
+            block_id="ocr_band",
+            block_type="paragraph",
+            page_start=1,
+            page_end=1,
+            text="COPYRIGHT PROTECTS CREATIVE WORK - YOURS, MINE, EVERYONE'S!",
+            bbox=PdfBBox(x0=70.0, top=260.0, x1=800.0, bottom=320.0),
+            line_ids=[],
+            avg_font_size=0.0,
+            column_id="main",
+            region="main",
+            reading_order_start=2,
+            reading_order_end=2,
+        ),
+        _block(
+            block_id="body",
+            block_type="paragraph",
+            text="We're all both consumers and creators of creative work.",
+            top=360.0,
+            bottom=390.0,
+            avg_font_size=12.0,
+            reading_order=3,
+        ),
+    ]
+    document = PdfStructuredDocument(
+        pages=[PdfStructuredPage(meta=page_meta, blocks=blocks)],
+        blocks=blocks,
+        body_font_size=12.0,
+    )
+
+    resolved = resolver.resolve_document(document=document)
+
+    assert [block.block_type for block in resolved.blocks] == ["heading", "paragraph", "paragraph"]
+
+
 def test_resolve_document_promotes_first_page_section_band_after_author():
     resolver = LocalPdfHeadingRefiner()
     page_meta = PdfPageMeta(page=1, page_width=800.0, page_height=900.0, rotation=0)

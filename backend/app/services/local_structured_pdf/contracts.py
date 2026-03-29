@@ -135,6 +135,9 @@ class PdfPageAtoms:
     hyperlinks: list[PdfHyperlinkAtom] = field(default_factory=list)
     text_blocks: list[PdfTextBlockAtom] = field(default_factory=list)
     tables: list[PdfTableAtom] = field(default_factory=list)
+    coarse_line_count: int = 0
+    coarse_rect_count: int = 0
+    coarse_curve_count: int = 0
     source_engines: list[str] = field(default_factory=list)
     mark_info_present: bool = False
     has_struct_tree: bool = False
@@ -305,6 +308,147 @@ class PdfStructuredDocument:
     def ordered_text(self) -> str:
         rows = [str(block.text or "").strip() for block in self.blocks]
         return "\n\n".join([row for row in rows if row]).strip()
+
+
+@dataclass(frozen=True)
+class PdfHybridTriageSignals:
+    text_line_count: int = 0
+    text_chunk_count: int = 0
+    text_block_count: int = 0
+    structured_block_count: int = 0
+    heading_count: int = 0
+    table_count: int = 0
+    equation_count: int = 0
+    image_count: int = 0
+    vector_line_count: int = 0
+    horizontal_line_count: int = 0
+    vertical_line_count: int = 0
+    line_art_count: int = 0
+    rect_count: int = 0
+    curve_count: int = 0
+    top_band_count: int = 0
+    bottom_band_count: int = 0
+    average_words_per_line: float = 0.0
+    image_area_ratio: float = 0.0
+    largest_image_ratio: float = 0.0
+    table_area_ratio: float = 0.0
+    replacement_char_ratio: float = 0.0
+    table_pattern_count: int = 0
+    max_consecutive_streak: int = 0
+    pattern_density: float = 0.0
+    has_consecutive_patterns: bool = False
+    has_grid_lines: bool = False
+    has_table_border_lines: bool = False
+    has_row_separator_pattern: bool = False
+    has_aligned_short_lines: bool = False
+    double_column: bool = False
+    has_struct_tree: bool = False
+
+
+@dataclass(frozen=True)
+class PdfHybridTriageResult:
+    page: int
+    page_type: str
+    decision: str
+    confidence: float
+    reasons: list[str] = field(default_factory=list)
+    signals: PdfHybridTriageSignals = field(default_factory=PdfHybridTriageSignals)
+
+
+@dataclass
+class PdfHybridTriageDocument:
+    mode: str = "auto"
+    pages: list[PdfHybridTriageResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def local_pages(self) -> list[int]:
+        return [int(item.page) for item in self.pages if str(item.decision or "") == "local"]
+
+    @property
+    def backend_pages(self) -> list[int]:
+        return [int(item.page) for item in self.pages if str(item.decision or "") == "backend"]
+
+
+@dataclass(frozen=True)
+class PdfHybridParsedBlock:
+    block_id: str
+    kind: str
+    page: int
+    reading_order: int
+    text: str
+    bbox: PdfBBox
+    source_line_ids: list[str] = field(default_factory=list)
+    table_rows: list[list[str]] = field(default_factory=list)
+    zone: str = "main"
+    merge_strategy: str = "space"
+    confidence: float = 0.0
+    heading_level: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PdfHybridModelAttempt:
+    model: str
+    accepted: bool = False
+    used: bool = False
+    page_role: str = "unknown"
+    block_count: int = 0
+    anchored_block_count: int = 0
+    unanchored_block_count: int = 0
+    protocol: str = ""
+    retry_used: bool = False
+    retry_count: int = 0
+    reason: str = ""
+    error: str = ""
+    raw_response_preview: str = ""
+
+
+@dataclass
+class PdfHybridParsedPage:
+    page: int
+    model: str
+    page_role: str = "unknown"
+    blocks: list[PdfHybridParsedBlock] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    attempted_models: list[str] = field(default_factory=list)
+    attempts: list[PdfHybridModelAttempt] = field(default_factory=list)
+    protocol: str = ""
+    raw_response_preview: str = ""
+    used: bool = False
+    retry_used: bool = False
+    retry_count: int = 0
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PdfHybridExecutionResult:
+    mode: str = "auto"
+    document: PdfStructuredDocument = field(default_factory=PdfStructuredDocument)
+    triage: PdfHybridTriageDocument = field(default_factory=PdfHybridTriageDocument)
+    parsed_pages: list[PdfHybridParsedPage] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def backend_attempted_pages(self) -> list[int]:
+        return sorted(int(item.page) for item in self.parsed_pages)
+
+    @property
+    def backend_used_pages(self) -> list[int]:
+        return sorted(int(item.page) for item in self.parsed_pages if bool(item.used))
+
+    @property
+    def backend_fallback_pages(self) -> list[int]:
+        attempted = set(self.backend_attempted_pages)
+        used = set(self.backend_used_pages)
+        expected = set(self.triage.backend_pages)
+        return sorted(expected.union(attempted) - used)
 
 
 PdfAtom = Optional[

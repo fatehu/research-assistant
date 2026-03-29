@@ -327,3 +327,87 @@ def test_resolve_document_reorders_first_page_front_matter_before_early_section_
     ]
     assert resolved.blocks[0].block_type == "heading"
     assert resolved.blocks[2].block_type == "paragraph"
+
+
+def test_resolve_document_does_not_reorder_appendix_style_content_as_front_matter():
+    resolver = LocalPdfFrontMatterResolver()
+    page_meta = PdfPageMeta(page=1, page_width=612.0, page_height=792.0, rotation=0)
+    blocks = [
+        PdfSemanticBlock(
+            block_id="appendix_title",
+            block_type="heading",
+            page_start=1,
+            page_end=1,
+            text="A Contributions",
+            bbox=PdfBBox(x0=70.9, top=72.4, x1=220.0, bottom=90.0),
+            line_ids=["appendix_title:l1"],
+            avg_font_size=17.0,
+            reading_order_start=1,
+            reading_order_end=1,
+            heading_level=2,
+        ),
+        PdfSemanticBlock(
+            block_id="lead",
+            block_type="paragraph",
+            page_start=1,
+            page_end=1,
+            text="The contributions of this study are as follows:",
+            bbox=PdfBBox(x0=70.5, top=94.3, x1=320.0, bottom=108.0),
+            line_ids=["lead:l1"],
+            avg_font_size=11.5,
+            reading_order_start=2,
+            reading_order_end=2,
+        ),
+        PdfSemanticBlock(
+            block_id="list_item",
+            block_type="list_item",
+            page_start=1,
+            page_end=1,
+            text="• Introduction of the SOLAR 10.7 Billion-Parameter Model",
+            bbox=PdfBBox(x0=83.9, top=116.9, x1=360.0, bottom=150.0),
+            line_ids=["list:l1"],
+            avg_font_size=11.5,
+            reading_order_start=3,
+            reading_order_end=3,
+        ),
+        PdfSemanticBlock(
+            block_id="right_column_tail",
+            block_type="paragraph",
+            page_start=1,
+            page_end=1,
+            text="ability for In-context learning, including Zero-shot learning.",
+            bbox=PdfBBox(x0=335.0, top=73.3, x1=560.0, bottom=110.0),
+            line_ids=["right:l1"],
+            avg_font_size=11.5,
+            reading_order_start=44,
+            reading_order_end=44,
+        ),
+        PdfSemanticBlock(
+            block_id="late_section",
+            block_type="heading",
+            page_start=1,
+            page_end=1,
+            text="B.2 Mixture of Experts",
+            bbox=PdfBBox(x0=70.9, top=182.0, x1=270.0, bottom=198.0),
+            line_ids=["late_section:l1"],
+            avg_font_size=15.0,
+            reading_order_start=51,
+            reading_order_end=51,
+            heading_level=2,
+        ),
+    ]
+    document = PdfStructuredDocument(
+        pages=[PdfStructuredPage(meta=page_meta, blocks=blocks)],
+        blocks=blocks,
+        body_font_size=11.5,
+    )
+
+    resolved = resolver.resolve_document(document=document)
+
+    assert [block.block_id for block in resolved.blocks] == [
+        "appendix_title",
+        "lead",
+        "list_item",
+        "right_column_tail",
+        "late_section",
+    ]

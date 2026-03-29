@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from collections import Counter
 from statistics import median
@@ -23,6 +24,7 @@ _TABLEISH_NUMBER_RE = re.compile(r"^(?:[-+]?\d+(?:\.\d+)?%?|N/?A)$", re.IGNORECA
 _TABLEISH_MARKER_RE = re.compile(r"^(?:O|X|✗|✓|✔)$", re.IGNORECASE)
 _CAPTION_PREFIX_RE = re.compile(r"^(?:fig(?:ure)?|table|chart|image|photo|plate)\b", re.IGNORECASE)
 _PAGE_NUMBER_ONLY_RE = re.compile(r"^\s*\(?\s*(?:\d+|[ivxlcdm]+)\s*\)?\s*$", re.IGNORECASE)
+_CONTENTS_TITLE_RE = re.compile(r"^(?:table\s+of\s+contents?|contents?)$", re.IGNORECASE)
 _APPENDIX_ENUM_RE = re.compile(
     r"^(?:appendix|chapter|section)\s+[A-Za-z0-9IVXLCM]+[\.\)]?\s+\S",
     re.IGNORECASE,
@@ -30,6 +32,18 @@ _APPENDIX_ENUM_RE = re.compile(
 _LETTER_NUMBERED_ENUM_RE = re.compile(r"^[A-Z](?:\.\d+)+[\.\)]?\s+\S", re.IGNORECASE)
 _ROMAN_OR_LETTER_ENUM_RE = re.compile(r"^(?:[ivxlcdm]+|[A-Z])[\.\)]?\s+\S", re.IGNORECASE)
 _NUMERIC_ENUM_RE = re.compile(r"^(\d+(?:\.\d+)*)[\.\)]?\s+\S")
+_SECTION_DIVIDER_RE = re.compile(
+    r"^(?:part|chapter|section|appendix|introduction|conclusion|notes?|bibliography|index)\b",
+    re.IGNORECASE,
+)
+_METAISH_RE = re.compile(
+    r"(?:https?://|www\.|doi:|arxiv:|wikipedia|license|retrieved|copyright)",
+    re.IGNORECASE,
+)
+_SOURCE_TABLE_CODE_RE = re.compile(
+    r"\btable\s+\d{2,}(?:-\d{2,}){2,}\b",
+    re.IGNORECASE,
+)
 _METRIC_PREFIX_RE = re.compile(r"^[+-]?\d+(?:\.\d+)*(?:[%‰])?(?:[↑↓↗↘→←]+)?$", re.IGNORECASE)
 
 
@@ -135,6 +149,7 @@ class LocalPdfBlockBuilder:
         pages = list(document.pages or [])
         body_font_size = self._estimate_body_font_size(pages=pages)
         heading_stats = self._build_heading_statistics(pages=pages)
+        directory_like_pages = self._detect_directory_like_pages(pages=pages)
         line_map = {
             str(line.line_id): line
             for page in pages
@@ -158,6 +173,9 @@ class LocalPdfBlockBuilder:
 
         for page in pages:
             lines = list(page.lines or [])
+            directory_like_page = int(page.page) in directory_like_pages
+            if directory_like_page:
+                lines = self._order_directory_lines(lines)
             index = 0
             while index < len(lines):
                 line = lines[index]
@@ -188,6 +206,7 @@ class LocalPdfBlockBuilder:
                             previous=heading_lines[-1],
                             current=candidate_line,
                             accumulated=heading_lines,
+                            directory_like_page=directory_like_page,
                         ):
                             break
                         heading_lines.append(candidate_line)
@@ -201,7 +220,11 @@ class LocalPdfBlockBuilder:
                     )
                     continue
 
-                if self._is_list_item_start(line):
+                if self._is_list_item_start(line) and not self._looks_enumerated_prose_lead(
+                    line=line,
+                    next_line=next_line,
+                    body_font_size=body_font_size,
+                ):
                     flush_paragraph()
                     list_lines = [line]
                     index += 1
@@ -239,7 +262,11 @@ class LocalPdfBlockBuilder:
                     index += 1
                     continue
 
-                if self._should_continue_paragraph(previous=current_paragraph[-1], current=line):
+                if self._should_continue_paragraph(
+                    previous=current_paragraph[-1],
+                    current=line,
+                    directory_like_page=directory_like_page,
+                ):
                     current_paragraph.append(line)
                     index += 1
                     continue
@@ -306,7 +333,20 @@ class LocalPdfBlockBuilder:
         text = _SPACE_RE.sub(" ", str(line.text or "").strip())
         if not text:
             return False
+        if self._is_standalone_section_ordinal(
+            line=line,
+            previous_line=previous_line,
+            next_line=next_line,
+            body_font_size=body_font_size,
+        ):
+            return True
         enumerated_heading = self._is_enumerated_heading_text(text)
+        if enumerated_heading and self._looks_enumerated_prose_lead(
+            line=line,
+            next_line=next_line,
+            body_font_size=body_font_size,
+        ):
+            return False
         if self._is_list_item_start(line) and not enumerated_heading:
             return False
         if self._looks_table_like_line(text):
@@ -360,11 +400,20 @@ class LocalPdfBlockBuilder:
         if len(text) > 100:
             score -= 0.12
 
-        if line.band == "top_band" and avg_font_size >= float(body_font_size) * 1.05 and title_like:
+        if (
+            line.band == "top_band"
+            and avg_font_size >= float(body_font_size) * 1.05
+            and title_like
+        ):
             return True
         if contextual_title and no_terminal_punct:
             return True
-        if enumerated_heading and title_like and no_terminal_punct and avg_font_size >= float(body_font_size) * 0.95:
+        if (
+            enumerated_heading
+            and title_like
+            and no_terminal_punct
+            and avg_font_size >= float(body_font_size) * 0.95
+        ):
             return True
         return score >= 0.72
 
@@ -398,6 +447,72 @@ class LocalPdfBlockBuilder:
         if len(next_text) <= len(text) * 1.5:
             return False
         return True
+
+    def _is_standalone_section_ordinal(
+        self,
+        *,
+        line: PdfResolvedLine,
+        previous_line: PdfResolvedLine | None,
+        next_line: PdfResolvedLine | None,
+        body_font_size: float,
+    ) -> bool:
+        text = _SPACE_RE.sub(" ", str(line.text or "").strip())
+        if previous_line is not None:
+            return False
+        if not text or not _PAGE_NUMBER_ONLY_RE.match(text):
+            return False
+        if next_line is None or int(next_line.page) != int(line.page):
+            return False
+        next_text = _SPACE_RE.sub(" ", str(next_line.text or "").strip())
+        if not next_text or not self._looks_title_like(next_text):
+            return False
+        if next_text.endswith((".", ";", ",")):
+            return False
+        next_word_count = len(next_text.split())
+        if next_word_count < 2 or next_word_count > self._heading_max_words:
+            return False
+        if float(next_line.bbox.top) - float(line.bbox.bottom) > 72.0:
+            return False
+        if abs(float(next_line.bbox.x0) - float(line.bbox.x0)) > 140.0:
+            return False
+        line_font = float(line.avg_font_size or 0.0)
+        next_font = float(next_line.avg_font_size or 0.0)
+        min_line_font = next_font * 1.1
+        if body_font_size > 0.0:
+            min_line_font = max(min_line_font, body_font_size * 1.0)
+        if line_font < min_line_font:
+            return False
+        if next_font < line_font * 0.7:
+            return False
+        return body_font_size <= 0.0 or next_font >= body_font_size * 1.1
+
+    def _looks_enumerated_prose_lead(
+        self,
+        *,
+        line: PdfResolvedLine,
+        next_line: PdfResolvedLine | None,
+        body_font_size: float,
+    ) -> bool:
+        text = _SPACE_RE.sub(" ", str(line.text or "").strip())
+        if not text or next_line is None or int(next_line.page) != int(line.page):
+            return False
+        words = text.split()
+        if len(words) < 6:
+            return False
+        next_text = _SPACE_RE.sub(" ", str(next_line.text or "").strip())
+        if not next_text:
+            return False
+        combined_text = f"{text} {next_text}".strip()
+        if not (_METAISH_RE.search(combined_text) or _SOURCE_TABLE_CODE_RE.search(combined_text)):
+            return False
+        if float(next_line.bbox.top) - float(line.bbox.bottom) > 20.0:
+            return False
+        if abs(float(next_line.avg_font_size or 0.0) - float(line.avg_font_size or 0.0)) > 0.8:
+            return False
+        if abs(float(next_line.bbox.x0) - float(line.bbox.x0)) > 24.0:
+            return False
+        line_font = float(line.avg_font_size or 0.0)
+        return body_font_size <= 0.0 or line_font <= body_font_size * 1.25
 
     @staticmethod
     def _looks_title_like(text: str) -> bool:
@@ -477,6 +592,7 @@ class LocalPdfBlockBuilder:
         previous: PdfResolvedLine,
         current: PdfResolvedLine,
         accumulated: Sequence[PdfResolvedLine],
+        directory_like_page: bool = False,
     ) -> bool:
         if int(previous.page) != int(current.page):
             return False
@@ -494,6 +610,8 @@ class LocalPdfBlockBuilder:
         if self._looks_table_like_line(current_text):
             return False
         if self._is_enumerated_heading_text(current_text) and accumulated:
+            return False
+        if directory_like_page and self._is_directory_entry_boundary(previous=previous, current=current):
             return False
 
         max_font = max(float(previous.avg_font_size or 0.0), float(current.avg_font_size or 0.0), 8.0)
@@ -521,12 +639,20 @@ class LocalPdfBlockBuilder:
 
         return True
 
-    def _should_continue_paragraph(self, *, previous: PdfResolvedLine, current: PdfResolvedLine) -> bool:
+    def _should_continue_paragraph(
+        self,
+        *,
+        previous: PdfResolvedLine,
+        current: PdfResolvedLine,
+        directory_like_page: bool = False,
+    ) -> bool:
         if int(previous.page) != int(current.page):
             return False
         if str(previous.column_id or "main") != str(current.column_id or "main"):
             return False
         if str(previous.region or "main") != str(current.region or "main"):
+            return False
+        if directory_like_page and self._is_directory_entry_boundary(previous=previous, current=current):
             return False
 
         max_font = max(float(previous.avg_font_size or 0.0), float(current.avg_font_size or 0.0), 8.0)
@@ -575,6 +701,103 @@ class LocalPdfBlockBuilder:
         if current_x0 > anchor_x0 + (self._paragraph_indent_tolerance * 2.0):
             return False
         return True
+
+    def _detect_directory_like_pages(self, *, pages: Sequence[PdfResolvedPage]) -> set[int]:
+        directory_like_pages: set[int] = set()
+        for page in pages:
+            lines = [
+                line
+                for line in list(page.lines or [])
+                if _SPACE_RE.sub(" ", str(line.text or "").strip())
+            ]
+            if len(lines) < 6:
+                continue
+            body_lines = lines[1:] if self._has_contents_title(lines[0]) else lines
+            if len(body_lines) < 5:
+                continue
+            page_number_lines = [line for line in body_lines if self._is_page_number_only_line(line)]
+            if len(page_number_lines) < 4:
+                continue
+            entry_like_lines = [
+                line
+                for line in body_lines
+                if not self._is_page_number_only_line(line)
+                and self._looks_directory_entry_line(line)
+            ]
+            if len(entry_like_lines) < 4:
+                continue
+            signal_total = len(page_number_lines) + len(entry_like_lines)
+            if signal_total < max(8, int(len(body_lines) * 0.65)):
+                continue
+            directory_like_pages.add(int(page.page))
+        return directory_like_pages
+
+    def _has_contents_title(self, line: PdfResolvedLine) -> bool:
+        text = _SPACE_RE.sub(" ", str(line.text or "").strip())
+        if not text:
+            return False
+        return bool(_CONTENTS_TITLE_RE.match(text))
+
+    def _looks_directory_entry_line(self, line: PdfResolvedLine) -> bool:
+        text = _SPACE_RE.sub(" ", str(line.text or "").strip())
+        if not text or _PAGE_NUMBER_ONLY_RE.match(text):
+            return False
+        if text.endswith((".", ";", ",")):
+            return False
+        if self._looks_table_like_line(text):
+            return False
+        word_count = len(text.split())
+        if word_count == 0 or word_count > 10:
+            return False
+        return (
+            self._is_enumerated_heading_text(text)
+            or bool(_SECTION_DIVIDER_RE.match(text))
+            or self._looks_title_like(text)
+        )
+
+    @staticmethod
+    def _is_page_number_only_line(line: PdfResolvedLine) -> bool:
+        text = _SPACE_RE.sub(" ", str(line.text or "").strip())
+        if not text:
+            return False
+        return bool(_PAGE_NUMBER_ONLY_RE.match(text))
+
+    def _is_directory_entry_boundary(
+        self,
+        *,
+        previous: PdfResolvedLine,
+        current: PdfResolvedLine,
+    ) -> bool:
+        previous_text = _SPACE_RE.sub(" ", str(previous.text or "").strip())
+        current_text = _SPACE_RE.sub(" ", str(current.text or "").strip())
+        if not previous_text or not current_text:
+            return False
+        if not self._looks_directory_entry_line(previous) or not self._looks_directory_entry_line(current):
+            return False
+        vertical_gap = float(current.bbox.top) - float(previous.bbox.bottom)
+        if vertical_gap > 28.0:
+            return False
+        left_delta = abs(float(previous.bbox.x0) - float(current.bbox.x0))
+        if left_delta > 12.0:
+            return False
+        if float(current.bbox.x0) > float(previous.bbox.x0) + 10.0:
+            return False
+        return True
+
+    @staticmethod
+    def _order_directory_lines(lines: Sequence[PdfResolvedLine]) -> list[PdfResolvedLine]:
+        ordered = sorted(
+            list(lines or []),
+            key=lambda line: (
+                round(float(line.bbox.top), 1),
+                round(float(line.bbox.x0), 1),
+                int(line.reading_order or 0),
+            ),
+        )
+        return [
+            replace(line, reading_order=index)
+            for index, line in enumerate(ordered, start=1)
+        ]
 
     def _make_block(
         self,

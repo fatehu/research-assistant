@@ -89,6 +89,11 @@ const PDF_UPLOAD_OPTIONS = [
     description: '沿用当前本地提取链路，速度更快，适合普通 PDF。',
   },
   {
+    label: '本地 Hybrid',
+    value: 'local_hybrid' as DocumentIngestMode,
+    description: '复杂页自动路由到 docling-fast，质量更高，速度略慢。',
+  },
+  {
     label: '在线多模态精读',
     value: 'online_mm' as DocumentIngestMode,
     description: '直接看页图提取正文、公式和表格，适合科研论文。',
@@ -344,10 +349,10 @@ const KnowledgePage = () => {
   const handleConfirmPdfUpload = async () => {
     if (!pendingUploadFile) return
     const file = pendingUploadFile
-    const options: DocumentUploadOptions = {
-      ingestMode: uploadIngestMode,
-      extractProfile: uploadExtractProfile,
-      extractGranularity: uploadExtractGranularity,
+    const options: DocumentUploadOptions = { ingestMode: uploadIngestMode }
+    if (uploadIngestMode === 'online_mm') {
+      options.extractProfile = uploadExtractProfile
+      options.extractGranularity = uploadExtractGranularity
     }
     resetUploadOptions()
     await executeUpload(file, options)
@@ -1042,28 +1047,36 @@ const KnowledgePage = () => {
             </div>
           </div>
 
-          <div>
-            <div className="mb-2 text-sm text-slate-300">提取目标</div>
-            <Select
-              className="w-full"
-              value={uploadExtractProfile}
-              onChange={(value) => setUploadExtractProfile(value)}
-              options={PDF_EXTRACT_PROFILE_OPTIONS}
-            />
-          </div>
+          {uploadIngestMode === 'online_mm' ? (
+            <>
+              <div>
+                <div className="mb-2 text-sm text-slate-300">提取目标</div>
+                <Select
+                  className="w-full"
+                  value={uploadExtractProfile}
+                  onChange={(value) => setUploadExtractProfile(value)}
+                  options={PDF_EXTRACT_PROFILE_OPTIONS}
+                />
+              </div>
 
-          <div>
-            <div className="mb-2 text-sm text-slate-300">提取颗粒度</div>
-            <Select
-              className="w-full"
-              value={uploadExtractGranularity}
-              onChange={(value) => setUploadExtractGranularity(value)}
-              options={PDF_EXTRACT_GRANULARITY_OPTIONS.map((option) => ({
-                label: `${option.label}：${option.description}`,
-                value: option.value,
-              }))}
-            />
-          </div>
+              <div>
+                <div className="mb-2 text-sm text-slate-300">提取颗粒度</div>
+                <Select
+                  className="w-full"
+                  value={uploadExtractGranularity}
+                  onChange={(value) => setUploadExtractGranularity(value)}
+                  options={PDF_EXTRACT_GRANULARITY_OPTIONS.map((option) => ({
+                    label: `${option.label}：${option.description}`,
+                    value: option.value,
+                  }))}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="rounded-lg border border-slate-700 bg-slate-900/60 px-4 py-3 text-xs text-slate-400">
+              当前为本地模式，提取目标和颗粒度参数仅在“在线多模态精读”模式下生效。
+            </div>
+          )}
 
           <div className="rounded-lg border border-slate-700 bg-slate-900/60 px-4 py-3 text-xs text-slate-400">
             当前文件：

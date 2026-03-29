@@ -20,6 +20,11 @@ from .contracts import (
 )
 
 _CAPTION_RE = re.compile(r"^\s*(?:table|tab\.?|figure|fig\.)\s*\d+[\s:\.-]", re.IGNORECASE)
+_METADATA_LABEL_RE = re.compile(
+    r"(?:doi|license|licen[cs]e|open licen[cs]e|copyright|retrieved|accessed|source|url)\b",
+    re.IGNORECASE,
+)
+_URLISH_RE = re.compile(r"(?:https?://|www\.|doi\.org/)", re.IGNORECASE)
 _COMMON_PROSE_WORDS = {
     "a",
     "an",
@@ -1261,6 +1266,8 @@ class LocalPdfTableDetector:
             return []
         if self._rows_look_like_parallel_prose(rows):
             return []
+        if self._rows_look_like_metadata_pairs(rows):
+            return []
         return rows
 
     def _extract_anchor_aligned_rows_from_line_ids(
@@ -1679,6 +1686,26 @@ class LocalPdfTableDetector:
                 return True
             return len(materialized) >= 3 and prose_rows >= max(2, len(materialized) - 1)
         return prose_rows >= len(materialized)
+
+    @classmethod
+    def _rows_look_like_metadata_pairs(cls, rows: Sequence[Sequence[str]]) -> bool:
+        materialized = [
+            [str(cell or "").strip() for cell in list(row or []) if str(cell or "").strip()]
+            for row in list(rows or [])
+        ]
+        materialized = [row for row in materialized if row]
+        if len(materialized) < 2:
+            return False
+        if max((len(row) for row in materialized), default=0) != 2:
+            return False
+        metadata_rows = 0
+        for left, right in materialized:
+            if not _URLISH_RE.search(right):
+                continue
+            if not _METADATA_LABEL_RE.search(left):
+                continue
+            metadata_rows += 1
+        return metadata_rows >= max(2, len(materialized) - 1)
 
     @classmethod
     def _rows_look_like_sparse_chart(cls, rows: Sequence[Sequence[str]]) -> bool:

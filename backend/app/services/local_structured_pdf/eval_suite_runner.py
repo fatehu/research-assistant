@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
 import logging
@@ -11,6 +12,7 @@ import time
 from typing import Any
 
 from .markdown_renderer import LocalPdfMarkdownRenderer
+from .docling_fast_hybrid_pipeline import LocalStructuredPdfDoclingFastHybridPipeline
 from .pipeline import LocalStructuredPdfPipeline
 
 
@@ -75,6 +77,9 @@ def run_eval_suites(
     output_root: Path,
     engine_name: str,
     heuristic_profile: str,
+    pipeline_mode: str = "deterministic",
+    hybrid_mode: str = "auto",
+    write_trace: bool = False,
     page_limit: int | None = None,
     evaluator_python: Path | None = None,
     evaluator_script: Path | None = None,
@@ -89,6 +94,9 @@ def run_eval_suites(
             output_root=output_root,
             engine_name=engine_name,
             heuristic_profile=heuristic_profile,
+            pipeline_mode=pipeline_mode,
+            hybrid_mode=hybrid_mode,
+            write_trace=write_trace,
             page_limit=page_limit,
             evaluator_python=evaluator_python,
             evaluator_script=evaluator_script,
@@ -99,6 +107,9 @@ def run_eval_suites(
         "manifest_version": "local_structured_pdf_eval_suites_v1",
         "engine_name": engine_name,
         "heuristic_profile": heuristic_profile,
+        "pipeline_mode": pipeline_mode,
+        "hybrid_mode": hybrid_mode if pipeline_mode == "hybrid" else "",
+        "write_trace": bool(write_trace),
         "suite_count": len(suite_reports),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "processor": _processor_name(),
@@ -118,6 +129,9 @@ def run_eval_suite(
     output_root: Path,
     engine_name: str,
     heuristic_profile: str,
+    pipeline_mode: str = "deterministic",
+    hybrid_mode: str = "auto",
+    write_trace: bool = False,
     page_limit: int | None = None,
     evaluator_python: Path | None = None,
     evaluator_script: Path | None = None,
@@ -128,21 +142,41 @@ def run_eval_suite(
     markdown_dir = engine_dir / "markdown"
     markdown_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline = LocalStructuredPdfPipeline(heuristic_profile=heuristic_profile)
+    normalized_pipeline_mode = _normalize_pipeline_mode(pipeline_mode)
+    normalized_hybrid_mode = _normalize_hybrid_mode(hybrid_mode)
+    pipeline = (
+        LocalStructuredPdfDoclingFastHybridPipeline(heuristic_profile=heuristic_profile)
+        if normalized_pipeline_mode == "hybrid"
+        else LocalStructuredPdfPipeline(heuristic_profile=heuristic_profile)
+    )
     pipeline.ensure_runtime_ready()
     renderer = LocalPdfMarkdownRenderer()
     pdf_paths = _collect_pdf_paths(suite=suite)
     failures: list[str] = []
     per_doc_rows: list[dict[str, Any]] = []
+    trace_dir = suite_root / "trace" / engine_name if bool(write_trace) else None
+    if trace_dir is not None:
+        trace_dir.mkdir(parents=True, exist_ok=True)
 
     started_at = time.time()
     for pdf_path in pdf_paths:
         doc_started_at = time.time()
         logging.info("Suite=%s processing %s", suite.name, pdf_path.name)
         try:
-            document = pipeline.parse_document(pdf_path=str(pdf_path), page_limit=page_limit)
+            document, trace = _run_pipeline_parse(
+                pipeline=pipeline,
+                pipeline_mode=normalized_pipeline_mode,
+                hybrid_mode=normalized_hybrid_mode,
+                pdf_path=pdf_path,
+                page_limit=page_limit,
+            )
             markdown = renderer.render_document(document=document)
             (markdown_dir / f"{pdf_path.stem}.md").write_text(markdown, encoding="utf-8")
+            if trace_dir is not None and trace is not None:
+                (trace_dir / f"{pdf_path.stem}.json").write_text(
+                    json.dumps(trace.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
         except Exception as exc:  # pragma: no cover - defensive CLI guard
             logging.exception("Suite=%s failed to process %s: %s", suite.name, pdf_path.name, exc)
             failures.append(pdf_path.stem)
@@ -160,6 +194,8 @@ def run_eval_suite(
         "engine_name": engine_name,
         "engine_version": "0.1.0-dev",
         "heuristic_profile": heuristic_profile,
+        "pipeline_mode": normalized_pipeline_mode,
+        "hybrid_mode": normalized_hybrid_mode if normalized_pipeline_mode == "hybrid" else "",
         "suite": {
             "name": suite.name,
             "input_dir": str(suite.input_dir),
@@ -174,6 +210,7 @@ def run_eval_suite(
         "failed_documents": failures,
         "date": time.strftime("%Y-%m-%d"),
         "documents": per_doc_rows,
+        "trace_dir": str(trace_dir) if trace_dir is not None else "",
     }
     summary_path = engine_dir / "summary.json"
     summary_path.write_text(json.dumps(export_summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -182,12 +219,15 @@ def run_eval_suite(
         "name": suite.name,
         "description": suite.description,
         "heuristic_profile": heuristic_profile,
+        "pipeline_mode": normalized_pipeline_mode,
+        "hybrid_mode": normalized_hybrid_mode if normalized_pipeline_mode == "hybrid" else "",
         "input_dir": str(suite.input_dir),
         "ground_truth_dir": str(suite.ground_truth_dir) if suite.ground_truth_dir else "",
         "document_count": doc_count,
         "failed_documents": failures,
         "summary_path": str(summary_path),
         "markdown_dir": str(markdown_dir),
+        "trace_dir": str(trace_dir) if trace_dir is not None else "",
         "elapsed_per_doc": export_summary["elapsed_per_doc"],
     }
 
@@ -220,6 +260,40 @@ def _collect_pdf_paths(*, suite: LocalPdfEvalSuite) -> list[Path]:
     if suite.doc_ids:
         return [path for path in [suite.input_dir / f"{doc_id}.pdf" for doc_id in suite.doc_ids] if path.is_file()]
     return sorted(path for path in suite.input_dir.glob("*.pdf") if path.is_file())
+
+
+def _normalize_pipeline_mode(pipeline_mode: str) -> str:
+    token = str(pipeline_mode or "deterministic").strip().lower()
+    if token not in {"deterministic", "hybrid"}:
+        return "deterministic"
+    return token
+
+
+def _normalize_hybrid_mode(hybrid_mode: str) -> str:
+    token = str(hybrid_mode or "auto").strip().lower()
+    if token not in {"auto", "full"}:
+        return "auto"
+    return token
+
+
+def _run_pipeline_parse(
+    *,
+    pipeline: Any,
+    pipeline_mode: str,
+    hybrid_mode: str,
+    pdf_path: Path,
+    page_limit: int | None,
+) -> tuple[Any, Any | None]:
+    if pipeline_mode == "hybrid":
+        trace = asyncio.run(
+            pipeline.parse_document_with_trace(
+                pdf_path=str(pdf_path),
+                page_limit=page_limit,
+                mode=hybrid_mode,
+            )
+        )
+        return trace.document, trace
+    return pipeline.parse_document(pdf_path=str(pdf_path), page_limit=page_limit), None
 
 
 def _prepare_ground_truth_subset(

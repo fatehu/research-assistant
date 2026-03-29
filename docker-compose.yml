@@ -86,6 +86,8 @@ services:
       - HUGGINGFACE_HUB_CACHE=/app/model_cache/huggingface/hub
       - TRANSFORMERS_CACHE=/app/model_cache/huggingface/transformers
       - XDG_CACHE_HOME=/app/model_cache/xdg-cache
+      - HOST_HUGGINGFACE_CACHE_MOUNT=/app/host_model_cache/huggingface
+      - MODEL_CACHE_PREWARM_REPOS=${MODEL_CACHE_PREWARM_REPOS:-BAAI/bge-m3,BAAI/bge-reranker-v2-m3}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - LOCAL_EMBEDDING_NORMALIZE=${LOCAL_EMBEDDING_NORMALIZE:-true}
       - LOCAL_EMBEDDING_DIMENSION=${LOCAL_EMBEDDING_DIMENSION:-0}
@@ -118,6 +120,7 @@ services:
       - DOCUMENT_PROCESSING_STALE_TIMEOUT_SECONDS=${DOCUMENT_PROCESSING_STALE_TIMEOUT_SECONDS:-7200}
       - CHUNK_QUALITY_GATE_ENABLED=${CHUNK_QUALITY_GATE_ENABLED:-false}
       - CHUNK_QUALITY_GATE_MODEL=${CHUNK_QUALITY_GATE_MODEL:-qwen3.5:0.8b-stable}
+      - DOCLING_URL=${DOCLING_URL:-http://research_pdf_hybrid_backend:5002}
       - CHUNK_QUALITY_GATE_TIMEOUT_SECONDS=${CHUNK_QUALITY_GATE_TIMEOUT_SECONDS:-40}
       - CHUNK_QUALITY_GATE_BAD_THRESHOLD=${CHUNK_QUALITY_GATE_BAD_THRESHOLD:-0.50}
       - CHUNK_QUALITY_GATE_SUSPECT_THRESHOLD=${CHUNK_QUALITY_GATE_SUSPECT_THRESHOLD:-0.65}
@@ -131,6 +134,7 @@ services:
       - CHUNK_REPAIR_MAX_FRAGMENTS=${CHUNK_REPAIR_MAX_FRAGMENTS:-120}
       - CHUNK_REPAIR_MAX_CHARS_PER_CHUNK=${CHUNK_REPAIR_MAX_CHARS_PER_CHUNK:-1800}
       - PDF_RAG_LINE_PIPELINE_ENABLED=${PDF_RAG_LINE_PIPELINE_ENABLED:-true}
+      - PDF_RAG_STRUCTURED_MODE=${PDF_RAG_STRUCTURED_MODE:-fast}
       - PDF_RAG_FAIL_OPEN=${PDF_RAG_FAIL_OPEN:-true}
       - PDF_RAG_QWEN_DEVICE=${PDF_RAG_QWEN_DEVICE:-auto}
       - PDF_RAG_ACTION_MODEL_DIR=${PDF_RAG_ACTION_MODEL_DIR:-models/runtime/qwen_action_lora_merged_v2_manual}
@@ -216,6 +220,10 @@ services:
       - ./backend:/app
       - backend_uploads:/app/uploads
       - model_cache:/app/model_cache
+      - type: bind
+        source: ${HOST_HUGGINGFACE_CACHE_DIR:-/mnt/c/Users/yui/.cache/huggingface}
+        target: /app/host_model_cache/huggingface
+        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -230,6 +238,60 @@ services:
         exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-exclude "model_cache/*" --reload-exclude ".cache/*" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
       fi;
       exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
+    networks:
+      - research_network
+
+  pdf-hybrid-backend:
+    image: research-assistant-backend:latest
+    container_name: research_pdf_hybrid_backend
+    gpus: ${DOCKER_BACKEND_GPUS:-all}
+    environment:
+      - APP_ENV=${APP_ENV:-development}
+      - LANG=${CONTAINER_LANG:-C.UTF-8}
+      - LC_ALL=${CONTAINER_LC_ALL:-C.UTF-8}
+      - PYTHONUTF8=${CONTAINER_PYTHONUTF8:-1}
+      - PYTHONIOENCODING=${CONTAINER_PYTHONIOENCODING:-UTF-8}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+      - LOCAL_STRUCTURED_PDF_HYBRID_MODEL=${LOCAL_STRUCTURED_PDF_HYBRID_MODEL:-qwen3.5:0.8b}
+      - LOCAL_STRUCTURED_PDF_HYBRID_MODEL_CHAIN=${LOCAL_STRUCTURED_PDF_HYBRID_MODEL_CHAIN:-qwen3.5:0.8b,qwen3.5:2b-q4_K_M,qwen3.5:4b-q4_K_M}
+      - LOCAL_STRUCTURED_PDF_HYBRID_DISABLE_THINKING=${LOCAL_STRUCTURED_PDF_HYBRID_DISABLE_THINKING:-true}
+      - LOCAL_STRUCTURED_PDF_HYBRID_ENABLE_NATIVE_FALLBACK=${LOCAL_STRUCTURED_PDF_HYBRID_ENABLE_NATIVE_FALLBACK:-false}
+      - PDF_HYBRID_BACKEND_FORCE_OCR=${PDF_HYBRID_BACKEND_FORCE_OCR:-false}
+      - PDF_HYBRID_BACKEND_OCR_LANG=${PDF_HYBRID_BACKEND_OCR_LANG:-}
+      - PDF_HYBRID_BACKEND_ENRICH_FORMULA=${PDF_HYBRID_BACKEND_ENRICH_FORMULA:-false}
+      - PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION=${PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION:-false}
+      - PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT=${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT:-}
+      - HF_HOME=/app/model_cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/app/model_cache/huggingface/hub
+      - TRANSFORMERS_CACHE=/app/model_cache/huggingface/transformers
+      - XDG_CACHE_HOME=/app/model_cache/xdg-cache
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+    ports:
+      - "5002:5002"
+    volumes:
+      - ./backend:/app
+      - model_cache:/app/model_cache
+    command: >
+      sh -c 'set -eu;
+      set -- --host 0.0.0.0 --port 5002;
+      if [ "${PDF_HYBRID_BACKEND_FORCE_OCR:-false}" = "true" ]; then
+        set -- "$@" --force-ocr;
+      fi;
+      if [ -n "${PDF_HYBRID_BACKEND_OCR_LANG:-}" ]; then
+        set -- "$@" --ocr-lang "${PDF_HYBRID_BACKEND_OCR_LANG}";
+      fi;
+      if [ "${PDF_HYBRID_BACKEND_ENRICH_FORMULA:-false}" = "true" ]; then
+        set -- "$@" --enrich-formula;
+      fi;
+      if [ "${PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION:-false}" = "true" ]; then
+        set -- "$@" --enrich-picture-description;
+      fi;
+      if [ -n "${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT:-}" ]; then
+        set -- "$@" --picture-description-prompt "${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT}";
+      fi;
+      exec python -m app.services.local_structured_pdf.opendataloader_upstream_hybrid_server "$@"'
+    restart: unless-stopped
     networks:
       - research_network
 

@@ -197,6 +197,13 @@ class LocalPdfFrontMatterResolver:
         ]
         if not title_candidates:
             return blocks
+        if not self._looks_reorderable_front_matter_band(
+            page_one_blocks=page_one_blocks,
+            title_candidates=title_candidates,
+            first_section_top=first_section_top,
+            upper_page_limit=upper_page_limit,
+        ):
+            return blocks
         title_anchor_bottom = max(float(block.bbox.bottom) for block in title_candidates)
         front_cluster = [
             block
@@ -242,6 +249,39 @@ class LocalPdfFrontMatterResolver:
         for index, block in zip(page_one_indices, reordered_page_one):
             reordered_blocks[index] = block
         return reordered_blocks
+
+    def _looks_reorderable_front_matter_band(
+        self,
+        *,
+        page_one_blocks: list[PdfSemanticBlock],
+        title_candidates: list[PdfSemanticBlock],
+        first_section_top: float,
+        upper_page_limit: float | None,
+    ) -> bool:
+        if len(title_candidates) >= 2:
+            return True
+
+        pre_section_blocks = [
+            block
+            for block in page_one_blocks
+            if float(block.bbox.top) < first_section_top
+            and (upper_page_limit is None or float(block.bbox.bottom) <= upper_page_limit)
+        ]
+        for block in pre_section_blocks:
+            text = _SPACE_RE.sub(" ", str(block.text or "").strip())
+            if not text:
+                continue
+            if _ABSTRACT_OR_SECTION_RE.match(text):
+                return True
+            if self._looks_symbol_only_meta(text):
+                return True
+            if self._looks_email_or_contact_line(text):
+                return True
+            if self._looks_author_line(text):
+                return True
+            if self._looks_affiliation_or_contact_line(text):
+                return True
+        return False
 
     def _should_demote_front_matter_heading(
         self,

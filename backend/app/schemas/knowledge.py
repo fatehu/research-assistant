@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-DocumentUploadMode = Literal["local_fast", "online_mm", "auto"]
+DocumentUploadMode = Literal["local_fast", "local_hybrid", "online_mm", "auto"]
 DocumentExtractProfile = Literal["general", "academic_formula", "table_first"]
 DocumentExtractGranularity = Literal["fine", "medium", "coarse"]
 

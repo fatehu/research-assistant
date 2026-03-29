@@ -76,8 +76,13 @@ class LocalStructuredPdfPipeline:
         *,
         pdf_path: str,
         page_limit: int | None = None,
+        include_chars: bool = False,
     ) -> PdfStructuredDocument:
-        page_atoms = self._extractor.extract_document_atoms(pdf_path=pdf_path, page_limit=page_limit)
+        page_atoms = self._extractor.extract_document_atoms(
+            pdf_path=pdf_path,
+            page_limit=page_limit,
+            include_chars=include_chars,
+        )
         if not page_atoms:
             return PdfStructuredDocument()
 

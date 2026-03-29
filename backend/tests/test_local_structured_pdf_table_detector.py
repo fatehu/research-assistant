@@ -390,6 +390,70 @@ def test_detect_document_splits_mixed_paragraph_and_preserves_caption():
     assert "Table 1: Example caption" in enriched.blocks[2].text
 
 
+def test_detect_document_does_not_materialize_source_metadata_pairs_as_table():
+    detector = LocalPdfTableDetector()
+    page_meta = PdfPageMeta(page=1, page_width=600.0, page_height=800.0, rotation=0)
+    normalized_page = PdfNormalizedPage(
+        meta=page_meta,
+        kept_words=[
+            *_row_words("r1", ["9th,", "2022.", "DOI:"], ["https://doi.org/10.25318/3210036401-eng."], 100.0),
+            *_row_words("r2", ["Canada", "Open", "Licence:"], ["https://www.statcan.gc.ca/en/reference/licence"], 120.0),
+        ],
+        dropped_words=[],
+        text_lines=[],
+    )
+    resolved_document = PdfResolvedDocument(
+        pages=[
+            PdfResolvedPage(
+                meta=page_meta,
+                lines=[
+                    _wide_line(
+                        "l1",
+                        ["r1l1", "r1l2", "r1l3", "r1r1"],
+                        "9th, 2022. DOI: https://doi.org/10.25318/3210036401-eng.",
+                        100.0,
+                    ),
+                    _wide_line(
+                        "l2",
+                        ["r2l1", "r2l2", "r2l3", "r2r1"],
+                        "Canada Open Licence: https://www.statcan.gc.ca/en/reference/licence",
+                        120.0,
+                    ),
+                ],
+            )
+        ]
+    )
+    structured_document = PdfStructuredDocument(
+        pages=[PdfStructuredPage(meta=page_meta, blocks=[])],
+        blocks=[
+            PdfSemanticBlock(
+                block_id="b1",
+                block_type="paragraph",
+                page_start=1,
+                page_end=1,
+                text=(
+                    "9th, 2022. DOI: https://doi.org/10.25318/3210036401-eng.\n"
+                    "Canada Open Licence: https://www.statcan.gc.ca/en/reference/licence"
+                ),
+                bbox=PdfBBox(x0=60.0, top=100.0, x1=560.0, bottom=134.0),
+                line_ids=["l1", "l2"],
+                reading_order_start=1,
+                reading_order_end=2,
+            )
+        ],
+        body_font_size=12.0,
+    )
+
+    enriched = detector.detect_document(
+        normalized_pages=[normalized_page],
+        resolved_document=resolved_document,
+        structured_document=structured_document,
+    )
+
+    assert [block.block_type for block in enriched.blocks] == ["paragraph"]
+    assert enriched.blocks[0].table_rows == []
+
+
 def test_detect_document_uses_header_anchors_for_wide_table_rows():
     detector = LocalPdfTableDetector()
     page_meta = PdfPageMeta(page=1, page_width=600.0, page_height=800.0, rotation=0)

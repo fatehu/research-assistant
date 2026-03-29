@@ -26,6 +26,9 @@ backend/env/
 # 任意命名的本地 Python 虚拟环境
 .venv/
 .venv*/
+.tmp-test-venv/
+.tmp-venv/
+.tmp-venv*/
 venv/
 venv*/
 env/
@@ -95,6 +98,7 @@ SESSION_RECOVERY.md
 _generate_experience_session_v2_narrative_brief
 experience-*.png
 tmp-*
+manual_review/
 frontend/.vite/
 frontend/vite.config.js.timestamp-*.mjs
 
@@ -112,5 +116,7 @@ backend/eval/results/**
 # Reader runtime artifacts
 backend/uploads/
 backend/.cache/
+backend/.nv/
 backend/models/
+backend/vendor/docling-wheelhouse/
 uploads/

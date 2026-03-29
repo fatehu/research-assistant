@@ -51,7 +51,13 @@ class LocalPdfNativeExtractor:
             "dependencies installed."
         )
 
-    def extract_page_atoms(self, *, pdf_path: str, page: int) -> PdfPageAtoms:
+    def extract_page_atoms(
+        self,
+        *,
+        pdf_path: str,
+        page: int,
+        include_chars: bool = True,
+    ) -> PdfPageAtoms:
         page_number = max(1, int(page))
         path = Path(str(pdf_path or "").strip()).expanduser()
         fallback = self._fallback_page_atoms(page_number=page_number)
@@ -80,6 +86,7 @@ class LocalPdfNativeExtractor:
                 plumber_pdf=plumber_pdf,
                 fitz_doc=fitz_doc,
                 document_flags=document_flags,
+                include_chars=include_chars,
             )
         except Exception as exc:
             logger.debug(f"[LocalStructuredPdf] native extraction failed page={page_number}: {exc}")
@@ -93,6 +100,7 @@ class LocalPdfNativeExtractor:
         *,
         pdf_path: str,
         page_limit: int | None = None,
+        include_chars: bool = True,
     ) -> list[PdfPageAtoms]:
         path = Path(str(pdf_path or "").strip()).expanduser()
         if not path.is_file():
@@ -125,6 +133,7 @@ class LocalPdfNativeExtractor:
                             plumber_pdf=plumber_pdf,
                             fitz_doc=fitz_doc,
                             document_flags=document_flags,
+                            include_chars=include_chars,
                         )
                     )
                 except Exception as exc:
@@ -148,6 +157,7 @@ class LocalPdfNativeExtractor:
         plumber_pdf: Any,
         fitz_doc: Any,
         document_flags: dict[str, bool],
+        include_chars: bool = True,
     ) -> PdfPageAtoms:
         fallback = self._fallback_page_atoms(page_number=page_number)
         page_index = page_number - 1
@@ -162,7 +172,7 @@ class LocalPdfNativeExtractor:
             fitz_page=fitz_page,
         )
         fitz_text = self._extract_fitz_text(fitz_page=fitz_page)
-        plumber_text = self._extract_plumber_text(page_obj=plumber_page)
+        plumber_text = self._extract_plumber_text(page_obj=plumber_page) if not fitz_text else ""
 
         page_atoms = PdfPageAtoms(
             meta=PdfPageMeta(
@@ -182,48 +192,77 @@ class LocalPdfNativeExtractor:
             has_struct_tree=bool(document_flags.get("has_struct_tree")),
         )
 
+        if fitz_page is not None:
+            page_atoms.text_blocks = self._safe_page_stage(
+                page_number=page_number,
+                stage_name="text_blocks",
+                default=[],
+                extractor=lambda: self._extract_text_blocks(fitz_page=fitz_page),
+            )
+            page_atoms.images = self._coarse_images_from_text_blocks(
+                text_blocks=page_atoms.text_blocks,
+                fitz_page=fitz_page,
+            )
+        coarse_line_count = 0
+        coarse_rect_count = 0
+        coarse_curve_count = 0
+        if fitz_page is not None:
+            coarse_line_count, coarse_rect_count, coarse_curve_count = self._coarse_vector_counts_from_drawings(
+                fitz_page=fitz_page,
+            )
+            page_atoms.coarse_line_count = int(coarse_line_count)
+            page_atoms.coarse_rect_count = int(coarse_rect_count)
+            page_atoms.coarse_curve_count = int(coarse_curve_count)
+
         if plumber_page is not None:
-            page_atoms.words = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="words",
-                default=[],
-                extractor=lambda: self._extract_words(page_obj=plumber_page),
+            skip_expensive_textual_stages = self._should_skip_words_and_tables_fast_path(
+                page_atoms=page_atoms,
+                line_like_count_override=coarse_line_count + coarse_rect_count,
+                curve_count_override=coarse_curve_count,
             )
-            page_atoms.chars = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="chars",
-                default=[],
-                extractor=lambda: self._extract_chars(page_obj=plumber_page),
-            )
-            if page_atoms.words and page_atoms.chars:
-                page_atoms.words = self._attach_char_ranges(
-                    words=page_atoms.words,
-                    chars=page_atoms.chars,
+            if not skip_expensive_textual_stages:
+                page_atoms.rects = self._safe_page_stage(
+                    page_number=page_number,
+                    stage_name="rects",
+                    default=[],
+                    extractor=lambda: self._extract_rects(page_obj=plumber_page),
                 )
-            page_atoms.images = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="images",
-                default=[],
-                extractor=lambda: self._extract_images(page_obj=plumber_page),
-            )
-            page_atoms.lines = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="lines",
-                default=[],
-                extractor=lambda: self._extract_lines(page_obj=plumber_page),
-            )
-            page_atoms.rects = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="rects",
-                default=[],
-                extractor=lambda: self._extract_rects(page_obj=plumber_page),
-            )
-            page_atoms.curves = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="curves",
-                default=[],
-                extractor=lambda: self._extract_curves(page_obj=plumber_page),
-            )
+                page_atoms.curves = self._safe_page_stage(
+                    page_number=page_number,
+                    stage_name="curves",
+                    default=[],
+                    extractor=lambda: self._extract_curves(page_obj=plumber_page),
+                )
+                page_atoms.lines = self._safe_page_stage(
+                    page_number=page_number,
+                    stage_name="lines",
+                    default=[],
+                    extractor=lambda: self._extract_lines(page_obj=plumber_page),
+                )
+                page_atoms.images = self._safe_page_stage(
+                    page_number=page_number,
+                    stage_name="images",
+                    default=[],
+                    extractor=lambda: self._extract_images(page_obj=plumber_page),
+                )
+                page_atoms.words = self._safe_page_stage(
+                    page_number=page_number,
+                    stage_name="words",
+                    default=[],
+                    extractor=lambda: self._extract_words(page_obj=plumber_page),
+                )
+                if include_chars:
+                    page_atoms.chars = self._safe_page_stage(
+                        page_number=page_number,
+                        stage_name="chars",
+                        default=[],
+                        extractor=lambda: self._extract_chars(page_obj=plumber_page),
+                    )
+                    if page_atoms.words and page_atoms.chars:
+                        page_atoms.words = self._attach_char_ranges(
+                            words=page_atoms.words,
+                            chars=page_atoms.chars,
+                        )
             page_atoms.annots = self._safe_page_stage(
                 page_number=page_number,
                 stage_name="annots",
@@ -238,13 +277,10 @@ class LocalPdfNativeExtractor:
             )
 
         if fitz_page is not None:
-            page_atoms.text_blocks = self._safe_page_stage(
-                page_number=page_number,
-                stage_name="text_blocks",
-                default=[],
-                extractor=lambda: self._extract_text_blocks(fitz_page=fitz_page),
-            )
-            if self._should_probe_tables(page_atoms=page_atoms):
+            if (
+                not self._should_skip_words_and_tables_fast_path(page_atoms=page_atoms)
+                and self._should_probe_tables(page_atoms=page_atoms)
+            ):
                 page_atoms.tables = self._safe_page_stage(
                     page_number=page_number,
                     stage_name="tables",
@@ -594,6 +630,73 @@ class LocalPdfNativeExtractor:
         return atoms
 
     @classmethod
+    def _coarse_images_from_text_blocks(
+        cls,
+        *,
+        text_blocks: Sequence[PdfTextBlockAtom],
+        fitz_page: Any | None = None,
+    ) -> list[PdfImageAtom]:
+        atoms: list[PdfImageAtom] = []
+        for index, block in enumerate(list(text_blocks or [])[:256], start=1):
+            if str(getattr(block, "block_kind", "")).lower() != "image":
+                continue
+            bbox = getattr(block, "bbox", None)
+            if bbox is None:
+                continue
+            atoms.append(
+                PdfImageAtom(
+                    image_id=f"tbimg{index:04d}",
+                    bbox=bbox,
+                    name="pymupdf_block_image",
+                )
+            )
+        if atoms or fitz_page is None:
+            return atoms
+        try:
+            raw_dict = fitz_page.get_text("dict", sort=False) or {}
+            raw_blocks = list(raw_dict.get("blocks") or [])
+        except Exception as exc:
+            logger.debug(f"[LocalStructuredPdf] PyMuPDF dict block extraction failed: {exc}")
+            return atoms
+        for block in raw_blocks[:256]:
+            if not isinstance(block, dict):
+                continue
+            if cls._safe_int(block.get("type"), default=0) != 1:
+                continue
+            bbox = cls._bbox_from_tuple(block.get("bbox"))
+            atoms.append(
+                PdfImageAtom(
+                    image_id=f"tbimg{len(atoms) + 1:04d}",
+                    bbox=bbox,
+                    name="pymupdf_dict_image",
+                )
+            )
+        return atoms
+
+    @classmethod
+    def _coarse_vector_counts_from_drawings(cls, *, fitz_page: Any | None) -> tuple[int, int, int]:
+        if fitz_page is None:
+            return 0, 0, 0
+        try:
+            drawings = list(fitz_page.get_drawings() or [])
+        except Exception as exc:
+            logger.debug(f"[LocalStructuredPdf] PyMuPDF drawing extraction failed: {exc}")
+            return 0, 0, 0
+        line_count = 0
+        rect_count = 0
+        curve_count = 0
+        for drawing in drawings:
+            for item in list(drawing.get("items") or []):
+                op = str(item[0] or "")
+                if op == "l":
+                    line_count += 1
+                elif op == "re":
+                    rect_count += 1
+                elif op in {"c", "v", "y"}:
+                    curve_count += 1
+        return line_count, rect_count, curve_count
+
+    @classmethod
     def _extract_lines(cls, *, page_obj: Any) -> list[PdfLineAtom]:
         atoms: list[PdfLineAtom] = []
         for index, row in enumerate(list(getattr(page_obj, "lines", []) or [])[:1200], start=1):
@@ -750,5 +853,58 @@ class LocalPdfNativeExtractor:
         if line_like_count >= 4 and curve_count >= 2:
             return True
         if line_like_count >= 3 and word_count >= 24:
+            return True
+        return False
+
+    @classmethod
+    def _should_skip_words_and_tables_fast_path(
+        cls,
+        *,
+        page_atoms: PdfPageAtoms,
+        line_like_count_override: int | None = None,
+        curve_count_override: int | None = None,
+    ) -> bool:
+        text = str(getattr(page_atoms, "extract_text_raw", "") or "").strip()
+        text_char_count = len(text)
+        text_token_count = len([token for token in text.split() if token])
+
+        page_width = float(getattr(getattr(page_atoms, "meta", None), "page_width", 0.0) or 0.0)
+        page_height = float(getattr(getattr(page_atoms, "meta", None), "page_height", 0.0) or 0.0)
+        page_area = max(1.0, page_width * page_height)
+
+        image_areas: list[float] = []
+        for image in list(getattr(page_atoms, "images", []) or []):
+            bbox = getattr(image, "bbox", None)
+            if bbox is None:
+                continue
+            width = max(0.0, float(getattr(bbox, "x1", 0.0) or 0.0) - float(getattr(bbox, "x0", 0.0) or 0.0))
+            height = max(0.0, float(getattr(bbox, "bottom", 0.0) or 0.0) - float(getattr(bbox, "top", 0.0) or 0.0))
+            area = width * height
+            if area > 0.0:
+                image_areas.append(area)
+        largest_image_ratio = (max(image_areas) / page_area) if image_areas else 0.0
+        total_image_ratio = (sum(image_areas) / page_area) if image_areas else 0.0
+
+        line_like_count = (
+            int(line_like_count_override)
+            if line_like_count_override is not None
+            else len(list(page_atoms.lines or [])) + len(list(page_atoms.rects or []))
+        )
+        curve_count = (
+            int(curve_count_override)
+            if curve_count_override is not None
+            else len(list(page_atoms.curves or []))
+        )
+        vector_line_count = line_like_count + curve_count
+
+        very_low_text = text_char_count <= 24 and text_token_count <= 4
+        if very_low_text and largest_image_ratio >= 0.70 and total_image_ratio >= 0.78:
+            return True
+        if (
+            very_low_text
+            and vector_line_count >= 220
+            and line_like_count >= 160
+            and curve_count >= 60
+        ):
             return True
         return False

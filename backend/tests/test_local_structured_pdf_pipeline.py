@@ -11,7 +11,14 @@ from app.services.local_structured_pdf import (
 
 
 class _Extractor:
-    def extract_document_atoms(self, *, pdf_path: str, page_limit: int | None = None) -> list[PdfPageAtoms]:
+    def extract_document_atoms(
+        self,
+        *,
+        pdf_path: str,
+        page_limit: int | None = None,
+        include_chars: bool = True,
+    ) -> list[PdfPageAtoms]:
+        del pdf_path, page_limit, include_chars
         return [PdfPageAtoms(meta=PdfPageMeta(page=1, page_width=600.0, page_height=800.0, rotation=0))]
 
 
@@ -143,3 +150,63 @@ def test_ensure_runtime_ready_delegates_to_extractor():
     pipeline.ensure_runtime_ready()
 
     assert calls == ["ready"]
+
+
+def test_parse_document_disables_chars_by_default():
+    seen: dict[str, bool | None] = {"include_chars": None}
+
+    class _RecorderExtractor(_Extractor):
+        def extract_document_atoms(  # type: ignore[override]
+            self,
+            *,
+            pdf_path: str,
+            page_limit: int | None = None,
+            include_chars: bool = True,
+        ) -> list[PdfPageAtoms]:
+            del pdf_path, page_limit
+            seen["include_chars"] = include_chars
+            return [PdfPageAtoms(meta=PdfPageMeta(page=1, page_width=600.0, page_height=800.0, rotation=0))]
+
+    pipeline = LocalStructuredPdfPipeline(
+        extractor=_RecorderExtractor(),
+        normalizer=_Normalizer(),
+        document_resolver=_DocumentResolver(),
+        block_builder=_BlockBuilder(),
+        table_detector=_TableDetector(),
+        block_role_resolver=_RecorderResolver("role", []),
+        section_resolver=_RecorderResolver("section", []),
+    )
+
+    pipeline.parse_document(pdf_path="/tmp/demo.pdf")
+
+    assert seen["include_chars"] is False
+
+
+def test_parse_document_allows_chars_opt_in():
+    seen: dict[str, bool | None] = {"include_chars": None}
+
+    class _RecorderExtractor(_Extractor):
+        def extract_document_atoms(  # type: ignore[override]
+            self,
+            *,
+            pdf_path: str,
+            page_limit: int | None = None,
+            include_chars: bool = True,
+        ) -> list[PdfPageAtoms]:
+            del pdf_path, page_limit
+            seen["include_chars"] = include_chars
+            return [PdfPageAtoms(meta=PdfPageMeta(page=1, page_width=600.0, page_height=800.0, rotation=0))]
+
+    pipeline = LocalStructuredPdfPipeline(
+        extractor=_RecorderExtractor(),
+        normalizer=_Normalizer(),
+        document_resolver=_DocumentResolver(),
+        block_builder=_BlockBuilder(),
+        table_detector=_TableDetector(),
+        block_role_resolver=_RecorderResolver("role", []),
+        section_resolver=_RecorderResolver("section", []),
+    )
+
+    pipeline.parse_document(pdf_path="/tmp/demo.pdf", include_chars=True)
+
+    assert seen["include_chars"] is True
