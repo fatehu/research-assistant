@@ -112,6 +112,15 @@ tmp/
 backend/eval/results/**
 !backend/eval/results/
 !backend/eval/results/README.md
+backend/eval/retrieval_beir/data/**
+!backend/eval/retrieval_beir/data/
+!backend/eval/retrieval_beir/data/.gitkeep
+backend/eval/retrieval_beir/output/**
+!backend/eval/retrieval_beir/output/
+!backend/eval/retrieval_beir/output/.gitkeep
+backend/eval/retrieval_beir/.cache/**
+!backend/eval/retrieval_beir/.cache/
+!backend/eval/retrieval_beir/.cache/.gitkeep
 
 # Reader runtime artifacts
 backend/uploads/
