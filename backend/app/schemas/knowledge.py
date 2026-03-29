@@ -60,6 +60,10 @@ class DocumentUploadResponse(BaseModel):
     file_size: int
     file_type: str
     status: str
+    processing_stage: Optional[str] = None
+    processing_stage_label: Optional[str] = None
+    processing_progress: Optional[float] = None
+    processing_detail: Optional[str] = None
     processing_mode: DocumentUploadMode = "local_fast"
     extract_profile: DocumentExtractProfile = "general"
     extract_granularity: DocumentExtractGranularity = "medium"
@@ -74,6 +78,10 @@ class DocumentResponse(BaseModel):
     file_size: int
     file_type: str
     status: str
+    processing_stage: Optional[str] = None
+    processing_stage_label: Optional[str] = None
+    processing_progress: Optional[float] = None
+    processing_detail: Optional[str] = None
     processing_mode: DocumentUploadMode = "local_fast"
     extract_profile: DocumentExtractProfile = "general"
     extract_granularity: DocumentExtractGranularity = "medium"
@@ -191,5 +199,8 @@ class ProcessingStatus(BaseModel):
     status: str
     progress: float
     message: str
+    processing_stage: Optional[str] = None
+    processing_stage_label: Optional[str] = None
+    processing_detail: Optional[str] = None
     chunk_count: int = 0
     error: Optional[str] = None

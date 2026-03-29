@@ -155,6 +155,7 @@ class ChunkMetadata:
     has_citations: bool = False         # 是否包含引用
     keywords: List[str] = field(default_factory=list)   # 关键词
     token_count: int = 0               # Token 数（V3 新增）
+    extra: Dict[str, Any] = field(default_factory=dict)  # 第三方引擎/结构扩展信息
 
 
 @dataclass
@@ -204,7 +205,7 @@ class ChunkResult:
 # ============== 异常 ==============
 
 class EmbeddingLimitExceeded(Exception):
-    """Embedding 调用次数超限，触发降级"""
+    """Embedding 预算超限，触发降级"""
     pass
 
 

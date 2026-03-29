@@ -12,6 +12,7 @@ import pytest
 import hashlib
 import numpy as np
 from typing import List
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
@@ -471,6 +472,55 @@ Transformer架构的提出改变了NLP研究。BERT和GPT取得了突破。
         assert result.strategy == "fixed"
         assert len(result.chunks) > 1
         assert service._embedding_call_count == 0, "固定分块不应调用 embedding"
+        assert service._embedding_text_count == 0, "固定分块不应累计 embedding 文本预算"
+        assert service._embedding_token_count == 0, "固定分块不应累计 embedding token 预算"
+
+    @pytest.mark.asyncio
+    async def test_embedding_budget_tracks_texts_not_calls(self, service_factory):
+        """多次小批调用不应因为调用次数本身触发熔断。"""
+        service = service_factory()
+        service.MAX_EMBEDDING_TEXTS = 100
+        service.MAX_EMBEDDING_TOKENS = 1000
+        service._embedding_cache = {}
+        service._embedding_call_count = 0
+        service._embedding_text_count = 0
+        service._embedding_token_count = 0
+        service._embedding_service = SimpleNamespace(
+            embed_texts=AsyncMock(side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts])
+        )
+
+        for idx in range(30):
+            embeddings = await service._cached_embed_texts([f"sentence-{idx}"])
+            assert len(embeddings) == 1
+
+        assert service._embedding_call_count == 30
+        assert service._embedding_text_count == 30
+        assert service._embedding_token_count >= 30
+
+    @pytest.mark.asyncio
+    async def test_embedding_budget_exceeded_by_text_volume(self, service_factory):
+        """预算应按累计文本量熔断，而不是按调用次数。"""
+        from app.services.smart_chunking_service import EmbeddingLimitExceeded
+
+        service = service_factory()
+        service.MAX_EMBEDDING_TEXTS = 3
+        service.MAX_EMBEDDING_TOKENS = 1000
+        service._embedding_cache = {}
+        service._embedding_call_count = 0
+        service._embedding_text_count = 0
+        service._embedding_token_count = 0
+        service._embedding_service = SimpleNamespace(
+            embed_texts=AsyncMock(side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts])
+        )
+
+        await service._cached_embed_texts(["a"])
+        await service._cached_embed_texts(["b"])
+        await service._cached_embed_texts(["c"])
+
+        with pytest.raises(EmbeddingLimitExceeded) as exc_info:
+            await service._cached_embed_texts(["d"])
+
+        assert "text budget exceeded" in str(exc_info.value)
 
 
 if __name__ == "__main__":

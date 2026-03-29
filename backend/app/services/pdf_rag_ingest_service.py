@@ -1,28 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import re
-from typing import Any, Optional
+from typing import Any
 
 from loguru import logger
 
 from app.config import settings
 from app.services.local_structured_pdf.contracts import (
-    PdfBBox,
     PdfHybridExecutionResult,
-    PdfSemanticBlock,
     PdfStructuredDocument,
 )
 from app.services.local_structured_pdf.docling_fast_hybrid_pipeline import (
     LocalStructuredPdfDoclingFastHybridPipeline,
 )
-from app.services.local_structured_pdf.markdown_renderer import LocalPdfMarkdownRenderer
+from app.services.local_structured_pdf.ingest_markdown_renderer import (
+    LocalPdfIngestMarkdownRenderer,
+)
 from app.services.local_structured_pdf.pipeline import LocalStructuredPdfPipeline
-from app.services.smart_chunking.types import ChunkLevel, generate_chunk_id
-
-
-_SPACE_RE = re.compile(r"\s+")
-_CITATION_RE = re.compile(r"\[[0-9,\-\s]+\]|\([12][0-9]{3}[a-z]?\)")
 
 
 class PdfRagIngestService:
@@ -31,11 +25,11 @@ class PdfRagIngestService:
         *,
         fast_pipeline: LocalStructuredPdfPipeline | None = None,
         hybrid_pipeline: LocalStructuredPdfDoclingFastHybridPipeline | None = None,
-        renderer: LocalPdfMarkdownRenderer | None = None,
+        ingest_renderer: LocalPdfIngestMarkdownRenderer | None = None,
     ) -> None:
         self._fast_pipeline = fast_pipeline
         self._hybrid_pipeline = hybrid_pipeline
-        self._renderer = renderer or LocalPdfMarkdownRenderer()
+        self._ingest_renderer = ingest_renderer or LocalPdfIngestMarkdownRenderer()
 
     async def ingest_pdf(
         self,
@@ -57,7 +51,6 @@ class PdfRagIngestService:
                 "applied": False,
                 "failure_reason": f"structured_ingest_failed:{exc}",
                 "document_text": "",
-                "chunks": [],
                 "extractor": extractor_name,
                 "report": {
                     "pipeline": "pdf_structured_rag_v2",
@@ -66,18 +59,18 @@ class PdfRagIngestService:
                 },
             }
 
-        document_text = self._renderer.render_document(document=document)
-        chunks = self._build_chunks_from_document(document=document, mode=selected_mode)
-        if not document_text.strip() or not chunks:
+        rendered = self._ingest_renderer.render_document(document=document)
+        document_text = str(rendered.markdown or "")
+        document_source_spans = [span.to_dict() for span in list(rendered.spans or [])]
+        if not document_text.strip():
             return {
                 "applied": False,
                 "failure_reason": "no_structured_content",
                 "document_text": document_text,
-                "chunks": [],
+                "document_source_spans": document_source_spans,
                 "extractor": extractor_name,
                 "report": self._build_report(
                     document=document,
-                    chunks=[],
                     mode=selected_mode,
                     document_name=document_name,
                     execution=execution,
@@ -88,11 +81,10 @@ class PdfRagIngestService:
             "applied": True,
             "failure_reason": None,
             "document_text": document_text,
-            "chunks": chunks,
+            "document_source_spans": document_source_spans,
             "extractor": extractor_name,
             "report": self._build_report(
                 document=document,
-                chunks=chunks,
                 mode=selected_mode,
                 document_name=document_name,
                 execution=execution,
@@ -132,74 +124,10 @@ class PdfRagIngestService:
             )
         return self._hybrid_pipeline
 
-    def _build_chunks_from_document(
-        self,
-        *,
-        document: PdfStructuredDocument,
-        mode: str,
-    ) -> list[dict[str, Any]]:
-        chunkable_blocks = [block for block in list(document.blocks or []) if self._render_block(block)]
-        if not chunkable_blocks:
-            return []
-
-        chunks: list[dict[str, Any]] = []
-        cursor = 0
-        total_blocks = max(1, len(chunkable_blocks))
-        for index, block in enumerate(chunkable_blocks):
-            block_content = self._build_chunk_content(block)
-            if not block_content:
-                continue
-            start_char = cursor
-            end_char = start_char + len(block_content)
-            cursor = end_char + 2
-
-            section_titles = [str(item).strip() for item in list(block.section_titles or []) if str(item).strip()]
-            section_title = self._resolve_section_title(block=block, section_titles=section_titles)
-            pages = list(range(int(block.page_start), int(block.page_end) + 1))
-            extra = {
-                "source_kind": "pdf_structured_rag_v2",
-                "structured_mode": mode,
-                "block_id": block.block_id,
-                "block_type": block.block_type,
-                "raw_block_content": self._render_block(block),
-                "pages": pages,
-                "bbox": self._bbox_to_dict(block.bbox),
-                "line_ids": list(block.line_ids or []),
-                "page_span": [int(block.page_start), int(block.page_end)],
-                "section_path_titles": section_titles,
-                "section_path": str(block.section_path or ""),
-                "heading_level": int(block.heading_level) if block.heading_level else None,
-                "table_row_count": len(list(block.table_rows or [])),
-            }
-            meta = {
-                "level": (
-                    ChunkLevel.SECTION.value
-                    if str(block.block_type or "").strip().lower() == "heading"
-                    else ChunkLevel.PARAGRAPH.value
-                ),
-                "section_type": str(block.block_type or "paragraph"),
-                "section_title": section_title,
-                "has_citations": bool(_CITATION_RE.search(block_content)),
-                "position_ratio": float(index + 1) / float(total_blocks),
-                "keywords": [],
-                "extra": extra,
-            }
-            chunks.append(
-                {
-                    "id": generate_chunk_id(block_content, start_char),
-                    "content": block_content,
-                    "start_char": start_char,
-                    "end_char": end_char,
-                    "metadata": meta,
-                }
-            )
-        return chunks
-
     def _build_report(
         self,
         *,
         document: PdfStructuredDocument,
-        chunks: list[dict[str, Any]],
         mode: str,
         document_name: str,
         execution: PdfHybridExecutionResult | None,
@@ -215,7 +143,6 @@ class PdfRagIngestService:
             "document_name": document_name or "",
             "page_count": len(list(document.pages or [])),
             "block_count": len(list(document.blocks or [])),
-            "chunk_count": len(chunks),
             "block_type_counts": block_counts,
         }
         if execution is not None:
@@ -231,53 +158,12 @@ class PdfRagIngestService:
             )
         return report
 
-    def _build_chunk_content(self, block: PdfSemanticBlock) -> str:
-        rendered = self._render_block(block)
-        if not rendered:
-            return ""
-        if str(block.block_type or "").strip().lower() == "heading":
-            return rendered
-
-        section_titles = [str(item).strip() for item in list(block.section_titles or []) if str(item).strip()]
-        if not section_titles:
-            return rendered
-        section_path = " > ".join(section_titles)
-        return f"Section: {section_path}\n\n{rendered}".strip()
-
-    def _render_block(self, block: PdfSemanticBlock) -> str:
-        return self._renderer.render_document(
-            document=PdfStructuredDocument(blocks=[block]),
-        ).strip()
-
-    @staticmethod
-    def _resolve_section_title(*, block: PdfSemanticBlock, section_titles: list[str]) -> Optional[str]:
-        block_type = str(block.block_type or "").strip().lower()
-        if block_type == "heading":
-            text = _normalize_spaces(block.text)
-            return text or (section_titles[-1] if section_titles else None)
-        if section_titles:
-            return section_titles[-1]
-        return None
-
     @staticmethod
     def _normalize_mode(value: str | None) -> str:
         normalized = str(value or "fast").strip().lower()
         if normalized not in {"fast", "hybrid"}:
             return "fast"
         return normalized
-
-    @staticmethod
-    def _bbox_to_dict(bbox: PdfBBox) -> dict[str, float]:
-        return {
-            "x0": float(bbox.x0),
-            "top": float(bbox.top),
-            "x1": float(bbox.x1),
-            "bottom": float(bbox.bottom),
-        }
-
-
-def _normalize_spaces(text: str) -> str:
-    return _SPACE_RE.sub(" ", str(text or "")).strip()
 
 
 _pdf_rag_ingest_service = PdfRagIngestService()

@@ -318,12 +318,10 @@ class LocalEmbeddingModel:
                 raise last_error or RuntimeError(f"加载本地嵌入模型失败: {model_name}")
             self._device = device
 
-            # 确定输出维度 (优先使用实例级 target_dimension，其次全局 settings)
-            target_dim = self._target_dimension or settings.local_embedding_dimension
-            if target_dim > 0:
-                self._dimension = target_dim
-            else:
-                self._dimension = self._model.get_sentence_embedding_dimension()
+            # LocalEmbeddingModel 只表示底座模型本身的原始维度。
+            # Matryoshka 截断在 encode 阶段按调用方目标维度处理，
+            # 避免同一模型因为 1024/default/256 等输出维度重复加载。
+            self._dimension = self._model.get_sentence_embedding_dimension()
 
             logger.info(
                 f"本地嵌入模型加载完成: {model_name}, "
@@ -347,17 +345,25 @@ class LocalEmbeddingModel:
 
     @property
     def dimension(self) -> int:
-        """获取向量维度 (尽量不加载模型即可获得)"""
+        """获取底座模型原始维度 (尽量不加载模型即可获得)"""
         if self._dimension is not None:
             return self._dimension
         # 尝试从注册表获取
         dim = MODEL_DIMENSIONS.get(self._model_name)
         if dim:
-            target = self._target_dimension or settings.local_embedding_dimension
-            return target if target > 0 else dim
+            return dim
         # 必须加载模型才能确定
         self._load_model()
         return self._dimension
+
+    def _resolve_output_dimension(self, target_dimension: int = 0) -> int:
+        explicit_target = max(0, int(target_dimension or 0))
+        if explicit_target > 0:
+            return explicit_target
+        if self._target_dimension > 0:
+            return int(self._target_dimension)
+        configured_target = max(0, int(settings.local_embedding_dimension or 0))
+        return configured_target
 
     def _add_query_prefix(self, text: str) -> str:
         """为查询添加模型特定的指令前缀"""
@@ -371,6 +377,7 @@ class LocalEmbeddingModel:
         texts: List[str],
         is_query: bool = False,
         show_progress: bool = False,
+        target_dimension: int = 0,
     ) -> np.ndarray:
         """
         同步编码文本为向量
@@ -395,7 +402,7 @@ class LocalEmbeddingModel:
         )
 
         # Matryoshka 维度截断
-        target_dim = self._target_dimension or settings.local_embedding_dimension
+        target_dim = self._resolve_output_dimension(target_dimension)
         if target_dim > 0 and embeddings.shape[1] > target_dim:
             embeddings = embeddings[:, :target_dim]
             if settings.local_embedding_normalize:
@@ -414,25 +421,40 @@ class EmbeddingModelPool:
     """
     
     def __init__(self):
-        self._models: Dict[str, LocalEmbeddingModel] = {}
+        self._models: Dict[Tuple[str, Tuple[str, ...]], LocalEmbeddingModel] = {}
         self._lock = threading.Lock()
-    
-    def get(self, model_name: str, target_dimension: int = 0) -> LocalEmbeddingModel:
-        """获取或创建指定模型的 LocalEmbeddingModel 实例"""
-        key = f"{model_name}:{target_dimension}"
+
+    @staticmethod
+    def _runtime_signature() -> Tuple[str, ...]:
+        return (
+            str(settings.local_embedding_device or "auto"),
+            str(settings.local_embedding_cache_dir or ""),
+            str(bool(settings.local_embedding_prefer_safetensors)),
+            str(bool(settings.local_embedding_local_files_only)),
+            str(bool(settings.local_embedding_allow_legacy_pickle_fallback)),
+            str(bool(settings.local_embedding_allow_runtime_cpu_fallback)),
+        )
+
+    def get(self, model_name: str) -> LocalEmbeddingModel:
+        """获取或创建指定模型的底座 LocalEmbeddingModel 实例。"""
+        key = (model_name, self._runtime_signature())
         if key not in self._models:
             with self._lock:
                 if key not in self._models:  # double-check
-                    logger.info(f"模型池: 创建新实例 {model_name} (dim={target_dimension})")
+                    logger.info(f"模型池: 创建新实例 {model_name} (base)")
                     self._models[key] = LocalEmbeddingModel(
                         model_name=model_name,
-                        target_dimension=target_dimension,
+                        target_dimension=0,
                     )
         return self._models[key]
-    
+
     def list_loaded(self) -> List[str]:
         """列出已加载的模型"""
-        return list(self._models.keys())
+        return [model_name for model_name, _runtime_signature in self._models.keys()]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._models.clear()
 
 
 # 全局模型池
@@ -468,7 +490,7 @@ class EmbeddingService:
 
         if self.provider == "local":
             actual_model = model_name or settings.local_embedding_model
-            self._local_model = _model_pool.get(actual_model, self._target_dimension_override)
+            self._local_model = _model_pool.get(actual_model)
 
         logger.info(
             f"Embedding 服务初始化: provider={self.provider}, "
@@ -550,6 +572,9 @@ class EmbeddingService:
         if self._target_dimension_override > 0:
             return self._target_dimension_override
         if self.provider == "local":
+            configured_target = max(0, int(settings.local_embedding_dimension or 0))
+            if configured_target > 0:
+                return configured_target
             return self._local_model.dimension
         elif self.provider == "mock":
             return max(1, int(settings.mock_embedding_dimension or MODEL_DIMENSIONS["mock/deterministic"]))
@@ -619,7 +644,11 @@ class EmbeddingService:
         loop = asyncio.get_event_loop()
 
         def _encode():
-            return self._local_model.encode_sync([text], is_query=is_query)
+            return self._local_model.encode_sync(
+                [text],
+                is_query=is_query,
+                target_dimension=self._target_dimension_override,
+            )
 
         embeddings = await loop.run_in_executor(None, _encode)
         return embeddings[0].tolist()
@@ -634,7 +663,10 @@ class EmbeddingService:
 
         def _encode():
             return self._local_model.encode_sync(
-                texts, is_query=is_query, show_progress=len(texts) > 10
+                texts,
+                is_query=is_query,
+                show_progress=len(texts) > 10,
+                target_dimension=self._target_dimension_override,
             )
 
         embeddings = await loop.run_in_executor(None, _encode)
@@ -820,18 +852,90 @@ class EmbeddingService:
         return similarities
 
 
-# 全局默认实例
-embedding_service = EmbeddingService()
+# 按初始化口径缓存的 EmbeddingService 实例
+_service_cache: Dict[Tuple[str, str, int, Tuple[str, ...]], EmbeddingService] = {}
+_service_cache_lock = threading.Lock()
+
+
+def _default_model_name_for_provider(provider: str) -> str:
+    normalized_provider = str(provider or "local").strip().lower()
+    if normalized_provider == "local":
+        return str(settings.local_embedding_model or "BAAI/bge-m3")
+    if normalized_provider == "mock":
+        return str(settings.mock_embedding_model or "mock/deterministic")
+    if normalized_provider == "aliyun":
+        return str(settings.aliyun_embedding_model or "text-embedding-v2")
+    if normalized_provider == "openai":
+        return "text-embedding-3-small"
+    if normalized_provider == "ollama":
+        return "nomic-embed-text"
+    return str(settings.aliyun_embedding_model or "text-embedding-v2")
+
+
+def _provider_runtime_signature(provider: str) -> Tuple[str, ...]:
+    normalized_provider = str(provider or "local").strip().lower()
+    if normalized_provider == "local":
+        return (
+            normalized_provider,
+            str(settings.local_embedding_device or "auto"),
+            str(settings.local_embedding_cache_dir or ""),
+            str(int(settings.local_embedding_dimension or 0)),
+            str(bool(settings.local_embedding_prefer_safetensors)),
+            str(bool(settings.local_embedding_local_files_only)),
+            str(bool(settings.local_embedding_allow_legacy_pickle_fallback)),
+            str(bool(settings.local_embedding_allow_runtime_cpu_fallback)),
+            str(int(settings.local_embedding_batch_size or 0)),
+            str(bool(settings.local_embedding_normalize)),
+        )
+    if normalized_provider == "mock":
+        return (
+            normalized_provider,
+            str(settings.mock_embedding_model or "mock/deterministic"),
+            str(int(settings.mock_embedding_dimension or MODEL_DIMENSIONS["mock/deterministic"])),
+        )
+    if normalized_provider == "aliyun":
+        return (
+            normalized_provider,
+            str(settings.aliyun_base_url or ""),
+            str(settings.aliyun_embedding_api_key or settings.aliyun_api_key or ""),
+            str(settings.aliyun_embedding_model or "text-embedding-v2"),
+        )
+    if normalized_provider == "openai":
+        return (
+            normalized_provider,
+            str(settings.openai_base_url or ""),
+            str(settings.openai_api_key or ""),
+        )
+    if normalized_provider == "ollama":
+        return (
+            normalized_provider,
+            str(settings.ollama_base_url or ""),
+        )
+    return (normalized_provider,)
+
+
+def _resolve_service_cache_key(
+    model_name: Optional[str] = None,
+    target_dimension: int = 0,
+) -> Tuple[str, str, int, Tuple[str, ...]]:
+    requested_model = str(model_name or "").strip() or None
+    provider = EmbeddingService._resolve_provider(requested_model)
+    effective_model = requested_model or _default_model_name_for_provider(provider)
+    dim_key = max(0, int(target_dimension or 0))
+    runtime_signature = _provider_runtime_signature(provider)
+    return provider, effective_model, dim_key, runtime_signature
+
+
+def clear_embedding_service_cache() -> None:
+    """清空 EmbeddingService 实例缓存。"""
+    with _service_cache_lock:
+        _service_cache.clear()
+    _model_pool.clear()
 
 
 def get_embedding_service() -> EmbeddingService:
-    """获取默认嵌入服务实例（使用全局配置）"""
-    return embedding_service
-
-
-# 按模型名缓存的 EmbeddingService 实例
-_service_cache: Dict[Tuple[str, int], EmbeddingService] = {}
-_service_cache_lock = threading.Lock()
+    """获取默认嵌入服务实例（使用当前配置，懒加载）。"""
+    return get_embedding_service_for_model_and_dimension(model_name=None, target_dimension=0)
 
 
 def get_embedding_service_for_model(model_name: Optional[str] = None) -> EmbeddingService:
@@ -842,22 +946,17 @@ def get_embedding_service_for_model_and_dimension(
     model_name: Optional[str] = None,
     target_dimension: int = 0,
 ) -> EmbeddingService:
-    model_key = (model_name or "").strip()
-    dim_key = max(0, int(target_dimension or 0))
-
-    default_model = embedding_service._get_model()
-    if not model_key:
-        model_key = default_model
-
-    if model_key == default_model and dim_key == embedding_service.get_target_dimension():
-        return embedding_service
-
-    cache_key = (model_key, dim_key)
+    provider_key, model_key, dim_key, runtime_signature = _resolve_service_cache_key(
+        model_name=model_name,
+        target_dimension=target_dimension,
+    )
+    cache_key = (provider_key, model_key, dim_key, runtime_signature)
     if cache_key not in _service_cache:
         with _service_cache_lock:
             if cache_key not in _service_cache:
                 logger.info(
-                    f"创建模型专用 EmbeddingService: {model_key} (dim={dim_key or 'default'})"
+                    f"创建 EmbeddingService: provider={provider_key}, "
+                    f"model={model_key}, dim={dim_key or 'default'}"
                 )
                 _service_cache[cache_key] = EmbeddingService(
                     model_name=model_key,
@@ -865,3 +964,14 @@ def get_embedding_service_for_model_and_dimension(
                 )
 
     return _service_cache[cache_key]
+
+
+class _EmbeddingServiceProxy:
+    """默认 embedding service 的惰性代理，兼容历史 import 口径。"""
+
+    def __getattr__(self, name):
+        return getattr(get_embedding_service(), name)
+
+
+# 向后兼容：保留同名导出，但不再在导入时初始化真实模型服务
+embedding_service = _EmbeddingServiceProxy()

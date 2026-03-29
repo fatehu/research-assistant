@@ -340,6 +340,7 @@ def _convert_to_response(result: dict) -> ChunkingResultResponse:
             position_ratio=chunk.metadata.position_ratio,
             keywords=chunk.metadata.keywords,
             token_count=chunk.metadata.token_count,
+            extra=chunk.metadata.extra,
         )
 
         chunks.append(SmartChunkResponse(

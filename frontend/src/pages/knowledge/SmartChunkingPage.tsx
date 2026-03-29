@@ -14,7 +14,6 @@ import {
   Spin,
   message,
   Tooltip,
-  Collapse,
   Progress,
   List,
   Typography,
@@ -61,7 +60,6 @@ import {
 
 const { TextArea } = Input
 const { Text, Paragraph, Title } = Typography
-const { Panel } = Collapse
 const { TabPane } = Tabs
 
 // 预设颜色映射
@@ -96,6 +94,93 @@ const LEVEL_NAMES: Record<string, string> = {
   paragraph: '段落级',
   section: '章节级',
   document: '文档级',
+}
+
+const DEFAULT_CUSTOM_CONFIG: Partial<ChunkingConfig> = {
+  strategy: ChunkingStrategy.HYBRID,
+  use_token_based: true,
+  base_chunk_tokens: 128,
+  overlap_tokens: 16,
+  min_semantic_tokens: 32,
+  max_semantic_tokens: 384,
+  base_chunk_size: 500,
+  chunk_overlap: 50,
+  breakpoint_percentile: 95,
+  semantic_threshold: 0.75,
+  min_semantic_chunk: 100,
+  max_semantic_chunk: 1500,
+  enable_hierarchical: true,
+  hierarchy_levels: [ChunkLevel.PARAGRAPH, ChunkLevel.SECTION],
+  detect_academic_structure: true,
+  preserve_citations: true,
+}
+
+function toEditableConfig(config?: Partial<ChunkingConfigResponse> | null): Partial<ChunkingConfig> {
+  return {
+    ...DEFAULT_CUSTOM_CONFIG,
+    ...config,
+    hierarchy_levels:
+      config?.hierarchy_levels && config.hierarchy_levels.length > 0
+        ? config.hierarchy_levels
+        : DEFAULT_CUSTOM_CONFIG.hierarchy_levels,
+  }
+}
+
+function deriveCompatibilityChars(config: Partial<ChunkingConfig>): Pick<
+  ChunkingConfig,
+  'base_chunk_size' | 'chunk_overlap' | 'min_semantic_chunk' | 'max_semantic_chunk'
+> {
+  const charsPerToken = 4
+  return {
+    base_chunk_size: Math.max(100, Math.min(3000, Math.round((config.base_chunk_tokens || 128) * charsPerToken))),
+    chunk_overlap: Math.max(0, Math.min(500, Math.round((config.overlap_tokens || 16) * charsPerToken))),
+    min_semantic_chunk: Math.max(50, Math.min(500, Math.round((config.min_semantic_tokens || 32) * charsPerToken))),
+    max_semantic_chunk: Math.max(500, Math.min(5000, Math.round((config.max_semantic_tokens || 384) * charsPerToken))),
+  }
+}
+
+function toRuntimeConfig(config: Partial<ChunkingConfig>): ChunkingConfig {
+  const strategy = (config.strategy || ChunkingStrategy.HYBRID) as ChunkingStrategy
+  const baseChunkTokens = config.base_chunk_tokens ?? (DEFAULT_CUSTOM_CONFIG.base_chunk_tokens as number)
+  const overlapTokens = config.overlap_tokens ?? (DEFAULT_CUSTOM_CONFIG.overlap_tokens as number)
+  const minSemanticTokens = config.min_semantic_tokens ?? (DEFAULT_CUSTOM_CONFIG.min_semantic_tokens as number)
+  const maxSemanticTokens = config.max_semantic_tokens ?? (DEFAULT_CUSTOM_CONFIG.max_semantic_tokens as number)
+  const hierarchyEnabled =
+    strategy === ChunkingStrategy.HIERARCHICAL
+      ? true
+      : Boolean(config.enable_hierarchical ?? DEFAULT_CUSTOM_CONFIG.enable_hierarchical)
+  const defaultHierarchyLevels =
+    strategy === ChunkingStrategy.HIERARCHICAL
+      ? [ChunkLevel.PARAGRAPH, ChunkLevel.SECTION, ChunkLevel.DOCUMENT]
+      : [ChunkLevel.PARAGRAPH, ChunkLevel.SECTION]
+
+  return {
+    strategy,
+    use_token_based: true,
+    base_chunk_tokens: baseChunkTokens,
+    overlap_tokens: overlapTokens,
+    min_semantic_tokens: minSemanticTokens,
+    max_semantic_tokens: maxSemanticTokens,
+    ...deriveCompatibilityChars({
+      ...config,
+      base_chunk_tokens: baseChunkTokens,
+      overlap_tokens: overlapTokens,
+      min_semantic_tokens: minSemanticTokens,
+      max_semantic_tokens: maxSemanticTokens,
+    }),
+    breakpoint_percentile: config.breakpoint_percentile ?? (DEFAULT_CUSTOM_CONFIG.breakpoint_percentile as number),
+    semantic_threshold: DEFAULT_CUSTOM_CONFIG.semantic_threshold as number,
+    enable_hierarchical: hierarchyEnabled,
+    hierarchy_levels:
+      hierarchyEnabled
+        ? ((config.hierarchy_levels?.length ? config.hierarchy_levels : defaultHierarchyLevels) as ChunkLevel[])
+        : ([ChunkLevel.PARAGRAPH, ChunkLevel.SECTION] as ChunkLevel[]),
+    detect_academic_structure:
+      strategy === ChunkingStrategy.ACADEMIC
+        ? true
+        : Boolean(config.detect_academic_structure ?? DEFAULT_CUSTOM_CONFIG.detect_academic_structure),
+    preserve_citations: Boolean(config.preserve_citations ?? DEFAULT_CUSTOM_CONFIG.preserve_citations),
+  }
 }
 
 // 预设卡片组件
@@ -203,26 +288,7 @@ export default function SmartChunkingPage() {
   const [testing, setTesting] = useState(false)
 
   // 自定义配置
-  const [customConfig, setCustomConfig] = useState<Partial<ChunkingConfig>>({
-    strategy: ChunkingStrategy.HYBRID,
-    // V3 Token 计量新增
-    use_token_based: true,
-    base_chunk_tokens: 128,        // 约 512 英文字符 / 192 中文字符
-    overlap_tokens: 16,
-    min_semantic_tokens: 32,
-    max_semantic_tokens: 384,
-    // 字符计量（旧）
-    base_chunk_size: 500,
-    chunk_overlap: 50,
-    breakpoint_percentile: 95,
-    semantic_threshold: 0.75, // 保留以兼容类型定义
-    min_semantic_chunk: 100,
-    max_semantic_chunk: 1500,
-    enable_hierarchical: true,
-    hierarchy_levels: [ChunkLevel.PARAGRAPH, ChunkLevel.SECTION],
-    detect_academic_structure: true,
-    preserve_citations: true,
-  })
+  const [customConfig, setCustomConfig] = useState<Partial<ChunkingConfig>>(DEFAULT_CUSTOM_CONFIG)
 
   // 加载预设列表
   const loadPresets = useCallback(async () => {
@@ -250,6 +316,7 @@ export default function SmartChunkingPage() {
     try {
       const config = await chunkingApi.getKnowledgeBaseConfig(parseInt(kbId))
       setCurrentConfig(config)
+      setCustomConfig(toEditableConfig(config))
       if (config?.name) {
         setSelectedPreset(config.name)
       }
@@ -276,9 +343,10 @@ export default function SmartChunkingPage() {
 
     setTesting(true)
     try {
+      const runtimeConfig = toRuntimeConfig(customConfig)
       const result = await chunkingApi.previewChunking(
         testText,
-        activeTab === 'custom' ? customConfig : undefined,
+        activeTab === 'custom' ? runtimeConfig : undefined,
         activeTab === 'presets' ? (selectedPreset as ChunkingPreset) : undefined
       )
       setTestResult(result)
@@ -347,7 +415,7 @@ export default function SmartChunkingPage() {
         // 使用专用的 apply-preset 端点
         await chunkingApi.applyPresetToKnowledgeBase(parseInt(kbId), selectedPreset as ChunkingPreset)
       } else {
-        await chunkingApi.updateKnowledgeBaseConfig(parseInt(kbId), customConfig as ChunkingConfig)
+        await chunkingApi.updateKnowledgeBaseConfig(parseInt(kbId), toRuntimeConfig(customConfig))
       }
       message.success('配置已保存')
       loadCurrentConfig()
@@ -358,6 +426,19 @@ export default function SmartChunkingPage() {
       setLoading(false)
     }
   }
+
+  const usesSemanticTuning =
+    customConfig.strategy === ChunkingStrategy.SEMANTIC ||
+    customConfig.strategy === ChunkingStrategy.HYBRID ||
+    customConfig.strategy === ChunkingStrategy.ACADEMIC
+  const usesHierarchyOutput =
+    customConfig.strategy === ChunkingStrategy.HIERARCHICAL ||
+    (customConfig.strategy === ChunkingStrategy.HYBRID && customConfig.enable_hierarchical)
+  const usesAcademicRouting = customConfig.strategy === ChunkingStrategy.HYBRID
+  const usesCitationProtection =
+    customConfig.strategy === ChunkingStrategy.SEMANTIC ||
+    customConfig.strategy === ChunkingStrategy.HYBRID ||
+    customConfig.strategy === ChunkingStrategy.ACADEMIC
 
   return (
     <div className="min-h-screen bg-slate-900 p-6">
@@ -404,9 +485,15 @@ export default function SmartChunkingPage() {
             showIcon
             className="mb-6 bg-blue-500/10 border-blue-500/30"
             message={
-              <span className="text-blue-300">
-                当前知识库使用的配置: <Tag color="blue">{currentConfig.name || currentConfig.strategy}</Tag>
-              </span>
+              <div className="text-blue-300 space-y-2">
+                <div>
+                  当前知识库使用的配置: <Tag color="blue">{currentConfig.name || currentConfig.strategy}</Tag>
+                </div>
+                <div className="text-blue-200/80 text-sm">
+                  当前入库主链已切到 <Text code>structured extract -&gt; ingest-md -&gt; SmartChunkingService</Text>。
+                  这里保存的配置只影响后续新上传文档，不会回溯重切已入库文档。
+                </div>
+              </div>
             }
           />
         )}
@@ -449,6 +536,13 @@ export default function SmartChunkingPage() {
                   key="custom"
                 >
                   <Form layout="vertical" className="text-slate-300">
+                    <Alert
+                      type="info"
+                      showIcon
+                      className="mb-4 bg-cyan-500/10 border-cyan-500/30"
+                      message="自定义配置已切到新链路参数系统。页面只展示当前模式真实会用到的主参数；保存时会统一按 Token 模式写入运行配置。"
+                    />
+
                     {/* 策略选择 */}
                     <Form.Item label={<Text className="text-slate-300">分块策略</Text>}>
                       <Select
@@ -463,10 +557,10 @@ export default function SmartChunkingPage() {
                             <span>
                               {name}
                               <Text className="text-slate-500 ml-2 text-xs">
-                                {key === 'fixed' && '— 按固定字符数切分，速度最快'}
-                                {key === 'semantic' && '— 基于语义相似度自动切分'}
-                                {key === 'hierarchical' && '— 多层级结构（段落/章节/文档）'}
-                                {key === 'academic' && '— 识别论文 Abstract/Method/Results 等'}
+                                {key === 'fixed' && '— 稳定快速，适合作为轻量基线'}
+                                {key === 'semantic' && '— 语义优先，适合通用文本与 Markdown'}
+                                {key === 'hierarchical' && '— 强化章节/文档上下文输出'}
+                                {key === 'academic' && '— 面向论文结构与章节内语义切分'}
                                 {key === 'hybrid' && '— 自动选择最佳策略（推荐）'}
                               </Text>
                             </span>
@@ -475,266 +569,200 @@ export default function SmartChunkingPage() {
                       />
                     </Form.Item>
 
-                    <Divider className="border-slate-700">基础分块参数</Divider>
+                    <Alert
+                      type="success"
+                      showIcon
+                      className="mb-4 bg-emerald-500/10 border-emerald-500/30"
+                      message={
+                        customConfig.strategy === ChunkingStrategy.FIXED
+                          ? '固定分块模式只保留稳定的长度控制参数，适合追求速度和可预测性。'
+                          : customConfig.strategy === ChunkingStrategy.SEMANTIC
+                            ? '语义分块模式优先使用语义边界与 Token 粒度，适合作为通用 Markdown 主策略。'
+                            : customConfig.strategy === ChunkingStrategy.HIERARCHICAL
+                              ? '层级分块模式强调 paragraph/section/document 三层输出，适合需要强上下文回溯的场景。'
+                              : customConfig.strategy === ChunkingStrategy.ACADEMIC
+                                ? '学术模式会按章节先分段，再在章节内做语义细分，适合论文和技术报告。'
+                                : '混合模式会在 academic 和 semantic 之间自动路由，并按需要补层级上下文。'
+                      }
+                    />
 
-                    {/* Token/字符计量模式切换 */}
-                    <Form.Item label={<Text className="text-slate-300">计量模式</Text>}>
-                      <Switch
-                        checked={customConfig.use_token_based}
-                        onChange={(v) => setCustomConfig({ ...customConfig, use_token_based: v })}
-                        checkedChildren="Token"
-                        unCheckedChildren="字符"
-                      />
-                      <Text className="text-slate-500 text-xs ml-2">
-                        {customConfig.use_token_based
-                          ? 'Token 模式: 自动适配中英文信息密度（推荐）'
-                          : '字符模式: 按字符数切分（旧行为）'}
-                      </Text>
-                    </Form.Item>
+                    <Divider className="border-slate-700">基础粒度</Divider>
+                    <Alert
+                      type="info"
+                      showIcon
+                      className="mb-4 bg-slate-900/60 border-slate-700"
+                      message="新链路统一使用 Token 计量。旧字符模式不再作为主配置项暴露。"
+                    />
 
-                    {customConfig.use_token_based ? (
-                      // Token 模式的滑块组
-                      <Row gutter={16}>
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="每个分块的目标大小（Token数）。128 Tokens 约等于 500 英文字符或 200 中文字符。">
-                                <Text className="text-slate-300">
-                                  基础块大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={32}
-                              max={512}
-                              step={16}
-                              value={customConfig.base_chunk_tokens}
-                              onChange={(v) => setCustomConfig({ ...customConfig, base_chunk_tokens: v })}
-                              marks={{ 32: '32', 128: '128', 256: '256', 512: '512' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_tokens} Tokens</Text>
-                          </Form.Item>
-                        </Col>
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="相邻分块之间的重叠大小（Token数）。">
-                                <Text className="text-slate-300">
-                                  块重叠大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={0}
-                              max={64}
-                              step={4}
-                              value={customConfig.overlap_tokens}
-                              onChange={(v) => setCustomConfig({ ...customConfig, overlap_tokens: v })}
-                              marks={{ 0: '0', 16: '16', 32: '32', 64: '64' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.overlap_tokens} Tokens</Text>
-                          </Form.Item>
-                        </Col>
-
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="语义分块的最小大小（Token数）。">
-                                <Text className="text-slate-300">
-                                  最小语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={16}
-                              max={128}
-                              step={8}
-                              value={customConfig.min_semantic_tokens}
-                              onChange={(v) => setCustomConfig({ ...customConfig, min_semantic_tokens: v })}
-                              marks={{ 16: '16', 32: '32', 64: '64', 128: '128' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_tokens} Tokens</Text>
-                          </Form.Item>
-                        </Col>
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="语义分块的最大大小（Token数）。">
-                                <Text className="text-slate-300">
-                                  最大语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={128}
-                              max={1024}
-                              step={32}
-                              value={customConfig.max_semantic_tokens}
-                              onChange={(v) => setCustomConfig({ ...customConfig, max_semantic_tokens: v })}
-                              marks={{ 128: '128', 384: '384', 512: '512', 1024: '1K' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_tokens} Tokens</Text>
-                          </Form.Item>
-                        </Col>
-                      </Row>
-                    ) : (
-                      // 字符模式的滑块组 (原有代码)
-                      <Row gutter={16}>
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="每个分块的目标大小（字符数）。较小的值产生更精细的分块，适合精确检索；较大的值保留更多上下文。">
-                                <Text className="text-slate-300">
-                                  基础块大小 <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={100}
-                              max={2000}
-                              step={50}
-                              value={customConfig.base_chunk_size}
-                              onChange={(v) =>
-                                setCustomConfig({ ...customConfig, base_chunk_size: v })
-                              }
-                              marks={{ 100: '100', 500: '500', 1000: '1K', 2000: '2K' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_size} 字符</Text>
-                          </Form.Item>
-                        </Col>
-                        <Col span={12}>
-                          <Form.Item
-                            label={
-                              <Tooltip title="相邻分块之间的重叠字符数。重叠可以避免关键信息被截断，但会增加总分块数。">
-                                <Text className="text-slate-300">
-                                  块重叠大小 <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={0}
-                              max={300}
-                              step={10}
-                              value={customConfig.chunk_overlap}
-                              onChange={(v) =>
-                                setCustomConfig({ ...customConfig, chunk_overlap: v })
-                              }
-                              marks={{ 0: '0', 50: '50', 150: '150', 300: '300' }}
-                            />
-                            <Text className="text-slate-500 text-xs">当前: {customConfig.chunk_overlap} 字符</Text>
-                          </Form.Item>
-                        </Col>
-                      </Row>
-                    )}
-
-                    {/* 语义分块参数 */}
-                    {(customConfig.strategy === ChunkingStrategy.SEMANTIC ||
-                      customConfig.strategy === ChunkingStrategy.HYBRID ||
-                      customConfig.strategy === ChunkingStrategy.ACADEMIC) && (
-                        <>
-                          <Divider className="border-slate-700">语义分块参数</Divider>
-                          <Form.Item
-                            label={
-                              <Tooltip title="语义断点检测的敏感度（百分位）。值越小（如 50），检测到的断点越多，分块越细；值越大（如 95），检测到的断点越少，分块越粗（语义更聚合）。">
-                                <Text className="text-slate-300">
-                                  语义敏感度 (百分位) <QuestionCircleOutlined className="text-slate-500" />
-                                </Text>
-                              </Tooltip>
-                            }
-                          >
-                            <Slider
-                              min={20}
-                              max={99}
-                              step={5}
-                              value={customConfig.breakpoint_percentile}
-                              onChange={(v) =>
-                                setCustomConfig({ ...customConfig, breakpoint_percentile: v })
-                              }
-                              marks={{ 20: '细碎', 50: '50', 75: '75', 90: '默认', 99: '聚合' }}
-                            />
-                          </Form.Item>
-                          <Row gutter={16}>
-                            <Col span={12}>
-                              <Form.Item
-                                label={
-                                  <Tooltip title="语义分块的最小字符数。小于此值的块会被合并到相邻块中，避免产生过碎的分块。">
-                                    <Text className="text-slate-300">
-                                      最小语义块 (字符) <QuestionCircleOutlined className="text-slate-500" />
-                                    </Text>
-                                  </Tooltip>
-                                }
-                              >
-                                <Slider
-                                  min={50}
-                                  max={500}
-                                  step={25}
-                                  value={customConfig.min_semantic_chunk}
-                                  onChange={(v) =>
-                                    setCustomConfig({ ...customConfig, min_semantic_chunk: v })
-                                  }
-                                  marks={{ 50: '50', 100: '100', 250: '250', 500: '500' }}
-                                />
-                                <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_chunk} 字符</Text>
-                              </Form.Item>
-                            </Col>
-                            <Col span={12}>
-                              <Form.Item
-                                label={
-                                  <Tooltip title="语义分块的最大字符数。超过此值的块会被强制二次切分，防止单块过大影响检索精度。">
-                                    <Text className="text-slate-300">
-                                      最大语义块 (字符) <QuestionCircleOutlined className="text-slate-500" />
-                                    </Text>
-                                  </Tooltip>
-                                }
-                              >
-                                <Slider
-                                  min={500}
-                                  max={3000}
-                                  step={100}
-                                  value={customConfig.max_semantic_chunk}
-                                  onChange={(v) =>
-                                    setCustomConfig({ ...customConfig, max_semantic_chunk: v })
-                                  }
-                                  marks={{ 500: '500', 1000: '1K', 1500: '默认', 2000: '2K', 3000: '3K' }}
-                                />
-                                <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_chunk} 字符</Text>
-                              </Form.Item>
-                            </Col>
-                          </Row>
-                        </>
-                      )}
-
-                    {/* 层级与学术参数 */}
-                    <Divider className="border-slate-700">高级选项</Divider>
                     <Row gutter={16}>
-                      <Col span={8}>
+                      <Col span={12}>
                         <Form.Item
                           label={
-                            <Tooltip title="生成段落→章节→文档的多级分块结构，检索时可回溯上级获取更多上下文。">
+                            <Tooltip title="每个分块的基础目标大小。值越大，上下文越完整；值越小，召回更细。">
                               <Text className="text-slate-300">
-                                层级分块 <QuestionCircleOutlined className="text-slate-500" />
+                                基础块大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
                             </Tooltip>
                           }
                         >
-                          <Switch
-                            checked={customConfig.enable_hierarchical}
-                            onChange={(v) =>
-                              setCustomConfig({ ...customConfig, enable_hierarchical: v })
-                            }
+                          <Slider
+                            min={32}
+                            max={512}
+                            step={16}
+                            value={customConfig.base_chunk_tokens}
+                            onChange={(v) => setCustomConfig({ ...customConfig, base_chunk_tokens: v })}
+                            marks={{ 32: '32', 128: '128', 256: '256', 512: '512' }}
                           />
+                          <Text className="text-slate-500 text-xs">当前: {customConfig.base_chunk_tokens} Tokens</Text>
                         </Form.Item>
                       </Col>
-                      <Col span={8}>
+                      <Col span={12}>
                         <Form.Item
                           label={
-                            <Tooltip title="自动识别 Abstract、Introduction、Methods、Results、Conclusion 等学术论文章节。">
+                            <Tooltip title="相邻分块之间保留的重叠大小。固定模式和固定切分回退路径更依赖这个参数。">
+                              <Text className="text-slate-300">
+                                块重叠大小 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
+                          <Slider
+                            min={0}
+                            max={64}
+                            step={4}
+                            value={customConfig.overlap_tokens}
+                            onChange={(v) => setCustomConfig({ ...customConfig, overlap_tokens: v })}
+                            marks={{ 0: '0', 16: '16', 32: '32', 64: '64' }}
+                          />
+                          <Text className="text-slate-500 text-xs">当前: {customConfig.overlap_tokens} Tokens</Text>
+                        </Form.Item>
+                      </Col>
+                    </Row>
+
+                    {usesSemanticTuning && (
+                      <>
+                        <Divider className="border-slate-700">语义边界</Divider>
+                        <Row gutter={16}>
+                          <Col span={12}>
+                            <Form.Item
+                              label={
+                                <Tooltip title="语义分块允许的最小粒度。值太小容易碎，值太大会吞掉细节。">
+                                  <Text className="text-slate-300">
+                                    最小语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                  </Text>
+                                </Tooltip>
+                              }
+                            >
+                              <Slider
+                                min={16}
+                                max={128}
+                                step={8}
+                                value={customConfig.min_semantic_tokens}
+                                onChange={(v) => setCustomConfig({ ...customConfig, min_semantic_tokens: v })}
+                                marks={{ 16: '16', 32: '32', 64: '64', 128: '128' }}
+                              />
+                              <Text className="text-slate-500 text-xs">当前: {customConfig.min_semantic_tokens} Tokens</Text>
+                            </Form.Item>
+                          </Col>
+                          <Col span={12}>
+                            <Form.Item
+                              label={
+                                <Tooltip title="语义分块允许的最大粒度。值越大，语义块越容易长上下文聚合。">
+                                  <Text className="text-slate-300">
+                                    最大语义块 (Token) <QuestionCircleOutlined className="text-slate-500" />
+                                  </Text>
+                                </Tooltip>
+                              }
+                            >
+                              <Slider
+                                min={128}
+                                max={1024}
+                                step={32}
+                                value={customConfig.max_semantic_tokens}
+                                onChange={(v) => setCustomConfig({ ...customConfig, max_semantic_tokens: v })}
+                                marks={{ 128: '128', 384: '384', 512: '512', 1024: '1K' }}
+                              />
+                              <Text className="text-slate-500 text-xs">当前: {customConfig.max_semantic_tokens} Tokens</Text>
+                            </Form.Item>
+                          </Col>
+                        </Row>
+
+                        <Form.Item
+                          label={
+                            <Tooltip title="当前语义 splitter 的边界敏感度。越低切得越细，越高切得越聚合。">
+                              <Text className="text-slate-300">
+                                语义边界敏感度 <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
+                          <Slider
+                            min={20}
+                            max={99}
+                            step={5}
+                            value={customConfig.breakpoint_percentile}
+                            onChange={(v) =>
+                              setCustomConfig({ ...customConfig, breakpoint_percentile: v })
+                            }
+                            marks={{ 20: '更细', 50: '50', 75: '75', 90: '默认', 99: '更聚合' }}
+                          />
+                        </Form.Item>
+                      </>
+                    )}
+
+                    {usesHierarchyOutput && (
+                      <>
+                        <Divider className="border-slate-700">层级输出</Divider>
+                        {customConfig.strategy === ChunkingStrategy.HYBRID && (
+                          <Form.Item
+                            label={
+                              <Tooltip title="混合模式下是否额外补 section/document 层级上下文。">
+                                <Text className="text-slate-300">
+                                  层级分块 <QuestionCircleOutlined className="text-slate-500" />
+                                </Text>
+                              </Tooltip>
+                            }
+                          >
+                            <Switch
+                              checked={customConfig.enable_hierarchical}
+                              onChange={(v) =>
+                                setCustomConfig({ ...customConfig, enable_hierarchical: v })
+                              }
+                            />
+                          </Form.Item>
+                        )}
+
+                        <Form.Item
+                          label={
+                            <Tooltip title="控制要产出的层级粒度。混合模式主要影响补层级；层级模式下用于约束输出层次。">
+                              <Text className="text-slate-300">
+                                层级选择 <QuestionCircleOutlined className="text-slate-500" />
+                              </Text>
+                            </Tooltip>
+                          }
+                        >
+                          <Select
+                            mode="multiple"
+                            value={customConfig.hierarchy_levels}
+                            onChange={(v) =>
+                              setCustomConfig({ ...customConfig, hierarchy_levels: v })
+                            }
+                            options={Object.entries(LEVEL_NAMES).map(([key, name]) => ({
+                              value: key,
+                              label: name,
+                            }))}
+                            placeholder="选择需要生成的层级"
+                          />
+                        </Form.Item>
+                      </>
+                    )}
+
+                    {usesAcademicRouting && (
+                      <>
+                        <Divider className="border-slate-700">混合路由</Divider>
+                        <Form.Item
+                          label={
+                            <Tooltip title="混合模式下，是否允许自动检测学术结构并切到 academic 路线。">
                               <Text className="text-slate-300">
                                 学术结构 <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
@@ -748,11 +776,15 @@ export default function SmartChunkingPage() {
                             }
                           />
                         </Form.Item>
-                      </Col>
-                      <Col span={8}>
+                      </>
+                    )}
+
+                    {usesCitationProtection && (
+                      <>
+                        <Divider className="border-slate-700">文本保护</Divider>
                         <Form.Item
                           label={
-                            <Tooltip title="当分块边界落在引用 [1] 附近时，自动扩展上下文以保留完整的引用语境。">
+                            <Tooltip title="对引用句和引文边界做保守保护，避免在学术文本里把引用上下文切断。">
                               <Text className="text-slate-300">
                                 引用保护 <QuestionCircleOutlined className="text-slate-500" />
                               </Text>
@@ -766,32 +798,7 @@ export default function SmartChunkingPage() {
                             }
                           />
                         </Form.Item>
-                      </Col>
-                    </Row>
-
-                    {customConfig.enable_hierarchical && (
-                      <Form.Item
-                        label={
-                          <Tooltip title="选择需要生成的层级。段落级用于精确检索，章节级用于上下文回溯，文档级用于全局摘要。">
-                            <Text className="text-slate-300">
-                              层级选择 <QuestionCircleOutlined className="text-slate-500" />
-                            </Text>
-                          </Tooltip>
-                        }
-                      >
-                        <Select
-                          mode="multiple"
-                          value={customConfig.hierarchy_levels}
-                          onChange={(v) =>
-                            setCustomConfig({ ...customConfig, hierarchy_levels: v })
-                          }
-                          options={Object.entries(LEVEL_NAMES).map(([key, name]) => ({
-                            value: key,
-                            label: name,
-                          }))}
-                          placeholder="选择需要生成的层级"
-                        />
-                      </Form.Item>
+                      </>
                     )}
                   </Form>
                 </TabPane>

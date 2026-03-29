@@ -2,15 +2,18 @@
 知识库 API 路由 - 支持共享知识库访问（可选）
 """
 import asyncio
+import hashlib
+import math
 import os
 import json
 import re
 import shutil
 import time
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Any, List, Optional, Set
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, or_, and_, tuple_
@@ -78,6 +81,10 @@ from app.services.smart_chunking_service import (
     ChunkLevel,
     get_preset_config,
 )
+from app.services.smart_chunking import (
+    estimate_tokens as estimate_chunk_tokens,
+    generate_chunk_id,
+)
 from app.services.status_event_bus import (
     build_status_channel_for_user,
     iter_status_events,
@@ -100,10 +107,494 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 _ACTIVE_DOCUMENT_TASKS: Set[int] = set()
 _ACTIVE_DOCUMENT_TASKS_LOCK: Optional[asyncio.Lock] = None
+_DOCUMENT_TASK_HANDLES: dict[int, asyncio.Task] = {}
+_DOCUMENT_TASK_CANCEL_REQUESTS: Set[int] = set()
+_STATUS_STREAM_SNAPSHOT_LIMIT = 50
+_REFERENCE_SECTION_RE = re.compile(
+    r"^(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s*)?(?:references?|bibliography|参考文献)\s*$",
+    re.IGNORECASE,
+)
+_PDF_SOURCE_SMALL_FRAGMENT_BLOCK_TYPES = {"heading", "footnote"}
+
+
+def _trim_optional_text(value: Any, *, limit: int) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if limit > 0 and len(text) > limit:
+        return text[:limit]
+    return text
+
+
+def _estimate_new_chunk_count_for_dimension_policy(
+    *,
+    text: str,
+    token_count: int,
+    config: ChunkConfig,
+) -> int:
+    normalized_text = str(text or "")
+    normalized_tokens = max(1, int(token_count or 0))
+    normalized_chars = max(1, len(normalized_text))
+
+    if bool(config.use_token_based):
+        stride_tokens = max(
+            1,
+            int(config.base_chunk_tokens or 0) - int(config.overlap_tokens or 0),
+        )
+        return max(1, int(math.ceil(normalized_tokens / stride_tokens)))
+
+    stride_chars = max(
+        1,
+        int(config.base_chunk_size or 0) - int(config.chunk_overlap or 0),
+    )
+    return max(1, int(math.ceil(normalized_chars / stride_chars)))
+
+
+def _unique_nonempty_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for value in list(values or []):
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        items.append(text)
+    return items
+
+
+def _is_reference_section_label(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    first_line = text.splitlines()[0].strip()
+    return bool(_REFERENCE_SECTION_RE.match(first_line))
+
+
+def _normalize_pdf_block_type(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _trim_text_range(text: str, start_char: int, end_char: int) -> tuple[int, int]:
+    text_len = len(text)
+    start = max(0, min(int(start_char or 0), text_len))
+    end = max(start, min(int(end_char or 0), text_len))
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _normalize_pdf_source_spans(source_spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_spans: list[dict[str, Any]] = []
+    for span in list(source_spans or []):
+        if not isinstance(span, dict):
+            continue
+        start_char = int(span.get("start_char") or 0)
+        end_char = int(span.get("end_char") or 0)
+        if end_char <= start_char:
+            continue
+        normalized_spans.append(
+            {
+                "start_char": start_char,
+                "end_char": end_char,
+                "block_id": str(span.get("block_id") or "").strip(),
+                "block_type": _normalize_pdf_block_type(span.get("block_type")),
+                "page_start": int(span.get("page_start") or 0),
+                "page_end": int(span.get("page_end") or 0),
+                "section_path": str(span.get("section_path") or "").strip(),
+            }
+        )
+    normalized_spans.sort(key=lambda item: (item["start_char"], item["end_char"]))
+    return normalized_spans
+
+
+def _get_overlapping_pdf_source_spans(
+    source_spans: list[dict[str, Any]],
+    *,
+    start_char: int,
+    end_char: int,
+) -> list[dict[str, Any]]:
+    normalized_start = int(start_char or 0)
+    normalized_end = int(end_char or 0)
+    if normalized_end <= normalized_start:
+        return []
+    return [
+        span
+        for span in list(source_spans or [])
+        if int(span.get("end_char") or 0) > normalized_start and int(span.get("start_char") or 0) < normalized_end
+    ]
+
+
+def _build_chunk_dict_from_range(
+    *,
+    base_chunk: dict[str, Any],
+    text: str,
+    start_char: int,
+    end_char: int,
+    postprocess_step: str,
+) -> Optional[dict[str, Any]]:
+    start, end = _trim_text_range(text, start_char, end_char)
+    if end <= start:
+        return None
+
+    content = text[start:end]
+    metadata = dict(base_chunk.get("metadata") or {})
+    extra = dict(metadata.get("extra") or {})
+    postprocess_steps = list(extra.get("postprocess_steps") or [])
+    if postprocess_step not in postprocess_steps:
+        postprocess_steps.append(postprocess_step)
+    extra["postprocess_steps"] = postprocess_steps
+    metadata["extra"] = extra
+    metadata["position_ratio"] = round(start / max(len(text), 1), 4)
+    metadata["token_count"] = estimate_chunk_tokens(content)
+
+    return {
+        "id": generate_chunk_id(content, start),
+        "content": content,
+        "start_char": start,
+        "end_char": end,
+        "metadata": metadata,
+    }
+
+
+def _merge_chunk_dicts(
+    *,
+    left: dict[str, Any],
+    right: dict[str, Any],
+    text: str,
+    postprocess_step: str,
+) -> Optional[dict[str, Any]]:
+    merged = _build_chunk_dict_from_range(
+        base_chunk=left,
+        text=text,
+        start_char=min(int(left.get("start_char") or 0), int(right.get("start_char") or 0)),
+        end_char=max(int(left.get("end_char") or 0), int(right.get("end_char") or 0)),
+        postprocess_step=postprocess_step,
+    )
+    if merged is None:
+        return None
+
+    left_extra = dict((left.get("metadata") or {}).get("extra") or {})
+    right_extra = dict((right.get("metadata") or {}).get("extra") or {})
+    merged_extra = dict(left_extra)
+    for key, value in right_extra.items():
+        merged_extra.setdefault(key, value)
+    postprocess_steps = list(merged_extra.get("postprocess_steps") or [])
+    if postprocess_step not in postprocess_steps:
+        postprocess_steps.append(postprocess_step)
+    merged_extra["postprocess_steps"] = postprocess_steps
+    merged["metadata"]["extra"] = merged_extra
+    return merged
+
+
+def _extract_pdf_source_section_keys(chunk: dict[str, Any]) -> set[str]:
+    metadata = dict(chunk.get("metadata") or {})
+    extra = dict(metadata.get("extra") or {})
+    pdf_source = dict(extra.get("pdf_source") or {})
+    section_paths = {
+        str(item).strip()
+        for item in list(pdf_source.get("section_paths") or [])
+        if str(item or "").strip()
+    }
+    section_title = str(metadata.get("section_title") or "").strip()
+    if section_title:
+        section_paths.add(section_title)
+    return section_paths
+
+
+def _chunks_can_merge_structurally(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_keys = _extract_pdf_source_section_keys(left)
+    right_keys = _extract_pdf_source_section_keys(right)
+    if left_keys and right_keys and left_keys.isdisjoint(right_keys):
+        return False
+    gap = int(right.get("start_char") or 0) - int(left.get("end_char") or 0)
+    return gap <= 64
+
+
+def _merge_small_pdf_structural_fragments(
+    chunks: list[dict[str, Any]],
+    *,
+    text: str,
+    source_spans: list[dict[str, Any]],
+    min_tokens: int,
+    max_tokens: int,
+) -> tuple[list[dict[str, Any]], int]:
+    adjusted = sorted(list(chunks or []), key=lambda item: int(item.get("start_char") or 0))
+    merges = 0
+    idx = 0
+
+    while idx < len(adjusted):
+        chunk = adjusted[idx]
+        metadata = dict(chunk.get("metadata") or {})
+        token_count = int(metadata.get("token_count") or estimate_chunk_tokens(chunk.get("content", "")))
+        extra = dict(metadata.get("extra") or {})
+        pdf_source = dict(extra.get("pdf_source") or {})
+        block_types = {
+            _normalize_pdf_block_type(item)
+            for item in list(pdf_source.get("block_types") or [])
+            if _normalize_pdf_block_type(item)
+        }
+
+        if token_count >= max(1, int(min_tokens or 0)):
+            idx += 1
+            continue
+        if not block_types or not block_types.issubset(_PDF_SOURCE_SMALL_FRAGMENT_BLOCK_TYPES):
+            idx += 1
+            continue
+
+        candidate_indexes: list[int] = []
+        if idx + 1 < len(adjusted):
+            candidate_indexes.append(idx + 1)
+        if idx - 1 >= 0:
+            candidate_indexes.append(idx - 1)
+
+        merged_chunk: Optional[dict[str, Any]] = None
+        target_idx: Optional[int] = None
+        for candidate_idx in candidate_indexes:
+            left_idx, right_idx = sorted((idx, candidate_idx))
+            left_chunk = adjusted[left_idx]
+            right_chunk = adjusted[right_idx]
+            if not _chunks_can_merge_structurally(left_chunk, right_chunk):
+                continue
+            preview = _merge_chunk_dicts(
+                left=left_chunk,
+                right=right_chunk,
+                text=text,
+                postprocess_step="merge_small_structural_fragment",
+            )
+            if preview is None:
+                continue
+            _enrich_chunks_with_pdf_source([preview], source_spans)
+            _backfill_chunk_metadata_from_pdf_source([preview])
+            preview_tokens = int((preview.get("metadata") or {}).get("token_count") or estimate_chunk_tokens(preview.get("content", "")))
+            if preview_tokens > max(1, int(max_tokens or 0)):
+                continue
+            merged_chunk = preview
+            target_idx = candidate_idx
+            break
+
+        if merged_chunk is None or target_idx is None:
+            idx += 1
+            continue
+
+        left_idx, right_idx = sorted((idx, target_idx))
+        adjusted[left_idx] = merged_chunk
+        del adjusted[right_idx]
+        merges += 1
+        idx = max(0, left_idx - 1)
+
+    return adjusted, merges
+
+
+def _backfill_chunk_metadata_from_pdf_source(chunks: list[dict[str, Any]]) -> int:
+    updated = 0
+    for chunk in list(chunks or []):
+        metadata = dict(chunk.get("metadata") or {})
+        extra = dict(metadata.get("extra") or {})
+        pdf_source = dict(extra.get("pdf_source") or {})
+        block_types = {
+            _normalize_pdf_block_type(item)
+            for item in list(pdf_source.get("block_types") or [])
+            if _normalize_pdf_block_type(item)
+        }
+
+        content_flags = dict(extra.get("content_flags") or {})
+        if "table" in block_types:
+            content_flags["has_table"] = True
+        if "equation" in block_types:
+            content_flags["has_equation"] = True
+        if "caption" in block_types:
+            content_flags["has_caption"] = True
+        if "list_item" in block_types:
+            content_flags["has_list"] = True
+        extra["content_flags"] = content_flags
+
+        if not str(metadata.get("section_title") or "").strip():
+            for section_path in list(pdf_source.get("section_paths") or []):
+                segments = [segment.strip() for segment in str(section_path or "").split(">") if segment.strip()]
+                if not segments:
+                    continue
+                metadata["section_title"] = segments[-1]
+                updated += 1
+                break
+
+        metadata["extra"] = extra
+        chunk["metadata"] = metadata
+
+    return updated
+
+
+def _apply_pdf_source_structural_postprocess(
+    chunks: list[dict[str, Any]],
+    *,
+    text: str,
+    source_spans: list[dict[str, Any]],
+    min_tokens: int,
+    max_tokens: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized = sorted(list(chunks or []), key=lambda item: int(item.get("start_char") or 0))
+    normalized_spans = _normalize_pdf_source_spans(source_spans)
+    if not normalized or not normalized_spans:
+        return normalized, {
+            "total_input": int(len(normalized)),
+            "total_output": int(len(normalized)),
+            "split_count": 0,
+            "merge_count": 0,
+            "section_title_backfilled": 0,
+        }
+
+    _enrich_chunks_with_pdf_source(normalized, normalized_spans)
+
+    merged_chunks, merge_count = _merge_small_pdf_structural_fragments(
+        normalized,
+        text=text,
+        source_spans=normalized_spans,
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
+    )
+    _enrich_chunks_with_pdf_source(merged_chunks, normalized_spans)
+    section_title_backfilled = _backfill_chunk_metadata_from_pdf_source(merged_chunks)
+
+    return merged_chunks, {
+        "total_input": int(len(normalized)),
+        "total_output": int(len(merged_chunks)),
+        "split_count": 0,
+        "merge_count": int(merge_count),
+        "section_title_backfilled": int(section_title_backfilled),
+    }
+
+
+def _enrich_chunks_with_pdf_source(
+    chunks: list[dict[str, Any]],
+    source_spans: list[dict[str, Any]],
+) -> None:
+    normalized_spans = _normalize_pdf_source_spans(source_spans)
+    if not normalized_spans:
+        return
+
+    for chunk in list(chunks or []):
+        if not isinstance(chunk, dict):
+            continue
+        chunk_start = int(chunk.get("start_char") or 0)
+        chunk_end = int(chunk.get("end_char") or 0)
+        if chunk_end <= chunk_start:
+            continue
+
+        matched = _get_overlapping_pdf_source_spans(
+            normalized_spans,
+            start_char=chunk_start,
+            end_char=chunk_end,
+        )
+        if not matched:
+            continue
+
+        block_ids = _unique_nonempty_strings([span.get("block_id") for span in matched])
+        block_types = _unique_nonempty_strings([span.get("block_type") for span in matched])
+        section_paths = _unique_nonempty_strings([span.get("section_path") for span in matched])
+        page_starts = [int(span.get("page_start") or 0) for span in matched if int(span.get("page_start") or 0) > 0]
+        page_ends = [int(span.get("page_end") or 0) for span in matched if int(span.get("page_end") or 0) > 0]
+
+        metadata = chunk.setdefault("metadata", {})
+        extra = dict(metadata.get("extra") or {})
+        extra["pdf_source"] = {
+            "block_ids": block_ids,
+            "block_types": block_types,
+            "page_start": min(page_starts) if page_starts else None,
+            "page_end": max(page_ends) if page_ends else None,
+            "section_paths": section_paths,
+        }
+        metadata["extra"] = extra
+
+
+def _is_reference_chunk(chunk: dict[str, Any]) -> bool:
+    if not isinstance(chunk, dict):
+        return False
+    metadata = dict(chunk.get("metadata") or {})
+
+    section_type = str(metadata.get("section_type") or "").strip().lower()
+    if section_type == "references":
+        return True
+
+    if _is_reference_section_label(metadata.get("section_title")):
+        return True
+
+    extra = dict(metadata.get("extra") or {})
+    pdf_source = dict(extra.get("pdf_source") or {})
+    for section_path in list(pdf_source.get("section_paths") or []):
+        for segment in str(section_path or "").split(">"):
+            if _is_reference_section_label(segment):
+                return True
+    return False
+
+
+def _filter_reference_chunks(chunks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    filtered: list[dict[str, Any]] = []
+    dropped = 0
+    for chunk in list(chunks or []):
+        if _is_reference_chunk(chunk):
+            dropped += 1
+            continue
+        filtered.append(chunk)
+    return filtered, dropped
 
 
 def _sse_payload(event: str, data: Any) -> str:
     return f"data: {json.dumps({'event': event, 'data': data}, ensure_ascii=False)}\n\n"
+
+
+def _build_document_status_event_data(*, kb_id: int, doc: Document) -> dict[str, Any]:
+    processing = _document_processing_snapshot(doc)
+    return {
+        "kb_id": int(kb_id),
+        "document_id": int(doc.id),
+        "status": str(doc.status),
+        "processing_stage": processing["stage"],
+        "processing_stage_label": processing["stage_label"],
+        "processing_progress": processing["progress"],
+        "processing_detail": processing["detail"],
+        "chunk_count": int(doc.chunk_count or 0),
+        "error_message": (doc.error_message or None),
+        "updated_at": processing["updated_at"],
+    }
+
+
+async def _collect_status_stream_snapshot(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    kb_id: Optional[int],
+    limit: int = _STATUS_STREAM_SNAPSHOT_LIMIT,
+) -> list[dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit or _STATUS_STREAM_SNAPSHOT_LIMIT), 200))
+    query = (
+        select(Document)
+        .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+        .where(KnowledgeBase.user_id == int(user_id))
+        .order_by(Document.created_at.desc())
+        .limit(normalized_limit)
+    )
+    if kb_id is not None:
+        query = query.where(Document.knowledge_base_id == int(kb_id))
+    else:
+        query = query.where(
+            Document.status.in_(
+                [
+                    DocumentStatus.PENDING.value,
+                    DocumentStatus.RUNNING.value,
+                    DocumentStatus.TIMEOUT.value,
+                    DocumentStatus.FAILED.value,
+                    DocumentStatus.CANCELLED.value,
+                ]
+            )
+        )
+
+    result = await db.execute(query)
+    docs = list(result.scalars().all())
+    return [
+        _build_document_status_event_data(kb_id=int(doc.knowledge_base_id), doc=doc)
+        for doc in docs
+    ]
 
 
 async def _publish_document_status_event(
@@ -114,14 +605,7 @@ async def _publish_document_status_event(
 ) -> None:
     payload = {
         "event": "document_status",
-        "data": {
-            "kb_id": int(kb_id),
-            "document_id": int(doc.id),
-            "status": str(doc.status),
-            "chunk_count": int(doc.chunk_count or 0),
-            "error_message": (doc.error_message or None),
-            "updated_at": (doc.updated_at or datetime.utcnow()).isoformat(),
-        },
+        "data": _build_document_status_event_data(kb_id=int(kb_id), doc=doc),
     }
     try:
         await publish_status_event(build_status_channel_for_user(int(user_id)), payload)
@@ -156,6 +640,108 @@ def _is_document_task_active(doc_id: int) -> bool:
     return int(doc_id) in _ACTIVE_DOCUMENT_TASKS
 
 
+def _is_document_task_scheduled(doc_id: int) -> bool:
+    task = _DOCUMENT_TASK_HANDLES.get(int(doc_id))
+    return task is not None and not task.done()
+
+
+def _has_live_document_task(doc_id: int) -> bool:
+    normalized_doc_id = int(doc_id)
+    return _is_document_task_active(normalized_doc_id) or _is_document_task_scheduled(normalized_doc_id)
+
+
+async def _mark_document_task_cancellation_requested(doc_id: int) -> None:
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        _DOCUMENT_TASK_CANCEL_REQUESTS.add(int(doc_id))
+
+
+async def _consume_document_task_cancellation_requested(doc_id: int) -> bool:
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        normalized_doc_id = int(doc_id)
+        if normalized_doc_id in _DOCUMENT_TASK_CANCEL_REQUESTS:
+            _DOCUMENT_TASK_CANCEL_REQUESTS.discard(normalized_doc_id)
+            return True
+        return False
+
+
+async def _finalize_document_task_handle(doc_id: int, task: asyncio.Task) -> None:
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        normalized_doc_id = int(doc_id)
+        current = _DOCUMENT_TASK_HANDLES.get(normalized_doc_id)
+        if current is task:
+            _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
+        _DOCUMENT_TASK_CANCEL_REQUESTS.discard(normalized_doc_id)
+
+
+def _build_document_task_done_callback(doc_id: int):
+    normalized_doc_id = int(doc_id)
+
+    def _callback(task: asyncio.Task) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - defensive cleanup during shutdown
+            current = _DOCUMENT_TASK_HANDLES.get(normalized_doc_id)
+            if current is task:
+                _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
+            _DOCUMENT_TASK_CANCEL_REQUESTS.discard(normalized_doc_id)
+            return
+        loop.create_task(_finalize_document_task_handle(normalized_doc_id, task))
+
+    return _callback
+
+
+async def _schedule_document_task(doc_id: int, chunk_size: int, chunk_overlap: int) -> bool:
+    normalized_doc_id = int(doc_id)
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        existing = _DOCUMENT_TASK_HANDLES.get(normalized_doc_id)
+        if existing is not None:
+            if not existing.done():
+                return False
+            _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
+
+        task = asyncio.create_task(
+            process_document_task(
+                doc_id=normalized_doc_id,
+                chunk_size=int(chunk_size),
+                chunk_overlap=int(chunk_overlap),
+            )
+        )
+        _DOCUMENT_TASK_HANDLES[normalized_doc_id] = task
+        task.add_done_callback(_build_document_task_done_callback(normalized_doc_id))
+        return True
+
+
+async def _cancel_document_task(doc_id: int, *, wait_timeout_seconds: float = 5.0) -> bool:
+    normalized_doc_id = int(doc_id)
+    task: Optional[asyncio.Task] = None
+
+    lock = _get_active_document_tasks_lock()
+    async with lock:
+        existing = _DOCUMENT_TASK_HANDLES.get(normalized_doc_id)
+        if existing is None:
+            return False
+        if existing.done():
+            _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
+            return False
+        _DOCUMENT_TASK_CANCEL_REQUESTS.add(normalized_doc_id)
+        task = existing
+        existing.cancel()
+
+    try:
+        await asyncio.wait_for(task, timeout=max(0.1, float(wait_timeout_seconds or 5.0)))
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        logger.warning(f"[Knowledge API] 取消文档任务等待超时: doc_id={normalized_doc_id}")
+    except Exception as exc:  # pragma: no cover - cancellation should not leak failure outward
+        logger.debug(f"[Knowledge API] 文档任务取消完成时抛出异常 doc_id={normalized_doc_id}: {exc}")
+    return True
+
+
 def _build_error_detail(
     *,
     code: str,
@@ -170,6 +756,107 @@ def _build_error_detail(
         "request_id": request_id,
     }
     return payload
+
+
+def _compute_sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(bytes(content or b"")).hexdigest()
+
+
+def _normalize_text_for_content_dedupe(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _document_dedupe_metadata(doc: Document) -> dict[str, Any]:
+    metadata = dict(doc.metadata_ or {})
+    dedupe = metadata.get("dedupe")
+    if isinstance(dedupe, dict):
+        return dict(dedupe)
+    return {}
+
+
+def _set_document_dedupe_metadata(doc: Document, **updates: Any) -> None:
+    metadata = dict(doc.metadata_ or {})
+    dedupe = dict(metadata.get("dedupe") or {})
+    dedupe.update({key: value for key, value in updates.items() if value is not None})
+    metadata["dedupe"] = dedupe
+    doc.metadata_ = metadata
+
+
+def _extract_documents_from_execute_result(result: Any) -> list[Document]:
+    if result is None:
+        return []
+    scalars = getattr(result, "scalars", None)
+    if callable(scalars):
+        scalar_result = scalars()
+        all_items = getattr(scalar_result, "all", None)
+        if callable(all_items):
+            return [item for item in all_items() if isinstance(item, Document)]
+    rows_getter = getattr(result, "all", None)
+    if callable(rows_getter):
+        docs: list[Document] = []
+        for row in rows_getter():
+            if isinstance(row, Document):
+                docs.append(row)
+            elif isinstance(row, tuple) and row and isinstance(row[0], Document):
+                docs.append(row[0])
+        return docs
+    return []
+
+
+async def _find_duplicate_document_by_file_hash(
+    db: AsyncSession,
+    *,
+    kb_id: int,
+    file_size: int,
+    file_sha256: str,
+) -> Optional[Document]:
+    result = await db.execute(
+        select(Document).where(
+            Document.knowledge_base_id == int(kb_id),
+            Document.file_size == int(file_size),
+            Document.status.in_(
+                [
+                    DocumentStatus.PENDING.value,
+                    DocumentStatus.RUNNING.value,
+                    DocumentStatus.COMPLETED.value,
+                ]
+            ),
+        )
+    )
+    for candidate in _extract_documents_from_execute_result(result):
+        dedupe = _document_dedupe_metadata(candidate)
+        if str(dedupe.get("file_sha256") or "").strip() == str(file_sha256 or "").strip():
+            return candidate
+    return None
+
+
+async def _find_duplicate_document_by_content_hash(
+    db: AsyncSession,
+    *,
+    kb_id: int,
+    content_hash: str,
+    exclude_doc_id: int,
+) -> Optional[Document]:
+    result = await db.execute(
+        select(Document).where(
+            Document.knowledge_base_id == int(kb_id),
+            Document.content_hash == str(content_hash or "").strip(),
+            Document.id != int(exclude_doc_id),
+            Document.status == DocumentStatus.COMPLETED.value,
+        ).order_by(Document.id.asc())
+    )
+    candidates = _extract_documents_from_execute_result(result)
+    if not candidates:
+        return None
+    for candidate in candidates:
+        dedupe = _document_dedupe_metadata(candidate)
+        if not dedupe.get("duplicate_of_document_id"):
+            return candidate
+    return candidates[0]
 
 
 def _safe_remove_file(path: Optional[str], *, context: str) -> None:
@@ -224,17 +911,59 @@ async def _recompute_kb_statistics(db: AsyncSession, kb_id: int) -> Optional[Kno
     return kb
 
 
-def _should_run_chunk_quality_gate(*, gate_enabled: bool, used_pdf_rag_ingest: bool) -> bool:
-    if not gate_enabled:
-        return False
-    if used_pdf_rag_ingest:
-        return False
-    return True
-
-
 _DOCUMENT_UPLOAD_MODES: Set[str] = {"local_fast", "local_hybrid", "online_mm", "auto"}
 _DOCUMENT_EXTRACT_PROFILES: Set[str] = {"general", "academic_formula", "table_first"}
 _DOCUMENT_EXTRACT_GRANULARITIES: Set[str] = {"fine", "medium", "coarse"}
+_PROCESSING_STAGE_LABELS: dict[str, str] = {
+    "queued": "排队中",
+    "preparing": "准备任务",
+    "online_mm_extract": "在线多模态提取中",
+    "online_mm_finalize": "在线多模态整理中",
+    "structured_ingest": "结构化提取中",
+    "text_extract": "文本提取中",
+    "chunking": "智能分块中",
+    "quality_gate": "质量检查中",
+    "embedding": "向量化中",
+    "saving": "写入分片中",
+    "finalizing": "入库收尾中",
+    "completed": "处理完成",
+    "failed": "处理失败",
+    "timeout": "处理超时",
+    "cancelled": "已取消",
+}
+_PROCESSING_STAGE_PROGRESS: dict[str, float] = {
+    "queued": 0.0,
+    "preparing": 5.0,
+    "online_mm_extract": 15.0,
+    "online_mm_finalize": 28.0,
+    "structured_ingest": 25.0,
+    "text_extract": 20.0,
+    "chunking": 45.0,
+    "quality_gate": 60.0,
+    "embedding": 78.0,
+    "saving": 92.0,
+    "finalizing": 97.0,
+    "completed": 100.0,
+    "failed": 0.0,
+    "timeout": 0.0,
+    "cancelled": 0.0,
+}
+_STATUS_DEFAULT_MESSAGE: dict[str, str] = {
+    DocumentStatus.PENDING.value: "等待处理",
+    DocumentStatus.RUNNING.value: "处理中",
+    DocumentStatus.COMPLETED.value: "处理完成",
+    DocumentStatus.FAILED.value: "处理失败",
+    DocumentStatus.TIMEOUT.value: "处理超时",
+    DocumentStatus.CANCELLED.value: "处理已取消",
+}
+_STATUS_STAGE_FALLBACK: dict[str, str] = {
+    DocumentStatus.PENDING.value: "queued",
+    DocumentStatus.RUNNING.value: "preparing",
+    DocumentStatus.COMPLETED.value: "completed",
+    DocumentStatus.FAILED.value: "failed",
+    DocumentStatus.TIMEOUT.value: "timeout",
+    DocumentStatus.CANCELLED.value: "cancelled",
+}
 
 
 def _normalize_document_upload_mode(raw: Optional[str]) -> DocumentUploadMode:
@@ -294,7 +1023,93 @@ def _resolve_pdf_rag_structured_mode(requested_ingest_mode: DocumentUploadMode) 
     return "hybrid" if requested_ingest_mode == "local_hybrid" else "fast"
 
 
+def _document_processing_snapshot(doc: Document) -> dict[str, Any]:
+    metadata = dict(doc.metadata_ or {})
+    raw_state = metadata.get("processing_state")
+    state = dict(raw_state) if isinstance(raw_state, dict) else {}
+    normalized_status = str(doc.status or DocumentStatus.PENDING.value).strip().lower() or DocumentStatus.PENDING.value
+
+    stage = str(state.get("stage") or "").strip().lower()
+    fallback_stage = _STATUS_STAGE_FALLBACK.get(normalized_status, "failed")
+    if normalized_status in {
+        DocumentStatus.COMPLETED.value,
+        DocumentStatus.FAILED.value,
+        DocumentStatus.TIMEOUT.value,
+        DocumentStatus.CANCELLED.value,
+    }:
+        stage = fallback_stage
+    elif not stage:
+        stage = fallback_stage
+
+    stage_label = (
+        str(state.get("stage_label") or "").strip()
+        or _PROCESSING_STAGE_LABELS.get(stage)
+        or _STATUS_DEFAULT_MESSAGE.get(normalized_status, "处理中")
+    )
+    progress_value = state.get("progress")
+    try:
+        progress = float(progress_value)
+    except (TypeError, ValueError):
+        progress = _PROCESSING_STAGE_PROGRESS.get(stage, 0.0)
+    progress = max(0.0, min(100.0, progress))
+
+    detail = str(state.get("detail") or "").strip() or None
+    updated_at = (
+        str(state.get("updated_at") or "").strip()
+        or (doc.updated_at or doc.created_at or datetime.utcnow()).isoformat()
+    )
+    current = state.get("current")
+    total = state.get("total")
+    return {
+        "stage": stage,
+        "stage_label": stage_label,
+        "progress": progress,
+        "detail": detail,
+        "updated_at": updated_at,
+        "current": int(current) if isinstance(current, (int, float)) else None,
+        "total": int(total) if isinstance(total, (int, float)) else None,
+    }
+
+
+def _set_document_processing_stage(
+    doc: Document,
+    *,
+    stage: str,
+    detail: Optional[str] = None,
+    progress: Optional[float] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+) -> None:
+    metadata = dict(doc.metadata_ or {})
+    state = dict(metadata.get("processing_state") or {})
+    normalized_stage = str(stage or "").strip().lower() or "preparing"
+    state["stage"] = normalized_stage
+    state["stage_label"] = _PROCESSING_STAGE_LABELS.get(normalized_stage, normalized_stage)
+    default_progress = _PROCESSING_STAGE_PROGRESS.get(normalized_stage, 0.0)
+    state["progress"] = max(0.0, min(100.0, float(default_progress if progress is None else progress)))
+    if detail is None:
+        state.pop("detail", None)
+    else:
+        normalized_detail = str(detail).strip()
+        if normalized_detail:
+            state["detail"] = normalized_detail
+        else:
+            state.pop("detail", None)
+    if current is None:
+        state.pop("current", None)
+    else:
+        state["current"] = max(0, int(current))
+    if total is None:
+        state.pop("total", None)
+    else:
+        state["total"] = max(0, int(total))
+    state["updated_at"] = datetime.utcnow().isoformat()
+    metadata["processing_state"] = state
+    doc.metadata_ = metadata
+
+
 def _build_document_response(doc: Document) -> DocumentResponse:
+    processing = _document_processing_snapshot(doc)
     return DocumentResponse(
         id=doc.id,
         knowledge_base_id=doc.knowledge_base_id,
@@ -303,6 +1118,10 @@ def _build_document_response(doc: Document) -> DocumentResponse:
         file_size=doc.file_size,
         file_type=doc.file_type,
         status=doc.status,
+        processing_stage=processing["stage"],
+        processing_stage_label=processing["stage_label"],
+        processing_progress=processing["progress"],
+        processing_detail=processing["detail"],
         processing_mode=_document_processing_mode(doc),
         extract_profile=_document_extract_profile(doc),
         extract_granularity=_document_extract_granularity(doc),
@@ -360,6 +1179,7 @@ def _mark_document_retry_requested(
     retry_request["requested_at"] = datetime.utcnow().isoformat()
     metadata["retry_request"] = retry_request
     doc.metadata_ = metadata
+    _set_document_processing_stage(doc, stage="queued")
 
 
 def _mark_stale_document_timeout(doc: Document) -> bool:
@@ -379,6 +1199,7 @@ def _mark_stale_document_timeout(doc: Document) -> bool:
     timeout_error = build_timeout_error_message(stale_timeout_seconds)
     doc.status = DocumentStatus.TIMEOUT.value
     doc.error_message = f"{previous_error} | {timeout_error}" if previous_error else timeout_error
+    _set_document_processing_stage(doc, stage="timeout", detail=timeout_error)
     return True
 
 
@@ -887,6 +1708,17 @@ async def stream_knowledge_status_events(
                 "ts": datetime.utcnow().isoformat(),
             },
         )
+        async with async_session_factory() as db:
+            snapshot_items = await _collect_status_stream_snapshot(
+                db,
+                user_id=int(current_user.id),
+                kb_id=int(kb_id) if kb_id is not None else None,
+            )
+        for item in snapshot_items:
+            if await request.is_disconnected():
+                return
+            yield _sse_payload("document_status", item)
+
         async for item in iter_status_events(channel):
             if await request.is_disconnected():
                 break
@@ -921,7 +1753,6 @@ async def stream_knowledge_status_events(
 @router.post("/knowledge-bases/{kb_id}/documents/upload", response_model=DocumentUploadResponse)
 async def upload_document(
     kb_id: int,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     ingest_mode: str = Form(default="local_fast"),
     extract_profile: str = Form(default="general"),
@@ -954,16 +1785,48 @@ async def upload_document(
         if not bool(settings.kb_online_mm_ingest_enabled):
             raise HTTPException(status_code=400, detail="在线多模态入库当前未启用")
     
-    # 保存文件
     file_id = str(uuid.uuid4())
+    try:
+        content = await file.read()
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=_build_error_detail(
+                code="file_save_failed",
+                message="文件保存失败",
+                details=str(e),
+                request_id=file_id,
+            ),
+        )
+
+    file_sha256 = _compute_sha256_bytes(content)
+    duplicate_doc = await _find_duplicate_document_by_file_hash(
+        db,
+        kb_id=int(kb_id),
+        file_size=len(content),
+        file_sha256=file_sha256,
+    )
+    if duplicate_doc is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=_build_error_detail(
+                code="duplicate_file_upload",
+                message="同一知识库中已存在相同文件",
+                details={
+                    "duplicate_of_document_id": int(duplicate_doc.id),
+                    "duplicate_status": str(duplicate_doc.status or ""),
+                    "duplicate_filename": str(duplicate_doc.original_filename or duplicate_doc.filename or ""),
+                },
+                request_id=file_id,
+            ),
+        )
+
+    # 保存文件
     file_name = f"{file_id}.{file_type}"
     file_path = os.path.join(UPLOAD_DIR, str(current_user.id), str(kb_id))
     os.makedirs(file_path, exist_ok=True)
-    
     full_path = os.path.join(file_path, file_name)
-    
     try:
-        content = await file.read()
         with open(full_path, 'wb') as f:
             f.write(content)
     except OSError as e:
@@ -994,9 +1857,16 @@ async def upload_document(
                 "extract_granularity": normalized_extract_granularity,
                 "requested_by": int(current_user.id),
                 "requested_at": datetime.utcnow().isoformat(),
-            }
+            },
+            "dedupe": {
+                "file_sha256": file_sha256,
+                "duplicate_type": None,
+                "duplicate_of_document_id": None,
+                "indexed": None,
+            },
         },
     )
+    _set_document_processing_stage(doc, stage="queued")
     db.add(doc)
     try:
         await db.flush()
@@ -1021,13 +1891,8 @@ async def upload_document(
         doc=doc,
     )
     
-    # 后台处理文档
-    background_tasks.add_task(
-        process_document_task,
-        doc.id,
-        kb.chunk_size,
-        kb.chunk_overlap,
-    )
+    # 直接注册异步任务句柄，支持文档级取消与状态治理。
+    await _schedule_document_task(doc.id, kb.chunk_size, kb.chunk_overlap)
     
     logger.info(f"用户 {current_user.id} 上传文档: {file.filename} -> {doc.id}")
     
@@ -1038,6 +1903,10 @@ async def upload_document(
         file_size=doc.file_size,
         file_type=doc.file_type,
         status=doc.status,
+        processing_stage=_document_processing_snapshot(doc)["stage"],
+        processing_stage_label=_document_processing_snapshot(doc)["stage_label"],
+        processing_progress=_document_processing_snapshot(doc)["progress"],
+        processing_detail=_document_processing_snapshot(doc)["detail"],
         processing_mode=normalized_ingest_mode,
         extract_profile=normalized_extract_profile,
         extract_granularity=normalized_extract_granularity,
@@ -1084,11 +1953,29 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     kb_id=int(doc.knowledge_base_id),
                     doc=doc,
                 )
+
+            async def _set_stage(
+                stage: str,
+                *,
+                detail: Optional[str] = None,
+                progress: Optional[float] = None,
+                current: Optional[int] = None,
+                total: Optional[int] = None,
+            ) -> None:
+                _set_document_processing_stage(
+                    doc,
+                    stage=stage,
+                    detail=detail,
+                    progress=progress,
+                    current=current,
+                    total=total,
+                )
+                await db.commit()
+                await _emit_status()
             
             # 更新状态为处理中
             doc.status = DocumentStatus.RUNNING.value
-            await db.commit()
-            await _emit_status()
+            await _set_stage("preparing")
             
             # 创建处理器
             processor = get_document_processor(chunk_size, chunk_overlap)
@@ -1106,6 +1993,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 logger.error(f"知识库不存在: {doc.knowledge_base_id}")
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "知识库不存在"
+                _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                 await db.commit()
                 await _emit_status()
                 return
@@ -1115,20 +2003,35 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             requested_ingest_mode = _document_processing_mode(doc)
             requested_extract_profile = _document_extract_profile(doc)
             requested_extract_granularity = _document_extract_granularity(doc)
+            embedding_model = (kb.embedding_model or "").strip() or settings.local_embedding_model
+            policy_service = get_embedding_dimension_policy_service()
             text = ""
             primary_chunks = []
             context_chunks = []
-            used_pdf_rag_ingest = False
+            pdf_source_spans: list[dict[str, Any]] = []
+            normalized_text = ""
+            normalized_text_hash = ""
+            normalized_text_token_count = 0
+            normalized_text_char_count = 0
+            frozen_embedding_svc = None
+            frozen_dimension_decision = None
+            frozen_existing_chunks = 0
+            frozen_estimated_new_chunks = 0
 
             if doc.file_type.lower() == "pdf" and requested_ingest_mode == "online_mm":
                 if not bool(settings.kb_online_mm_ingest_enabled):
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = "在线多模态入库未启用"
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     await _emit_status()
                     return
 
                 extract_started_at = time.perf_counter()
+                await _set_stage(
+                    "online_mm_extract",
+                    detail=f"profile={requested_extract_profile}, granularity={requested_extract_granularity}",
+                )
                 logger.info(
                     f"[doc:{task_trace_id}] 开始在线多模态 PDF 入库链路: {doc_id}, "
                     f"profile={requested_extract_profile}, granularity={requested_extract_granularity}"
@@ -1138,6 +2041,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 except Exception as exc:
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = f"在线多模态入库服务不可用: {exc}"[:2000]
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     await _emit_status()
                     return
@@ -1180,6 +2084,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                         f"[doc:{task_trace_id}] 复用在线多模态抽取缓存: blocks={len(cached_blocks)}, "
                         f"elapsed={_task_elapsed_ms():.2f}ms"
                     )
+                    await _set_stage("online_mm_finalize", detail="复用抽取缓存，整理结果")
                     online_mm_result = await online_mm_service.finalize_blocks(
                         blocks=cached_blocks,
                         document_name=doc.original_filename or doc.filename or "",
@@ -1226,6 +2131,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                         doc.metadata_ = current_metadata
                         await db.commit()
                         await _emit_status()
+                        await _set_stage("online_mm_finalize", detail="在线多模态抽取完成，正在整理块")
                         online_mm_result = await online_mm_service.finalize_blocks(
                             blocks=list(extract_result.get("blocks") or []),
                             document_name=doc.original_filename or doc.filename or "",
@@ -1258,6 +2164,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     reason = str(online_mm_result.get("failure_reason") or "online_mm_ingest_failed").strip()
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = f"在线多模态入库失败: {reason}"[:2000]
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     await _emit_status()
                     return
@@ -1273,7 +2180,11 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
 
             elif doc.file_type.lower() == "pdf" and bool(settings.pdf_rag_line_pipeline_enabled):
                 extract_started_at = time.perf_counter()
-                logger.info(f"[doc:{task_trace_id}] 开始 PDF 结构化 RAG 入库链路: {doc_id}")
+                await _set_stage(
+                    "structured_ingest",
+                    detail=f"mode={_resolve_pdf_rag_structured_mode(requested_ingest_mode)}",
+                )
+                logger.info(f"[doc:{task_trace_id}] 开始本地 PDF 结构化提取链路: {doc_id}")
                 pdf_rag_service = get_pdf_rag_ingest_service()
                 pdf_result = await pdf_rag_service.ingest_pdf(
                     file_path=doc.file_path,
@@ -1281,28 +2192,27 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     mode=_resolve_pdf_rag_structured_mode(requested_ingest_mode),
                 )
                 text = str(pdf_result.get("document_text") or "")
+                pdf_source_spans = list(pdf_result.get("document_source_spans") or [])
                 current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
                 current_metadata["pdf_rag_ingest"] = dict(pdf_result.get("report") or {})
                 if pdf_result.get("extractor"):
                     current_metadata["pdf_extractor"] = pdf_result.get("extractor")
                 doc.metadata_ = current_metadata
                 if bool(pdf_result.get("applied")):
-                    primary_chunks = list(pdf_result.get("chunks") or [])
-                    used_pdf_rag_ingest = True
                     logger.info(
-                        f"[doc:{task_trace_id}] PDF 结构化 RAG 链路完成: chars={len(text)}, chunks={len(primary_chunks)}, "
+                        f"[doc:{task_trace_id}] 本地 PDF 结构化提取完成: chars={len(text)}, next=smart_chunking, "
                         f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
                         f"elapsed={_task_elapsed_ms():.2f}ms"
                     )
                 else:
                     logger.warning(
-                        f"[doc:{task_trace_id}] PDF 结构化 RAG 链路未启用成功，回退旧链路: "
+                        f"[doc:{task_trace_id}] 本地 PDF 结构化提取失败，回退通用提取链路: "
                         f"reason={pdf_result.get('failure_reason')}, elapsed={_task_elapsed_ms():.2f}ms"
                     )
 
-            if not primary_chunks:
-                # 提取文本
+            if not text.strip() and not primary_chunks:
                 extract_started_at = time.perf_counter()
+                await _set_stage("text_extract")
                 logger.info(f"[doc:{task_trace_id}] 开始提取文档文本: {doc_id}")
                 text = await processor.extract_text(doc.file_path, doc.file_type)
                 logger.info(
@@ -1310,21 +2220,80 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     f"stage_ms={(time.perf_counter() - extract_started_at) * 1000:.2f}, "
                     f"elapsed={_task_elapsed_ms():.2f}ms"
                 )
+            elif text.strip() and not primary_chunks:
+                logger.info(
+                    f"[doc:{task_trace_id}] 复用上游提取文本进入统一智能分块: chars={len(text)}, "
+                    f"elapsed={_task_elapsed_ms():.2f}ms"
+                )
 
-                if not text.strip():
-                    doc.status = DocumentStatus.FAILED.value
-                    doc.error_message = "文档内容为空"
-                    await db.commit()
-                    await _emit_status()
-                    return
+            if not text.strip():
+                doc.status = DocumentStatus.FAILED.value
+                doc.error_message = "文档内容为空"
+                _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
+                await db.commit()
+                await _emit_status()
+                return
 
-                if doc.file_type.lower() == "pdf" and processor.last_pdf_extractor:
-                    current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
-                    current_metadata["pdf_extractor"] = processor.last_pdf_extractor
-                    doc.metadata_ = current_metadata
+            if doc.file_type.lower() == "pdf" and processor.last_pdf_extractor:
+                current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                current_metadata["pdf_extractor"] = processor.last_pdf_extractor
+                doc.metadata_ = current_metadata
 
+            normalized_text = _normalize_text_for_content_dedupe(text)
+            normalized_text_hash = processor.compute_hash(normalized_text)
+            duplicate_content_doc = await _find_duplicate_document_by_content_hash(
+                db,
+                kb_id=int(doc.knowledge_base_id),
+                content_hash=normalized_text_hash,
+                exclude_doc_id=int(doc.id),
+            )
+            if duplicate_content_doc is not None:
+                doc.content = None
+                doc.content_hash = normalized_text_hash
+                doc.char_count = 0
+                doc.token_count = 0
+                doc.chunk_count = 0
+                doc.status = DocumentStatus.COMPLETED.value
+                doc.error_message = None
+                doc.processed_at = datetime.utcnow()
+                _set_document_dedupe_metadata(
+                    doc,
+                    content_hash_normalized=normalized_text_hash,
+                    duplicate_type="content_exact",
+                    duplicate_of_document_id=int(duplicate_content_doc.id),
+                    indexed=False,
+                    duplicate_stage="post_extract",
+                )
+                _set_document_processing_stage(
+                    doc,
+                    stage="completed",
+                    detail=f"与文档 #{duplicate_content_doc.id} 内容完全重复，已跳过分块与向量化",
+                )
+                await _recompute_kb_statistics(db, int(doc.knowledge_base_id))
+                await db.commit()
+                await _emit_status()
+                logger.info(
+                    f"[doc:{task_trace_id}] 检测到内容重复，跳过后续入库: "
+                    f"doc={doc.id}, duplicate_of={duplicate_content_doc.id}, elapsed={_task_elapsed_ms():.2f}ms"
+                )
+                return
+
+            _set_document_dedupe_metadata(
+                doc,
+                content_hash_normalized=normalized_text_hash,
+                duplicate_type=None,
+                duplicate_of_document_id=None,
+            )
+            normalized_text_char_count = len(text)
+            normalized_text_token_count = processor.estimate_tokens(text)
+
+            if not primary_chunks:
                 # 分片
                 chunk_started_at = time.perf_counter()
+                await _set_stage(
+                    "chunking",
+                    detail=f"strategy={kb_config.get('strategy', 'hybrid')}",
+                )
                 logger.info(f"[doc:{task_trace_id}] 开始智能分块: {doc_id}")
 
                 # 准备配置
@@ -1351,8 +2320,33 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 if "hierarchy_levels" in kb_config:
                     chunk_config.hierarchy_levels = [ChunkLevel(l) for l in kb_config["hierarchy_levels"]]
 
+                estimated_text_tokens = processor.estimate_tokens(text)
+                frozen_existing_chunks = await policy_service.estimate_kb_paragraph_chunks(db, kb.id)
+                frozen_estimated_new_chunks = _estimate_new_chunk_count_for_dimension_policy(
+                    text=text,
+                    token_count=estimated_text_tokens,
+                    config=chunk_config,
+                )
+                frozen_dimension_decision = policy_service.decide_dimension(
+                    corpus_chunks=int(frozen_existing_chunks) + int(frozen_estimated_new_chunks),
+                    embedding_model=embedding_model,
+                    previous_dimension=kb.embedding_dimension,
+                )
+                frozen_embedding_svc = get_embedding_service_for_model_and_dimension(
+                    embedding_model,
+                    frozen_dimension_decision.target_dimension,
+                )
+                logger.info(
+                    f"[doc:{task_trace_id}] [dimension_policy:chunking] kb={kb.id}, doc={doc_id}, "
+                    f"model={embedding_model}, existing_chunks={frozen_existing_chunks}, "
+                    f"estimated_new_chunks={frozen_estimated_new_chunks}, "
+                    f"projected_chunks={frozen_dimension_decision.corpus_chunks}, "
+                    f"target_dim={frozen_dimension_decision.target_dimension}, "
+                    f"reason={frozen_dimension_decision.reason}"
+                )
+
                 # 执行分块
-                smart_service = SmartChunkingService()
+                smart_service = SmartChunkingService(embedding_svc=frozen_embedding_svc)
                 result = await smart_service.chunk_document(text, chunk_config, doc.file_type)
                 logger.info(
                     f"[doc:{task_trace_id}] 智能分块完成: 层级分块={'是' if result.get('hierarchy') else '否'}, "
@@ -1392,23 +2386,27 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                                 "section_title": val.metadata.section_title,
                                 "parent_id": val.metadata.parent_id,
                                 "child_ids": val.metadata.child_ids,
+                                "semantic_score": val.metadata.semantic_score,
                                 "has_citations": val.metadata.has_citations,
                                 "position_ratio": val.metadata.position_ratio,
                                 "keywords": val.metadata.keywords,
+                                "token_count": val.metadata.token_count,
+                                "extra": val.metadata.extra,
                             }
                         })
 
             if not text.strip():
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "文档内容为空"
+                _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                 await db.commit()
                 await _emit_status()
                 return
 
             doc.content = text
-            doc.content_hash = processor.compute_hash(text)
-            doc.char_count = len(text)
-            doc.token_count = processor.estimate_tokens(text)
+            doc.content_hash = normalized_text_hash or processor.compute_hash(_normalize_text_for_content_dedupe(text))
+            doc.char_count = normalized_text_char_count or len(text)
+            doc.token_count = normalized_text_token_count or processor.estimate_tokens(text)
             
             chunks_to_save = primary_chunks
             
@@ -1421,6 +2419,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             if not chunks_to_save:
                 doc.status = DocumentStatus.FAILED.value
                 doc.error_message = "文档分片失败：无有效分块"
+                _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                 await db.commit()
                 await _emit_status()
                 return
@@ -1428,17 +2427,10 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             # 按位置排序
             chunks_to_save.sort(key=lambda x: x["start_char"])
 
-            # Skip the legacy chunk gate for PDF line-RAG outputs. Those chunks have
-            # already been judged by the action/clean/chunk pipeline and should not
-            # be re-scored by the older chunk-quality design.
-            should_run_chunk_quality_gate = _should_run_chunk_quality_gate(
-                gate_enabled=bool(settings.chunk_quality_gate_enabled),
-                used_pdf_rag_ingest=used_pdf_rag_ingest,
-            )
-
             # Chunk quality gate (optional): score + mark bad chunks + local repair.
-            if should_run_chunk_quality_gate:
+            if bool(settings.chunk_quality_gate_enabled):
                 gate_started_at = time.perf_counter()
+                await _set_stage("quality_gate")
                 gate_service = get_chunk_quality_gate_service()
                 logger.info(
                     f"[doc:{task_trace_id}] 开始 chunk quality gate: "
@@ -1475,6 +2467,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     reason = str(gate_result.get("failure_reason") or "chunk_quality_gate_failed")
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = f"chunk quality gate failed: {reason}"[:2000]
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     await _emit_status()
                     return
@@ -1482,42 +2475,99 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 if not chunks_to_save:
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = "chunk quality gate dropped all chunks"
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     await _emit_status()
                     return
-            elif bool(settings.chunk_quality_gate_enabled) and used_pdf_rag_ingest:
-                logger.info(
-                    f"[doc:{task_trace_id}] 跳过 chunk quality gate: pdf_rag_ingest 已产出主分块, "
-                    f"elapsed={_task_elapsed_ms():.2f}ms"
+
+            if pdf_source_spans:
+                chunks_to_save, structural_report = _apply_pdf_source_structural_postprocess(
+                    chunks_to_save,
+                    text=text,
+                    source_spans=pdf_source_spans,
+                    min_tokens=int(chunk_config.min_semantic_tokens or 0),
+                    max_tokens=int(chunk_config.max_semantic_tokens or 0),
                 )
+                _enrich_chunks_with_pdf_source(context_chunks, pdf_source_spans)
+                if any(
+                    int(structural_report.get(key) or 0) > 0
+                    for key in ("split_count", "merge_count", "section_title_backfilled")
+                ):
+                    current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
+                    current_metadata["pdf_structural_postprocess"] = {
+                        **structural_report,
+                        "applied_at": datetime.utcnow().isoformat(),
+                    }
+                    doc.metadata_ = current_metadata
+                    logger.info(
+                        f"[doc:{task_trace_id}] PDF 结构后处理: "
+                        f"input={structural_report.get('total_input', len(chunks_to_save))}, "
+                        f"output={structural_report.get('total_output', len(chunks_to_save))}, "
+                        f"splits={structural_report.get('split_count', 0)}, "
+                        f"merges={structural_report.get('merge_count', 0)}, "
+                        f"section_titles={structural_report.get('section_title_backfilled', 0)}"
+                    )
+                chunks_to_save.sort(key=lambda item: int(item.get("start_char") or 0))
+
+            reference_primary_dropped = 0
+            reference_context_dropped = 0
+            chunks_to_save, reference_primary_dropped = _filter_reference_chunks(chunks_to_save)
+            context_chunks, reference_context_dropped = _filter_reference_chunks(context_chunks)
+            if reference_primary_dropped or reference_context_dropped:
                 current_metadata = dict(doc.metadata_) if doc.metadata_ else {}
-                current_metadata["chunk_quality_gate"] = {
-                    "enabled": False,
-                    "skipped": True,
-                    "skipped_reason": "pdf_rag_ingest_managed_chunks",
+                current_metadata["reference_filter"] = {
+                    "primary_dropped": int(reference_primary_dropped),
+                    "context_dropped": int(reference_context_dropped),
+                    "applied_at": datetime.utcnow().isoformat(),
                 }
                 doc.metadata_ = current_metadata
+                logger.info(
+                    f"[doc:{task_trace_id}] 参考文献块已跳过入库: "
+                    f"primary_dropped={reference_primary_dropped}, "
+                    f"context_dropped={reference_context_dropped}, "
+                    f"remaining_primary={len(chunks_to_save)}, remaining_context={len(context_chunks)}"
+                )
+
+            if not chunks_to_save:
+                doc.status = DocumentStatus.FAILED.value
+                doc.error_message = "文档分片失败：过滤参考文献后无有效主分块"
+                _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
+                await db.commit()
+                await _emit_status()
+                return
 
             # 生成嵌入向量
+            await _set_stage("embedding", current=0, total=len(chunks_to_save))
             logger.info(f"[doc:{task_trace_id}] 开始生成嵌入向量: {doc_id}, {len(chunks_to_save)} 个分片")
-            embedding_model = (kb.embedding_model or "").strip() or settings.local_embedding_model
-            policy_service = get_embedding_dimension_policy_service()
-            existing_chunks = await policy_service.estimate_kb_paragraph_chunks(db, kb.id)
-            projected_chunks = int(existing_chunks) + len(chunks_to_save)
-            decision = policy_service.decide_dimension(
-                corpus_chunks=projected_chunks,
-                embedding_model=embedding_model,
-                previous_dimension=kb.embedding_dimension,
-            )
-            embedding_svc = get_embedding_service_for_model_and_dimension(
-                embedding_model,
-                decision.target_dimension,
-            )
-            logger.info(
-                f"[doc:{task_trace_id}] [dimension_policy] kb={kb.id}, doc={doc_id}, model={embedding_model}, "
-                f"existing_chunks={existing_chunks}, projected_chunks={projected_chunks}, "
-                f"prev_dim={kb.embedding_dimension}, target_dim={decision.target_dimension}, reason={decision.reason}"
-            )
+            if frozen_embedding_svc is not None and frozen_dimension_decision is not None:
+                existing_chunks = int(frozen_existing_chunks)
+                projected_chunks = int(existing_chunks) + len(chunks_to_save)
+                decision = frozen_dimension_decision
+                embedding_svc = frozen_embedding_svc
+                logger.info(
+                    f"[doc:{task_trace_id}] [dimension_policy:reuse] kb={kb.id}, doc={doc_id}, "
+                    f"model={embedding_model}, existing_chunks={existing_chunks}, "
+                    f"estimated_new_chunks={frozen_estimated_new_chunks}, actual_new_chunks={len(chunks_to_save)}, "
+                    f"projected_estimate={decision.corpus_chunks}, projected_actual={projected_chunks}, "
+                    f"target_dim={decision.target_dimension}, reason={decision.reason}"
+                )
+            else:
+                existing_chunks = await policy_service.estimate_kb_paragraph_chunks(db, kb.id)
+                projected_chunks = int(existing_chunks) + len(chunks_to_save)
+                decision = policy_service.decide_dimension(
+                    corpus_chunks=projected_chunks,
+                    embedding_model=embedding_model,
+                    previous_dimension=kb.embedding_dimension,
+                )
+                embedding_svc = get_embedding_service_for_model_and_dimension(
+                    embedding_model,
+                    decision.target_dimension,
+                )
+                logger.info(
+                    f"[doc:{task_trace_id}] [dimension_policy] kb={kb.id}, doc={doc_id}, model={embedding_model}, "
+                    f"existing_chunks={existing_chunks}, projected_chunks={projected_chunks}, "
+                    f"prev_dim={kb.embedding_dimension}, target_dim={decision.target_dimension}, reason={decision.reason}"
+                )
 
             chunk_context_summaries: list[str] = []
             embedding_inputs: list[str] = []
@@ -1549,11 +2599,14 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             )
             
             # 创建分片记录
+            await _set_stage("saving", current=0, total=len(chunks_to_save))
             smart_id_map = {} # str_id -> DocumentChunk
             
             for i, chunk_data in enumerate(chunks_to_save):
                 meta = chunk_data["metadata"]
                 extra_meta = dict(meta.get("extra") or {})
+                section_type = _trim_optional_text(meta.get("section_type"), limit=50)
+                section_title = _trim_optional_text(meta.get("section_title"), limit=500)
                 chunk_embedding = embeddings[i] if i < len(embeddings) else None
                 chunk_embedding_dimension = (
                     len(chunk_embedding) if chunk_embedding is not None else embedding_svc.get_dimension()
@@ -1576,8 +2629,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     
                     # 智能分块字段
                     chunk_level=meta.get("level", "paragraph"),
-                    section_type=meta.get("section_type"),
-                    section_title=meta.get("section_title"),
+                    section_type=section_type,
+                    section_title=section_title,
                     has_citations=meta.get("has_citations", False),
                     metadata_={
                         "position_ratio": meta.get("position_ratio"),
@@ -1594,6 +2647,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             for chunk_data in context_chunks:
                 meta = chunk_data["metadata"]
                 extra_meta = dict(meta.get("extra") or {})
+                section_type = _trim_optional_text(meta.get("section_type"), limit=50)
+                section_title = _trim_optional_text(meta.get("section_title"), limit=500)
                 # 为 context chunk 分配 index，接在 primary 后面
                 # 注意：这里 index 可能不连续，但对检索影响不大
                 
@@ -1620,8 +2675,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     
                     # 智能分块字段
                     chunk_level=meta.get("level", "section"),
-                    section_type=meta.get("section_type"),
-                    section_title=meta.get("section_title"),
+                    section_type=section_type,
+                    section_title=section_title,
                     has_citations=meta.get("has_citations", False),
                     metadata_={
                         "position_ratio": meta.get("position_ratio"),
@@ -1639,7 +2694,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             await db.flush() # Generate IDs
             
             # 更新父子关系 (现在 context chunks 也在 smart_id_map 中了，可以链接)
-            all_chunks = primary_chunks + context_chunks
+            all_chunks = chunks_to_save + context_chunks
             for chunk_data in all_chunks:
                 smart_id = chunk_data["id"]
                 parent_smart_id = chunk_data["metadata"].get("parent_id")
@@ -1656,8 +2711,14 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                     ctx_id = ctx.get("id", "")
                     section_context[ctx_id] = {
                         "content": ctx["content"][:500],  # 存摘要，避免过大
-                        "section_type": ctx.get("metadata", {}).get("section_type"),
-                        "section_title": ctx.get("metadata", {}).get("section_title"),
+                        "section_type": _trim_optional_text(
+                            ctx.get("metadata", {}).get("section_type"),
+                            limit=50,
+                        ),
+                        "section_title": _trim_optional_text(
+                            ctx.get("metadata", {}).get("section_title"),
+                            limit=500,
+                        ),
                         "start_char": ctx.get("start_char", 0),
                         "end_char": ctx.get("end_char", 0),
                     }
@@ -1670,6 +2731,14 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
             doc.error_message = None
             doc.chunk_count = len(chunks_to_save)
             doc.processed_at = datetime.utcnow()
+            _set_document_dedupe_metadata(
+                doc,
+                content_hash_normalized=normalized_text_hash or doc.content_hash,
+                duplicate_type=None,
+                duplicate_of_document_id=None,
+                indexed=True,
+            )
+            _set_document_processing_stage(doc, stage="finalizing", current=len(chunks_to_save), total=len(chunks_to_save))
             
             # 更新知识库统计
             kb = await db.get(KnowledgeBase, doc.knowledge_base_id)
@@ -1699,6 +2768,8 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 )
 
             await db.commit()
+            _set_document_processing_stage(doc, stage="completed", current=len(chunks_to_save), total=len(chunks_to_save))
+            await db.commit()
             await _emit_status()
             logger.info(
                 f"[doc:{task_trace_id}] 数据落库完成: chunks_saved={len(chunks_to_save)}, "
@@ -1721,6 +2792,36 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 f"total_ms={_task_elapsed_ms():.2f}"
             )
             
+        except asyncio.CancelledError:
+            logger.info(f"[doc:{task_trace_id}] 文档任务收到取消信号: {doc_id}")
+
+            try:
+                await db.rollback()
+            except Exception as rollback_exc:
+                logger.warning(f"[doc:{task_trace_id}] 文档取消回滚异常 {doc_id}: {rollback_exc}")
+
+            explicit_cancel = await _consume_document_task_cancellation_requested(doc_id)
+            if explicit_cancel:
+                try:
+                    doc = await db.get(Document, doc_id)
+                    if doc:
+                        kb_for_owner = await db.get(KnowledgeBase, doc.knowledge_base_id)
+                        doc.status = DocumentStatus.CANCELLED.value
+                        doc.error_message = "文档处理已取消"
+                        doc.processed_at = None
+                        _set_document_processing_stage(doc, stage="cancelled", detail="用户取消任务")
+                        await db.commit()
+                        if kb_for_owner:
+                            await _publish_document_status_event(
+                                user_id=int(kb_for_owner.user_id),
+                                kb_id=int(doc.knowledge_base_id),
+                                doc=doc,
+                            )
+                except Exception as persist_exc:
+                    logger.error(f"[doc:{task_trace_id}] 文档取消状态写回异常 {doc_id}: {persist_exc}")
+            else:
+                logger.info(f"[doc:{task_trace_id}] 文档任务被中断，保留当前状态以便后续恢复: {doc_id}")
+            return
         except Exception as e:
             logger.exception(f"[doc:{task_trace_id}] 处理文档失败 {doc_id}: {e}")
 
@@ -1735,6 +2836,7 @@ async def process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int
                 if doc:
                     doc.status = DocumentStatus.FAILED.value
                     doc.error_message = str(e)[:2000]
+                    _set_document_processing_stage(doc, stage="failed", detail=doc.error_message)
                     await db.commit()
                     kb_for_owner = await db.get(KnowledgeBase, doc.knowledge_base_id)
                     if kb_for_owner:
@@ -1787,7 +2889,7 @@ async def resume_interrupted_document_tasks_on_startup() -> dict[str, Any]:
             await db.commit()
 
     for doc_id, chunk_size, chunk_overlap in scheduled:
-        asyncio.create_task(process_document_task(doc_id=doc_id, chunk_size=chunk_size, chunk_overlap=chunk_overlap))
+        await _schedule_document_task(doc_id=doc_id, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     return {
         "enabled": True,
@@ -1813,7 +2915,8 @@ async def get_document(
     doc = await db.get(Document, doc_id)
     if not doc or doc.knowledge_base_id != kb_id:
         raise HTTPException(status_code=404, detail="文档不存在")
-    
+
+    processing = _document_processing_snapshot(doc)
     return DocumentDetailResponse(
         id=doc.id,
         knowledge_base_id=doc.knowledge_base_id,
@@ -1822,6 +2925,10 @@ async def get_document(
         file_size=doc.file_size,
         file_type=doc.file_type,
         status=doc.status,
+        processing_stage=processing["stage"],
+        processing_stage_label=processing["stage_label"],
+        processing_progress=processing["progress"],
+        processing_detail=processing["detail"],
         processing_mode=_document_processing_mode(doc),
         extract_profile=_document_extract_profile(doc),
         extract_granularity=_document_extract_granularity(doc),
@@ -1853,6 +2960,11 @@ async def delete_document(
     doc = await db.get(Document, doc_id)
     if not doc or doc.knowledge_base_id != kb_id:
         raise HTTPException(status_code=404, detail="文档不存在")
+
+    if _has_live_document_task(int(doc.id)):
+        await _cancel_document_task(int(doc.id))
+        if _has_live_document_task(int(doc.id)):
+            raise HTTPException(status_code=409, detail="文档任务仍在取消中，请稍后重试删除")
     
     # 删除文件
     preserve_file = await _document_file_has_other_references(db, doc)
@@ -1888,8 +3000,6 @@ async def get_document_status(
         raise HTTPException(status_code=404, detail="文档不存在")
     
     # 计算进度
-    progress = 0
-    message = "等待处理"
     
     if _mark_stale_document_timeout(doc):
         await db.commit()
@@ -1907,7 +3017,7 @@ async def get_document_status(
 
     if (
         doc.status == DocumentStatus.RUNNING.value
-        and not _is_document_task_active(int(doc.id))
+        and not _has_live_document_task(int(doc.id))
         and bool(doc.file_path)
         and os.path.exists(str(doc.file_path))
         and not _document_retry_requested_recently(doc, minimum_interval_seconds=45)
@@ -1926,12 +3036,10 @@ async def get_document_status(
             kb_id=int(kb_id),
             doc=doc,
         )
-        asyncio.create_task(
-            process_document_task(
-                doc_id=int(doc.id),
-                chunk_size=int(kb.chunk_size or 500),
-                chunk_overlap=int(kb.chunk_overlap or 50),
-            )
+        await _schedule_document_task(
+            doc_id=int(doc.id),
+            chunk_size=int(kb.chunk_size or 500),
+            chunk_overlap=int(kb.chunk_overlap or 50),
         )
         logger.info(
             "[KnowledgeResume] status poll resumed interrupted document: doc_id={}, kb_id={}, reason={}",
@@ -1940,30 +3048,23 @@ async def get_document_status(
             str(_document_retry_metadata(doc).get("reason") or ""),
         )
 
-    if doc.status == DocumentStatus.PENDING.value:
-        progress = 0
-        message = "等待处理"
-    elif doc.status == DocumentStatus.RUNNING.value:
-        progress = 50
-        message = "正在处理..."
-    elif doc.status == DocumentStatus.COMPLETED.value:
-        progress = 100
-        message = "处理完成"
-    elif doc.status == DocumentStatus.TIMEOUT.value:
-        progress = 0
-        message = "处理超时"
-    elif doc.status == DocumentStatus.CANCELLED.value:
-        progress = 0
-        message = "处理已取消"
-    elif doc.status == DocumentStatus.FAILED.value:
-        progress = 0
-        message = "处理失败"
-    
+    processing = _document_processing_snapshot(doc)
+    message = str(processing["stage_label"] or _STATUS_DEFAULT_MESSAGE.get(str(doc.status), "处理中"))
+    if doc.status in {
+        DocumentStatus.FAILED.value,
+        DocumentStatus.TIMEOUT.value,
+        DocumentStatus.CANCELLED.value,
+    } and doc.error_message:
+        message = _STATUS_DEFAULT_MESSAGE.get(str(doc.status), message)
+
     return ProcessingStatus(
         document_id=doc.id,
         status=doc.status,
-        progress=progress,
+        progress=float(processing["progress"]),
         message=message,
+        processing_stage=processing["stage"],
+        processing_stage_label=processing["stage_label"],
+        processing_detail=processing["detail"],
         chunk_count=doc.chunk_count or 0,
         error=doc.error_message,
     )
@@ -1973,7 +3074,6 @@ async def get_document_status(
 async def retry_document_processing(
     kb_id: int,
     doc_id: int,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1989,12 +3089,16 @@ async def retry_document_processing(
     if not doc.file_path or not os.path.exists(doc.file_path):
         raise HTTPException(status_code=400, detail="源文件不存在，无法重试")
 
-    if doc.status == DocumentStatus.RUNNING.value and _is_document_task_active(int(doc.id)):
+    if doc.status == DocumentStatus.RUNNING.value and _has_live_document_task(int(doc.id)):
+        processing = _document_processing_snapshot(doc)
         return ProcessingStatus(
             document_id=doc.id,
             status=doc.status,
-            progress=50,
-            message="文档已在处理中",
+            progress=float(processing["progress"]),
+            message=str(processing["stage_label"] or "文档已在处理中"),
+            processing_stage=processing["stage"],
+            processing_stage_label=processing["stage_label"],
+            processing_detail=processing["detail"],
             chunk_count=doc.chunk_count or 0,
             error=doc.error_message,
         )
@@ -2014,18 +3118,86 @@ async def retry_document_processing(
         doc=doc,
     )
 
-    background_tasks.add_task(
-        process_document_task,
-        doc.id,
-        kb.chunk_size,
-        kb.chunk_overlap,
-    )
+    await _schedule_document_task(doc.id, kb.chunk_size, kb.chunk_overlap)
 
     return ProcessingStatus(
         document_id=doc.id,
         status=doc.status,
         progress=0,
         message="已加入重试队列",
+        processing_stage="queued",
+        processing_stage_label=_PROCESSING_STAGE_LABELS["queued"],
+        processing_detail=None,
+        chunk_count=doc.chunk_count or 0,
+        error=doc.error_message,
+    )
+
+
+@router.post("/knowledge-bases/{kb_id}/documents/{doc_id}/cancel", response_model=ProcessingStatus)
+async def cancel_document_processing(
+    kb_id: int,
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """取消单个文档处理任务，不影响 backend 其他请求。"""
+    kb = await db.get(KnowledgeBase, kb_id)
+    if not kb or kb.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    doc = await db.get(Document, doc_id)
+    if not doc or doc.knowledge_base_id != kb_id:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    if doc.status in {
+        DocumentStatus.COMPLETED.value,
+        DocumentStatus.FAILED.value,
+        DocumentStatus.TIMEOUT.value,
+        DocumentStatus.CANCELLED.value,
+    }:
+        processing = _document_processing_snapshot(doc)
+        return ProcessingStatus(
+            document_id=doc.id,
+            status=doc.status,
+            progress=float(processing["progress"]),
+            message=str(processing["stage_label"] or _STATUS_DEFAULT_MESSAGE.get(str(doc.status), "处理中")),
+            processing_stage=processing["stage"],
+            processing_stage_label=processing["stage_label"],
+            processing_detail=processing["detail"],
+            chunk_count=doc.chunk_count or 0,
+            error=doc.error_message,
+        )
+
+    await _cancel_document_task(int(doc.id))
+    await db.refresh(doc)
+
+    if doc.status != DocumentStatus.CANCELLED.value:
+        doc.status = DocumentStatus.CANCELLED.value
+        doc.error_message = "文档处理已取消"
+        doc.processed_at = None
+        _set_document_processing_stage(doc, stage="cancelled", detail="用户取消任务")
+        await db.commit()
+        await _publish_document_status_event(
+            user_id=int(current_user.id),
+            kb_id=int(kb_id),
+            doc=doc,
+        )
+    else:
+        await _publish_document_status_event(
+            user_id=int(current_user.id),
+            kb_id=int(kb_id),
+            doc=doc,
+        )
+
+    processing = _document_processing_snapshot(doc)
+    return ProcessingStatus(
+        document_id=doc.id,
+        status=doc.status,
+        progress=float(processing["progress"]),
+        message=str(processing["stage_label"] or _STATUS_DEFAULT_MESSAGE.get(str(doc.status), "处理中")),
+        processing_stage=processing["stage"],
+        processing_stage_label=processing["stage_label"],
+        processing_detail=processing["detail"],
         chunk_count=doc.chunk_count or 0,
         error=doc.error_message,
     )

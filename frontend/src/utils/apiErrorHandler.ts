@@ -25,6 +25,15 @@ export enum ApiErrorType {
   Cancelled = 'CANCELLED',
   /** 其他未知错误 */
   Unknown = 'UNKNOWN',
+  /** 明确的业务冲突 */
+  Conflict = 'CONFLICT',
+}
+
+interface ApiErrorDetailObject {
+  code?: string
+  message?: string
+  details?: unknown
+  request_id?: string
 }
 
 export interface ParsedApiError {
@@ -36,8 +45,56 @@ export interface ParsedApiError {
   status?: number
   /** 服务端返回的 detail（如果有） */
   detail?: string
+  /** 服务端业务错误码（如果有） */
+  code?: string
   /** 原始错误对象 */
   raw: unknown
+}
+
+function isDetailObject(value: unknown): value is ApiErrorDetailObject {
+  return typeof value === 'object' && value !== null
+}
+
+function normalizeDetailPayload(data: any): {
+  detailText?: string
+  detailCode?: string
+  detailDetails?: unknown
+} {
+  const rawDetail = data?.detail
+  if (typeof rawDetail === 'string') {
+    return { detailText: rawDetail }
+  }
+  if (isDetailObject(rawDetail)) {
+    return {
+      detailText: typeof rawDetail.message === 'string' ? rawDetail.message : undefined,
+      detailCode: typeof rawDetail.code === 'string' ? rawDetail.code : undefined,
+      detailDetails: rawDetail.details,
+    }
+  }
+  if (typeof data?.message === 'string') {
+    return { detailText: data.message }
+  }
+  if (typeof data === 'string') {
+    return { detailText: data }
+  }
+  return {}
+}
+
+function formatDuplicateUploadMessage(detailDetails: unknown, fallback?: string): string {
+  if (typeof detailDetails !== 'object' || detailDetails === null) {
+    return fallback || '当前知识库中已存在相同文件'
+  }
+  const details = detailDetails as Record<string, unknown>
+  const duplicateFilename = typeof details.duplicate_filename === 'string' ? details.duplicate_filename.trim() : ''
+  const duplicateDocId = Number(details.duplicate_of_document_id || 0)
+  const parts: string[] = ['当前知识库中已存在相同文件']
+  if (duplicateFilename) {
+    parts.push(`已存在文件：${duplicateFilename}`)
+  }
+  if (Number.isFinite(duplicateDocId) && duplicateDocId > 0) {
+    parts.push(`文档 ID：${duplicateDocId}`)
+  }
+  return parts.join('，')
 }
 
 /**
@@ -47,10 +104,8 @@ export function parseApiError(error: unknown): ParsedApiError {
   // Axios 错误
   if (isAxiosError(error)) {
     const status = error.response?.status
-    const detail =
-      error.response?.data?.detail ||
-      error.response?.data?.message ||
-      (typeof error.response?.data === 'string' ? error.response.data : undefined)
+    const { detailText, detailCode, detailDetails } = normalizeDetailPayload(error.response?.data)
+    const detail = detailText
 
     // 请求被取消
     if (error.code === 'ERR_CANCELED') {
@@ -67,17 +122,28 @@ export function parseApiError(error: unknown): ParsedApiError {
       return { type: ApiErrorType.Network, message: '网络连接失败，请检查网络后重试', raw: error }
     }
 
+    if (status === 409 && detailCode === 'duplicate_file_upload') {
+      return {
+        type: ApiErrorType.Conflict,
+        message: formatDuplicateUploadMessage(detailDetails, detail || '当前知识库中已存在相同文件'),
+        status,
+        detail,
+        code: detailCode,
+        raw: error,
+      }
+    }
+
     switch (status) {
       case 401:
-        return { type: ApiErrorType.Unauthorized, message: '登录已过期，请重新登录', status, detail, raw: error }
+        return { type: ApiErrorType.Unauthorized, message: '登录已过期，请重新登录', status, detail, code: detailCode, raw: error }
       case 403:
-        return { type: ApiErrorType.Forbidden, message: '没有权限执行此操作', status, detail, raw: error }
+        return { type: ApiErrorType.Forbidden, message: '没有权限执行此操作', status, detail, code: detailCode, raw: error }
       case 404:
-        return { type: ApiErrorType.NotFound, message: detail || '请求的资源不存在', status, detail, raw: error }
+        return { type: ApiErrorType.NotFound, message: detail || '请求的资源不存在', status, detail, code: detailCode, raw: error }
       case 422:
-        return { type: ApiErrorType.Validation, message: detail || '参数校验失败', status, detail, raw: error }
+        return { type: ApiErrorType.Validation, message: detail || '参数校验失败', status, detail, code: detailCode, raw: error }
       case 429:
-        return { type: ApiErrorType.RateLimited, message: '请求过于频繁，请稍后再试', status, detail, raw: error }
+        return { type: ApiErrorType.RateLimited, message: '请求过于频繁，请稍后再试', status, detail, code: detailCode, raw: error }
       default:
         if (status && status >= 500) {
           return {
@@ -85,6 +151,7 @@ export function parseApiError(error: unknown): ParsedApiError {
             message: detail || '服务器内部错误，请稍后重试',
             status,
             detail,
+            code: detailCode,
             raw: error,
           }
         }
@@ -93,6 +160,7 @@ export function parseApiError(error: unknown): ParsedApiError {
           message: detail || `请求失败 (${status})`,
           status,
           detail,
+          code: detailCode,
           raw: error,
         }
     }
@@ -150,7 +218,11 @@ export function handleApiError(error: unknown, context?: string): ParsedApiError
   console.error(`${prefix} ${parsed.type}:`, parsed.message, parsed.raw)
 
   // 弹出用户提示
-  message.error(parsed.message)
+  if (parsed.type === ApiErrorType.Conflict) {
+    message.warning(parsed.message)
+  } else {
+    message.error(parsed.message)
+  }
 
   return parsed
 }

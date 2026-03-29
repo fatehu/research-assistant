@@ -7,7 +7,7 @@
 - 分句（中英文混合 + 引用保护）
 """
 import re
-from typing import List
+from typing import List, Optional
 
 from loguru import logger
 
@@ -53,7 +53,12 @@ def preprocess_text(
 
 # ============== 分句 ==============
 
-def split_to_sentences(text: str, config: ChunkConfig) -> List[str]:
+def split_to_sentences(
+    text: str,
+    config: ChunkConfig,
+    *,
+    max_semantic_chars: Optional[int] = None,
+) -> List[str]:
     """
     将文本分割为句子 — 带引用保护。
 
@@ -93,12 +98,13 @@ def split_to_sentences(text: str, config: ChunkConfig) -> List[str]:
             r'\([A-Z][a-z]+(?:\s+(?:et\s+al\.?|and|&))?.+\d{4}\)|'  # (Author, 2020)
             r'[A-Z][a-z]+(?:\s+et\s+al\.?)?\s*\(\d{4}\))'      # Author (2020)
         )
+        citation_merge_limit = int(max_semantic_chars or config.max_semantic_chunk)
         for sentence in result[1:]:
             if citation_start_pattern.match(sentence) and merged:
                 # 以引用开头 → 合并到前一句
                 prev = merged[-1]
                 combined = prev + ' ' + sentence
-                if len(combined) <= config.max_semantic_chunk:
+                if len(combined) <= citation_merge_limit:
                     merged[-1] = combined
                 else:
                     merged.append(sentence)

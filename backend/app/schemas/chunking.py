@@ -71,13 +71,13 @@ class ChunkingConfigCreate(BaseModel):
         default=32,
         ge=8,
         le=256,
-        description="最小语义块（Token）"
+        description="最小语义块（Token）。第三方语义分块输出后会执行最小块合并，避免标题/残片漂出。"
     )
     max_semantic_tokens: int = Field(
         default=384,
         ge=64,
         le=2048,
-        description="最大语义块（Token）"
+        description="最大语义块（Token）。第三方语义分块输出后会执行硬上限切分，防止超大块直接入库。"
     )
 
     # ===== 字符计量 (旧字段，向后兼容) =====
@@ -97,13 +97,15 @@ class ChunkingConfigCreate(BaseModel):
         default=100,
         ge=50,
         le=500,
-        description="最小语义块大小（字符）— 仅在 use_token_based=False 时生效"
+        description="最小语义块大小（字符）— 主要用于字符模式与兼容路径；"
+                    "Token 模式下通常不建议优先调整"
     )
     max_semantic_chunk: int = Field(
         default=1500,
         ge=500,
         le=5000,
-        description="最大语义块大小（字符）— 仅在 use_token_based=False 时生效"
+        description="最大语义块大小（字符）— 主要用于字符模式与兼容路径；"
+                    "Token 模式下通常不建议优先调整"
     )
 
     # 语义分块配置（V2: breakpoint_percentile）
@@ -111,8 +113,7 @@ class ChunkingConfigCreate(BaseModel):
         default=95.0,
         ge=50.0,
         le=99.9,
-        description="断点百分位阈值。距离高于此百分位的句子间隙视为语义边界。"
-                    "越高→切分越少、块越大；越低→切分越多、块越小。推荐 85-95"
+        description="语义断点百分位细调。会直接传给第三方语义 splitter，同时也影响 legacy 语义回退路径。"
     )
     semantic_threshold: float = Field(
         default=0.75,
@@ -138,7 +139,7 @@ class ChunkingConfigCreate(BaseModel):
     )
     preserve_citations: bool = Field(
         default=True,
-        description="是否保留引用上下文"
+        description="是否保留引用上下文。会影响第三方语义 splitter 的分句器，避免引用句被切断。"
     )
 
 
@@ -176,6 +177,7 @@ class ChunkMetadataResponse(BaseModel):
     position_ratio: float = 0.0
     keywords: List[str] = []
     token_count: int = 0
+    extra: Dict[str, Any] = {}
 
 
 class SmartChunkResponse(BaseModel):

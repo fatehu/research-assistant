@@ -280,6 +280,10 @@ export interface Document {
   file_size: number
   file_type: string
   status: TaskStatus
+  processing_stage?: string
+  processing_stage_label?: string
+  processing_progress?: number
+  processing_detail?: string
   error_message?: string
   chunk_count: number
   token_count: number
@@ -476,6 +480,9 @@ export interface ProcessingStatus {
   status: string
   progress: number
   message: string
+  processing_stage?: string
+  processing_stage_label?: string
+  processing_detail?: string
   chunk_count: number
   error?: string
 }
@@ -484,6 +491,10 @@ export interface KnowledgeDocumentStatusEventData {
   kb_id: number
   document_id: number
   status: Document['status']
+  processing_stage?: string
+  processing_stage_label?: string
+  processing_progress?: number
+  processing_detail?: string
   chunk_count: number
   error_message?: string
   updated_at?: string
@@ -781,6 +792,11 @@ export const knowledgeApi = {
 
   retryDocument: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
     const response = await api.post(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/retry`)
+    return response.data
+  },
+
+  cancelDocument: async (kbId: number, docId: number): Promise<ProcessingStatus> => {
+    const response = await api.post(`/api/v1/knowledge/knowledge-bases/${kbId}/documents/${docId}/cancel`)
     return response.data
   },
 

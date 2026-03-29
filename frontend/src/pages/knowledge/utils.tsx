@@ -26,13 +26,15 @@ export const getFileIcon = (fileType: string) => {
 }
 
 /** 状态标签映射 */
-export const getStatusTag = (status: string) => {
+export const getStatusTag = (status: string, stageLabel?: string) => {
+  const runningLabel = String(stageLabel || '').trim() || '处理中'
+  const pendingLabel = String(stageLabel || '').trim() || '等待处理'
   switch (status) {
     case 'pending':
-      return <Tag icon={<ClockCircleOutlined />} color="default">等待处理</Tag>
+      return <Tag icon={<ClockCircleOutlined />} color="default">{pendingLabel}</Tag>
     case 'processing':
     case 'running':
-      return <Tag icon={<LoadingOutlined spin />} color="processing">处理中</Tag>
+      return <Tag icon={<LoadingOutlined spin />} color="processing">{runningLabel}</Tag>
     case 'ready':
       return <Tag icon={<CheckCircleOutlined />} color="success">已就绪</Tag>
     case 'completed':

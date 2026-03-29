@@ -15,6 +15,7 @@ import {
 import { handleApiError } from '@/utils/apiErrorHandler'
 
 const inflightDocumentStatusRequests = new Map<string, Promise<ProcessingStatus | undefined>>()
+const inflightKnowledgeBaseSummaryRequests = new Map<number, Promise<KnowledgeBase | undefined>>()
 
 interface KnowledgeState {
   // 知识库列表
@@ -46,6 +47,7 @@ interface KnowledgeState {
   createKnowledgeBase: (name: string, description?: string, embedding_model?: string) => Promise<KnowledgeBase>
   selectKnowledgeBase: (kbId: number) => Promise<void>
   updateKnowledgeBase: (kbId: number, data: Partial<KnowledgeBase>) => Promise<void>
+  refreshKnowledgeBaseSummary: (kbId: number) => Promise<KnowledgeBase | undefined>
   deleteKnowledgeBase: (kbId: number) => Promise<void>
 
   fetchDocuments: (kbId: number) => Promise<void>
@@ -53,11 +55,16 @@ interface KnowledgeState {
   selectDocument: (kbId: number, docId: number) => Promise<void>
   deleteDocument: (kbId: number, docId: number) => Promise<void>
   retryDocument: (kbId: number, docId: number) => Promise<ProcessingStatus>
+  cancelDocument: (kbId: number, docId: number) => Promise<ProcessingStatus>
   refreshDocumentStatus: (kbId: number, docId: number) => Promise<ProcessingStatus | undefined>
   applyDocumentStatusPatch: (
     docId: number,
     patch: {
       status?: Document['status']
+      processing_stage?: string
+      processing_stage_label?: string
+      processing_progress?: number
+      processing_detail?: string
       chunk_count?: number
       error_message?: string
     },
@@ -144,6 +151,37 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     }))
   },
 
+  refreshKnowledgeBaseSummary: async (kbId: number) => {
+    const normalizedKbId = Number(kbId || 0)
+    if (!Number.isFinite(normalizedKbId) || normalizedKbId <= 0) {
+      return undefined
+    }
+
+    const existing = inflightKnowledgeBaseSummaryRequests.get(normalizedKbId)
+    if (existing) {
+      return existing
+    }
+
+    const request = (async () => {
+      try {
+        const kb = await knowledgeApi.getKnowledgeBase(normalizedKbId)
+        set((state) => ({
+          knowledgeBases: state.knowledgeBases.map((item) => (item.id === normalizedKbId ? kb : item)),
+          currentKnowledgeBase: state.currentKnowledgeBase?.id === normalizedKbId ? kb : state.currentKnowledgeBase,
+        }))
+        return kb
+      } catch (error) {
+        handleApiError(error, '刷新知识库统计')
+        return undefined
+      } finally {
+        inflightKnowledgeBaseSummaryRequests.delete(normalizedKbId)
+      }
+    })()
+
+    inflightKnowledgeBaseSummaryRequests.set(normalizedKbId, request)
+    return request
+  },
+
   deleteKnowledgeBase: async (kbId: number) => {
     await knowledgeApi.deleteKnowledgeBase(kbId)
     const { currentKnowledgeBase } = get()
@@ -175,6 +213,20 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
       set((state) => ({
         documents: [doc, ...state.documents],
         totalDocuments: state.totalDocuments + 1,
+        knowledgeBases: state.knowledgeBases.map((kb) =>
+          kb.id === kbId
+            ? {
+              ...kb,
+              document_count: kb.document_count + 1,
+            }
+            : kb,
+        ),
+        currentKnowledgeBase: state.currentKnowledgeBase?.id === kbId
+          ? {
+            ...state.currentKnowledgeBase,
+            document_count: state.currentKnowledgeBase.document_count + 1,
+          }
+          : state.currentKnowledgeBase,
         isUploading: false,
       }))
       return doc
@@ -212,6 +264,24 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
     const status = await knowledgeApi.retryDocument(kbId, docId)
     get().applyDocumentStatusPatch(docId, {
       status: status.status as Document['status'],
+      processing_stage: status.processing_stage,
+      processing_stage_label: status.processing_stage_label,
+      processing_progress: status.progress,
+      processing_detail: status.processing_detail,
+      chunk_count: status.chunk_count,
+      error_message: status.error,
+    })
+    return status
+  },
+
+  cancelDocument: async (kbId: number, docId: number) => {
+    const status = await knowledgeApi.cancelDocument(kbId, docId)
+    get().applyDocumentStatusPatch(docId, {
+      status: status.status as Document['status'],
+      processing_stage: status.processing_stage,
+      processing_stage_label: status.processing_stage_label,
+      processing_progress: status.progress,
+      processing_detail: status.processing_detail,
       chunk_count: status.chunk_count,
       error_message: status.error,
     })
@@ -230,6 +300,10 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
         const status = await knowledgeApi.getDocumentStatus(kbId, docId)
         get().applyDocumentStatusPatch(docId, {
           status: status.status as Document['status'],
+          processing_stage: status.processing_stage,
+          processing_stage_label: status.processing_stage_label,
+          processing_progress: status.progress,
+          processing_detail: status.processing_detail,
           chunk_count: status.chunk_count,
           error_message: status.error,
         })
@@ -258,6 +332,10 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
           ? {
             ...d,
             status: patch.status ?? d.status,
+            processing_stage: patch.processing_stage ?? d.processing_stage,
+            processing_stage_label: patch.processing_stage_label ?? d.processing_stage_label,
+            processing_progress: patch.processing_progress ?? d.processing_progress,
+            processing_detail: patch.processing_detail ?? d.processing_detail,
             chunk_count: patch.chunk_count ?? d.chunk_count,
             error_message: patch.error_message ?? d.error_message,
           }
@@ -267,6 +345,10 @@ export const useKnowledgeStore = create<KnowledgeState>((set, get) => ({
         ? {
           ...state.currentDocument,
           status: patch.status ?? state.currentDocument.status,
+          processing_stage: patch.processing_stage ?? state.currentDocument.processing_stage,
+          processing_stage_label: patch.processing_stage_label ?? state.currentDocument.processing_stage_label,
+          processing_progress: patch.processing_progress ?? state.currentDocument.processing_progress,
+          processing_detail: patch.processing_detail ?? state.currentDocument.processing_detail,
           chunk_count: patch.chunk_count ?? state.currentDocument.chunk_count,
           error_message: patch.error_message ?? state.currentDocument.error_message,
         }

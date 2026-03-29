@@ -59,6 +59,16 @@ import { handleApiError } from '@/utils/apiErrorHandler'
 
 const { TextArea } = Input
 
+const isTerminalDocumentStatus = (status: string | undefined | null) => {
+  const normalizedStatus = String(status || '').trim().toLowerCase()
+  return (
+    normalizedStatus === 'completed'
+    || normalizedStatus === 'failed'
+    || normalizedStatus === 'timeout'
+    || normalizedStatus === 'cancelled'
+  )
+}
+
 const getSearchStageText = (elapsedMs: number): string => {
   if (elapsedMs < 10000) return '编码中'
   if (elapsedMs < 60000) return '检索候选中'
@@ -140,10 +150,13 @@ const KnowledgePage = () => {
     createKnowledgeBase,
     selectKnowledgeBase,
     deleteKnowledgeBase,
+    refreshKnowledgeBaseSummary,
     fetchDocuments,
     uploadDocument,
     deleteDocument,
     retryDocument,
+    cancelDocument,
+    refreshDocumentStatus,
     applyDocumentStatusPatch,
     search,
     clearSearch,
@@ -180,6 +193,8 @@ const KnowledgePage = () => {
   const [uploadExtractProfile, setUploadExtractProfile] = useState<DocumentExtractProfile>('general')
   const [uploadExtractGranularity, setUploadExtractGranularity] = useState<DocumentExtractGranularity>('medium')
   const knowledgeStreamWarnedRef = useRef(false)
+  const activeDocumentIdsRef = useRef<number[]>([])
+  const currentKnowledgeBaseId = currentKnowledgeBase?.id ?? null
 
   const buildSearchLogEntry = useCallback((level: SearchLogLevel, message: string): SearchLogEntry => {
     return {
@@ -227,11 +242,11 @@ const KnowledgePage = () => {
 
   // 状态流：优先订阅事件，降低高频轮询开销
   useEffect(() => {
-    if (!currentKnowledgeBase) return
+    if (!currentKnowledgeBaseId) return
     const streamController = new AbortController()
     knowledgeApi
       .streamStatusEvents(
-        { kb_id: currentKnowledgeBase.id },
+        { kb_id: currentKnowledgeBaseId },
         (event, payload) => {
           if (event === 'connected' || event === 'heartbeat') {
             knowledgeStreamWarnedRef.current = false
@@ -244,9 +259,16 @@ const KnowledgePage = () => {
           if (!Number.isFinite(docId) || docId <= 0) return
           applyDocumentStatusPatch(docId, {
             status: data.status,
+            processing_stage: data.processing_stage,
+            processing_stage_label: data.processing_stage_label,
+            processing_progress: data.processing_progress,
+            processing_detail: data.processing_detail,
             chunk_count: Number(data.chunk_count || 0),
             error_message: data.error_message,
           })
+          if (isTerminalDocumentStatus(data.status)) {
+            void refreshKnowledgeBaseSummary(currentKnowledgeBaseId)
+          }
         },
         streamController,
       )
@@ -262,7 +284,52 @@ const KnowledgePage = () => {
     return () => {
       streamController.abort()
     }
-  }, [applyDocumentStatusPatch, currentKnowledgeBase])
+  }, [applyDocumentStatusPatch, currentKnowledgeBaseId, refreshKnowledgeBaseSummary])
+
+  useEffect(() => {
+    activeDocumentIdsRef.current = documents
+      .filter((doc) => {
+        const normalizedStatus = String(doc.status || '').trim().toLowerCase()
+        return normalizedStatus === 'pending' || normalizedStatus === 'running'
+      })
+      .map((doc) => doc.id)
+  }, [documents])
+
+  useEffect(() => {
+    if (!currentKnowledgeBaseId) return
+
+    let disposed = false
+
+    const syncActiveDocuments = async () => {
+      if (disposed) return
+      const activeDocumentIds = activeDocumentIdsRef.current
+      if (activeDocumentIds.length === 0) return
+
+      const settled = await Promise.allSettled(
+        activeDocumentIds.map((docId) =>
+          refreshDocumentStatus(currentKnowledgeBaseId, docId),
+        ),
+      )
+
+      const shouldRefreshSummary = settled.some((item) => {
+        if (item.status !== 'fulfilled') return false
+        return isTerminalDocumentStatus(item.value?.status)
+      })
+
+      if (shouldRefreshSummary) {
+        await refreshKnowledgeBaseSummary(currentKnowledgeBaseId)
+      }
+    }
+
+    const timer = window.setInterval(() => {
+      void syncActiveDocuments()
+    }, 5000)
+
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [currentKnowledgeBaseId, refreshDocumentStatus, refreshKnowledgeBaseSummary])
 
   useEffect(() => {
     if (!isSearching) {
@@ -383,6 +450,16 @@ const KnowledgePage = () => {
       message.success(status.message || '已重新开始处理')
     } catch (error) {
       handleApiError(error, '重试文档处理')
+    }
+  }
+
+  const handleCancelDocument = async (docId: number) => {
+    if (!currentKnowledgeBase) return
+    try {
+      const status = await cancelDocument(currentKnowledgeBase.id, docId)
+      message.success(status.message || '已取消处理')
+    } catch (error) {
+      handleApiError(error, '取消文档处理')
     }
   }
 
@@ -707,15 +784,47 @@ const KnowledgePage = () => {
                   ),
                 },
                 { title: '大小', dataIndex: 'file_size', key: 'size', width: 100, render: (size: number) => <span className="text-slate-400">{formatFileSize(size)}</span> },
-                { title: '状态', dataIndex: 'status', key: 'status', width: 120, render: (status: string) => getStatusTag(status) },
+                {
+                  title: '状态',
+                  dataIndex: 'status',
+                  key: 'status',
+                  width: 220,
+                  render: (_status: string, record: any) => {
+                    const detail = String(record.processing_detail || '').trim()
+                    const progress = Number(record.processing_progress)
+                    const showProgress = Number.isFinite(progress) && progress > 0 && progress < 100
+                    return (
+                      <div className="flex flex-col gap-1">
+                        {getStatusTag(record.status, record.processing_stage_label)}
+                        {(showProgress || detail) && (
+                          <div className="text-[11px] leading-4 text-slate-500">
+                            {showProgress ? `${Math.round(progress)}%` : ''}
+                            {showProgress && detail ? ' · ' : ''}
+                            {detail || ''}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  },
+                },
                 { title: '分片', dataIndex: 'chunk_count', key: 'chunks', width: 80, render: (count: number) => <span className="text-slate-400">{count}</span> },
                 { title: '上传时间', dataIndex: 'created_at', key: 'created_at', width: 160, render: (date: string) => <span className="text-slate-400">{dayjs(date).format('YYYY-MM-DD HH:mm')}</span> },
                 {
                   title: '操作',
                   key: 'action',
-                  width: 140,
+                  width: 180,
                   render: (_: any, record: any) => (
                     <Space>
+                      {['pending', 'running', 'processing'].includes(String(record.status || '').toLowerCase()) && (
+                        <Tooltip title="取消处理">
+                          <Button
+                            type="text"
+                            icon={<CloseOutlined />}
+                            className="text-amber-400 hover:text-amber-300"
+                            onClick={() => handleCancelDocument(record.id)}
+                          />
+                        </Tooltip>
+                      )}
                       {['failed', 'timeout', 'cancelled', 'canceled', 'running'].includes(String(record.status || '').toLowerCase()) && (
                         <Tooltip title={String(record.status || '').toLowerCase() === 'running' ? '继续处理' : '重试'}>
                           <Button

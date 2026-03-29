@@ -31,6 +31,7 @@ from .contracts import (
 from .block_builder import LocalPdfBlockBuilder
 from .block_role_resolver import LocalPdfBlockRoleResolver
 from .auxiliary_block_resolver import LocalPdfAuxiliaryBlockResolver
+from .ingest_markdown_renderer import LocalPdfIngestMarkdownRenderer
 from .markdown_renderer import LocalPdfMarkdownRenderer
 from .native_extractor import LocalPdfNativeExtractor
 from .document_resolver import LocalPdfDocumentResolver
@@ -70,6 +71,7 @@ __all__ = [
     "LocalPdfHybridBackendTransformer",
     "LocalOllamaQwenVlPageParser",
     "LocalPdfPageTriageService",
+    "LocalPdfIngestMarkdownRenderer",
     "LocalPdfMarkdownRenderer",
     "LocalPdfNativeExtractor",
     "LocalStructuredPdfDoclingCompatBackend",

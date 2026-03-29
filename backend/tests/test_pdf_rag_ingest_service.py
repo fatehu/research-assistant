@@ -79,7 +79,7 @@ class _FakeHybridPipeline:
 
 
 @pytest.mark.asyncio
-async def test_ingest_pdf_fast_mode_builds_structured_chunks(monkeypatch):
+async def test_ingest_pdf_fast_mode_returns_ingest_markdown_and_report(monkeypatch):
     document = _document(
         [
             _block(
@@ -115,25 +115,66 @@ async def test_ingest_pdf_fast_mode_builds_structured_chunks(monkeypatch):
     assert result["report"]["mode"] == "fast"
     assert result["report"]["page_count"] == 1
     assert result["report"]["block_count"] == 3
-    assert result["report"]["chunk_count"] == 3
     assert fast_pipeline.calls[0][0] == "parse_document"
     assert result["document_text"].startswith("# 1 Introduction")
     assert "| A | B |" in result["document_text"]
+    spans = list(result["document_source_spans"] or [])
+    assert [span["block_id"] for span in spans] == ["h1", "p1", "t1"]
+    assert [span["block_type"] for span in spans] == ["heading", "paragraph", "table"]
+    assert all(span["page_start"] == 1 and span["page_end"] == 1 for span in spans)
+    assert all(span["section_path"] == "1 Introduction" for span in spans)
+    assert [result["document_text"][span["start_char"]:span["end_char"]] for span in spans] == [
+        "# 1 Introduction",
+        "This is the first paragraph with [1] style citation.",
+        "| A | B |\n| --- | --- |\n| 1 | 2 |",
+    ]
 
-    heading_chunk = result["chunks"][0]
-    assert heading_chunk["metadata"]["level"] == "section"
-    assert heading_chunk["metadata"]["section_type"] == "heading"
 
-    paragraph_chunk = result["chunks"][1]
-    assert paragraph_chunk["metadata"]["section_title"] == "1 Introduction"
-    assert paragraph_chunk["metadata"]["has_citations"] is True
-    assert paragraph_chunk["content"].startswith("Section: 1 Introduction")
-    assert paragraph_chunk["metadata"]["extra"]["block_type"] == "paragraph"
-    assert paragraph_chunk["metadata"]["extra"]["pages"] == [1]
+@pytest.mark.asyncio
+async def test_ingest_pdf_uses_ingest_markdown_renderer_for_document_text(monkeypatch):
+    document = _document(
+        [
+            _block(
+                block_id="h1",
+                block_type="heading",
+                text="1 Introduction",
+                heading_level=1,
+                section_titles=["1 Introduction"],
+            ),
+            _block(
+                block_id="eq1",
+                block_type="equation",
+                text=r"E = mc^2",
+                section_titles=["1 Introduction"],
+            ),
+            _block(
+                block_id="c1",
+                block_type="caption",
+                text="Figure 1. Model overview.",
+                section_titles=["1 Introduction"],
+            ),
+        ]
+    )
+    fast_pipeline = _FakeFastPipeline(document)
+    service = PdfRagIngestService(fast_pipeline=fast_pipeline)
+    monkeypatch.setattr("app.services.pdf_rag_ingest_service.settings.pdf_rag_structured_mode", "fast")
 
-    table_chunk = result["chunks"][2]
-    assert "| A | B |" in table_chunk["content"]
-    assert table_chunk["metadata"]["extra"]["table_row_count"] == 2
+    result = await service.ingest_pdf(file_path="dummy.pdf", document_name="paper.pdf")
+
+    assert result["document_text"] == (
+        "# 1 Introduction\n\n"
+        "$$\nE = mc^2\n$$\n\n"
+        "Figure 1. Model overview."
+    )
+    spans = list(result["document_source_spans"] or [])
+    assert [span["block_id"] for span in spans] == ["h1", "eq1", "c1"]
+    assert [span["block_type"] for span in spans] == ["heading", "equation", "caption"]
+    assert all(span["section_path"] == "1 Introduction" for span in spans)
+    assert [result["document_text"][span["start_char"]:span["end_char"]] for span in spans] == [
+        "# 1 Introduction",
+        "$$\nE = mc^2\n$$",
+        "Figure 1. Model overview.",
+    ]
 
 
 @pytest.mark.asyncio
@@ -193,4 +234,3 @@ async def test_ingest_pdf_returns_unapplied_when_structured_document_has_no_chun
     assert result["failure_reason"] == "no_structured_content"
     assert result["extractor"] == "local_structured_pdf_fast"
     assert result["report"]["block_count"] == 0
-    assert result["chunks"] == []
