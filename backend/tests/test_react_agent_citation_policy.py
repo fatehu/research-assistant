@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.agent_tools import ToolResult
-from app.services.react_agent import AgentContext, ReActAgent
+from app.services.react_agent import AgentContext, AgentRuntimeContext, ReActAgent
 from app.config import settings
 
 
@@ -36,6 +36,27 @@ class _SelectableTools:
     def get_tools_description(self, **kwargs) -> str:
         self.calls.append(kwargs)
         return "- web_search: 搜索互联网"
+
+
+class _KnowledgeFollowupTools:
+    def __init__(self):
+        self.classify_calls = []
+        self.select_calls = []
+        self.desc_calls = []
+
+    def classify_intent(self, user_text: str) -> str:
+        self.classify_calls.append(user_text)
+        return "knowledge_query" if "知识库" in user_text else "general_chat"
+
+    def select_tool_names_for_intent(self, intent: str, user_text: str = ""):
+        self.select_calls.append((intent, user_text))
+        if intent == "knowledge_query":
+            return ["knowledge_search", "datetime", "calculator"]
+        return ["datetime", "calculator"]
+
+    def get_tools_description(self, **kwargs) -> str:
+        self.desc_calls.append(kwargs)
+        return "- knowledge_search: 搜索知识库"
 
 
 class _SchemaCollectionTools:
@@ -76,6 +97,17 @@ class _SchemaCollectionTools:
         ]
 
 
+class _CodelabTools:
+    def resolve_intent(self, user_text: str) -> str:
+        return "code_task"
+
+    def select_tool_names_for_intent(self, intent: str, user_text: str = ""):
+        return ["notebook_cell", "notebook_variables", "notebook_execute", "knowledge_search"]
+
+    def get_tools_description(self, **kwargs) -> str:
+        return "- notebook_cell: 查看单元格\n- notebook_variables: 查看变量\n- notebook_execute: 执行代码\n- knowledge_search: 搜索知识库"
+
+
 class _NoCompression:
     async def compress_chunks(self, *args, **kwargs):
         return []
@@ -90,6 +122,22 @@ def test_system_prompt_contains_citation_policy():
     assert "禁止编造不存在的来源编号" in prompt
 
 
+def test_codelab_system_prompt_contains_dedicated_route_policy(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    agent = ReActAgent(
+        _DummyLLM(),
+        _CodelabTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="codelab_agent", notebook_id="nb-1"),
+    )
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "利用上传的数据集进行机器学习案例构建"}])
+
+    assert "CodeLab 场景规则" in prompt
+    assert "默认先使用 `notebook_cell`、`notebook_variables`、`notebook_execute`" in prompt
+    assert "不要调用 `knowledge_search`、`web_search`、`web_scrape` 或任何 `mcp.*` 工具" in prompt
+
+
 def test_system_prompt_uses_intent_based_tool_selection(monkeypatch):
     monkeypatch.setattr(settings, "tool_selection_enabled", True)
     tools = _SelectableTools()
@@ -101,6 +149,54 @@ def test_system_prompt_uses_intent_based_tool_selection(monkeypatch):
     assert tools.calls and tools.calls[0]["intent"] == "web_query"
     assert agent._last_tool_selection["intent"] == "web_query"
     assert agent._last_tool_selection["selected_tools"] == ["web_search", "datetime", "calculator"]
+
+
+def test_system_prompt_carries_followup_turn_into_intent_detection(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    tools = _KnowledgeFollowupTools()
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+
+    prompt = agent._build_system_prompt(
+        messages=[
+            {"role": "user", "content": "利用知识库，解释什么是 agentic search"},
+            {"role": "assistant", "content": "好的"},
+            {"role": "user", "content": "继续"},
+        ]
+    )
+
+    assert "优先调用 `knowledge_search`" in prompt
+    assert tools.classify_calls[-1] == "利用知识库，解释什么是 agentic search\n继续"
+    assert agent._last_tool_selection["intent"] == "knowledge_query"
+    assert agent._last_tool_selection["tool_choice"] == "required"
+
+
+def test_system_prompt_switches_knowledge_query_to_auto_after_first_observation(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    tools = _KnowledgeFollowupTools()
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+
+    prompt = agent._build_system_prompt(
+        messages=[
+            {"role": "user", "content": "利用知识库，解释什么是 agentic search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "knowledge_search", "arguments": "{\"query\":\"agentic search\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "name": "knowledge_search", "content": "[来源1] 命中片段"},
+        ]
+    )
+
+    assert "优先基于现有证据直接收束为答案" in prompt
+    assert "不要只为了改写同义 query" in prompt
+    assert agent._last_tool_selection["intent"] == "knowledge_query"
+    assert agent._last_tool_selection["tool_choice"] == "auto"
 
 
 def test_collect_llm_tool_schemas_falls_back_to_full_when_tool_selection_disabled(monkeypatch):

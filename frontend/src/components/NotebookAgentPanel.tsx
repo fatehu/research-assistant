@@ -52,6 +52,10 @@ const quickActions = [
   { key: 'optimize', icon: <BulbOutlined />, label: '优化代码', prompt: '请优化最近的代码，提高性能' },
 ]
 
+const VARIABLE_CONTEXT_KEYWORDS = /变量|数据|dataset|dataframe|\bdf\b|shape|列名|columns|index|索引|tensor|数组|ndarray|模型|model|训练|预测|推理|结果|输出|报错|错误|error|warning|accuracy|loss|score/i
+
+const shouldIncludeVariableContext = (prompt: string) => VARIABLE_CONTEXT_KEYWORDS.test(prompt)
+
 const parseRagMetrics = (value: unknown): RagMetrics | null => {
   if (!value || typeof value !== 'object') {
     return null
@@ -119,6 +123,11 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
     scrollToBottom('auto')
   }, [streamingContent, streamingReActSteps.length, scrollToBottom])
 
+  const activeCell = useMemo(() => {
+    if (currentCellIndex < 0 || currentCellIndex >= cells.length) return null
+    return cells[currentCellIndex]
+  }, [cells, currentCellIndex])
+
   const loadHistory = useCallback(async () => {
     if (!notebookId) return
     setIsLoadingHistory(true)
@@ -177,7 +186,15 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
       await agentApi.chat(
         notebookId,
-        { message: content.trim(), include_context: true, include_variables: true, user_authorized: authorized, stream: true },
+        {
+          message: content.trim(),
+          include_context: true,
+          include_variables: shouldIncludeVariableContext(content),
+          user_authorized: authorized,
+          stream: true,
+          active_cell_id: activeCell?.id,
+          active_cell_index: activeCell ? currentCellIndex : undefined,
+        },
         (event) => {
           if (event.type === 'content') {
             fullContent += event.content

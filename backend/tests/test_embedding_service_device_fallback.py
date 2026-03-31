@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import sys
 import types
 
@@ -152,6 +153,59 @@ def test_local_embedding_prefers_safetensors_then_falls_back_to_legacy(monkeypat
     assert len(calls) == 2
     assert calls[0]["model_kwargs"] == {"use_safetensors": True}
     assert "model_kwargs" not in calls[1]
+    assert model._loaded is True
+
+
+def test_local_embedding_skips_safetensors_when_cached_main_snapshot_is_legacy(monkeypatch, tmp_path):
+    calls = []
+
+    class _FakeSentenceTransformer:
+        def __init__(self, model_name, cache_folder=None, device=None, trust_remote_code=True, **kwargs):
+            calls.append(
+                {
+                    "cache_folder": cache_folder,
+                    "device": device,
+                    "trust_remote_code": trust_remote_code,
+                    **kwargs,
+                }
+            )
+
+        def get_sentence_embedding_dimension(self):
+            return 1024
+
+    fake_st = types.SimpleNamespace(SentenceTransformer=_FakeSentenceTransformer)
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        backends=types.SimpleNamespace(
+            mps=types.SimpleNamespace(is_available=lambda: False),
+        ),
+    )
+
+    snapshot_dir = (
+        Path(tmp_path)
+        / "models--BAAI--bge-m3"
+        / "snapshots"
+        / "legacy-snapshot"
+    )
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "pytorch_model.bin").write_text("stub", encoding="utf-8")
+    refs_dir = snapshot_dir.parent.parent / "refs"
+    refs_dir.mkdir(parents=True)
+    (refs_dir / "main").write_text("legacy-snapshot", encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(settings, "local_embedding_device", "auto")
+    monkeypatch.setattr(settings, "local_embedding_cache_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "local_embedding_prefer_safetensors", True)
+    monkeypatch.setattr(settings, "local_embedding_local_files_only", False)
+    monkeypatch.setattr(settings, "local_embedding_allow_legacy_pickle_fallback", True)
+
+    model = LocalEmbeddingModel(model_name="BAAI/bge-m3")
+    model._load_model()
+
+    assert len(calls) == 1
+    assert "model_kwargs" not in calls[0]
     assert model._loaded is True
 
 

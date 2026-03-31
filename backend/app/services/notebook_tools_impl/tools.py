@@ -34,6 +34,7 @@ except ImportError:
 
 from app.config import settings
 from app.services.agent_tools import Tool, ToolResult
+from app.services.notebook_workspace_service import build_notebook_workspace_context
 
 
 # ========== 安全配置 ==========
@@ -80,6 +81,14 @@ BLOCKED_DOMAINS = {
 }
 
 
+def _workspace_context_for_notebook_payload(notebook: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    notebook_id = str(notebook.get("id") or "").strip()
+    user_id = notebook.get("user_id")
+    if not notebook_id or user_id is None:
+        return None
+    return build_notebook_workspace_context(notebook_id, int(user_id))
+
+
 # ========== 工具实现 ==========
 
 class NotebookExecuteTool(Tool):
@@ -87,13 +96,16 @@ class NotebookExecuteTool(Tool):
     在 Notebook 内核中执行 Python 代码
     
     这是最核心的工具，让 Agent 能够直接操控 Notebook 环境
-    执行后会自动在 Notebook 中创建新的 Cell 并保存结果
+    执行后可追加新 Cell，或直接覆盖已有 Cell 并保存结果
     """
     name = "notebook_execute"
     description = """在 Notebook 的 Python 内核中执行代码。
 代码会在持久化的命名空间中执行，变量在多次调用之间保持。
-执行后会自动在 Notebook 中创建新的代码单元格并显示结果。
-适用于：运行数据分析代码、创建图表、测试代码片段等。
+执行后可以：
+1. 追加一个新的代码单元格；
+2. 覆盖已有单元格并把执行结果写回该单元格。
+适用于：运行数据分析代码、创建图表、测试代码片段，或修复已有报错单元格。
+如果是在修复当前/最近报错的单元格，优先使用 cell_index 或 cell_id 覆盖原单元格，而不是再新增一个修复版单元格。
 注意：此操作需要用户授权。"""
     parameters = {
         "type": "object",
@@ -105,6 +117,19 @@ class NotebookExecuteTool(Tool):
             "description": {
                 "type": "string",
                 "description": "代码功能描述（可选，用于日志）"
+            },
+            "cell_id": {
+                "type": "string",
+                "description": "可选：要覆盖的目标单元格 ID。提供后会直接更新该单元格。"
+            },
+            "cell_index": {
+                "type": "integer",
+                "description": "可选：要覆盖的目标单元格位置索引，从1开始。提供后会直接更新该单元格。"
+            },
+            "write_mode": {
+                "type": "string",
+                "enum": ["auto", "append", "replace"],
+                "description": "写回模式。append=总是新增，replace=优先覆盖目标/最近报错单元格，auto=自动判断，默认 auto。"
             }
         },
         "required": ["code"]
@@ -116,8 +141,75 @@ class NotebookExecuteTool(Tool):
         self.notebooks_store = notebooks_store
         self.user_authorized = user_authorized
     
-    async def execute(self, code: str, description: str = None, **kwargs) -> ToolResult:
-        """执行代码并创建 Cell"""
+    @staticmethod
+    def _resolve_target_cell(notebook: dict, cell_id: str = None, cell_index: int = None):
+        cells = list(notebook.get('cells', []) or [])
+        if cell_index is not None:
+            actual_index = int(cell_index) - 1
+            if 0 <= actual_index < len(cells):
+                cell = cells[actual_index]
+                return cell, actual_index, cell.get('id')
+            return None, None, None
+
+        if cell_id:
+            for idx, cell in enumerate(cells):
+                if cell.get('id') == cell_id:
+                    return cell, idx, cell_id
+        return None, None, None
+
+    @staticmethod
+    def _find_recent_error_cell(notebook: dict):
+        cells = list(notebook.get('cells', []) or [])
+        for idx in range(len(cells) - 1, -1, -1):
+            cell = cells[idx]
+            outputs = list(cell.get('outputs') or [])
+            for output in outputs:
+                if str(output.get('output_type') or '') == 'error':
+                    return cell, idx
+        return None, None
+
+    @staticmethod
+    def _normalize_code_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @classmethod
+    def _code_similarity(cls, source: Any, candidate: Any) -> float:
+        source_text = cls._normalize_code_text(source)
+        candidate_text = cls._normalize_code_text(candidate)
+        if not source_text or not candidate_text:
+            return 0.0
+        return float(SequenceMatcher(None, source_text, candidate_text).ratio())
+
+    @classmethod
+    def _identifier_overlap(cls, source: Any, candidate: Any) -> float:
+        source_ids = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(source or "")))
+        candidate_ids = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(candidate or "")))
+        source_ids = {item for item in source_ids if len(item) > 1}
+        candidate_ids = {item for item in candidate_ids if len(item) > 1}
+        if not source_ids or not candidate_ids:
+            return 0.0
+        return len(source_ids & candidate_ids) / max(1, len(source_ids | candidate_ids))
+
+    @classmethod
+    def _looks_like_fix(cls, code: str, source: str, description: Optional[str] = None) -> bool:
+        desc = str(description or "").lower()
+        if any(token in desc for token in ("修复", "fix", "debug", "报错", "错误", "replace", "覆盖", "改这个", "update cell")):
+            return True
+
+        similarity = cls._code_similarity(source, code)
+        overlap = cls._identifier_overlap(source, code)
+        return similarity >= 0.55 or (similarity >= 0.35 and overlap >= 0.45) or overlap >= 0.75
+
+    async def execute(
+        self,
+        code: str,
+        description: str = None,
+        cell_id: str = None,
+        cell_index: int = None,
+        write_mode: str = "auto",
+        **kwargs,
+    ) -> ToolResult:
+        """执行代码并创建或更新 Cell"""
         import uuid
         from datetime import datetime
         
@@ -138,7 +230,11 @@ class NotebookExecuteTool(Tool):
             kernel = self.kernel_manager.get_or_create_kernel(self.notebook_id)
             
             # 执行代码
-            result = kernel.execute(code, timeout=60)
+            workspace_context = None
+            if self.notebooks_store is not None and self.notebook_id in self.notebooks_store:
+                workspace_context = _workspace_context_for_notebook_payload(self.notebooks_store[self.notebook_id])
+
+            result = kernel.execute(code, timeout=60, workspace_context=workspace_context)
             
             # 将 outputs 转换为可序列化的格式
             serialized_outputs = []
@@ -150,34 +246,83 @@ class NotebookExecuteTool(Tool):
                 else:
                     serialized_outputs.append(output)
             
-            # 创建新的 Cell 并添加到 Notebook
+            # 更新已有 Cell，或创建新的 Cell 并添加到 Notebook
             new_cell_id = None
             new_cell = None
+            updated_cell = None
+            updated_cell_id = None
+            operation = "append"
             if self.notebooks_store is not None and self.notebook_id in self.notebooks_store:
                 notebook = self.notebooks_store[self.notebook_id]
-                new_cell_id = str(uuid.uuid4())
-                
-                new_cell = {
-                    'id': new_cell_id,
-                    'cell_type': 'code',
-                    'source': code,
-                    'outputs': serialized_outputs,
-                    'execution_count': result.get('execution_count'),
-                    'metadata': {
-                        'created_by': 'ai_agent',
-                        'description': description,
-                        'created_at': datetime.utcnow().isoformat()
-                    }
-                }
-                
-                # 添加到 Notebook
                 if 'cells' not in notebook:
                     notebook['cells'] = []
-                notebook['cells'].append(new_cell)
+
+                target_cell = None
+                target_index = None
+
+                explicit_target = bool(cell_id) or cell_index is not None
+                if explicit_target:
+                    target_cell, target_index, updated_cell_id = self._resolve_target_cell(
+                        notebook,
+                        cell_id=cell_id,
+                        cell_index=cell_index,
+                    )
+                    if target_cell is None:
+                        return ToolResult(
+                            success=False,
+                            output=f"未找到目标单元格 (cell_id={cell_id}, cell_index={cell_index})",
+                            error="cell_not_found",
+                        )
+                else:
+                    normalized_write_mode = str(write_mode or "auto").strip().lower()
+                    recent_error_cell, recent_error_index = self._find_recent_error_cell(notebook)
+                    if normalized_write_mode == "replace" and recent_error_cell is not None:
+                        target_cell = recent_error_cell
+                        target_index = recent_error_index
+                        updated_cell_id = recent_error_cell.get('id')
+                    elif (
+                        normalized_write_mode == "auto"
+                        and recent_error_cell is not None
+                        and self._looks_like_fix(code, recent_error_cell.get('source', ''), description=description)
+                    ):
+                        target_cell = recent_error_cell
+                        target_index = recent_error_index
+                        updated_cell_id = recent_error_cell.get('id')
+
+                if target_cell is not None:
+                    target_cell['cell_type'] = 'code'
+                    target_cell['source'] = code
+                    target_cell['outputs'] = serialized_outputs
+                    target_cell['execution_count'] = result.get('execution_count')
+                    target_cell['metadata'] = target_cell.get('metadata', {})
+                    target_cell['metadata']['updated_by'] = 'ai_agent'
+                    target_cell['metadata']['updated_at'] = datetime.utcnow().isoformat()
+                    if description:
+                        target_cell['metadata']['description'] = description
+                    updated_cell = target_cell
+                    operation = "update"
+                    logger.info(
+                        f"[NotebookExecute] 更新现有 Cell: {updated_cell_id}, index={target_index + 1 if target_index is not None else 'unknown'}"
+                    )
+                else:
+                    new_cell_id = str(uuid.uuid4())
+                    new_cell = {
+                        'id': new_cell_id,
+                        'cell_type': 'code',
+                        'source': code,
+                        'outputs': serialized_outputs,
+                        'execution_count': result.get('execution_count'),
+                        'metadata': {
+                            'created_by': 'ai_agent',
+                            'description': description,
+                            'created_at': datetime.utcnow().isoformat()
+                        }
+                    }
+                    notebook['cells'].append(new_cell)
+                    logger.info(f"[NotebookExecute] 创建新 Cell: {new_cell_id}")
+
                 notebook['updated_at'] = datetime.utcnow()
                 notebook['execution_count'] = result.get('execution_count', notebook.get('execution_count', 0))
-                
-                logger.info(f"[NotebookExecute] 创建新 Cell: {new_cell_id}")
             
             # 格式化输出
             output_parts = []
@@ -211,12 +356,14 @@ class NotebookExecuteTool(Tool):
                 success=result.get('success', True),
                 output=output_text,
                 data={
-                    "cell_id": new_cell_id,
+                    "cell_id": updated_cell_id or new_cell_id,
                     "execution_count": result.get('execution_count'),
                     "execution_time_ms": result.get('execution_time_ms'),
                     "outputs": serialized_outputs,
-                    "notebook_updated": new_cell_id is not None,
-                    "new_cell": new_cell if new_cell_id else None
+                    "notebook_updated": bool(updated_cell_id or new_cell_id),
+                    "new_cell": new_cell if new_cell_id else None,
+                    "updated_cell": updated_cell if updated_cell_id else None,
+                    "operation": operation,
                 }
             )
             

@@ -51,11 +51,13 @@ class ExecutePayload(BaseModel):
     code: str
     timeout_seconds: int = Field(default=20, ge=1, le=120)
     hard_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    workspace: Optional[Dict[str, Any]] = None
 
 
 class NotebookPayload(BaseModel):
     notebook_id: str = Field(min_length=1, max_length=200)
     hard_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    workspace: Optional[Dict[str, Any]] = None
 
 
 def _get_or_create_executor(notebook_id: str, hard_timeout_seconds: int) -> LocalCodeLabExecutor:
@@ -69,16 +71,20 @@ def _get_or_create_executor(notebook_id: str, hard_timeout_seconds: int) -> Loca
 @app.post("/internal/codelab/execute", dependencies=[Depends(_require_internal_token)])
 def execute(payload: ExecutePayload):
     executor = _get_or_create_executor(payload.notebook_id, payload.hard_timeout_seconds)
-    return executor.execute(code=payload.code, timeout_seconds=payload.timeout_seconds)
+    return executor.execute(
+        code=payload.code,
+        timeout_seconds=payload.timeout_seconds,
+        workspace_context=payload.workspace,
+    )
 
 
 @app.post("/internal/codelab/reset", dependencies=[Depends(_require_internal_token)])
 def reset(payload: NotebookPayload):
     executor = _get_or_create_executor(payload.notebook_id, payload.hard_timeout_seconds)
-    executor.reset()
+    executor.reset(workspace_context=payload.workspace)
     return {
         "success": True,
-        "variables": executor.get_variables(),
+        "variables": executor.get_variables(workspace_context=payload.workspace),
     }
 
 
@@ -104,4 +110,3 @@ def close(payload: NotebookPayload):
 @app.get("/internal/healthz")
 def healthz():
     return {"ok": True}
-

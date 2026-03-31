@@ -29,19 +29,17 @@ const ChatInput = ({
   }
 
   return (
-    <div className="border-t border-slate-800/50 bg-slate-900/90 backdrop-blur-xl">
-      <div className="max-w-3xl mx-auto p-4">
+    <div className="border-t border-white/[0.06] bg-slate-950/88 backdrop-blur-2xl">
+      <div className="mx-auto max-w-[1040px] px-4 py-4 sm:px-6 lg:px-8">
         <div className="relative flex items-end gap-3">
-          <div className="flex-1 relative">
+          <div className="relative flex-1 rounded-[24px] border border-slate-700/60 bg-slate-800/78 p-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04),0_14px_28px_rgba(2,6,23,0.2)] transition-all duration-200 focus-within:border-emerald-400/30 focus-within:shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_0_0_1px_rgba(16,185,129,0.06)]">
             <TextArea
               value={inputValue}
               onChange={(e) => onInputChange(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="输入问题，按 Enter 发送..."
               autoSize={{ minRows: 1, maxRows: 6 }}
-              className="text-base bg-slate-800/80 border-slate-700/50 rounded-xl resize-none 
-                focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/20
-                placeholder:text-slate-500"
+              className="!m-0 !rounded-[18px] !border-0 !bg-transparent !px-4 !py-3 !text-base !leading-7 !text-slate-100 !shadow-none resize-none placeholder:!text-slate-500 focus:!shadow-none"
               disabled={isSending}
             />
           </div>
@@ -52,7 +50,7 @@ const ChatInput = ({
               danger
               icon={<StopOutlined />}
               onClick={onStop}
-              className="bg-red-500 hover:bg-red-600 border-none rounded-xl h-10 px-5
+              className="bg-red-500 hover:bg-red-600 border-none rounded-2xl h-[52px] px-5
                 shadow-lg shadow-red-500/20"
             >
               停止
@@ -64,7 +62,7 @@ const ChatInput = ({
               icon={<SendOutlined />}
               onClick={onSend}
               disabled={!inputValue.trim()}
-              className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-xl h-10 px-5
+              className="bg-emerald-500 hover:bg-emerald-600 border-none rounded-2xl h-[52px] px-5
                 shadow-lg shadow-emerald-500/20 disabled:opacity-50"
             >
               发送
@@ -73,7 +71,7 @@ const ChatInput = ({
         </div>
 
         {/* 底部信息 */}
-        <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
+        <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
           <span className="flex items-center gap-2">
             <span
               className={`w-1.5 h-1.5 rounded-full ${

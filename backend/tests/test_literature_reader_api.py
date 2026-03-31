@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -38,6 +38,9 @@ class _FakeResult:
         return self
 
     def all(self):
+        return self._rows
+
+    def fetchall(self):
         return self._rows
 
 
@@ -537,6 +540,91 @@ async def test_download_paper_pdf_falls_back_when_stored_pdf_url_is_stale(monkey
         "https://arxiv.org/pdf/1706.03762",
     ]
     assert paper.pdf_url == "https://arxiv.org/pdf/1706.03762"
+
+
+@pytest.mark.asyncio
+async def test_add_paper_to_knowledge_should_use_local_fast_without_mutating_paper_binding(monkeypatch, tmp_path: Path):
+    pdf_path = tmp_path / "attention_19.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%EOF\n")
+    paper = SimpleNamespace(
+        id=19,
+        user_id=9,
+        title="Attention Is All You Need",
+        pdf_url="https://arxiv.org/pdf/1706.03762",
+        pdf_downloaded=True,
+        pdf_path=str(pdf_path),
+        knowledge_base_id=None,
+        document_id=None,
+    )
+    kb = SimpleNamespace(id=61, name="Reader KB", chunk_size=500, chunk_overlap=50)
+    published: list[int] = []
+    invalidations: list[tuple[int, int, str, int]] = []
+
+    class _FakeMutationDB:
+        def __init__(self):
+            self._results = [
+                _FakeResult(row=None),
+                _FakeResult(rows=[]),
+            ]
+            self.added: list[object] = []
+            self.committed = False
+
+        async def execute(self, _query):
+            if not self._results:
+                return _FakeResult(rows=[])
+            return self._results.pop(0)
+
+        def add(self, obj):
+            self.added.append(obj)
+
+        async def flush(self):
+            next_id = 700
+            for obj in self.added:
+                if getattr(obj, "id", None) is None:
+                    obj.id = next_id
+                    next_id += 1
+
+        async def commit(self):
+            self.committed = True
+
+        async def refresh(self, _obj):
+            return None
+
+    async def _fake_get_owned_paper(_db, _current_user, _paper_id):
+        return paper
+
+    async def _fake_get_owned_kb(_db, _current_user, _kb_id):
+        return kb
+
+    async def _fake_publish(link):
+        published.append(int(link.id))
+
+    async def _fake_invalidate(*, user_id: int, kb_id: int, scope: str, target_id: int):
+        invalidations.append((user_id, kb_id, scope, target_id))
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned_paper)
+    monkeypatch.setattr(literature_api, "_get_owned_kb_or_404", _fake_get_owned_kb)
+    monkeypatch.setattr(literature_api, "_publish_paper_link_status_event", _fake_publish)
+    monkeypatch.setattr(literature_api, "_invalidate_ask_cache_for_scope", _fake_invalidate)
+
+    db = _FakeMutationDB()
+    response = await literature_api.add_paper_to_knowledge(
+        paper_id=19,
+        payload=literature_api.AddPaperToKnowledgeRequest(knowledge_base_id=61),
+        background_tasks=BackgroundTasks(),
+        db=db,
+        current_user=SimpleNamespace(id=9),
+    )
+
+    created_doc = next(item for item in db.added if item.__class__.__name__ == "Document")
+    assert created_doc.metadata_["ingest_request"]["mode"] == "local_fast"
+    assert created_doc.metadata_["ingest_request"]["extract_profile"] == "general"
+    assert paper.knowledge_base_id is None
+    assert paper.document_id is None
+    assert response.document_id == created_doc.id
+    assert db.committed is True
+    assert published == [response.id]
+    assert invalidations == [(9, 61, "paper", 19)]
 
 
 @pytest.mark.asyncio
@@ -3394,6 +3482,55 @@ async def test_build_generative_reader_agent_tool_registry_for_paper_should_keep
     }
 
 
+@pytest.mark.asyncio
+async def test_build_generative_reader_agent_tool_registry_for_paper_should_degrade_when_selected_kb_missing(
+    monkeypatch,
+    tmp_path: Path,
+):
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%EOF\n")
+    paper = SimpleNamespace(id=79, title="Demo Paper", knowledge_base_id=84)
+
+    class _FakeTool:
+        def __init__(self, name: str):
+            self.name = name
+
+    class _FakeRegistry:
+        def __init__(self, *args, **kwargs):
+            self._tools = {
+                "web_search": _FakeTool("web_search"),
+                "web_scrape": _FakeTool("web_scrape"),
+            }
+            self._mcp_tools = {}
+
+        def register(self, tool):
+            self._tools[tool.name] = tool
+
+        async def refresh_mcp_tools(self, force_refresh: bool = False):
+            return None
+
+        def list_tools(self):
+            return [{"function": {"name": name}} for name in self._tools.keys()]
+
+    monkeypatch.setattr(literature_api, "ToolRegistry", _FakeRegistry)
+    monkeypatch.setattr(literature_api, "_resolve_local_pdf_path", lambda _user_id, _paper: str(pdf_path))
+    monkeypatch.setattr(
+        literature_api,
+        "LiteratureDirectPaperReadTool",
+        lambda **kwargs: _FakeTool("paper_read"),
+    )
+
+    registry, allowed = await literature_api._build_generative_reader_agent_tool_registry_for_paper(
+        db=_FakeDB([_FakeResult(row=None)]),
+        current_user=SimpleNamespace(id=5),
+        paper=paper,
+        selected_kb_id=84,
+    )
+
+    assert registry is not None
+    assert allowed == {"paper_read", "web_search", "web_scrape"}
+
+
 def test_mcp_client_normalize_call_result_should_shape_web_search_payload():
     schema = MCPToolSchema(
         server_name="tavily",
@@ -4337,7 +4474,7 @@ async def test_build_experience_adjacent_page_structured_context_v2_should_reuse
 
 
 @pytest.mark.asyncio
-async def test_build_experience_adjacent_page_structured_context_v2_should_fail_loudly_when_cached_row_is_invalid(
+async def test_build_experience_adjacent_page_structured_context_v2_should_rebuild_when_cached_row_is_invalid(
     tmp_path,
     monkeypatch,
 ):
@@ -4378,16 +4515,38 @@ async def test_build_experience_adjacent_page_structured_context_v2_should_fail_
             "meta": {},
         }, "db"
 
+    async def _fake_extract(**kwargs):
+        page = int(kwargs.get("page") or 0)
+        relation = str(kwargs.get("relation") or "previous_page")
+        return {
+            "page": page,
+            "relation": relation,
+            "source": "neighbor_page_vlm_parse",
+            "fidelity": "ordered_structured_context",
+            "reference_only": False,
+            "page_image": {"url": f"https://example.com/p{page}.png"},
+            "page_summary": "recovered from rebuild",
+            "content_stream": [{"seq": 1, "type": "paragraph", "text": "recovered"}],
+            "continuation_hints": [],
+            "raw_text": "recovered",
+            "meta": {},
+        }
+
     monkeypatch.setattr(literature_api, "_get_pdf_page_count", _fake_get_page_count)
     monkeypatch.setattr(literature_api, "_adjacent_page_structured_v2_cache_get", _fake_cache_get)
+    monkeypatch.setattr(literature_api, "_extract_adjacent_page_structured_context_v2", _fake_extract)
 
-    with pytest.raises(ValueError, match="neighboring-page structured context cache corrupted for page 6: ordered content_stream missing"):
-        await literature_api._build_experience_adjacent_page_structured_context_v2(
-            compose_service=_FakeComposeService(),
-            paper=SimpleNamespace(id=78, user_id=5, title="Demo Paper", pdf_path="paper.pdf"),
-            focus_page=7,
-            current_user=SimpleNamespace(id=5),
-        )
+    rows = await literature_api._build_experience_adjacent_page_structured_context_v2(
+        compose_service=_FakeComposeService(),
+        paper=SimpleNamespace(id=78, user_id=5, title="Demo Paper", pdf_path="paper.pdf"),
+        focus_page=7,
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["page"] == 6
+    assert rows[0]["content_stream"][0]["text"] == "recovered"
+    assert str((rows[0].get("meta") or {}).get("page_scope_cache_layer") or "").strip() == "built"
 
 
 def test_coerce_adjacent_page_structured_result_should_normalize_common_item_type_aliases():
@@ -4402,7 +4561,8 @@ def test_coerce_adjacent_page_structured_result_should_normalize_common_item_typ
             "content_stream": [
                 {"seq": 1, "type": "heading", "text": "Section title"},
                 {"seq": 2, "type": "link", "text": "https://example.com"},
-                {"seq": 3, "type": "formula", "normalized_text": "a+b"},
+                {"seq": 3, "type": "author_list", "text": "Alice, Bob"},
+                {"seq": 4, "type": "formula", "normalized_text": "a+b"},
             ],
             "continuation_hints": ["hint"],
             "raw_text": "raw",
@@ -4420,9 +4580,34 @@ def test_coerce_adjacent_page_structured_result_should_normalize_common_item_typ
         image_url="https://example.com/p6.png",
     )
 
-    assert [item["type"] for item in row["content_stream"]] == ["header", "paragraph", "equation"]
+    assert [item["type"] for item in row["content_stream"]] == ["header", "paragraph", "paragraph", "equation"]
     assert row["content_stream"][0]["meta"]["raw_type"] == "heading"
     assert row["content_stream"][1]["meta"]["raw_type"] == "link"
+    assert row["content_stream"][2]["meta"]["raw_type"] == "author_list"
+
+
+def test_reading_dossier_v2_adjacent_row_should_synthesize_fallback_stream_from_summary_fields():
+    row = literature_api.ReadingDossierV2AdjacentPageRow.model_validate(
+        {
+            "page": 6,
+            "relation": "prev",
+            "source": "neighbor_page_vlm_parse",
+            "fidelity": "ordered_structured_context",
+            "reference_only": False,
+            "page_image": {"url": "https://example.com/p6.png"},
+            "page_summary": "Recovered summary",
+            "content_stream": [],
+            "continuation_hints": [],
+            "raw_text": "",
+            "meta": {},
+        }
+    ).model_dump(mode="json")
+
+    assert row["relation"] == "previous_page"
+    assert len(row["content_stream"]) == 1
+    assert row["content_stream"][0]["type"] == "paragraph"
+    assert row["content_stream"][0]["text"] == "Recovered summary"
+    assert row["content_stream"][0]["meta"]["synthetic_fallback"] is True
 
 
 def test_reading_dossier_v2_should_expose_cache_meta_with_v2_specific_namespace():
@@ -5371,6 +5556,36 @@ def test_page_artifact_v2_should_resolve_draft_selected_excerpts_by_text_when_id
     assert excerpt_blocks[0]["meta"]["placement"] == "inline"
 
 
+def test_page_artifact_v2_should_resolve_draft_selected_excerpts_by_text_when_ids_are_missing():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    authored_plan = _build_sample_page_artifact_v2_authored_plan()
+    authored_plan["meta"] = {
+        **authored_plan.get("meta", {}),
+        "draft_node_sequence": [
+            {
+                "node_kind": "paragraph",
+                "text": "先看当前页的结果段。",
+                "meta": {"group_id": "g-results"},
+            },
+            {
+                "node_kind": "original_excerpt",
+                "display_text": "We first examined the frequency of insight.",
+                "meta": {"group_id": "g-results", "placement": "inline"},
+            },
+        ],
+    }
+
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=dossier,
+        authored_plan=authored_plan,
+    )
+
+    excerpt_blocks = [block for block in artifact["reading_blocks"] if block["segment_kind"] == "original_excerpt"]
+    assert len(excerpt_blocks) == 1
+    assert excerpt_blocks[0]["source_layout_ids"] == ["layout:7:1"]
+    assert excerpt_blocks[0]["meta"]["placement"] == "inline"
+
+
 def test_page_artifact_v2_should_support_table_equation_and_aside_blocks_incrementally():
     artifact = literature_api._build_page_artifact_v2_from_dossier(
         reading_dossier=_build_sample_reading_dossier_v2_for_session(),
@@ -5397,16 +5612,29 @@ def test_page_artifact_v2_should_fail_loudly_for_unsupported_requested_node_kind
         )
 
 
-def test_page_artifact_v2_should_fail_loudly_for_unresolved_table_binding():
-    with pytest.raises(ValueError, match="media slot binding could not be resolved: table_slot"):
-        literature_api._build_page_artifact_v2_from_dossier(
-            reading_dossier=_build_sample_reading_dossier_v2_for_session(),
-            authored_plan={
-                **_build_sample_page_artifact_v2_authored_plan(),
-                "table_slots": [{"label": "Table 1", "source_layout_id": "layout:7:missing"}],
-                "requested_node_kinds": ["table_slot"],
-            },
-        )
+def test_page_artifact_v2_should_skip_unresolved_table_binding_instead_of_failing_page():
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+        authored_plan={
+            **_build_sample_page_artifact_v2_authored_plan(),
+            "table_slots": [{"label": "Table 1", "source_layout_id": "layout:7:missing"}],
+            "requested_node_kinds": ["table_slot"],
+        },
+    )
+
+    assert all(block["segment_kind"] != "table_slot" for block in artifact["reading_blocks"])
+    assert artifact["meta"]["skipped_slot_bindings"] == [
+        {
+            "segment_id": "seg-table-1",
+            "slot_kind": "table_slot",
+            "label": "Table 1",
+            "source_layout_id": "layout:7:missing",
+            "reason": "media slot binding could not be resolved: table_slot",
+        }
+    ]
+    report = literature_api._validate_page_artifact_v2_contract(artifact)
+    assert report["valid"] is True
+    assert report["renderable"] is True
 
 
 def test_page_artifact_v2_should_fail_loudly_when_figure_layout_anchor_has_no_concrete_asset_ref():
@@ -5458,6 +5686,52 @@ def test_page_artifact_v2_should_allow_missing_figure_slot_when_draft_did_not_re
     ]
 
     report = literature_api._validate_page_artifact_v2_contract(without_figure_slot)
+    assert report["valid"] is True
+    assert report["renderable"] is True
+
+
+def test_page_artifact_v2_should_allow_equation_slot_without_bound_evidence_ids():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    dossier["current_page"]["rich_grounding"]["evidence_map"] = [
+        item
+        for item in dossier["current_page"]["rich_grounding"]["evidence_map"]
+        if item["source_layout_id"] != "layout:7:eq1"
+    ]
+
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=dossier,
+        authored_plan={
+            **_build_sample_page_artifact_v2_authored_plan(),
+            "equation_slots": [{"label": "(1)", "caption": "Score composition equation", "source_layout_id": "layout:7:eq1"}],
+            "requested_node_kinds": ["equation_slot"],
+        },
+    )
+
+    equation_block = next(block for block in artifact["reading_blocks"] if block["segment_kind"] == "equation_slot")
+    assert equation_block["source_layout_ids"] == ["layout:7:eq1"]
+    assert equation_block["evidence_ids"] == []
+    assert equation_block["meta"]["binding_resolution"] == "layout_anchor_without_evidence"
+    report = literature_api._validate_page_artifact_v2_contract(artifact)
+    assert report["valid"] is True
+    assert report["renderable"] is True
+
+
+def test_page_artifact_v2_should_allow_partial_spine_anchor_coverage_when_excerpt_coverage_is_positive():
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+        authored_plan=_build_sample_page_artifact_v2_authored_plan(),
+    )
+
+    relaxed = json.loads(json.dumps(artifact, ensure_ascii=False))
+    relaxed["current_page_spine"]["reading_node_ids"] = ["node:7:1", "node:7:2", "node:7:3"]
+    relaxed["current_page_spine"]["layout_ids"] = ["layout:7:1", "layout:7:2", "layout:7:3"]
+    relaxed["current_page_spine"]["meta"]["represented_excerpt_count"] = 1
+    relaxed["current_page_spine"]["meta"]["coverage_ratio"] = 1 / 3
+    relaxed["current_page_spine"]["meta"]["excerpt_coverage"]["available_main_flow_count"] = 3
+    relaxed["current_page_spine"]["meta"]["excerpt_coverage"]["covered_main_flow_count"] = 1
+    relaxed["current_page_spine"]["meta"]["excerpt_coverage"]["coverage_ratio"] = 1 / 3
+
+    report = literature_api._validate_page_artifact_v2_contract(relaxed)
     assert report["valid"] is True
     assert report["renderable"] is True
 
@@ -5925,7 +6199,7 @@ def test_experience_session_v2_narrative_brief_should_normalize_nested_strategy_
     assert brief["next_page_bridge"]["page"] == 8
 
 
-def test_experience_session_v2_artifact_draft_should_require_original_excerpt_display_text_and_source_ids():
+def test_experience_session_v2_artifact_draft_should_require_original_excerpt_display_text_and_allow_missing_source_ids():
     with pytest.raises(ValueError, match="original_excerpt nodes require display_text"):
         literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
             {
@@ -5943,22 +6217,30 @@ def test_experience_session_v2_artifact_draft_should_require_original_excerpt_di
             }
         )
 
-    with pytest.raises(ValueError, match="original_excerpt nodes require source ids"):
-        literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
-            {
-                "focus_page": 7,
-                "template_hint": "guided_mixed_media_v1",
-                "layout_recipe": "current_page_spine_interleave_v1",
-                "presentation_mode": "mixed_layout",
-                "nodes": [
-                    {
-                        "node_kind": "original_excerpt",
-                        "display_text": "We first examined the frequency of insight.",
-                    }
-                ],
-                "resource_requests": [],
-            }
-        )
+    draft = literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
+        {
+            "focus_page": 7,
+            "template_hint": "guided_mixed_media_v1",
+            "layout_recipe": "current_page_spine_interleave_v1",
+            "presentation_mode": "mixed_layout",
+            "nodes": [
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "We first examined the frequency of insight.",
+                },
+                {
+                    "node_kind": "paragraph",
+                    "text": "先解释这段摘录为什么是当前页的主锚点。",
+                },
+            ],
+            "resource_requests": [],
+        }
+    ).model_dump(mode="json")
+
+    excerpt_node = next(node for node in draft["nodes"] if node["node_kind"] == "original_excerpt")
+    assert excerpt_node["display_text"] == "We first examined the frequency of insight."
+    assert excerpt_node["source_layout_ids"] == []
+    assert excerpt_node["source_block_ids"] == []
 
 
 def test_experience_session_v2_artifact_draft_should_normalize_common_model_alias_fields():
@@ -6128,7 +6410,12 @@ def test_experience_session_v2_artifact_draft_prompt_should_include_dossier_brie
     assert payload["narrative_brief"]["current_page_main_arc"]
     assert "reader_attention_order" in payload["narrative_brief"]
     assert payload["resource_bundle"]["bundle_entries"]
+    assert payload["resource_bundle"]["meta"]["resource_request_affordance"]["available"] is True
+    assert payload["resource_bundle"]["meta"]["resource_request_affordance"]["must_use_tools"] is True
+    assert "video_explainer" in payload["resource_bundle"]["meta"]["resource_request_affordance"]["suggested_resource_kinds"]
+    assert "Bilibili video pages" in payload["resource_bundle"]["meta"]["resource_request_affordance"]["suggested_targets"]
     assert payload["rules"]["reader_facing_language"] == "zh-CN"
+    assert payload["rules"]["minimum_public_web_resource_requests_before_finalizing"] == 1
     assert payload["teaching_sequence_preferences"]["target_shape"] == "ordered_teaching_node_sequence"
     assert payload["teaching_sequence_preferences"]["authored_language"] == "zh-CN"
     assert payload["anchor_excerpt_candidates"]
@@ -6146,6 +6433,12 @@ def test_experience_session_v2_prompts_should_require_chinese_guided_copy():
     assert '"translation_zh":"..."' in draft_prompt
     assert "do not translate excerpts into Chinese" not in draft_prompt
     assert "provide translation_zh as a faithful Simplified Chinese translation" in draft_prompt
+    assert "YouTube" in draft_prompt
+    assert "Bilibili" in draft_prompt
+    assert "first draft round should request 1 or 2 public-web resources" in draft_prompt
+    assert "encyclopedia" in draft_prompt
+    assert "resource_requests is a top-level array, not a node" in draft_prompt
+    assert "Never place resource_request objects inside nodes[]" in draft_prompt
 
 
 def test_reader_experience_block_explain_request_should_require_local_context():
@@ -6514,6 +6807,52 @@ def test_experience_session_v2_artifact_draft_should_normalize_resource_request_
     assert draft["resource_requests"][0]["request_id"].startswith("req-")
 
 
+def test_experience_session_v2_artifact_draft_should_extract_resource_requests_misplaced_inside_nodes():
+    draft = literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
+        {
+            "focus_page": 7,
+            "template_hint": "guided_mixed_media_v1",
+            "layout_recipe": "current_page_spine_interleave_v1",
+            "presentation_mode": "mixed_layout",
+            "nodes": [
+                {"node_kind": "heading", "text": "先确定本页问题。"},
+                {
+                    "node_kind": "resource_request",
+                    "tool_name": "web_search",
+                    "query": "Transformer attention explainer",
+                    "reason": "Need a concise explainer",
+                    "max_results": 2,
+                },
+                {"node_kind": "paragraph", "text": "再给出当前页的阅读路径。"},
+                {
+                    "type": "resource_request",
+                    "tool": "web_scrape",
+                    "url": "https://example.com/attention",
+                    "reason": "Need exact page content",
+                    "max_results": 1,
+                },
+            ],
+            "resource_requests": [
+                {
+                    "tool_name": "knowledge_search",
+                    "query": "attention mechanism background",
+                    "reason": "Need local grounding",
+                }
+            ],
+        }
+    ).model_dump(mode="json")
+
+    assert [node["node_kind"] for node in draft["nodes"]] == ["heading", "paragraph"]
+    assert [item["tool_name"] for item in draft["resource_requests"]] == [
+        "knowledge_search",
+        "web_search",
+        "web_scrape",
+    ]
+    assert draft["resource_requests"][1]["query"] == "Transformer attention explainer"
+    assert draft["resource_requests"][2]["url"] == "https://example.com/attention"
+    assert draft["meta"]["normalized_resource_requests_from_nodes"] == 2
+
+
 @pytest.mark.asyncio
 async def test_experience_session_v2_artifact_draft_generation_should_fail_loudly_on_invalid_output(monkeypatch):
     dossier = _build_sample_reading_dossier_v2_for_session()
@@ -6698,6 +7037,128 @@ async def test_run_reader_experience_v2_artifact_drafting_loop_should_support_mu
 
 
 @pytest.mark.asyncio
+async def test_run_reader_experience_v2_artifact_drafting_loop_should_force_initial_public_web_request_round(monkeypatch):
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    paper = SimpleNamespace(
+        id=78,
+        title="Demo Paper",
+        url="https://example.com/paper",
+        doi="10.1000/demo",
+        arxiv_url="https://arxiv.org/abs/1234.5678",
+        pdf_url="https://example.com/paper.pdf",
+        pdf_path="demo.pdf",
+    )
+    session = literature_api._build_experience_session_v2(
+        cache_key="lit:experience_session:v2:test",
+        reading_dossier=dossier,
+        focus_page=7,
+        reader_profile="curious_generalist",
+        max_iterations=4,
+        max_tool_rounds=4,
+        narrative_brief=_build_sample_experience_session_v2_narrative_brief(),
+    )
+    draft_queue = [
+        _build_sample_experience_session_v2_artifact_draft(
+            nodes=[
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "We first examined the frequency of insight.",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                },
+                {"node_kind": "paragraph", "text": "先把当前页图证和正文主线对齐。"},
+                {"node_kind": "figure_slot", "label": "Figure 3", "source_layout_ids": ["layout:7:fig1"]},
+            ],
+            resource_requests=[],
+        ),
+        _build_sample_experience_session_v2_artifact_draft(
+            nodes=[
+                {"node_kind": "heading", "text": "Figure 3 先行"},
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "We first examined the frequency of insight.",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                },
+                {"node_kind": "paragraph", "text": "先看图里的比较，再补一条面向读者的术语背景网页。"},
+                {"node_kind": "figure_slot", "label": "Figure 3", "source_layout_ids": ["layout:7:fig1"]},
+                {
+                    "node_kind": "external_resource",
+                    "label": "Wikipedia: Attention mechanism",
+                    "resource_ref_ids": ["web:forced:1"],
+                },
+            ],
+            resource_requests=[],
+        ),
+    ]
+    captured: dict[str, object] = {}
+
+    async def _fake_generate(**_kwargs):
+        return draft_queue.pop(0)
+
+    async def _fake_force_requests(**kwargs):
+        captured["force_kwargs"] = kwargs
+        return [
+            {
+                "request_id": "req-forced-1",
+                "tool_name": "web_search",
+                "query": "attention mechanism explainer site:wikipedia.org OR site:developers.google.com",
+                "reason": "Need one public explainer beyond paper metadata",
+                "max_results": 2,
+            }
+        ]
+
+    async def _fake_execute_requests(**kwargs):
+        captured["executed_requests"] = kwargs["requests"]
+        bundle = literature_api._jsonable_dict(kwargs["resource_bundle"])
+        bundle["bundle_entries"] = [
+            *list(bundle.get("bundle_entries") or []),
+            {
+                "resource_id": "web:forced:1",
+                "label": "Wikipedia: Attention mechanism",
+                "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
+                "resource_type": "encyclopedia_background",
+                "summary": "High-level explainer",
+                "source_tool": "web_search",
+                "renderable": True,
+                "meta": {"seeded": False},
+            },
+        ]
+        bundle["external_resources"] = [
+            {
+                "resource_id": "web:forced:1",
+                "label": "Wikipedia: Attention mechanism",
+                "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
+                "resource_type": "encyclopedia_background",
+            }
+        ]
+        bundle_meta = literature_api._jsonable_dict(bundle.get("meta") or {})
+        bundle_meta["retrieval_rounds"] = 1
+        bundle["meta"] = bundle_meta
+        return bundle, [{"tool_name": "web_search", "success": True, "latency_ms": 12, "meta": {"request_id": "req-forced-1"}}]
+
+    monkeypatch.setattr(literature_api, "_generate_experience_session_v2_artifact_draft", _fake_generate)
+    monkeypatch.setattr(literature_api, "_generate_experience_v2_mandatory_resource_requests", _fake_force_requests)
+    monkeypatch.setattr(literature_api, "_execute_experience_v2_artifact_resource_requests", _fake_execute_requests)
+
+    updated_session, resource_bundle, artifact_draft, authored_plan = await literature_api._run_reader_experience_v2_artifact_drafting_loop(
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+        paper=paper,
+        selected_kb_id=0,
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        reading_dossier=dossier,
+        session_payload=session,
+    )
+
+    assert captured["executed_requests"][0]["tool_name"] == "web_search"
+    assert updated_session["meta"]["latest_resource_bundle"]["meta"]["retrieval_rounds"] == 1
+    assert resource_bundle["external_resources"][0]["resource_id"] == "web:forced:1"
+    assert artifact_draft["nodes"][-1]["node_kind"] == "external_resource"
+    assert authored_plan["external_resources"][0]["url"] == "https://en.wikipedia.org/wiki/Attention_(machine_learning)"
+
+
+@pytest.mark.asyncio
 async def test_execute_experience_v2_artifact_resource_requests_should_treat_empty_kb_result_as_nonfatal(monkeypatch):
     paper = SimpleNamespace(id=78, title="Demo Paper", pdf_path="demo.pdf")
     seed_bundle = {
@@ -6746,6 +7207,182 @@ async def test_execute_experience_v2_artifact_resource_requests_should_treat_emp
     assert feedback[0]["status"] == "no_results"
     assert tool_trace[0]["tool_name"] == "knowledge_search"
     assert tool_trace[0]["meta"]["nonfatal_empty_result"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_reader_experience_v2_artifact_drafting_loop_should_finalize_when_round_budget_exhausted_but_bundle_is_already_sufficient(
+    monkeypatch,
+):
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    cache_key = literature_api._experience_session_v2_cache_key(
+        user_id=5,
+        paper_id=78,
+        focus_page=7,
+        selected_kb_id=84,
+        dossier_signature=literature_api._reading_dossier_v2_signature(dossier),
+        user_intent="build experience",
+        reader_profile="curious_generalist",
+    )
+    session = literature_api._build_experience_session_v2(
+        cache_key=cache_key,
+        reading_dossier=dossier,
+        focus_page=7,
+        reader_profile="curious_generalist",
+        max_iterations=4,
+        max_tool_rounds=6,
+        narrative_brief=_build_sample_experience_session_v2_narrative_brief(),
+        meta={"route_kind": "experience_v2_live"},
+    )
+    paper = SimpleNamespace(
+        id=78,
+        title="Demo Paper",
+        pdf_path="demo.pdf",
+        url="https://example.com/paper",
+        doi="10.1000/demo",
+        arxiv_url="https://arxiv.org/abs/1234.5678",
+        pdf_url="https://example.com/paper.pdf",
+    )
+
+    draft_queue = [
+        _build_sample_experience_session_v2_artifact_draft(
+            nodes=[
+                {"node_kind": "heading", "text": "Attention 的第一页导读"},
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "The dominant sequence transduction models are based on recurrent or convolutional neural networks.",
+                    "translation_zh": "主流的序列转换模型通常依赖循环网络或卷积网络。",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                },
+                {"node_kind": "paragraph", "text": "先解释这一页的总主张，再补一条外部解释资源。"},
+            ],
+            resource_requests=[
+                {
+                    "request_id": "req-r1",
+                    "tool_name": "web_search",
+                    "query": "Transformer attention explainer",
+                    "reason": "Need one public explainer",
+                    "max_results": 2,
+                }
+            ],
+        ),
+        _build_sample_experience_session_v2_artifact_draft(
+            nodes=[
+                {"node_kind": "heading", "text": "Attention 的第一页导读"},
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "The dominant sequence transduction models are based on recurrent or convolutional neural networks.",
+                    "translation_zh": "主流的序列转换模型通常依赖循环网络或卷积网络。",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                },
+                {"node_kind": "paragraph", "text": "已经有一条百科资源，但模型还想补一条平行解释。"},
+                {
+                    "node_kind": "external_resource",
+                    "label": "Wikipedia: Attention mechanism",
+                    "resource_ref_ids": ["web:forced:1"],
+                },
+            ],
+            resource_requests=[
+                {
+                    "request_id": "req-r2",
+                    "tool_name": "web_search",
+                    "query": "self-attention tutorial overview",
+                    "reason": "Maybe add another explainer",
+                    "max_results": 2,
+                }
+            ],
+        ),
+        _build_sample_experience_session_v2_artifact_draft(
+            nodes=[
+                {"node_kind": "heading", "text": "Attention 的第一页导读"},
+                {
+                    "node_kind": "original_excerpt",
+                    "display_text": "The dominant sequence transduction models are based on recurrent or convolutional neural networks.",
+                    "translation_zh": "主流的序列转换模型通常依赖循环网络或卷积网络。",
+                    "source_layout_ids": ["layout:7:1"],
+                    "source_block_ids": ["blk-7-1"],
+                },
+                {"node_kind": "paragraph", "text": "这一版其实已经能成页，只是还在继续要平行网页。"},
+                {
+                    "node_kind": "external_resource",
+                    "label": "Wikipedia: Attention mechanism",
+                    "resource_ref_ids": ["web:forced:1"],
+                },
+            ],
+            resource_requests=[
+                {
+                    "request_id": "req-r3",
+                    "tool_name": "web_search",
+                    "query": "Transformer explainer for beginners",
+                    "reason": "Unnecessary extra explainer",
+                    "max_results": 2,
+                }
+            ],
+        ),
+    ]
+
+    async def _fake_generate(**_kwargs):
+        return draft_queue.pop(0)
+
+    async def _fake_execute_requests(**kwargs):
+        bundle = literature_api._jsonable_dict(kwargs["resource_bundle"])
+        requests = [literature_api._jsonable_dict(item) for item in list(kwargs.get("requests") or [])]
+        bundle_entries = list(bundle.get("bundle_entries") or [])
+        if not any(str(item.get("resource_id") or "") == "web:forced:1" for item in bundle_entries):
+            bundle_entries.append(
+                {
+                    "resource_id": "web:forced:1",
+                    "label": "Wikipedia: Attention mechanism",
+                    "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
+                    "resource_type": "encyclopedia_background",
+                    "summary": "High-level explainer",
+                    "source_tool": "web_search",
+                    "renderable": True,
+                    "meta": {"seeded": False},
+                }
+            )
+        bundle["bundle_entries"] = bundle_entries
+        bundle["external_resources"] = [
+            {
+                "resource_id": "web:forced:1",
+                "label": "Wikipedia: Attention mechanism",
+                "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
+                "resource_type": "encyclopedia_background",
+            }
+        ]
+        bundle_meta = literature_api._jsonable_dict(bundle.get("meta") or {})
+        bundle_meta["retrieval_rounds"] = int(bundle_meta.get("retrieval_rounds") or 0) + 1
+        bundle["meta"] = bundle_meta
+        return bundle, [
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "latency_ms": 12,
+                "tool_args": {"query": str(requests[0].get("query") or "")},
+            }
+        ]
+
+    monkeypatch.setattr(literature_api, "_generate_experience_session_v2_artifact_draft", _fake_generate)
+    monkeypatch.setattr(literature_api, "_execute_experience_v2_artifact_resource_requests", _fake_execute_requests)
+
+    updated_session, resource_bundle, artifact_draft, authored_plan = await literature_api._run_reader_experience_v2_artifact_drafting_loop(
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+        paper=paper,
+        selected_kb_id=84,
+        compose_payload=_build_sample_compose_payload_for_dossier_v2(),
+        reading_dossier=dossier,
+        session_payload=session,
+    )
+
+    assert artifact_draft["resource_requests"] == []
+    assert artifact_draft["meta"]["resource_request_budget_exhausted"] is True
+    assert artifact_draft["meta"]["dropped_pending_resource_requests"] == 1
+    assert resource_bundle["meta"]["resource_request_budget_exhausted"] is True
+    assert resource_bundle["external_resources"][0]["resource_id"] == "web:forced:1"
+    assert updated_session["meta"]["latest_artifact_draft"]["resource_requests"] == []
+    assert authored_plan["external_resources"][0]["url"] == "https://en.wikipedia.org/wiki/Attention_(machine_learning)"
 
 
 def test_page_artifact_v2_authored_plan_should_keep_neighboring_continuity_latent():
@@ -7328,6 +7965,80 @@ def test_page_artifact_v2_should_allow_draft_selected_media_caption_excerpt():
     assert excerpt_blocks[0]["text"].startswith("Fig 3. Concordance and insight")
 
 
+def test_page_artifact_v2_should_allow_draft_selected_non_main_flow_excerpt_when_source_ids_are_explicit():
+    dossier = _build_sample_reading_dossier_v2_for_session()
+    footnote_text = (
+        "*Equal contribution. Listing order is random. Jakob proposed replacing RNNs with self-attention and "
+        "started the effort to evaluate this idea."
+    )
+    footnote_blocks = ["foot-1", "foot-2", "foot-3"]
+    dossier["current_page"]["rich_grounding"]["reading_nodes"].append(
+        {
+            "node_id": "layout:7:footnote",
+            "node_kind": "footer",
+            "clean_text": footnote_text,
+            "normalized_text": footnote_text,
+            "raw_text": footnote_text,
+            "source_layout_ids": ["layout:7:footnote"],
+            "source_block_ids": footnote_blocks,
+            "include_in_main_flow": False,
+            "meta": {"layout_type": "corner_note"},
+        }
+    )
+    dossier["current_page"]["rich_grounding"]["layout_atoms"].append(
+        {
+            "layout_id": "layout:7:footnote",
+            "layout_type": "corner_note",
+            "clean_text": footnote_text,
+            "normalized_text": footnote_text,
+            "raw_text": footnote_text,
+            "canonical_block_ids": footnote_blocks,
+            "include_in_main_flow": False,
+        }
+    )
+    dossier["current_page"]["rich_grounding"]["evidence_map"].append(
+        {
+            "source_layout_id": "layout:7:footnote",
+            "source_block_ids": footnote_blocks,
+            "evidence_id": "layout:7:footnote",
+        }
+    )
+
+    artifact_draft = _build_sample_experience_session_v2_artifact_draft(
+        nodes=[
+            {
+                "node_kind": "heading",
+                "text": "作者贡献脚注也可以作为当前页补充锚点。",
+            },
+            {
+                "node_kind": "original_excerpt",
+                "display_text": footnote_text,
+                "source_layout_ids": ["layout:7:footnote"],
+                "source_block_ids": footnote_blocks,
+            },
+            {
+                "node_kind": "paragraph",
+                "text": "即使脚注不在 main flow，只要模型明确选中了它，也不该把整页 artifact 打死。",
+            },
+        ],
+    )
+    authored_plan = literature_api._promote_experience_v2_artifact_draft_to_authored_plan(
+        artifact_draft=artifact_draft,
+        resource_bundle={"bundle_entries": [], "external_resources": [], "required_media_refs": [], "continuity_resolutions": [], "meta": {}},
+    )
+
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=dossier,
+        authored_plan=authored_plan,
+    )
+
+    excerpt_blocks = [block for block in artifact["reading_blocks"] if block["segment_kind"] == "original_excerpt"]
+    assert len(excerpt_blocks) == 1
+    assert excerpt_blocks[0]["source_layout_ids"] == ["layout:7:footnote"]
+    assert excerpt_blocks[0]["source_block_ids"] == footnote_blocks
+    assert excerpt_blocks[0]["text"] == footnote_text
+
+
 def test_page_artifact_v2_should_allow_draft_selected_figure_name_excerpt():
     dossier = _build_sample_reading_dossier_v2_for_session()
     dossier["current_page"]["rich_grounding"]["reading_nodes"] = []
@@ -7690,7 +8401,7 @@ async def test_reader_experience_v2_cached_payload_should_return_generation_shel
 
 
 @pytest.mark.asyncio
-async def test_prepare_reader_experience_v2_runtime_should_fail_loudly_when_structured_adjacent_context_is_unavailable(monkeypatch):
+async def test_prepare_reader_experience_v2_runtime_should_degrade_when_structured_adjacent_context_is_unavailable(monkeypatch):
     paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
     compose_payload = _build_sample_compose_payload_for_dossier_v2()
 
@@ -7704,13 +8415,14 @@ async def test_prepare_reader_experience_v2_runtime_should_fail_loudly_when_stru
     monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _make_fake_v2_compose_service(compose_payload))
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
 
-    with pytest.raises(HTTPException, match="neighboring-page structured context unavailable for v2 route"):
-        await literature_api._prepare_reader_experience_v2_runtime(
-            paper_id=78,
-            payload=literature_api.ReaderExperiencePlanRequest(page=7, focus_page=7, reader_profile="curious_generalist"),
-            db=SimpleNamespace(),
-            current_user=SimpleNamespace(id=5),
-        )
+    runtime_state = await literature_api._prepare_reader_experience_v2_runtime(
+        paper_id=78,
+        payload=literature_api.ReaderExperiencePlanRequest(page=7, focus_page=7, reader_profile="curious_generalist"),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert runtime_state["reading_dossier"]["adjacent_pages"]["pages"] == []
 
 
 @pytest.mark.asyncio

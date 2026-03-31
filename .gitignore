@@ -125,7 +125,11 @@ backend/eval/retrieval_beir/.cache/**
 # Reader runtime artifacts
 backend/uploads/
 backend/.cache/
+backend/.triton/
 backend/.nv/
 backend/models/
 backend/vendor/docling-wheelhouse/
 uploads/
+
+# Local manual notebook/upload fixtures
+tests/car_parts_final.csv

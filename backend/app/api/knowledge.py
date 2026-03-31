@@ -62,6 +62,7 @@ from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.contextual_retrieval_service import (
     build_adjacent_lookup_keys,
     build_context_summary,
+    build_reranker_input,
     compose_embedding_input,
     merge_adjacent_context,
     normalize_adjacent_window,
@@ -109,6 +110,8 @@ _ACTIVE_DOCUMENT_TASKS: Set[int] = set()
 _ACTIVE_DOCUMENT_TASKS_LOCK: Optional[asyncio.Lock] = None
 _DOCUMENT_TASK_HANDLES: dict[int, asyncio.Task] = {}
 _DOCUMENT_TASK_CANCEL_REQUESTS: Set[int] = set()
+_DOCUMENT_TASK_RUN_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_DOCUMENT_TASK_RUN_SEMAPHORE_LIMIT: Optional[int] = None
 _STATUS_STREAM_SNAPSHOT_LIMIT = 50
 _REFERENCE_SECTION_RE = re.compile(
     r"^(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s*)?(?:references?|bibliography|参考文献)\s*$",
@@ -148,6 +151,27 @@ def _estimate_new_chunk_count_for_dimension_policy(
         int(config.base_chunk_size or 0) - int(config.chunk_overlap or 0),
     )
     return max(1, int(math.ceil(normalized_chars / stride_chars)))
+
+
+def _build_reranker_documents(candidates: list[Any]) -> list[str]:
+    documents: list[str] = []
+    for candidate in list(candidates or []):
+        row = getattr(candidate, "row", None)
+        if row is None:
+            documents.append("")
+            continue
+        documents.append(
+            build_reranker_input(
+                content=getattr(row, "content", "") or "",
+                context_summary=getattr(row, "context_summary", None),
+                document_name=getattr(row, "document_name", None),
+                section_title=getattr(row, "section_title", None),
+                section_type=getattr(row, "section_type", None),
+                max_context_length=int(settings.reranker_context_max_chars or 220),
+                max_content_length=int(settings.reranker_snippet_max_chars or 960),
+            )
+        )
+    return documents
 
 
 def _unique_nonempty_strings(values: list[Any]) -> list[str]:
@@ -620,6 +644,15 @@ def _get_active_document_tasks_lock() -> asyncio.Lock:
     return _ACTIVE_DOCUMENT_TASKS_LOCK
 
 
+def _get_document_task_run_semaphore() -> asyncio.Semaphore:
+    global _DOCUMENT_TASK_RUN_SEMAPHORE, _DOCUMENT_TASK_RUN_SEMAPHORE_LIMIT
+    limit = max(1, int(getattr(settings, "knowledge_document_task_max_concurrency", 2) or 2))
+    if _DOCUMENT_TASK_RUN_SEMAPHORE is None or _DOCUMENT_TASK_RUN_SEMAPHORE_LIMIT != limit:
+        _DOCUMENT_TASK_RUN_SEMAPHORE = asyncio.Semaphore(limit)
+        _DOCUMENT_TASK_RUN_SEMAPHORE_LIMIT = limit
+    return _DOCUMENT_TASK_RUN_SEMAPHORE
+
+
 async def _claim_document_task_slot(doc_id: int) -> bool:
     lock = _get_active_document_tasks_lock()
     async with lock:
@@ -693,6 +726,24 @@ def _build_document_task_done_callback(doc_id: int):
     return _callback
 
 
+async def _run_document_task_with_queue(doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
+    semaphore = _get_document_task_run_semaphore()
+    queued_at = time.perf_counter()
+    async with semaphore:
+        wait_ms = (time.perf_counter() - queued_at) * 1000
+        if wait_ms >= 10:
+            logger.info(
+                "[KnowledgeQueue] doc_id={} acquired processing slot after {}ms wait",
+                int(doc_id),
+                round(wait_ms, 2),
+            )
+        await process_document_task(
+            doc_id=int(doc_id),
+            chunk_size=int(chunk_size),
+            chunk_overlap=int(chunk_overlap),
+        )
+
+
 async def _schedule_document_task(doc_id: int, chunk_size: int, chunk_overlap: int) -> bool:
     normalized_doc_id = int(doc_id)
     lock = _get_active_document_tasks_lock()
@@ -704,7 +755,7 @@ async def _schedule_document_task(doc_id: int, chunk_size: int, chunk_overlap: i
             _DOCUMENT_TASK_HANDLES.pop(normalized_doc_id, None)
 
         task = asyncio.create_task(
-            process_document_task(
+            _run_document_task_with_queue(
                 doc_id=normalized_doc_id,
                 chunk_size=int(chunk_size),
                 chunk_overlap=int(chunk_overlap),
@@ -1625,8 +1676,11 @@ async def delete_knowledge_base(
     documents = result.scalars().all()
     
     for doc in documents:
-        if doc.file_path and os.path.exists(doc.file_path):
+        preserve_file = await _document_file_has_other_references(db, doc)
+        if doc.file_path and os.path.exists(doc.file_path) and not preserve_file:
             _safe_remove_file(doc.file_path, context=f"delete_kb:{kb_id}")
+        elif preserve_file:
+            logger.info(f"[Knowledge API] 删除知识库时保留共享文件: kb={kb_id}, doc={doc.id}, path={doc.file_path}")
     
     await db.delete(kb)
     await db.commit()
@@ -2882,6 +2936,8 @@ async def resume_interrupted_document_tasks_on_startup() -> dict[str, Any]:
                 continue
             resume_reason = "startup_resume_from_cache" if _document_has_resume_cache(doc) else "startup_resume_restart"
             _mark_document_retry_requested(doc, reason=resume_reason, trigger="startup")
+            doc.status = DocumentStatus.PENDING.value
+            doc.error_message = None
             scheduled.append((int(doc.id), int(kb.chunk_size or 500), int(kb.chunk_overlap or 50)))
             recovered_doc_ids.append(int(doc.id))
 
@@ -3016,15 +3072,20 @@ async def get_document_status(
         )
 
     if (
-        doc.status == DocumentStatus.RUNNING.value
+        doc.status in {DocumentStatus.RUNNING.value, DocumentStatus.PENDING.value}
         and not _has_live_document_task(int(doc.id))
         and bool(doc.file_path)
         and os.path.exists(str(doc.file_path))
         and not _document_retry_requested_recently(doc, minimum_interval_seconds=45)
     ):
+        resume_from_cache = _document_has_resume_cache(doc)
+        if doc.status == DocumentStatus.RUNNING.value:
+            reason = "status_poll_resume_from_cache" if resume_from_cache else "status_poll_resume_restart"
+        else:
+            reason = "status_poll_queue_resume_from_cache" if resume_from_cache else "status_poll_queue_resume_restart"
         _mark_document_retry_requested(
             doc,
-            reason="status_poll_resume_from_cache" if _document_has_resume_cache(doc) else "status_poll_resume_restart",
+            reason=reason,
             trigger="status_poll",
         )
         doc.status = DocumentStatus.PENDING.value
@@ -3045,7 +3106,7 @@ async def get_document_status(
             "[KnowledgeResume] status poll resumed interrupted document: doc_id={}, kb_id={}, reason={}",
             int(doc.id),
             int(kb_id),
-            str(_document_retry_metadata(doc).get("reason") or ""),
+            reason,
         )
 
     processing = _document_processing_snapshot(doc)
@@ -3517,6 +3578,7 @@ async def search_knowledge(
                 dc.chunk_level,
                 dc.section_type,
                 dc.section_title,
+                dc.context_summary,
                 dc.parent_chunk_id,
                 dc.embedding_model,
                 dc.embedding_dimension,
@@ -3624,6 +3686,7 @@ async def search_knowledge(
                 dc.chunk_level,
                 dc.section_type,
                 dc.section_title,
+                dc.context_summary,
                 dc.parent_chunk_id,
                 NULL::float as similarity,
                 ts_rank_cd(
@@ -3697,9 +3760,19 @@ async def search_knowledge(
         rerank_started_at = time.perf_counter()
         try:
             reranker = get_reranker_service()
+            rerank_documents = _build_reranker_documents(fused_candidates)
+            rerank_lengths = [len(doc) for doc in rerank_documents if doc]
+            avg_chars = (sum(rerank_lengths) / len(rerank_lengths)) if rerank_lengths else 0.0
+            max_chars = max(rerank_lengths) if rerank_lengths else 0
+            avg_est_tokens = (avg_chars / 4.0) if avg_chars > 0 else 0.0
+            logger.info(
+                f"[search:{search_trace_id}] 精排输入准备: 候选={len(rerank_documents)}, "
+                f"avg_chars={avg_chars:.1f}, max_chars={max_chars}, "
+                f"avg_est_tokens={avg_est_tokens:.1f}, elapsed={_elapsed_ms():.2f}ms"
+            )
             reranked = await reranker.rerank(
                 query=request.query,
-                documents=[candidate.row.content for candidate in fused_candidates],
+                documents=rerank_documents,
                 top_k=final_top_k,
             )
             selected_candidates = [

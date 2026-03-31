@@ -4,6 +4,8 @@ import { message, Modal } from 'antd'
 import { codelabApi, Notebook, Cell } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
+const CELL_EXECUTION_TIMEOUT_SECONDS = 20
+
 /**
  * useNotebook - 封装 Notebook 的全部 CRUD 操作和 Cell 管理
  *
@@ -128,7 +130,7 @@ export function useNotebook() {
       const result = await codelabApi.executeCell(currentNotebook.id, {
         code,
         cell_id: cellId,
-        timeout: 30,
+        timeout: CELL_EXECUTION_TIMEOUT_SECONDS,
       })
 
       startTransition(() => {
@@ -145,7 +147,22 @@ export function useNotebook() {
         })
       })
 
-      if (!result.success) message.warning('代码执行出错')
+      if (!result.success) {
+        const errorOutput = result.outputs.find(output => output.output_type === 'error')
+        const errorDetail = typeof errorOutput?.content === 'object' && errorOutput?.content && 'evalue' in errorOutput.content
+          ? String(errorOutput.content.evalue ?? '')
+          : ''
+
+        if (result.terminated_reason === 'timeout') {
+          message.warning(errorDetail || `代码执行超时（>${CELL_EXECUTION_TIMEOUT_SECONDS}s）`)
+        } else if (result.terminated_reason === 'policy_violation') {
+          message.warning(errorDetail || '代码触发沙箱限制')
+        } else if (result.terminated_reason === 'resource_limit') {
+          message.warning(errorDetail || '当前执行任务过多，请稍后重试')
+        } else {
+          message.warning(errorDetail || '代码执行出错')
+        }
+      }
     } catch (error) {
       handleApiError(error, '执行失败')
     } finally {

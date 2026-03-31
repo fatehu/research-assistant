@@ -24,6 +24,7 @@ import { useKnowledgeStore } from '@/stores/knowledgeStore'
 import { useMentorshipStore } from '@/stores/mentorshipStore'
 import { RoleBadge } from '@/components/ui'
 import { StudentActivities } from '@/components/team/MentorDashboard'
+import RetrievalRuntimeStatusStrip from '@/components/system/RetrievalRuntimeStatusStrip'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import 'dayjs/locale/zh-cn'
@@ -430,6 +431,8 @@ const DashboardPage = () => {
                       </div>
                     ))}
                   </div>
+
+                  <RetrievalRuntimeStatusStrip />
 
                   {/* 快速输入框 */}
                   <div className="relative max-w-4xl">

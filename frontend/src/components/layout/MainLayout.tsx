@@ -7,7 +7,6 @@ import {
   DatabaseOutlined,
   FileTextOutlined,
   CodeOutlined,
-  GlobalOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   SearchOutlined,
@@ -316,12 +315,6 @@ const MainLayout = () => {
       icon: <CodeOutlined />,
       label: '代码实验室',
       disabled: false,
-    },
-    {
-      key: '/feed',
-      icon: <GlobalOutlined style={{ color: '#94a3b8' }} />,
-      label: <span style={{ color: '#94a3b8' }}>资讯追踪 <span style={{ fontSize: 10, opacity: 0.7 }}>(即将推出)</span></span>,
-      disabled: true,
     },
   ]), [])
 

@@ -11,10 +11,11 @@ interface SearchResultListItemProps {
   index: number
   sourceInfo: SourceInfo
   onSave: (paper: PaperSearchResult) => void
+  savePending?: boolean
 }
 
 /** 搜索结果列表视图项 */
-const SearchResultListItem = ({ paper, index, sourceInfo, onSave }: SearchResultListItemProps) => (
+const SearchResultListItem = ({ paper, index, sourceInfo, onSave, savePending = false }: SearchResultListItemProps) => (
   <div
     className="group flex items-center gap-4 rounded-[22px] border border-transparent px-4 py-3 transition-all duration-200 hover:border-white/[0.06] hover:bg-white/[0.04]"
     style={{ animationDelay: `${index * 30}ms` }}
@@ -73,9 +74,11 @@ const SearchResultListItem = ({ paper, index, sourceInfo, onSave }: SearchResult
           size="small"
           icon={<PlusOutlined />}
           onClick={() => onSave(paper)}
+          loading={savePending}
+          disabled={savePending}
           className="!border-emerald-400/20 !bg-emerald-400/12 !text-emerald-200 hover:!border-emerald-300/30 hover:!bg-emerald-400/18"
         >
-          保存
+          {savePending ? '保存中...' : '保存'}
         </Button>
       )}
       {paper.pdf_url && (

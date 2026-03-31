@@ -79,6 +79,39 @@ def compose_embedding_input(
     return f"[Context]\n{summary}\n[Content]\n{body}"
 
 
+def build_reranker_input(
+    *,
+    content: str,
+    context_summary: str | None = None,
+    document_name: str | None = None,
+    section_title: str | None = None,
+    section_type: str | None = None,
+    max_context_length: int = 220,
+    max_content_length: int = 960,
+) -> str:
+    """Compose a compact structured input for cross-encoder reranking."""
+    body = (content or "").strip()
+    if not body:
+        return ""
+
+    context = (context_summary or "").strip()
+    if not context:
+        context = build_context_summary(
+            document_name=document_name,
+            section_title=section_title,
+            section_type=section_type,
+            max_length=max_context_length,
+        )
+    elif len(context) > max_context_length:
+        context = context[: max(0, max_context_length - 3)] + "..."
+
+    snippet = body
+    if len(snippet) > max_content_length:
+        snippet = snippet[: max(0, max_content_length - 3)] + "..."
+
+    return f"[Context]\n{context}\n[Content]\n{snippet}"
+
+
 def build_adjacent_lookup_keys(document_id: int, chunk_index: int, window: int) -> list[tuple[int, int]]:
     """Build (document_id, chunk_index) keys for adjacent context lookup."""
     normalized_window = normalize_adjacent_window(window)

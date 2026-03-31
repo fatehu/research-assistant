@@ -90,9 +90,13 @@ class Settings(BaseSettings):
 
     # Reranker / retrieval
     enable_reranker: bool = True
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_model: str = "Alibaba-NLP/gte-reranker-modernbert-base"
     reranker_device: str = "auto"
-    reranker_top_k: int = 20
+    reranker_top_k: int = 8
+    reranker_batch_size: int = 4
+    reranker_max_length: int = 384
+    reranker_context_max_chars: int = 220
+    reranker_snippet_max_chars: int = 960
 
     enable_hybrid_retrieval: bool = True
     hybrid_vector_top_k: int = 20
@@ -107,6 +111,8 @@ class Settings(BaseSettings):
     search_timeout_fallback_ms: int = 90000
     knowledge_search_timeout_ms: int = 45000
     search_timeout_auto_fallback: bool = True
+    retrieval_warmup_on_startup: bool = True
+    retrieval_warmup_timeout_seconds: int = 180
 
     # Query rewrite
     enable_query_rewrite: bool = True
@@ -136,6 +142,7 @@ class Settings(BaseSettings):
 
     # Document processing safety guard
     document_processing_stale_timeout_seconds: int = 7200
+    knowledge_document_task_max_concurrency: int = 2
     knowledge_resume_running_documents_on_startup: bool = True
     knowledge_resume_running_documents_limit: int = 20
 
@@ -220,6 +227,7 @@ class Settings(BaseSettings):
     agent_function_calling_fallback_xml: bool = True
     agent_parallel_tool_calls_enabled: bool = True
     agent_parallel_tool_calls_max_concurrency: int = 4
+    agent_tool_failure_streak_limit: int = 3
     agent_context_budget_enabled: bool = True
     agent_context_max_input_tokens: int = 10000
     agent_context_window_turns: int = 8
@@ -336,7 +344,7 @@ class Settings(BaseSettings):
     reader_pipeline_version: str = "layout_uid_v1"
     # Single-agent V2 runtime contract
     reader_agent_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
-    reader_agent_model: str = "qwen-3.5-plus"
+    reader_agent_model: str = "qwen3.5-flash"
     reader_agent_timeout_ms: int = 90000
     reader_agent_max_tokens: int = 12000
     # Optional dedicated Phase 3 artifact-drafting model settings.
@@ -435,6 +443,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_constraints(self):
+        explicitly_configured_fields = set(getattr(self, "model_fields_set", set()) or set())
+        if self.app_env == "development":
+            if "knowledge_document_task_max_concurrency" not in explicitly_configured_fields:
+                self.knowledge_document_task_max_concurrency = 1
+            if "knowledge_resume_running_documents_on_startup" not in explicitly_configured_fields:
+                self.knowledge_resume_running_documents_on_startup = False
+
         if self.app_env not in {"staging", "production"}:
             return self
 

@@ -23,6 +23,17 @@ type PageArtifactV2RendererProps = {
     selectedKbId?: number
     userIntent?: string
   }
+  onRewriteBlockRequest?: (block: PageArtifactV2ReadingBlock) => void
+  onRewriteBlockCancel?: () => void
+  activeRewriteBlockId?: string | null
+  rewriteDraft?: string
+  rewritePromptPlaceholder?: string
+  rewritePreviewText?: string
+  onRewriteDraftChange?: (value: string) => void
+  onRewriteSubmit?: () => void
+  rewritingBlockId?: string | null
+  rewriteDisabled?: boolean
+  recentRewriteMarker?: { blockId: string; nonce: number } | null
 }
 
 type MediaBinding = {
@@ -100,6 +111,14 @@ type ReaderAskThreadState = {
   seeded: boolean
 }
 
+type ReaderRewriteAnimationState = {
+  blockId: string
+  visibleText: string
+  isTyping: boolean
+  highlight: boolean
+  nonce: number
+}
+
 const MAX_BLOCK_EXPLAIN_HISTORY_MESSAGES = 12
 const READER_BLOCK_EXPLAIN_LOADING_HINTS = {
   simplify: [
@@ -136,13 +155,30 @@ const SUPPORT_SEGMENT_KINDS = new Set<PageArtifactV2SegmentKind>([
   'aside_content',
 ])
 
+const REWRITABLE_SEGMENT_KINDS = new Set<PageArtifactV2SegmentKind>([
+  'heading',
+  'paragraph',
+  'authored_explanation',
+  'aside_content',
+  'term_annotation',
+])
+
 const RAIL_HINTS = new Set([
   'rail',
   'side',
   'sidebar',
+  'support',
   'side-rail',
   'support-rail',
   'support_rail',
+])
+
+const INLINE_HINTS = new Set([
+  'inline',
+  'block',
+  'main',
+  'main-flow',
+  'main_flow',
 ])
 
 function toClassToken(raw: string): string {
@@ -166,6 +202,14 @@ function compactText(raw: string, maxLength: number): string {
   if (!text) return ''
   if (text.length <= maxLength) return text
   return `${text.slice(0, maxLength - 1).trimEnd()}…`
+}
+
+function getRewriteInlineTitle(block: PageArtifactV2ReadingBlock): string {
+  const kind = String(block.segment_kind || '').trim()
+  if (kind === 'heading') return '重写当前标题'
+  if (kind === 'term_annotation') return '重写当前术语注释'
+  if (kind === 'aside_content') return '重写当前页边提示'
+  return '重写当前块'
 }
 
 function trimTrailingSentencePunctuation(raw: string): string {
@@ -224,7 +268,14 @@ function getReaderRole(block: PageArtifactV2ReadingBlock): string {
 function shouldRenderInRail(block: PageArtifactV2ReadingBlock): boolean {
   const placement = getPlacementHint(block)
   const lane = getLaneHint(block)
-  return RAIL_HINTS.has(placement) || RAIL_HINTS.has(lane)
+  if (RAIL_HINTS.has(placement) || RAIL_HINTS.has(lane)) return true
+  if (!SUPPORT_SEGMENT_KINDS.has(block.segment_kind)) return false
+  if (INLINE_HINTS.has(placement) || INLINE_HINTS.has(lane)) return false
+  return true
+}
+
+function canRewriteExperienceBlock(block: PageArtifactV2ReadingBlock): boolean {
+  return REWRITABLE_SEGMENT_KINDS.has(block.segment_kind)
 }
 
 function cleanLeadCopy(raw: string): string {
@@ -778,6 +829,7 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
   const [askStreamingAnswer, setAskStreamingAnswer] = useState('')
   const [askError, setAskError] = useState('')
   const [askLoadingHintIndex, setAskLoadingHintIndex] = useState(0)
+  const [rewriteAnimation, setRewriteAnimation] = useState<ReaderRewriteAnimationState | null>(null)
   const askAbortRef = useRef<AbortController | null>(null)
   const spineMeta = (artifact.current_page_spine?.meta || {}) as Record<string, unknown>
   const excerptCoverageMeta = (spineMeta.excerpt_coverage || {}) as Record<string, unknown>
@@ -877,6 +929,58 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
   }, [])
 
   useEffect(() => {
+    const marker = props.recentRewriteMarker
+    if (!marker) return
+    const target = (artifact.reading_blocks || []).find((item) => item.segment_id === marker.blockId)
+    if (!target || !canRewriteExperienceBlock(target)) return
+    const fullText = String(target.text || '').trim()
+    if (!fullText) return
+
+    let frameIndex = 0
+    const step = Math.max(1, Math.ceil(fullText.length / 36))
+    setRewriteAnimation({
+      blockId: marker.blockId,
+      visibleText: '',
+      isTyping: true,
+      highlight: true,
+      nonce: marker.nonce,
+    })
+
+    const intervalId = window.setInterval(() => {
+      frameIndex = Math.min(fullText.length, frameIndex + step)
+      const nextText = fullText.slice(0, frameIndex)
+      setRewriteAnimation((current) => {
+        if (!current || current.nonce !== marker.nonce) return current
+        return {
+          ...current,
+          visibleText: nextText,
+          isTyping: frameIndex < fullText.length,
+        }
+      })
+      if (frameIndex >= fullText.length) {
+        window.clearInterval(intervalId)
+      }
+    }, 24)
+
+    const settleTimer = window.setTimeout(() => {
+      setRewriteAnimation((current) => {
+        if (!current || current.nonce !== marker.nonce) return current
+        return {
+          ...current,
+          visibleText: fullText,
+          isTyping: false,
+          highlight: false,
+        }
+      })
+    }, Math.max(1100, Math.min(2600, fullText.length * 22)))
+
+    return () => {
+      window.clearInterval(intervalId)
+      window.clearTimeout(settleTimer)
+    }
+  }, [artifact.reading_blocks, props.recentRewriteMarker])
+
+  useEffect(() => {
     if (!askLoadingKey) {
       setAskLoadingHintIndex(0)
       return
@@ -887,6 +991,21 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     }, 1500)
     return () => window.clearInterval(timerId)
   }, [askLoadingKey])
+
+  const getDisplayedBlock = (block: PageArtifactV2ReadingBlock): PageArtifactV2ReadingBlock => {
+    if (!rewriteAnimation || rewriteAnimation.blockId !== block.segment_id) return block
+    return {
+      ...block,
+      text: rewriteAnimation.isTyping
+        ? (rewriteAnimation.visibleText || ' ')
+        : String(block.text || ''),
+    }
+  }
+
+  const isRewriteHighlighted = (block: PageArtifactV2ReadingBlock | null | undefined): boolean => {
+    if (!block || !rewriteAnimation) return false
+    return rewriteAnimation.blockId === block.segment_id && rewriteAnimation.highlight
+  }
 
   const heroTitle =
     cleanLeadCopy(derived.firstHeading?.text || '')
@@ -1039,6 +1158,7 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
   )
   const activeAskThread = activeAskKey ? (askThreads[activeAskKey] || getInitialAskThreadState()) : null
   const canUseAskActions = mode === 'reader' && Number(props.navigation?.paperId || 0) > 0
+  const canUseRewriteActions = mode === 'reader' && typeof props.onRewriteBlockRequest === 'function'
 
   const getBlockAskChip = (block: PageArtifactV2ReadingBlock): ReaderBlockAskChip | null => {
     if (!canUseAskActions) return null
@@ -1216,6 +1336,7 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
 
   const handleAskChipClick = (chip: ReaderBlockAskChip) => {
     setActivePreviewKey(null)
+    props.onRewriteBlockCancel?.()
     if (activeAskKey === chip.key) {
       setActiveAskKey(null)
       return
@@ -1248,39 +1369,121 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     void runAskChip(followupChip, nextDraft, nextDraft)
   }
 
-  const renderBlockAskSurface = (chip: ReaderBlockAskChip | null) => {
-    if (!chip) return null
-    const isActive = activeAskKey === chip.key
-    const isLoading = askLoadingKey === chip.key
+  const renderBlockActionSurface = (
+    block: PageArtifactV2ReadingBlock,
+    chip: ReaderBlockAskChip | null,
+  ) => {
+    const isRewritable = canUseRewriteActions && canRewriteExperienceBlock(block)
+    if (!chip && !isRewritable) return null
+    const isActive = Boolean(chip && activeAskKey === chip.key)
+    const isLoading = Boolean(chip && askLoadingKey === chip.key)
     const isStreaming = isLoading && Boolean(askStreamingAnswer)
     const hasAssistantReply = Boolean(activeAskThread?.messages.some((item) => item.role === 'assistant'))
     const queryStage = isLoading ? (isStreaming ? 'streaming' : 'loading') : (hasAssistantReply ? 'settled' : 'ready')
-    const loadingHint = getBlockExplainLoadingHint(chip.explainKind, askLoadingHintIndex)
-    const streamingHint = getBlockExplainStreamingHint(chip.explainKind)
-    const contextNote = getBlockExplainContextNote(chip.explainKind)
-    const loadingCues = READER_BLOCK_EXPLAIN_LOADING_CUES[chip.explainKind]
-    const skeletonWidths = READER_BLOCK_EXPLAIN_SKELETON_WIDTHS[chip.explainKind]
+    const loadingHint = chip ? getBlockExplainLoadingHint(chip.explainKind, askLoadingHintIndex) : ''
+    const streamingHint = chip ? getBlockExplainStreamingHint(chip.explainKind) : ''
+    const contextNote = chip ? getBlockExplainContextNote(chip.explainKind) : ''
+    const loadingCues = chip ? READER_BLOCK_EXPLAIN_LOADING_CUES[chip.explainKind] : []
+    const skeletonWidths = chip ? READER_BLOCK_EXPLAIN_SKELETON_WIDTHS[chip.explainKind] : []
+    const isRewriteActive = props.activeRewriteBlockId === block.segment_id
+    const isRewriting = props.rewritingBlockId === block.segment_id
+    const normalizedRewriteDraft = String(props.rewriteDraft || '')
     return (
       <div
         className={[
           'page-artifact-v2__block-actions',
-          `page-artifact-v2__block-actions--${chip.explainKind}`,
-          isActive ? 'page-artifact-v2__block-actions--active' : '',
+          chip ? `page-artifact-v2__block-actions--${chip.explainKind}` : '',
+          isActive || isRewriteActive ? 'page-artifact-v2__block-actions--active' : '',
         ].filter(Boolean).join(' ')}
       >
-        <button
-          type="button"
-          aria-pressed={isActive}
-          onClick={() => handleAskChipClick(chip)}
-          className={[
-            'page-artifact-v2__inline-chip',
-            `page-artifact-v2__inline-chip--${chip.explainKind}`,
-            isLoading ? 'page-artifact-v2__inline-chip--busy' : '',
-          ].filter(Boolean).join(' ')}
-        >
-          {chip.label}
-        </button>
-        {isActive ? (
+        <div className="page-artifact-v2__block-actions-row">
+          {chip ? (
+            <button
+              type="button"
+              aria-pressed={isActive}
+              onClick={() => handleAskChipClick(chip)}
+              className={[
+                'page-artifact-v2__inline-chip',
+                `page-artifact-v2__inline-chip--${chip.explainKind}`,
+                isLoading ? 'page-artifact-v2__inline-chip--busy' : '',
+              ].filter(Boolean).join(' ')}
+            >
+              {chip.label}
+            </button>
+          ) : null}
+          {isRewritable ? (
+            <button
+              type="button"
+              aria-pressed={isRewriteActive}
+              aria-busy={isRewriting}
+              disabled={Boolean(props.rewriteDisabled || isRewriting)}
+              onClick={() => {
+                if (isRewriteActive) {
+                  props.onRewriteBlockCancel?.()
+                  return
+                }
+                setActiveAskKey(null)
+                setAskError('')
+                props.onRewriteBlockRequest?.(block)
+              }}
+              className={[
+                'page-artifact-v2__inline-chip',
+                'page-artifact-v2__inline-chip--simplify',
+                'page-artifact-v2__inline-chip--rewrite',
+                isRewriting ? 'page-artifact-v2__inline-chip--busy' : '',
+              ].filter(Boolean).join(' ')}
+            >
+              {isRewriting ? '重写中' : '重写当前块'}
+            </button>
+          ) : null}
+        </div>
+        {isRewritable && isRewriteActive ? (
+          <div
+            className={[
+              'page-artifact-v2__block-query',
+              'page-artifact-v2__block-query--rewrite',
+              isRewriting ? 'page-artifact-v2__block-query--streaming' : '',
+            ].filter(Boolean).join(' ')}
+          >
+            <div className="page-artifact-v2__block-query-head">
+              <div className="page-artifact-v2__block-query-kicker">{getRewriteInlineTitle(block)}</div>
+              <div className="page-artifact-v2__block-query-status">
+                只会改写当前块并覆盖当前 artifact cache。重新生成整页后，这次改写可能会被覆盖。
+              </div>
+            </div>
+            {String(props.rewritePreviewText || '').trim() ? (
+              <div className="page-artifact-v2__rewrite-preview">
+                <div className="page-artifact-v2__rewrite-preview-label">当前内容</div>
+                <div className="page-artifact-v2__rewrite-preview-copy">{props.rewritePreviewText}</div>
+              </div>
+            ) : null}
+            <div className="page-artifact-v2__block-query-composer">
+              <Input.TextArea
+                value={normalizedRewriteDraft}
+                onChange={(event) => props.onRewriteDraftChange?.(event.target.value)}
+                autoSize={{ minRows: 3, maxRows: 6 }}
+                maxLength={2000}
+                showCount
+                placeholder={props.rewritePromptPlaceholder || '例如：把这一段讲得更通俗，但保留关键概念和当前页语境。'}
+                disabled={isRewriting}
+              />
+              <div className="page-artifact-v2__block-query-actions page-artifact-v2__block-query-actions--rewrite">
+                <Button onClick={props.onRewriteBlockCancel} disabled={isRewriting}>
+                  取消
+                </Button>
+                <Button
+                  type="primary"
+                  onClick={props.onRewriteSubmit}
+                  loading={isRewriting}
+                  disabled={!normalizedRewriteDraft.trim()}
+                >
+                  应用改写
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {chip && isActive ? (
           <div
             className={[
               'page-artifact-v2__block-query',
@@ -1515,23 +1718,31 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
                       && headingText
                       && headingText === normalizedHeroTitle
                     )
+                    const displayedHeading = group.heading ? getDisplayedBlock(group.heading) : null
                     return group.heading && !shouldHideHeadingAsHeroDuplicate ? (
-                    <header className="page-artifact-v2__section-heading">
-                      {mode === 'workbench' ? (
-                        <div className="page-artifact-v2__block-eyebrow">
-                          <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--support" />
-                          <span className="page-artifact-v2__block-label">阅读引导</span>
-                        </div>
-                      ) : null}
-                      <Title level={3} className="page-artifact-v2__heading-text">
-                        {group.heading.text}
-                      </Title>
-                    </header>
+                    <>
+                      <header className={[
+                        'page-artifact-v2__section-heading',
+                        isRewriteHighlighted(group.heading) ? 'page-artifact-v2__section-heading--rewrite-flash' : '',
+                      ].filter(Boolean).join(' ')}>
+                        {mode === 'workbench' ? (
+                          <div className="page-artifact-v2__block-eyebrow">
+                            <span className="page-artifact-v2__block-dot page-artifact-v2__block-dot--support" />
+                            <span className="page-artifact-v2__block-label">阅读引导</span>
+                          </div>
+                        ) : null}
+                        <Title level={3} className="page-artifact-v2__heading-text">
+                          {displayedHeading?.text || group.heading.text}
+                        </Title>
+                      </header>
+                      {mode === 'reader' ? renderBlockActionSurface(group.heading, null) : null}
+                    </>
                     ) : null
                   })()}
 
                   <div className="page-artifact-v2__section-body">
                     {group.blocks.map((block) => {
+                      const displayedBlock = getDisplayedBlock(block)
                       const askChip = mode === 'reader' ? getBlockAskChip(block) : null
                       const isFigureTarget = Boolean(
                         isFigureFocusMode
@@ -1545,10 +1756,11 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
                             isFigureFocusMode && !isFigureTarget ? 'page-artifact-v2__main-item--figure-muted' : '',
                             isFigureTarget ? 'page-artifact-v2__main-item--figure-focus' : '',
                             isFigureTarget && askLoadingKey === activeAskChip?.key ? 'page-artifact-v2__main-item--figure-scanning' : '',
+                            isRewriteHighlighted(block) ? 'page-artifact-v2__main-item--rewrite-flash' : '',
                           ].filter(Boolean).join(' ')}
                         >
-                          {renderMainBlock(block, derived.mainSegmentIds.has(block.segment_id), mode)}
-                          {mode === 'reader' ? renderBlockAskSurface(askChip) : null}
+                          {renderMainBlock(displayedBlock, derived.mainSegmentIds.has(block.segment_id), mode)}
+                          {mode === 'reader' ? renderBlockActionSurface(block, askChip) : null}
                         </div>
                       )
                     })}
@@ -1574,11 +1786,18 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
               ) : null}
               <div className="page-artifact-v2__side-stack">
                 {derived.railBlocks.map((block) => {
+                  const displayedBlock = getDisplayedBlock(block)
                   const askChip = mode === 'reader' ? getBlockAskChip(block) : null
                   return (
-                    <div key={block.segment_id} className="page-artifact-v2__side-item">
-                      {renderSupportCard(block, mode, 'rail')}
-                      {mode === 'reader' ? renderBlockAskSurface(askChip) : null}
+                    <div
+                      key={block.segment_id}
+                      className={[
+                        'page-artifact-v2__side-item',
+                        isRewriteHighlighted(block) ? 'page-artifact-v2__side-item--rewrite-flash' : '',
+                      ].filter(Boolean).join(' ')}
+                    >
+                      {renderSupportCard(displayedBlock, mode, 'rail')}
+                      {mode === 'reader' ? renderBlockActionSurface(block, askChip) : null}
                     </div>
                   )
                 })}

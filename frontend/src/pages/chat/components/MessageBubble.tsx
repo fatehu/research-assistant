@@ -1,14 +1,20 @@
-import { useState, forwardRef } from 'react'
+import { useMemo, useState, forwardRef } from 'react'
 import { Button, Tooltip, Avatar, message } from 'antd'
 import {
   RobotOutlined,
   UserOutlined,
   CopyOutlined,
+  SearchOutlined,
+  DatabaseOutlined,
+  LinkOutlined,
+  ThunderboltOutlined,
+  DownOutlined,
+  UpOutlined,
 } from '@ant-design/icons'
-import { motion } from 'framer-motion'
+import { AnimatePresence, motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { SHOW_RAG_METRICS, type Message, type RagMetrics } from '@/services/api'
+import { SHOW_RAG_METRICS, type Message, type RagMetrics, type ReactStep } from '@/services/api'
 import CodeBlock from './CodeBlock'
 import ThinkingPanel from './ThinkingPanel'
 import HistoryReActPanel from './HistoryReActPanel'
@@ -20,6 +26,22 @@ interface MessageBubbleProps {
   streamingThought?: string
   isThinking?: boolean
   isHighlighted?: boolean
+}
+
+interface KnowledgeEvidenceItem {
+  id: string
+  sourceLabel: string
+  sourcePath: string
+  retrievalScore?: string
+  compressionScore?: string
+  content: string
+}
+
+interface RagMetricCardItem {
+  key: string
+  label: string
+  value: string
+  icon: React.ReactNode
 }
 
 const parseRagMetrics = (value: unknown): RagMetrics | null => {
@@ -57,6 +79,67 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
   return ragUsed ? normalized : null
 }
 
+const normalizeEvidenceContent = (value: string): string =>
+  value.replace(/^\[来源\d+\]\s*/i, '').replace(/\s+/g, ' ').trim()
+
+const parseKnowledgeEvidence = (steps: ReactStep[] | undefined): KnowledgeEvidenceItem[] => {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return []
+  }
+
+  const items: KnowledgeEvidenceItem[] = []
+  const seen = new Set<string>()
+
+  for (const step of steps) {
+    if (step.type !== 'observation' || step.tool !== 'knowledge_search' || !step.output) {
+      continue
+    }
+
+    const output = String(step.output || '').trim()
+    if (!output) continue
+
+    const blockPattern =
+      /\[(来源\d+)\]\s*\(retrieval score ([\d.]+)%\)\s*Source:\s*([^\n]+)\s*Compression score:\s*([\d.]+)\/10\s*Content:\s*([\s\S]*?)(?=\n\[来源\d+\]\s*\(retrieval score|\s*$)/g
+
+    let matched = false
+    let match: RegExpExecArray | null
+    while ((match = blockPattern.exec(output)) !== null) {
+      matched = true
+      const sourceLabel = String(match[1] || '').trim()
+      const sourcePath = String(match[3] || '').trim()
+      const content = normalizeEvidenceContent(String(match[5] || ''))
+      if (!content) continue
+      const id = `${sourcePath}::${content}`
+      if (seen.has(id)) continue
+      seen.add(id)
+      items.push({
+        id,
+        sourceLabel,
+        sourcePath,
+        retrievalScore: String(match[2] || '').trim(),
+        compressionScore: String(match[4] || '').trim(),
+        content,
+      })
+    }
+
+    if (!matched) {
+      const compact = normalizeEvidenceContent(output.replace(/^Compressed contexts:\s*\d+\s*/i, ''))
+      if (!compact) continue
+      const id = `raw::${compact}`
+      if (seen.has(id)) continue
+      seen.add(id)
+      items.push({
+        id,
+        sourceLabel: '检索依据',
+        sourcePath: 'knowledge_search',
+        content: compact,
+      })
+    }
+  }
+
+  return items
+}
+
 /** 消息气泡 - 美化版 */
 const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
   (
@@ -75,12 +158,61 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const reactSteps = isStreaming ? undefined : msg.react_steps
     const [thoughtExpanded, setThoughtExpanded] = useState(false)
     const [ragExpanded, setRagExpanded] = useState(false)
+    const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
+    const evidenceItems = useMemo(
+      () => (!isStreaming && !isUser ? parseKnowledgeEvidence(reactSteps) : []),
+      [isStreaming, isUser, reactSteps]
+    )
+    const ragMetricCards = useMemo<RagMetricCardItem[]>(
+      () =>
+        ragMetrics
+          ? [
+              {
+                key: 'search',
+                label: '检索调用',
+                value: String(ragMetrics.knowledge_search_calls),
+                icon: <SearchOutlined />,
+              },
+              {
+                key: 'sources',
+                label: '来源数',
+                value: String(ragMetrics.source_labels_count),
+                icon: <DatabaseOutlined />,
+              },
+              {
+                key: 'citations',
+                label: '答案引用',
+                value: String(ragMetrics.answer_citation_count),
+                icon: <LinkOutlined />,
+              },
+              {
+                key: 'compression',
+                label: '压缩调用',
+                value: String(ragMetrics.compression_calls),
+                icon: <ThunderboltOutlined />,
+              },
+            ]
+          : [],
+      [ragMetrics]
+    )
 
     const handleCopy = () => {
       navigator.clipboard.writeText(content)
       message.success('已复制到剪贴板')
     }
+    const timeLabel = new Date(msg.created_at).toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+
+    const bubbleColumnClass = isUser
+      ? 'flex min-w-0 flex-1 flex-col items-end'
+      : 'flex min-w-0 flex-1 flex-col'
+    const userBubbleShellClass = 'inline-flex max-w-[min(76%,720px)] flex-col items-end'
+    const assistantBubbleWidthClass = 'w-full max-w-[min(100%,860px)]'
+    const hasAssistantPrelude =
+      !isUser && !isStreaming && ((reactSteps?.length ?? 0) > 0 || Boolean(thought))
 
     return (
       <motion.div
@@ -89,7 +221,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3, ease: 'easeOut' }}
-        className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''} ${
+        className={`flex items-start gap-3.5 ${isUser ? 'flex-row-reverse' : ''} ${
           isHighlighted ? 'relative' : ''
         }`}
       >
@@ -108,123 +240,134 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
         <div className="flex-shrink-0">
           {isUser ? (
             <Avatar
-              size={40}
+              size={30}
               icon={<UserOutlined />}
-              className="bg-gradient-to-br from-blue-500 to-indigo-600 shadow-lg shadow-blue-500/30"
+              className="border border-slate-700/60 bg-slate-800 text-white shadow-[0_10px_24px_rgba(2,6,23,0.14)]"
             />
           ) : (
-            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-emerald-500 via-teal-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-emerald-500/30">
-              <RobotOutlined className="text-white text-lg" />
+            <div className="flex h-[30px] w-[30px] items-center justify-center rounded-full border border-emerald-400/18 bg-slate-900/72 shadow-[0_10px_24px_rgba(2,6,23,0.14)]">
+              <RobotOutlined className="text-sm text-emerald-300" />
             </div>
           )}
         </div>
 
         {/* 内容区 */}
-        <div className={`flex-1 max-w-[85%] ${isUser ? 'flex flex-col items-end' : ''}`}>
-          {/* 角色标签 */}
-          <div className={`flex items-center gap-2 mb-2 ${isUser ? 'flex-row-reverse' : ''}`}>
-            <span className={`text-sm font-medium ${isUser ? 'text-blue-400' : 'text-emerald-400'}`}>
+        <div className={bubbleColumnClass}>
+          <div className={`mb-2 flex items-center gap-2 ${isUser ? 'justify-end' : ''}`}>
+            <span className={`text-xs font-medium tracking-wide ${isUser ? 'text-slate-300' : 'text-emerald-300'}`}>
               {isUser ? '你' : 'AI 助手'}
             </span>
-            <span className="text-xs text-slate-500">
-              {new Date(msg.created_at).toLocaleTimeString('zh-CN', {
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
-            </span>
+            <span className="text-xs text-slate-500">{timeLabel}</span>
           </div>
 
-          {/* ReAct 推理过程面板 (历史 AI 消息) */}
-          {!isUser && !isStreaming && reactSteps && reactSteps.length > 0 && (
-            <HistoryReActPanel steps={reactSteps} />
-          )}
-
-          {/* 最终思考面板 */}
-          {!isUser && !isStreaming && thought && (
-            <ThinkingPanel
-              thought={thought}
-              isThinking={false}
-              isExpanded={thoughtExpanded}
-              onToggle={() => setThoughtExpanded(!thoughtExpanded)}
-            />
-          )}
-
           {SHOW_RAG_METRICS && !isUser && !isStreaming && ragMetrics && (
-            <div className="relative mb-3 rounded-xl overflow-hidden border border-cyan-500/25 bg-slate-900/80 backdrop-blur-sm">
-              <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/10 via-blue-500/5 to-emerald-500/10 pointer-events-none" />
-              <button
-                type="button"
-                onClick={() => setRagExpanded(!ragExpanded)}
-                className="relative z-10 w-full flex items-center justify-between px-3 py-2 text-left bg-transparent border-0 outline-none appearance-none hover:bg-white/5 transition-colors"
-              >
-                <span className="text-xs font-medium text-cyan-100 tracking-wide">RAG质量</span>
+            <div className="mb-3 flex w-full max-w-[min(100%,860px)] flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRagExpanded(!ragExpanded)}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/[0.08] bg-slate-900/75 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-emerald-400/20 hover:text-white"
+                >
+                  <SearchOutlined className="text-[11px] text-emerald-300" />
+                  检索质量
+                  {ragExpanded ? <UpOutlined className="text-[10px]" /> : <DownOutlined className="text-[10px]" />}
+                </button>
                 <span
-                  className={`text-[11px] px-2 py-0.5 rounded-full border ${
+                  className={`rounded-full border px-2.5 py-1 text-[11px] ${
                     ragMetrics.citation_valid
-                      ? 'text-emerald-300 border-emerald-400/30 bg-emerald-500/10'
-                      : 'text-amber-300 border-amber-400/30 bg-amber-500/10'
+                      ? 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200'
+                      : 'border-amber-400/20 bg-amber-500/10 text-amber-200'
                   }`}
                 >
                   {ragMetrics.citation_valid ? '引用有效' : '引用待修正'}
                 </span>
-              </button>
+                {ragMetricCards.map((item) => (
+                  <span
+                    key={item.key}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-slate-900/65 px-2.5 py-1 text-[11px] text-slate-300"
+                  >
+                    <span className="text-emerald-300">{item.icon}</span>
+                    {item.label} {item.value}
+                  </span>
+                ))}
+              </div>
 
-              {ragExpanded && (
-                <div className="relative z-10 px-3 pb-3 pt-2 border-t border-cyan-500/20 text-xs text-slate-200 grid grid-cols-2 gap-2">
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">检索调用: {ragMetrics.knowledge_search_calls}</div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">来源数: {ragMetrics.source_labels_count}</div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">答案引用: {ragMetrics.answer_citation_count}</div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">需引用: {ragMetrics.citation_required ? '是' : '否'}</div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">压缩调用: {ragMetrics.compression_calls}</div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">
-                    压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}
-                  </div>
-                  <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2">
-                    修复成功/尝试: {ragMetrics.citation_repair_successes}/{ragMetrics.citation_repair_attempts}
-                  </div>
-                  <div className="col-span-2 rounded-lg border border-slate-700/70 bg-slate-900/70 px-2.5 py-2 break-all">
-                    来源标签: {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(', ') : '-'}
-                  </div>
-                </div>
-              )}
+              <AnimatePresence initial={false}>
+                {ragExpanded && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                    className="overflow-hidden"
+                  >
+                    <div className="rounded-2xl border border-white/[0.08] bg-slate-900/72 px-4 py-3 text-xs text-slate-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+                      <div className="flex flex-wrap gap-2">
+                        <span className="rounded-full border border-slate-700/80 bg-slate-950/70 px-2.5 py-1">
+                          需引用: {ragMetrics.citation_required ? '是' : '否'}
+                        </span>
+                        <span className="rounded-full border border-slate-700/80 bg-slate-950/70 px-2.5 py-1">
+                          修复成功/尝试: {ragMetrics.citation_repair_successes}/{ragMetrics.citation_repair_attempts}
+                        </span>
+                        <span className="rounded-full border border-slate-700/80 bg-slate-950/70 px-2.5 py-1">
+                          压缩命中/回退: {ragMetrics.compression_success_chunks}/{ragMetrics.compression_fallback_chunks}
+                        </span>
+                      </div>
+                      <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-slate-500">来源标签</div>
+                      <div className="mt-2 text-sm leading-6 text-slate-200">
+                        {ragMetrics.source_labels.length > 0 ? ragMetrics.source_labels.join(' · ') : '-'}
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           )}
 
           {/* 消息内容 */}
           {isUser ? (
-            // 用户消息 - 简洁风格
-            <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-5 py-3 rounded-2xl rounded-tr-md shadow-lg shadow-blue-500/20">
-              <p className="text-[15px] whitespace-pre-wrap leading-relaxed">{content}</p>
+            <div className={userBubbleShellClass}>
+              <div className="w-fit max-w-full rounded-2xl rounded-tr-md bg-slate-800 px-5 py-3 text-white shadow-[0_12px_24px_rgba(15,23,42,0.16)]">
+                <p className="whitespace-pre-wrap text-base leading-7 text-white">{content}</p>
+              </div>
             </div>
           ) : (
-            // AI消息 - 精美卡片风格
-            <div className="relative">
-              {/* 渐变边框效果 */}
-              <div className="absolute -inset-0.5 bg-gradient-to-r from-emerald-500/20 via-teal-500/20 to-cyan-500/20 rounded-2xl blur-sm" />
+            <div className={assistantBubbleWidthClass}>
+              <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-6 pt-5 pb-6 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_30px_rgba(2,6,23,0.18)]">
+                  {hasAssistantPrelude && (
+                    <div className="mb-3 space-y-3 border-b border-white/[0.04] pb-3">
+                      {reactSteps && reactSteps.length > 0 && (
+                        <HistoryReActPanel steps={reactSteps} embedded />
+                      )}
+                      {thought && (
+                        <ThinkingPanel
+                          thought={thought}
+                          isThinking={false}
+                          isExpanded={thoughtExpanded}
+                          onToggle={() => setThoughtExpanded(!thoughtExpanded)}
+                          embedded
+                        />
+                      )}
+                    </div>
+                  )}
 
-              <div className="relative bg-slate-800/90 backdrop-blur-xl border border-slate-700/50 rounded-2xl rounded-tl-md overflow-hidden">
-                {/* 顶部渐变装饰 */}
-                <div className="h-1 bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500" />
-
-                <div className="p-5">
                   {content ? (
                     <>
                       <div
                         className="prose prose-invert prose-slate max-w-none
-                        prose-p:my-3 prose-p:leading-relaxed prose-p:text-slate-200
+                        [&>*:first-child]:mt-0 [&>*:last-child]:mb-0
+                        prose-p:my-3 prose-p:text-base prose-p:leading-8 prose-p:text-slate-100
                         prose-headings:mt-6 prose-headings:mb-3 prose-headings:text-white prose-headings:font-semibold
                         prose-h1:text-xl prose-h2:text-lg prose-h3:text-base
-                        prose-li:my-1 prose-li:text-slate-200
-                        prose-ul:my-3 prose-ol:my-3
-                        prose-pre:my-4 prose-pre:bg-slate-900 prose-pre:border prose-pre:border-slate-700/50 prose-pre:rounded-xl
-                        prose-code:text-emerald-400 prose-code:bg-slate-900/80 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:text-sm prose-code:font-mono
+                        prose-pre:my-4 prose-pre:bg-slate-950/90 prose-pre:border prose-pre:border-slate-700/60 prose-pre:rounded-xl
+                        prose-code:text-emerald-200 prose-code:bg-white/[0.06] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:text-sm prose-code:font-mono
                         prose-strong:text-white prose-strong:font-semibold
-                        prose-em:text-slate-300 prose-em:italic
-                        prose-a:text-blue-400 prose-a:no-underline hover:prose-a:text-blue-300 hover:prose-a:underline
-                        prose-blockquote:border-l-4 prose-blockquote:border-emerald-500/50 prose-blockquote:bg-slate-900/50 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:rounded-r-lg
+                        prose-em:text-slate-200 prose-em:italic
+                        prose-a:text-emerald-300 prose-a:no-underline hover:prose-a:text-emerald-200 hover:prose-a:underline
+                        prose-blockquote:border-l-4 prose-blockquote:border-slate-600 prose-blockquote:bg-slate-950/60 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:rounded-r-lg
                         prose-hr:border-slate-700 prose-hr:my-6
                         prose-table:border prose-table:border-slate-700 prose-th:bg-slate-800 prose-th:px-3 prose-th:py-2 prose-td:px-3 prose-td:py-2 prose-td:border-t prose-td:border-slate-700
-                        text-[15px] leading-relaxed"
+                        text-base leading-7"
                       >
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
@@ -232,11 +375,105 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                             code: ({ className, children }) => (
                               <CodeBlock className={className}>{children}</CodeBlock>
                             ),
+                            ul: ({ children, ...props }) => (
+                              <ul
+                                {...props}
+                                className="my-3 list-outside list-disc pl-6 text-slate-100 [padding-inline-start:1.5rem]"
+                              >
+                                {children}
+                              </ul>
+                            ),
+                            ol: ({ children, ...props }) => (
+                              <ol
+                                {...props}
+                                className="my-3 list-outside list-decimal pl-6 text-slate-100 [padding-inline-start:1.5rem]"
+                              >
+                                {children}
+                              </ol>
+                            ),
+                            li: ({ children, ...props }) => (
+                              <li {...props} className="my-1 pl-1 text-slate-100 marker:text-slate-400">
+                                {children}
+                              </li>
+                            ),
                           }}
                         >
                           {content}
                         </ReactMarkdown>
                       </div>
+
+                      {evidenceItems.length > 0 && (
+                        <div className="mt-6 overflow-hidden rounded-xl border border-white/[0.05] bg-slate-950/75 shadow-sm">
+                          <button
+                            type="button"
+                            onClick={() => setEvidenceExpanded((value) => !value)}
+                            className="flex w-full items-center justify-between gap-3 bg-slate-950/70 px-5 py-3.5 text-left text-slate-200 transition-colors hover:bg-slate-900/80"
+                          >
+                            <div>
+                              <div className="text-sm font-semibold text-slate-100">检索依据</div>
+                              <div className="text-xs text-slate-500">
+                                来自本轮 `knowledge_search` 的命中片段
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <div className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2.5 py-1 text-[11px] text-slate-300">
+                                {evidenceItems.length} 条
+                              </div>
+                              <span className="flex h-7 w-7 items-center justify-center rounded-full border border-white/[0.08] bg-slate-900/80 text-slate-300">
+                                {evidenceExpanded ? <UpOutlined className="text-[11px]" /> : <DownOutlined className="text-[11px]" />}
+                              </span>
+                            </div>
+                          </button>
+
+                          <AnimatePresence initial={false}>
+                            {evidenceExpanded && (
+                              <motion.div
+                                initial={{ opacity: 0, height: 0 }}
+                                animate={{ opacity: 1, height: 'auto' }}
+                                exit={{ opacity: 0, height: 0 }}
+                                transition={{ duration: 0.2, ease: 'easeOut' }}
+                                className="overflow-hidden"
+                              >
+                                <div className="bg-slate-950/75 px-5 pb-4">
+                                  <div className="space-y-3 pt-0.5">
+                                  {evidenceItems.map((item) => (
+                                    <div
+                                      key={item.id}
+                                      className="rounded-xl border border-slate-700/70 bg-slate-950/70 px-3.5 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                                        <span className="rounded-full border border-emerald-400/20 bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-200">
+                                          {item.sourceLabel}
+                                        </span>
+                                        {item.retrievalScore ? (
+                                          <span className="rounded-full border border-slate-600/70 bg-slate-800 px-2 py-0.5 text-slate-300">
+                                            检索 {item.retrievalScore}%
+                                          </span>
+                                        ) : null}
+                                        {item.compressionScore ? (
+                                          <span className="rounded-full border border-slate-600/70 bg-slate-800 px-2 py-0.5 text-slate-300">
+                                            片段相关度 {item.compressionScore}/10
+                                          </span>
+                                        ) : null}
+                                      </div>
+
+                                      <Tooltip title={item.sourcePath}>
+                                        <div className="mt-2 truncate text-xs text-slate-500">
+                                          {item.sourcePath}
+                                        </div>
+                                      </Tooltip>
+                                      <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100">
+                                        {item.content}
+                                      </div>
+                                    </div>
+                                  ))}
+                                  </div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                      )}
 
                       {/* 流式输出光标 */}
                       {isStreaming && (
@@ -266,15 +503,15 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                   ) : null}
 
                   {/* 操作栏 */}
-                  {!isStreaming && content && (
-                    <div className="flex items-center gap-3 mt-4 pt-4 border-t border-slate-700/50">
+                      {!isStreaming && content && (
+                    <div className="mt-5 flex items-center gap-3 border-t border-white/[0.04] pt-4">
                       <Tooltip title="复制内容">
                         <Button
                           type="text"
                           size="small"
                           icon={<CopyOutlined />}
                           onClick={handleCopy}
-                          className="text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 rounded-lg transition-all"
+                          className="rounded-lg text-slate-400 transition-all hover:bg-white/[0.04] hover:text-emerald-300"
                         >
                           复制
                         </Button>
@@ -284,7 +521,6 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                       <span className="text-xs text-slate-600">AI 生成内容，仅供参考</span>
                     </div>
                   )}
-                </div>
               </div>
             </div>
           )}

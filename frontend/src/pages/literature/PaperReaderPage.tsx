@@ -3330,15 +3330,15 @@ export default function PaperReaderPage() {
     setKnowledgeBases(kbList)
     setCollections(collList)
 
-    const fallbackKbCandidate = Number(
-      requestedKbId ||
-      cachedReader?.selected_kb_id ||
-      nextSession.selected_kb_id ||
-      nextPaper.knowledge_base_id ||
-      kbList[0]?.id,
-    )
+    const resolveAvailableKbId = (value: unknown): number | undefined => {
+      const candidate = Number(value || 0)
+      if (!Number.isFinite(candidate) || candidate <= 0) return undefined
+      return kbList.some((kb) => Number(kb.id) === candidate) ? candidate : undefined
+    }
     const fallbackKb =
-      Number.isFinite(fallbackKbCandidate) && fallbackKbCandidate > 0 ? fallbackKbCandidate : undefined
+      resolveAvailableKbId(requestedKbId)
+      ?? resolveAvailableKbId(cachedReader?.selected_kb_id)
+      ?? resolveAvailableKbId(nextSession.selected_kb_id)
     setSelectedKbId(fallbackKb)
     lastSavedReaderSignatureRef.current = JSON.stringify({
       page: restoredPage,
@@ -3441,8 +3441,9 @@ export default function PaperReaderPage() {
 
   useEffect(() => {
     if (!validPaperId || !searchParams.has('kb') || requestedKbId === selectedKbId) return
+    if (!knowledgeBases.some((kb) => Number(kb.id) === Number(requestedKbId || 0))) return
     setSelectedKbId(requestedKbId)
-  }, [requestedKbId, searchParams, selectedKbId, validPaperId])
+  }, [knowledgeBases, requestedKbId, searchParams, selectedKbId, validPaperId])
 
   useEffect(() => {
     if (!validPaperId) return
@@ -6379,8 +6380,9 @@ export default function PaperReaderPage() {
       <div>
         <Title level={4} className="!mb-1">{paper.title}</Title>
         <Text type="secondary">
-          论文阅读工作台（PDF.js 真阅读器，支持文本层选择、缩放与引用跳转）
+          论文阅读工作台
         </Text>
+        {/* （PDF.js 真阅读器，支持文本层选择、缩放与引用跳转） */}
       </div>
 
       <Row gutter={16}>

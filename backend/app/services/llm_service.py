@@ -3,9 +3,10 @@ LLM service with provider abstraction.
 Supports plain chat, streaming chat, and native function-calling.
 """
 
+import hashlib
 import json
 import re
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from loguru import logger
 from openai import AsyncOpenAI
@@ -15,6 +16,8 @@ from app.config import settings
 
 class LLMService:
     """LLM service for OpenAI-compatible providers."""
+
+    _FUNCTION_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
     REACT_SYSTEM_PROMPT = (
         "你是一个专业的AI科研助手。请先在<think>中简要思考，再在<answer>中给出中文结论。"
@@ -66,6 +69,62 @@ class LLMService:
         full_messages.extend(messages)
         return full_messages
 
+    @staticmethod
+    def _format_exception(exc: Exception) -> str:
+        parts = [f"{type(exc).__name__}: {exc!r}"]
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None:
+            parts.append(f"cause={type(cause).__name__}: {cause!r}")
+        context = getattr(exc, "__context__", None)
+        if context is not None and context is not cause:
+            parts.append(f"context={type(context).__name__}: {context!r}")
+        return " | ".join(parts)
+
+    @classmethod
+    def _sanitize_tool_name(cls, name: str) -> str:
+        raw = str(name or "").strip()
+        if raw and cls._FUNCTION_NAME_PATTERN.fullmatch(raw):
+            return raw
+        sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw).strip("_")
+        return sanitized or "tool"
+
+    @classmethod
+    def _build_provider_safe_tools(
+        cls,
+        tools: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        alias_to_actual: Dict[str, str] = {}
+        used_aliases: set[str] = set()
+        safe_tools: List[Dict[str, Any]] = []
+
+        for item in list(tools or []):
+            if not isinstance(item, dict):
+                safe_tools.append(item)
+                continue
+
+            function_payload = item.get("function")
+            if not isinstance(function_payload, dict):
+                safe_tools.append(dict(item))
+                continue
+
+            actual_name = str(function_payload.get("name") or "").strip()
+            alias_name = cls._sanitize_tool_name(actual_name)
+
+            if alias_name in used_aliases and alias_to_actual.get(alias_name) != actual_name:
+                digest = hashlib.sha1(actual_name.encode("utf-8")).hexdigest()[:8]
+                alias_name = f"{alias_name[:48]}_{digest}"
+
+            used_aliases.add(alias_name)
+            alias_to_actual[alias_name] = actual_name or alias_name
+
+            copied_tool = dict(item)
+            copied_function = dict(function_payload)
+            copied_function["name"] = alias_name
+            copied_tool["function"] = copied_function
+            safe_tools.append(copied_tool)
+
+        return safe_tools, alias_to_actual
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -94,7 +153,7 @@ class LLMService:
                 "finish_reason": response.choices[0].finish_reason,
             }
         except Exception as exc:
-            logger.error(f"LLM chat failed [{self.provider}]: {exc}")
+            logger.error(f"LLM chat failed [{self.provider}]: {self._format_exception(exc)}")
             raise
 
     async def chat_stream(
@@ -124,7 +183,7 @@ class LLMService:
                 if delta and delta.content:
                     yield delta.content
         except Exception as exc:
-            logger.error(f"LLM stream failed [{self.provider}]: {exc}")
+            logger.error(f"LLM stream failed [{self.provider}]: {self._format_exception(exc)}")
             raise
 
     async def chat_with_tools(
@@ -142,13 +201,14 @@ class LLMService:
             max_tokens = settings.llm_max_tokens
 
         full_messages = self._build_messages(messages, system_prompt)
+        safe_tools, alias_to_actual = self._build_provider_safe_tools(tools)
 
         try:
             response = await self.client.chat.completions.create(
                 model=self.config["model"],
                 messages=full_messages,
-                tools=tools or None,
-                tool_choice=tool_choice if tools else None,
+                tools=safe_tools or None,
+                tool_choice=tool_choice if safe_tools else None,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
@@ -176,11 +236,12 @@ class LLMService:
             tool_calls: List[Dict[str, Any]] = []
             for call in raw_tool_calls:
                 fn = getattr(call, "function", None)
+                raw_name = getattr(fn, "name", "")
                 tool_calls.append(
                     {
                         "id": getattr(call, "id", ""),
                         "type": getattr(call, "type", "function"),
-                        "name": getattr(fn, "name", ""),
+                        "name": alias_to_actual.get(str(raw_name), str(raw_name)),
                         "arguments": getattr(fn, "arguments", "") or "{}",
                     }
                 )
@@ -194,7 +255,7 @@ class LLMService:
                 "finish_reason": response.choices[0].finish_reason,
             }
         except Exception as exc:
-            logger.error(f"LLM function calling failed [{self.provider}]: {exc}")
+            logger.error(f"LLM function calling failed [{self.provider}]: {self._format_exception(exc)}")
             raise
 
     async def chat_with_tools_stream(
@@ -226,18 +287,18 @@ class LLMService:
         messages: List[Dict[str, Any]],
         available_tools: Optional[List[str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Legacy ReAct stream parser for <think>/<answer>."""
+        """Legacy ReAct stream parser for <think>/<thinking>/<answer>."""
         system_prompt = self.REACT_SYSTEM_PROMPT
         if available_tools:
             tools_desc = "\n".join([f"- {tool}" for tool in available_tools])
             system_prompt += f"\n\n可用工具:\n{tools_desc}"
 
         yield {"type": "start", "data": {"provider": self.provider, "model": self.config["model"]}}
-        open_think = "<think>"
-        close_think = "</think>"
+        open_think_tags = ["<think>", "<thinking>"]
+        close_think_tags = ["</think>", "</thinking>"]
         open_answer = "<answer>"
         close_answer = "</answer>"
-        tag_prefixes = [open_think, close_think, open_answer, close_answer]
+        tag_prefixes = [*open_think_tags, *close_think_tags, open_answer, close_answer]
 
         mode = "outside"
         buffer = ""
@@ -250,16 +311,17 @@ class LLMService:
             while True:
                 if mode == "outside":
                     candidates = [
-                        (idx, "think")
-                        for idx in [buffer.find(open_think)]
+                        (idx, "think", tag)
+                        for tag in open_think_tags
+                        for idx in [buffer.find(tag)]
                         if idx >= 0
                     ] + [
-                        (idx, "answer")
+                        (idx, "answer", open_answer)
                         for idx in [buffer.find(open_answer)]
                         if idx >= 0
                     ]
                     if not candidates:
-                        keep = max(len(open_think), len(open_answer)) - 1
+                        keep = max(max(len(tag) for tag in open_think_tags), len(open_answer)) - 1
                         if len(buffer) > keep:
                             plain = buffer[:-keep]
                             if plain:
@@ -268,7 +330,7 @@ class LLMService:
                             buffer = buffer[-keep:]
                         break
 
-                    idx, tag_type = min(candidates, key=lambda item: item[0])
+                    idx, tag_type, matched_tag = min(candidates, key=lambda item: item[0])
                     if idx > 0:
                         plain = buffer[:idx]
                         answer_parts.append(plain)
@@ -278,22 +340,28 @@ class LLMService:
                         if not thinking_started:
                             thinking_started = True
                             yield {"type": "thinking_start", "data": ""}
-                        buffer = buffer[idx + len(open_think):]
+                        buffer = buffer[idx + len(matched_tag):]
                         mode = "think"
                     else:
-                        buffer = buffer[idx + len(open_answer):]
+                        buffer = buffer[idx + len(matched_tag):]
                         mode = "answer"
                     continue
 
                 if mode == "think":
-                    close_idx = buffer.find(close_think)
-                    if close_idx >= 0:
+                    close_candidates = [
+                        (idx, tag)
+                        for tag in close_think_tags
+                        for idx in [buffer.find(tag)]
+                        if idx >= 0
+                    ]
+                    if close_candidates:
+                        close_idx, matched_close_tag = min(close_candidates, key=lambda item: item[0])
                         thought_parts.append(buffer[:close_idx])
-                        buffer = buffer[close_idx + len(close_think):]
+                        buffer = buffer[close_idx + len(matched_close_tag):]
                         mode = "outside"
                         continue
 
-                    keep = len(close_think) - 1
+                    keep = max(len(tag) for tag in close_think_tags) - 1
                     if len(buffer) > keep:
                         thought_parts.append(buffer[:-keep])
                         buffer = buffer[-keep:]

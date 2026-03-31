@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from app.core.database import get_db
 from app.config import settings
+from app.services.retrieval_warmup_service import get_retrieval_warmup_service
 
 router = APIRouter()
 
@@ -83,3 +84,9 @@ async def config_check():
             "output_cells": settings.notebook_context_output_cells,
         },
     }
+
+
+@router.get("/health/retrieval-runtime")
+async def retrieval_runtime_status():
+    """查看检索运行时预热状态。"""
+    return get_retrieval_warmup_service().get_status_snapshot()

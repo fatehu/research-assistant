@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from app.services.contextual_retrieval_service import (
     build_adjacent_lookup_keys,
     build_context_summary,
+    build_reranker_input,
     compose_embedding_input,
     merge_adjacent_context,
     normalize_adjacent_window,
@@ -59,6 +60,33 @@ def test_compose_embedding_input_for_paragraph_and_non_paragraph():
         chunk_level="section",
     )
     assert section_text == "Section content"
+
+
+def test_build_reranker_input_uses_structural_context_and_trims_body():
+    reranker_input = build_reranker_input(
+        content="A" * 120,
+        context_summary="文档:paper.pdf | 章节:Method",
+        max_context_length=40,
+        max_content_length=60,
+    )
+
+    assert "[Context]" in reranker_input
+    assert "[Content]" in reranker_input
+    assert "文档:paper.pdf" in reranker_input
+    assert len(reranker_input.split("[Content]\n", 1)[1]) <= 60
+
+
+def test_build_reranker_input_falls_back_to_document_and_section_metadata():
+    reranker_input = build_reranker_input(
+        content="This is the body.",
+        document_name="demo.pdf",
+        section_title="Results",
+        section_type="results",
+        context_summary=None,
+    )
+
+    assert "demo.pdf" in reranker_input
+    assert "Results" in reranker_input
 
 
 def test_build_adjacent_lookup_keys_respects_boundary():

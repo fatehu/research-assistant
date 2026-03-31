@@ -51,7 +51,7 @@ const ChatMessages = ({
 
   return (
     <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
-      <div className="max-w-3xl mx-auto px-4 py-6">
+      <div className="mx-auto max-w-[1040px] px-4 py-8 sm:px-6 lg:px-8">
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-20">
             <Spin size="large" />
@@ -67,7 +67,7 @@ const ChatMessages = ({
         ) : messages.length === 0 ? (
           <EmptyState onQuickPrompt={onQuickPrompt} />
         ) : (
-          <div className="space-y-6">
+          <div className="space-y-7">
             <AnimatePresence mode="popLayout">
               {messages.map((msg, idx) => (
                 <MessageBubble

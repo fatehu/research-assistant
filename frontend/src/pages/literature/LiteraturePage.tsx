@@ -55,6 +55,17 @@ const floatingListShellClass =
 const emptyGlowClass =
   'absolute inset-x-10 top-6 h-32 rounded-full bg-emerald-400/12 blur-3xl'
 
+const getSearchResultIdentity = (paper: Pick<PaperSearchResult, 'source' | 'external_id' | 'doi' | 'arxiv_id' | 'title'>): string => {
+  const source = String(paper.source || '').trim().toLowerCase()
+  const externalId = String(paper.external_id || '').trim()
+  if (source && externalId) return `${source}:${externalId}`
+  const doi = String(paper.doi || '').trim().toLowerCase()
+  if (doi) return `doi:${doi}`
+  const arxivId = String(paper.arxiv_id || '').trim().toLowerCase()
+  if (arxivId) return `arxiv:${arxivId}`
+  return `title:${String(paper.title || '').trim().toLowerCase()}`
+}
+
 const EmptyState = ({
   icon,
   title,
@@ -137,6 +148,7 @@ export default function LiteraturePage() {
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const [linkImportModalOpen, setLinkImportModalOpen] = useState(false)
   const [linkImportSubmitting, setLinkImportSubmitting] = useState(false)
+  const [savingPaperKeys, setSavingPaperKeys] = useState<Record<string, true>>({})
   const [createCollectionForm] = Form.useForm()
   const [linkImportForm] = Form.useForm()
 
@@ -173,11 +185,20 @@ export default function LiteraturePage() {
   }
 
   const handleSavePaper = async (paper: PaperSearchResult) => {
+    const paperKey = getSearchResultIdentity(paper)
+    if (paper.is_saved || savingPaperKeys[paperKey]) return
+    setSavingPaperKeys(state => ({ ...state, [paperKey]: true }))
     try {
       await savePaper(paper)
       message.success('论文已保存到文献库')
     } catch {
       // Error handled by store
+    } finally {
+      setSavingPaperKeys(state => {
+        const next = { ...state }
+        delete next[paperKey]
+        return next
+      })
     }
   }
 
@@ -384,11 +405,12 @@ export default function LiteraturePage() {
           <div className="grid grid-cols-1 gap-3">
             {searchResults.map((paper, index) => (
               <SearchResultCard
-                key={paper.external_id}
+                key={getSearchResultIdentity(paper)}
                 paper={paper}
                 index={index}
                 sourceInfo={getSourceInfo(paper.source)}
                 onSave={handleSavePaper}
+                savePending={Boolean(savingPaperKeys[getSearchResultIdentity(paper)])}
               />
             ))}
           </div>
@@ -396,11 +418,12 @@ export default function LiteraturePage() {
           <div className={floatingListShellClass}>
             {searchResults.map((paper, index) => (
               <SearchResultListItem
-                key={paper.external_id}
+                key={getSearchResultIdentity(paper)}
                 paper={paper}
                 index={index}
                 sourceInfo={getSourceInfo(paper.source)}
                 onSave={handleSavePaper}
+                savePending={Boolean(savingPaperKeys[getSearchResultIdentity(paper)])}
               />
             ))}
           </div>

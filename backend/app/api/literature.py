@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, delete, distinct, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -79,6 +80,8 @@ from app.schemas.literature import (
     ReaderGenerativePlanResponse,
     ReaderExperiencePlanRequest,
     ReaderExperiencePlanResponse,
+    ReaderExperienceBlockRewriteRequest,
+    ReaderExperienceBlockRewriteResponse,
     ReaderExperienceV2Response,
     ReaderWorkbenchV2Response,
     ReaderGenerativePrefetchRequest,
@@ -115,6 +118,7 @@ from app.schemas.literature import (
     ReadingDossierV2,
     ReadingDossierV2AdjacentPageRow,
     PageArtifactV2,
+    PageArtifactV2ReadingBlock,
     PageArtifactV2AuthoredPlanInput,
     _looks_like_legacy_adjacent_payload_stuffing,
     PaperKnowledgeLinkResponse,
@@ -187,6 +191,13 @@ _ARTIFACT_DRAFT_V2_SUPPORTED_NODE_KINDS = {
     "aside",
     "term_note",
     "external_resource",
+}
+_EXPERIENCE_V2_BLOCK_REWRITE_SUPPORTED_SEGMENT_KINDS = {
+    "heading",
+    "paragraph",
+    "authored_explanation",
+    "aside_content",
+    "term_annotation",
 }
 
 _ADJACENT_PAGE_STRUCTURED_PRIMARY_ATTEMPTS = 3
@@ -393,8 +404,8 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
         "arxiv_url": paper.arxiv_url,
         "pdf_path": paper.pdf_path,
         "pdf_downloaded": paper.pdf_downloaded or False,
-        "knowledge_base_id": paper.knowledge_base_id,
-        "document_id": paper.document_id,
+        "knowledge_base_id": None,
+        "document_id": None,
         "influential_citation_count": paper.influential_citation_count or 0,
         "fields_of_study": paper.fields_of_study or [],
         "tags": paper.tags or [],
@@ -1130,6 +1141,30 @@ async def _add_paper_to_collections_if_missing(
     return added_ids
 
 
+async def _resolve_target_collection_ids_for_save(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    requested_collection_ids: Optional[Sequence[int]],
+) -> List[int]:
+    collection_ids = [int(item) for item in dict.fromkeys(requested_collection_ids or [])]
+    if collection_ids:
+        return collection_ids
+
+    default_result = await db.execute(
+        select(PaperCollection).where(
+            and_(
+                PaperCollection.user_id == int(user_id),
+                PaperCollection.is_default == True,
+            )
+        )
+    )
+    default_collection = default_result.scalars().first()
+    if not default_collection:
+        return []
+    return [int(default_collection.id)]
+
+
 async def _find_existing_paper_for_request(
     db: AsyncSession,
     *,
@@ -1454,6 +1489,31 @@ async def _get_owned_kb_or_404(db: AsyncSession, current_user: User, kb_id: int)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
     return kb
+
+
+async def _get_owned_kb_or_none(db: AsyncSession, current_user: User, kb_id: Optional[int]) -> Optional[KnowledgeBase]:
+    try:
+        resolved_kb_id = int(kb_id or 0)
+    except (TypeError, ValueError):
+        return None
+    if resolved_kb_id <= 0:
+        return None
+    stmt = select(KnowledgeBase).where(
+        and_(KnowledgeBase.id == resolved_kb_id, KnowledgeBase.user_id == current_user.id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _normalize_reader_selected_kb_id(
+    db: AsyncSession,
+    current_user: User,
+    selected_kb_id: Optional[int],
+) -> Optional[int]:
+    kb = await _get_owned_kb_or_none(db, current_user, selected_kb_id)
+    if kb is None:
+        return None
+    return int(kb.id)
 
 
 async def _get_same_group_user_ids(db: AsyncSession, user_id: int) -> set[int]:
@@ -2614,6 +2674,7 @@ def _build_page_artifact_v2_from_dossier(
         available_layout_ids: Sequence[str],
         fallback_to_page_image: bool = False,
         require_concrete_figure_asset_ref: bool = False,
+        allow_missing_evidence_binding: bool = False,
     ) -> Dict[str, Any]:
         payload = _jsonable_dict(row)
         requested_layout_id = str(
@@ -2636,7 +2697,8 @@ def _build_page_artifact_v2_from_dossier(
             raise ValueError(
                 f"media slot binding could not be resolved: {slot_kind}"
             )
-        if binding_kind.endswith("_layout_anchor") and not binding_evidence_ids:
+        missing_binding_evidence = bool(binding_kind.endswith("_layout_anchor") and not binding_evidence_ids)
+        if missing_binding_evidence and not allow_missing_evidence_binding:
             raise ValueError(
                 f"media slot binding could not be resolved: {slot_kind}"
             )
@@ -2667,6 +2729,11 @@ def _build_page_artifact_v2_from_dossier(
         }
         if slot_kind == "figure_slot":
             block_meta["figure_binding"] = dict(block_meta["media_binding"])
+        if missing_binding_evidence:
+            block_meta["binding_resolution"] = "layout_anchor_without_evidence"
+            block_meta["media_binding"]["binding_resolution"] = "layout_anchor_without_evidence"
+            if slot_kind == "figure_slot":
+                block_meta["figure_binding"]["binding_resolution"] = "layout_anchor_without_evidence"
         atom_payload = _jsonable_dict(layout_atoms_by_id.get(binding_layout_id) or {})
         if slot_kind == "table_slot" and atom_payload.get("table_cells"):
             table_cells = list(atom_payload.get("table_cells") or [])
@@ -2689,6 +2756,7 @@ def _build_page_artifact_v2_from_dossier(
 
     blocks: List[Dict[str, Any]] = []
     main_segment_ids: List[str] = []
+    skipped_slot_bindings: List[Dict[str, Any]] = []
     authored_explanations = [
         str(item).strip()
         for item in list(authored_payload.get("authored_explanations") or [])
@@ -2722,6 +2790,54 @@ def _build_page_artifact_v2_from_dossier(
     def _next_segment_id(prefix: str, counters: Dict[str, int]) -> str:
         counters[prefix] = int(counters.get(prefix) or 0) + 1
         return f"{prefix}-{counters[prefix]}"
+
+    def _append_grounded_slot_block(
+        *,
+        segment_id: str,
+        slot_kind: str,
+        row: Mapping[str, Any],
+        available_layout_ids: Sequence[str],
+        fallback_to_page_image: bool = False,
+        require_concrete_figure_asset_ref: bool = False,
+        allow_missing_evidence_binding: bool = False,
+    ) -> bool:
+        try:
+            resolved = _resolve_grounded_slot(
+                slot_kind=slot_kind,
+                row=row,
+                available_layout_ids=available_layout_ids,
+                fallback_to_page_image=fallback_to_page_image,
+                require_concrete_figure_asset_ref=require_concrete_figure_asset_ref,
+                allow_missing_evidence_binding=allow_missing_evidence_binding,
+            )
+        except ValueError as exc:
+            detail = str(exc).strip()
+            if detail.startswith("media slot binding could not be resolved:"):
+                skipped_slot_bindings.append(
+                    {
+                        "segment_id": segment_id,
+                        "slot_kind": slot_kind,
+                        "label": str(_jsonable_dict(row).get("label") or _jsonable_dict(row).get("title") or slot_kind).strip(),
+                        "source_layout_id": str(
+                            _jsonable_dict(row).get("source_layout_id")
+                            or _jsonable_dict(row).get("layout_id")
+                            or _jsonable_dict(row).get("binding_layout_id")
+                            or ""
+                        ).strip(),
+                        "reason": detail,
+                    }
+                )
+                return False
+            raise
+        blocks.append(
+            {
+                "segment_id": segment_id,
+                "source_lane": "authoring_plan",
+                "page": focus_page,
+                **resolved,
+            }
+        )
+        return True
 
     if draft_node_sequence:
         segment_counters: Dict[str, int] = {}
@@ -2792,21 +2908,15 @@ def _build_page_artifact_v2_from_dossier(
                     else table_layout_ids if node_kind == "table_slot"
                     else equation_layout_ids
                 )
-                resolved = _resolve_grounded_slot(
+                prefix = "seg-figure" if node_kind == "figure_slot" else "seg-table" if node_kind == "table_slot" else "seg-equation"
+                _append_grounded_slot_block(
+                    segment_id=_next_segment_id(prefix, segment_counters),
                     slot_kind=node_kind,
                     row=node,
                     available_layout_ids=available_layout_ids,
                     fallback_to_page_image=(node_kind == "figure_slot"),
                     require_concrete_figure_asset_ref=(node_kind == "figure_slot"),
-                )
-                prefix = "seg-figure" if node_kind == "figure_slot" else "seg-table" if node_kind == "table_slot" else "seg-equation"
-                blocks.append(
-                    {
-                        "segment_id": _next_segment_id(prefix, segment_counters),
-                        "source_lane": "authoring_plan",
-                        "page": focus_page,
-                        **resolved,
-                    }
+                    allow_missing_evidence_binding=True,
                 )
                 continue
             if node_kind == "aside":
@@ -2955,20 +3065,14 @@ def _build_page_artifact_v2_from_dossier(
         if isinstance(item, Mapping)
     ]
     for idx, row in enumerate(authored_figure_slots, start=1):
-        resolved = _resolve_grounded_slot(
+        _append_grounded_slot_block(
+            segment_id=f"seg-figure-{idx}",
             slot_kind="figure_slot",
             row=row,
             available_layout_ids=figure_layout_ids,
             fallback_to_page_image=True,
             require_concrete_figure_asset_ref=True,
-        )
-        blocks.append(
-            {
-                "segment_id": f"seg-figure-{idx}",
-                "source_lane": "authoring_plan",
-                "page": focus_page,
-                **resolved,
-            }
+            allow_missing_evidence_binding=True,
         )
 
     authored_table_slots = [
@@ -2977,18 +3081,12 @@ def _build_page_artifact_v2_from_dossier(
         if isinstance(item, Mapping)
     ]
     for idx, row in enumerate(authored_table_slots, start=1):
-        resolved = _resolve_grounded_slot(
+        _append_grounded_slot_block(
+            segment_id=f"seg-table-{idx}",
             slot_kind="table_slot",
             row=row,
             available_layout_ids=table_layout_ids,
-        )
-        blocks.append(
-            {
-                "segment_id": f"seg-table-{idx}",
-                "source_lane": "authoring_plan",
-                "page": focus_page,
-                **resolved,
-            }
+            allow_missing_evidence_binding=True,
         )
 
     authored_equation_slots = [
@@ -2997,18 +3095,12 @@ def _build_page_artifact_v2_from_dossier(
         if isinstance(item, Mapping)
     ]
     for idx, row in enumerate(authored_equation_slots, start=1):
-        resolved = _resolve_grounded_slot(
+        _append_grounded_slot_block(
+            segment_id=f"seg-equation-{idx}",
             slot_kind="equation_slot",
             row=row,
             available_layout_ids=equation_layout_ids,
-        )
-        blocks.append(
-            {
-                "segment_id": f"seg-equation-{idx}",
-                "source_lane": "authoring_plan",
-                "page": focus_page,
-                **resolved,
-            }
+            allow_missing_evidence_binding=True,
         )
 
     authored_media_slots = [
@@ -3027,20 +3119,14 @@ def _build_page_artifact_v2_from_dossier(
             available_layout_ids = figure_layout_ids
         else:
             raise ValueError(f"requested artifact node kind not supported yet: media_slot:{media_type or 'unknown'}")
-        resolved = _resolve_grounded_slot(
+        _append_grounded_slot_block(
+            segment_id=f"seg-media-{idx}",
             slot_kind="media_slot",
             row=row,
             available_layout_ids=available_layout_ids,
             fallback_to_page_image=(media_type == "figure"),
             require_concrete_figure_asset_ref=(media_type == "figure"),
-        )
-        blocks.append(
-            {
-                "segment_id": f"seg-media-{idx}",
-                "source_lane": "authoring_plan",
-                "page": focus_page,
-                **resolved,
-            }
+            allow_missing_evidence_binding=True,
         )
 
     authored_term_annotations = [
@@ -3212,6 +3298,7 @@ def _build_page_artifact_v2_from_dossier(
         "meta": {
             "dossier_contract": str(dossier_payload.get("dossier_contract") or "").strip(),
             "artifact_build_mode": "phase3_model_draft_promotion",
+            **({"skipped_slot_bindings": skipped_slot_bindings} if skipped_slot_bindings else {}),
             **(
                 {"reader_opening": _jsonable_dict(authored_meta.get("reader_opening") or {})}
                 if _jsonable_dict(authored_meta.get("reader_opening") or {})
@@ -3297,8 +3384,6 @@ def _validate_page_artifact_v2_contract(payload: Mapping[str, Any]) -> Dict[str,
         if str((_jsonable_dict(item.get("meta") or {})).get("source_node_id") or "").strip()
     }
     expected_node_ids = {str(item).strip() for item in list(spine.get("reading_node_ids") or []) if str(item).strip()}
-    if expected_node_ids and not expected_node_ids.issubset(represented_node_ids):
-        errors.append("original excerpt blocks must preserve all current-page main-flow reading node anchors")
 
     represented_layout_ids = {
         str(layout_id).strip()
@@ -3307,12 +3392,20 @@ def _validate_page_artifact_v2_contract(payload: Mapping[str, Any]) -> Dict[str,
         if str(layout_id).strip()
     }
     expected_layout_ids = {str(item).strip() for item in list(spine.get("layout_ids") or []) if str(item).strip()}
-    if expected_layout_ids and not expected_layout_ids.issubset(represented_layout_ids):
-        errors.append("original excerpt blocks must preserve all current-page main-flow layout anchors")
 
-    represented_excerpt_count = int((_jsonable_dict(spine.get("meta") or {})).get("represented_excerpt_count") or len(original_blocks))
+    spine_meta = _jsonable_dict(spine.get("meta") or {})
+    represented_excerpt_count = int(spine_meta.get("represented_excerpt_count") or len(original_blocks))
+    coverage_ratio = float(
+        (_jsonable_dict(spine_meta.get("excerpt_coverage") or {})).get("coverage_ratio")
+        or spine_meta.get("coverage_ratio")
+        or 0.0
+    )
     if represented_excerpt_count <= 0:
         errors.append("current_page_spine must preserve at least one draft-selected current-page excerpt")
+    elif expected_node_ids and represented_node_ids and not expected_node_ids.intersection(represented_node_ids) and coverage_ratio <= 0:
+        errors.append("original excerpt blocks must preserve at least one current-page reading node anchor")
+    elif expected_layout_ids and represented_layout_ids and not expected_layout_ids.intersection(represented_layout_ids) and coverage_ratio <= 0:
+        errors.append("original excerpt blocks must preserve at least one current-page layout anchor")
 
     provenance = _jsonable_dict(data.get("provenance") or {})
     current_lane = _jsonable_dict((_jsonable_dict(provenance.get("source_lanes") or {})).get("current_page") or {})
@@ -3596,7 +3689,10 @@ async def _build_experience_adjacent_page_structured_context_v2(
         paper_pdf_path=paper.pdf_path,
     )
     if not pdf_path or not os.path.exists(pdf_path):
-        raise ValueError("neighboring-page structured context not implemented: pdf path missing")
+        logger.warning(
+            f"[Literature Experience] adjacent structured context skipped: pdf path missing paper={paper.id} focus_page={focus_page}"
+        )
+        return []
 
     max_page = await _get_pdf_page_count(pdf_path)
     if not max_page or max_page <= 1:
@@ -3606,17 +3702,24 @@ async def _build_experience_adjacent_page_structured_context_v2(
     for relation, page_num in (("previous_page", int(focus_page) - 1), ("next_page", int(focus_page) + 1)):
         if page_num < 1 or page_num > int(max_page):
             continue
-        asset_url = await compose_service.ensure_page_render_asset(
-            paper_id=int(paper.id),
-            page=int(page_num),
-            pdf_path=str(pdf_path),
-        )
-        image_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
-            paper_id=int(paper.id),
-            page=int(page_num),
-        )
-        if not image_path:
-            raise ValueError(f"neighboring-page structured context not implemented: render asset missing for page {page_num}")
+        try:
+            asset_url = await compose_service.ensure_page_render_asset(
+                paper_id=int(paper.id),
+                page=int(page_num),
+                pdf_path=str(pdf_path),
+            )
+            image_path = compose_service._find_existing_page_render_asset_path(  # pylint: disable=protected-access
+                paper_id=int(paper.id),
+                page=int(page_num),
+            )
+            if not image_path:
+                raise ValueError(f"render asset missing for page {page_num}")
+        except Exception as exc:
+            logger.warning(
+                f"[Literature Experience] adjacent structured context skipped paper={paper.id} focus_page={focus_page} "
+                f"page={page_num} relation={relation}: {exc}"
+            )
+            continue
         cache_key = _adjacent_page_structured_v2_cache_key(
             paper_id=int(paper.id),
             page=int(page_num),
@@ -3625,46 +3728,54 @@ async def _build_experience_adjacent_page_structured_context_v2(
             image_url=str(asset_url or "").strip(),
         )
         cached_row, cache_layer = await _adjacent_page_structured_v2_cache_get(cache_key)
+        row: Optional[Dict[str, Any]] = None
         if isinstance(cached_row, Mapping):
             try:
                 row = ReadingDossierV2AdjacentPageRow.model_validate(_jsonable_dict(cached_row)).model_dump(mode="json")
+                row["meta"] = {
+                    **_jsonable_dict(row.get("meta") or {}),
+                    "page_scope_cache_key": cache_key,
+                    "page_scope_cache_layer": cache_layer,
+                }
             except Exception as exc:
-                message = str(exc)
-                if "ordered content_stream" in message:
-                    raise ValueError(
-                        f"neighboring-page structured context cache corrupted for page {page_num}: ordered content_stream missing"
-                    ) from exc
-                raise ValueError(
-                    f"neighboring-page structured context cache corrupted for page {page_num}: {message}"
-                ) from exc
-            if not list(row.get("content_stream") or []):
-                raise ValueError(
-                    f"neighboring-page structured context cache corrupted for page {page_num}: ordered content_stream missing"
+                logger.warning(
+                    f"[Literature Experience] adjacent structured cache invalid, rebuilding paper={paper.id} "
+                    f"focus_page={focus_page} page={page_num} relation={relation}: {exc}"
                 )
-            row["meta"] = {
-                **_jsonable_dict(row.get("meta") or {}),
-                "page_scope_cache_key": cache_key,
-                "page_scope_cache_layer": cache_layer,
-            }
-        else:
-            row = await _extract_adjacent_page_structured_context_v2(
-                image_path=str(image_path),
-                relation=relation,
-                page=int(page_num),
-                image_url=str(asset_url or "").strip(),
-            )
-            await _adjacent_page_structured_v2_cache_set(
-                cache_key,
-                row,
-                user_id=int(getattr(current_user, "id", 0) or getattr(paper, "user_id", 0) or 0),
-                paper_id=int(paper.id),
-                page=int(page_num),
-            )
-            row["meta"] = {
-                **_jsonable_dict(row.get("meta") or {}),
-                "page_scope_cache_key": cache_key,
-                "page_scope_cache_layer": "built",
-            }
+                row = None
+
+        if row is None:
+            try:
+                row = await _extract_adjacent_page_structured_context_v2(
+                    image_path=str(image_path),
+                    relation=relation,
+                    page=int(page_num),
+                    image_url=str(asset_url or "").strip(),
+                )
+                try:
+                    await _adjacent_page_structured_v2_cache_set(
+                        cache_key,
+                        row,
+                        user_id=int(getattr(current_user, "id", 0) or getattr(paper, "user_id", 0) or 0),
+                        paper_id=int(paper.id),
+                        page=int(page_num),
+                    )
+                except Exception as cache_exc:
+                    logger.warning(
+                        f"[Literature Experience] adjacent structured cache write failed paper={paper.id} "
+                        f"focus_page={focus_page} page={page_num} relation={relation}: {cache_exc}"
+                    )
+                row["meta"] = {
+                    **_jsonable_dict(row.get("meta") or {}),
+                    "page_scope_cache_key": cache_key,
+                    "page_scope_cache_layer": "built",
+                }
+            except Exception as exc:
+                logger.warning(
+                    f"[Literature Experience] adjacent structured extraction skipped paper={paper.id} "
+                    f"focus_page={focus_page} page={page_num} relation={relation}: {exc}"
+                )
+                continue
         rows.append(row)
     return rows
 
@@ -4034,12 +4145,13 @@ def _build_current_page_excerpt_rows(
     reading_nodes: Sequence[Mapping[str, Any]],
     layout_atoms: Sequence[Mapping[str, Any]],
     max_chars: Optional[int],
+    include_non_main_flow: bool = False,
 ) -> List[Dict[str, Any]]:
     excerpt_rows: List[Dict[str, Any]] = []
     for node in reading_nodes:
         if not isinstance(node, Mapping):
             continue
-        if not bool(node.get("include_in_main_flow", True)):
+        if (not include_non_main_flow) and not bool(node.get("include_in_main_flow", True)):
             continue
         node_kind = str(node.get("node_kind") or (_jsonable_dict(node.get("meta") or {})).get("layout_type") or "").strip().lower()
         text = str(node.get("clean_text") or node.get("normalized_text") or node.get("raw_text") or "").strip()
@@ -4060,7 +4172,7 @@ def _build_current_page_excerpt_rows(
     for atom in layout_atoms:
         if not isinstance(atom, Mapping):
             continue
-        if not bool(atom.get("include_in_main_flow", True)):
+        if (not include_non_main_flow) and not bool(atom.get("include_in_main_flow", True)):
             continue
         node_kind = str(atom.get("layout_type") or atom.get("node_kind") or "").strip().lower()
         text = str(atom.get("clean_text") or atom.get("normalized_text") or atom.get("raw_text") or "").strip()
@@ -4156,7 +4268,18 @@ def _resolve_excerpt_against_current_page_grounding(
         layout_atoms=layout_atoms,
         max_chars=max_chars,
     )
-    return _match(direct_rows)
+    matched = _match(direct_rows)
+    if matched:
+        return matched
+    if not override_layout_ids and not override_block_ids:
+        return None
+    non_main_flow_rows = _build_current_page_excerpt_rows(
+        reading_nodes=reading_nodes,
+        layout_atoms=layout_atoms,
+        max_chars=max_chars,
+        include_non_main_flow=True,
+    )
+    return _match(non_main_flow_rows)
 
 
 def _build_current_page_excerpt_rows(
@@ -4164,12 +4287,13 @@ def _build_current_page_excerpt_rows(
     reading_nodes: Sequence[Mapping[str, Any]],
     layout_atoms: Sequence[Mapping[str, Any]],
     max_chars: Optional[int],
+    include_non_main_flow: bool = False,
 ) -> List[Dict[str, Any]]:
     excerpt_rows: List[Dict[str, Any]] = []
     for node in reading_nodes:
         if not isinstance(node, Mapping):
             continue
-        if not bool(node.get("include_in_main_flow", True)):
+        if (not include_non_main_flow) and not bool(node.get("include_in_main_flow", True)):
             continue
         node_kind = str(node.get("node_kind") or (_jsonable_dict(node.get("meta") or {})).get("layout_type") or "").strip().lower()
         text = str(node.get("clean_text") or node.get("normalized_text") or node.get("raw_text") or "").strip()
@@ -4190,7 +4314,7 @@ def _build_current_page_excerpt_rows(
     for atom in layout_atoms:
         if not isinstance(atom, Mapping):
             continue
-        if not bool(atom.get("include_in_main_flow", True)):
+        if (not include_non_main_flow) and not bool(atom.get("include_in_main_flow", True)):
             continue
         node_kind = str(atom.get("layout_type") or atom.get("node_kind") or "").strip().lower()
         text = str(atom.get("clean_text") or atom.get("normalized_text") or atom.get("raw_text") or "").strip()
@@ -4286,7 +4410,18 @@ def _resolve_excerpt_against_current_page_grounding(
         layout_atoms=layout_atoms,
         max_chars=max_chars,
     )
-    return _match(direct_excerpt_rows)
+    resolved = _match(direct_excerpt_rows)
+    if resolved:
+        return resolved
+    if not override_layout_ids and not override_block_ids:
+        return None
+    non_main_flow_excerpt_rows = _build_current_page_excerpt_rows(
+        reading_nodes=reading_nodes,
+        layout_atoms=layout_atoms,
+        max_chars=max_chars,
+        include_non_main_flow=True,
+    )
+    return _match(non_main_flow_excerpt_rows)
 
 
 def _infer_excerpt_candidate_kind(
@@ -5299,6 +5434,262 @@ def _build_reader_experience_block_explain_messages(
     return messages
 
 
+def _compact_experience_v2_block_rewrite_text(raw: Any, *, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(1, int(max_chars) - 1)].rstrip() + "…"
+
+
+def _find_experience_v2_block_index(
+    blocks: Sequence[Mapping[str, Any]],
+    block_id: str,
+) -> int:
+    target_id = str(block_id or "").strip()
+    for index, block in enumerate(blocks):
+        if str((_jsonable_dict(block)).get("segment_id") or "").strip() == target_id:
+            return index
+    return -1
+
+
+def _experience_v2_block_rewrite_is_supported(block: Mapping[str, Any]) -> bool:
+    return str(_jsonable_dict(block).get("segment_kind") or "").strip() in _EXPERIENCE_V2_BLOCK_REWRITE_SUPPORTED_SEGMENT_KINDS
+
+
+def _serialize_experience_v2_block_for_rewrite_context(
+    block: Mapping[str, Any],
+    *,
+    max_chars: int = 260,
+) -> Dict[str, Any]:
+    payload = PageArtifactV2ReadingBlock.model_validate(_jsonable_dict(block)).model_dump(mode="json")
+    meta = _jsonable_dict(payload.get("meta") or {})
+    label = str(
+        meta.get("reader_title")
+        or meta.get("display_term")
+        or meta.get("label")
+        or meta.get("group_label")
+        or ""
+    ).strip()
+    return {
+        "segment_id": str(payload.get("segment_id") or "").strip(),
+        "segment_kind": str(payload.get("segment_kind") or "").strip(),
+        "text": _compact_experience_v2_block_rewrite_text(payload.get("text") or "", max_chars=max_chars),
+        "label": label,
+        "reader_role": str(meta.get("reader_role") or "").strip(),
+        "group_label": str(meta.get("group_label") or meta.get("section_label") or "").strip(),
+        "placement": str(meta.get("placement") or "").strip(),
+        "lane": str(meta.get("lane") or "").strip(),
+    }
+
+
+def _find_nearest_experience_v2_excerpt_context(
+    blocks: Sequence[Mapping[str, Any]],
+    *,
+    target_index: int,
+    preferred_group_id: str,
+) -> Dict[str, Any]:
+    def _matches_group(candidate: Mapping[str, Any]) -> bool:
+        if not preferred_group_id:
+            return False
+        meta = _jsonable_dict(_jsonable_dict(candidate).get("meta") or {})
+        candidate_group_id = str(meta.get("group_id") or meta.get("section_id") or "").strip()
+        return bool(candidate_group_id and candidate_group_id == preferred_group_id)
+
+    for group_only in (True, False):
+        for offset in range(0, len(blocks)):
+            candidate_indexes = [target_index - offset]
+            if offset > 0:
+                candidate_indexes.append(target_index + offset)
+            for candidate_index in candidate_indexes:
+                if candidate_index < 0 or candidate_index >= len(blocks):
+                    continue
+                candidate = _jsonable_dict(blocks[candidate_index])
+                if str(candidate.get("segment_kind") or "").strip() != "original_excerpt":
+                    continue
+                if group_only and not _matches_group(candidate):
+                    continue
+                meta = _jsonable_dict(candidate.get("meta") or {})
+                return {
+                    "segment_id": str(candidate.get("segment_id") or "").strip(),
+                    "text": _compact_experience_v2_block_rewrite_text(candidate.get("text") or "", max_chars=420),
+                    "translation_zh": _compact_experience_v2_block_rewrite_text(
+                        meta.get("translation_zh") or meta.get("reader_translation_zh") or "",
+                        max_chars=420,
+                    ),
+                }
+    return {}
+
+
+def _experience_v2_block_rewrite_system_prompt(segment_kind: str) -> str:
+    normalized_kind = str(segment_kind or "").strip().lower()
+    tone_hint = {
+        "heading": "保持标题感，简洁、有方向感，不要写成长段。",
+        "paragraph": "保持讲读段落口吻，帮助读者顺着当前页主线理解。",
+        "authored_explanation": "保持讲读段落口吻，帮助读者顺着当前页主线理解。",
+        "aside_content": "保持页边提示或旁注口吻，简洁、补充性强，不要喧宾夺主。",
+        "term_annotation": "保持术语注释口吻，先说概念，再说它在这一页为什么重要。",
+    }.get(normalized_kind, "保持当前块在页面中的角色与语气。")
+    return (
+        "你是论文阅读页里的局部改写助手，只允许重写一个现成 block 的 reader-facing text。\n"
+        "硬性要求：\n"
+        "1) 只返回 strict JSON，格式必须是 {\"text\":\"...\"}。\n"
+        "2) 只改写目标 block 的 text；不要新增字段，不要输出 markdown code fence。\n"
+        "3) 不要改变 block 的功能、位置、结构、source ids、evidence ids、media binding 或 external resource 绑定。\n"
+        "4) 只基于提供的当前块与局部上下文改写，不要编造新事实，不要引入新的来源或邻页情节。\n"
+        "5) 全部用简体中文输出，优先满足用户的改写要求。\n"
+        f"6) {tone_hint}\n"
+        "7) 如果当前块已经足够好，也要按用户提示做出可见但克制的优化，而不是原样照抄。\n"
+    )
+
+
+def _build_experience_v2_block_rewrite_prompt_payload(
+    *,
+    paper: Paper,
+    artifact_payload: Mapping[str, Any],
+    narrative_brief: Mapping[str, Any],
+    block_id: str,
+    rewrite_prompt: str,
+    reader_profile: str,
+    user_intent: str,
+) -> Dict[str, Any]:
+    artifact = PageArtifactV2.model_validate(_jsonable_dict(artifact_payload)).model_dump(mode="json")
+    blocks = list(artifact.get("reading_blocks") or [])
+    target_index = _find_experience_v2_block_index(blocks, block_id)
+    if target_index < 0:
+        raise ValueError("block rewrite failed: target block not found in current artifact")
+    target_block = PageArtifactV2ReadingBlock.model_validate(_jsonable_dict(blocks[target_index])).model_dump(mode="json")
+    if not _experience_v2_block_rewrite_is_supported(target_block):
+        raise ValueError("block rewrite failed: current block kind does not support local rewrite")
+
+    target_meta = _jsonable_dict(target_block.get("meta") or {})
+    preferred_group_id = str(target_meta.get("group_id") or target_meta.get("section_id") or "").strip()
+    previous_blocks = [
+        _serialize_experience_v2_block_for_rewrite_context(blocks[index])
+        for index in range(max(0, target_index - 2), target_index)
+    ]
+    next_blocks = [
+        _serialize_experience_v2_block_for_rewrite_context(blocks[index])
+        for index in range(target_index + 1, min(len(blocks), target_index + 3))
+    ]
+    nearest_excerpt = _find_nearest_experience_v2_excerpt_context(
+        blocks,
+        target_index=target_index,
+        preferred_group_id=preferred_group_id,
+    )
+    artifact_meta = _jsonable_dict(artifact.get("meta") or {})
+    reader_opening = _jsonable_dict(artifact_meta.get("reader_opening") or {})
+    compact_brief = _compact_narrative_brief_payload(narrative_brief or {}) if narrative_brief else {}
+
+    return {
+        "task": "Rewrite exactly one page_artifact_v2 reading block and return strict JSON only.",
+        "focus_page": int(artifact.get("focus_page") or 1),
+        "reader_profile": str(reader_profile or "").strip() or "curious_generalist",
+        "user_intent": str(user_intent or "").strip(),
+        "user_rewrite_prompt": str(rewrite_prompt or "").strip(),
+        "paper": {
+            "title": _compact_experience_v2_block_rewrite_text(paper.title or "", max_chars=220),
+            "abstract": _compact_experience_v2_block_rewrite_text(paper.abstract or "", max_chars=420),
+        },
+        "page_context": {
+            "reader_opening_summary": _compact_experience_v2_block_rewrite_text(
+                reader_opening.get("summary") or compact_brief.get("current_page_main_arc") or "",
+                max_chars=320,
+            ),
+            "opening_key_points": list(reader_opening.get("key_points") or compact_brief.get("opening_key_points") or [])[:4],
+            "current_page_main_arc": _compact_experience_v2_block_rewrite_text(
+                compact_brief.get("current_page_main_arc") or "",
+                max_chars=320,
+            ),
+        },
+        "rewrite_contract": {
+            "editable_field": "text_only",
+            "segment_id_must_stay_same": str(target_block.get("segment_id") or "").strip(),
+            "segment_kind_must_stay_same": str(target_block.get("segment_kind") or "").strip(),
+            "do_not_change": [
+                "segment_id",
+                "segment_kind",
+                "source_layout_ids",
+                "source_block_ids",
+                "evidence_ids",
+                "meta bindings",
+                "external resource urls",
+            ],
+            "output_schema": {"text": "string"},
+        },
+        "target_block": {
+            **_serialize_experience_v2_block_for_rewrite_context(target_block, max_chars=1800),
+            "current_text": str(target_block.get("text") or "").strip(),
+            "source_layout_ids": list(target_block.get("source_layout_ids") or []),
+            "source_block_ids": list(target_block.get("source_block_ids") or []),
+            "evidence_ids": list(target_block.get("evidence_ids") or []),
+        },
+        "local_context": {
+            "previous_blocks": previous_blocks,
+            "next_blocks": next_blocks,
+            "nearest_original_excerpt": nearest_excerpt,
+        },
+    }
+
+
+def _validate_experience_v2_block_rewrite_model_payload(payload: Mapping[str, Any]) -> Dict[str, str]:
+    normalized = _jsonable_dict(payload)
+    text = str(normalized.get("text") or normalized.get("rewritten_text") or "").strip()
+    if not text:
+        raise ValueError("block rewrite failed: model returned empty text")
+    return {"text": text}
+
+
+def _apply_experience_v2_block_rewrite_to_artifact(
+    *,
+    artifact_payload: Mapping[str, Any],
+    block_id: str,
+    rewritten_text: str,
+    rewrite_prompt: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    artifact = PageArtifactV2.model_validate(_jsonable_dict(artifact_payload)).model_dump(mode="json")
+    blocks = [PageArtifactV2ReadingBlock.model_validate(_jsonable_dict(item)).model_dump(mode="json") for item in list(artifact.get("reading_blocks") or [])]
+    target_index = _find_experience_v2_block_index(blocks, block_id)
+    if target_index < 0:
+        raise ValueError("block rewrite failed: target block not found in current artifact")
+    target_block = _jsonable_dict(blocks[target_index])
+    if not _experience_v2_block_rewrite_is_supported(target_block):
+        raise ValueError("block rewrite failed: current block kind does not support local rewrite")
+
+    updated_block = dict(target_block)
+    updated_block["text"] = str(rewritten_text or "").strip()
+    block_meta = _jsonable_dict(updated_block.get("meta") or {})
+    block_meta["manual_rewrite"] = {
+        "updated_at": datetime.utcnow().isoformat(),
+        "source": "user_prompt",
+        "prompt_excerpt": _compact_experience_v2_block_rewrite_text(rewrite_prompt, max_chars=160),
+        "overwritable_by_regenerate": True,
+    }
+    updated_block["meta"] = block_meta
+    updated_block = PageArtifactV2ReadingBlock.model_validate(updated_block).model_dump(mode="json")
+    blocks[target_index] = updated_block
+    artifact["reading_blocks"] = blocks
+
+    artifact_meta = _jsonable_dict(artifact.get("meta") or {})
+    rewrite_entries = [
+        item
+        for item in list(artifact_meta.get("manual_block_rewrites") or [])
+        if str(_jsonable_dict(item).get("segment_id") or "").strip() != str(block_id or "").strip()
+    ]
+    rewrite_entries.append(
+        {
+            "segment_id": str(updated_block.get("segment_id") or "").strip(),
+            "segment_kind": str(updated_block.get("segment_kind") or "").strip(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "source": "user_prompt",
+            "overwritable_by_regenerate": True,
+        }
+    )
+    artifact_meta["manual_block_rewrites"] = rewrite_entries[-24:]
+    artifact["meta"] = artifact_meta
+    artifact = PageArtifactV2.model_validate(artifact).model_dump(mode="json")
+    return artifact, updated_block
+
+
 def _build_reader_v2_seed_resource_bundle(
     *,
     paper: Paper,
@@ -5350,8 +5741,83 @@ def _build_reader_v2_seed_resource_bundle(
         "meta": {
             "bundle_mode": "phase3_seeded_resource_bundle",
             "retrieval_rounds": 0,
+            "resource_request_affordance": {
+                "available": True,
+                "intent": "learning_support_required_initial_web_round",
+                "must_use_tools": True,
+                "minimum_initial_web_requests": 1,
+                "maximum_initial_web_requests": 2,
+                "guidance": (
+                    "Seeded paper/doi/pdf links are only a starting bundle. "
+                    "The first artifact-draft pass must request one or two public-web resources "
+                    "that improve reader-facing learning support beyond paper/doi/pdf links."
+                ),
+                "allowed_tools": ["paper_read", "knowledge_search", "web_search", "web_scrape"],
+                "suggested_resource_kinds": [
+                    "term_explainer",
+                    "encyclopedia_background",
+                    "official_docs_or_tutorial",
+                    "video_explainer",
+                ],
+                "suggested_targets": [
+                    "Wikipedia or comparable encyclopedia entries",
+                    "official documentation/tutorial pages",
+                    "YouTube video pages",
+                    "Bilibili video pages",
+                ],
+            },
         },
     }
+
+
+def _resource_bundle_has_nonseed_public_web_entries(resource_bundle: Mapping[str, Any]) -> bool:
+    bundle = _jsonable_dict(resource_bundle or {})
+    for raw_entry in list(bundle.get("bundle_entries") or []):
+        if not isinstance(raw_entry, Mapping):
+            continue
+        entry = _jsonable_dict(raw_entry)
+        url = str(entry.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        source_tool = str(entry.get("source_tool") or "").strip()
+        meta = _jsonable_dict(entry.get("meta") or {})
+        if source_tool and source_tool != "seed":
+            return True
+        if not bool(meta.get("seeded")):
+            return True
+    return False
+
+
+def _experience_v2_artifact_draft_can_finalize_with_current_resources(
+    artifact_draft: Mapping[str, Any],
+    resource_bundle: Mapping[str, Any],
+) -> bool:
+    draft = _jsonable_dict(artifact_draft or {})
+    nodes = [item for item in list(draft.get("nodes") or []) if isinstance(item, Mapping)]
+    if not nodes:
+        return False
+
+    substantive_node_count = 0
+    for raw_node in nodes:
+        node = _jsonable_dict(raw_node)
+        node_kind = str(node.get("node_kind") or "").strip()
+        if node_kind not in _ARTIFACT_DRAFT_V2_SUPPORTED_NODE_KINDS:
+            continue
+        if any(
+            [
+                str(node.get("text") or "").strip(),
+                str(node.get("display_text") or "").strip(),
+                str(node.get("translation_zh") or "").strip(),
+                str(node.get("label") or "").strip(),
+                str(node.get("caption") or "").strip(),
+                str(node.get("term") or "").strip(),
+                str(node.get("definition") or "").strip(),
+                list(node.get("resource_ref_ids") or []),
+            ]
+        ):
+            substantive_node_count += 1
+
+    return substantive_node_count >= 3 and _resource_bundle_has_nonseed_public_web_entries(resource_bundle)
 
 
 def _build_page_artifact_v2_compact_source_context(
@@ -5461,6 +5927,7 @@ def _build_experience_session_v2_artifact_draft_prompt_payload(
         raise ValueError("artifact draft generation failed: narrative brief layer missing in session execution")
     focus_page = int(dossier.get("focus_page") or session.get("focus_page") or 1)
     bundle = _jsonable_dict(resource_bundle or {})
+    must_request_public_web_resources = not _resource_bundle_has_nonseed_public_web_entries(bundle)
     payload: Dict[str, Any] = {
         "task": "Generate experience_session_v2 artifact_draft JSON for bounded Phase 3 drafting.",
         "mode": "bootstrap_full_context" if include_full_dossier else "revise_compact_context",
@@ -5477,6 +5944,7 @@ def _build_experience_session_v2_artifact_draft_prompt_payload(
             "allowed_node_kinds": sorted(_ARTIFACT_DRAFT_V2_SUPPORTED_NODE_KINDS),
             "allowed_tools_for_resource_requests": ["paper_read", "knowledge_search", "web_search", "web_scrape"],
             "max_resource_requests_per_round": 2,
+            "minimum_public_web_resource_requests_before_finalizing": 1 if must_request_public_web_resources else 0,
             "content_completeness_priority": True,
             "do_not_optimize_for_brevity_only": True,
             "keep_reader_page_coherent_and_substantive": True,
@@ -5521,6 +5989,9 @@ def _build_experience_session_v2_artifact_draft_prompt_payload(
             ][:24],
             "required_media_refs": list(bundle.get("required_media_refs") or [])[:16],
             "continuity_resolutions": list(bundle.get("continuity_resolutions") or [])[:8],
+            "meta": {
+                "resource_request_affordance": _jsonable_dict(_jsonable_dict(bundle.get("meta") or {}).get("resource_request_affordance") or {}),
+            },
         },
         "anchor_excerpt_candidates": _build_page_artifact_v2_compact_source_context(
             reading_dossier=dossier,
@@ -5568,7 +6039,7 @@ def _experience_session_v2_artifact_draft_system_prompt() -> str:
         "20) Prefer several smaller original_excerpt nodes over a single very long excerpt. Avoid excerpt dumps.\n"
         "21) Insert figure/table/equation slots at the point where they advance the explanation; do not dump them separately from the teaching flow.\n"
         "22) Use support_note nodes sparingly. A page may have little or no support rail if the main flow is sufficient.\n"
-        "23) Use these exact node fields:\n"
+        "23) Use these exact node fields inside nodes[] only:\n"
         '    - heading: {"node_kind":"heading","text":"..."}\n'
         '    - paragraph: {"node_kind":"paragraph","text":"..."}\n'
         '    - original_excerpt: {"node_kind":"original_excerpt","display_text":"...","translation_zh":"...","source_layout_ids":["..."],"source_block_ids":["..."]}\n'
@@ -5576,21 +6047,28 @@ def _experience_session_v2_artifact_draft_system_prompt() -> str:
         '    - aside: {"node_kind":"aside","text":"..."}\n'
         '    - term_note: {"node_kind":"term_note","term":"...","definition":"..."}\n'
         '    - external_resource: {"node_kind":"external_resource","label":"...","resource_ref_ids":["resource_id"]}\n'
-        '    - resource_request: {"request_id":"req-...","tool_name":"web_search","query":"...","reason":"...","max_results":3}\n'
-        '      or for scraping {"request_id":"req-...","tool_name":"web_scrape","url":"https://...","reason":"...","max_results":1}\n'
-        "24) Use node meta to express page composition when helpful: lane(main|support), placement(block|inline|rail), prominence(hero|primary|secondary), group_id, group_label, section_id, section_label, reader_role.\n"
-        "25) Do not emit unnecessary support blocks. If support content is low-value, omit it instead of filling the rail.\n"
-        "26) Do not auto-surface every excerpt or media item; surface only what the draft needs for the reader-facing page.\n"
-        "27) Do not embed full resource objects inside nodes; use resource_ref_ids only.\n"
-        "28) Do not replace required field names with aliases such as content, body, source_layout_id, resource_refs, resources, or tool.\n"
-        "29) All reader-facing authored text must be written in Simplified Chinese, including heading.text, paragraph.text, aside.text, term_note.definition, and authored external_resource labels.\n"
-        "30) Keep canonical labels such as Figure 3, DOI, USMLE, URLs, and source titles in their original form when they are the clearest anchor.\n"
-        "31) original_excerpt.display_text should remain the source-language excerpt with only light OCR/spacing fixes.\n"
-        "32) For every original_excerpt node, also provide translation_zh as a faithful Simplified Chinese translation shown to the reader beneath the excerpt.\n"
-        "33) translation_zh should preserve the meaning of the excerpt and may smooth OCR/spacing issues, but it must not add claims that are absent from the source excerpt.\n"
-        "34) For term_note, explain the concept in Chinese and include the original English term in parentheses on first mention when helpful.\n"
-        "35) template_hint, layout_recipe, and presentation_mode should normally be concise strings; if you need structured planning detail, put it under meta rather than replacing those fields with objects.\n"
-        "36) Prefer natural Chinese technical phrasing. Avoid awkward hyphenated compounds such as '答案-解释一致性'; prefer forms like '答案与解释的一致性' and keep the English term in parentheses on first mention when helpful.\n"
+        "24) resource_requests is a top-level array, not a node. Never place resource_request objects inside nodes[].\n"
+        '    - web search request inside resource_requests[]: {"request_id":"req-...","tool_name":"web_search","query":"...","reason":"...","max_results":3}\n'
+        '    - web scrape request inside resource_requests[]: {"request_id":"req-...","tool_name":"web_scrape","url":"https://...","reason":"...","max_results":1}\n'
+        "25) Use node meta to express page composition when helpful: lane(main|support), placement(block|inline|rail), prominence(hero|primary|secondary), group_id, group_label, section_id, section_label, reader_role.\n"
+        "26) Do not emit unnecessary support blocks. If support content is low-value, omit it instead of filling the rail.\n"
+        "27) Do not auto-surface every excerpt or media item; surface only what the draft needs for the reader-facing page.\n"
+        "28) Do not embed full resource objects inside nodes; use resource_ref_ids only.\n"
+        "29) Do not replace required field names with aliases such as content, body, source_layout_id, resource_refs, resources, or tool.\n"
+        "30) All reader-facing authored text must be written in Simplified Chinese, including heading.text, paragraph.text, aside.text, term_note.definition, and authored external_resource labels.\n"
+        "31) Keep canonical labels such as Figure 3, DOI, USMLE, URLs, and source titles in their original form when they are the clearest anchor.\n"
+        "32) original_excerpt.display_text should remain the source-language excerpt with only light OCR/spacing fixes.\n"
+        "33) For every original_excerpt node, also provide translation_zh as a faithful Simplified Chinese translation shown to the reader beneath the excerpt.\n"
+        "34) translation_zh should preserve the meaning of the excerpt and may smooth OCR/spacing issues, but it must not add claims that are absent from the source excerpt.\n"
+        "35) For term_note, explain the concept in Chinese and include the original English term in parentheses on first mention when helpful.\n"
+        "36) template_hint, layout_recipe, and presentation_mode should normally be concise strings; if you need structured planning detail, put it under meta rather than replacing those fields with objects.\n"
+        "37) Prefer natural Chinese technical phrasing. Avoid awkward hyphenated compounds such as '答案-解释一致性'; prefer forms like '答案与解释的一致性' and keep the English term in parentheses on first mention when helpful.\n"
+        "38) Seeded paper/doi/pdf links are not the only allowed external resources. The first draft round should request 1 or 2 public-web resources beyond seed links unless such resources are already present in the bundle.\n"
+        "39) resource_requests may be used for term explainers, encyclopedia background, official docs/tutorials, and video explainer pages such as YouTube or Bilibili pages when they materially help the reader.\n"
+        "40) At least one initial resource_request should use web_search or web_scrape. Prefer web_search when the exact URL is not already known.\n"
+        "41) After public-web resources are retrieved, prefer surfacing at least one materially useful external_resource node from those fetched results rather than showing seed paper/doi links only.\n"
+        "42) If previous_artifact_draft is provided and resource_bundle already contains non-seed public-web resources, revise the page with those fetched resources first and prefer finalizing without more resource_requests.\n"
+        "43) Do not keep emitting resource_requests just to gather adjacent explainers, near-duplicate pages, or alternate phrasings of the same concept once the page is already teachable with the current bundle.\n"
     )
 
 
@@ -5610,6 +6088,141 @@ def _validate_experience_session_v2_artifact_draft_payload(
         )
     draft = ExperienceSessionV2ArtifactDraft.model_validate(payload)
     return draft.model_dump(mode="json")
+
+
+def _build_experience_v2_mandatory_resource_request_prompt_payload(
+    *,
+    paper: Paper,
+    reading_dossier: Mapping[str, Any],
+    session_payload: Mapping[str, Any],
+    resource_bundle: Mapping[str, Any],
+) -> Dict[str, Any]:
+    dossier = ReadingDossierV2.model_validate(_jsonable_dict(reading_dossier)).model_dump(mode="json")
+    session = ExperienceSessionV2.model_validate(_jsonable_dict(session_payload)).model_dump(mode="json")
+    narrative_brief = _find_latest_experience_session_v2_narrative_brief(session)
+    if not narrative_brief:
+        raise ValueError("artifact draft generation failed: mandatory resource planning missing narrative brief")
+    bundle = _jsonable_dict(resource_bundle or {})
+    compact_source_context = _build_page_artifact_v2_compact_source_context(
+        reading_dossier=dossier,
+        focus_page=int(dossier.get("focus_page") or session.get("focus_page") or 1),
+    )
+    return {
+        "task": "Plan 1-2 mandatory public-web resource_requests for experience_session_v2 before final artifact drafting.",
+        "paper": {
+            "title": str(getattr(paper, "title", "") or "").strip(),
+            "url": str(getattr(paper, "url", "") or "").strip(),
+            "doi": str(getattr(paper, "doi", "") or "").strip(),
+            "arxiv_url": str(getattr(paper, "arxiv_url", "") or "").strip(),
+        },
+        "rules": {
+            "strict_json_only": True,
+            "return_shape": {"resource_requests": "[1..2 items]"},
+            "minimum_resource_requests": 1,
+            "maximum_resource_requests": 2,
+            "must_include_public_web_tool": True,
+            "allowed_tools": ["web_search", "web_scrape"],
+            "prefer_web_search_when_exact_url_unknown": True,
+            "avoid_seed_duplicates": True,
+            "target_reader_value": "term explainer, encyclopedia background, official tutorial/docs, or video explainer page",
+        },
+        "narrative_brief": {
+            "current_page_main_arc": _jsonable_dict(narrative_brief).get("current_page_main_arc"),
+            "opening_key_points": list(_jsonable_dict(narrative_brief).get("opening_key_points") or [])[:4],
+            "reader_attention_order": list(_jsonable_dict(narrative_brief).get("reader_attention_order") or [])[:6],
+            "required_media_refs": list(_jsonable_dict(narrative_brief).get("required_media_refs") or [])[:4],
+        },
+        "resource_bundle": {
+            "existing_external_resources": [
+                {
+                    "resource_id": str(_jsonable_dict(item).get("resource_id") or "").strip(),
+                    "label": str(_jsonable_dict(item).get("label") or "").strip(),
+                    "url": str(_jsonable_dict(item).get("url") or "").strip(),
+                    "resource_type": str(_jsonable_dict(item).get("resource_type") or "").strip(),
+                    "source_tool": str(_jsonable_dict(item).get("source_tool") or "").strip(),
+                }
+                for item in list(bundle.get("bundle_entries") or [])
+                if isinstance(item, Mapping)
+            ][:16],
+            "affordance": _jsonable_dict(_jsonable_dict(bundle.get("meta") or {}).get("resource_request_affordance") or {}),
+        },
+        "compact_source_context": {
+            "excerpt_candidates": list(compact_source_context.get("excerpt_candidates") or [])[:8],
+            "media_candidates": _jsonable_dict(compact_source_context.get("media_candidates") or {}),
+        },
+    }
+
+
+def _experience_v2_mandatory_resource_request_system_prompt() -> str:
+    return (
+        "You are planning mandatory public-web resource_requests for experience_session_v2.\n"
+        "Return strict JSON only with shape {\"resource_requests\":[...] }.\n"
+        "Hard rules:\n"
+        "1) Emit 1 or 2 resource_requests.\n"
+        "2) At least one request must use web_search or web_scrape.\n"
+        "3) Prefer public explainer resources that help a reader understand the current page, not generic paper metadata.\n"
+        "4) Avoid duplicating seeded paper/doi/pdf/arxiv links.\n"
+        "5) Prefer web_search when the exact URL is not already known.\n"
+        "6) Queries and reasons should be concise but specific to the current page's concepts, figures, equations, or terminology.\n"
+        "7) Output only the JSON object, no commentary.\n"
+    )
+
+
+def _validate_experience_v2_mandatory_resource_request_payload(
+    raw_payload: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    payload = _jsonable_dict(raw_payload)
+    requests: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for raw_request in list(payload.get("resource_requests") or []):
+        if not isinstance(raw_request, Mapping):
+            continue
+        request = ExperienceSessionV2ArtifactDraftResourceRequest.model_validate(_jsonable_dict(raw_request)).model_dump(mode="json")
+        key = "|".join(
+            [
+                str(request.get("tool_name") or "").strip(),
+                str(request.get("query") or "").strip(),
+                str(request.get("url") or "").strip(),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        requests.append(request)
+        if len(requests) >= 2:
+            break
+    if not requests:
+        raise ValueError("artifact draft generation failed: mandatory web resource planning produced no resource_requests")
+    if not any(str(item.get("tool_name") or "").strip() in {"web_search", "web_scrape"} for item in requests):
+        raise ValueError("artifact draft generation failed: mandatory web resource planning requires public-web requests")
+    return requests
+
+
+async def _generate_experience_v2_mandatory_resource_requests(
+    *,
+    paper: Paper,
+    reading_dossier: Mapping[str, Any],
+    session_payload: Mapping[str, Any],
+    resource_bundle: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    prompt_payload = _build_experience_v2_mandatory_resource_request_prompt_payload(
+        paper=paper,
+        reading_dossier=reading_dossier,
+        session_payload=session_payload,
+        resource_bundle=resource_bundle,
+    )
+    config = _experience_session_v2_artifact_agent_config()
+    parsed = await _call_experience_session_v2_artifact_draft_model(
+        system_prompt=_experience_v2_mandatory_resource_request_system_prompt(),
+        user_prompt_payload=prompt_payload,
+        provider=str(config.get("provider") or "").strip(),
+        api_key=str(config.get("api_key") or "").strip(),
+        base_url=str(config.get("base_url") or "").strip(),
+        model=str(config.get("model") or "").strip(),
+        timeout_seconds=float(config.get("timeout_seconds") or 0.0),
+        max_tokens=min(2400, max(512, int(config.get("max_tokens") or 0))),
+    )
+    return _validate_experience_v2_mandatory_resource_request_payload(parsed)
 
 
 async def _call_experience_session_v2_artifact_draft_model(
@@ -8704,32 +9317,33 @@ async def _build_generative_reader_agent_tool_registry_for_paper(
 ) -> tuple[Optional[ToolRegistry], Set[str]]:
     semantic_tool_names = {"paper_read", "knowledge_search", "web_search", "web_scrape"}
     paper_pdf_path = _resolve_local_pdf_path(int(current_user.id), paper)
-    resolved_kb_id = int(selected_kb_id or getattr(paper, "knowledge_base_id", 0) or 0)
+    resolved_kb_id = int(selected_kb_id or 0)
 
     if resolved_kb_id > 0:
-        kb = await _get_owned_kb_or_404(db, current_user, int(resolved_kb_id))
-        ready_links, _ = await _retrieve_scope_ready_links(
-            db,
-            user_id=int(current_user.id),
-            kb_id=int(kb.id),
-            paper_ids=[int(paper.id)],
-        )
-        document_ids = sorted({int(link.document_id) for link in ready_links if getattr(link, "document_id", None)})
-        registry, allowed = await _build_literature_agent_tool_registry(
-            db=db,
-            user_id=int(current_user.id),
-            knowledge_base_id=int(kb.id),
-            knowledge_base_name=str(kb.name or f"KB#{kb.id}"),
-            document_ids=document_ids,
-            paper_id=int(paper.id),
-            paper_title=str(getattr(paper, "title", None) or f"paper_{paper.id}"),
-            paper_pdf_path=paper_pdf_path,
-        )
-        return registry, {
-            name
-            for name in allowed
-            if name in semantic_tool_names or _is_web_mcp_tool_name(name)
-        }
+        kb = await _get_owned_kb_or_none(db, current_user, int(resolved_kb_id))
+        if kb is not None:
+            ready_links, _ = await _retrieve_scope_ready_links(
+                db,
+                user_id=int(current_user.id),
+                kb_id=int(kb.id),
+                paper_ids=[int(paper.id)],
+            )
+            document_ids = sorted({int(link.document_id) for link in ready_links if getattr(link, "document_id", None)})
+            registry, allowed = await _build_literature_agent_tool_registry(
+                db=db,
+                user_id=int(current_user.id),
+                knowledge_base_id=int(kb.id),
+                knowledge_base_name=str(kb.name or f"KB#{kb.id}"),
+                document_ids=document_ids,
+                paper_id=int(paper.id),
+                paper_title=str(getattr(paper, "title", None) or f"paper_{paper.id}"),
+                paper_pdf_path=paper_pdf_path,
+            )
+            return registry, {
+                name
+                for name in allowed
+                if name in semantic_tool_names or _is_web_mcp_tool_name(name)
+            }
 
     if not paper_pdf_path or not os.path.exists(str(paper_pdf_path)):
         return None, set()
@@ -9199,6 +9813,11 @@ async def save_paper(
     """保存论文（从搜索结果）。"""
     logger.info(f"[Literature API] 保存论文: {request.title[:50]}...")
 
+    collection_ids = await _resolve_target_collection_ids_for_save(
+        db,
+        user_id=current_user.id,
+        requested_collection_ids=request.collection_ids,
+    )
     request_arxiv_id = _normalize_arxiv_id(
         _infer_arxiv_id_from_candidates(
             request.arxiv_id,
@@ -9216,7 +9835,16 @@ async def save_paper(
     )
 
     if existing:
-        raise HTTPException(status_code=400, detail="论文已存在")
+        if collection_ids:
+            await _add_paper_to_collections_if_missing(
+                db,
+                paper_id=existing.id,
+                user_id=current_user.id,
+                collection_ids=collection_ids,
+            )
+            await db.commit()
+        existing_collection_ids = await _load_collection_ids_for_paper(db, existing.id)
+        return PaperResponse(**paper_to_response(existing, existing_collection_ids))
 
     # 创建论文
     paper = Paper(
@@ -9239,41 +9867,47 @@ async def save_paper(
         source=request.source,
         raw_data=request.raw_data
     )
-    
-    db.add(paper)
-    await db.flush()
-    await _ensure_paper_entity(db, paper)
 
-    # 添加到收藏夹
-    collection_ids = [int(item) for item in dict.fromkeys(request.collection_ids or [])]
+    try:
+        db.add(paper)
+        await db.flush()
+        await _ensure_paper_entity(db, paper)
 
-    # 如果没有指定收藏夹，添加到默认收藏夹
-    if not collection_ids:
-        default_stmt = select(PaperCollection).where(
-            and_(
-                PaperCollection.user_id == current_user.id,
-                PaperCollection.is_default == True
+        if collection_ids:
+            await _add_paper_to_collections_if_missing(
+                db,
+                paper_id=paper.id,
+                user_id=current_user.id,
+                collection_ids=collection_ids,
             )
+
+        await db.commit()
+        await db.refresh(paper)
+        response_collection_ids = await _load_collection_ids_for_paper(db, paper.id)
+        return PaperResponse(**paper_to_response(paper, response_collection_ids))
+    except IntegrityError as exc:
+        await db.rollback()
+        logger.warning(
+            f"[Literature API] 保存论文命中并发唯一键冲突，回退到已有论文: user={current_user.id}, "
+            f"source={request.source}, external_id={request.external_id}"
         )
-        default_result = await db.execute(default_stmt)
-        # 使用 scalars().first() 安全处理可能存在的多个默认收藏夹
-        default_collection = default_result.scalars().first()
-
-        if default_collection:
-            collection_ids = [default_collection.id]
-
-    if collection_ids:
-        collection_ids = await _add_paper_to_collections_if_missing(
+        existing = await _find_existing_paper_for_request(
             db,
-            paper_id=paper.id,
             user_id=current_user.id,
-            collection_ids=collection_ids,
+            request=request,
         )
-
-    await db.commit()
-    await db.refresh(paper)
-
-    return PaperResponse(**paper_to_response(paper, collection_ids))
+        if existing is None:
+            raise
+        if collection_ids:
+            await _add_paper_to_collections_if_missing(
+                db,
+                paper_id=existing.id,
+                user_id=current_user.id,
+                collection_ids=collection_ids,
+            )
+            await db.commit()
+        existing_collection_ids = await _load_collection_ids_for_paper(db, existing.id)
+        return PaperResponse(**paper_to_response(existing, existing_collection_ids))
 
 
 @router.post("/papers/import-link", response_model=ImportPaperByLinkResponse)
@@ -9929,7 +10563,18 @@ async def download_paper_pdf(
             file_type="pdf",
             mime_type="application/pdf",
             status=DocumentStatus.PENDING.value,
-            metadata_={"paper_id": paper.id, "title": paper.title},
+            metadata_={
+                "paper_id": paper.id,
+                "title": paper.title,
+                "ingest_request": {
+                    "mode": "local_fast",
+                    "extract_profile": "general",
+                    "extract_granularity": "medium",
+                    "requested_by": int(current_user.id),
+                    "requested_at": datetime.utcnow().isoformat(),
+                    "source": "literature_download_pdf",
+                },
+            },
         )
         db.add(doc)
         await db.flush()
@@ -9956,9 +10601,6 @@ async def download_paper_pdf(
         link.status = KnowledgeLinkStatus.PENDING.value
         link.error_message = None
 
-        paper.knowledge_base_id = kb.id
-        paper.document_id = doc.id
-
         if background_tasks:
             background_tasks.add_task(
                 _run_document_processing_for_link,
@@ -9981,7 +10623,7 @@ async def download_paper_pdf(
         "message": "PDF 下载成功",
         "pdf_path": pdf_path,
         "knowledge_base_id": knowledge_base_id,
-        "document_id": paper.document_id
+        "document_id": int(doc.id) if knowledge_base_id else None,
     }
 
 
@@ -10311,12 +10953,22 @@ async def get_reader_session(
             page=1,
             zoom="100%",
             scroll_y=0,
-            selected_kb_id=paper.knowledge_base_id,
+            selected_kb_id=None,
             last_anchor={},
         )
         db.add(session)
         await db.commit()
         await db.refresh(session)
+    else:
+        normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+            db=db,
+            current_user=current_user,
+            selected_kb_id=session.selected_kb_id,
+        )
+        if normalized_selected_kb_id != session.selected_kb_id:
+            session.selected_kb_id = normalized_selected_kb_id
+            await db.commit()
+            await db.refresh(session)
 
     return ReaderSessionResponse(
         page=session.page or 1,
@@ -10353,7 +11005,11 @@ async def update_reader_session(
     session.page = int(payload.page)
     session.zoom = payload.zoom
     session.scroll_y = int(payload.scroll_y)
-    session.selected_kb_id = payload.selected_kb_id
+    session.selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
     session.last_anchor = payload.last_anchor or {}
 
     await db.commit()
@@ -10383,12 +11039,17 @@ async def stream_reader_generative_page(
         try:
             async with async_session_factory() as db:
                 paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+                normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+                    db=db,
+                    current_user=current_user,
+                    selected_kb_id=payload.selected_kb_id,
+                )
                 page_payload, meta = await service.build_or_get_page_payload(
                     db=db,
                     user_id=int(current_user.id),
                     paper=paper,
                     page=page_num,
-                    selected_kb_id=payload.selected_kb_id,
+                    selected_kb_id=normalized_selected_kb_id,
                     force_refresh=bool(payload.force_refresh),
                     prefer_agent=bool(getattr(payload, "prefer_agent", False)),
                     style_hint=payload.style_hint,
@@ -10506,13 +11167,18 @@ async def get_reader_composed_generative_plan(
     compose_service = get_literature_reader_compose_service()
     runtime = get_generative_reader_agent_runtime()
     page_num = max(1, int(payload.page))
+    normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
 
     composed_payload, meta = await compose_service.build_or_get_composed_payload(
         db=db,
         user_id=int(current_user.id),
         paper=paper,
         page=page_num,
-        selected_kb_id=payload.selected_kb_id,
+        selected_kb_id=normalized_selected_kb_id,
         pipeline_version_override=getattr(payload, "pipeline_version", None),
         force_refresh=bool(payload.force_refresh),
         regenerate=bool(payload.regenerate),
@@ -10536,7 +11202,7 @@ async def get_reader_composed_generative_plan(
         user_id=int(current_user.id),
         paper_id=int(paper.id),
         page=page_num,
-        selected_kb_id=int(payload.selected_kb_id or 0),
+        selected_kb_id=int(normalized_selected_kb_id or 0),
         compose_source_signature=compose_source_signature,
         user_intent=str(payload.user_intent or "").strip(),
     )
@@ -10586,7 +11252,7 @@ async def get_reader_composed_generative_plan(
         db=db,
         current_user=current_user,
         paper=paper,
-        selected_kb_id=payload.selected_kb_id,
+        selected_kb_id=normalized_selected_kb_id,
     )
     plan = await runtime.build_plan(
         user_id=int(current_user.id),
@@ -10942,6 +11608,11 @@ async def _build_reader_experience_plan_cached_payload(
     compose_service = get_literature_reader_compose_service()
     runtime = get_generative_reader_agent_runtime()
     focus_page = max(1, int(payload.focus_page or payload.page or 1))
+    normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
 
     composed_payload = await compose_service.get_latest_cached_payload_only(
         db=db,
@@ -10961,7 +11632,7 @@ async def _build_reader_experience_plan_cached_payload(
     compose_build_mode = str(composed_payload.get("build_mode") or "compose_cache")
     compose_source_signature = str(composed_payload.get("source_signature") or "")
     source_sig_hash = ""
-    selected_kb_id = int(payload.selected_kb_id or 0)
+    selected_kb_id = int(normalized_selected_kb_id or 0)
     user_intent = str(payload.user_intent or "").strip()
     reader_profile = str(payload.reader_profile or "").strip()
     focus_section_ids = list(payload.focus_section_ids or [])
@@ -11245,13 +11916,18 @@ async def _build_reader_experience_plan_payload(
     compose_service = get_literature_reader_compose_service()
     runtime = get_generative_reader_agent_runtime()
     focus_page = max(1, int(payload.focus_page or payload.page or 1))
+    normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
 
     composed_payload, meta = await compose_service.build_or_get_composed_payload(
         db=db,
         user_id=int(current_user.id),
         paper=paper,
         page=focus_page,
-        selected_kb_id=payload.selected_kb_id,
+        selected_kb_id=normalized_selected_kb_id,
         force_refresh=bool(payload.force_refresh),
         regenerate=bool(payload.regenerate),
         latency_budget_ms=payload.latency_budget_ms,
@@ -11268,7 +11944,7 @@ async def _build_reader_experience_plan_payload(
     compose_build_mode = str(composed_payload.get("build_mode") or meta.build_mode or "")
     compose_source_signature = str(composed_payload.get("source_signature") or meta.source_signature or "")
     source_sig_hash = str(meta.source_sig_hash or "")
-    selected_kb_id = int(payload.selected_kb_id or 0)
+    selected_kb_id = int(normalized_selected_kb_id or 0)
     user_intent = str(payload.user_intent or "").strip()
     reader_profile = str(payload.reader_profile or "").strip()
     focus_section_ids = list(payload.focus_section_ids or [])
@@ -11315,7 +11991,7 @@ async def _build_reader_experience_plan_payload(
             db=db,
             current_user=current_user,
             paper=paper,
-            selected_kb_id=payload.selected_kb_id,
+            selected_kb_id=normalized_selected_kb_id,
         )
         generated_plan = await runtime.build_plan(
             user_id=int(current_user.id),
@@ -11522,12 +12198,17 @@ async def _prepare_reader_experience_v2_runtime(
     paper = await _get_owned_paper_or_404(db, current_user, paper_id)
     compose_service = get_literature_reader_compose_service()
     focus_page = max(1, int(payload.focus_page or payload.page or 1))
+    normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
     composed_payload, meta = await compose_service.build_or_get_composed_payload(
         db=db,
         user_id=int(current_user.id),
         paper=paper,
         page=focus_page,
-        selected_kb_id=payload.selected_kb_id,
+        selected_kb_id=normalized_selected_kb_id,
         force_refresh=bool(payload.force_refresh),
         regenerate=bool(payload.regenerate),
         latency_budget_ms=payload.latency_budget_ms,
@@ -11546,7 +12227,7 @@ async def _prepare_reader_experience_v2_runtime(
     source_sig_hash = str(meta.source_sig_hash or "")
     reader_profile = str(payload.reader_profile or "").strip() or "curious_generalist"
     user_intent = str(payload.user_intent or "").strip()
-    selected_kb_id = int(payload.selected_kb_id or 0)
+    selected_kb_id = int(normalized_selected_kb_id or 0)
 
     try:
         adjacent_page_context = await _build_experience_adjacent_page_structured_context_v2(
@@ -11556,7 +12237,11 @@ async def _prepare_reader_experience_v2_runtime(
             current_user=current_user,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.warning(
+            f"[Literature Experience] adjacent structured context degraded to empty paper={paper_id} "
+            f"focus_page={focus_page}: {exc}"
+        )
+        adjacent_page_context = []
 
     try:
         reading_dossier = _build_reading_dossier_v2(
@@ -11567,6 +12252,9 @@ async def _prepare_reader_experience_v2_runtime(
             source_sig_hash=source_sig_hash,
         )
     except ValueError as exc:
+        logger.warning(
+            f"[Literature Experience] reading dossier v2 build failed paper={paper_id} focus_page={focus_page}: {exc}"
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     dossier_meta = _jsonable_dict(reading_dossier.get("meta") or {})
@@ -11656,6 +12344,24 @@ async def _run_reader_experience_v2_artifact_drafting_loop(
         resource_bundle=resource_bundle,
         include_full_dossier=True,
     )
+    if (
+        not list((_jsonable_dict(latest_artifact_draft).get("resource_requests") or []))
+        and not _resource_bundle_has_nonseed_public_web_entries(resource_bundle)
+        and bool(
+            _jsonable_dict(_jsonable_dict(resource_bundle.get("meta") or {}).get("resource_request_affordance") or {}).get("must_use_tools")
+        )
+    ):
+        forced_requests = await _generate_experience_v2_mandatory_resource_requests(
+            paper=paper,
+            reading_dossier=reading_dossier,
+            session_payload=session_payload,
+            resource_bundle=resource_bundle,
+        )
+        latest_artifact_draft = _jsonable_dict(latest_artifact_draft)
+        latest_artifact_draft["resource_requests"] = forced_requests
+        forced_meta = _jsonable_dict(latest_artifact_draft.get("meta") or {})
+        forced_meta["forced_public_web_resource_round"] = True
+        latest_artifact_draft["meta"] = forced_meta
     retrieval_rounds = 0
     max_retrieval_rounds = min(
         _EXPERIENCE_V2_ARTIFACT_DRAFT_MAX_RETRIEVAL_ROUNDS,
@@ -11665,6 +12371,22 @@ async def _run_reader_experience_v2_artifact_drafting_loop(
     while list((_jsonable_dict(latest_artifact_draft).get("resource_requests") or [])):
         retrieval_rounds += 1
         if retrieval_rounds > max_retrieval_rounds:
+            if _experience_v2_artifact_draft_can_finalize_with_current_resources(
+                latest_artifact_draft,
+                resource_bundle,
+            ):
+                latest_artifact_draft = _jsonable_dict(latest_artifact_draft)
+                dropped_requests = len(list(latest_artifact_draft.get("resource_requests") or []))
+                latest_artifact_draft["resource_requests"] = []
+                draft_meta = _jsonable_dict(latest_artifact_draft.get("meta") or {})
+                draft_meta["resource_request_budget_exhausted"] = True
+                draft_meta["dropped_pending_resource_requests"] = dropped_requests
+                latest_artifact_draft["meta"] = draft_meta
+                bundle_meta = _jsonable_dict(resource_bundle.get("meta") or {})
+                bundle_meta["resource_request_budget_exhausted"] = True
+                bundle_meta["dropped_pending_resource_requests"] = dropped_requests
+                resource_bundle = {**_jsonable_dict(resource_bundle), "meta": bundle_meta}
+                break
             raise ValueError("artifact draft generation blocked by retrieval round budget exhausted")
         requested_resources = [
             ExperienceSessionV2ArtifactDraftResourceRequest.model_validate(_jsonable_dict(item)).model_dump(mode="json")
@@ -12300,6 +13022,24 @@ async def stream_reader_composed_page(
                         progress_state["message"] = message_token
             await event_queue.put((str(event or "").strip() or "stage", data))
 
+        def sanitize_stream_ui_plan(raw_ui_plan: Any, payload_hint: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+            candidate = dict(raw_ui_plan or {}) if isinstance(raw_ui_plan, Mapping) else {}
+            sanitize = getattr(service, "_sanitize_ui_plan_for_runtime", None)
+            if not callable(sanitize):
+                return candidate
+            try:
+                return sanitize(
+                    page=page_num,
+                    payload=dict(payload_hint or {}),
+                    ui_plan=candidate,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Literature API] stream ui_plan sanitize failed "
+                    f"paper={paper_id} page={page_num}: {exc}"
+                )
+                return candidate
+
         async def build_payload_in_background() -> None:
             try:
                 async with async_session_factory() as db:
@@ -12431,6 +13171,10 @@ async def stream_reader_composed_page(
                 if event_name == "__error__":
                     yield _sse_payload("error", {"message": str((event_data or {}).get("message") or "stream_build_failed")})
                     return
+                if event_name in {"plan_draft", "plan_patch"} and isinstance(event_data, Mapping):
+                    event_dict = dict(event_data or {})
+                    event_dict["ui_plan"] = sanitize_stream_ui_plan(event_dict.get("ui_plan"), {})
+                    event_data = event_dict
                 yield _sse_payload(event_name, event_data)
 
             if composed_payload is None or meta is None:
@@ -12459,7 +13203,10 @@ async def stream_reader_composed_page(
                     "plan_draft",
                     {
                         "iteration": int(first.get("iteration") or 1),
-                        "ui_plan": first.get("ui_plan") or composed_payload.get("ui_plan") or {},
+                        "ui_plan": sanitize_stream_ui_plan(
+                            first.get("ui_plan") or composed_payload.get("ui_plan") or {},
+                            composed_payload,
+                        ),
                         "phase": "skeleton",
                         "layout_lock": True,
                     },
@@ -12492,7 +13239,7 @@ async def stream_reader_composed_page(
                         "plan_patch",
                         {
                             "iteration": int(row.get("iteration") or 0),
-                            "ui_plan": row.get("ui_plan") or {},
+                            "ui_plan": sanitize_stream_ui_plan(row.get("ui_plan") or {}, composed_payload),
                             "phase": "semantic",
                             "patch_type": "node_replace",
                         },
@@ -12534,7 +13281,7 @@ async def stream_reader_composed_page(
                     "plan_draft",
                     {
                         "iteration": 1,
-                        "ui_plan": composed_payload.get("ui_plan") or {},
+                        "ui_plan": sanitize_stream_ui_plan(composed_payload.get("ui_plan") or {}, composed_payload),
                         "phase": "skeleton",
                         "layout_lock": True,
                     },
@@ -13252,6 +13999,102 @@ async def stream_reader_experience_v2_block_explain(
         },
     )
 
+
+@router.post(
+    "/papers/{paper_id}/experience-v2/block-rewrite",
+    response_model=ReaderExperienceBlockRewriteResponse,
+    response_class=JSONResponse,
+)
+async def rewrite_reader_experience_v2_block_http(
+    paper_id: int,
+    payload: ReaderExperienceBlockRewriteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    runtime_request = ReaderExperiencePlanRequest(
+        page=int(payload.page),
+        focus_page=int(payload.page),
+        selected_kb_id=payload.selected_kb_id,
+        reader_profile=str(payload.reader_profile or "").strip() or "curious_generalist",
+        user_intent=str(payload.user_intent or "").strip(),
+    )
+    runtime_state = await _prepare_reader_experience_v2_runtime(
+        paper_id=paper_id,
+        payload=runtime_request,
+        db=db,
+        current_user=current_user,
+    )
+    cached_artifact = runtime_state.get("cached_artifact")
+    if not isinstance(cached_artifact, Mapping):
+        raise HTTPException(
+            status_code=409,
+            detail="completed page_artifact_v2 not available: block rewrite requires an existing ready artifact",
+        )
+
+    artifact_payload = PageArtifactV2.model_validate(_jsonable_dict(cached_artifact)).model_dump(mode="json")
+    target_index = _find_experience_v2_block_index(list(artifact_payload.get("reading_blocks") or []), payload.block_id)
+    if target_index < 0:
+        raise HTTPException(status_code=404, detail="target block not found in current artifact")
+    target_block = _jsonable_dict(list(artifact_payload.get("reading_blocks") or [])[target_index])
+    if not _experience_v2_block_rewrite_is_supported(target_block):
+        raise HTTPException(
+            status_code=409,
+            detail="current block kind does not support local rewrite yet",
+        )
+
+    narrative_brief = _find_latest_experience_session_v2_narrative_brief(
+        _jsonable_dict(runtime_state.get("cached_session") or {})
+    ) or {}
+    prompt_payload = _build_experience_v2_block_rewrite_prompt_payload(
+        paper=runtime_state["paper"],
+        artifact_payload=artifact_payload,
+        narrative_brief=narrative_brief,
+        block_id=str(payload.block_id or "").strip(),
+        rewrite_prompt=str(payload.rewrite_prompt or "").strip(),
+        reader_profile=str(runtime_state.get("reader_profile") or "").strip(),
+        user_intent=str(runtime_state.get("user_intent") or "").strip(),
+    )
+    config = _experience_session_v2_artifact_agent_config()
+    parsed = await _call_experience_session_v2_artifact_draft_model(
+        system_prompt=_experience_v2_block_rewrite_system_prompt(str(target_block.get("segment_kind") or "")),
+        user_prompt_payload=prompt_payload,
+        provider=str(config.get("provider") or "").strip(),
+        api_key=str(config.get("api_key") or "").strip(),
+        base_url=str(config.get("base_url") or "").strip(),
+        model=str(config.get("model") or "").strip(),
+        timeout_seconds=float(config.get("timeout_seconds") or 0.0),
+        max_tokens=min(2200, max(512, int(config.get("max_tokens") or 0))),
+    )
+    rewrite_payload = _validate_experience_v2_block_rewrite_model_payload(parsed)
+    updated_artifact, rewritten_block = _apply_experience_v2_block_rewrite_to_artifact(
+        artifact_payload=artifact_payload,
+        block_id=str(payload.block_id or "").strip(),
+        rewritten_text=str(rewrite_payload.get("text") or "").strip(),
+        rewrite_prompt=str(payload.rewrite_prompt or "").strip(),
+    )
+    artifact_validation = _validate_page_artifact_v2_contract(updated_artifact)
+    if not artifact_validation.get("valid") or not artifact_validation.get("renderable"):
+        raise HTTPException(
+            status_code=409,
+            detail="completed page_artifact_v2 not available: rewritten block failed artifact validation",
+        )
+    await _page_artifact_v2_cache_set(
+        str(runtime_state.get("artifact_cache_key") or "").strip(),
+        updated_artifact,
+        user_id=int(current_user.id),
+        paper_id=int(runtime_state["paper"].id),
+        page=int(runtime_state["focus_page"]),
+        compose_source_signature=str(runtime_state.get("compose_source_signature") or "").strip(),
+    )
+    response_payload = ReaderExperienceBlockRewriteResponse(
+        focus_page=int(runtime_state["focus_page"]),
+        artifact=PageArtifactV2.model_validate(updated_artifact),
+        rewritten_block=PageArtifactV2ReadingBlock.model_validate(rewritten_block),
+        message="当前块已重写并覆盖到当前 artifact；重新生成整页后该改写可能被覆盖。",
+    ).model_dump(mode="json")
+    return JSONResponse(content=response_payload)
+
+
 @router.get("/papers/{paper_id}/annotations", response_model=List[PaperAnnotationResponse])
 async def list_annotations(
     paper_id: int,
@@ -13647,7 +14490,18 @@ async def add_paper_to_knowledge(
         file_type="pdf",
         mime_type="application/pdf",
         status=DocumentStatus.PENDING.value,
-        metadata_={"paper_id": paper.id, "title": paper.title},
+        metadata_={
+            "paper_id": paper.id,
+            "title": paper.title,
+            "ingest_request": {
+                "mode": "local_fast",
+                "extract_profile": "general",
+                "extract_granularity": "medium",
+                "requested_by": int(current_user.id),
+                "requested_at": datetime.utcnow().isoformat(),
+                "source": "literature_add_to_knowledge",
+            },
+        },
     )
     db.add(doc)
     await db.flush()
@@ -13673,9 +14527,6 @@ async def add_paper_to_knowledge(
     link.document_id = doc.id
     link.status = KnowledgeLinkStatus.PENDING.value
     link.error_message = None
-
-    paper.knowledge_base_id = kb.id
-    paper.document_id = doc.id
 
     await db.commit()
     await db.refresh(link)

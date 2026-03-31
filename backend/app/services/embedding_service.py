@@ -16,6 +16,7 @@ Embedding 服务 - 支持本地科研嵌入模型和云端 API
 import asyncio
 import gc
 import hashlib
+from pathlib import Path
 import re
 import threading
 import numpy as np
@@ -129,6 +130,13 @@ class LocalEmbeddingModel:
         prefer_safetensors = bool(getattr(settings, "local_embedding_prefer_safetensors", True))
         local_files_only = bool(getattr(settings, "local_embedding_local_files_only", False))
         allow_legacy_fallback = bool(getattr(settings, "local_embedding_allow_legacy_pickle_fallback", True))
+        safetensors_viable = self._cached_main_snapshot_supports_safetensors(cache_dir)
+
+        if prefer_safetensors and safetensors_viable is False:
+            logger.info(
+                f"检测到本地模型主快照不支持 safetensors，跳过优先 safetensors 加载: model={self._model_name}"
+            )
+            prefer_safetensors = False
 
         if prefer_safetensors:
             if local_files_only or cache_dir:
@@ -162,6 +170,56 @@ class LocalEmbeddingModel:
         if not profiles:
             profiles.append(("default", dict(base_kwargs)))
         return profiles
+
+    def _cached_main_snapshot_supports_safetensors(self, cache_dir: Optional[str]) -> Optional[bool]:
+        """检查当前 refs/main 指向的本地快照是否具备 safetensors 权重文件。
+
+        返回:
+        - True: 明确支持 safetensors
+        - False: 明确只看到 legacy bin 布局，不应优先走 safetensors
+        - None: 无法判断，保留现有加载顺序
+        """
+        snapshot_dir = self._resolve_cached_main_snapshot_dir(cache_dir)
+        if snapshot_dir is None:
+            return None
+
+        has_safetensors = any(
+            (snapshot_dir / name).exists()
+            for name in ("model.safetensors", "model.safetensors.index.json")
+        )
+        has_legacy_bin = any(
+            (snapshot_dir / name).exists()
+            for name in ("pytorch_model.bin", "pytorch_model.bin.index.json")
+        )
+
+        if has_safetensors:
+            return True
+        if has_legacy_bin:
+            return False
+        return None
+
+    def _resolve_cached_main_snapshot_dir(self, cache_dir: Optional[str]) -> Optional[Path]:
+        if not cache_dir:
+            return None
+
+        normalized_model_name = str(self._model_name or "").strip()
+        if not normalized_model_name:
+            return None
+
+        model_cache_dir = Path(cache_dir) / f"models--{normalized_model_name.replace('/', '--')}"
+        ref_file = model_cache_dir / "refs" / "main"
+        try:
+            snapshot_id = ref_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+
+        if not snapshot_id:
+            return None
+
+        snapshot_dir = model_cache_dir / "snapshots" / snapshot_id
+        if snapshot_dir.exists():
+            return snapshot_dir
+        return None
 
     @staticmethod
     def _is_runtime_device_error(exc: Exception) -> bool:
@@ -342,6 +400,14 @@ class LocalEmbeddingModel:
         except Exception as e:
             logger.error(f"加载本地嵌入模型失败: {e}")
             raise
+
+    @property
+    def is_loaded(self) -> bool:
+        return bool(self._loaded)
+
+    @property
+    def device(self) -> Optional[str]:
+        return self._device
 
     @property
     def dimension(self) -> int:
@@ -588,6 +654,49 @@ class EmbeddingService:
 
     def get_target_dimension(self) -> int:
         return self.get_dimension()
+
+    def get_runtime_status(self) -> Dict[str, object]:
+        metadata: Dict[str, object] = {
+            "provider": str(self.provider or "").strip().lower(),
+            "model": self._get_model(),
+        }
+        if self.provider == "local":
+            metadata["ready"] = bool(self._local_model and self._local_model.is_loaded)
+            metadata["dimension"] = int(self.get_dimension() or 0)
+            if self._local_model and self._local_model.device:
+                metadata["device"] = self._local_model.device
+            return metadata
+        if self.provider == "mock":
+            metadata["ready"] = True
+            metadata["dimension"] = int(self.get_dimension() or 0)
+            metadata["device"] = "mock"
+            return metadata
+        metadata["ready"] = False
+        return metadata
+
+    async def warmup(self) -> Dict[str, object]:
+        """Preload local/mock embedding runtime for the first retrieval request."""
+        provider = str(self.provider or "").strip().lower()
+        model_name = self._get_model()
+        metadata: Dict[str, object] = {
+            "provider": provider,
+            "model": model_name,
+            "dimension": int(self.get_dimension() or 0),
+        }
+
+        if provider not in {"local", "mock"}:
+            return {
+                "status": "skipped",
+                "detail": f"provider={provider} startup warmup not required",
+                "metadata": metadata,
+            }
+
+        await self.embed_text("retrieval warmup query", is_query=True)
+        return {
+            "status": "warmed",
+            "detail": f"provider={provider} model ready",
+            "metadata": metadata,
+        }
 
     # ===================================================================
     #  核心嵌入方法

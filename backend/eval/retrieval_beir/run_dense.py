@@ -164,6 +164,105 @@ def _prepare_run_paths(
     )
 
 
+def _limit_dataset(
+    *,
+    corpus: dict[str, dict[str, str]],
+    queries: dict[str, str],
+    qrels: dict[str, dict[str, int]],
+    max_queries: int,
+    max_corpus: int,
+) -> tuple[dict[str, dict[str, str]], dict[str, str], dict[str, dict[str, int]], dict[str, int]]:
+    selected_queries = dict(queries)
+    selected_qrels = {
+        query_id: dict(rels)
+        for query_id, rels in qrels.items()
+        if query_id in selected_queries
+    }
+    selected_corpus = dict(corpus)
+
+    if max_queries > 0:
+        ranked_query_ids = [
+            query_id
+            for query_id in selected_queries.keys()
+            if selected_qrels.get(query_id)
+        ]
+        seen_query_ids = set(ranked_query_ids)
+        if len(ranked_query_ids) < max_queries:
+            ranked_query_ids.extend(
+                query_id
+                for query_id in selected_queries.keys()
+                if query_id not in seen_query_ids
+            )
+        query_ids = ranked_query_ids[:max_queries]
+        selected_queries = {query_id: selected_queries[query_id] for query_id in query_ids}
+        selected_qrels = {
+            query_id: selected_qrels.get(query_id, {})
+            for query_id in query_ids
+            if selected_qrels.get(query_id)
+        }
+
+    if max_corpus > 0:
+        required_doc_ids: set[str] = set()
+        for rels in selected_qrels.values():
+            for doc_id, relevance in rels.items():
+                if relevance and doc_id in selected_corpus:
+                    required_doc_ids.add(doc_id)
+
+        if len(required_doc_ids) > max_corpus:
+            raise SystemExit(
+                f"max_corpus={max_corpus} is too small for the selected queries; "
+                f"required relevant docs={len(required_doc_ids)}"
+            )
+
+        kept_doc_ids = set(required_doc_ids)
+        for doc_id in selected_corpus.keys():
+            if len(kept_doc_ids) >= max_corpus:
+                break
+            kept_doc_ids.add(doc_id)
+
+        selected_corpus = {
+            doc_id: selected_corpus[doc_id]
+            for doc_id in selected_corpus.keys()
+            if doc_id in kept_doc_ids
+        }
+        selected_qrels = {
+            query_id: {
+                doc_id: relevance
+                for doc_id, relevance in rels.items()
+                if doc_id in selected_corpus
+            }
+            for query_id, rels in selected_qrels.items()
+        }
+        selected_qrels = {
+            query_id: rels
+            for query_id, rels in selected_qrels.items()
+            if rels
+        }
+        selected_queries = {
+            query_id: text
+            for query_id, text in selected_queries.items()
+            if query_id in selected_qrels
+        }
+    else:
+        selected_qrels = {
+            query_id: rels
+            for query_id, rels in selected_qrels.items()
+            if rels
+        }
+        selected_queries = {
+            query_id: text
+            for query_id, text in selected_queries.items()
+            if query_id in selected_qrels
+        }
+
+    sample_info = {
+        "corpus_size": len(selected_corpus),
+        "query_count": len(selected_queries),
+        "qrels_size": len(selected_qrels),
+    }
+    return selected_corpus, selected_queries, selected_qrels, sample_info
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run dense-only BEIR retrieval evaluation.")
     parser.add_argument("--dataset", required=True, help="Official BEIR dataset name, e.g. scifact")
@@ -178,6 +277,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=32, help="Encoding batch size")
     parser.add_argument("--score-function", default="cos_sim", help="BEIR score function, default: cos_sim")
     parser.add_argument("--k-values", default="1,3,5,10,20,50,100", help="Comma-separated evaluation k values")
+    parser.add_argument("--max-queries", type=int, default=0, help="Optional smoke subset limit for queries; 0 keeps all")
+    parser.add_argument("--max-corpus", type=int, default=0, help="Optional smoke subset limit for corpus; 0 keeps all")
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -205,6 +306,13 @@ def main() -> int:
     )
 
     corpus, queries, qrels = GenericDataLoader(data_folder=str(dataset_dir)).load(split=args.split)
+    corpus, queries, qrels, sample_info = _limit_dataset(
+        corpus=corpus,
+        queries=queries,
+        qrels=qrels,
+        max_queries=int(args.max_queries or 0),
+        max_corpus=int(args.max_corpus or 0),
+    )
     k_values = _parse_k_values(args.k_values)
     retriever = EvaluateRetrieval(
         DRES(model, batch_size=int(args.batch_size)),
@@ -233,6 +341,12 @@ def main() -> int:
             "query_count": len(queries),
             "corpus_size": len(corpus),
             "qrels_size": len(qrels),
+        },
+        "sample": {
+            "enabled": bool(args.max_queries or args.max_corpus),
+            "max_queries": int(args.max_queries or 0),
+            "max_corpus": int(args.max_corpus or 0),
+            **sample_info,
         },
         "embedding": {
             "provider": str(model.embedding_svc.provider),

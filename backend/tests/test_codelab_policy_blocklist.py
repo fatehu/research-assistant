@@ -5,7 +5,11 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.sandbox_runner.local_executor import _WORKER_CODE
+from app.sandbox_runner.local_executor import validate_code_policy
 from app.services.codelab_executor import CodeLabExecutor
+
+
 @pytest.fixture(autouse=True)
 def _disable_runner(monkeypatch):
     monkeypatch.setattr("app.config.settings.codelab_runner_enabled", False)
@@ -32,3 +36,23 @@ def test_codelab_executor_blocks_forbidden_call():
     finally:
         executor.close()
 
+
+def test_codelab_executor_allows_time_module():
+    assert validate_code_policy("import time\nprint(round(time.time()) > 0)") is None
+
+
+def test_codelab_executor_allows_warnings_module():
+    assert validate_code_policy(
+        "import warnings\nwarnings.filterwarnings('ignore')\nprint('ok')"
+    ) is None
+
+
+def test_codelab_executor_allows_joblib_module():
+    assert validate_code_policy("import joblib\nprint(joblib.__version__)") is None
+
+
+def test_codelab_executor_allows_common_python_builtins():
+    assert '"format"' in _WORKER_CODE
+    assert '"getattr"' in _WORKER_CODE
+    assert '"hasattr"' in _WORKER_CODE
+    assert '"type"' in _WORKER_CODE

@@ -32,6 +32,7 @@ from app.services.vector_search_tuning import apply_hnsw_ef_search, resolve_ef_s
 from app.services.chinese_segmentation_service import segment_text_for_fts
 from app.services.contextual_retrieval_service import (
     build_adjacent_lookup_keys,
+    build_reranker_input,
     merge_adjacent_context,
     normalize_adjacent_window,
 )
@@ -1430,6 +1431,9 @@ class KnowledgeSearchTool(ToolBase):
                     dc.knowledge_base_id,
                     dc.content,
                     dc.chunk_index,
+                    dc.section_type,
+                    dc.section_title,
+                    dc.context_summary,
                     dc.embedding_model,
                     dc.embedding_dimension,
                     1 - {distance_expr} AS similarity,
@@ -1516,6 +1520,9 @@ class KnowledgeSearchTool(ToolBase):
                 dc.knowledge_base_id,
                 dc.content,
                 dc.chunk_index,
+                dc.section_type,
+                dc.section_title,
+                dc.context_summary,
                 NULL::float as similarity,
                 ts_rank_cd(
                     to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)),
@@ -1578,7 +1585,18 @@ class KnowledgeSearchTool(ToolBase):
                 reranker = get_reranker_service()
                 reranked = await reranker.rerank(
                     query=query,
-                    documents=[candidate.row.content for candidate in state.fused_candidates],
+                    documents=[
+                        build_reranker_input(
+                            content=getattr(candidate.row, "content", "") or "",
+                            context_summary=getattr(candidate.row, "context_summary", None),
+                            document_name=getattr(candidate.row, "document_name", None),
+                            section_title=getattr(candidate.row, "section_title", None),
+                            section_type=getattr(candidate.row, "section_type", None),
+                            max_context_length=int(settings.reranker_context_max_chars or 220),
+                            max_content_length=int(settings.reranker_snippet_max_chars or 960),
+                        )
+                        for candidate in state.fused_candidates
+                    ],
                     top_k=state.runtime.final_top_k,
                 )
                 selected_candidates = [
@@ -2468,6 +2486,8 @@ class DefaultToolProvider:
 class ToolRegistry:
     """工具注册表 - 支持 Notebook 工具扩展"""
     _mcp_route_circuit_state: Dict[str, Dict[str, Any]] = {}
+    _ROUTE_PROFILE_CHAT = "chat"
+    _ROUTE_PROFILE_CODELAB = "codelab"
     _INTENT_TOOL_MAP: Dict[str, Set[str]] = {
         "knowledge_query": {"knowledge_search"},
         "web_query": {"web_search", "web_scrape"},
@@ -2483,6 +2503,41 @@ class ToolRegistry:
         "literature_task": {"literature_search"},
         "general_chat": {"datetime", "calculator", "text_analysis"},
     }
+    _CODELAB_INTENT_TOOL_MAP: Dict[str, Set[str]] = {
+        "knowledge_query": {"knowledge_search"},
+        "web_query": {"web_search", "web_scrape"},
+        "code_task": {
+            "notebook_execute",
+            "notebook_variables",
+            "notebook_cell",
+            "notebook_cleanup",
+            "pip_install",
+            "code_analysis",
+            "calculator",
+            "unit_converter",
+            "text_analysis",
+        },
+        "literature_task": {"literature_search"},
+        "general_chat": {"datetime", "calculator", "text_analysis"},
+    }
+    _CODELAB_NOTEBOOK_BASE_TOOLS: Set[str] = {
+        "notebook_execute",
+        "notebook_variables",
+        "notebook_cell",
+        "notebook_cleanup",
+        "pip_install",
+        "code_analysis",
+    }
+    _CODELAB_FALLBACK_ALLOWLIST: Set[str] = {
+        "datetime",
+        "calculator",
+        "text_analysis",
+        "unit_converter",
+    }
+    _CODELAB_FOLLOWUP_ONLY_PATTERNS: tuple[str, ...] = (
+        r"^\s*(继续|继续说|继续做|继续分析|继续处理|接着|然后|然后呢|展开|继续下去)\s*$",
+        r"^\s*(continue|go on|keep going|retry|again|fix it|continue please)\s*$",
+    )
     
     def __init__(
         self, 
@@ -2495,6 +2550,7 @@ class ToolRegistry:
         notebooks_store: dict = None,
         user_authorized: bool = False,  # 用户是否授权 Agent 操作 Notebook
         tool_provider: Optional[ToolProvider] = None,
+        route_profile: Optional[str] = None,
     ):
         self.db = db
         self.db_session_factory = db_session_factory
@@ -2503,6 +2559,10 @@ class ToolRegistry:
         self.kernel_manager = kernel_manager
         self.notebooks_store = notebooks_store
         self.user_authorized = user_authorized
+        profile = str(route_profile or "").strip().lower()
+        if profile not in {self._ROUTE_PROFILE_CHAT, self._ROUTE_PROFILE_CODELAB}:
+            profile = self._ROUTE_PROFILE_CODELAB if notebook_id and kernel_manager else self._ROUTE_PROFILE_CHAT
+        self.route_profile = profile
         self._tools: Dict[str, Tool] = {}
         self._mcp_tools: Dict[str, MCPRemoteTool] = {}
         self._mcp_client_manager: Any = None
@@ -2955,6 +3015,11 @@ class ToolRegistry:
     def _iter_all_tools(self) -> List[Tool]:
         return list(self._tools.values()) + list(self._mcp_tools.values())
 
+    def _intent_tool_map_for_profile(self) -> Dict[str, Set[str]]:
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB:
+            return self._CODELAB_INTENT_TOOL_MAP
+        return self._INTENT_TOOL_MAP
+
     @staticmethod
     def classify_intent(user_text: str) -> str:
         text = (user_text or "").lower()
@@ -3043,12 +3108,111 @@ class ToolRegistry:
             return "web_query"
         return "general_chat"
 
+    @classmethod
+    def classify_codelab_intent(cls, user_text: str) -> str:
+        text = str(user_text or "").lower()
+        if not text.strip():
+            return "general_chat"
+
+        if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
+            return "literature_task"
+
+        explicit_web = any(
+            token in text
+            for token in [
+                "网页",
+                "网站",
+                "实时",
+                "today",
+                "latest",
+                "联网",
+                "搜索互联网",
+                "web",
+                "internet",
+                "online",
+            ]
+        )
+        if explicit_web:
+            return "web_query"
+
+        explicit_knowledge = any(
+            token in text
+            for token in [
+                "知识库",
+                "rag",
+                "向量检索",
+                "knowledge base",
+                "vector store",
+                "kb",
+            ]
+        )
+
+        notebook_tokens = [
+            "代码",
+            "notebook",
+            "python",
+            "cell",
+            "单元格",
+            "变量",
+            "dataframe",
+            "df",
+            "运行",
+            "debug",
+            "报错",
+            "机器学习",
+            "建模",
+            "训练",
+            "预测",
+            "分析",
+            "画图",
+            "绘图",
+            "可视化",
+            "plot",
+            "matplotlib",
+            "seaborn",
+            "pandas",
+            "numpy",
+            "sklearn",
+            "model",
+            "ml",
+        ]
+        local_workspace_tokens = [
+            "上传",
+            "upload",
+            "uploaded",
+            "文件",
+            "csv",
+            "xlsx",
+            "excel",
+            "dataset",
+            "data set",
+            "数据集",
+            "表格",
+        ]
+
+        if cls._looks_like_notebook_local_file_task(text):
+            return "code_task"
+        if any(token in text for token in notebook_tokens):
+            return "code_task"
+        if any(token in text for token in local_workspace_tokens) and not explicit_knowledge:
+            return "code_task"
+        if explicit_knowledge:
+            return "knowledge_query"
+        return "general_chat"
+
     @staticmethod
     def _parse_csv_names(value: str) -> Set[str]:
         return {item.strip() for item in (value or "").split(",") if item.strip()}
 
     def _fallback_tools(self) -> Set[str]:
         return self._parse_csv_names(str(getattr(settings, "tool_selection_fallback_tools", "")))
+
+    @classmethod
+    def _looks_like_codelab_followup_only(cls, user_text: str) -> bool:
+        text = str(user_text or "").strip()
+        if not text:
+            return False
+        return any(re.match(pattern, text, re.IGNORECASE) for pattern in cls._CODELAB_FOLLOWUP_ONLY_PATTERNS)
 
     def _mcp_tool_matches_intent(self, tool: Tool, intent: str) -> bool:
         text = f"{tool.name} {tool.description}".lower()
@@ -3062,29 +3226,108 @@ class ToolRegistry:
             return any(k in text for k in ["code", "notebook", "python", "execute", "analysis", "pip"])
         return False
 
+    @staticmethod
+    def _looks_like_notebook_local_file_task(user_text: str) -> bool:
+        text = str(user_text or "").lower()
+        if not text.strip():
+            return False
+
+        local_file_tokens = [
+            "上传",
+            "upload",
+            "uploaded",
+            "文件",
+            "csv",
+            "xlsx",
+            "excel",
+            "dataset",
+            "data set",
+            "数据集",
+            "表格",
+        ]
+        notebook_task_tokens = [
+            "notebook",
+            "cell",
+            "python",
+            "机器学习",
+            "建模",
+            "训练",
+            "预测",
+            "分析",
+            "画图",
+            "可视化",
+            "案例",
+            "pandas",
+            "numpy",
+            "sklearn",
+            "model",
+            "ml",
+        ]
+        remote_lookup_tokens = [
+            "知识库",
+            "rag",
+            "向量检索",
+            "knowledge base",
+            "联网",
+            "网页",
+            "web",
+            "internet",
+            "搜索互联网",
+        ]
+        return (
+            any(token in text for token in local_file_tokens)
+            and any(token in text for token in notebook_task_tokens)
+            and not any(token in text for token in remote_lookup_tokens)
+        )
+
+    def resolve_intent(self, user_text: str) -> str:
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB:
+            if self.notebook_id and self.kernel_manager and self._looks_like_codelab_followup_only(user_text):
+                return "code_task"
+            return self.classify_codelab_intent(user_text)
+        if self.notebook_id and self.kernel_manager and self._looks_like_notebook_local_file_task(user_text):
+            return "code_task"
+        return self.classify_intent(user_text)
+
     def select_tool_names_for_intent(self, intent: str, user_text: str = "") -> List[str]:
         if not bool(getattr(settings, "tool_selection_enabled", True)):
             return [tool.name for tool in self._iter_all_tools()]
 
-        resolved_intent = intent if intent in self._INTENT_TOOL_MAP else self.classify_intent(user_text)
-        selected = set(self._INTENT_TOOL_MAP.get(resolved_intent, set()))
-        selected.update(self._fallback_tools())
+        intent_tool_map = self._intent_tool_map_for_profile()
+        notebook_local_file_task = bool(
+            self.notebook_id and self.kernel_manager and self._looks_like_notebook_local_file_task(user_text)
+        )
+        codelab_followup_only = bool(
+            self.route_profile == self._ROUTE_PROFILE_CODELAB
+            and self.notebook_id
+            and self.kernel_manager
+            and self._looks_like_codelab_followup_only(user_text)
+        )
+        if notebook_local_file_task or codelab_followup_only:
+            resolved_intent = "code_task"
+        else:
+            resolved_intent = intent if intent in intent_tool_map else self.resolve_intent(user_text)
+        selected = set(intent_tool_map.get(resolved_intent, set()))
+        fallback_tools = self._fallback_tools()
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB:
+            selected.update(name for name in fallback_tools if name in self._CODELAB_FALLBACK_ALLOWLIST)
+        else:
+            selected.update(fallback_tools)
 
         # Notebook 场景下默认保留代码工具，避免普通表述被误判为 general_chat 后无法操作 notebook。
         if self.notebook_id and self.kernel_manager:
-            selected.update(
-                {
-                    "notebook_execute",
-                    "notebook_variables",
-                    "notebook_cell",
-                    "notebook_cleanup",
-                    "pip_install",
-                    "code_analysis",
-                }
-            )
+            selected.update(self._CODELAB_NOTEBOOK_BASE_TOOLS)
 
         for tool in self._iter_all_tools():
-            if tool.name.startswith("mcp.") and self._mcp_tool_matches_intent(tool, resolved_intent):
+            if (
+                not notebook_local_file_task
+                and tool.name.startswith("mcp.")
+                and not (
+                    self.route_profile == self._ROUTE_PROFILE_CODELAB
+                    and resolved_intent != "web_query"
+                )
+                and self._mcp_tool_matches_intent(tool, resolved_intent)
+            ):
                 selected.add(tool.name)
 
         return [tool.name for tool in self._iter_all_tools() if tool.name in selected]
@@ -3242,6 +3485,12 @@ def get_tool_registry(
     db: Optional[AsyncSession],
     user_id: int,
     db_session_factory: Optional[Callable[[], AsyncSession]] = None,
+    route_profile: Optional[str] = None,
 ) -> ToolRegistry:
     """获取工具注册表"""
-    return ToolRegistry(db=db, user_id=user_id, db_session_factory=db_session_factory)
+    return ToolRegistry(
+        db=db,
+        user_id=user_id,
+        db_session_factory=db_session_factory,
+        route_profile=route_profile,
+    )

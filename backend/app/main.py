@@ -12,6 +12,7 @@ from app.core.database import create_tables
 from app.core.error_handlers import register_error_handlers
 from app.core.rate_limit import build_rate_limit_dependency
 from app.services.literature_reader_compose_service import get_literature_reader_compose_service
+from app.services.retrieval_warmup_service import get_retrieval_warmup_service
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab,
     admin, mentor, student, invitations, share, announcements, mcp
@@ -54,6 +55,15 @@ async def lifespan(app: FastAPI):
     logger.info(f"  NOTEBOOK_CONTEXT_CELLS: {settings.notebook_context_cells}")
     logger.info(f"  NOTEBOOK_CONTEXT_CELL_MAX_LENGTH: {settings.notebook_context_cell_max_length}")
     logger.info(f"  NOTEBOOK_CONTEXT_VARIABLES: {settings.notebook_context_variables}")
+    logger.info(f"  RETRIEVAL_WARMUP_ON_STARTUP: {settings.retrieval_warmup_on_startup}")
+    logger.info(f"  RETRIEVAL_WARMUP_TIMEOUT_SECONDS: {settings.retrieval_warmup_timeout_seconds}")
+    logger.info(
+        f"  KNOWLEDGE_DOCUMENT_TASK_MAX_CONCURRENCY: {settings.knowledge_document_task_max_concurrency}"
+    )
+    logger.info(
+        "  KNOWLEDGE_RESUME_RUNNING_DOCUMENTS_ON_STARTUP: "
+        f"{settings.knowledge_resume_running_documents_on_startup}"
+    )
     logger.info("=" * 50)
     
     # 启动时建表仅用于开发/测试；生产请使用 Alembic
@@ -79,6 +89,15 @@ async def lifespan(app: FastAPI):
             int(cleanup_report.get("remaining_old_keys") or 0),
         )
 
+    retrieval_warmup_report = get_retrieval_warmup_service().start_background_warmup()
+    logger.info(
+        "[RetrievalWarmupStartup] enabled={} status={} background_task_running={} components={}",
+        bool(retrieval_warmup_report.get("enabled")),
+        retrieval_warmup_report.get("status"),
+        bool(retrieval_warmup_report.get("background_task_running")),
+        retrieval_warmup_report.get("components") or [],
+    )
+
     recovery_report = await knowledge.resume_interrupted_document_tasks_on_startup()
     logger.info(
         "[KnowledgeResume] enabled={} scheduled={} marked_failed={} documents={}",
@@ -89,7 +108,8 @@ async def lifespan(app: FastAPI):
     )
 
     yield
-    
+
+    await get_retrieval_warmup_service().shutdown()
     logger.info("👋 应用关闭")
 
 

@@ -67,6 +67,30 @@ POLICY_DENIED_ATTRS = {
     "kill",
 }
 
+ALLOWED_IMPORT_ROOTS = {
+    "math",
+    "random",
+    "statistics",
+    "datetime",
+    "time",
+    "warnings",
+    "json",
+    "re",
+    "collections",
+    "itertools",
+    "functools",
+    "typing",
+    "decimal",
+    "fractions",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "sklearn",
+    "torch",
+    "seaborn",
+    "joblib",
+}
+
 
 @dataclass
 class PolicyViolation:
@@ -95,6 +119,11 @@ def validate_code_policy(code: str) -> Optional[PolicyViolation]:
                         code="forbidden_import",
                         message=f"禁止导入模块: {root}",
                     )
+                if root not in ALLOWED_IMPORT_ROOTS:
+                    return PolicyViolation(
+                        code="forbidden_import",
+                        message=f"不在白名单内的模块: {root}",
+                    )
 
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
@@ -120,6 +149,7 @@ import ast
 import base64
 import io
 import json
+import os
 import traceback
 import time
 from contextlib import redirect_stdout, redirect_stderr
@@ -135,9 +165,9 @@ POLICY_DENIED_CALLS = {"__import__", "eval", "exec", "open", "compile", "input",
 POLICY_DENIED_ATTRS = {"system", "popen", "spawn", "fork", "execv", "execve", "run", "kill"}
 
 ALLOWED_IMPORT_ROOTS = {
-    "math", "random", "statistics", "datetime", "json", "re", "collections",
+    "math", "random", "statistics", "datetime", "time", "warnings", "json", "re", "collections",
     "itertools", "functools", "typing", "decimal", "fractions", "numpy",
-    "pandas", "matplotlib", "sklearn", "torch", "seaborn"
+    "pandas", "matplotlib", "sklearn", "torch", "seaborn", "joblib"
 }
 
 
@@ -184,9 +214,9 @@ def _safe_builtins():
     allowed = [
         "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "len",
         "list", "max", "min", "pow", "print", "range", "round", "set", "slice",
-        "sorted", "str", "sum", "tuple", "zip", "map", "filter", "isinstance",
-        "issubclass", "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
-        "RuntimeError"
+        "sorted", "str", "sum", "tuple", "zip", "map", "filter", "format",
+        "getattr", "hasattr", "isinstance", "issubclass", "type", "Exception",
+        "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError"
     ]
     safe = {name: builtins_map[name] for name in allowed if name in builtins_map}
     safe["__import__"] = _safe_import
@@ -197,6 +227,65 @@ def _safe_builtins():
 namespace = {"__builtins__": _safe_builtins()}
 execution_count = 0
 last_used_at = time.time()
+_WORKSPACE_DIR = ""
+_WORKSPACE_FILES = []
+_WORKSPACE_FILE_PATHS = {}
+
+
+def _resolve_uploaded_file(name: str):
+    raw_name = str(name or "").strip()
+    if not raw_name:
+        raise FileNotFoundError("文件名不能为空")
+    candidate = _WORKSPACE_FILE_PATHS.get(raw_name)
+    if candidate and os.path.isfile(candidate):
+        return candidate
+    if _WORKSPACE_DIR:
+        normalized = os.path.abspath(os.path.join(_WORKSPACE_DIR, raw_name))
+        workspace_root = os.path.abspath(_WORKSPACE_DIR)
+        if normalized.startswith(workspace_root) and os.path.isfile(normalized):
+            return normalized
+    raise FileNotFoundError(f"找不到上传文件: {raw_name}")
+
+
+def _apply_workspace(workspace):
+    global _WORKSPACE_DIR, _WORKSPACE_FILES, _WORKSPACE_FILE_PATHS
+    workspace = workspace if isinstance(workspace, dict) else {}
+    directory = str(workspace.get("directory") or "").strip()
+    files = list(workspace.get("file_names") or [])
+    file_paths = dict(workspace.get("file_paths") or {})
+
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+        try:
+            os.chdir(directory)
+        except Exception:
+            pass
+
+    _WORKSPACE_DIR = directory
+    _WORKSPACE_FILES = [str(item) for item in files if str(item or "").strip()]
+    _WORKSPACE_FILE_PATHS = {
+        str(key): str(value)
+        for key, value in file_paths.items()
+        if str(key or "").strip() and str(value or "").strip()
+    }
+
+    def list_uploaded_files():
+        return list(_WORKSPACE_FILES)
+
+    def uploaded_file_path(name: str):
+        return _resolve_uploaded_file(name)
+
+    def read_uploaded_text(name: str, encoding: str = "utf-8"):
+        path = _resolve_uploaded_file(name)
+        with open(path, "r", encoding=encoding) as handle:
+            return handle.read()
+
+    namespace["NOTEBOOK_FILES_DIR"] = _WORKSPACE_DIR
+    namespace["NOTEBOOK_FILES"] = list(_WORKSPACE_FILES)
+    namespace["NOTEBOOK_FILE_PATHS"] = dict(_WORKSPACE_FILE_PATHS)
+    namespace["list_uploaded_files"] = list_uploaded_files
+    namespace["uploaded_file_path"] = uploaded_file_path
+    namespace["read_uploaded_text"] = read_uploaded_text
 
 
 def _capture_plot(ns, outputs):
@@ -424,6 +513,7 @@ def _execute_code(code: str):
 def _handle(req):
     global namespace, execution_count, last_used_at
     cmd = req.get("cmd")
+    _apply_workspace(req.get("workspace"))
     if cmd == "execute":
         last_used_at = time.time()
         return _execute_code(req.get("code", ""))
@@ -567,13 +657,17 @@ class CodeLabExecutor:
         self._last_variables: Dict[str, str] = {}
         self._last_variable_previews: Dict[str, str] = {}
         self._last_execution_count: int = 0
+        self._last_workspace_context: Optional[Dict[str, Any]] = None
 
     def close(self) -> None:
         self._worker.close()
 
-    def reset(self) -> None:
+    def reset(self, workspace_context: Optional[Dict[str, Any]] = None) -> None:
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         try:
-            payload = self._worker.call({"cmd": "reset"}, timeout_seconds=3)
+            payload = self._worker.call({"cmd": "reset", "workspace": effective_workspace}, timeout_seconds=3)
             self._last_variables = dict(payload.get("variables", {}) or {})
             self._last_variable_previews = dict(payload.get("variable_previews", {}) or {})
             self._last_execution_count = int(payload.get("execution_count", 0) or 0)
@@ -584,9 +678,12 @@ class CodeLabExecutor:
             self._last_variable_previews = {}
             self._last_execution_count = 0
 
-    def get_variables(self) -> Dict[str, str]:
+    def get_variables(self, workspace_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         try:
-            payload = self._worker.call({"cmd": "variables"}, timeout_seconds=2)
+            payload = self._worker.call({"cmd": "variables", "workspace": effective_workspace}, timeout_seconds=2)
             self._last_variables = dict(payload.get("variables", {}) or {})
             self._last_variable_previews = dict(payload.get("variable_previews", {}) or {})
             self._last_execution_count = int(payload.get("execution_count", 0) or self._last_execution_count)
@@ -607,7 +704,15 @@ class CodeLabExecutor:
         variables = self.get_variables()
         return name in variables
 
-    def execute(self, code: str, timeout_seconds: int) -> Dict[str, Any]:
+    def execute(
+        self,
+        code: str,
+        timeout_seconds: int,
+        workspace_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         policy = validate_code_policy(code)
         if policy is not None:
             return {
@@ -634,7 +739,7 @@ class CodeLabExecutor:
         started = time.time()
         try:
             payload = self._worker.call(
-                {"cmd": "execute", "code": code},
+                {"cmd": "execute", "code": code, "workspace": effective_workspace},
                 timeout_seconds=float(timeout_value),
             )
             self._last_variables = dict(payload.get("variables", {}) or {})

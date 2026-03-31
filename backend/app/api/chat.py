@@ -420,6 +420,7 @@ async def send_message(
                         db=None,
                         user_id=current_user.id,
                         db_session_factory=async_session_factory,
+                        route_profile="chat",
                     )
                     agent = create_react_agent(
                         llm_service,

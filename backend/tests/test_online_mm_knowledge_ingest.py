@@ -236,6 +236,8 @@ def _reset_task_state() -> None:
     knowledge_api._ACTIVE_DOCUMENT_TASKS.clear()
     knowledge_api._DOCUMENT_TASK_HANDLES.clear()
     knowledge_api._DOCUMENT_TASK_CANCEL_REQUESTS.clear()
+    knowledge_api._DOCUMENT_TASK_RUN_SEMAPHORE = None
+    knowledge_api._DOCUMENT_TASK_RUN_SEMAPHORE_LIMIT = None
 
 
 def test_upload_document_should_persist_ingest_request_metadata(tmp_path, monkeypatch):
@@ -1221,8 +1223,49 @@ def test_resume_interrupted_document_tasks_on_startup_should_schedule_running_do
     assert retry_request["trigger"] == "startup"
     assert retry_request["reason"] == "startup_resume_from_cache"
     assert retry_request["count"] == 1
+    assert doc.status == DocumentStatus.PENDING.value
+    assert (doc.error_message or "") == ""
     assert db.commit_calls == 1
     assert scheduled == [(147, 700, 70)]
+
+
+def test_schedule_document_task_should_queue_by_concurrency_limit(monkeypatch):
+    _reset_task_state()
+    monkeypatch.setattr(knowledge_api.settings, "knowledge_document_task_max_concurrency", 1)
+
+    started: list[int] = []
+    finished: list[int] = []
+    release_first = asyncio.Event()
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def _fake_process_document_task(doc_id: int, chunk_size: int, chunk_overlap: int):
+        started.append(int(doc_id))
+        if int(doc_id) == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        finished.append(int(doc_id))
+
+    monkeypatch.setattr(knowledge_api, "process_document_task", _fake_process_document_task)
+
+    async def _run():
+        queued_first = await knowledge_api._schedule_document_task(1, 500, 50)
+        queued_second = await knowledge_api._schedule_document_task(2, 500, 50)
+        assert queued_first is True
+        assert queued_second is True
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        assert started == [1]
+        assert not second_started.is_set()
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        await asyncio.gather(*list(knowledge_api._DOCUMENT_TASK_HANDLES.values()))
+
+    asyncio.run(_run())
+
+    assert started == [1, 2]
+    assert finished == [1, 2]
 
 
 def test_get_document_status_should_resume_interrupted_running_doc(monkeypatch):
@@ -1271,6 +1314,55 @@ def test_get_document_status_should_resume_interrupted_running_doc(monkeypatch):
     assert retry_request["reason"] == "status_poll_resume_from_cache"
     assert retry_request["count"] == 1
     assert scheduled == [(147, 640, 64)]
+    assert db.commit_calls >= 1
+
+
+def test_get_document_status_should_resume_orphaned_pending_doc(monkeypatch):
+    kb = KnowledgeBase(id=84, user_id=7, name="KB", chunk_size=640, chunk_overlap=64)
+    doc = Document(
+        id=148,
+        knowledge_base_id=84,
+        filename="stored.pdf",
+        original_filename="paper.pdf",
+        file_path="/tmp/paper.pdf",
+        file_size=128,
+        file_type="pdf",
+        status=DocumentStatus.PENDING.value,
+        metadata_={},
+    )
+    knowledge_api._set_document_processing_stage(doc, stage="queued")
+    db = _FakeProcessDB(doc=doc, kb=kb)
+    scheduled = []
+
+    async def _noop_publish(**_kwargs):
+        return None
+
+    async def _fake_schedule(doc_id: int, chunk_size: int, chunk_overlap: int) -> bool:
+        scheduled.append((int(doc_id), int(chunk_size), int(chunk_overlap)))
+        return True
+
+    monkeypatch.setattr(knowledge_api, "_publish_document_status_event", _noop_publish)
+    monkeypatch.setattr(knowledge_api.os.path, "exists", lambda path: path == "/tmp/paper.pdf")
+    monkeypatch.setattr(knowledge_api, "_schedule_document_task", _fake_schedule)
+    _reset_task_state()
+
+    status = asyncio.run(
+        knowledge_api.get_document_status(
+            kb_id=84,
+            doc_id=148,
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+    )
+
+    assert status.status == DocumentStatus.PENDING.value
+    assert status.message == "排队中"
+    assert status.processing_stage == "queued"
+    retry_request = dict((doc.metadata_ or {}).get("retry_request") or {})
+    assert retry_request["trigger"] == "status_poll"
+    assert retry_request["reason"] == "status_poll_queue_resume_restart"
+    assert retry_request["count"] == 1
+    assert scheduled == [(148, 640, 64)]
     assert db.commit_calls >= 1
 
 

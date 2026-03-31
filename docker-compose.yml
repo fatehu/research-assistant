@@ -87,15 +87,15 @@ services:
       - TRANSFORMERS_CACHE=/app/model_cache/huggingface/transformers
       - XDG_CACHE_HOME=/app/model_cache/xdg-cache
       - HOST_HUGGINGFACE_CACHE_MOUNT=/app/host_model_cache/huggingface
-      - MODEL_CACHE_PREWARM_REPOS=${MODEL_CACHE_PREWARM_REPOS:-BAAI/bge-m3,BAAI/bge-reranker-v2-m3}
+      - MODEL_CACHE_PREWARM_REPOS=${MODEL_CACHE_PREWARM_REPOS:-BAAI/bge-m3,Alibaba-NLP/gte-reranker-modernbert-base}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - LOCAL_EMBEDDING_NORMALIZE=${LOCAL_EMBEDDING_NORMALIZE:-true}
       - LOCAL_EMBEDDING_DIMENSION=${LOCAL_EMBEDDING_DIMENSION:-0}
       - KB_ONLINE_MM_INGEST_ENABLED=${KB_ONLINE_MM_INGEST_ENABLED:-true}
       - ENABLE_RERANKER=${ENABLE_RERANKER:-true}
-      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      - RERANKER_MODEL=${RERANKER_MODEL:-Alibaba-NLP/gte-reranker-modernbert-base}
       - RERANKER_DEVICE=${RERANKER_DEVICE:-auto}
-      - RERANKER_TOP_K=${RERANKER_TOP_K:-20}
+      - RERANKER_TOP_K=${RERANKER_TOP_K:-8}
       - ENABLE_HYBRID_RETRIEVAL=${ENABLE_HYBRID_RETRIEVAL:-true}
       - HYBRID_VECTOR_TOP_K=${HYBRID_VECTOR_TOP_K:-20}
       - HYBRID_TEXT_TOP_K=${HYBRID_TEXT_TOP_K:-20}
@@ -308,6 +308,9 @@ services:
       - CODELAB_EXEC_TIMEOUT_HARD_SECONDS=${CODELAB_EXEC_TIMEOUT_HARD_SECONDS:-20}
       - PYTHONUNBUFFERED=1
     command: uvicorn app.sandbox_runner.main:app --host 0.0.0.0 --port 8099
+    volumes:
+      - ./backend:/app
+      - backend_uploads:/app/uploads
     restart: unless-stopped
     deploy:
       resources:

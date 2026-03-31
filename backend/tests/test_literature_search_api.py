@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -19,6 +20,9 @@ class _FakeResult:
         self._rows = list(rows or [])
 
     def all(self):
+        return list(self._rows)
+
+    def fetchall(self):
         return list(self._rows)
 
     def first(self):
@@ -52,11 +56,13 @@ class _SearchDB:
 
 
 class _SaveDB:
-    def __init__(self, results):
+    def __init__(self, results, *, flush_error=None):
         self._results = list(results)
         self.execute_calls = 0
         self.added = []
         self.committed = False
+        self.rolled_back = False
+        self.flush_error = flush_error
 
     async def execute(self, _query):
         self.execute_calls += 1
@@ -68,12 +74,17 @@ class _SaveDB:
         self.added.append(item)
 
     async def flush(self):
+        if self.flush_error is not None:
+            raise self.flush_error
         for item in self.added:
             if getattr(item, "id", None) is None:
                 item.id = 321
 
     async def commit(self):
         self.committed = True
+
+    async def rollback(self):
+        self.rolled_back = True
 
     async def refresh(self, paper):
         now = datetime.utcnow()
@@ -261,6 +272,112 @@ async def test_save_paper_persists_pubmed_identifier(monkeypatch):
     assert saved_paper.source == "pubmed"
     assert response.source == "pubmed"
     assert response.doi == "10.1000/pubmed"
+
+
+@pytest.mark.asyncio
+async def test_save_paper_returns_existing_paper_idempotently(monkeypatch):
+    db = _SaveDB(results=[])
+    existing = _saved_paper(
+        paper_id=88,
+        user_id=5,
+        source="semantic_scholar",
+        title="Already Saved Paper",
+    )
+    existing.semantic_scholar_id = "s2-existing"
+    added_calls = []
+
+    async def _fake_find_existing(_db, *, user_id, request):
+        assert user_id == 5
+        assert request.external_id == "s2-existing"
+        return existing
+
+    async def _fake_add_to_collections(_db, *, paper_id, user_id, collection_ids):
+        added_calls.append((paper_id, user_id, list(collection_ids)))
+        return [7]
+
+    async def _fake_load_collection_ids(_db, paper_id):
+        assert paper_id == 88
+        return [2, 7]
+
+    monkeypatch.setattr(literature_api, "_find_existing_paper_for_request", _fake_find_existing)
+    monkeypatch.setattr(literature_api, "_add_paper_to_collections_if_missing", _fake_add_to_collections)
+    monkeypatch.setattr(literature_api, "_load_collection_ids_for_paper", _fake_load_collection_ids)
+
+    response = await literature_api.save_paper(
+        request=literature_api.SavePaperFromSearchRequest(
+            source="semantic_scholar",
+            external_id="s2-existing",
+            title="Already Saved Paper",
+            collection_ids=[7],
+        ),
+        db=db,
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert response.id == 88
+    assert response.collection_ids == [2, 7]
+    assert added_calls == [(88, 5, [7])]
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_save_paper_recovers_from_unique_violation(monkeypatch):
+    db = _SaveDB(
+        results=[],
+        flush_error=IntegrityError("INSERT INTO papers ...", {}, Exception("duplicate key value")),
+    )
+    existing = _saved_paper(
+        paper_id=98,
+        user_id=5,
+        source="semantic_scholar",
+        title="Recovered Existing Paper",
+    )
+    existing.semantic_scholar_id = "s2-race"
+    find_calls = {"count": 0}
+    added_calls = []
+
+    async def _fake_find_existing(_db, *, user_id, request):
+        find_calls["count"] += 1
+        assert user_id == 5
+        assert request.external_id == "s2-race"
+        if find_calls["count"] == 1:
+            return None
+        return existing
+
+    async def _fake_add_to_collections(_db, *, paper_id, user_id, collection_ids):
+        added_calls.append((paper_id, user_id, list(collection_ids)))
+        return [7]
+
+    async def _fake_load_collection_ids(_db, paper_id):
+        assert paper_id == 98
+        return [7]
+
+    async def _fake_ensure_paper_entity(_db, paper):
+        paper.paper_entity_id = 11
+        return SimpleNamespace(id=11)
+
+    monkeypatch.setattr(literature_api, "_find_existing_paper_for_request", _fake_find_existing)
+    monkeypatch.setattr(literature_api, "_add_paper_to_collections_if_missing", _fake_add_to_collections)
+    monkeypatch.setattr(literature_api, "_load_collection_ids_for_paper", _fake_load_collection_ids)
+    monkeypatch.setattr(literature_api, "_ensure_paper_entity", _fake_ensure_paper_entity)
+
+    response = await literature_api.save_paper(
+        request=literature_api.SavePaperFromSearchRequest(
+            source="semantic_scholar",
+            external_id="s2-race",
+            title="Recovered Existing Paper",
+            collection_ids=[7],
+        ),
+        db=db,
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert response.id == 98
+    assert response.collection_ids == [7]
+    assert db.rolled_back is True
+    assert db.committed is True
+    assert added_calls == [(98, 5, [7])]
+    assert find_calls["count"] == 2
 
 
 @pytest.mark.asyncio

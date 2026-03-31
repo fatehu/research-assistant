@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Button, Input, Tooltip, Badge, Spin,
@@ -5,12 +6,13 @@ import {
 import {
   PlayCircleOutlined, PlusOutlined, CodeOutlined,
   FileMarkdownOutlined, SaveOutlined, ReloadOutlined,
-  FolderOutlined, LoadingOutlined, RobotOutlined,
+  FolderOutlined, LoadingOutlined, RobotOutlined, FileTextOutlined,
 } from '@ant-design/icons'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Notebook, Cell } from '@/services/api'
 import NotebookAgentPanel from '@/components/NotebookAgentPanel'
 import NotebookCell from './NotebookCell'
+import NotebookFilesDrawer from './NotebookFilesDrawer'
 
 interface NotebookEditorViewProps {
   notebook: Notebook
@@ -74,6 +76,7 @@ const NotebookEditorView = ({
   onRefreshNotebook,
 }: NotebookEditorViewProps) => {
   const navigate = useNavigate()
+  const [isFilesDrawerOpen, setIsFilesDrawerOpen] = useState(false)
 
   return (
     <div className="h-full flex bg-slate-950">
@@ -104,6 +107,11 @@ const NotebookEditorView = ({
             <Tooltip title="重启内核">
               <Button type="text" icon={<ReloadOutlined />} onClick={onRestartKernel} className="text-slate-400 hover:text-amber-400">
                 重启内核
+              </Button>
+            </Tooltip>
+            <Tooltip title="Notebook 文件">
+              <Button type="text" icon={<FileTextOutlined />} onClick={() => setIsFilesDrawerOpen(true)} className="text-slate-400 hover:text-sky-400">
+                文件
               </Button>
             </Tooltip>
             <Tooltip title="添加代码单元格">
@@ -200,6 +208,12 @@ const NotebookEditorView = ({
         onRefreshNotebook={onRefreshNotebook}
         currentCellIndex={selectedCellIndex}
         cells={notebook.cells}
+      />
+
+      <NotebookFilesDrawer
+        notebookId={notebook.id}
+        open={isFilesDrawerOpen}
+        onClose={() => setIsFilesDrawerOpen(false)}
       />
     </div>
   )

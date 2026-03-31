@@ -46,6 +46,7 @@ class CodeLabExecutor:
         self._last_variables: Dict[str, str] = {}
         self._last_variable_previews: Dict[str, str] = {}
         self._last_execution_count: int = 0
+        self._last_workspace_context: Optional[Dict[str, Any]] = None
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self._runner_token}"}
@@ -95,10 +96,13 @@ class CodeLabExecutor:
         except Exception:
             logger.debug("[CodeLabExecutor] close异常", exc_info=True)
 
-    def reset(self) -> None:
+    def reset(self, workspace_context: Optional[Dict[str, Any]] = None) -> None:
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         if self._local_executor is not None:
-            self._local_executor.reset()
-            self._last_variables = dict(self._local_executor.get_variables() or {})
+            self._local_executor.reset(workspace_context=effective_workspace)
+            self._last_variables = dict(self._local_executor.get_variables(workspace_context=effective_workspace) or {})
             return
 
         payload = self._request(
@@ -107,13 +111,17 @@ class CodeLabExecutor:
             json_payload={
                 "notebook_id": self.notebook_id,
                 "hard_timeout_seconds": self.hard_timeout_seconds,
+                "workspace": effective_workspace,
             },
         )
         self._last_variables = dict(payload.get("variables", {}) or {})
 
-    def get_variables(self) -> Dict[str, str]:
+    def get_variables(self, workspace_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         if self._local_executor is not None:
-            self._last_variables = dict(self._local_executor.get_variables() or {})
+            self._last_variables = dict(self._local_executor.get_variables(workspace_context=effective_workspace) or {})
             return dict(self._last_variables)
 
         payload = self._request(
@@ -140,15 +148,27 @@ class CodeLabExecutor:
         variables = self.get_variables()
         return name in variables
 
-    def execute(self, code: str, timeout_seconds: int) -> Dict[str, Any]:
+    def execute(
+        self,
+        code: str,
+        timeout_seconds: int,
+        workspace_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if self._local_executor is not None:
-            result = self._local_executor.execute(code=code, timeout_seconds=timeout_seconds)
+            result = self._local_executor.execute(
+                code=code,
+                timeout_seconds=timeout_seconds,
+                workspace_context=workspace_context,
+            )
             self._last_variables = dict(result.get("variables", {}) or {})
             self._last_variable_previews = dict(result.get("variable_previews", {}) or {})
             self._last_execution_count = int(result.get("execution_count", self._last_execution_count) or 0)
             return result
 
         timeout_value = max(1, min(int(timeout_seconds or 1), self.hard_timeout_seconds))
+        if workspace_context is not None:
+            self._last_workspace_context = dict(workspace_context)
+        effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         started = time.time()
         payload = self._request(
             "POST",
@@ -158,6 +178,7 @@ class CodeLabExecutor:
                 "code": code,
                 "timeout_seconds": timeout_value,
                 "hard_timeout_seconds": self.hard_timeout_seconds,
+                "workspace": effective_workspace,
             },
         )
         self._last_variables = dict(payload.get("variables", {}) or {})
@@ -179,4 +200,3 @@ class CodeLabExecutor:
                 f"[CodeLabExecutor] 析构 close 失败 notebook_id={getattr(self, 'notebook_id', 'unknown')}\n"
                 f"{traceback.format_exc()}"
             )
-

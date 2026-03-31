@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,3 +60,84 @@ async def test_react_chat_stream_plain_text_without_tags_is_incremental():
     assert "".join(item["data"] for item in content_events) == "plain stream output"
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == "plain stream output"
+
+
+@pytest.mark.asyncio
+async def test_react_chat_stream_supports_thinking_alias_tags():
+    service = _build_service_with_chunks(
+        [
+            "<thinking>先分析问题",
+            "再给结论</thinking><answer>最终答案</answer>",
+        ]
+    )
+
+    events = []
+    async for event in service.react_chat_stream([{"role": "user", "content": "hello"}]):
+        events.append(event)
+
+    thought_events = [item for item in events if item.get("type") == "thought"]
+    content_events = [item for item in events if item.get("type") == "content"]
+
+    assert thought_events
+    assert thought_events[0]["data"] == "先分析问题再给结论"
+    assert "".join(item["data"] for item in content_events) == "最终答案"
+    assert events[-1]["data"]["answer"] == "最终答案"
+
+
+@pytest.mark.asyncio
+async def test_chat_with_tools_sanitizes_invalid_function_names_and_maps_back():
+    captured = {}
+    service = object.__new__(LLMService)
+    service.provider = "deepseek"
+    service.config = {"model": "test-model"}
+
+    async def _fake_create(**kwargs):
+        captured["tools"] = kwargs.get("tools") or []
+        alias_name = captured["tools"][0]["function"]["name"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        reasoning_content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call-1",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name=alias_name,
+                                    arguments='{"query":"hello"}',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+            model="test-model",
+        )
+
+    service.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=_fake_create),
+        )
+    )
+
+    result = await service.chat_with_tools(
+        messages=[{"role": "user", "content": "search"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp.firecrawl.firecrawl_scrape",
+                    "description": "scrape a page",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ],
+        system_prompt="system",
+    )
+
+    assert captured["tools"][0]["function"]["name"] == "mcp_firecrawl_firecrawl_scrape"
+    assert result["tool_calls"][0]["name"] == "mcp.firecrawl.firecrawl_scrape"

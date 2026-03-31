@@ -387,7 +387,7 @@ class ReaderComposeAgentRuntime:
         result = await DashScopeMultimodalService.chat_json(
             api_key=str(getattr(settings, "aliyun_api_key", "") or "").strip(),
             base_url=str(getattr(settings, "aliyun_dashscope_api_base", "") or getattr(settings, "aliyun_base_url", "") or "").strip(),
-            model=str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip(),
+            model=str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash").strip(),
             system_prompt=(
                 "You are a multimodal reader UI review agent.\n"
                 "Return JSON only.\n"

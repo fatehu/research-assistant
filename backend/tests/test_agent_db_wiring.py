@@ -14,6 +14,7 @@ def test_codelab_agent_chat_uses_db_session_factory_for_tool_registry():
     source = inspect.getsource(codelab.notebook_agent_chat)
     assert "db_session_factory=async_session_factory" in source
     assert "db=None" in source
+    assert 'route_profile="codelab"' in source
 
 
 def test_notebook_agent_routes_have_db_dependency():
@@ -39,6 +40,7 @@ def test_chat_stream_uses_db_session_factory_for_tool_registry():
     source = inspect.getsource(chat.send_message)
     assert "db_session_factory=async_session_factory" in source
     assert "db=None" in source
+    assert 'route_profile="chat"' in source
 
 
 def test_chat_stream_done_payload_includes_rag_metrics():

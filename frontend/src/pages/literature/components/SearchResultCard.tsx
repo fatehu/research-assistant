@@ -11,10 +11,11 @@ interface SearchResultCardProps {
   index: number
   sourceInfo: SourceInfo
   onSave: (paper: PaperSearchResult) => void
+  savePending?: boolean
 }
 
 /** 搜索结果卡片视图 */
-const SearchResultCard = ({ paper, index, sourceInfo, onSave }: SearchResultCardProps) => (
+const SearchResultCard = ({ paper, index, sourceInfo, onSave, savePending = false }: SearchResultCardProps) => (
   <div
     className="glass-card p-4 mb-3 hover:border-emerald-500/30 transition-all duration-300"
     style={{ animationDelay: `${index * 50}ms` }}
@@ -81,8 +82,8 @@ const SearchResultCard = ({ paper, index, sourceInfo, onSave }: SearchResultCard
             已保存
           </Button>
         ) : (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => onSave(paper)}>
-            保存
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => onSave(paper)} loading={savePending} disabled={savePending}>
+            {savePending ? '保存中...' : '保存'}
           </Button>
         )}
         {paper.pdf_url && (

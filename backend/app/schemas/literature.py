@@ -800,6 +800,150 @@ def _looks_like_legacy_adjacent_payload_stuffing(value: str) -> bool:
     )
 
 
+_ADJACENT_CONTENT_STREAM_ALLOWED_TYPES = {
+    "paragraph",
+    "figure",
+    "table",
+    "equation",
+    "caption",
+    "header",
+    "footer",
+}
+
+_ADJACENT_CONTENT_STREAM_TYPE_ALIASES = {
+    "heading": "header",
+    "title": "header",
+    "section_title": "header",
+    "section_header": "header",
+    "subheading": "header",
+    "subtitle": "header",
+    "image": "figure",
+    "chart": "figure",
+    "photo": "figure",
+    "illustration": "figure",
+    "formula": "equation",
+    "math": "equation",
+    "footnote": "footer",
+    "page_number": "footer",
+    "page_num": "footer",
+    "list_item": "paragraph",
+    "bullet": "paragraph",
+    "link": "paragraph",
+    "author": "paragraph",
+    "authors": "paragraph",
+    "author_list": "paragraph",
+    "author_block": "paragraph",
+    "byline": "paragraph",
+    "affiliation": "paragraph",
+    "affiliations": "paragraph",
+    "institution": "paragraph",
+    "email": "paragraph",
+    "keyword": "paragraph",
+    "keywords": "paragraph",
+    "metadata": "paragraph",
+    "meta": "paragraph",
+    "abstract": "paragraph",
+}
+
+_ADJACENT_RELATION_ALIASES = {
+    "previous": "previous_page",
+    "prev": "previous_page",
+    "prev_page": "previous_page",
+    "prior_page": "previous_page",
+    "preceding_page": "previous_page",
+    "last_page": "previous_page",
+    "next": "next_page",
+    "nextpage": "next_page",
+    "following_page": "next_page",
+    "subsequent_page": "next_page",
+}
+
+
+def _normalize_adjacent_content_stream_type(raw_type: Any) -> str:
+    value = str(raw_type or "").strip().lower()
+    if not value:
+        return "paragraph"
+    if value in _ADJACENT_CONTENT_STREAM_ALLOWED_TYPES:
+        return value
+    if value in _ADJACENT_CONTENT_STREAM_TYPE_ALIASES:
+        return _ADJACENT_CONTENT_STREAM_TYPE_ALIASES[value]
+    if any(token in value for token in ("figure", "image", "chart", "photo", "diagram", "plot")):
+        return "figure"
+    if any(token in value for token in ("table", "tabular")):
+        return "table"
+    if any(token in value for token in ("equation", "formula", "math")):
+        return "equation"
+    if any(token in value for token in ("caption", "legend")):
+        return "caption"
+    if any(token in value for token in ("header", "heading", "title")):
+        return "header"
+    if any(token in value for token in ("footer", "footnote", "page_number", "pagenumber")):
+        return "footer"
+    return "paragraph"
+
+
+def _normalize_adjacent_relation(raw_relation: Any) -> str:
+    value = str(raw_relation or "").strip().lower()
+    if value in {"previous_page", "next_page"}:
+        return value
+    if value in _ADJACENT_RELATION_ALIASES:
+        return _ADJACENT_RELATION_ALIASES[value]
+    if "prev" in value or "prior" in value or "preced" in value or "before" in value:
+        return "previous_page"
+    if "next" in value or "follow" in value or "after" in value or "subsequent" in value:
+        return "next_page"
+    return value
+
+
+def _adjacent_content_stream_item_has_payload(item: Mapping[str, Any]) -> bool:
+    return any(
+        [
+            str(item.get("text") or "").strip(),
+            str(item.get("ocr_text") or "").strip(),
+            str(item.get("caption") or "").strip(),
+            str(item.get("description") or "").strip(),
+            str(item.get("normalized_text") or "").strip(),
+            str(item.get("label") or "").strip(),
+            bool(item.get("columns")),
+            bool(item.get("rows")),
+        ]
+    )
+
+
+def _build_adjacent_content_stream_fallback(raw_row: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    payload = dict(raw_row or {})
+    candidate = ""
+    for value in (
+        payload.get("page_summary"),
+        payload.get("summary"),
+        payload.get("body_text"),
+        payload.get("raw_text"),
+    ):
+        text = str(value or "").strip()
+        if not text or _looks_like_legacy_adjacent_payload_stuffing(text):
+            continue
+        candidate = text
+        break
+    if not candidate:
+        return []
+    return [
+        {
+            "seq": 1,
+            "type": "paragraph",
+            "text": candidate,
+            "ocr_text": "",
+            "role": "body",
+            "label": "",
+            "caption": "",
+            "description": "",
+            "columns": [],
+            "rows": [],
+            "normalized_text": "",
+            "meta": {"synthetic_fallback": True},
+        }
+    ]
+
+
 class ReadingDossierV2AdjacentContentStreamItem(BaseModel):
     seq: int = Field(..., ge=1)
     type: Literal["paragraph", "figure", "table", "equation", "caption", "header", "footer"]
@@ -814,6 +958,28 @@ class ReadingDossierV2AdjacentContentStreamItem(BaseModel):
     normalized_text: str = ""
     meta: Dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        if not isinstance(data, Mapping):
+            return data
+        payload = dict(data)
+        raw_type = str(payload.get("type") or "").strip().lower()
+        normalized_type = _normalize_adjacent_content_stream_type(raw_type)
+        payload["type"] = normalized_type
+        meta = dict(payload.get("meta") or {})
+        if raw_type and raw_type != normalized_type:
+            meta["raw_type"] = raw_type
+        payload["meta"] = meta
+        if not _adjacent_content_stream_item_has_payload(payload):
+            label = str(payload.get("label") or "").strip()
+            caption = str(payload.get("caption") or "").strip()
+            if caption and not str(payload.get("text") or "").strip():
+                payload["text"] = caption
+            elif label and not str(payload.get("text") or "").strip():
+                payload["text"] = label
+        return payload
+
     @model_validator(mode="after")
     def _validate_content_payload(self):
         if not any(
@@ -823,6 +989,7 @@ class ReadingDossierV2AdjacentContentStreamItem(BaseModel):
                 str(self.caption or "").strip(),
                 str(self.description or "").strip(),
                 str(self.normalized_text or "").strip(),
+                str(self.label or "").strip(),
                 bool(self.columns),
                 bool(self.rows),
             ]
@@ -851,6 +1018,32 @@ class ReadingDossierV2AdjacentPageRow(BaseModel):
     continuation_hints: List[str] = Field(default_factory=list)
     raw_text: str = ""
     meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_input(cls, data):
+        if not isinstance(data, Mapping):
+            return data
+        payload = dict(data)
+        payload["relation"] = _normalize_adjacent_relation(payload.get("relation"))
+        payload["reference_only"] = False
+
+        normalized_stream: List[Dict[str, Any]] = []
+        for index, raw_item in enumerate(list(payload.get("content_stream") or []), start=1):
+            if not isinstance(raw_item, Mapping):
+                continue
+            item_payload = dict(raw_item)
+            item_payload["seq"] = index
+            try:
+                item_payload = ReadingDossierV2AdjacentContentStreamItem.model_validate(item_payload).model_dump(mode="json")
+            except Exception:
+                continue
+            normalized_stream.append(item_payload)
+
+        if not normalized_stream:
+            normalized_stream = _build_adjacent_content_stream_fallback(payload)
+        payload["content_stream"] = normalized_stream
+        return payload
 
     @model_validator(mode="after")
     def _validate_structured_context(self):
@@ -1557,8 +1750,6 @@ class ExperienceSessionV2ArtifactDraftNode(BaseModel):
         if self.node_kind == "original_excerpt":
             if not str(self.display_text or "").strip():
                 raise ValueError("original_excerpt nodes require display_text")
-            if not list(self.source_layout_ids or []) and not list(self.source_block_ids or []):
-                raise ValueError("original_excerpt nodes require source ids")
         if self.node_kind in {"figure_slot", "table_slot", "equation_slot"}:
             if not list(self.source_layout_ids or []) and not str(self.meta.get("source_layout_id") or "").strip():
                 raise ValueError(f"{self.node_kind} nodes require source_layout_ids")
@@ -1601,6 +1792,49 @@ class ExperienceSessionV2ArtifactDraft(BaseModel):
             return value
         payload = dict(value)
         draft_meta = dict(payload.get("meta") or {})
+
+        def _looks_like_resource_request_item(item: Any) -> bool:
+            if not isinstance(item, Mapping):
+                return False
+            raw_kind = str(
+                item.get("node_kind")
+                or item.get("kind")
+                or item.get("type")
+                or item.get("node_type")
+                or ""
+            ).strip().lower()
+            if raw_kind in {
+                "resource_request",
+                "resource_requests",
+                "retrieval_request",
+                "retrieval_requests",
+            }:
+                return True
+            tool_name = str(
+                item.get("tool_name")
+                or item.get("tool")
+                or item.get("name")
+                or item.get("requested_tool")
+                or ""
+            ).strip()
+            if not tool_name:
+                return False
+            if not str(item.get("query") or item.get("q") or item.get("search_query") or "").strip() and not str(
+                item.get("url") or item.get("href") or item.get("target_url") or ""
+            ).strip():
+                return False
+            text_keys = (
+                "text",
+                "display_text",
+                "translation_zh",
+                "label",
+                "caption",
+                "term",
+                "definition",
+            )
+            if any(str(item.get(key) or "").strip() for key in text_keys):
+                return False
+            return True
 
         def _normalize_top_level_string_field(
             field_name: str,
@@ -1668,6 +1902,18 @@ class ExperienceSessionV2ArtifactDraft(BaseModel):
             )
         if "resource_requests" not in payload and isinstance(payload.get("retrieval_requests"), Sequence):
             payload["resource_requests"] = list(payload.get("retrieval_requests") or [])
+        existing_resource_requests = list(payload.get("resource_requests") or [])
+        normalized_nodes: List[Any] = []
+        extracted_resource_requests: List[Any] = []
+        for item in list(payload.get("nodes") or []):
+            if _looks_like_resource_request_item(item):
+                extracted_resource_requests.append(dict(item))
+                continue
+            normalized_nodes.append(item)
+        if extracted_resource_requests:
+            payload["nodes"] = normalized_nodes
+            payload["resource_requests"] = existing_resource_requests + extracted_resource_requests
+            draft_meta["normalized_resource_requests_from_nodes"] = len(extracted_resource_requests)
         if draft_meta:
             payload["meta"] = draft_meta
         return payload
@@ -1723,6 +1969,11 @@ class PageArtifactV2ReadingBlock(BaseModel):
             meta = dict(self.meta or {})
             binding = meta.get("media_binding") or meta.get("figure_binding") or {}
             binding_kind = str(binding.get("binding_kind") or meta.get("binding_kind") or "").strip()
+            binding_resolution = str(
+                binding.get("binding_resolution")
+                or meta.get("binding_resolution")
+                or ""
+            ).strip()
             page_asset_ref = str(
                 binding.get("page_asset_ref")
                 or binding.get("page_image_url")
@@ -1735,7 +1986,7 @@ class PageArtifactV2ReadingBlock(BaseModel):
             if binding_kind.endswith("_layout_anchor"):
                 if not list(self.source_layout_ids or []):
                     raise ValueError(f"{self.segment_kind} blocks must include resolved current-page layout bindings")
-                if not list(self.evidence_ids or []):
+                if not list(self.evidence_ids or []) and binding_resolution != "layout_anchor_without_evidence":
                     raise ValueError(f"{self.segment_kind} blocks must include resolved current-page evidence bindings")
             elif binding_kind != "page_image_anchor":
                 raise ValueError(f"{self.segment_kind} blocks must declare a supported binding kind")
@@ -2534,6 +2785,22 @@ class ReaderExperienceBlockExplainRequest(BaseModel):
         if len(self.history) > 12:
             self.history = list(self.history[-12:])
         return self
+
+
+class ReaderExperienceBlockRewriteRequest(BaseModel):
+    page: int = Field(..., ge=1)
+    block_id: str = Field(..., min_length=1, max_length=128)
+    rewrite_prompt: str = Field(..., min_length=1, max_length=2000)
+    selected_kb_id: Optional[int] = None
+    reader_profile: str = "curious_generalist"
+    user_intent: Optional[str] = Field(default=None, max_length=1000)
+
+
+class ReaderExperienceBlockRewriteResponse(BaseModel):
+    focus_page: int = Field(..., ge=1)
+    artifact: PageArtifactV2
+    rewritten_block: PageArtifactV2ReadingBlock
+    message: str = ""
 
 
 ReaderComponentNode.model_rebuild()

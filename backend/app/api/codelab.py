@@ -22,7 +22,8 @@ import traceback
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -40,6 +41,14 @@ from app.services.notebook_agent_history_service import (
 )
 from app.services.agent_runtime_service import get_agent_runtime_service
 from app.services.codelab_executor import CodeLabExecutor, RunnerUnavailableError
+from app.services.notebook_workspace_service import (
+    build_notebook_workspace_context,
+    delete_notebook_workspace,
+    delete_notebook_workspace_file,
+    ensure_notebook_workspace,
+    list_notebook_workspace_files,
+    save_notebook_workspace_upload,
+)
 from app.config import settings
 
 router = APIRouter()
@@ -100,6 +109,24 @@ class ExecuteResponse(BaseModel):
     execution_time_ms: int
     terminated_reason: str = "none"  # timeout | policy_violation | resource_limit | none
     policy_violation_code: Optional[str] = None
+
+
+class NotebookWorkspaceFileResponse(BaseModel):
+    name: str
+    relative_path: str
+    runtime_path: str
+    size_bytes: int
+    content_type: Optional[str] = None
+    updated_at: str
+    extension: str
+
+
+class NotebookWorkspaceResponse(BaseModel):
+    notebook_id: str
+    workspace_dir: str
+    display_path: str
+    file_count: int
+    files: List[NotebookWorkspaceFileResponse]
 
 
 # ========== 持久化执行内核 ==========
@@ -219,8 +246,55 @@ except:
             logger.debug(f"内核初始化完成: notebook_id={self.notebook_id}")
         except Exception as e:
             logger.warning(f"内核初始化部分失败: {e}")
-    
-    def execute(self, code: str, timeout: int = 30) -> Dict[str, Any]:
+
+    def _apply_workspace_context(self, workspace_context: Optional[Dict[str, Any]] = None) -> None:
+        workspace = workspace_context if isinstance(workspace_context, dict) else {}
+        workspace_dir = str(workspace.get("directory") or "").strip()
+        file_names = [str(item) for item in list(workspace.get("file_names") or []) if str(item or "").strip()]
+        file_paths = {
+            str(key): str(value)
+            for key, value in dict(workspace.get("file_paths") or {}).items()
+            if str(key or "").strip() and str(value or "").strip()
+        }
+
+        def _resolve_uploaded_file(name: str) -> str:
+            raw_name = str(name or "").strip()
+            if not raw_name:
+                raise FileNotFoundError("文件名不能为空")
+            explicit_path = file_paths.get(raw_name)
+            if explicit_path and os.path.isfile(explicit_path):
+                return explicit_path
+            if workspace_dir:
+                normalized = os.path.abspath(os.path.join(workspace_dir, raw_name))
+                workspace_root = os.path.abspath(workspace_dir)
+                if normalized.startswith(workspace_root) and os.path.isfile(normalized):
+                    return normalized
+            raise FileNotFoundError(f"找不到上传文件: {raw_name}")
+
+        def list_uploaded_files():
+            return list(file_names)
+
+        def uploaded_file_path(name: str) -> str:
+            return _resolve_uploaded_file(name)
+
+        def read_uploaded_text(name: str, encoding: str = "utf-8") -> str:
+            file_path = _resolve_uploaded_file(name)
+            with open(file_path, "r", encoding=encoding) as handle:
+                return handle.read()
+
+        self.namespace["NOTEBOOK_FILES_DIR"] = workspace_dir
+        self.namespace["NOTEBOOK_FILES"] = list(file_names)
+        self.namespace["NOTEBOOK_FILE_PATHS"] = dict(file_paths)
+        self.namespace["list_uploaded_files"] = list_uploaded_files
+        self.namespace["uploaded_file_path"] = uploaded_file_path
+        self.namespace["read_uploaded_text"] = read_uploaded_text
+        
+    def execute(
+        self,
+        code: str,
+        timeout: int = 30,
+        workspace_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         在持久化的命名空间中执行代码
         返回执行结果，包括输出、图表、错误等
@@ -229,12 +303,17 @@ except:
             self.last_used_at = datetime.utcnow()
             hard_timeout = max(1, int(settings.codelab_exec_timeout_hard_seconds))
             safe_timeout = max(1, min(int(timeout or 1), hard_timeout))
-            result = self._sandbox_executor.execute(code=code, timeout_seconds=safe_timeout)
+            result = self._sandbox_executor.execute(
+                code=code,
+                timeout_seconds=safe_timeout,
+                workspace_context=workspace_context,
+            )
             self.execution_count = int(result.get('execution_count', self.execution_count) or 0)
             self.namespace = {}
             self._variable_previews = dict(result.get("variable_previews", {}) or {})
             return result
 
+        self._apply_workspace_context(workspace_context)
         self.execution_count += 1
         self.last_used_at = datetime.utcnow()
         
@@ -396,10 +475,10 @@ except:
         except:
             return str(value)
     
-    def reset(self):
+    def reset(self, workspace_context: Optional[Dict[str, Any]] = None):
         """重置内核状态"""
         if self._sandbox_executor is not None:
-            self._sandbox_executor.reset()
+            self._sandbox_executor.reset(workspace_context=workspace_context)
             self.execution_count = 0
             self.namespace.clear()
             self._variable_previews = {}
@@ -409,6 +488,7 @@ except:
         self.namespace.clear()
         self.execution_count = 0
         self._initialize_namespace()
+        self._apply_workspace_context(workspace_context)
         logger.info(f"内核已重置: notebook_id={self.notebook_id}")
     
     def get_variables(self) -> Dict[str, str]:
@@ -484,13 +564,14 @@ class KernelManager:
         """获取 Notebook 的执行内核（如果存在）"""
         return self._kernels.get(notebook_id)
     
-    def reset_kernel(self, notebook_id: str) -> PythonKernel:
+    def reset_kernel(self, notebook_id: str, workspace_context: Optional[Dict[str, Any]] = None) -> PythonKernel:
         """重置 Notebook 的执行内核"""
         with self._lock:
             if notebook_id in self._kernels:
-                self._kernels[notebook_id].reset()
+                self._kernels[notebook_id].reset(workspace_context=workspace_context)
             else:
                 self._kernels[notebook_id] = PythonKernel(notebook_id)
+                self._kernels[notebook_id].reset(workspace_context=workspace_context)
             return self._kernels[notebook_id]
     
     def destroy_kernel(self, notebook_id: str):
@@ -672,6 +753,14 @@ def get_notebook(notebook_id: str, user_id: int) -> Optional[Dict]:
     return None
 
 
+def _workspace_context_for_notebook(notebook: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    notebook_id = str(notebook.get("id") or "").strip()
+    user_id = notebook.get("user_id")
+    if not notebook_id or user_id is None:
+        return None
+    return build_notebook_workspace_context(notebook_id, int(user_id))
+
+
 # ========== API 端点 ==========
 
 @router.get("/notebooks", response_model=List[NotebookResponse])
@@ -721,6 +810,8 @@ async def create_notebook(
     
     # 同步到缓存
     await _sync_to_cache(notebook)
+
+    ensure_notebook_workspace(notebook["id"], current_user.id)
     
     # 预创建内核
     kernel_manager.get_or_create_kernel(notebook['id'])
@@ -820,6 +911,7 @@ async def delete_notebook(
     
     # 销毁对应的内核
     kernel_manager.destroy_kernel(notebook_id)
+    delete_notebook_workspace(notebook_id, current_user.id)
     
     return {"message": "Notebook 已删除"}
 
@@ -841,11 +933,17 @@ async def execute_cell(
     
     # 获取或创建执行内核
     kernel = kernel_manager.get_or_create_kernel(notebook_id)
+    workspace_context = _workspace_context_for_notebook(notebook)
 
     # 在内核中执行代码（用户维度并发限制）
     try:
         async with _UserExecutionSlot(current_user.id):
-            result = await asyncio.to_thread(kernel.execute, request.code, request.get_timeout())
+            result = await asyncio.to_thread(
+                kernel.execute,
+                request.code,
+                request.get_timeout(),
+                workspace_context,
+            )
     except _ResourceLimitError as exc:
         return ExecuteResponse(
             success=False,
@@ -1011,6 +1109,83 @@ async def add_cell(
     return cells[-1]
 
 
+@router.get("/notebooks/{notebook_id}/files", response_model=NotebookWorkspaceResponse)
+async def list_notebook_files(
+    notebook_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+
+    workspace = build_notebook_workspace_context(notebook_id, current_user.id)
+    return {
+        "notebook_id": notebook_id,
+        "workspace_dir": workspace["directory"],
+        "display_path": workspace["display_path"],
+        "file_count": workspace["file_count"],
+        "files": list_notebook_workspace_files(notebook_id, current_user.id),
+    }
+
+
+@router.post("/notebooks/{notebook_id}/files/upload", response_model=NotebookWorkspaceFileResponse)
+async def upload_notebook_file(
+    notebook_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+
+    try:
+        return await save_notebook_workspace_upload(notebook_id, current_user.id, file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/notebooks/{notebook_id}/files/{file_name}")
+async def download_notebook_file(
+    notebook_id: str,
+    file_name: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+
+    files = list_notebook_workspace_files(notebook_id, current_user.id)
+    target = next((item for item in files if item.get("name") == file_name), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    return FileResponse(
+        path=str(target["runtime_path"]),
+        media_type=str(target.get("content_type") or "application/octet-stream"),
+        filename=str(target["name"]),
+    )
+
+
+@router.delete("/notebooks/{notebook_id}/files/{file_name}")
+async def delete_uploaded_notebook_file(
+    notebook_id: str,
+    file_name: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+
+    deleted = delete_notebook_workspace_file(notebook_id, current_user.id, file_name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return {"message": "文件已删除"}
+
+
 @router.delete("/notebooks/{notebook_id}/cells/{cell_id}")
 async def delete_cell(
     notebook_id: str,
@@ -1045,6 +1220,7 @@ async def run_all_cells(
     # 获取执行内核
     kernel = kernel_manager.get_or_create_kernel(notebook_id)
     service = NotebookService(db)
+    workspace_context = _workspace_context_for_notebook(notebook)
     
     results = []
     try:
@@ -1056,6 +1232,7 @@ async def run_all_cells(
                         kernel.execute,
                         cell['source'],
                         settings.code_execution_timeout,
+                        workspace_context,
                     )
                     
                     # 序列化输出
@@ -1135,7 +1312,8 @@ async def restart_kernel(
         raise HTTPException(status_code=404, detail="Notebook 不存在")
     
     # 重置内核
-    kernel_manager.reset_kernel(notebook_id)
+    workspace_context = _workspace_context_for_notebook(notebook)
+    kernel_manager.reset_kernel(notebook_id, workspace_context=workspace_context)
     
     # 清除所有 cell 的输出和执行计数
     service = NotebookService(db)
@@ -1205,4 +1383,3 @@ router.include_router(codelab_agent_routes.router)
 
 # Backward-compatible export for tests and legacy imports after route split.
 notebook_agent_chat = codelab_agent_routes.notebook_agent_chat
-

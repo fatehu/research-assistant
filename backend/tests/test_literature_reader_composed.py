@@ -4024,6 +4024,126 @@ async def test_reader_compose_sse_event_order(monkeypatch):
     assert events[-1] == "done"
 
 
+@pytest.mark.asyncio
+async def test_reader_composed_stream_plan_draft_should_sanitize_null_figure_image_url(monkeypatch):
+    class _FakeDB:
+        pass
+
+    class _FakeSessionFactory:
+        async def __aenter__(self):
+            return _FakeDB()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeComposeService:
+        def __init__(self) -> None:
+            self._real = LiteratureReaderComposeService()
+
+        def _sanitize_ui_plan_for_runtime(self, *, page, payload, ui_plan):
+            return self._real._sanitize_ui_plan_for_runtime(page=page, payload=payload, ui_plan=ui_plan)  # pylint: disable=protected-access
+
+        async def build_or_get_composed_payload(self, **_kwargs):
+            return (
+                {
+                    "paper_id": 9,
+                    "page": 2,
+                    "status": "done",
+                    "build_mode": "compose_agent_layout_uid_v1",
+                    "degraded_reason": "",
+                    "source_signature": "sig-demo",
+                    "engine_version": "reader_compose_v15",
+                    "pipeline_version": "layout_uid_v1",
+                    "ui_plan": {
+                        "plan_id": "demo",
+                        "components": [
+                            {
+                                "id": "figure_1",
+                                "type": "FigurePanel",
+                                "props": {
+                                    "caption": "Figure 1. Demo",
+                                    "image_url": None,
+                                },
+                                "children": [],
+                                "source_anchor_refs": [],
+                                "source_block_ids": [],
+                            }
+                        ],
+                        "layout": {},
+                        "style_tokens": {},
+                        "trace_meta": {},
+                    },
+                    "assets": [],
+                    "quality_report": {"overall": 0.9, "validation_errors": []},
+                    "iteration_trace": [],
+                    "main_block_ids": [],
+                    "aux_block_ids": [],
+                    "validation_report": _validation_report_stub(True),
+                    "repair_report": {},
+                    "generated_at": "2026-03-31T00:00:00Z",
+                },
+                ReaderComposeBuildMeta(
+                    cache_hit=False,
+                    cache_layer="none",
+                    build_mode="compose_agent_layout_uid_v1",
+                    source_signature="sig-demo",
+                    source_sig_hash="sig-hash",
+                    engine_version="reader_compose_v15",
+                    iterations=1,
+                    degraded=False,
+                    stop_reason="",
+                ),
+            )
+
+    async def _fake_get_owned(_db, _user, _paper_id):
+        return SimpleNamespace(id=9, user_id=7, title="Demo")
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    monkeypatch.setattr(literature_api, "async_session_factory", lambda: _FakeSessionFactory())
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _FakeComposeService())
+
+    response = await literature_api.stream_reader_composed_page(
+        paper_id=9,
+        payload=SimpleNamespace(
+            page=2,
+            selected_kb_id=None,
+            force_refresh=False,
+            regenerate=False,
+            latency_budget_ms=None,
+            quality_target=None,
+            style_intent=None,
+            theme_mode="light",
+            detail_level="standard",
+            compare_mode=False,
+            citation_tldr=False,
+        ),
+        request=_FakeRequest(),
+        current_user=SimpleNamespace(id=7),
+    )
+
+    chunks = []
+    async for item in response.body_iterator:
+        chunks.append(item.decode("utf-8") if isinstance(item, bytes) else str(item))
+
+    payloads = []
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            if line.startswith("data: "):
+                payloads.append(json.loads(line[len("data: "):].strip()))
+
+    plan_draft = next(item for item in payloads if str(item.get("event") or "") == "plan_draft")
+    ui_plan = dict((plan_draft.get("data") or {}).get("ui_plan") or {})
+    figure_node = next(
+        node for node in list(ui_plan.get("components") or [])
+        if str((node or {}).get("type") or "") == "FigurePanel"
+    )
+    assert ((figure_node.get("props") or {}).get("image_url")) == ""
+
+
 def test_reader_composed_stream_disconnect_should_continue_background_build_and_stop_sse(monkeypatch):
     async def _run() -> None:
         started = asyncio.Event()
@@ -4880,6 +5000,37 @@ def test_build_initial_ui_plan_should_prefer_takeaways_from_payload():
     text = str(items[0].get("text") or "")
     assert "AI" in text
     assert len(text) >= 8
+
+
+def test_build_initial_ui_plan_should_normalize_figure_panel_image_url_to_string():
+    service = LiteratureReaderComposeService()
+    paper = SimpleNamespace(id=33, title="Demo", venue="PLOS", year=2024, authors=[], doi=None, pdf_url=None, url=None)
+    ui_plan = service._build_initial_ui_plan(
+        paper=paper,
+        page=1,
+        base_payload={
+            "blocks": [
+                {
+                    "id": "fig1",
+                    "kind": "caption",
+                    "text": "Figure 1. Demo caption",
+                    "source_anchor": {"page": 1, "start_char": 0, "end_char": 21},
+                }
+            ],
+            "assets": [],
+            "style_cues": {},
+            "toc_quality": 0.8,
+            "toc_hidden": False,
+        },
+        style_intent="journal_classic",
+        theme_mode="light",
+        detail_level="standard",
+        compare_mode=False,
+    )
+
+    figure_nodes = [node for node in ui_plan.get("components") or [] if node.get("type") == "FigurePanel"]
+    assert figure_nodes
+    assert ((figure_nodes[0].get("props") or {}).get("image_url")) == ""
 
 
 def test_build_initial_ui_plan_should_dedupe_main_blocks_and_reduce_inline_slot_density():

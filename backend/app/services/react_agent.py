@@ -84,6 +84,7 @@ class AgentContext:
     context_summary: str = ""
     memory_contexts: List[MemoryContext] = field(default_factory=list)
     memory_enabled: bool = False
+    tool_failure_streaks: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -112,6 +113,11 @@ class AgentCore:
 1. 需要工具：<think>...</think><action>{{"tool":"工具名","input":{{...}}}}</action>
 2. 直接回答：<think>...</think><answer>...</answer>
 """
+    _FOLLOWUP_ONLY_PATTERNS = (
+        r"^\s*(继续|继续说|继续讲|接着说|展开|展开讲讲|详细说说|详细讲讲|细讲|再说说|再展开一点|还有呢|然后呢)\s*$",
+        r"^\s*(为什么|怎么回事|什么意思|具体呢|那呢|这个呢|那个呢)\s*[？?]?\s*$",
+        r"^\s*(继续|展开|详细|具体|那|这个|那个).{0,8}\s*$",
+    )
 
     CITATION_POLICY_PROMPT = """
 ## 知识检索引用规范（必须遵守）
@@ -144,9 +150,152 @@ class AgentCore:
                 return str(item.get("content", "") or "")
         return ""
 
+    @classmethod
+    def _looks_like_followup_only(cls, text: str) -> bool:
+        clean = str(text or "").strip()
+        if not clean:
+            return False
+        return any(re.match(pattern, clean, re.IGNORECASE) for pattern in cls._FOLLOWUP_ONLY_PATTERNS)
+
+    @classmethod
+    def _intent_user_text(cls, messages: Optional[Sequence[Dict[str, Any]]]) -> str:
+        user_texts = [
+            str(item.get("content", "") or "").strip()
+            for item in (messages or [])
+            if str(item.get("role", "")).lower() == "user" and str(item.get("content", "") or "").strip()
+        ]
+        if not user_texts:
+            return ""
+        latest = user_texts[-1]
+        if len(user_texts) == 1:
+            return latest
+        if cls._looks_like_followup_only(latest):
+            return "\n".join(user_texts[-2:])
+        return latest
+
     @staticmethod
-    def _strip_think_content(text: str) -> str:
-        return re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.DOTALL).strip()
+    def _has_tool_message(
+        messages: Optional[Sequence[Dict[str, Any]]],
+        tool_names: Optional[set[str]] = None,
+    ) -> bool:
+        normalized = {str(name or "").strip() for name in (tool_names or set()) if str(name or "").strip()}
+        for item in reversed(messages or []):
+            if str(item.get("role", "")).lower() != "tool":
+                continue
+            name = str(item.get("name", "")).strip()
+            if not normalized or name in normalized:
+                return True
+        return False
+
+    @classmethod
+    def _resolve_tool_choice(
+        cls,
+        intent: str,
+        selected_tools: Sequence[str],
+        messages: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> str:
+        selected = {str(name or "").strip() for name in selected_tools if str(name or "").strip()}
+        if intent == "knowledge_query" and "knowledge_search" in selected:
+            if cls._has_tool_message(messages, {"knowledge_search"}):
+                return "auto"
+            return "required"
+        if intent == "web_query" and selected.intersection({"web_search", "web_scrape"}):
+            if cls._has_tool_message(messages, {"web_search", "web_scrape"}):
+                return "auto"
+            return "required"
+        return "auto"
+
+    @classmethod
+    def _tool_use_policy_prompt(
+        cls,
+        intent: str,
+        selected_tools: Sequence[str],
+        messages: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> str:
+        selected = {str(name or "").strip() for name in selected_tools if str(name or "").strip()}
+        if intent == "knowledge_query" and "knowledge_search" in selected:
+            if cls._has_tool_message(messages, {"knowledge_search"}):
+                return (
+                    "## 本轮工具策略（必须遵守）\n"
+                    "1. 你已经拿到至少一轮 `knowledge_search` observation，优先基于现有证据直接收束为答案。\n"
+                    "2. 只有当现有 observation 明显无法支撑某个关键结论时，才补充一次新的 `knowledge_search`。\n"
+                    "3. 不要只为了改写同义 query、重复拿相近来源或扩写提纲而继续搜索。\n"
+                )
+            return (
+                "## 本轮工具策略（必须遵守）\n"
+                "1. 这是知识库/上传文档相关问题，优先调用 `knowledge_search`，不要直接凭记忆作答。\n"
+                "2. 在 `knowledge_search` observation 返回前，不要声称“无法访问知识库”“没有权限”或“没有相关工具”。\n"
+                "3. 只有当工具 observation 明确返回空结果、无权限或无可用知识库时，才能这样说明。\n"
+            )
+        if intent == "web_query" and selected.intersection({"web_search", "web_scrape"}):
+            if cls._has_tool_message(messages, {"web_search", "web_scrape"}):
+                return (
+                    "## 本轮工具策略（必须遵守）\n"
+                    "1. 你已经拿到网页 observation，优先基于现有结果作答。\n"
+                    "2. 只有当当前 observation 无法覆盖用户问题的关键点时，才继续补充网页检索。\n"
+                )
+            return (
+                "## 本轮工具策略（必须遵守）\n"
+                "1. 这是网页/实时信息相关问题，优先调用 `web_search` 或 `web_scrape`。\n"
+                "2. 在网页 observation 返回前，不要假装已经联网检索过，也不要编造网页来源。\n"
+            )
+        if intent == "literature_task" and "literature_search" in selected:
+            return (
+                "## 本轮工具策略\n"
+                "1. 这是论文/文献相关问题，优先使用 `literature_search` 获取候选文献与元信息。\n"
+                "2. 若用户明确提到其上传资料、知识库或本地文档，再结合 `knowledge_search`。\n"
+            )
+        if intent == "code_task" and selected.intersection(
+            {"notebook_execute", "notebook_variables", "notebook_cell", "code_analysis"}
+        ):
+            return (
+                "## 本轮工具策略\n"
+                "1. 这是代码/Notebook 相关问题，优先用可用工具验证运行结果、变量状态或报错原因。\n"
+                "2. 不要凭空断言代码已运行成功，除非 observation 已确认。\n"
+            )
+        return ""
+
+    def _channel_tool_policy_prompt(
+        self,
+        intent: str,
+        selected_tools: Sequence[str],
+    ) -> str:
+        channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
+        if channel not in {"codelab_agent", "notebook_agent"}:
+            return ""
+
+        selected = {str(name or "").strip() for name in selected_tools if str(name or "").strip()}
+        if not selected.intersection({"notebook_execute", "notebook_variables", "notebook_cell", "code_analysis"}):
+            return ""
+
+        lines = [
+            "## CodeLab 场景规则（必须遵守）",
+            "1. 你当前在 CodeLab Notebook 中工作，默认先使用 `notebook_cell`、`notebook_variables`、`notebook_execute` 和当前工作区文件解决问题。",
+            "2. 只要问题涉及当前 notebook、当前 cell、变量、上传文件、csv/xlsx/数据集、建模、画图或调试，就先按本地 Notebook 任务处理。",
+            "3. 除非用户明确要求“查知识库”“联网”“搜索网页”，否则不要调用 `knowledge_search`、`web_search`、`web_scrape` 或任何 `mcp.*` 工具。",
+            "4. 修复已有单元格时优先围绕当前/最近相关 cell 操作，不要脱离当前 notebook 另起一套无关方案。",
+        ]
+        if intent in {"knowledge_query", "web_query"}:
+            lines.append("5. 如果当前意图被判成远程查询，但用户并未明确要求知识库或联网，请回退到 notebook 本地工具。")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _normalize_think_tag_aliases(text: str) -> str:
+        normalized = str(text or "")
+        normalized = normalized.replace("<thinking>", "<think>")
+        normalized = normalized.replace("</thinking>", "</think>")
+        return normalized
+
+    @classmethod
+    def _extract_think_text(cls, text: str) -> str:
+        normalized = cls._normalize_think_tag_aliases(text)
+        match = re.search(r"<think>(.*?)</think>", normalized, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    @classmethod
+    def _strip_think_content(cls, text: str) -> str:
+        normalized = cls._normalize_think_tag_aliases(text)
+        return re.sub(r"<think>.*?</think>", "", normalized, flags=re.DOTALL).strip()
 
     @staticmethod
     def _sanitize_message_for_context(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -173,20 +322,28 @@ class AgentCore:
 
     def _build_system_prompt(self, messages: Optional[List[Dict[str, Any]]] = None) -> str:
         user_text = self._latest_user_text(messages)
+        intent_user_text = self._intent_user_text(messages)
         intent = "general_chat"
         selected_tools: List[str] = []
         schema_scope = "all"
+        tool_choice = "auto"
         tool_selection_enabled = bool(getattr(settings, "tool_selection_enabled", True))
 
         if tool_selection_enabled:
+            resolve_intent = getattr(self.tools, "resolve_intent", None)
             classify = getattr(self.tools, "classify_intent", None)
-            if callable(classify):
+            if callable(resolve_intent):
                 try:
-                    intent = str(classify(user_text))
+                    intent = str(resolve_intent(intent_user_text))
+                except Exception:
+                    intent = "general_chat"
+            elif callable(classify):
+                try:
+                    intent = str(classify(intent_user_text))
                 except Exception:
                     intent = "general_chat"
             try:
-                tools_desc = self.tools.get_tools_description(intent=intent, user_text=user_text)
+                tools_desc = self.tools.get_tools_description(intent=intent, user_text=intent_user_text)
                 schema_scope = "intent"
             except TypeError:
                 tools_desc = self.tools.get_tools_description()
@@ -194,26 +351,36 @@ class AgentCore:
             select_names = getattr(self.tools, "select_tool_names_for_intent", None)
             if callable(select_names):
                 try:
-                    selected_tools = list(select_names(intent, user_text=user_text))
+                    selected_tools = list(select_names(intent, user_text=intent_user_text))
                 except Exception:
                     selected_tools = []
                 schema_scope = "selected" if selected_tools else "all"
         else:
             tools_desc = self.tools.get_tools_description()
 
+        tool_choice = self._resolve_tool_choice(intent, selected_tools, messages=messages)
+        channel_policy_prompt = self._channel_tool_policy_prompt(intent, selected_tools)
+        policy_prompt = self._tool_use_policy_prompt(intent, selected_tools, messages=messages)
         desc_tokens = estimate_tokens(tools_desc)
         self._last_tool_selection = {
             "intent": intent,
+            "intent_user_text": intent_user_text,
             "selected_tools": selected_tools,
             "prompt_desc_tokens": desc_tokens,
             "schema_scope": schema_scope,
             "tool_selection_enabled": tool_selection_enabled,
+            "tool_choice": tool_choice,
         }
         logger.info(
             f"[AgentCore] intent={intent} selected_tools={selected_tools or 'ALL'} "
-            f"schema_scope={schema_scope} prompt_desc_tokens={desc_tokens}"
+            f"schema_scope={schema_scope} tool_choice={tool_choice} prompt_desc_tokens={desc_tokens}"
         )
-        return f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
+        prompt = f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
+        if channel_policy_prompt:
+            prompt = f"{prompt}\n\n{channel_policy_prompt}"
+        if policy_prompt:
+            prompt = f"{prompt}\n\n{policy_prompt}"
+        return prompt
 
     @staticmethod
     def _build_observation_message(tool_name: str, observation_output: str) -> str:
@@ -297,11 +464,12 @@ class AgentCore:
         return f"{clean}\n\n注：当前可用来源仅为 {allowed_tokens}。"
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
+        normalized = self._normalize_think_tag_aliases(response)
         result = {"thought": None, "action": None, "answer": None, "raw": response}
-        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+        think_match = re.search(r"<think>(.*?)</think>", normalized, re.DOTALL)
         if think_match:
             result["thought"] = think_match.group(1).strip()
-        action_match = re.search(r"<action>(.*?)</action>", response, re.DOTALL)
+        action_match = re.search(r"<action>(.*?)</action>", normalized, re.DOTALL)
         if action_match:
             payload = action_match.group(1).strip()
             for candidate in (payload, payload.replace("'", '"')):
@@ -310,7 +478,7 @@ class AgentCore:
                     break
                 except Exception:
                     pass
-        answer_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        answer_match = re.search(r"<answer>(.*?)</answer>", normalized, re.DOTALL)
         if answer_match:
             result["answer"] = answer_match.group(1).strip()
         return result
@@ -332,10 +500,12 @@ class AgentCore:
 
     @staticmethod
     def _extract_answer_text(content: str) -> str:
-        m = re.search(r"<answer>(.*?)</answer>", content or "", re.DOTALL)
+        normalized = AgentCore._normalize_think_tag_aliases(content)
+        m = re.search(r"<answer>(.*?)</answer>", normalized or "", re.DOTALL)
         if m:
             return m.group(1).strip()
-        return re.sub(r"</?(?:think|action|observation|answer)>", "", content or "").strip()
+        stripped = AgentCore._strip_think_content(normalized or "")
+        return re.sub(r"</?(?:action|observation|answer)>", "", stripped).strip()
 
     @classmethod
     def _normalize_messages_for_plain_chat(cls, messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -518,9 +688,15 @@ class AgentCore:
         if not self.runtime_context.user_id:
             return
         user_text = self._latest_user_text(context.messages)
+        resolve_intent = getattr(self.tools, "resolve_intent", None)
         classify = getattr(self.tools, "classify_intent", None)
         intent = "general_chat"
-        if callable(classify):
+        if callable(resolve_intent):
+            try:
+                intent = str(resolve_intent(user_text))
+            except Exception as exc:
+                logger.warning(f"[AgentCore] resolve_intent failed, fallback to general_chat: {exc}")
+        elif callable(classify):
             try:
                 intent = str(classify(user_text))
             except Exception as exc:
@@ -727,6 +903,135 @@ class AgentCore:
         elif et == "answer":
             context.steps.append(AgentStep(step_type="answer", content=str(data or "")))
 
+    @staticmethod
+    def _truncate_failure_text(value: str, limit: int = 180) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."
+
+    @staticmethod
+    def _normalize_search_query_tokens(query: str) -> set[str]:
+        text = str(query or "").strip().lower()
+        if not text:
+            return set()
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", text)
+            if len(token) >= 2
+        }
+
+    @classmethod
+    def _knowledge_query_similarity(cls, left: str, right: str) -> float:
+        left_clean = str(left or "").strip().lower()
+        right_clean = str(right or "").strip().lower()
+        if not left_clean or not right_clean:
+            return 0.0
+        if left_clean == right_clean:
+            return 1.0
+        left_tokens = cls._normalize_search_query_tokens(left_clean)
+        right_tokens = cls._normalize_search_query_tokens(right_clean)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        overlap = len(left_tokens & right_tokens)
+        return overlap / max(1, min(len(left_tokens), len(right_tokens)))
+
+    @staticmethod
+    def _successful_knowledge_search_queries(context: AgentContext) -> List[str]:
+        queries: List[str] = []
+        pending_query: Optional[str] = None
+        for step in context.steps:
+            if step.step_type == "action" and step.tool_name == "knowledge_search":
+                pending_query = str((step.tool_input or {}).get("query") or "").strip()
+                continue
+            if step.step_type == "observation" and step.tool_name == "knowledge_search":
+                if step.success and pending_query:
+                    queries.append(pending_query)
+                pending_query = None
+        return queries
+
+    @classmethod
+    def _find_redundant_knowledge_search_queries(
+        cls,
+        context: AgentContext,
+        calls: Sequence[ParsedToolCall],
+    ) -> List[str]:
+        previous_queries = cls._successful_knowledge_search_queries(context)
+        if not previous_queries:
+            return []
+        knowledge_calls = [call for call in calls if call.name == "knowledge_search"]
+        if not knowledge_calls or len(knowledge_calls) != len(calls):
+            return []
+
+        redundant_queries: List[str] = []
+        for call in knowledge_calls:
+            query = str(call.arguments.get("query") or "").strip()
+            if not query:
+                continue
+            best_similarity = max(
+                (cls._knowledge_query_similarity(query, previous) for previous in previous_queries),
+                default=0.0,
+            )
+            if best_similarity >= 0.6:
+                redundant_queries.append(query)
+        return redundant_queries
+
+    @staticmethod
+    def _redundant_knowledge_search_observation(queries: Sequence[str]) -> str:
+        joined = "；".join(str(item or "").strip() for item in queries if str(item or "").strip()) or "当前重复检索"
+        return (
+            "系统提示：已检测到与现有知识库结果高度相似的重复检索请求。"
+            f"重复 query：{joined}。请直接基于现有 observation 给出最终回答，"
+            "只使用已经出现过的 [来源X] 引用，不要继续用同义改写重复搜索。"
+        )
+
+    def _maybe_stop_after_repeated_tool_failures(
+        self,
+        context: AgentContext,
+        events: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        threshold = max(int(getattr(settings, "agent_tool_failure_streak_limit", 3) or 3), 1)
+        observations = [
+            event.get("data")
+            for event in events
+            if event.get("type") == "observation" and isinstance(event.get("data"), dict)
+        ]
+        if not observations:
+            return None
+
+        stop_tool = ""
+        stop_count = 0
+        stop_output = ""
+        for item in observations:
+            tool_name = str(item.get("tool") or "").strip()
+            if not tool_name:
+                continue
+            if bool(item.get("success")):
+                context.tool_failure_streaks[tool_name] = 0
+                continue
+
+            next_count = int(context.tool_failure_streaks.get(tool_name, 0)) + 1
+            context.tool_failure_streaks[tool_name] = next_count
+            if next_count >= threshold:
+                stop_tool = tool_name
+                stop_count = next_count
+                stop_output = str(item.get("output") or item.get("error") or "")
+                break
+
+        if not stop_tool:
+            return None
+
+        recent_detail = self._truncate_failure_text(stop_output or "工具 observation 连续失败。")
+        context.final_answer = (
+            f"`{stop_tool}` 已连续失败 {stop_count} 次，已停止自动重试。"
+            f"最近失败信息：{recent_detail}。建议先检查前置条件或调整指令后再继续。"
+        )
+        context.state = AgentState.DONE
+        return (
+            f"检测到 `{stop_tool}` 连续失败 {stop_count} 次，继续自动尝试大概率只会重复犯错，"
+            "本轮提前停止。"
+        )
+
     async def _execute_single_tool_call(
         self,
         context: AgentContext,
@@ -862,7 +1167,7 @@ class AgentCore:
             system_prompt=system_prompt,
             temperature=settings.react_temperature,
             max_tokens=settings.llm_max_tokens,
-            tool_choice="auto",
+            tool_choice=str(self._last_tool_selection.get("tool_choice") or "auto"),
         )
         self._accumulate_usage(context, response)
         content = str(response.get("content") or "")
@@ -874,12 +1179,31 @@ class AgentCore:
         if reasoning:
             thought_text = reasoning
 
+        if not thought_text and content.strip():
+            thought_text = self._extract_think_text(content)
+
         if not thought_text and content.strip() and parsed_calls:
             thought_text = self._strip_think_content(content)
         if thought_text:
             events.append({"type": "thought", "data": thought_text})
 
         if parsed_calls:
+            redundant_queries = self._find_redundant_knowledge_search_queries(context, parsed_calls)
+            if redundant_queries:
+                notice = self._redundant_knowledge_search_observation(redundant_queries)
+                events.append(
+                    {
+                        "type": "thought",
+                        "data": "检测到重复知识库搜索，改为基于现有检索结果直接收束回答。",
+                    }
+                )
+                context.messages.append(
+                    {
+                        "role": "user",
+                        "content": f"<observation>\n{notice}\n</observation>\n\n请直接给出最终回答。",
+                    }
+                )
+                return events, False
             context.messages.append(
                 {
                     "role": "assistant",
@@ -950,6 +1274,22 @@ class AgentCore:
                         arguments_raw=json.dumps(action, ensure_ascii=False),
                     )
                 )
+            redundant_queries = self._find_redundant_knowledge_search_queries(context, parsed_calls)
+            if redundant_queries:
+                notice = self._redundant_knowledge_search_observation(redundant_queries)
+                events.append(
+                    {
+                        "type": "thought",
+                        "data": "检测到重复知识库搜索，改为基于现有检索结果直接收束回答。",
+                    }
+                )
+                context.messages.append(
+                    {
+                        "role": "user",
+                        "content": f"<observation>\n{notice}\n</observation>\n\n请直接给出最终回答。",
+                    }
+                )
+                return events, False
             context.messages.append({"role": "assistant", "content": self._strip_think_content(content)})
             executed = await self._execute_tool_calls(context, parsed_calls)
             for item in executed:
@@ -1073,6 +1413,13 @@ class AgentCore:
                     if event.get("type") == "answer":
                         answer_emitted = True
                     yield event
+                failure_stop_thought = self._maybe_stop_after_repeated_tool_failures(context, events)
+                if failure_stop_thought:
+                    thought_event = {"type": "thought", "data": failure_stop_thought}
+                    self._append_step_from_event(context, thought_event)
+                    context.persist_events.append(thought_event)
+                    yield thought_event
+                    break
                 if done:
                     break
 

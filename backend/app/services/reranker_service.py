@@ -66,6 +66,8 @@ class RerankerService:
                 init_kwargs = {"device": device}
                 if cache_dir:
                     init_kwargs["cache_folder"] = cache_dir
+                if int(settings.reranker_max_length or 0) > 0:
+                    init_kwargs["max_length"] = int(settings.reranker_max_length)
 
                 try:
                     self._model = CrossEncoder(
@@ -75,7 +77,13 @@ class RerankerService:
                     )
                 except TypeError:
                     # Compatibility fallback for older sentence-transformers versions.
+                    init_kwargs.pop("max_length", None)
                     self._model = CrossEncoder(model_name, **init_kwargs)
+                    if int(settings.reranker_max_length or 0) > 0 and hasattr(self._model, "max_length"):
+                        self._model.max_length = int(settings.reranker_max_length)
+                else:
+                    if int(settings.reranker_max_length or 0) > 0 and hasattr(self._model, "max_length"):
+                        self._model.max_length = int(settings.reranker_max_length)
                 self._device = device
                 self._loaded = True
                 logger.info(f"Reranker model loaded: {model_name}, device={device}")
@@ -105,7 +113,14 @@ class RerankerService:
         self._load_model()
 
         pairs = [[query, doc] for doc in documents]
-        scores = await asyncio.to_thread(self._model.predict, pairs)
+        batch_size = max(1, int(settings.reranker_batch_size or 1))
+        scores = await asyncio.to_thread(
+            self._model.predict,
+            pairs,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
 
         if hasattr(scores, "tolist"):
             scores = scores.tolist()
@@ -118,6 +133,40 @@ class RerankerService:
             reverse=True,
         )
         return ranked[:top_k]
+
+    async def warmup(self) -> dict[str, object]:
+        """Preload reranker weights and a tiny inference pass."""
+        metadata: dict[str, object] = {
+            "enabled": bool(settings.enable_reranker),
+            "model": str(settings.reranker_model or "").strip(),
+            "device": self._resolve_device(),
+        }
+        if not bool(settings.enable_reranker):
+            return {
+                "status": "skipped",
+                "detail": "reranker disabled",
+                "metadata": metadata,
+            }
+
+        await self.rerank(
+            query="retrieval warmup query",
+            documents=["retrieval warmup document"],
+            top_k=1,
+        )
+        return {
+            "status": "warmed",
+            "detail": "reranker ready",
+            "metadata": metadata,
+        }
+
+    def get_runtime_status(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "enabled": bool(settings.enable_reranker),
+            "model": str(settings.reranker_model or "").strip(),
+            "device": self._device or self._resolve_device(),
+            "ready": bool(self._loaded),
+        }
+        return payload
 
     @staticmethod
     def normalize_score(score: float) -> float:

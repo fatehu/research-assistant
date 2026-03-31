@@ -737,7 +737,7 @@ class ReaderPanelPlanAgentService:
         whitelist = [str(item).strip() for item in list(component_whitelist or []) if str(item).strip()]
         api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
         base_url = str(getattr(settings, "aliyun_base_url", "") or "").strip()
-        model = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip()
+        model = str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash").strip()
         timeout_seconds = max(8.0, float(int(getattr(settings, "reader_agent_timeout_ms", 90000) or 90000) / 1000.0))
         max_tokens = max(1024, int(getattr(settings, "reader_agent_max_tokens", 7000) or 7000))
         style_goal = f"{str(style_intent or '').strip() or 'editorial'}; theme={str(theme_mode or 'light').strip() or 'light'}; detail={str(detail_level or 'standard').strip() or 'standard'}"

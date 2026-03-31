@@ -159,7 +159,7 @@ const ChatPage = () => {
 
   // ─── 渲染 ──────────────────────────────────────
   return (
-    <div className="h-full flex flex-col bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950">
+    <div className="flex h-full flex-col bg-slate-950">
       <ChatMessages
         messages={messages}
         currentConversation={currentConversation}

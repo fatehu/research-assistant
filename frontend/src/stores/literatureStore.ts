@@ -9,6 +9,19 @@ import {
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
+const getSearchResultIdentity = (paper: Pick<PaperSearchResult, 'source' | 'external_id' | 'doi' | 'arxiv_id' | 'title'>): string => {
+  const source = String(paper.source || '').trim().toLowerCase()
+  const externalId = String(paper.external_id || '').trim()
+  if (source && externalId) return `${source}:${externalId}`
+  const doi = String(paper.doi || '').trim().toLowerCase()
+  if (doi) return `doi:${doi}`
+  const arxivId = String(paper.arxiv_id || '').trim().toLowerCase()
+  if (arxivId) return `arxiv:${arxivId}`
+  return `title:${String(paper.title || '').trim().toLowerCase()}`
+}
+
+let activeSearchRequestId = 0
+
 interface LiteratureState {
   // 论文列表
   papers: Paper[]
@@ -128,7 +141,17 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   // 搜索论文
   searchPapers: async (query, source = 'multi', options = {}) => {
     const limit = options.limit || 20
-    set({ searchLoading: true, searchQuery: query, searchSource: source, searchOffset: 0 })
+    const requestId = ++activeSearchRequestId
+    set({
+      searchLoading: true,
+      searchLoadingMore: false,
+      searchQuery: query,
+      searchSource: source,
+      searchOffset: 0,
+      searchResults: [],
+      searchTotal: 0,
+      searchHasMore: false,
+    })
     try {
       const response = await literatureApi.searchPapers({
         query,
@@ -138,6 +161,9 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         year_start: options.year_start,
         year_end: options.year_end,
       })
+      if (requestId !== activeSearchRequestId) {
+        return
+      }
       const newOffset = response.papers.length
       const hasMore = response.has_more && response.papers.length > 0
       set({
@@ -149,7 +175,15 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       })
     } catch (error) {
       console.error('Search failed:', error)
-      set({ searchLoading: false })
+      if (requestId === activeSearchRequestId) {
+        set({
+          searchResults: [],
+          searchTotal: 0,
+          searchOffset: 0,
+          searchHasMore: false,
+          searchLoading: false,
+        })
+      }
       throw error
     }
   },
@@ -159,6 +193,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
     const { searchQuery, searchSource, searchOffset, searchTotal, searchLoadingMore, searchHasMore } = get()
     if (searchLoadingMore || !searchHasMore) return
 
+    const requestId = activeSearchRequestId
     const limit = 20
     set({ searchLoadingMore: true })
     try {
@@ -168,6 +203,15 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         limit,
         offset: searchOffset,
       })
+      const latest = get()
+      if (
+        requestId !== activeSearchRequestId ||
+        latest.searchQuery !== searchQuery ||
+        latest.searchSource !== searchSource ||
+        latest.searchOffset !== searchOffset
+      ) {
+        return
+      }
       const newOffset = searchOffset + response.papers.length
       const hasMore = response.has_more && response.papers.length > 0
       set(state => ({
@@ -179,11 +223,14 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       }))
     } catch (error) {
       console.error('Load more failed:', error)
-      set({ searchLoadingMore: false })
+      if (requestId === activeSearchRequestId) {
+        set({ searchLoadingMore: false })
+      }
     }
   },
 
   clearSearch: () => {
+    activeSearchRequestId += 1
     set({ searchResults: [], searchQuery: '', searchTotal: 0, searchOffset: 0, searchHasMore: false })
   },
 
@@ -237,11 +284,13 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       // 更新搜索结果中的状态
       set(state => ({
         searchResults: state.searchResults.map(p =>
-          p.external_id === paper.external_id
+          getSearchResultIdentity(p) === getSearchResultIdentity(paper)
             ? { ...p, is_saved: true, saved_paper_id: saved.id }
             : p
         ),
-        papers: [...state.papers, saved],
+        papers: state.papers.some(existing => existing.id === saved.id)
+          ? state.papers.map(existing => (existing.id === saved.id ? saved : existing))
+          : [...state.papers, saved],
       }))
 
       // 更新收藏夹计数

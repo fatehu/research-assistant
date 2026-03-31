@@ -7148,7 +7148,7 @@ class LiteratureReaderComposeService:
         figure_page_image_url = rendered_page_image
         figure_page_image_path = rendered_page_image_path
         text_normalization_map: Dict[str, Dict[str, Any]] = {}
-        model_name = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip() or "qwen-3.5-plus"
+        model_name = str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash").strip() or "qwen3.5-flash"
         text_normalization_validation: Dict[str, Any] = {
             "passed": True,
             "errors": [],
@@ -7660,7 +7660,7 @@ class LiteratureReaderComposeService:
         payload["qwen_plan_meta"] = {
             "used": True,
             "reason": "layout_uid_v1",
-            "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+            "model": str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash"),
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "completion_tokens": int(usage.get("completion_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
@@ -7914,7 +7914,7 @@ class LiteratureReaderComposeService:
             payload["qwen_plan_meta"] = {
                 "used": False,
                 "reason": "docmind_layout_empty",
-                "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+                "model": str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash"),
                 "steps_executed": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -8179,7 +8179,7 @@ class LiteratureReaderComposeService:
         payload["qwen_plan_meta"] = {
             "used": True,
             "reason": "single_agent_v2",
-            "model": str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus"),
+            "model": str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash"),
             "steps_executed": int(repair_report.get("steps_executed") or len(step_metrics)),
             "prompt_tokens": int(total_prompt_tokens),
             "completion_tokens": int(total_completion_tokens),
@@ -9906,7 +9906,7 @@ class LiteratureReaderComposeService:
     ) -> Dict[str, Any]:
         api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
         base_url = str(getattr(settings, "aliyun_base_url", "") or "").strip()
-        model_name = str(getattr(settings, "reader_agent_model", "qwen-3.5-plus") or "qwen-3.5-plus").strip()
+        model_name = str(getattr(settings, "reader_agent_model", "qwen3.5-flash") or "qwen3.5-flash").strip()
         if not api_key or not base_url or not model_name:
             return {}
 
@@ -13181,7 +13181,7 @@ class LiteratureReaderComposeService:
                         "type": "FigurePanel",
                         "props": {
                             "caption": text,
-                            "image_url": None,
+                            "image_url": "",
                             "ai_insight": self._build_caption_insight(text),
                         },
                         "children": [],
@@ -13231,7 +13231,7 @@ class LiteratureReaderComposeService:
                     "type": "FigurePanel",
                     "props": {
                         "caption": text,
-                        "image_url": None,
+                        "image_url": "",
                         "ai_insight": self._build_caption_insight(text),
                     },
                     "children": [],
@@ -20342,6 +20342,7 @@ class LiteratureReaderComposeService:
                         if label_match:
                             props["source_label"] = self._normalize_spaces(str(label_match.group(1) or ""))
                     image_url = str(props.get("image_url") or props.get("image_src") or "").strip()
+                    props["image_url"] = image_url
                     if (not image_url) or re.match(r"^https?://(?:dx\.)?doi\.org/", image_url, flags=re.IGNORECASE):
                         layout_uid = _resolve_layout_uid(canonical_ids)
                         if not layout_uid:

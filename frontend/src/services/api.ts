@@ -2160,6 +2160,25 @@ export interface ReaderExperienceV2Response {
   meta?: Record<string, unknown>
 }
 
+export interface RetrievalRuntimeComponentStatus {
+  component: 'embedding' | 'reranker' | string
+  status: string
+  detail: string
+  duration_ms: number
+  metadata?: Record<string, unknown>
+}
+
+export interface RetrievalRuntimeStatusResponse {
+  enabled: boolean
+  status: string
+  timeout_seconds: number
+  duration_ms: number
+  started_at?: string | null
+  completed_at?: string | null
+  background_task_running?: boolean
+  components: RetrievalRuntimeComponentStatus[]
+}
+
 export interface ReaderWorkbenchV2Response {
   focus_page: number
   status: 'ready' | 'running' | 'failed' | 'empty'
@@ -2429,6 +2448,22 @@ export interface ReaderExperienceBlockExplainRequest {
 export interface ReaderExperienceBlockExplainEvent {
   event: 'start' | 'token' | 'done' | 'error'
   data: any
+}
+
+export interface ReaderExperienceBlockRewriteRequest {
+  page: number
+  block_id: string
+  rewrite_prompt: string
+  selected_kb_id?: number
+  reader_profile?: string
+  user_intent?: string
+}
+
+export interface ReaderExperienceBlockRewriteResponse {
+  focus_page: number
+  artifact: PageArtifactV2
+  rewritten_block: PageArtifactV2ReadingBlock
+  message: string
 }
 
 export interface LiteratureAskSession {
@@ -2830,6 +2865,23 @@ export const literatureApi = {
       payload,
       { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
     )
+    return response.data
+  },
+
+  rewriteReaderExperienceV2Block: async (
+    paperId: number,
+    payload: ReaderExperienceBlockRewriteRequest,
+  ): Promise<ReaderExperienceBlockRewriteResponse> => {
+    const response = await api.post(
+      `/api/v1/literature/papers/${paperId}/experience-v2/block-rewrite`,
+      payload,
+      { timeout: LONG_RUNNING_READER_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  getRetrievalRuntimeStatus: async (): Promise<RetrievalRuntimeStatusResponse> => {
+    const response = await api.get('/health/retrieval-runtime', { timeout: 10000 })
     return response.data
   },
 
@@ -3250,6 +3302,24 @@ export interface Notebook {
   execution_count: number
 }
 
+export interface NotebookWorkspaceFile {
+  name: string
+  relative_path: string
+  runtime_path: string
+  size_bytes: number
+  content_type?: string | null
+  updated_at: string
+  extension: string
+}
+
+export interface NotebookWorkspace {
+  notebook_id: string
+  workspace_dir: string
+  display_path: string
+  file_count: number
+  files: NotebookWorkspaceFile[]
+}
+
 export interface ExecuteRequest {
   code: string
   cell_id?: string
@@ -3340,6 +3410,29 @@ export const codelabApi = {
     const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/interrupt`)
     return response.data
   },
+
+  listFiles: async (notebookId: string): Promise<NotebookWorkspace> => {
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/files`)
+    return response.data
+  },
+
+  uploadFile: async (notebookId: string, file: File): Promise<NotebookWorkspaceFile> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/files/upload`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return response.data
+  },
+
+  deleteFile: async (notebookId: string, fileName: string): Promise<{ message: string }> => {
+    const response = await api.delete(`/api/v1/codelab/notebooks/${notebookId}/files/${encodeURIComponent(fileName)}`)
+    return response.data
+  },
+
+  getFileDownloadUrl: (notebookId: string, fileName: string): string => (
+    `${API_BASE_URL}/api/v1/codelab/notebooks/${notebookId}/files/${encodeURIComponent(fileName)}`
+  ),
 }
 
 
@@ -3366,14 +3459,53 @@ export interface AgentContextResponse {
   notebook_id: string
   notebook_title: string
   cell_count: number
+  code_cell_count?: number
   execution_count: number
   variables: Record<string, string>
   recent_outputs: Array<{
     cell_id: string
+    cell_index?: number
     execution_count: number | null
     outputs: CellOutput[]
+    summary?: string[]
   }>
   code_summary: string
+  stage_summary?: string
+  history_summary?: string
+  recent_cells?: Array<{
+    cell_id: string
+    cell_index: number
+    label: string
+    cell_type: string
+    kind: string
+    source_excerpt: string
+    execution_count: number | null
+    has_output: boolean
+    status: string
+    output_summary?: string
+    error_summary?: string
+  }>
+  focus?: {
+    active_cell?: {
+      cell_id: string
+      cell_index: number
+      label: string
+      kind: string
+      source_excerpt: string
+      status: string
+      output_summary?: string
+      error_summary?: string
+    } | null
+    recent_error?: Record<string, any> | null
+    recent_output?: Record<string, any> | null
+    recent_executed?: Record<string, any> | null
+  }
+  workspace?: {
+    directory: string
+    display_path?: string
+    file_count: number
+    files: NotebookWorkspaceFile[]
+  }
 }
 
 export interface AgentChatRequest {
@@ -3382,6 +3514,8 @@ export interface AgentChatRequest {
   include_variables?: boolean
   user_authorized?: boolean
   stream?: boolean
+  active_cell_id?: string
+  active_cell_index?: number
 }
 
 export interface AgentChatEvent {

@@ -364,6 +364,157 @@ def test_tool_selection_classify_uploaded_pdf_as_knowledge_query():
     assert agent_tools.ToolRegistry.classify_intent("根据我上传的文档做一个摘要") == "knowledge_query"
 
 
+def test_notebook_uploaded_file_task_prefers_code_tools_and_skips_mcp(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+                _fake_tool("knowledge_search"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-1",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=True,
+        tool_provider=_Provider(),
+    )
+    registry._mcp_tools = {
+        "mcp.tavily.tavily_search": SimpleNamespace(
+            name="mcp.tavily.tavily_search",
+            description="web search fetch tool",
+            parameters={"type": "object", "properties": {}},
+        ),
+        "mcp.firecrawl.firecrawl_scrape": SimpleNamespace(
+            name="mcp.firecrawl.firecrawl_scrape",
+            description="browser scrape tool",
+            parameters={"type": "object", "properties": {}},
+        ),
+    }
+
+    user_text = "请根据我上传的 csv 文件在 notebook 里构建一个机器学习案例并画图"
+    assert registry.resolve_intent(user_text) == "code_task"
+
+    selected = set(registry.select_tool_names_for_intent("knowledge_query", user_text=user_text))
+    assert "notebook_execute" in selected
+    assert "notebook_cell" in selected
+    assert "knowledge_search" not in selected
+    assert "mcp.tavily.tavily_search" not in selected
+    assert "mcp.firecrawl.firecrawl_scrape" not in selected
+
+
+def test_codelab_route_profile_forces_uploaded_dataset_task_into_code_tools(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator,knowledge_search")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+                _fake_tool("knowledge_search"),
+                _fake_tool("web_search"),
+                _fake_tool("web_scrape"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-2",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=True,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    user_text = "利用上传的数据集进行机器学习案例构建"
+    assert registry.resolve_intent(user_text) == "code_task"
+
+    selected = set(registry.select_tool_names_for_intent("knowledge_query", user_text=user_text))
+    assert "notebook_execute" in selected
+    assert "notebook_variables" in selected
+    assert "knowledge_search" not in selected
+    assert "web_search" not in selected
+
+
+def test_codelab_followup_only_message_stays_in_code_task(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator,knowledge_search")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+                _fake_tool("knowledge_search"),
+                _fake_tool("web_search"),
+                _fake_tool("web_scrape"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-followup",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=True,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    user_text = "continue"
+    assert registry.resolve_intent(user_text) == "code_task"
+
+    selected = set(registry.select_tool_names_for_intent("general_chat", user_text=user_text))
+    assert "notebook_execute" in selected
+    assert "notebook_variables" in selected
+    assert "knowledge_search" not in selected
+    assert "web_search" not in selected
+
+
 class _FakeSoup:
     def __init__(self, html: str, parser: str):
         self._html = html
