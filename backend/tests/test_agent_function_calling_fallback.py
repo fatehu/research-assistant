@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.config import settings
 from app.services.agent_tools import ToolResult
-from app.services.react_agent import ReActAgent
+from app.services.react_agent import AgentContext, AgentRuntimeContext, ParsedToolCall, ReActAgent
 
 
 class _FallbackLLM:
@@ -102,6 +102,50 @@ class _CaptureToolChoiceFCLLM:
                     "arguments": "{\"query\":\"agentic search\"}",
                 }
             ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
+class _AnswerDraftToolCallFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": "",
+                "reasoning": (
+                    "让我先给出关键里程碑：\n"
+                    "## 核心节点\n"
+                    "- 2014年：注意力机制进入机器翻译\n"
+                    "- 2017年：Transformer 发布\n"
+                    "- 2018年：BERT 推动预训练范式\n"
+                    "具体来说，这些节点说明了为什么后续大模型能力会快速增强。"
+                ),
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "name": "datetime",
+                        "arguments": "{\"query\":\"2014 到现在多少年\"}",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            }
+        return {
+            "content": "关键里程碑如下：2014、2017、2018。",
+            "reasoning": "",
+            "tool_calls": [],
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
 
@@ -239,6 +283,27 @@ class _KnowledgeIntentTools:
         return ToolResult(success=True, output="[来源1] 检索命中", data={"results": [{"content": "agentic search"}]})
 
 
+class _DateTimeOnlyTools:
+    def get_tools_description(self, **kwargs):
+        return "- datetime: 时间计算"
+
+    def list_tools(self, **kwargs):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "datetime",
+                    "description": "datetime",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                },
+            }
+        ]
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "datetime"
+        return ToolResult(success=True, output="2014 距今约 12 年。")
+
+
 class _RepeatedFailureLLM:
     provider = "test"
     config = {"model": "test-model"}
@@ -260,6 +325,40 @@ class _RepeatedFailureTools:
     async def execute(self, tool_name: str, **kwargs):
         assert tool_name == "notebook_execute"
         return ToolResult(success=False, output="PolicyViolationError: 不要导入 os", error="policy_violation")
+
+
+class _SimpleExecuteTools:
+    def get_tools_description(self, **kwargs):
+        return "- datetime: 时间计算"
+
+    def get(self, _name: str):
+        return None
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "datetime"
+        assert kwargs["query"] == "2014 到现在多少年"
+        return ToolResult(
+            success=True,
+            output="Bahdanau 2014 引入注意力机制。",
+            data={"result": "12 年"},
+            execution_time_ms=12.5,
+            output_tokens_estimate=18,
+        )
+
+
+class _ToolLedgerRuntimeService:
+    def __init__(self):
+        self.entries = []
+        self.item_entries = []
+
+    async def append_conversation_tool_ledger_entries(self, conversation_id: int, entries):
+        assert conversation_id == 54
+        self.entries.extend(list(entries or []))
+
+    async def append_conversation_item_entries(self, conversation_id: int, entries):
+        assert conversation_id == 54
+        self.item_entries.extend(list(entries or []))
+
 
 
 @pytest.mark.asyncio
@@ -313,7 +412,24 @@ async def test_function_calling_direct_answer_extracts_thinking_alias_into_thoug
 
 
 @pytest.mark.asyncio
-async def test_function_calling_uses_required_tool_choice_for_knowledge_query():
+async def test_function_calling_tool_plan_redacts_answer_like_reasoning_into_process_summary():
+    agent = ReActAgent(_AnswerDraftToolCallFCLLM(), _DateTimeOnlyTools(), max_iterations=2)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "帮我梳理注意力机制时间线"}], stream=False):
+        events.append(event)
+
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    answer_event = next(event for event in events if event.get("type") == "answer")
+
+    assert thought_events
+    assert "调用 `datetime`" in str(thought_events[0]["data"])
+    assert "关键里程碑" not in str(thought_events[0]["data"])
+    assert "2014" in str(answer_event["data"])
+
+
+@pytest.mark.asyncio
+async def test_function_calling_uses_auto_tool_choice_with_available_tools():
     llm = _CaptureToolChoiceFCLLM()
     agent = ReActAgent(llm, _KnowledgeIntentTools(), max_iterations=1)
 
@@ -321,12 +437,12 @@ async def test_function_calling_uses_required_tool_choice_for_knowledge_query():
     async for event in agent.run([{"role": "user", "content": "利用知识库解释 agentic search"}], stream=False):
         events.append(event)
 
-    assert llm.captured_tool_choice == "required"
+    assert llm.captured_tool_choice == "auto"
     assert any(event.get("type") == "action" for event in events)
 
 
 @pytest.mark.asyncio
-async def test_function_calling_relaxes_tool_choice_after_first_knowledge_observation():
+async def test_function_calling_keeps_auto_tool_choice_after_first_knowledge_observation():
     llm = _CaptureMultiTurnToolChoiceFCLLM()
     agent = ReActAgent(llm, _KnowledgeIntentTools(), max_iterations=3)
 
@@ -336,7 +452,7 @@ async def test_function_calling_relaxes_tool_choice_after_first_knowledge_observ
 
     done_events = [event for event in events if event.get("type") == "done"]
 
-    assert llm.captured_tool_choices[:2] == ["required", "auto"]
+    assert llm.captured_tool_choices[:2] == ["auto", "auto"]
     assert done_events and "[来源1]" in str(done_events[0]["data"]["answer"])
 
 
@@ -374,6 +490,47 @@ async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     assert done_events
     assert done_events[0]["data"]["iterations"] == 3
     assert "已停止自动重试" in str(done_events[0]["data"]["answer"])
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_persists_tool_ledger_entries():
+    runtime_service = _ToolLedgerRuntimeService()
+    agent = ReActAgent(
+        llm_service=_DirectAnswerFCLLM(),
+        tool_registry=_SimpleExecuteTools(),
+        runtime_context=AgentRuntimeContext(user_id=7, channel="chat", conversation_id=54),
+        runtime_service=runtime_service,
+    )
+    context = AgentContext(
+        messages=[{"role": "user", "content": "解释注意力机制"}],
+        iteration=1,
+        run_id="run-1",
+    )
+
+    executed = await agent._execute_tool_calls(
+        context,
+        [
+            ParsedToolCall(
+                call_id="call_1",
+                name="datetime",
+                arguments={"query": "2014 到现在多少年"},
+                arguments_raw='{"query":"2014 到现在多少年"}',
+            )
+        ],
+    )
+
+    assert len(executed) == 1
+    assert len(runtime_service.entries) == 2
+    assert runtime_service.entries[0]["kind"] == "tool_call"
+    assert runtime_service.entries[0]["tool_name"] == "datetime"
+    assert runtime_service.entries[1]["kind"] == "tool_result"
+    assert runtime_service.entries[1]["status"] == "succeeded"
+    assert runtime_service.entries[1]["success"] is True
+    assert "Bahdanau 2014" in str(runtime_service.entries[1]["summary"])
+    assert runtime_service.item_entries
+    assert runtime_service.item_entries[0]["kind"] == "tool_use_summary"
+    assert runtime_service.item_entries[0]["turn_id"] is None
+    assert "datetime" in str(runtime_service.item_entries[0]["summary"])
 
 
 def test_plain_chat_normalization_strips_tool_protocol_messages():

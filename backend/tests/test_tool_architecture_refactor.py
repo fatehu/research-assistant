@@ -312,12 +312,12 @@ def _patch_registry_defaults(monkeypatch):
     monkeypatch.setattr(agent_tools, "LiteratureSearchTool", lambda: _fake_tool("literature_search"))
 
 
-def test_tool_selection_filters_tools_and_keeps_fallback(monkeypatch):
+def test_codelab_tool_selection_filters_tools_and_keeps_fallback(monkeypatch):
     _patch_registry_defaults(monkeypatch)
     monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
     monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
 
-    registry = agent_tools.ToolRegistry(db=object(), user_id=1)
+    registry = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="codelab")
     selected = set(registry.select_tool_names_for_intent("knowledge_query"))
 
     assert {"knowledge_search", "datetime", "calculator"}.issubset(selected)
@@ -330,12 +330,12 @@ def test_tool_selection_filters_tools_and_keeps_fallback(monkeypatch):
     assert "knowledge_search" not in desc
 
 
-def test_tool_selection_filters_mcp_tools(monkeypatch):
+def test_codelab_tool_selection_filters_mcp_tools(monkeypatch):
     _patch_registry_defaults(monkeypatch)
     monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
     monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
 
-    registry = agent_tools.ToolRegistry(db=object(), user_id=1)
+    registry = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="codelab")
     registry._mcp_tools = {
         "mcp.web.fetch": SimpleNamespace(
             name="mcp.web.fetch",
@@ -352,6 +352,45 @@ def test_tool_selection_filters_mcp_tools(monkeypatch):
     selected = set(registry.select_tool_names_for_intent("web_query", user_text="latest news"))
     assert "mcp.web.fetch" in selected
     assert "mcp.code.exec" not in selected
+
+
+def test_chat_registry_ignores_intent_filtering_and_exposes_full_pool(monkeypatch):
+    _patch_registry_defaults(monkeypatch)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
+
+    registry = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="chat")
+    registry._mcp_tools = {
+        "mcp.firecrawl.firecrawl_scrape": SimpleNamespace(
+            name="mcp.firecrawl.firecrawl_scrape",
+            description="browser scrape tool",
+            parameters={"type": "object", "properties": {}},
+        ),
+        "mcp.code.exec": SimpleNamespace(
+            name="mcp.code.exec",
+            description="python code execute tool",
+            parameters={"type": "object", "properties": {}},
+        ),
+    }
+
+    selected = set(registry.select_tool_names_for_intent("code_task", user_text="实现这个的最小代码是多少"))
+    assert {
+        "knowledge_search",
+        "web_search",
+        "calculator",
+        "datetime",
+        "text_analysis",
+        "unit_converter",
+        "literature_search",
+        "mcp.firecrawl.firecrawl_scrape",
+        "mcp.code.exec",
+    }.issubset(selected)
+
+    listed = {
+        item["function"]["name"]
+        for item in registry.list_tools(intent="web_query", user_text="latest news")
+    }
+    assert listed == selected
 
 
 def test_tool_selection_classify_uploaded_pdf_as_knowledge_query():
@@ -458,14 +497,15 @@ def test_codelab_route_profile_forces_uploaded_dataset_task_into_code_tools(monk
         route_profile="codelab",
     )
 
-    user_text = "利用上传的数据集进行机器学习案例构建"
+    user_text = "请基于已上传的 car_parts_final.csv，先不要修改 notebook，也不要联网；只告诉我接下来最合理的两步。"
     assert registry.resolve_intent(user_text) == "code_task"
 
-    selected = set(registry.select_tool_names_for_intent("knowledge_query", user_text=user_text))
+    selected = set(registry.select_tool_names_for_intent("web_query", user_text=user_text))
     assert "notebook_execute" in selected
     assert "notebook_variables" in selected
     assert "knowledge_search" not in selected
     assert "web_search" not in selected
+    assert "web_scrape" not in selected
 
 
 def test_codelab_followup_only_message_stays_in_code_task(monkeypatch):
@@ -513,6 +553,140 @@ def test_codelab_followup_only_message_stays_in_code_task(monkeypatch):
     assert "notebook_variables" in selected
     assert "knowledge_search" not in selected
     assert "web_search" not in selected
+
+
+def test_codelab_general_chat_without_authorization_does_not_auto_mount_notebook_tools(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-general-chat",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=False,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    selected = set(registry.select_tool_names_for_intent("general_chat", user_text="你好"))
+    assert "datetime" in selected
+    assert "calculator" in selected
+    assert "notebook_execute" not in selected
+    assert "notebook_variables" not in selected
+    assert "notebook_cell" not in selected
+
+
+def test_codelab_code_task_without_authorization_strips_mutation_tools(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-unauthorized",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=False,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    user_text = "根据当前 notebook 和上传文件，告诉我下一步怎么做"
+    selected = set(registry.select_tool_names_for_intent("code_task", user_text=user_text))
+
+    assert "notebook_variables" in selected
+    assert "notebook_cell" in selected
+    assert "code_analysis" in selected
+    assert "notebook_execute" not in selected
+    assert "notebook_cleanup" not in selected
+    assert "pip_install" not in selected
+
+
+def test_codelab_negative_web_instruction_keeps_current_notebook_prompt_local(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator,knowledge_search")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+                _fake_tool("knowledge_search"),
+                _fake_tool("web_search"),
+                _fake_tool("web_scrape"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-local-only",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=True,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    user_text = "只根据当前 notebook 状态，简短告诉我下一步应该做什么，不要执行，不要联网。"
+    assert registry.resolve_intent(user_text) == "code_task"
+
+    selected = set(registry.select_tool_names_for_intent(registry.resolve_intent(user_text), user_text=user_text))
+    assert "notebook_cell" in selected
+    assert "notebook_variables" in selected
+    assert "web_search" not in selected
+    assert "web_scrape" not in selected
 
 
 class _FakeSoup:
@@ -643,6 +817,7 @@ async def test_literature_search_multi_and_default_source_compatible():
         def __init__(self):
             self.multi_calls = 0
             self.search_calls = 0
+            self.last_search_source = None
 
         async def search_multi(self, **kwargs):
             self.multi_calls += 1
@@ -650,20 +825,25 @@ async def test_literature_search_multi_and_default_source_compatible():
 
         async def search(self, **kwargs):
             self.search_calls += 1
+            self.last_search_source = kwargs.get("source")
             return {"total": 1, "papers": [_paper(3)]}
+
+        def multi_source_count(self):
+            return 4
 
     service = _FakeService()
     tool = agent_tools.LiteratureSearchTool()
     tool.service = service
 
     multi_result = await tool.execute(query="transformer", source="multi", max_results=1)
-    default_result = await tool.execute(query="transformer", source="semantic_scholar", max_results=1)
+    default_result = await tool.execute(query="transformer", max_results=1)
 
     assert multi_result.success is True
     assert multi_result.data["source"] == "multi"
     assert len(multi_result.data["papers"]) == 1
     assert default_result.success is True
-    assert default_result.data["source"] == "semantic_scholar"
+    assert default_result.data["source"] == "auto"
+    assert service.last_search_source == "auto"
     assert service.multi_calls == 1
     assert service.search_calls == 1
 
@@ -676,6 +856,9 @@ async def test_notebook_literature_tool_supports_multi():
 
         async def search(self, **kwargs):
             return {"total": 1, "papers": [_paper(2)]}
+
+        def multi_source_count(self):
+            return 4
 
     tool = notebook_tools.EnhancedLiteratureSearchTool()
     tool.service = _FakeService()
@@ -719,9 +902,13 @@ async def test_literature_service_multi_deduplicates_and_keeps_better_paper():
     async def _pubmed(*args, **kwargs):
         return {"papers": [_paper_result(source="pubmed", external_id="pm-1", doi="10.1000/abc", citation_count=10)]}
 
+    async def _openalex(*args, **kwargs):
+        return {"papers": []}
+
     service.s2.search = _s2
     service.arxiv.search = _arxiv
     service.pubmed.search = _pubmed
+    service.openalex.search = _openalex
 
     result = await service.search_multi("transformer", limit_per_source=3)
     papers = result["papers"]
@@ -730,3 +917,55 @@ async def test_literature_service_multi_deduplicates_and_keeps_better_paper():
     assert len(papers) == 1
     assert papers[0].source == "pubmed"
     assert papers[0].citation_count == 10
+
+
+@pytest.mark.asyncio
+async def test_literature_service_auto_fallback_tries_multiple_sources_until_success():
+    from app.services.literature_service import LiteratureService, PaperResult
+
+    def _paper_result(*, source: str, external_id: str) -> PaperResult:
+        return PaperResult(
+            source=source,
+            external_id=external_id,
+            title="Recovered Paper",
+            abstract="abstract",
+            authors=[{"name": "a"}],
+            year=2024,
+            venue="venue",
+            citation_count=1,
+            reference_count=0,
+            url=f"https://example.com/{external_id}",
+            pdf_url=None,
+            arxiv_id=None,
+            doi=None,
+            fields_of_study=[],
+            raw_data={},
+        )
+
+    service = LiteratureService()
+    calls = []
+
+    async def _openalex(*args, **kwargs):
+        calls.append("openalex")
+        return {"papers": [], "error": "rate_limited"}
+
+    async def _s2(*args, **kwargs):
+        calls.append("semantic_scholar")
+        return {"papers": []}
+
+    async def _arxiv(*args, **kwargs):
+        calls.append("arxiv")
+        return {"papers": [_paper_result(source="arxiv", external_id="ax-1")], "total": 1}
+
+    service.openalex.search = _openalex
+    service.s2.search = _s2
+    service.arxiv.search = _arxiv
+    service.pubmed.search = _s2
+    service.crossref.search = _s2
+
+    result = await service.search("transformer", source="auto", limit=3)
+
+    assert result["resolved_source"] == "arxiv"
+    assert result["attempted_sources"] == ["openalex", "semantic_scholar", "arxiv"]
+    assert result["partial_errors"] == {"openalex": "rate_limited"}
+    assert calls == ["openalex", "semantic_scholar", "arxiv"]

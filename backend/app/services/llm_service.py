@@ -66,8 +66,53 @@ class LLMService:
         full_messages: List[Dict[str, Any]] = []
         if system_prompt:
             full_messages.append({"role": "system", "content": system_prompt})
-        full_messages.extend(messages)
+        full_messages.extend(self.sanitize_provider_messages(messages))
         return full_messages
+
+    @classmethod
+    def sanitize_provider_messages(
+        cls,
+        messages: List[Dict[str, Any]] | Tuple[Dict[str, Any], ...] | None,
+    ) -> List[Dict[str, Any]]:
+        sanitized: List[Dict[str, Any]] = []
+        for raw in list(messages or []):
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role") or "").strip().lower()
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+
+            content = raw.get("content")
+            if isinstance(content, list):
+                normalized_content: Any = list(content)
+            elif isinstance(content, dict):
+                normalized_content = dict(content)
+            else:
+                normalized_content = str(content or "")
+
+            entry: Dict[str, Any] = {
+                "role": role,
+                "content": normalized_content,
+            }
+
+            if role == "assistant":
+                tool_calls = [dict(item) for item in list(raw.get("tool_calls") or []) if isinstance(item, dict)]
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                elif not str(normalized_content or "").strip():
+                    continue
+            elif role in {"system", "user"} and not str(normalized_content or "").strip():
+                continue
+            elif role == "tool":
+                tool_call_id = str(raw.get("tool_call_id") or "").strip()
+                if tool_call_id:
+                    entry["tool_call_id"] = tool_call_id
+                tool_name = str(raw.get("name") or "").strip()
+                if tool_name:
+                    entry["name"] = tool_name
+
+            sanitized.append(entry)
+        return sanitized
 
     @staticmethod
     def _format_exception(exc: Exception) -> str:

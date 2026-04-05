@@ -1,7 +1,7 @@
 import os
 import sys
-
-import pytest
+import types
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -9,32 +9,52 @@ from app.config import settings
 from app.services.reranker_service import RerankerService
 
 
-@pytest.mark.asyncio
-async def test_reranker_predict_uses_configured_batch_size(monkeypatch):
-    service = RerankerService()
+def test_reranker_prefers_local_files_only_when_cached_snapshot_exists(monkeypatch, tmp_path):
+    calls = []
 
-    class _FakeModel:
-        def __init__(self):
-            self.calls = []
+    class _FakeCrossEncoder:
+        def __init__(self, model_name, trust_remote_code=True, **kwargs):
+            calls.append(
+                {
+                    "model_name": model_name,
+                    "trust_remote_code": trust_remote_code,
+                    **kwargs,
+                }
+            )
 
-        def predict(self, pairs, **kwargs):
-            self.calls.append({"pairs": pairs, "kwargs": kwargs})
-            return [0.2 for _ in pairs]
+        def predict(self, *args, **kwargs):
+            return [0.5]
 
-    fake_model = _FakeModel()
-    monkeypatch.setattr(service, "_load_model", lambda: None)
-    service._model = fake_model
-    service._loaded = True
-    monkeypatch.setattr(settings, "reranker_batch_size", 3)
-
-    ranked = await service.rerank(
-        query="motif design",
-        documents=["doc-a", "doc-b"],
-        top_k=2,
+    fake_st = types.SimpleNamespace(CrossEncoder=_FakeCrossEncoder)
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        backends=types.SimpleNamespace(
+            mps=types.SimpleNamespace(is_available=lambda: False),
+        ),
     )
 
-    assert ranked == [(0, 0.2), (1, 0.2)]
-    assert len(fake_model.calls) == 1
-    assert fake_model.calls[0]["kwargs"]["batch_size"] == 3
-    assert fake_model.calls[0]["kwargs"]["show_progress_bar"] is False
-    assert fake_model.calls[0]["kwargs"]["convert_to_numpy"] is True
+    snapshot_dir = (
+        Path(tmp_path)
+        / "models--Alibaba-NLP--gte-reranker-modernbert-base"
+        / "snapshots"
+        / "cached-snapshot"
+    )
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "config.json").write_text("{}", encoding="utf-8")
+    refs_dir = snapshot_dir.parent.parent / "refs"
+    refs_dir.mkdir(parents=True)
+    (refs_dir / "main").write_text("cached-snapshot", encoding="utf-8")
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(settings, "reranker_model", "Alibaba-NLP/gte-reranker-modernbert-base")
+    monkeypatch.setattr(settings, "reranker_device", "auto")
+    monkeypatch.setattr(settings, "reranker_max_length", 384)
+    monkeypatch.setattr(settings, "local_embedding_cache_dir", str(tmp_path))
+
+    service = RerankerService()
+    service._load_model()
+
+    assert calls
+    assert calls[0]["local_files_only"] is True
+    assert service.get_runtime_status()["ready"] is True

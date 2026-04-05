@@ -7,6 +7,7 @@ interface ThinkingPanelProps {
   isExpanded: boolean
   onToggle: () => void
   embedded?: boolean
+  label?: string
 }
 
 /** 思考过程面板（仅显示最终思考） */
@@ -16,6 +17,7 @@ const ThinkingPanel = ({
   isExpanded,
   onToggle,
   embedded = false,
+  label = '最终思考',
 }: ThinkingPanelProps) => {
   if (!thought && !isThinking) return null
 
@@ -47,7 +49,7 @@ const ThinkingPanel = ({
             <span className={`text-xs font-medium tracking-wide ${
               embedded ? 'text-slate-400' : 'text-amber-100'
             }`}>
-              最终思考
+              {label}
             </span>
             {isThinking && (
               <span className={`flex items-center gap-1 text-[11px] ${

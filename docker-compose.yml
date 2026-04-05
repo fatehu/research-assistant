@@ -13,7 +13,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-research_user} -d ${POSTGRES_DB:-research_assistant}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-research_user} -d ${POSTGRES_DB:-research_assistant}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,7 +29,7 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -214,6 +214,8 @@ services:
       - CODELAB_RUNNER_TOKEN=${CODELAB_RUNNER_TOKEN:?CODELAB_RUNNER_TOKEN is required}
       - CODELAB_RUNNER_TIMEOUT_SECONDS=${CODELAB_RUNNER_TIMEOUT_SECONDS:-25}
       - CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS=${CODELAB_RUNNER_CONNECT_TIMEOUT_SECONDS:-3}
+      # 预热
+      - RETRIEVAL_WARMUP_ON_STARTUP=${RETRIEVAL_WARMUP_ON_STARTUP:-true}
     ports:
       - "8888:8000"
     volumes:
@@ -232,12 +234,9 @@ services:
       codelab-runner:
         condition: service_started
     command: >
-      sh -c 'set -eu;
-      alembic upgrade head;
-      if [ "${BACKEND_UVICORN_RELOAD:-true}" = "true" ]; then
-        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-exclude "model_cache/*" --reload-exclude ".cache/*" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
-      fi;
-      exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
+      sh -c 'set -eu; alembic upgrade head; if [ "${BACKEND_UVICORN_RELOAD:-true}" = "true" ]; then
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-exclude "model_cache/*" --reload-exclude ".cache/*" --reload-exclude "tests/*" --reload-exclude "docs/*" --reload-exclude "e2e/*" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
+      fi; exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
     networks:
       - research_network
 
@@ -273,24 +272,17 @@ services:
       - ./backend:/app
       - model_cache:/app/model_cache
     command: >
-      sh -c 'set -eu;
-      set -- --host 0.0.0.0 --port 5002;
-      if [ "${PDF_HYBRID_BACKEND_FORCE_OCR:-false}" = "true" ]; then
+      sh -c 'set -eu; set -- --host 0.0.0.0 --port 5002; if [ "${PDF_HYBRID_BACKEND_FORCE_OCR:-false}" = "true" ]; then
         set -- "$@" --force-ocr;
-      fi;
-      if [ -n "${PDF_HYBRID_BACKEND_OCR_LANG:-}" ]; then
+      fi; if [ -n "${PDF_HYBRID_BACKEND_OCR_LANG:-}" ]; then
         set -- "$@" --ocr-lang "${PDF_HYBRID_BACKEND_OCR_LANG}";
-      fi;
-      if [ "${PDF_HYBRID_BACKEND_ENRICH_FORMULA:-false}" = "true" ]; then
+      fi; if [ "${PDF_HYBRID_BACKEND_ENRICH_FORMULA:-false}" = "true" ]; then
         set -- "$@" --enrich-formula;
-      fi;
-      if [ "${PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION:-false}" = "true" ]; then
+      fi; if [ "${PDF_HYBRID_BACKEND_ENRICH_PICTURE_DESCRIPTION:-false}" = "true" ]; then
         set -- "$@" --enrich-picture-description;
-      fi;
-      if [ -n "${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT:-}" ]; then
+      fi; if [ -n "${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT:-}" ]; then
         set -- "$@" --picture-description-prompt "${PDF_HYBRID_BACKEND_PICTURE_DESCRIPTION_PROMPT}";
-      fi;
-      exec python -m app.services.local_structured_pdf.opendataloader_upstream_hybrid_server "$@"'
+      fi; exec python -m app.services.local_structured_pdf.opendataloader_upstream_hybrid_server "$@"'
     restart: unless-stopped
     networks:
       - research_network
@@ -384,9 +376,7 @@ services:
     command: >
       sh -c "if [ ! -d node_modules ] || [ -z \"$(ls -A node_modules 2>/dev/null)\" ]; then
         npm install;
-      fi &&
-      rm -rf node_modules/.vite &&
-      npm run dev -- --config vite.docker.config.ts --host 0.0.0.0 --port 3000"
+      fi && rm -rf node_modules/.vite && npm run dev -- --config vite.docker.config.ts --host 0.0.0.0 --port 3000"
     depends_on:
       - backend
     networks:
@@ -400,6 +390,8 @@ volumes:
   postgres_data:
   redis_data:
   backend_uploads:
-  model_cache:       # 嵌入模型缓存 (避免重复下载)
-  # 新增：前端 node_modules 命名卷
+  model_cache:
+    # 嵌入模型缓存 (避免重复下载)
+    # 新增：前端 node_modules 命名卷
+
   frontend_node_modules:

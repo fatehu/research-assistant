@@ -2,15 +2,50 @@
 文献服务 - Semantic Scholar 和 arXiv API 集成
 """
 import asyncio
-import httpx
+from dataclasses import dataclass
+import os
+import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-from loguru import logger
-import re
-import os
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
+
+import httpx
+from loguru import logger
+
+from app.config import settings
+
+
+SUPPORTED_LITERATURE_SOURCES = (
+    "semantic_scholar",
+    "arxiv",
+    "pubmed",
+    "openalex",
+    "crossref",
+)
+
+
+def _parse_source_order(raw: str, default: tuple[str, ...]) -> list[str]:
+    items = [str(part or "").strip().lower() for part in str(raw or "").split(",")]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not item or item not in SUPPORTED_LITERATURE_SOURCES or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized or list(default)
+
+
+def _parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -33,7 +68,97 @@ class PaperResult:
     raw_data: Dict[str, Any]
 
 
-class SemanticScholarService:
+class RateLimitedHttpProvider:
+    RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+    def __init__(
+        self,
+        *,
+        provider_name: str,
+        min_interval_seconds: float,
+    ) -> None:
+        self.provider_name = str(provider_name or "provider").strip() or "provider"
+        self.timeout_seconds = max(
+            5.0,
+            float(getattr(settings, "literature_search_provider_timeout_seconds", 20) or 20),
+        )
+        self.retry_attempts = max(
+            0,
+            int(getattr(settings, "literature_search_provider_retry_attempts", 2) or 2),
+        )
+        self.retry_backoff_seconds = max(
+            0.0,
+            float(getattr(settings, "literature_search_retry_backoff_seconds", 1.0) or 1.0),
+        )
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds or 0.0))
+        self._rate_limit_lock = asyncio.Lock()
+        self._next_request_after = 0.0
+
+    async def _respect_rate_limit(self) -> None:
+        async with self._rate_limit_lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_request_after - now)
+            if wait_seconds > 0:
+                logger.debug(
+                    f"[{self.provider_name}] rate-limit sleep {wait_seconds:.2f}s before next request"
+                )
+                await asyncio.sleep(wait_seconds)
+                now = time.monotonic()
+            self._next_request_after = now + self.min_interval_seconds
+
+    async def _request_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        method: str = "GET",
+        retryable_status_codes: Optional[set[int]] = None,
+        **kwargs,
+    ) -> httpx.Response:
+        retryable_status_codes = retryable_status_codes or self.RETRYABLE_STATUS_CODES
+        last_response: Optional[httpx.Response] = None
+
+        for attempt in range(self.retry_attempts + 1):
+            await self._respect_rate_limit()
+            try:
+                response = await client.request(method, url, **kwargs)
+            except httpx.RequestError as exc:
+                if attempt >= self.retry_attempts:
+                    raise
+                wait_seconds = max(
+                    self.retry_backoff_seconds,
+                    self.retry_backoff_seconds * (2 ** attempt),
+                )
+                logger.warning(
+                    f"[{self.provider_name}] request error: {exc}; retry in {wait_seconds:.2f}s "
+                    f"({attempt + 1}/{self.retry_attempts + 1})"
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            last_response = response
+            if response.status_code not in retryable_status_codes:
+                return response
+            if attempt >= self.retry_attempts:
+                return response
+
+            retry_after = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+            wait_seconds = retry_after if retry_after is not None else max(
+                self.retry_backoff_seconds,
+                self.retry_backoff_seconds * (2 ** attempt),
+            )
+            logger.warning(
+                f"[{self.provider_name}] upstream returned HTTP {response.status_code}; retry in "
+                f"{wait_seconds:.2f}s ({attempt + 1}/{self.retry_attempts + 1})"
+            )
+            await asyncio.sleep(wait_seconds)
+
+        if last_response is None:
+            raise RuntimeError(f"{self.provider_name} request finished without response")
+        return last_response
+
+
+class SemanticScholarService(RateLimitedHttpProvider):
     """Semantic Scholar API 服务"""
     
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
@@ -48,7 +173,26 @@ class SemanticScholarService:
     ]
     
     def __init__(self):
-        self.api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+        self.api_key = (
+            str(getattr(settings, "semantic_scholar_api_key", "") or os.getenv("SEMANTIC_SCHOLAR_API_KEY", ""))
+            .strip()
+        )
+        min_interval_seconds = (
+            float(getattr(settings, "literature_search_semantic_scholar_min_interval_seconds", 1.0) or 1.0)
+            if self.api_key
+            else float(
+                getattr(
+                    settings,
+                    "literature_search_semantic_scholar_public_min_interval_seconds",
+                    3.0,
+                )
+                or 3.0
+            )
+        )
+        super().__init__(
+            provider_name="semantic_scholar",
+            min_interval_seconds=min_interval_seconds,
+        )
         self.headers = {}
         if self.api_key:
             self.headers["x-api-key"] = self.api_key
@@ -86,26 +230,6 @@ class SemanticScholarService:
         if len(self._cache) > 100:
             oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
             del self._cache[oldest_key]
-    
-    async def _request_with_retry(self, client, url: str, params: dict, max_retries: int = 3):
-        """带重试的请求"""
-        for attempt in range(max_retries):
-            response = await client.get(url, params=params, headers=self.headers)
-            
-            if response.status_code == 200:
-                return response
-            
-            if response.status_code == 429:
-                # 速率限制 - 指数退避
-                wait_time = (2 ** attempt) * 2  # 2, 4, 8 秒
-                logger.warning(f"[S2] 速率限制，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})")
-                await asyncio.sleep(wait_time)
-                continue
-            
-            # 其他错误直接返回
-            return response
-        
-        return response  # 返回最后一次响应
     
     async def search(
         self,
@@ -157,8 +281,13 @@ class SemanticScholarService:
             params["openAccessPdf"] = ""
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await self._request_with_retry(client, self.SEARCH_URL, params)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    self.SEARCH_URL,
+                    params=params,
+                    headers=self.headers,
+                )
                 
                 if response.status_code != 200:
                     logger.error(f"[S2] API 错误: {response.status_code} - {response.text[:200]}")
@@ -190,8 +319,13 @@ class SemanticScholarService:
         params = {"fields": ",".join(self.PAPER_FIELDS)}
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(url, params=params, headers=self.headers)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    url,
+                    params=params,
+                    headers=self.headers,
+                )
                 
                 if response.status_code != 200:
                     logger.error(f"[S2] 获取论文失败: {response.status_code}")
@@ -209,8 +343,13 @@ class SemanticScholarService:
         params = {"fields": "authorId,name,affiliations,paperCount,citationCount,hIndex,papers.title,papers.year"}
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(url, params=params, headers=self.headers)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    url,
+                    params=params,
+                    headers=self.headers,
+                )
                 
                 if response.status_code != 200:
                     return None
@@ -259,7 +398,7 @@ class SemanticScholarService:
         )
 
 
-class ArxivService:
+class ArxivService(RateLimitedHttpProvider):
     """arXiv API 服务"""
     
     BASE_URL = "http://export.arxiv.org/api/query"
@@ -278,6 +417,14 @@ class ArxivService:
         "q-bio": "Quantitative Biology",
         "q-fin": "Quantitative Finance",
     }
+
+    def __init__(self):
+        super().__init__(
+            provider_name="arxiv",
+            min_interval_seconds=float(
+                getattr(settings, "literature_search_arxiv_min_interval_seconds", 3.0) or 3.0
+            ),
+        )
     
     async def search(
         self,
@@ -316,8 +463,8 @@ class ArxivService:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(self.BASE_URL, params=params)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(client, self.BASE_URL, params=params)
                 
                 if response.status_code != 200:
                     logger.error(f"[arXiv] API 错误: {response.status_code}")
@@ -350,8 +497,8 @@ class ArxivService:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(self.BASE_URL, params=params)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(client, self.BASE_URL, params=params)
                 
                 if response.status_code != 200:
                     return None
@@ -497,13 +644,25 @@ class ArxivService:
             return None
 
 
-class PubMedService:
+class PubMedService(RateLimitedHttpProvider):
     """PubMed API 服务 - 生物医学文献"""
     
     BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
     
     def __init__(self):
-        self.api_key = os.getenv("PUBMED_API_KEY", "")  # 可选，提高速率限制
+        self.api_key = (
+            str(getattr(settings, "pubmed_api_key", "") or os.getenv("PUBMED_API_KEY", ""))
+            .strip()
+        )
+        min_interval_seconds = (
+            float(getattr(settings, "literature_search_pubmed_api_key_min_interval_seconds", 0.12) or 0.12)
+            if self.api_key
+            else float(getattr(settings, "literature_search_pubmed_min_interval_seconds", 0.34) or 0.34)
+        )
+        super().__init__(
+            provider_name="pubmed",
+            min_interval_seconds=min_interval_seconds,
+        )
     
     async def search(
         self,
@@ -515,7 +674,7 @@ class PubMedService:
         logger.info(f"[PubMed] 搜索: {query}, limit={limit}")
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
                 # 第一步：搜索获取 ID 列表
                 search_params = {
                     "db": "pubmed",
@@ -528,7 +687,11 @@ class PubMedService:
                 if self.api_key:
                     search_params["api_key"] = self.api_key
                 
-                search_resp = await client.get(f"{self.BASE_URL}/esearch.fcgi", params=search_params)
+                search_resp = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/esearch.fcgi",
+                    params=search_params,
+                )
                 if search_resp.status_code != 200:
                     return {"total": 0, "papers": [], "error": f"Search error: {search_resp.status_code}"}
                 
@@ -550,7 +713,11 @@ class PubMedService:
                 if self.api_key:
                     fetch_params["api_key"] = self.api_key
                 
-                fetch_resp = await client.get(f"{self.BASE_URL}/efetch.fcgi", params=fetch_params)
+                fetch_resp = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/efetch.fcgi",
+                    params=fetch_params,
+                )
                 if fetch_resp.status_code != 200:
                     return {"total": total, "papers": [], "error": "Fetch error"}
                 
@@ -583,8 +750,12 @@ class PubMedService:
             params["api_key"] = self.api_key
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(f"{self.BASE_URL}/efetch.fcgi", params=params)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/efetch.fcgi",
+                    params=params,
+                )
                 if response.status_code != 200:
                     logger.error(f"[PubMed] 获取论文失败: {response.status_code}")
                     return None
@@ -673,13 +844,22 @@ class PubMedService:
         return papers
 
 
-class OpenAlexService:
+class OpenAlexService(RateLimitedHttpProvider):
     """OpenAlex API 服务 - 开放学术图谱"""
     
     BASE_URL = "https://api.openalex.org"
     
     def __init__(self):
-        self.email = os.getenv("OPENALEX_EMAIL", "")  # 可选，提高速率限制
+        super().__init__(
+            provider_name="openalex",
+            min_interval_seconds=float(
+                getattr(settings, "literature_search_openalex_min_interval_seconds", 0.12) or 0.12
+            ),
+        )
+        self.email = (
+            str(getattr(settings, "openalex_email", "") or os.getenv("OPENALEX_EMAIL", ""))
+            .strip()
+        )
     
     async def search(
         self,
@@ -692,7 +872,7 @@ class OpenAlexService:
         logger.info(f"[OpenAlex] 搜索: {query}, limit={limit}")
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
                 params = {
                     "search": query,
                     "per_page": limit,
@@ -706,7 +886,7 @@ class OpenAlexService:
                 if year_range:
                     params["filter"] = f"publication_year:{year_range[0]}-{year_range[1]}"
                 
-                response = await client.get(f"{self.BASE_URL}/works", params=params)
+                response = await self._request_with_retry(client, f"{self.BASE_URL}/works", params=params)
                 
                 if response.status_code != 200:
                     return {"total": 0, "papers": [], "error": f"API error: {response.status_code}"}
@@ -739,8 +919,12 @@ class OpenAlexService:
             params["mailto"] = self.email
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(f"{self.BASE_URL}/works/{normalized}", params=params)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/works/{normalized}",
+                    params=params,
+                )
                 if response.status_code != 200:
                     logger.error(f"[OpenAlex] 获取论文失败: {response.status_code}")
                     return None
@@ -762,9 +946,13 @@ class OpenAlexService:
             params["mailto"] = self.email
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
                 encoded = quote(f"https://doi.org/{normalized}", safe="")
-                response = await client.get(f"{self.BASE_URL}/works/{encoded}", params=params)
+                response = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/works/{encoded}",
+                    params=params,
+                )
                 if response.status_code != 200:
                     logger.error(f"[OpenAlex] DOI 获取论文失败: {response.status_code}")
                     return None
@@ -825,13 +1013,22 @@ class OpenAlexService:
         )
 
 
-class CrossRefService:
+class CrossRefService(RateLimitedHttpProvider):
     """CrossRef API 服务 - DOI 元数据"""
     
     BASE_URL = "https://api.crossref.org/works"
     
     def __init__(self):
-        self.email = os.getenv("CROSSREF_EMAIL", "")
+        super().__init__(
+            provider_name="crossref",
+            min_interval_seconds=float(
+                getattr(settings, "literature_search_crossref_min_interval_seconds", 0.25) or 0.25
+            ),
+        )
+        self.email = (
+            str(getattr(settings, "crossref_email", "") or os.getenv("CROSSREF_EMAIL", ""))
+            .strip()
+        )
     
     async def search(
         self,
@@ -843,7 +1040,7 @@ class CrossRefService:
         logger.info(f"[CrossRef] 搜索: {query}, limit={limit}")
         
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
                 params = {
                     "query": query,
                     "rows": limit,
@@ -855,7 +1052,12 @@ class CrossRefService:
                 if self.email:
                     headers["User-Agent"] = f"ResearchAssistant/1.0 (mailto:{self.email})"
                 
-                response = await client.get(self.BASE_URL, params=params, headers=headers)
+                response = await self._request_with_retry(
+                    client,
+                    self.BASE_URL,
+                    params=params,
+                    headers=headers,
+                )
                 
                 if response.status_code != 200:
                     return {"total": 0, "papers": [], "error": f"API error: {response.status_code}"}
@@ -887,8 +1089,12 @@ class CrossRefService:
             headers["User-Agent"] = f"ResearchAssistant/1.0 (mailto:{self.email})"
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(f"{self.BASE_URL}/{quote(normalized, safe='')}", headers=headers)
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = await self._request_with_retry(
+                    client,
+                    f"{self.BASE_URL}/{quote(normalized, safe='')}",
+                    headers=headers,
+                )
                 if response.status_code != 200:
                     logger.error(f"[CrossRef] DOI 获取论文失败: {response.status_code}")
                     return None
@@ -958,10 +1164,14 @@ class LiteratureService:
     """统一文献服务"""
 
     MULTI_SOURCE_PRIORITY = {
+        "openalex": 4,
         "semantic_scholar": 3,
         "pubmed": 2,
         "arxiv": 1,
+        "crossref": 0,
     }
+    AUTO_SOURCE_ORDER = ("openalex", "semantic_scholar", "arxiv", "pubmed", "crossref")
+    MULTI_SOURCE_ORDER = ("openalex", "semantic_scholar", "arxiv", "pubmed")
     
     def __init__(self):
         self.s2 = SemanticScholarService()
@@ -969,6 +1179,20 @@ class LiteratureService:
         self.pubmed = PubMedService()
         self.openalex = OpenAlexService()
         self.crossref = CrossRefService()
+        self.default_source = str(
+            getattr(settings, "literature_search_default_source", "auto") or "auto"
+        ).strip().lower() or "auto"
+        self.auto_source_order = _parse_source_order(
+            getattr(settings, "literature_search_auto_source_order", ""),
+            self.AUTO_SOURCE_ORDER,
+        )
+        self.multi_source_order = _parse_source_order(
+            getattr(settings, "literature_search_multi_source_order", ""),
+            self.MULTI_SOURCE_ORDER,
+        )
+
+    def multi_source_count(self) -> int:
+        return max(1, len(self.multi_source_order))
     
     async def search(
         self,
@@ -979,16 +1203,78 @@ class LiteratureService:
         **kwargs
     ) -> Dict[str, Any]:
         """统一搜索接口"""
-        if source == "arxiv":
+        normalized_source = str(source or "").strip().lower() or self.default_source
+        if normalized_source == "auto":
+            return await self.search_auto(query, limit=limit, offset=offset, **kwargs)
+        if normalized_source == "multi":
+            return await self.search_multi(
+                query=query,
+                limit_per_source=limit,
+                offset=offset,
+                year_range=kwargs.get("year_range"),
+            )
+        if normalized_source == "arxiv":
             return await self.arxiv.search(query, limit, offset, **kwargs)
-        elif source == "pubmed":
+        if normalized_source == "pubmed":
             return await self.pubmed.search(query, limit, offset)
-        elif source == "openalex":
+        if normalized_source == "openalex":
             return await self.openalex.search(query, limit, offset, **kwargs)
-        elif source == "crossref":
+        if normalized_source == "crossref":
             return await self.crossref.search(query, limit, offset)
-        else:
+        if normalized_source == "semantic_scholar":
             return await self.s2.search(query, limit, offset, **kwargs)
+        return {
+            "total": 0,
+            "offset": offset,
+            "papers": [],
+            "error": f"unsupported_source:{normalized_source}",
+        }
+
+    async def search_auto(
+        self,
+        query: str,
+        limit: int = 10,
+        offset: int = 0,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        attempted_sources: List[str] = []
+        errors: Dict[str, str] = {}
+
+        for source_name in self.auto_source_order:
+            attempted_sources.append(source_name)
+            result = await self.search(
+                query=query,
+                source=source_name,
+                limit=limit,
+                offset=offset,
+                **kwargs,
+            )
+            papers = [p for p in result.get("papers", []) if isinstance(p, PaperResult)]
+            if papers:
+                payload = dict(result)
+                payload["papers"] = papers
+                payload["requested_source"] = "auto"
+                payload["resolved_source"] = source_name
+                payload["attempted_sources"] = list(attempted_sources)
+                if errors:
+                    payload["partial_errors"] = dict(errors)
+                return payload
+            if result.get("error"):
+                errors[source_name] = str(result["error"])
+
+        payload: Dict[str, Any] = {
+            "total": 0,
+            "offset": offset,
+            "papers": [],
+            "requested_source": "auto",
+            "resolved_source": None,
+            "attempted_sources": attempted_sources,
+        }
+        if errors:
+            if len(errors) == len(attempted_sources):
+                payload["error"] = "literature_search_all_failed"
+            payload["partial_errors"] = errors
+        return payload
 
     @staticmethod
     def _normalize_title(title: str) -> str:
@@ -1056,20 +1342,20 @@ class LiteratureService:
         offset: int = 0,
         year_range: Optional[tuple] = None,
     ) -> Dict[str, Any]:
-        """三源并行搜索并融合去重（Semantic Scholar + arXiv + PubMed）。"""
+        """多源并行搜索并融合去重。"""
         limit_per_source = max(1, int(limit_per_source))
         offset = max(0, int(offset))
         fetch_limit = min(max(limit_per_source + offset, limit_per_source), 100)
 
         tasks = {
-            "semantic_scholar": self.s2.search(
-                query,
+            source_name: self.search(
+                query=query,
+                source=source_name,
                 limit=fetch_limit,
                 offset=0,
                 year_range=year_range,
-            ),
-            "arxiv": self.arxiv.search(query, limit=fetch_limit, offset=0),
-            "pubmed": self.pubmed.search(query, limit=fetch_limit, offset=0),
+            )
+            for source_name in self.multi_source_order
         }
         settled = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
@@ -1127,6 +1413,9 @@ class LiteratureService:
             "has_more": has_more,
             "papers": page,
             "sources": source_totals,
+            "requested_source": "multi",
+            "resolved_source": "multi",
+            "attempted_sources": list(tasks.keys()),
         }
         if errors:
             payload["partial_errors"] = errors

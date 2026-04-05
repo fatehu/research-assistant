@@ -7,6 +7,7 @@ export const SHOW_RAG_METRICS = VITE_ENV.VITE_SHOW_RAG_METRICS === 'true'
 // Let long-running reader/workbench v2 builds be bounded by backend/runtime policy
 // instead of a browser-side hard timeout that aborts valid cold-start executions.
 const LONG_RUNNING_READER_TIMEOUT_MS = 0
+const CHAT_CONTEXT_PREVIEW_TIMEOUT_MS = 90000
 
 export interface ApiErrorContract {
   code?: string
@@ -173,6 +174,234 @@ export interface Conversation {
   messages?: Message[]
   message_count?: number
   last_message?: string
+  context_state?: ConversationContextState
+  compacted_history?: ConversationCompactedHistory
+  history_log?: ConversationHistoryLog
+  turn_store?: ConversationTurnStore
+  tool_ledger?: ConversationToolLedger
+  item_stream?: ConversationItemStream
+  context_snapshots?: ConversationContextSnapshot[]
+}
+
+export interface ConversationEvidenceLedgerEntry {
+  entry_id: string
+  origin_kind: 'tool_result' | 'assistant_summary' | 'llm_inferred'
+  summary: string
+  status: 'confirmed' | 'provisional'
+  source_labels: string[]
+  tool_names: string[]
+  turn_ids: string[]
+  tool_call_ids: string[]
+}
+
+export interface ConversationContextState {
+  version: string
+  active_topic?: string
+  user_goal?: string
+  constraints: string[]
+  open_questions: string[]
+  resolved_facts: string[]
+  evidence_ledger: ConversationEvidenceLedgerEntry[]
+  last_reasoning_summary?: string
+  last_user_message?: string
+  turn_count: number
+  updated_at?: string
+}
+
+export interface ConversationReplacementHistoryEntry {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface ConversationCompactedHistory {
+  version: string
+  history_anchors?: string
+  history_summary?: string
+  compact_boundary_message_id?: number
+  replacement_history: ConversationReplacementHistoryEntry[]
+  compacted_message_count: number
+  up_to_message_id?: number
+  updated_at?: string
+}
+
+export interface ChatUserPreferences {
+  version: string
+  response_language: 'auto' | 'zh-CN' | 'en-US'
+  response_verbosity: 'concise' | 'balanced' | 'detailed'
+  web_search: 'ask' | 'avoid' | 'allow_when_needed'
+  updated_at?: string
+}
+
+export type ChatPreferenceKey = 'response_language' | 'response_verbosity' | 'web_search'
+
+export type ChatRagScopeMode = 'all' | 'knowledge_base' | 'document'
+
+export interface ChatRagOverrides {
+  version?: string
+  enabled: boolean
+  scope_mode: ChatRagScopeMode
+  knowledge_base_ids?: number[]
+  document_ids?: number[]
+  use_reranker?: boolean
+  use_hybrid?: boolean
+  use_query_rewrite?: boolean
+  use_contextual_compression?: boolean
+}
+
+export interface ChatPreferenceCandidate {
+  candidate_id: string
+  key: ChatPreferenceKey
+  suggested_value: ChatUserPreferences[ChatPreferenceKey]
+  reason: string
+  source_excerpt?: string
+  source_kind?: string
+}
+
+export interface ChatSendPlan {
+  plan_id: string
+  preview_mode: 'agent' | 'direct'
+  reusable: boolean
+  draft_message: string
+  draft_hash?: string
+  conversation_revision?: string | null
+  created_at?: string
+  expires_at?: string
+  message_count_sent: number
+}
+
+export interface ConversationToolLedgerEntry {
+  entry_id: string
+  kind: string
+  tool_name: string
+  turn_id?: string
+  tool_call_id?: string
+  run_id?: string
+  iteration: number
+  status?: string
+  arguments?: Record<string, unknown>
+  summary?: string
+  success?: boolean
+  error?: string
+  permission_required: boolean
+  execution_time_ms?: number
+  output_tokens_estimate?: number
+  truncated?: boolean
+  parallel_group?: string
+  created_at?: string
+}
+
+export interface ConversationToolLedger {
+  version: string
+  updated_at?: string
+  entries: ConversationToolLedgerEntry[]
+}
+
+export interface ConversationTurnEntry {
+  turn_id: string
+  status: string
+  user_message_id?: number
+  assistant_message_id?: number
+  run_id?: string
+  user_content?: string
+  assistant_summary?: string
+  iteration_count: number
+  tool_call_count: number
+  tool_result_count: number
+  error_message?: string
+  started_at?: string
+  completed_at?: string
+}
+
+export interface ConversationTurnStore {
+  version: string
+  updated_at?: string
+  entries: ConversationTurnEntry[]
+}
+
+export interface ConversationItemStreamEntry {
+  item_id: string
+  kind: string
+  turn_id?: string
+  role?: 'user' | 'assistant' | 'system' | 'tool'
+  content?: string
+  message_id?: number
+  run_id?: string
+  iteration: number
+  tool_name?: string
+  tool_call_id?: string
+  status?: string
+  arguments?: Record<string, unknown>
+  thought?: string
+  summary?: string
+  success?: boolean
+  error?: string
+  permission_required: boolean
+  execution_time_ms?: number
+  output_tokens_estimate?: number
+  truncated?: boolean
+  parallel_group?: string
+  metadata?: Record<string, unknown>
+  created_at?: string
+}
+
+export interface ConversationItemStream {
+  version: string
+  updated_at?: string
+  entries: ConversationItemStreamEntry[]
+}
+
+export interface ConversationCompactResponse {
+  conversation_id: number
+  context_state?: ConversationContextState
+  compacted_history?: ConversationCompactedHistory
+  history_log?: ConversationHistoryLog
+  turn_store?: ConversationTurnStore
+  tool_ledger?: ConversationToolLedger
+  item_stream?: ConversationItemStream
+  context_snapshots?: ConversationContextSnapshot[]
+  summary_text?: string
+  compacted_message_count: number
+}
+
+export interface ConversationHistoryEvent {
+  title: string
+  detail: string
+  created_at?: string
+}
+
+export interface ConversationHistoryLog {
+  version: string
+  updated_at?: string
+  events: ConversationHistoryEvent[]
+}
+
+export interface ConversationContextSnapshot {
+  version: string
+  mode?: string
+  created_at?: string
+  summary_text?: string
+  compacted_message_count: number
+  up_to_message_id?: number
+  context_state?: ConversationContextState
+  compacted_history?: ConversationCompactedHistory
+}
+
+export interface ChatContextPreviewResponse {
+  conversation_id?: number
+  preview_mode: 'agent' | 'direct'
+  context_debug: ChatContextDebug
+  context_state?: ConversationContextState
+  compacted_history?: ConversationCompactedHistory
+  history_log?: ConversationHistoryLog
+  turn_store?: ConversationTurnStore
+  tool_ledger?: ConversationToolLedger
+  item_stream?: ConversationItemStream
+  context_snapshots?: ConversationContextSnapshot[]
+  chat_preferences?: ChatUserPreferences
+  effective_chat_preferences?: ChatUserPreferences
+  effective_rag_overrides?: ChatRagOverrides
+  chat_preference_candidates?: ChatPreferenceCandidate[]
+  send_plan?: ChatSendPlan
 }
 
 export interface ReactStep {
@@ -199,8 +428,72 @@ export interface RagMetrics {
   compression_fallback_chunks: number
 }
 
+export interface ChatContextDebugMessage {
+  role: string
+  content: string
+}
+
+export interface ChatModelRequestMessageRaw extends Record<string, unknown> {
+  role?: string
+  content?: unknown
+  thought?: string
+  tool_calls?: Record<string, unknown>[]
+  metadata?: Record<string, unknown>
+}
+
+export interface ChatContextDebug {
+  version: string
+  iteration: number
+  context_truncated: boolean
+  estimated_tokens: number
+  budget: number
+  window_turns: number
+  message_count_before_trim: number
+  message_count_sent: number
+  older_messages_count: number
+  recently_slid_messages_count?: number
+  recent_messages_count: number
+  intent: string
+  intent_user_text?: string
+  routing_source?: string
+  routing_reason?: string
+  routing_confidence?: number
+  carry_over_previous_goal?: boolean
+  selected_tools: string[]
+  tool_choice: string
+  conversation_state?: ConversationContextState
+  conversation_state_summary?: string
+  anchor_summary?: string
+  persisted_anchor_summary?: string
+  persisted_summary?: string
+  older_history_summary?: string
+  memory_enabled: boolean
+  memory_count: number
+  memory_lines: string[]
+  recently_slid_messages?: ChatContextDebugMessage[]
+  recent_messages: ChatContextDebugMessage[]
+  successful_knowledge_queries: string[]
+  source_labels: string[]
+  reasoning_summary?: string
+  reasoning_summary_model?: string
+  reasoning_summary_provider?: string
+  compact_boundary_message_id?: number
+  replacement_history_count?: number
+  user_chat_preferences?: ChatUserPreferences
+  model_request_mode?: 'direct' | 'function_calling' | 'xml' | string
+  model_system_prompt?: string
+  model_messages_raw?: ChatModelRequestMessageRaw[]
+  model_messages_assembled_raw?: ChatModelRequestMessageRaw[]
+  model_tool_schemas_raw?: Record<string, unknown>[]
+}
+
+export interface ReasoningSummary {
+  summary: string
+}
+
 export interface MessageMetadata extends Record<string, unknown> {
   rag_metrics?: RagMetrics
+  reasoning_summary?: ReasoningSummary
 }
 
 export interface Message {
@@ -210,10 +503,6 @@ export interface Message {
   content: string
   message_type: string
   thought?: string
-  react_steps?: ReactStep[]
-  action?: string
-  action_input?: Record<string, unknown>
-  observation?: string
   metadata?: MessageMetadata
   prompt_tokens?: number
   completion_tokens?: number
@@ -244,6 +533,25 @@ export interface KnowledgeBase {
   is_public: boolean
   created_at: string
   updated_at: string
+}
+
+export interface AvailableKnowledgeBaseSummary {
+  id: number
+  name: string
+  description?: string
+  document_count: number
+  total_chunks: number
+}
+
+export interface SharedKnowledgeBaseSummary extends AvailableKnowledgeBaseSummary {
+  owner_id: number
+  owner_name: string
+}
+
+export interface AvailableKnowledgeBasesResponse {
+  own: AvailableKnowledgeBaseSummary[]
+  shared: SharedKnowledgeBaseSummary[]
+  sharing_enabled: boolean
 }
 
 export interface KnowledgeBaseCreate {
@@ -590,6 +898,34 @@ export const chatApi = {
     return response.data
   },
 
+  previewContext: async (
+    message: string,
+    conversationId?: number,
+    useTools?: boolean,
+    chatPreferenceOverrides?: Partial<ChatUserPreferences>,
+    ragOverrides?: ChatRagOverrides | null,
+  ): Promise<ChatContextPreviewResponse> => {
+    const response = await api.post(
+      '/api/v1/chat/context-preview',
+      {
+        message,
+        conversation_id: conversationId,
+        ...(typeof useTools === 'boolean' ? { use_tools: useTools } : {}),
+        ...(chatPreferenceOverrides && Object.keys(chatPreferenceOverrides).length
+          ? { chat_preference_overrides: chatPreferenceOverrides }
+          : {}),
+        ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+      },
+      { timeout: CHAT_CONTEXT_PREVIEW_TIMEOUT_MS },
+    )
+    return response.data
+  },
+
+  compactConversation: async (conversationId: number): Promise<ConversationCompactResponse> => {
+    const response = await api.post(`/api/v1/chat/conversations/${conversationId}/compact`)
+    return response.data
+  },
+
   deleteConversation: async (conversationId: number): Promise<void> => {
     await api.delete(`/api/v1/chat/conversations/${conversationId}`)
   },
@@ -610,7 +946,10 @@ export const chatApi = {
     message: string,
     conversationId?: number,
     onEvent?: (event: string, data: any) => void,
-    abortController?: AbortController
+    abortController?: AbortController,
+    sendPlanId?: string,
+    chatPreferenceOverrides?: Partial<ChatUserPreferences>,
+    ragOverrides?: ChatRagOverrides | null,
   ): Promise<void> => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
@@ -623,6 +962,11 @@ export const chatApi = {
           message,
           conversation_id: conversationId,
           stream: true,
+          send_plan_id: sendPlanId,
+          ...(chatPreferenceOverrides && Object.keys(chatPreferenceOverrides).length
+            ? { chat_preference_overrides: chatPreferenceOverrides }
+            : {}),
+          ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
         }),
         signal: abortController?.signal,
       })
@@ -688,15 +1032,7 @@ export const chatApi = {
     conversation_id: number
     content: string
     thought?: string
-    react_steps?: Array<{
-      type: string
-      iteration: number
-      content?: string
-      tool?: string
-      input?: Record<string, unknown>
-      output?: string
-      success?: boolean
-    }>
+    metadata?: MessageMetadata
   }): Promise<Message> => {
     const response = await api.post('/api/v1/chat/messages/stopped', data)
     return response.data
@@ -712,11 +1048,7 @@ export const knowledgeApi = {
     return response.data
   },
 
-  getAvailableKnowledgeBases: async (): Promise<{
-    own: { id: number; name: string; description?: string; document_count: number; total_chunks: number }[];
-    shared: { id: number; name: string; description?: string; document_count: number; total_chunks: number; owner_id: number; owner_name: string }[];
-    sharing_enabled: boolean;
-  }> => {
+  getAvailableKnowledgeBases: async (): Promise<AvailableKnowledgeBasesResponse> => {
     const response = await api.get('/api/v1/knowledge/available')
     return response.data
   },
@@ -745,9 +1077,14 @@ export const knowledgeApi = {
     await api.delete(`/api/v1/knowledge/knowledge-bases/${kbId}`)
   },
 
-  getDocuments: async (kbId: number, skip = 0, limit = 20): Promise<{ items: Document[]; total: number }> => {
+  getDocuments: async (
+    kbId: number,
+    skip = 0,
+    limit = 20,
+    search = '',
+  ): Promise<{ items: Document[]; total: number }> => {
     const response = await api.get(`/api/v1/knowledge/knowledge-bases/${kbId}/documents`, {
-      params: { skip, limit },
+      params: { skip, limit, ...(search.trim() ? { search: search.trim() } : {}) },
     })
     return response.data
   },

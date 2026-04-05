@@ -72,25 +72,6 @@ class AgentStepRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class ConversationSummary(Base):
-    """Conversation summary for context window compaction."""
-
-    __tablename__ = "conversation_summaries"
-
-    id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(
-        Integer,
-        ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    up_to_message_id = Column(Integer, nullable=True, index=True)
-    summary_text = Column(Text, nullable=False)
-    token_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
 class AgentMemoryItem(Base):
     """Long-term memory item."""
 

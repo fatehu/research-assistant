@@ -206,6 +206,7 @@ def test_local_embedding_skips_safetensors_when_cached_main_snapshot_is_legacy(m
 
     assert len(calls) == 1
     assert "model_kwargs" not in calls[0]
+    assert calls[0]["local_files_only"] is True
     assert model._loaded is True
 
 

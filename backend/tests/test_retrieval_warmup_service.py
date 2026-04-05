@@ -159,3 +159,24 @@ async def test_retrieval_warmup_service_can_run_in_background(monkeypatch):
     assert [item["status"] for item in final_report["components"]] == ["warmed", "warmed"]
     assert embedding.calls == 1
     assert reranker.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_warmup_service_runs_components_concurrently(monkeypatch):
+    monkeypatch.setattr(settings, "retrieval_warmup_on_startup", True)
+    monkeypatch.setattr(settings, "retrieval_warmup_timeout_seconds", 5)
+    embedding = _WarmStub(delay_seconds=0.1)
+    reranker = _WarmStub(delay_seconds=0.1)
+    service = RetrievalWarmupService(
+        embedding_factory=lambda: embedding,
+        reranker_factory=lambda: reranker,
+    )
+
+    started_at = time.perf_counter()
+    report = await service.warmup_on_startup()
+    elapsed = time.perf_counter() - started_at
+
+    assert report["status"] == "ready"
+    assert embedding.calls == 1
+    assert reranker.calls == 1
+    assert elapsed < 0.18

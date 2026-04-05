@@ -136,7 +136,7 @@ const ReActPanel = ({
                               <div className="rounded-lg border border-white/[0.04] bg-slate-950/40 p-3">
                                 <div className="flex items-center gap-2 mb-2">
                                   <BulbOutlined className="text-amber-400" />
-                                  <span className="text-xs font-medium text-amber-400">思考</span>
+                                  <span className="text-xs font-medium text-amber-400">过程摘要</span>
                                 </div>
                                 <p className="text-sm leading-relaxed text-slate-400">{step.content}</p>
                               </div>
@@ -214,7 +214,7 @@ const ReActPanel = ({
                     <div className="rounded-lg border border-white/[0.04] bg-slate-950/40 p-3">
                       <div className="flex items-center gap-2 mb-2">
                         <BulbOutlined className="text-amber-400 animate-pulse" />
-                        <span className="text-xs font-medium text-amber-400">思考中...</span>
+                        <span className="text-xs font-medium text-amber-400">处理中...</span>
                       </div>
                       <p className="text-sm leading-relaxed text-slate-400">
                         {currentThought || '正在分析问题并规划步骤...'}

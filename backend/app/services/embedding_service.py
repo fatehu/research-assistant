@@ -131,6 +131,7 @@ class LocalEmbeddingModel:
         local_files_only = bool(getattr(settings, "local_embedding_local_files_only", False))
         allow_legacy_fallback = bool(getattr(settings, "local_embedding_allow_legacy_pickle_fallback", True))
         safetensors_viable = self._cached_main_snapshot_supports_safetensors(cache_dir)
+        cached_snapshot_available = self._resolve_cached_main_snapshot_dir(cache_dir) is not None
 
         if prefer_safetensors and safetensors_viable is False:
             logger.info(
@@ -163,7 +164,7 @@ class LocalEmbeddingModel:
 
         if allow_legacy_fallback:
             legacy_kwargs = dict(base_kwargs)
-            if local_files_only:
+            if local_files_only or cached_snapshot_available:
                 legacy_kwargs["local_files_only"] = True
             profiles.append(("legacy_default", legacy_kwargs))
 

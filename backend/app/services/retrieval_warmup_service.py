@@ -296,7 +296,7 @@ class RetrievalWarmupService:
         ]
         reports: list[RetrievalWarmupComponentReport] = []
 
-        for component, component_runtime in component_runtimes:
+        for component, _component_runtime in component_runtimes:
             self._update_snapshot(
                 lambda snapshot, component=component: self._find_component(snapshot, component).update(
                     {
@@ -306,8 +306,16 @@ class RetrievalWarmupService:
                     }
                 )
             )
-            report = await self._run_component(component, component_runtime.warmup)
-            reports.append(report)
+
+        warmup_tasks = [
+            asyncio.create_task(
+                self._run_component(component, component_runtime.warmup),
+                name=f"retrieval-warmup-{component}",
+            )
+            for component, component_runtime in component_runtimes
+        ]
+        reports = list(await asyncio.gather(*warmup_tasks))
+        for report in reports:
             self._update_snapshot(
                 lambda snapshot, report=report: self._find_component(snapshot, report.component).update(report.as_dict())
             )

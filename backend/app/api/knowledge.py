@@ -1350,9 +1350,9 @@ async def get_shared_kb_ids(current_user: User, db: AsyncSession) -> Set[int]:
     if not SHARING_ENABLED:
         logger.debug("共享功能未启用")
         return set()
-    
+
     logger.debug(f"获取用户 {current_user.id} 的共享知识库")
-    
+
     # 获取用户加入的研究组
     group_ids_result = await db.execute(
         select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
@@ -1490,7 +1490,7 @@ async def list_knowledge_bases(
         KnowledgeBase.user_id == current_user.id
     )
     total = (await db.execute(count_query)).scalar() or 0
-    
+
     # 查询列表
     query = (
         select(KnowledgeBase)
@@ -1696,23 +1696,41 @@ async def list_documents(
     kb_id: int,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
+    search: str = Query("", max_length=200),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """获取文档列表"""
     # 验证知识库权限
     kb = await db.get(KnowledgeBase, kb_id)
-    if not kb or kb.user_id != current_user.id:
+    if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    
+    if kb.user_id != current_user.id:
+        shared_kb_ids: set[int] = set()
+        if SHARING_ENABLED:
+            shared_kb_ids = await get_shared_kb_ids(current_user, db)
+        if int(kb_id) not in shared_kb_ids:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+
+    search_token = str(search or "").strip()
+    filters = [Document.knowledge_base_id == kb_id]
+    if search_token:
+        like_pattern = f"%{search_token}%"
+        filters.append(
+            or_(
+                Document.original_filename.ilike(like_pattern),
+                Document.filename.ilike(like_pattern),
+            )
+        )
+
     # 查询总数
-    count_query = select(func.count(Document.id)).where(Document.knowledge_base_id == kb_id)
+    count_query = select(func.count(Document.id)).where(*filters)
     total = (await db.execute(count_query)).scalar() or 0
     
     # 查询列表
     query = (
         select(Document)
-        .where(Document.knowledge_base_id == kb_id)
+        .where(*filters)
         .order_by(Document.created_at.desc())
         .offset(skip)
         .limit(limit)

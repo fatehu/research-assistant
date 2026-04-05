@@ -388,6 +388,33 @@ def _build_routed_scrape_prompt(*, formats: Sequence[str], only_main_content: bo
     )
 
 
+def _looks_like_research_web_query(query: str) -> bool:
+    text = str(query or "").strip().lower()
+    if not text:
+        return False
+    patterns = (
+        r"\barxiv\b",
+        r"\bpaper\b",
+        r"\bresearch\b",
+        r"\bdoi\b",
+        r"\bpdf\b",
+        r"\bpreprint\b",
+        r"论文",
+        r"研究",
+        r"学术",
+        r"文献",
+        r"期刊",
+        r"arxiv",
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def _default_routed_search_categories(query: str) -> List[str]:
+    if _looks_like_research_web_query(query):
+        return ["research", "pdf"]
+    return []
+
+
 _AUTHORITATIVE_PUBLIC_DOMAIN_SUFFIXES = (
     ".gov",
     ".edu",
@@ -778,60 +805,6 @@ class WebSearchTool(ToolBase):
             error="web_search_all_failed",
         )
 
-
-class WebScrapeInput(BaseModel):
-    url: str = Field(min_length=1, max_length=2000)
-    formats: Optional[List[str]] = None
-    only_main_content: bool = True
-
-
-class WebScrapeTool(ToolBase):
-    """网页抓取工具壳：优先交给 MCP 路由（例如 Firecrawl）。"""
-
-    name = "web_scrape"
-    parallel_safe = True
-    description = "抓取网页正文、结构化内容或提取页面关键信息。优先由 MCP 抓取工具处理。"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "要抓取的网页 URL",
-            },
-            "formats": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "期望的输出格式，例如 markdown、html、text",
-            },
-            "only_main_content": {
-                "type": "boolean",
-                "description": "是否尽量仅抓取正文区域",
-                "default": True,
-            },
-        },
-        "required": ["url"],
-    }
-    input_model = WebScrapeInput
-    timeout_seconds = 45
-    retry_count = 0
-
-    async def _execute(
-        self,
-        url: str,
-        formats: Optional[List[str]] = None,
-        only_main_content: bool = True,
-    ) -> ToolResult:
-        return ToolResult(
-            success=False,
-            output="web_scrape 当前依赖外部 MCP 抓取服务；请检查 Firecrawl MCP 路由是否已启用。",
-            error="web_scrape_mcp_required",
-            data={
-                "url": url,
-                "formats": formats or [],
-                "only_main_content": bool(only_main_content),
-            },
-        )
-
     async def _safe_provider_call(
         self,
         provider_name: str,
@@ -1047,11 +1020,70 @@ class WebScrapeTool(ToolBase):
         return "".join(parts)
 
 
+class WebScrapeInput(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    formats: Optional[List[str]] = None
+    only_main_content: bool = True
+
+
+class WebScrapeTool(ToolBase):
+    """网页抓取工具壳：优先交给 MCP 路由（例如 Firecrawl）。"""
+
+    name = "web_scrape"
+    parallel_safe = True
+    description = "抓取网页正文、结构化内容或提取页面关键信息。优先由 MCP 抓取工具处理。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "要抓取的网页 URL",
+            },
+            "formats": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "期望的输出格式，例如 markdown、html、text",
+            },
+            "only_main_content": {
+                "type": "boolean",
+                "description": "是否尽量仅抓取正文区域",
+                "default": True,
+            },
+        },
+        "required": ["url"],
+    }
+    input_model = WebScrapeInput
+    timeout_seconds = 45
+    retry_count = 0
+
+    async def _execute(
+        self,
+        url: str,
+        formats: Optional[List[str]] = None,
+        only_main_content: bool = True,
+    ) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="web_scrape 当前依赖外部 MCP 抓取服务；请检查 Firecrawl MCP 路由是否已启用。",
+            error="web_scrape_mcp_required",
+            data={
+                "url": url,
+                "formats": formats or [],
+                "only_main_content": bool(only_main_content),
+            },
+        )
+
+
 class KnowledgeSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=20)
     include_adjacent_chunks: bool = False
     adjacent_window: int = Field(default=1, ge=1, le=3)
+    knowledge_base_ids: Optional[List[int]] = None
+    document_ids: Optional[List[int]] = None
+    use_reranker: Optional[bool] = None
+    use_hybrid: Optional[bool] = None
+    use_query_rewrite: Optional[bool] = None
 
 
 @dataclass
@@ -1070,6 +1102,8 @@ class KnowledgeRetrieveRuntime:
 class KnowledgeRetrieveState:
     rewrite_result: QueryRewriteResult
     runtime: KnowledgeRetrieveRuntime
+    resolved_kb_ids: Set[int]
+    resolved_document_ids: Set[int]
     fused_candidates: List[Any]
     vector_rows: List[Any]
     text_rows: List[Any]
@@ -1105,6 +1139,28 @@ class KnowledgeSearchTool(ToolBase):
                 "type": "integer",
                 "description": "相邻窗口大小（1-3）",
                 "default": 1
+            },
+            "knowledge_base_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "可选：仅在指定知识库内检索"
+            },
+            "document_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "可选：仅在指定文档内检索"
+            },
+            "use_reranker": {
+                "type": "boolean",
+                "description": "可选：覆盖默认 reranker 开关"
+            },
+            "use_hybrid": {
+                "type": "boolean",
+                "description": "可选：覆盖默认 hybrid retrieval 开关"
+            },
+            "use_query_rewrite": {
+                "type": "boolean",
+                "description": "可选：覆盖默认 query rewrite 开关"
             }
         },
         "required": ["query"]
@@ -1133,6 +1189,11 @@ class KnowledgeSearchTool(ToolBase):
         top_k: int = 5,
         include_adjacent_chunks: bool = False,
         adjacent_window: int = 1,
+        knowledge_base_ids: Optional[List[int]] = None,
+        document_ids: Optional[List[int]] = None,
+        use_reranker: Optional[bool] = None,
+        use_hybrid: Optional[bool] = None,
+        use_query_rewrite: Optional[bool] = None,
     ) -> ToolResult:
         """执行知识库搜索（自动选择会话策略）"""
         if self.db is not None:
@@ -1142,6 +1203,11 @@ class KnowledgeSearchTool(ToolBase):
                 top_k,
                 include_adjacent_chunks=include_adjacent_chunks,
                 adjacent_window=adjacent_window,
+                knowledge_base_ids=knowledge_base_ids,
+                document_ids=document_ids,
+                use_reranker=use_reranker,
+                use_hybrid=use_hybrid,
+                use_query_rewrite=use_query_rewrite,
             )
 
         if self.db_session_factory is None:
@@ -1159,6 +1225,11 @@ class KnowledgeSearchTool(ToolBase):
                     top_k,
                     include_adjacent_chunks=include_adjacent_chunks,
                     adjacent_window=adjacent_window,
+                    knowledge_base_ids=knowledge_base_ids,
+                    document_ids=document_ids,
+                    use_reranker=use_reranker,
+                    use_hybrid=use_hybrid,
+                    use_query_rewrite=use_query_rewrite,
                 )
         except Exception as e:
             logger.error(f"知识库搜索失败（短会话模式）: {e}")
@@ -1175,17 +1246,36 @@ class KnowledgeSearchTool(ToolBase):
         top_k: int = 5,
         include_adjacent_chunks: bool = False,
         adjacent_window: int = 1,
+        knowledge_base_ids: Optional[List[int]] = None,
+        document_ids: Optional[List[int]] = None,
+        use_reranker: Optional[bool] = None,
+        use_hybrid: Optional[bool] = None,
+        use_query_rewrite: Optional[bool] = None,
     ) -> ToolResult:
         """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
             start_time = time.time()
-            runtime = self._resolve_retrieve_runtime(top_k)
+            runtime = self._resolve_retrieve_runtime(
+                top_k,
+                use_reranker=use_reranker,
+                use_hybrid=use_hybrid,
+            )
 
             # 1) Rewrite
-            rewrite_result = await self._rewrite(query)
+            rewrite_result = await self._rewrite(
+                query,
+                use_query_rewrite=use_query_rewrite,
+            )
 
             # 2) Retrieve
-            retrieve_payload = await self._retrieve(db, query, rewrite_result, runtime)
+            retrieve_payload = await self._retrieve(
+                db,
+                query,
+                rewrite_result,
+                runtime,
+                requested_kb_ids=knowledge_base_ids,
+                requested_document_ids=document_ids,
+            )
             if isinstance(retrieve_payload, ToolResult):
                 return retrieve_payload
 
@@ -1210,14 +1300,25 @@ class KnowledgeSearchTool(ToolBase):
                 result_count=len(results),
             )
 
+            payload = _build_knowledge_search_payload(
+                query=query,
+                results=results,
+                search_time_ms=search_time,
+            )
+            payload["retrieval_runtime"] = {
+                "use_reranker": runtime.use_reranker,
+                "use_hybrid": runtime.use_hybrid,
+                "final_top_k": runtime.final_top_k,
+            }
+            payload["retrieval_scope"] = {
+                "knowledge_base_ids": sorted(int(item) for item in retrieve_payload.resolved_kb_ids),
+                "document_ids": sorted(int(item) for item in retrieve_payload.resolved_document_ids),
+            }
+
             return ToolResult(
                 success=True,
                 output=output,
-                data=_build_knowledge_search_payload(
-                    query=query,
-                    results=results,
-                    search_time_ms=search_time,
-                ),
+                data=payload,
             )
 
         except Exception as e:
@@ -1228,9 +1329,15 @@ class KnowledgeSearchTool(ToolBase):
                 error=str(e),
             )
 
-    def _resolve_retrieve_runtime(self, top_k: int) -> KnowledgeRetrieveRuntime:
-        use_reranker = bool(settings.enable_reranker)
-        use_hybrid = bool(settings.enable_hybrid_retrieval)
+    def _resolve_retrieve_runtime(
+        self,
+        top_k: int,
+        *,
+        use_reranker: Optional[bool] = None,
+        use_hybrid: Optional[bool] = None,
+    ) -> KnowledgeRetrieveRuntime:
+        use_reranker = bool(settings.enable_reranker) if use_reranker is None else bool(use_reranker)
+        use_hybrid = bool(settings.enable_hybrid_retrieval) if use_hybrid is None else bool(use_hybrid)
         final_top_k = max(int(top_k), 1)
         score_threshold = max(
             0.0,
@@ -1262,19 +1369,65 @@ class KnowledgeSearchTool(ToolBase):
             fusion_limit=reranker_candidate_k,
         )
 
-    async def _rewrite(self, query: str) -> QueryRewriteResult:
+    async def _rewrite(self, query: str, *, use_query_rewrite: Optional[bool] = None) -> QueryRewriteResult:
         return await self.query_rewrite_service.rewrite_query(
             query,
             rewrite_mode="auto",
-            use_query_rewrite=True,
+            use_query_rewrite=True if use_query_rewrite is None else bool(use_query_rewrite),
         )
 
-    async def _resolve_kb_ids(self, db: AsyncSession) -> Set[int]:
+    async def _resolve_scope(
+        self,
+        db: AsyncSession,
+        *,
+        requested_kb_ids: Optional[Sequence[int]] = None,
+        requested_document_ids: Optional[Sequence[int]] = None,
+    ) -> tuple[Set[int], Set[int]]:
         kb_query = select(KnowledgeBase.id).where(KnowledgeBase.user_id == self.user_id)
         kb_result = await db.execute(kb_query)
-        kb_ids = set(row[0] for row in kb_result.fetchall())
+        accessible_kb_ids = set(row[0] for row in kb_result.fetchall())
         shared_kb_ids = await self._get_shared_kb_ids(db)
-        return kb_ids | shared_kb_ids
+        accessible_kb_ids |= shared_kb_ids
+
+        normalized_requested_kb_ids = {
+            int(item)
+            for item in list(requested_kb_ids or [])
+            if isinstance(item, int) and int(item) > 0
+        }
+        resolved_kb_ids = (
+            accessible_kb_ids & normalized_requested_kb_ids
+            if normalized_requested_kb_ids
+            else set(accessible_kb_ids)
+        )
+
+        normalized_requested_document_ids = {
+            int(item)
+            for item in list(requested_document_ids or [])
+            if isinstance(item, int) and int(item) > 0
+        }
+        if not normalized_requested_document_ids:
+            return resolved_kb_ids, set()
+
+        docs_query = select(Document.id, Document.knowledge_base_id).where(
+            Document.id.in_(normalized_requested_document_ids)
+        )
+        docs_result = await db.execute(docs_query)
+        resolved_document_ids: Set[int] = set()
+        document_kb_ids: Set[int] = set()
+        for doc_id, kb_id in docs_result.fetchall():
+            if int(kb_id) not in accessible_kb_ids:
+                continue
+            if normalized_requested_kb_ids and int(kb_id) not in resolved_kb_ids:
+                continue
+            resolved_document_ids.add(int(doc_id))
+            document_kb_ids.add(int(kb_id))
+
+        if not resolved_document_ids:
+            return set(), set()
+
+        resolved_kb_ids = document_kb_ids
+
+        return resolved_kb_ids, resolved_document_ids
 
     async def _retrieve(
         self,
@@ -1282,13 +1435,31 @@ class KnowledgeSearchTool(ToolBase):
         query: str,
         rewrite_result: QueryRewriteResult,
         runtime: KnowledgeRetrieveRuntime,
+        *,
+        requested_kb_ids: Optional[Sequence[int]] = None,
+        requested_document_ids: Optional[Sequence[int]] = None,
     ) -> ToolResult | KnowledgeRetrieveState:
-        kb_ids = await self._resolve_kb_ids(db)
+        kb_ids, document_ids = await self._resolve_scope(
+            db,
+            requested_kb_ids=requested_kb_ids,
+            requested_document_ids=requested_document_ids,
+        )
         if not kb_ids:
             return ToolResult(
                 success=True,
-                output="用户没有创建任何知识库，也没有收到共享的知识库，无法搜索相关内容。建议用户先上传文档到知识库，或请导师共享知识库。",
-                data={"results": [], "total": 0},
+                output=(
+                    "当前临时 RAG 作用域下没有可检索的知识库或文档。"
+                    if requested_kb_ids or requested_document_ids
+                    else "用户没有创建任何知识库，也没有收到共享的知识库，无法搜索相关内容。建议用户先上传文档到知识库，或请导师共享知识库。"
+                ),
+                data={
+                    "results": [],
+                    "total": 0,
+                    "retrieval_scope": {
+                        "knowledge_base_ids": sorted(int(item) for item in kb_ids),
+                        "document_ids": sorted(int(item) for item in document_ids),
+                    },
+                },
             )
 
         kb_id_list = list(kb_ids)
@@ -1297,6 +1468,7 @@ class KnowledgeSearchTool(ToolBase):
             query=query,
             rewrite_result=rewrite_result,
             kb_ids=kb_id_list,
+            document_ids=list(document_ids),
             runtime=runtime,
         )
         text_rows = await self._retrieve_text_rows(
@@ -1304,6 +1476,7 @@ class KnowledgeSearchTool(ToolBase):
             query=query,
             rewrite_result=rewrite_result,
             kb_ids=kb_id_list,
+            document_ids=list(document_ids),
             runtime=runtime,
         )
 
@@ -1323,6 +1496,8 @@ class KnowledgeSearchTool(ToolBase):
         return KnowledgeRetrieveState(
             rewrite_result=rewrite_result,
             runtime=runtime,
+            resolved_kb_ids=kb_ids,
+            resolved_document_ids=document_ids,
             fused_candidates=fused_candidates,
             vector_rows=vector_rows,
             text_rows=text_rows,
@@ -1339,6 +1514,7 @@ class KnowledgeSearchTool(ToolBase):
         query: str,
         rewrite_result: QueryRewriteResult,
         kb_ids: List[int],
+        document_ids: List[int],
         runtime: KnowledgeRetrieveRuntime,
     ) -> tuple[list[Any], set[int], int, int, list[dict[str, int]]]:
         vector_groups_sql = text(
@@ -1349,6 +1525,7 @@ class KnowledgeSearchTool(ToolBase):
                 COUNT(*) AS chunk_count
             FROM document_chunks
             WHERE knowledge_base_id = ANY(:kb_ids)
+                AND (:filter_by_document_ids = FALSE OR document_id = ANY(:document_ids))
                 AND embedding IS NOT NULL
                 AND embedding_dimension IS NOT NULL
             GROUP BY COALESCE(NULLIF(embedding_model, ''), :default_embedding_model), embedding_dimension
@@ -1360,6 +1537,8 @@ class KnowledgeSearchTool(ToolBase):
                 vector_groups_sql,
                 {
                     "kb_ids": kb_ids,
+                    "document_ids": document_ids,
+                    "filter_by_document_ids": bool(document_ids),
                     "default_embedding_model": settings.local_embedding_model,
                 },
             )
@@ -1444,6 +1623,7 @@ class KnowledgeSearchTool(ToolBase):
                 JOIN documents d ON dc.document_id = d.id
                 JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
                 WHERE dc.knowledge_base_id = ANY(:kb_ids)
+                    AND (:filter_by_document_ids = FALSE OR dc.document_id = ANY(:document_ids))
                     AND dc.embedding IS NOT NULL
                     AND dc.embedding_dimension = :vector_dimension
                     AND {distance_expr} <= :distance_threshold
@@ -1482,6 +1662,8 @@ class KnowledgeSearchTool(ToolBase):
                         "query_vector": vector_str,
                         "distance_threshold": runtime.distance_threshold,
                         "kb_ids": kb_ids,
+                        "document_ids": document_ids,
+                        "filter_by_document_ids": bool(document_ids),
                         "vector_dimension": group_dimension,
                         "vector_top_k": runtime.vector_top_k,
                     },
@@ -1506,6 +1688,7 @@ class KnowledgeSearchTool(ToolBase):
         query: str,
         rewrite_result: QueryRewriteResult,
         kb_ids: List[int],
+        document_ids: List[int],
         runtime: KnowledgeRetrieveRuntime,
     ) -> list[Any]:
         if not runtime.use_hybrid:
@@ -1534,6 +1717,7 @@ class KnowledgeSearchTool(ToolBase):
             JOIN documents d ON dc.document_id = d.id
             JOIN knowledge_bases kb ON dc.knowledge_base_id = kb.id
             WHERE dc.knowledge_base_id = ANY(:kb_ids)
+                AND (:filter_by_document_ids = FALSE OR dc.document_id = ANY(:document_ids))
                 AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) IS NOT NULL
                 AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) <> ''
                 AND to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content)) @@ websearch_to_tsquery('simple', :fts_query)
@@ -1554,6 +1738,8 @@ class KnowledgeSearchTool(ToolBase):
                     {
                         "fts_query": fts_query,
                         "kb_ids": kb_ids,
+                        "document_ids": document_ids,
+                        "filter_by_document_ids": bool(document_ids),
                         "text_top_k": runtime.text_top_k,
                     },
                 )
@@ -2263,17 +2449,17 @@ class UnitConverterTool(Tool):
 
 class LiteratureSearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=500)
-    source: str = Field(default="semantic_scholar")
+    source: str = Field(default="auto")
     max_results: int = Field(default=5, ge=1, le=20)
     year_start: Optional[int] = None
     year_end: Optional[int] = None
 
 
 class LiteratureSearchTool(ToolBase):
-    """学术文献搜索工具 - 使用 Semantic Scholar 和 arXiv API"""
+    """学术文献搜索工具 - 自动在多个学术数据源间回退。"""
     name = "literature_search"
     parallel_safe = True
-    description = "搜索学术论文和文献。可以搜索 Semantic Scholar 或 arXiv 数据库，获取论文标题、摘要、作者、引用数等信息。适用于学术研究、文献综述、找相关论文等场景。"
+    description = "搜索学术论文和文献。默认会自动尝试 OpenAlex、Semantic Scholar、arXiv、PubMed、CrossRef，并在需要时进行多源融合。适用于学术研究、文献综述、找相关论文等场景。"
     parameters = {
         "type": "object",
         "properties": {
@@ -2283,9 +2469,9 @@ class LiteratureSearchTool(ToolBase):
             },
             "source": {
                 "type": "string",
-                "description": "数据源: semantic_scholar (默认，更全面)、arxiv (预印本，更新快) 或 multi（三源并行融合）",
-                "enum": ["semantic_scholar", "arxiv", "multi"],
-                "default": "semantic_scholar"
+                "description": "数据源: auto（默认，自动多路尝试）、semantic_scholar、arxiv、pubmed、openalex、crossref，或 multi（多源并行融合）",
+                "enum": ["auto", "semantic_scholar", "arxiv", "pubmed", "openalex", "crossref", "multi"],
+                "default": "auto"
             },
             "max_results": {
                 "type": "integer",
@@ -2312,7 +2498,7 @@ class LiteratureSearchTool(ToolBase):
     async def _execute(
         self,
         query: str,
-        source: str = "semantic_scholar",
+        source: str = "auto",
         max_results: int = 5,
         year_start: int = None,
         year_end: int = None
@@ -2326,7 +2512,13 @@ class LiteratureSearchTool(ToolBase):
                 kwargs["year_range"] = (year_start, year_end)
             
             if source == "multi":
-                per_source = max(1, math.ceil(max_results / 3))
+                multi_source_count = 4
+                if hasattr(self.service, "multi_source_count"):
+                    try:
+                        multi_source_count = int(self.service.multi_source_count())
+                    except Exception:
+                        multi_source_count = 4
+                per_source = max(1, math.ceil(max_results / max(1, multi_source_count)))
                 result = await self.service.search_multi(
                     query=query,
                     limit_per_source=per_source,
@@ -2350,16 +2542,25 @@ class LiteratureSearchTool(ToolBase):
                 )
             
             papers = result.get("papers", [])
+            requested_source = str(source or "auto").strip() or "auto"
+            resolved_source = str(result.get("resolved_source") or requested_source).strip() or requested_source
             
             if not papers:
                 return ToolResult(
                     success=True,
                     output=f"未找到关于 '{query}' 的学术论文。",
-                    data={"papers": [], "query": query, "source": source}
+                    data={
+                        "papers": [],
+                        "query": query,
+                        "source": requested_source,
+                        "resolved_source": result.get("resolved_source"),
+                        "attempted_sources": result.get("attempted_sources", []),
+                        "partial_errors": result.get("partial_errors", {}),
+                    }
                 )
             
             # 格式化输出
-            output = self._format_results(query, source, papers)
+            output = self._format_results(query, resolved_source, papers)
             
             return ToolResult(
                 success=True,
@@ -2367,7 +2568,11 @@ class LiteratureSearchTool(ToolBase):
                 data={
                     "papers": [self._paper_to_dict(p) for p in papers],
                     "query": query,
-                    "source": source,
+                    "source": requested_source,
+                    "resolved_source": resolved_source,
+                    "attempted_sources": result.get("attempted_sources", []),
+                    "partial_errors": result.get("partial_errors", {}),
+                    "sources": result.get("sources", {}),
                     "total": result.get("total", len(papers))
                 }
             )
@@ -2383,9 +2588,13 @@ class LiteratureSearchTool(ToolBase):
     def _format_results(self, query: str, source: str, papers: list) -> str:
         """格式化搜索结果"""
         source_name = {
+            "auto": "自动学术搜索链",
             "semantic_scholar": "Semantic Scholar",
             "arxiv": "arXiv",
-            "multi": "Semantic Scholar + arXiv + PubMed",
+            "pubmed": "PubMed",
+            "openalex": "OpenAlex",
+            "crossref": "CrossRef",
+            "multi": "OpenAlex + Semantic Scholar + arXiv + PubMed",
         }.get(source, source)
         output_parts = [f"在 {source_name} 搜索 '{query}' 的结果：\n"]
         
@@ -2528,6 +2737,11 @@ class ToolRegistry:
         "pip_install",
         "code_analysis",
     }
+    _CODELAB_NOTEBOOK_MUTATION_TOOLS: Set[str] = {
+        "notebook_execute",
+        "notebook_cleanup",
+        "pip_install",
+    }
     _CODELAB_FALLBACK_ALLOWLIST: Set[str] = {
         "datetime",
         "calculator",
@@ -2537,6 +2751,13 @@ class ToolRegistry:
     _CODELAB_FOLLOWUP_ONLY_PATTERNS: tuple[str, ...] = (
         r"^\s*(继续|继续说|继续做|继续分析|继续处理|接着|然后|然后呢|展开|继续下去)\s*$",
         r"^\s*(continue|go on|keep going|retry|again|fix it|continue please)\s*$",
+    )
+    _CODELAB_NEGATIVE_WEB_PATTERNS: tuple[str, ...] = (
+        r"(不要|别|不用|无需|不必|不能|禁止|先不要|暂时不要)\s*(再)?\s*(去)?\s*(联网|上网|搜索互联网|搜(索)?网页|搜(索)?网站|查(看)?网页|查(看)?网站|web|internet|online)",
+        r"(不要|别|不用|无需|不必|不能|禁止|先不要|暂时不要).{0,6}(网页|网站|web|internet|online)",
+    )
+    _CODELAB_NEGATIVE_KNOWLEDGE_PATTERNS: tuple[str, ...] = (
+        r"(不要|别|不用|无需|不必|不能|禁止|先不要|暂时不要)\s*(查|用|走)?\s*(知识库|rag|向量检索|knowledge base|vector store|kb)",
     )
     
     def __init__(
@@ -2551,6 +2772,7 @@ class ToolRegistry:
         user_authorized: bool = False,  # 用户是否授权 Agent 操作 Notebook
         tool_provider: Optional[ToolProvider] = None,
         route_profile: Optional[str] = None,
+        initialize_mcp: bool = True,
     ):
         self.db = db
         self.db_session_factory = db_session_factory
@@ -2566,6 +2788,7 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
         self._mcp_tools: Dict[str, MCPRemoteTool] = {}
         self._mcp_client_manager: Any = None
+        self._initialize_mcp = bool(initialize_mcp)
         self._tool_provider: ToolProvider = tool_provider or DefaultToolProvider()
         self._tool_context = ToolDependencyContext(
             db=self.db,
@@ -2583,7 +2806,8 @@ class ToolRegistry:
         if notebook_id and kernel_manager:
             self._register_notebook_tools()
 
-        self._init_mcp_client_manager()
+        if self._initialize_mcp:
+            self._init_mcp_client_manager()
     
     def _register_default_tools(self):
         """注册默认工具"""
@@ -2749,6 +2973,32 @@ class ToolRegistry:
             elif "max_results" in arguments:
                 translated["max_results"] = int(max_results_value)
 
+        categories_key = _pick_mcp_property_name(properties, ["categories", "category"])
+        if categories_key and categories_key not in translated and categories_key not in arguments:
+            default_categories = _default_routed_search_categories(query)
+            if default_categories:
+                translated[categories_key] = default_categories
+
+        ignore_invalid_key = _pick_mcp_property_name(
+            properties,
+            ["ignoreInvalidURLs", "ignore_invalid_urls", "ignoreInvalidUrls"],
+        )
+        if ignore_invalid_key and ignore_invalid_key not in translated and ignore_invalid_key not in arguments:
+            translated[ignore_invalid_key] = True
+
+        scrape_options_key = _pick_mcp_property_name(
+            properties,
+            ["scrapeOptions", "scrape_options", "extractOptions", "extract_options"],
+        )
+        if scrape_options_key and scrape_options_key not in translated and scrape_options_key not in arguments:
+            scrape_options: Dict[str, Any] = {}
+            requested_formats = _normalize_requested_formats(arguments.get("formats"))
+            scrape_options["formats"] = requested_formats or ["markdown"]
+            scrape_options["onlyMainContent"] = bool(arguments.get("only_main_content", True))
+            scrape_options["removeBase64Images"] = True
+            scrape_options["blockAds"] = True
+            translated[scrape_options_key] = scrape_options
+
         return _copy_matching_mcp_arguments(
             translated=translated,
             original=arguments,
@@ -2792,6 +3042,17 @@ class ToolRegistry:
         )
         if main_content_key:
             translated[main_content_key] = only_main_content
+
+        block_ads_key = _pick_mcp_property_name(properties, ["blockAds", "block_ads"])
+        if block_ads_key and block_ads_key not in translated and block_ads_key not in arguments:
+            translated[block_ads_key] = True
+
+        remove_base64_key = _pick_mcp_property_name(
+            properties,
+            ["removeBase64Images", "remove_base64_images"],
+        )
+        if remove_base64_key and remove_base64_key not in translated and remove_base64_key not in arguments:
+            translated[remove_base64_key] = True
 
         prompt_key = _pick_mcp_property_name(properties, ["prompt", "instruction", "instructions"])
         if prompt_key and prompt_key not in translated and prompt_key not in arguments:
@@ -3020,6 +3281,12 @@ class ToolRegistry:
             return self._CODELAB_INTENT_TOOL_MAP
         return self._INTENT_TOOL_MAP
 
+    def _uses_intent_tool_filtering(self) -> bool:
+        """Only codelab keeps intent-based tool narrowing; chat exposes the full pool."""
+        if not bool(getattr(settings, "tool_selection_enabled", True)):
+            return False
+        return self.route_profile == self._ROUTE_PROFILE_CODELAB
+
     @staticmethod
     def classify_intent(user_text: str) -> str:
         text = (user_text or "").lower()
@@ -3117,36 +3384,6 @@ class ToolRegistry:
         if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
             return "literature_task"
 
-        explicit_web = any(
-            token in text
-            for token in [
-                "网页",
-                "网站",
-                "实时",
-                "today",
-                "latest",
-                "联网",
-                "搜索互联网",
-                "web",
-                "internet",
-                "online",
-            ]
-        )
-        if explicit_web:
-            return "web_query"
-
-        explicit_knowledge = any(
-            token in text
-            for token in [
-                "知识库",
-                "rag",
-                "向量检索",
-                "knowledge base",
-                "vector store",
-                "kb",
-            ]
-        )
-
         notebook_tokens = [
             "代码",
             "notebook",
@@ -3189,9 +3426,29 @@ class ToolRegistry:
             "数据集",
             "表格",
         ]
+        local_only_tokens = [
+            "当前 notebook",
+            "当前notebook",
+            "当前 cell",
+            "当前cell",
+            "当前单元格",
+            "当前状态",
+            "工作区",
+            "本地文件",
+            "已上传",
+        ]
+        explicit_web = cls._has_codelab_explicit_web_request(text)
+        explicit_knowledge = cls._has_codelab_explicit_knowledge_request(text)
 
         if cls._looks_like_notebook_local_file_task(text):
             return "code_task"
+        if (
+            (any(token in text for token in notebook_tokens) or any(token in text for token in local_workspace_tokens))
+            and (cls._has_codelab_negative_web_instruction(text) or any(token in text for token in local_only_tokens))
+        ):
+            return "code_task"
+        if explicit_web:
+            return "web_query"
         if any(token in text for token in notebook_tokens):
             return "code_task"
         if any(token in text for token in local_workspace_tokens) and not explicit_knowledge:
@@ -3213,6 +3470,50 @@ class ToolRegistry:
         if not text:
             return False
         return any(re.match(pattern, text, re.IGNORECASE) for pattern in cls._CODELAB_FOLLOWUP_ONLY_PATTERNS)
+
+    @classmethod
+    def _has_codelab_negative_web_instruction(cls, text: str) -> bool:
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in cls._CODELAB_NEGATIVE_WEB_PATTERNS)
+
+    @classmethod
+    def _has_codelab_negative_knowledge_instruction(cls, text: str) -> bool:
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in cls._CODELAB_NEGATIVE_KNOWLEDGE_PATTERNS)
+
+    @classmethod
+    def _has_codelab_explicit_web_request(cls, text: str) -> bool:
+        if cls._has_codelab_negative_web_instruction(text):
+            return False
+        return any(
+            token in text
+            for token in [
+                "网页",
+                "网站",
+                "实时",
+                "today",
+                "latest",
+                "联网",
+                "搜索互联网",
+                "web",
+                "internet",
+                "online",
+            ]
+        )
+
+    @classmethod
+    def _has_codelab_explicit_knowledge_request(cls, text: str) -> bool:
+        if cls._has_codelab_negative_knowledge_instruction(text):
+            return False
+        return any(
+            token in text
+            for token in [
+                "知识库",
+                "rag",
+                "向量检索",
+                "knowledge base",
+                "vector store",
+                "kb",
+            ]
+        )
 
     def _mcp_tool_matches_intent(self, tool: Tool, intent: str) -> bool:
         text = f"{tool.name} {tool.description}".lower()
@@ -3263,21 +3564,11 @@ class ToolRegistry:
             "model",
             "ml",
         ]
-        remote_lookup_tokens = [
-            "知识库",
-            "rag",
-            "向量检索",
-            "knowledge base",
-            "联网",
-            "网页",
-            "web",
-            "internet",
-            "搜索互联网",
-        ]
         return (
             any(token in text for token in local_file_tokens)
             and any(token in text for token in notebook_task_tokens)
-            and not any(token in text for token in remote_lookup_tokens)
+            and not ToolRegistry._has_codelab_explicit_knowledge_request(text)
+            and not ToolRegistry._has_codelab_explicit_web_request(text)
         )
 
     def resolve_intent(self, user_text: str) -> str:
@@ -3290,7 +3581,7 @@ class ToolRegistry:
         return self.classify_intent(user_text)
 
     def select_tool_names_for_intent(self, intent: str, user_text: str = "") -> List[str]:
-        if not bool(getattr(settings, "tool_selection_enabled", True)):
+        if not self._uses_intent_tool_filtering():
             return [tool.name for tool in self._iter_all_tools()]
 
         intent_tool_map = self._intent_tool_map_for_profile()
@@ -3314,17 +3605,21 @@ class ToolRegistry:
         else:
             selected.update(fallback_tools)
 
-        # Notebook 场景下默认保留代码工具，避免普通表述被误判为 general_chat 后无法操作 notebook。
-        if self.notebook_id and self.kernel_manager:
+        # Notebook 场景下，仅在代码任务里默认保留 Notebook 工具，避免普通聊天也被带去读写 Notebook。
+        if self.notebook_id and self.kernel_manager and resolved_intent == "code_task":
             selected.update(self._CODELAB_NOTEBOOK_BASE_TOOLS)
+
+        # 未授权时，剥离明确的改写类工具，避免普通问答或建议场景误触写操作。
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB and not self.user_authorized:
+            selected.difference_update(self._CODELAB_NOTEBOOK_MUTATION_TOOLS)
 
         for tool in self._iter_all_tools():
             if (
                 not notebook_local_file_task
                 and tool.name.startswith("mcp.")
                 and not (
-                    self.route_profile == self._ROUTE_PROFILE_CODELAB
-                    and resolved_intent != "web_query"
+                    (self.route_profile == self._ROUTE_PROFILE_CODELAB and resolved_intent != "web_query")
+                    or (self.route_profile == self._ROUTE_PROFILE_CHAT and resolved_intent == "code_task")
                 )
                 and self._mcp_tool_matches_intent(tool, resolved_intent)
             ):
@@ -3343,6 +3638,8 @@ class ToolRegistry:
         if include_tool_names:
             allow = set(include_tool_names)
             return [tool for tool in tools if tool.name in allow]
+        if not self._uses_intent_tool_filtering():
+            return tools
         if intent:
             names = set(self.select_tool_names_for_intent(intent, user_text=user_text))
             return [tool for tool in tools if tool.name in names]
@@ -3486,6 +3783,7 @@ def get_tool_registry(
     user_id: int,
     db_session_factory: Optional[Callable[[], AsyncSession]] = None,
     route_profile: Optional[str] = None,
+    initialize_mcp: bool = True,
 ) -> ToolRegistry:
     """获取工具注册表"""
     return ToolRegistry(
@@ -3493,4 +3791,5 @@ def get_tool_registry(
         user_id=user_id,
         db_session_factory=db_session_factory,
         route_profile=route_profile,
+        initialize_mcp=initialize_mcp,
     )

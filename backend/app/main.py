@@ -12,6 +12,7 @@ from app.core.database import create_tables
 from app.core.error_handlers import register_error_handlers
 from app.core.rate_limit import build_rate_limit_dependency
 from app.services.literature_reader_compose_service import get_literature_reader_compose_service
+from app.services.conversation_context_compaction_service import get_conversation_context_compaction_service
 from app.services.retrieval_warmup_service import get_retrieval_warmup_service
 from app.api import (
     auth, users, chat, health, knowledge, literature, codelab,
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  NOTEBOOK_CONTEXT_VARIABLES: {settings.notebook_context_variables}")
     logger.info(f"  RETRIEVAL_WARMUP_ON_STARTUP: {settings.retrieval_warmup_on_startup}")
     logger.info(f"  RETRIEVAL_WARMUP_TIMEOUT_SECONDS: {settings.retrieval_warmup_timeout_seconds}")
+    logger.info(f"  CONVERSATION_CONTEXT_COMPACTION_ENABLED: {settings.conversation_context_compaction_enabled}")
     logger.info(
         f"  KNOWLEDGE_DOCUMENT_TASK_MAX_CONCURRENCY: {settings.knowledge_document_task_max_concurrency}"
     )
@@ -97,6 +99,13 @@ async def lifespan(app: FastAPI):
         bool(retrieval_warmup_report.get("background_task_running")),
         retrieval_warmup_report.get("components") or [],
     )
+    compaction_report = get_conversation_context_compaction_service().start_background_worker()
+    logger.info(
+        "[ConversationCompactionStartup] enabled={} running={} queued={}",
+        bool(compaction_report.get("enabled")),
+        bool(compaction_report.get("running")),
+        int(compaction_report.get("queued") or 0),
+    )
 
     recovery_report = await knowledge.resume_interrupted_document_tasks_on_startup()
     logger.info(
@@ -110,6 +119,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await get_retrieval_warmup_service().shutdown()
+    await get_conversation_context_compaction_service().shutdown()
     logger.info("👋 应用关闭")
 
 

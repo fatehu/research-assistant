@@ -1696,15 +1696,6 @@ class ExperienceSessionV2ArtifactDraftNode(BaseModel):
         if layout_ids:
             payload["source_layout_ids"] = layout_ids
 
-        block_ids = _artifact_draft_node_collect_string_list(
-            payload,
-            direct_keys=("source_block_ids", "source_block_id", "block_id", "block_ids"),
-            nested_keys=("source_ref", "source_refs", "binding"),
-            object_id_keys=("source_block_id", "block_id", "source_block_ref"),
-        )
-        if block_ids:
-            payload["source_block_ids"] = block_ids
-
         resource_ref_ids = _artifact_draft_node_collect_string_list(
             payload,
             direct_keys=("resource_ref_ids", "resource_ref_id", "resource_ids", "resource_id"),
@@ -1713,6 +1704,41 @@ class ExperienceSessionV2ArtifactDraftNode(BaseModel):
         )
         if resource_ref_ids:
             payload["resource_ref_ids"] = resource_ref_ids
+
+        if node_kind in {"figure_slot", "table_slot", "equation_slot"} and not layout_ids:
+            downgrade_meta = dict(payload.get("meta") or {})
+            downgrade_meta["normalized_from_invalid_slot_kind"] = str(
+                payload.get("kind") or payload.get("type") or payload.get("node_type") or "figure_slot"
+            ).strip() or "figure_slot"
+            downgrade_meta["normalized_reason"] = "missing_source_layout_ids"
+            if resource_ref_ids:
+                payload["node_kind"] = "external_resource"
+                payload["label"] = (
+                    str(payload.get("label") or "").strip()
+                    or str(payload.get("caption") or payload.get("description") or payload.get("summary") or payload.get("text") or "").strip()
+                    or "补充资源"
+                )
+                node_kind = "external_resource"
+                payload["meta"] = downgrade_meta
+            else:
+                fallback_parts = [
+                    str(payload.get("label") or "").strip(),
+                    str(payload.get("caption") or payload.get("description") or payload.get("summary") or payload.get("text") or "").strip(),
+                ]
+                fallback_text = "：".join(part for part in fallback_parts if part) or "补充说明"
+                payload["node_kind"] = "paragraph"
+                payload["text"] = fallback_text
+                node_kind = "paragraph"
+                payload["meta"] = downgrade_meta
+
+        block_ids = _artifact_draft_node_collect_string_list(
+            payload,
+            direct_keys=("source_block_ids", "source_block_id", "block_id", "block_ids"),
+            nested_keys=("source_ref", "source_refs", "binding"),
+            object_id_keys=("source_block_id", "block_id", "source_block_ref"),
+        )
+        if block_ids:
+            payload["source_block_ids"] = block_ids
 
         meta = dict(payload.get("meta") or {})
         node_id = str(payload.get("node_id") or "").strip()

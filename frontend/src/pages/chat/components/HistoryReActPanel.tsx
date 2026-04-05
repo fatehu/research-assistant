@@ -116,7 +116,7 @@ const HistoryReActPanel = ({
                           <div className="flex items-center gap-2 mb-1.5">
                             <BulbOutlined className="text-amber-400 text-xs" />
                             <span className="text-xs font-medium text-amber-400">
-                              第 {step.iteration} 轮思考
+                              第 {step.iteration} 轮过程
                             </span>
                           </div>
                           <p className={`text-xs leading-relaxed ${embedded ? 'text-slate-400' : 'text-slate-300'}`}>{step.content}</p>

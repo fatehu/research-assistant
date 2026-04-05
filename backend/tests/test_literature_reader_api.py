@@ -3629,6 +3629,9 @@ async def test_tool_registry_should_translate_routed_web_search_arguments_and_pr
                     "properties": {
                         "q": {"type": "string"},
                         "count": {"type": "integer"},
+                        "categories": {"type": "array"},
+                        "ignoreInvalidURLs": {"type": "boolean"},
+                        "scrapeOptions": {"type": "object"},
                     },
                 },
             )
@@ -3662,12 +3665,28 @@ async def test_tool_registry_should_translate_routed_web_search_arguments_and_pr
     agent_tools.ToolRegistry._mcp_route_circuit_state = {}
 
     registry = agent_tools.ToolRegistry(db=None, user_id=1)
-    result = await registry.execute("web_search", query="llm news", max_results=3)
+    result = await registry.execute("web_search", query="attention paper", max_results=3)
 
     assert result.success is True
     assert result.output == "remote-web"
     assert local_search.calls == []
-    assert fake_manager.call_history == [("mcp.brave.search", {"q": "llm news", "count": 3})]
+    assert fake_manager.call_history == [
+        (
+            "mcp.brave.search",
+            {
+                "q": "attention paper",
+                "count": 3,
+                "categories": ["research", "pdf"],
+                "ignoreInvalidURLs": True,
+                "scrapeOptions": {
+                    "formats": ["markdown"],
+                    "onlyMainContent": True,
+                    "removeBase64Images": True,
+                    "blockAds": True,
+                },
+            },
+        )
+    ]
     assert result.data["provider"] == "brave"
     assert result.data["provider_route"] == "mcp.brave.search"
     assert result.data["source_kind"] == "public_web_search"
@@ -3675,8 +3694,16 @@ async def test_tool_registry_should_translate_routed_web_search_arguments_and_pr
     assert result.data["provenance"]["execution_mode"] == "routed"
     assert result.data["provenance"]["local_tool_name"] == "web_search"
     assert result.data["provenance"]["argument_translation"]["translated_arguments"] == {
-        "q": "llm news",
+        "q": "attention paper",
         "count": 3,
+        "categories": ["research", "pdf"],
+        "ignoreInvalidURLs": True,
+        "scrapeOptions": {
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+            "removeBase64Images": True,
+            "blockAds": True,
+        },
     }
 
 
@@ -3696,6 +3723,8 @@ async def test_tool_registry_should_translate_routed_web_scrape_arguments_for_ex
                         "urls": {"type": "array"},
                         "prompt": {"type": "string"},
                         "format": {"type": "string", "enum": ["markdown", "html"]},
+                        "blockAds": {"type": "boolean"},
+                        "removeBase64Images": {"type": "boolean"},
                     },
                     "required": ["urls", "prompt"],
                 },
@@ -3733,6 +3762,8 @@ async def test_tool_registry_should_translate_routed_web_scrape_arguments_for_ex
     assert fake_manager.call_history[0][0] == "mcp.firecrawl.firecrawl_extract"
     assert fake_manager.call_history[0][1]["urls"] == ["https://example.com"]
     assert fake_manager.call_history[0][1]["format"] == "markdown"
+    assert fake_manager.call_history[0][1]["blockAds"] is True
+    assert fake_manager.call_history[0][1]["removeBase64Images"] is True
     assert "main article content" in fake_manager.call_history[0][1]["prompt"]
     assert result.data["provider"] == "firecrawl"
     assert result.data["provider_route"] == "mcp.firecrawl.firecrawl_extract"
@@ -3847,6 +3878,148 @@ def test_list_documents_should_mark_stale_running_doc_as_timeout(monkeypatch):
     assert db.committed is True
     assert db.refreshed == [301]
     assert published == [(7, 41, 301)]
+
+
+def test_list_documents_allows_shared_knowledge_base_access(monkeypatch):
+    kb = SimpleNamespace(id=41, user_id=9)
+    shared_doc = SimpleNamespace(
+        id=501,
+        knowledge_base_id=41,
+        filename="shared.pdf",
+        original_filename="shared.pdf",
+        file_size=123,
+        file_type="application/pdf",
+        status=DocumentStatus.COMPLETED.value,
+        processing_stage=None,
+        processing_progress=None,
+        error_message=None,
+        chunk_count=3,
+        token_count=100,
+        char_count=300,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        processed_at=datetime.now(timezone.utc),
+        content=None,
+        processing_mode=None,
+        extract_profile=None,
+        extract_granularity=None,
+        metadata_=None,
+    )
+
+    class _SharedDocumentListDB:
+        def __init__(self):
+            self._results = [
+                _FakeResult(row=1),
+                _FakeResult(rows=[shared_doc]),
+            ]
+
+        async def get(self, model, ident):
+            if model is knowledge_api.KnowledgeBase and ident == 41:
+                return kb
+            return None
+
+        async def execute(self, _query):
+            return self._results.pop(0)
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _doc):
+            return None
+
+    async def _fake_get_shared_kb_ids(current_user, db):
+        assert current_user.id == 7
+        return {41}
+
+    monkeypatch.setattr(knowledge_api, "SHARING_ENABLED", True)
+    monkeypatch.setattr(knowledge_api, "get_shared_kb_ids", _fake_get_shared_kb_ids)
+
+    db = _SharedDocumentListDB()
+
+    async def _run():
+        return await knowledge_api.list_documents(
+            kb_id=41,
+            skip=0,
+            limit=20,
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.total == 1
+    assert len(response.items) == 1
+    assert response.items[0].id == 501
+
+
+def test_list_documents_supports_filename_search():
+    kb = SimpleNamespace(id=41, user_id=7)
+    matched_doc = SimpleNamespace(
+        id=601,
+        knowledge_base_id=41,
+        filename="attention-is-all-you-need.pdf",
+        original_filename="Attention Is All You Need.pdf",
+        file_size=123,
+        file_type="application/pdf",
+        status=DocumentStatus.COMPLETED.value,
+        processing_stage=None,
+        processing_progress=None,
+        error_message=None,
+        chunk_count=8,
+        token_count=200,
+        char_count=600,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        processed_at=datetime.now(timezone.utc),
+        content=None,
+        processing_mode=None,
+        extract_profile=None,
+        extract_granularity=None,
+        metadata_=None,
+    )
+
+    class _SearchDocumentListDB:
+        def __init__(self):
+            self.queries: list[str] = []
+
+        async def get(self, model, ident):
+            if model is knowledge_api.KnowledgeBase and ident == 41:
+                return kb
+            return None
+
+        async def execute(self, query):
+            self.queries.append(str(query))
+            query_text = str(query)
+            if "count(" in query_text.lower():
+                return _FakeResult(row=1)
+            return _FakeResult(rows=[matched_doc])
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _doc):
+            return None
+
+    db = _SearchDocumentListDB()
+
+    async def _run():
+        return await knowledge_api.list_documents(
+            kb_id=41,
+            skip=0,
+            limit=20,
+            search="attention",
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.total == 1
+    assert len(response.items) == 1
+    assert response.items[0].id == 601
+    assert response.items[0].original_filename == "Attention Is All You Need.pdf"
+    assert any("original_filename" in query and "LIKE" in query for query in db.queries)
+    assert any("filename" in query and "LIKE" in query for query in db.queries)
 
 
 def test_collection_knowledge_readiness_should_treat_stale_running_link_as_timeout(monkeypatch):
@@ -6312,6 +6485,62 @@ def test_experience_session_v2_artifact_draft_should_normalize_common_model_alia
     assert draft["nodes"][5]["resource_ref_ids"] == ["seed:1"]
 
 
+def test_experience_session_v2_artifact_draft_should_downgrade_unanchored_visual_slot_to_paragraph():
+    draft = literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
+        {
+            "focus_page": 7,
+            "template_hint": "guided_mixed_media_v1",
+            "layout_recipe": "current_page_spine_interleave_v1",
+            "presentation_mode": "mixed_layout",
+            "nodes": [
+                {
+                    "node_kind": "figure_slot",
+                    "label": "Supplemental diagram",
+                    "description": "用一张补充图解释 agentic search 的检索闭环。",
+                }
+            ],
+            "resource_requests": [],
+        }
+    ).model_dump(mode="json")
+
+    assert draft["nodes"][0]["node_kind"] == "paragraph"
+    assert "Supplemental diagram" in draft["nodes"][0]["text"]
+    assert draft["nodes"][0]["meta"]["normalized_reason"] == "missing_source_layout_ids"
+
+
+def test_experience_session_v2_artifact_draft_should_downgrade_unanchored_visual_slot_with_resources_to_external_resource():
+    draft = literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
+        {
+            "focus_page": 7,
+            "template_hint": "guided_mixed_media_v1",
+            "layout_recipe": "current_page_spine_interleave_v1",
+            "presentation_mode": "mixed_layout",
+            "nodes": [
+                {
+                    "node_kind": "paragraph",
+                    "text": "先补一句说明，提示读者这里会引用一个补充视觉资源。",
+                },
+                {
+                    "node_kind": "figure_slot",
+                    "label": "Supplemental diagram",
+                    "resources": [
+                        {
+                            "resource_id": "web:diagram-1",
+                            "url": "https://example.com/diagram.png",
+                            "renderable": True,
+                        }
+                    ],
+                }
+            ],
+            "resource_requests": [],
+        }
+    ).model_dump(mode="json")
+
+    assert draft["nodes"][1]["node_kind"] == "external_resource"
+    assert draft["nodes"][1]["resource_ref_ids"] == ["web:diagram-1"]
+    assert draft["nodes"][1]["meta"]["normalized_reason"] == "missing_source_layout_ids"
+
+
 def test_experience_session_v2_artifact_draft_should_preserve_grouping_meta_alias_fields():
     draft = literature_api.ExperienceSessionV2ArtifactDraft.model_validate(
         {
@@ -6439,6 +6668,8 @@ def test_experience_session_v2_prompts_should_require_chinese_guided_copy():
     assert "encyclopedia" in draft_prompt
     assert "resource_requests is a top-level array, not a node" in draft_prompt
     assert "Never place resource_request objects inside nodes[]" in draft_prompt
+    assert "Use figure/table/equation slots only when they can bind to current-page media with source_layout_ids" in draft_prompt
+    assert "prefer external_resource when resource_ref_ids are available" in draft_prompt
 
 
 def test_reader_experience_block_explain_request_should_require_local_context():
@@ -8364,6 +8595,14 @@ async def test_experience_session_v2_cache_set_get_should_use_dedicated_kind_and
     assert layer == "db"
 
 
+async def _fake_experience_v2_compose_signature_cache_miss(**_kwargs):
+    return None, None, None
+
+
+async def _fake_experience_v2_stable_cache_miss(**_kwargs):
+    return None, None, None
+
+
 @pytest.mark.asyncio
 async def test_reader_experience_v2_cached_payload_should_return_generation_shell_when_no_completed_artifact_exists(monkeypatch):
     paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
@@ -8386,6 +8625,8 @@ async def test_reader_experience_v2_cached_payload_should_return_generation_shel
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
 
     payload = literature_api.ReaderExperiencePlanRequest(page=7, focus_page=7, reader_profile="curious_generalist")
     response = await literature_api._build_reader_experience_v2_cached_payload(
@@ -8412,6 +8653,7 @@ async def test_prepare_reader_experience_v2_runtime_should_degrade_when_structur
         raise ValueError("neighboring-page structured context unavailable for v2 route")
 
     monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", lambda **_kwargs: asyncio.sleep(0, result=146))
     monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _make_fake_v2_compose_service(compose_payload))
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
 
@@ -8423,6 +8665,156 @@ async def test_prepare_reader_experience_v2_runtime_should_degrade_when_structur
     )
 
     assert runtime_state["reading_dossier"]["adjacent_pages"]["pages"] == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_reader_experience_v2_runtime_should_reuse_compose_signature_cache_when_exact_key_misses(monkeypatch):
+    paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
+    compose_payload = _build_sample_compose_payload_for_dossier_v2()
+    session_alias_writes: list[dict[str, object]] = []
+    artifact_alias_writes: list[dict[str, object]] = []
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    async def _fake_adjacent(**_kwargs):
+        return _build_sample_adjacent_structured_context_for_dossier_v2()
+
+    async def _fake_session_get(_cache_key):
+        return None, "none"
+
+    async def _fake_artifact_get(_cache_key):
+        return None, "none"
+
+    async def _fake_legacy_get(**kwargs):
+        if kwargs["plan_kind"] == literature_api.EXPERIENCE_SESSION_V2_CACHE_KIND:
+            return {"session_id": "sess-123", "status": "completed"}, None, "legacy-session-key"
+        artifact = literature_api._build_page_artifact_v2_from_dossier(
+            reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+            authored_plan=_build_sample_page_artifact_v2_authored_plan(),
+        )
+        return artifact, None, "legacy-artifact-key"
+
+    async def _fake_session_set(cache_key, payload, **kwargs):
+        session_alias_writes.append({"cache_key": cache_key, "payload": payload, **kwargs})
+
+    async def _fake_artifact_set(cache_key, payload, **kwargs):
+        artifact_alias_writes.append({"cache_key": cache_key, "payload": payload, **kwargs})
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", lambda **_kwargs: asyncio.sleep(0, result=146))
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _make_fake_v2_compose_service(compose_payload))
+    monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_legacy_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_cache_set", _fake_session_set)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_set", _fake_artifact_set)
+
+    runtime_state = await literature_api._prepare_reader_experience_v2_runtime(
+        paper_id=78,
+        payload=literature_api.ReaderExperiencePlanRequest(
+            page=7,
+            focus_page=7,
+            reader_profile="curious_generalist",
+            user_intent="build v2 experience",
+            selected_kb_id=146,
+        ),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    expected_session_key = literature_api._experience_session_v2_cache_key(
+        user_id=5,
+        paper_id=78,
+        focus_page=7,
+        selected_kb_id=146,
+        dossier_signature="compose-sig",
+        user_intent="build v2 experience",
+        reader_profile="curious_generalist",
+    )
+    expected_artifact_key = literature_api._page_artifact_v2_cache_key(
+        user_id=5,
+        paper_id=78,
+        focus_page=7,
+        selected_kb_id=146,
+        dossier_signature="compose-sig",
+        user_intent="build v2 experience",
+        reader_profile="curious_generalist",
+    )
+
+    assert runtime_state["session_cache_key"] == expected_session_key
+    assert runtime_state["artifact_cache_key"] == expected_artifact_key
+    assert runtime_state["cached_session"]["session_id"] == "sess-123"
+    assert runtime_state["cached_artifact"]["version"] == "page_artifact_v2"
+    assert runtime_state["session_cache_hit"] is True
+    assert runtime_state["artifact_cache_hit"] is True
+    assert runtime_state["session_cache_layer"].startswith("db_compose_signature")
+    assert runtime_state["artifact_cache_layer"].startswith("db_compose_signature")
+    assert session_alias_writes and session_alias_writes[0]["cache_key"] == expected_session_key
+    assert artifact_alias_writes and artifact_alias_writes[0]["cache_key"] == expected_artifact_key
+    assert session_alias_writes[0]["compose_source_signature"] == "compose-sig"
+    assert artifact_alias_writes[0]["compose_source_signature"] == "compose-sig"
+
+
+@pytest.mark.asyncio
+async def test_prepare_reader_experience_v2_runtime_should_reuse_latest_stable_artifact_when_compose_signature_changes(monkeypatch):
+    paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
+    compose_payload = _build_sample_compose_payload_for_dossier_v2()
+    artifact_alias_writes: list[dict[str, object]] = []
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    async def _fake_adjacent(**_kwargs):
+        return _build_sample_adjacent_structured_context_for_dossier_v2()
+
+    async def _fake_session_get(_cache_key):
+        return None, "none"
+
+    async def _fake_artifact_get(_cache_key):
+        return None, "none"
+
+    async def _fake_artifact_set(cache_key, payload, **kwargs):
+        artifact_alias_writes.append({"cache_key": cache_key, "payload": payload, **kwargs})
+
+    artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+        authored_plan=_build_sample_page_artifact_v2_authored_plan(),
+    )
+
+    async def _fake_stable_get(**kwargs):
+        assert kwargs["plan_kind"] == literature_api.PAGE_ARTIFACT_V2_CACHE_KIND
+        return artifact, None, "stable-artifact-key"
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", lambda **_kwargs: asyncio.sleep(0, result=146))
+    monkeypatch.setattr(literature_api, "get_literature_reader_compose_service", lambda: _make_fake_v2_compose_service(compose_payload))
+    monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_stable_get)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_set", _fake_artifact_set)
+
+    runtime_state = await literature_api._prepare_reader_experience_v2_runtime(
+        paper_id=78,
+        payload=literature_api.ReaderExperiencePlanRequest(
+            page=7,
+            focus_page=7,
+            reader_profile="curious_generalist",
+            user_intent="build v2 experience",
+            selected_kb_id=146,
+        ),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert runtime_state["cached_artifact"]["version"] == "page_artifact_v2"
+    assert runtime_state["artifact_cache_hit"] is True
+    assert runtime_state["artifact_cache_layer"].startswith("db_stable")
+    assert artifact_alias_writes and artifact_alias_writes[0]["compose_source_signature"] == "compose-sig"
 
 
 @pytest.mark.asyncio
@@ -8465,6 +8857,8 @@ async def test_reader_experience_v2_live_payload_should_build_and_persist_comple
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_set", _fake_session_set)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_set", _fake_artifact_set)
     _patch_fake_experience_session_v2_narrative_brief_generator(monkeypatch)
@@ -8546,6 +8940,8 @@ async def test_reader_experience_v2_live_payload_should_fail_loudly_when_model_b
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
     monkeypatch.setattr(literature_api, "_generate_experience_session_v2_narrative_brief", _fake_generate)
 
     with pytest.raises(HTTPException, match="narrative brief generation failed: invalid JSON output"):
@@ -8593,6 +8989,8 @@ async def test_reader_experience_v2_live_payload_should_surface_failed_session_w
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
 
     payload = literature_api.ReaderExperiencePlanRequest(page=7, focus_page=7, reader_profile="curious_generalist")
     cached_response = await literature_api._build_reader_experience_v2_cached_payload(
@@ -8660,6 +9058,8 @@ async def test_reader_workbench_v2_payload_should_expose_dossier_session_artifac
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_set", _fake_session_set)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_set", _fake_artifact_set)
     _patch_fake_experience_session_v2_narrative_brief_generator(monkeypatch)
@@ -8717,6 +9117,8 @@ async def test_reader_workbench_v2_payload_should_surface_failed_state_explicitl
     monkeypatch.setattr(literature_api, "_build_experience_adjacent_page_structured_context_v2", _fake_adjacent)
     monkeypatch.setattr(literature_api, "_experience_session_v2_cache_get", _fake_session_get)
     monkeypatch.setattr(literature_api, "_page_artifact_v2_cache_get", _fake_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_by_compose_signature", _fake_experience_v2_compose_signature_cache_miss)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_experience_v2_stable_cache_miss)
 
     response = await literature_api._build_reader_workbench_v2_payload(
         paper_id=78,

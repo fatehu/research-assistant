@@ -21,7 +21,7 @@ from app.models.literature import (
     LiteratureQAMessage,
 )
 from app.models.notebook import Notebook, NotebookCell
-from app.models.agent import AgentRun, AgentStepRecord, ConversationSummary, AgentMemoryItem
+from app.models.agent import AgentRun, AgentStepRecord, AgentMemoryItem
 
 # 角色系统模型
 from app.models.role import (
@@ -69,7 +69,6 @@ __all__ = [
     # Agent runtime persistence
     "AgentRun",
     "AgentStepRecord",
-    "ConversationSummary",
     "AgentMemoryItem",
     # 角色系统
     "UserRole",

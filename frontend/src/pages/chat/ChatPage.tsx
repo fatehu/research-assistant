@@ -1,8 +1,17 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 
 import { useChatStore } from '@/stores/chatStore'
-import { ChatMessages, ChatInput } from './components'
+import {
+  chatApi,
+  type ChatContextPreviewResponse,
+  type ChatPreferenceCandidate,
+  type ChatPreferenceKey,
+  type ChatRagOverrides,
+  type ChatUserPreferences,
+} from '@/services/api'
+import { useAuthStore } from '@/stores/authStore'
+import { ChatMessages, ChatInput, ContextDebugWindow } from './components'
 
 /**
  * ChatPage - 聊天主页面（重构版）
@@ -24,20 +33,29 @@ const ChatPage = () => {
   const navigate = useNavigate()
   const location = useLocation()
   const initialMessageSent = useRef(false)
+  const { user } = useAuthStore()
 
   const {
     messages,
     currentConversation,
     isLoading,
     isSending,
+    isCompactingContext,
     isThinking,
+    sendPhase,
+    sendPhaseLabel,
+    sendPhaseHint,
     streamingContent,
     streamingThought,
+    streamingContextDebug,
+    lastRunContextDebug,
     iterationSteps,
     currentIteration,
     currentToolCall,
+    currentTurnId,
     selectConversation,
     sendMessage,
+    compactConversationContext,
     stopGeneration,
     clearCurrentConversation,
   } = useChatStore()
@@ -46,41 +64,115 @@ const ChatPage = () => {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null)
   const [conversationLoaded, setConversationLoaded] = useState(false)
+  const [contextPreview, setContextPreview] = useState<ChatContextPreviewResponse | null>(null)
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [chatPreferenceOverrides, setChatPreferenceOverrides] = useState<Partial<ChatUserPreferences>>({})
+  const [ragOverrides, setRagOverrides] = useState<ChatRagOverrides | null>(null)
+  const [ignoredCandidateIds, setIgnoredCandidateIds] = useState<string[]>([])
+  const [ragResetToken, setRagResetToken] = useState(0)
+  const previewRequestIdRef = useRef(0)
+  const serializedPreferenceOverrides = useMemo(
+    () => JSON.stringify(chatPreferenceOverrides || {}),
+    [chatPreferenceOverrides],
+  )
+  const serializedRagOverrides = useMemo(
+    () => JSON.stringify(ragOverrides || {}),
+    [ragOverrides],
+  )
+  const activeContextDebug = useMemo(
+    () => streamingContextDebug || contextPreview?.context_debug || lastRunContextDebug || null,
+    [contextPreview?.context_debug, lastRunContextDebug, streamingContextDebug],
+  )
+  const confirmedChatPreferences = useMemo(
+    () =>
+      user?.preferences && typeof user.preferences.chat_preferences === 'object'
+        ? (user.preferences.chat_preferences as ChatUserPreferences)
+        : null,
+    [user?.preferences],
+  )
+  const effectiveChatPreferences = useMemo(() => {
+    const base = confirmedChatPreferences || {
+      version: 'chat_preferences.v1',
+      response_language: 'auto' as const,
+      response_verbosity: 'balanced' as const,
+      web_search: 'ask' as const,
+    }
+    if (contextPreview?.effective_chat_preferences) {
+      return contextPreview.effective_chat_preferences
+    }
+    return {
+      ...base,
+      ...chatPreferenceOverrides,
+    }
+  }, [chatPreferenceOverrides, confirmedChatPreferences, contextPreview?.effective_chat_preferences])
+  const visibleChatPreferenceCandidates = useMemo(
+    () =>
+      (contextPreview?.chat_preference_candidates || []).filter(
+        (item): item is ChatPreferenceCandidate =>
+          Boolean(item?.candidate_id) && !ignoredCandidateIds.includes(item.candidate_id),
+      ),
+    [contextPreview?.chat_preference_candidates, ignoredCandidateIds],
+  )
+
+  useEffect(() => {
+    previewRequestIdRef.current += 1
+    setContextPreview(null)
+    setIsPreviewLoading(false)
+    setPreviewError(null)
+    setIgnoredCandidateIds([])
+  }, [conversationId, inputValue, isSending, serializedPreferenceOverrides, serializedRagOverrides])
+
+  useEffect(() => {
+    setChatPreferenceOverrides({})
+    setRagOverrides(null)
+    setIgnoredCandidateIds([])
+    setRagResetToken((current) => current + 1)
+  }, [conversationId])
 
   // ─── 加载对话 ───────────────────────────────────
   useEffect(() => {
-    const loadConversation = async () => {
-      if (isSending) {
-        setConversationLoaded(true)
-        return
-      }
+    let cancelled = false
 
+    const loadConversation = async () => {
       setConversationLoaded(false)
       if (conversationId) {
-        setLoadError(null)
+        if (!cancelled) {
+          setLoadError(null)
+        }
         try {
           await selectConversation(parseInt(conversationId))
-          setLoadError(null)
-          setConversationLoaded(true)
+          if (!cancelled) {
+            setLoadError(null)
+            setConversationLoaded(true)
+          }
         } catch (error: any) {
           console.error('加载对话失败:', error)
-          if (error?.response?.status === 404) {
-            setLoadError('对话不存在或已被删除')
-          } else if (error?.response?.status === 401) {
-            setLoadError('登录已过期，请重新登录')
-          } else {
-            setLoadError('加载对话失败，请刷新重试')
+          if (!cancelled) {
+            if (error?.response?.status === 404) {
+              setLoadError('对话不存在或已被删除')
+            } else if (error?.response?.status === 401) {
+              setLoadError('登录已过期，请重新登录')
+            } else {
+              setLoadError('加载对话失败，请刷新重试')
+            }
           }
         }
       } else {
-        setLoadError(null)
-        clearCurrentConversation()
-        setConversationLoaded(true)
+        if (!cancelled) {
+          setLoadError(null)
+          clearCurrentConversation()
+          setConversationLoaded(true)
+        }
       }
     }
 
     loadConversation()
-  }, [clearCurrentConversation, conversationId, isSending, selectConversation])
+
+    return () => {
+      cancelled = true
+    }
+  }, [clearCurrentConversation, conversationId, selectConversation])
 
   // ─── 处理首页传来的初始消息 / 消息高亮 ──────────
   useEffect(() => {
@@ -141,10 +233,25 @@ const ChatPage = () => {
     const messageContent = content || inputValue.trim()
     if (!messageContent || isSending) return
 
+    const sendPlanId =
+      contextPreview?.send_plan &&
+      contextPreview.send_plan.reusable &&
+      contextPreview.send_plan.draft_message === messageContent
+        ? contextPreview.send_plan.plan_id
+        : undefined
+
     setInputValue('')
 
     try {
-      const newConvId = await sendMessage(messageContent)
+      const newConvId = await sendMessage(messageContent, {
+        sendPlanId,
+        chatPreferenceOverrides,
+        ragOverrides,
+      })
+      setChatPreferenceOverrides({})
+      setRagOverrides(null)
+      setIgnoredCandidateIds([])
+      setRagResetToken((current) => current + 1)
       if (newConvId && !conversationId) {
         navigate(`/chat/${newConvId}`, { replace: true })
       }
@@ -157,6 +264,64 @@ const ChatPage = () => {
     setInputValue(prompt)
   }
 
+  const handleRequestPreview = async () => {
+    const trimmed = inputValue.trim()
+    if (!trimmed || isSending || !conversationId) return
+
+    const requestId = previewRequestIdRef.current + 1
+    previewRequestIdRef.current = requestId
+    setIsPreviewLoading(true)
+    setPreviewError(null)
+
+    try {
+      const preview = await chatApi.previewContext(
+        trimmed,
+        parseInt(conversationId, 10),
+        undefined,
+        chatPreferenceOverrides,
+        ragOverrides,
+      )
+      if (previewRequestIdRef.current !== requestId) return
+      setContextPreview(preview)
+      setPreviewError(null)
+    } catch (error) {
+      if (previewRequestIdRef.current !== requestId) return
+      console.error('上下文预演失败:', error)
+      setContextPreview(null)
+      setPreviewError('完整预演暂不可用')
+    } finally {
+      if (previewRequestIdRef.current === requestId) {
+        setIsPreviewLoading(false)
+      }
+    }
+  }
+
+  const handleChatPreferenceOverrideChange = (
+    key: ChatPreferenceKey,
+    value: ChatUserPreferences[ChatPreferenceKey],
+  ) => {
+    setChatPreferenceOverrides((current) => ({
+      ...current,
+      [key]: value,
+    }))
+  }
+
+  const handleChatPreferenceOverrideClear = (key: ChatPreferenceKey) => {
+    setChatPreferenceOverrides((current) => {
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+  }
+
+  const handleIgnoreCandidate = (candidateId: string) => {
+    setIgnoredCandidateIds((current) => (current.includes(candidateId) ? current : [...current, candidateId]))
+  }
+
+  const handleRagOverridesChange = (next: ChatRagOverrides | null) => {
+    setRagOverrides(next && next.enabled ? next : null)
+  }
+
   // ─── 渲染 ──────────────────────────────────────
   return (
     <div className="flex h-full flex-col bg-slate-950">
@@ -166,12 +331,16 @@ const ChatPage = () => {
         isLoading={isLoading}
         loadError={loadError}
         isSending={isSending}
+        sendPhase={sendPhase}
+        sendPhaseLabel={sendPhaseLabel}
+        sendPhaseHint={sendPhaseHint}
         isThinking={isThinking}
         streamingContent={streamingContent}
         streamingThought={streamingThought}
         iterationSteps={iterationSteps}
         currentIteration={currentIteration}
         currentToolCall={currentToolCall}
+        currentTurnId={currentTurnId}
         highlightedMessageId={highlightedMessageId}
         onQuickPrompt={handleQuickPrompt}
         onReload={handleReload}
@@ -180,10 +349,45 @@ const ChatPage = () => {
       <ChatInput
         inputValue={inputValue}
         isSending={isSending}
+        sendPhase={sendPhase}
+        sendPhaseLabel={sendPhaseLabel}
+        sendPhaseHint={sendPhaseHint}
+        hasConversationHistory={messages.length > 0 || Boolean(currentConversation?.message_count)}
+        contextPreview={contextPreview}
+        isPreviewLoading={isPreviewLoading}
+        previewError={previewError}
+        conversationState={currentConversation?.context_state || null}
+        compactedHistory={currentConversation?.compacted_history || null}
+        chatPreferences={confirmedChatPreferences}
+        effectiveChatPreferences={effectiveChatPreferences}
+        chatPreferenceCandidates={visibleChatPreferenceCandidates}
+        chatPreferenceOverrides={chatPreferenceOverrides}
+        ragOverrides={ragOverrides}
+        effectiveRagOverrides={contextPreview?.effective_rag_overrides || ragOverrides}
+        ragResetToken={ragResetToken}
         llmProvider={currentConversation?.llm_provider}
         onInputChange={setInputValue}
         onSend={() => handleSend()}
         onStop={stopGeneration}
+        onRequestPreview={handleRequestPreview}
+        onChatPreferenceOverrideChange={handleChatPreferenceOverrideChange}
+        onChatPreferenceOverrideClear={handleChatPreferenceOverrideClear}
+        onIgnoreChatPreferenceCandidate={handleIgnoreCandidate}
+        onRagOverridesChange={handleRagOverridesChange}
+      />
+
+      <ContextDebugWindow
+        contextDebug={isLoading ? null : activeContextDebug}
+        conversationState={currentConversation?.context_state || null}
+        conversationCompactedHistory={currentConversation?.compacted_history || null}
+        conversationHistoryLog={currentConversation?.history_log || null}
+        conversationTurnStore={currentConversation?.turn_store || null}
+        conversationToolLedger={currentConversation?.tool_ledger || null}
+        conversationItemStream={currentConversation?.item_stream || null}
+        conversationContextSnapshots={currentConversation?.context_snapshots || []}
+        isSending={isSending}
+        isCompacting={isCompactingContext}
+        onManualCompact={compactConversationContext}
       />
     </div>
   )

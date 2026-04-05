@@ -81,6 +81,7 @@ verify_pages.js
 
 # Playwright temporary artifacts
 .playwright-cli/
+.playwright-mcp/
 output/
 
 # Runtime-generated MCP config

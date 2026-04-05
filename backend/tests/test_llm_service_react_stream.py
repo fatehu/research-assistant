@@ -141,3 +141,55 @@ async def test_chat_with_tools_sanitizes_invalid_function_names_and_maps_back():
 
     assert captured["tools"][0]["function"]["name"] == "mcp_firecrawl_firecrawl_scrape"
     assert result["tool_calls"][0]["name"] == "mcp.firecrawl.firecrawl_scrape"
+
+
+def test_sanitize_provider_messages_strips_internal_fields_but_keeps_tool_protocol():
+    sanitized = LLMService.sanitize_provider_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "thought": "这是一条内部摘要",
+                "metadata": {"debug": True},
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"attention\"}"},
+                    }
+                ],
+                "thought": "准备调用工具",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "web_search",
+                "content": "tool output",
+                "metadata": {"debug": True},
+            },
+        ]
+    )
+
+    assert sanitized == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{\"query\":\"attention\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "tool output",
+            "tool_call_id": "call_1",
+            "name": "web_search",
+        },
+    ]

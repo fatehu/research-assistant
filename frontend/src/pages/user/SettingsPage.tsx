@@ -46,11 +46,23 @@ type NotificationPreferences = {
   system_notification: boolean
 }
 
+type ChatPreferences = {
+  response_language: 'auto' | 'zh-CN' | 'en-US'
+  response_verbosity: 'concise' | 'balanced' | 'detailed'
+  web_search: 'ask' | 'avoid' | 'allow_when_needed'
+}
+
 const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   login_alert: true,
   invite_notification: true,
   announcement_notification: true,
   system_notification: false,
+}
+
+const DEFAULT_CHAT_PREFERENCES: ChatPreferences = {
+  response_language: 'auto',
+  response_verbosity: 'balanced',
+  web_search: 'ask',
 }
 
 const SettingsPage: React.FC = () => {
@@ -78,10 +90,14 @@ const SettingsPage: React.FC = () => {
 
   useEffect(() => {
     if (user) {
+      const rawPreferences = (user.preferences || {}) as Record<string, unknown>
       llmForm.setFieldsValue({
         preferred_llm_provider: user.preferred_llm_provider || 'openai',
+        chat_preferences: {
+          ...DEFAULT_CHAT_PREFERENCES,
+          ...(rawPreferences.chat_preferences as Partial<ChatPreferences> | undefined),
+        },
       })
-      const rawPreferences = (user.preferences || {}) as Record<string, unknown>
       const rawNotificationPrefs = (rawPreferences.notifications || {}) as Partial<NotificationPreferences>
       setNotificationPreferences({
         ...DEFAULT_NOTIFICATION_PREFERENCES,
@@ -182,11 +198,16 @@ const SettingsPage: React.FC = () => {
   const handleSaveLLMSettings = async (values: any) => {
     setSavingLLM(true)
     try {
+      const nextChatPreferences: ChatPreferences = {
+        ...DEFAULT_CHAT_PREFERENCES,
+        ...(values.chat_preferences || {}),
+      }
       const response = await api.put('/api/v1/users/profile', {
         preferred_llm_provider: values.preferred_llm_provider,
         preferences: {
           ...user?.preferences,
           ...values.preferences,
+          chat_preferences: nextChatPreferences,
         },
       })
       updateUser(response.data)
@@ -281,11 +302,55 @@ const SettingsPage: React.FC = () => {
 
           <Alert
             message="提示"
-            description="选择默认模型服务商，用于助手相关操作。"
+            description="选择默认模型服务商，并配置聊天时稳定生效的显式偏好。"
             type="info"
             showIcon
             style={{ backgroundColor: 'rgba(74, 144, 217, 0.1)', border: '1px solid rgba(74, 144, 217, 0.3)', marginBottom: 16 }}
           />
+
+          <Divider style={{ borderColor: '#30363D' }}>聊天偏好</Divider>
+
+          <Form.Item
+            name={['chat_preferences', 'response_language']}
+            label={<span style={{ color: '#8899A6' }}>默认回答语言</span>}
+          >
+            <Select
+              style={{ width: '100%' }}
+              styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
+            >
+              <Option value="auto">自动</Option>
+              <Option value="zh-CN">中文</Option>
+              <Option value="en-US">English</Option>
+            </Select>
+          </Form.Item>
+
+          <Form.Item
+            name={['chat_preferences', 'response_verbosity']}
+            label={<span style={{ color: '#8899A6' }}>默认详略程度</span>}
+          >
+            <Select
+              style={{ width: '100%' }}
+              styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
+            >
+              <Option value="concise">简洁</Option>
+              <Option value="balanced">平衡</Option>
+              <Option value="detailed">详细</Option>
+            </Select>
+          </Form.Item>
+
+          <Form.Item
+            name={['chat_preferences', 'web_search']}
+            label={<span style={{ color: '#8899A6' }}>默认联网策略</span>}
+          >
+            <Select
+              style={{ width: '100%' }}
+              styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
+            >
+              <Option value="ask">按问题决定</Option>
+              <Option value="avoid">默认避免联网</Option>
+              <Option value="allow_when_needed">必要时允许联网</Option>
+            </Select>
+          </Form.Item>
 
           <Button type="primary" icon={<SaveOutlined />} htmlType="submit" loading={savingLLM} style={{ backgroundColor: '#4A90D9' }}>
             保存设置
@@ -608,4 +673,3 @@ const SettingsPage: React.FC = () => {
 }
 
 export default SettingsPage
-

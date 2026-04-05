@@ -1,4 +1,4 @@
-import { useMemo, useState, forwardRef } from 'react'
+import { useMemo, useState, forwardRef, isValidElement, type ReactNode } from 'react'
 import { Button, Tooltip, Avatar, message } from 'antd'
 import {
   RobotOutlined,
@@ -14,13 +14,24 @@ import {
 import { AnimatePresence, motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { SHOW_RAG_METRICS, type Message, type RagMetrics, type ReactStep } from '@/services/api'
+import {
+  SHOW_RAG_METRICS,
+  type Message,
+  type RagMetrics,
+  type ConversationItemStream,
+  type ConversationToolLedger,
+  type ConversationTurnStore,
+} from '@/services/api'
 import CodeBlock from './CodeBlock'
 import ThinkingPanel from './ThinkingPanel'
 import HistoryReActPanel from './HistoryReActPanel'
 
 interface MessageBubbleProps {
   msg: Message
+  turnStore?: ConversationTurnStore
+  itemStream?: ConversationItemStream
+  toolLedger?: ConversationToolLedger
+  showHistoryPrelude?: boolean
   isStreaming?: boolean
   streamingContent?: string
   streamingThought?: string
@@ -42,6 +53,11 @@ interface RagMetricCardItem {
   label: string
   value: string
   icon: React.ReactNode
+}
+
+interface EnhancedTermParts {
+  primary: string
+  secondary: string
 }
 
 const parseRagMetrics = (value: unknown): RagMetrics | null => {
@@ -82,69 +98,168 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
 const normalizeEvidenceContent = (value: string): string =>
   value.replace(/^\[来源\d+\]\s*/i, '').replace(/\s+/g, ' ').trim()
 
-const parseKnowledgeEvidence = (steps: ReactStep[] | undefined): KnowledgeEvidenceItem[] => {
-  if (!Array.isArray(steps) || steps.length === 0) {
+const parseKnowledgeEvidence = (
+  toolLedger: ConversationToolLedger | undefined,
+  turnId: string | undefined,
+): KnowledgeEvidenceItem[] => {
+  if (!toolLedger?.entries?.length || !turnId) {
     return []
   }
 
   const items: KnowledgeEvidenceItem[] = []
   const seen = new Set<string>()
 
-  for (const step of steps) {
-    if (step.type !== 'observation' || step.tool !== 'knowledge_search' || !step.output) {
+  for (const entry of toolLedger.entries) {
+    if (
+      entry.kind !== 'tool_result' ||
+      entry.tool_name !== 'knowledge_search' ||
+      entry.turn_id !== turnId ||
+      !entry.summary
+    ) {
       continue
     }
 
-    const output = String(step.output || '').trim()
+    const output = String(entry.summary || '').trim()
     if (!output) continue
-
-    const blockPattern =
-      /\[(来源\d+)\]\s*\(retrieval score ([\d.]+)%\)\s*Source:\s*([^\n]+)\s*Compression score:\s*([\d.]+)\/10\s*Content:\s*([\s\S]*?)(?=\n\[来源\d+\]\s*\(retrieval score|\s*$)/g
-
-    let matched = false
-    let match: RegExpExecArray | null
-    while ((match = blockPattern.exec(output)) !== null) {
-      matched = true
-      const sourceLabel = String(match[1] || '').trim()
-      const sourcePath = String(match[3] || '').trim()
-      const content = normalizeEvidenceContent(String(match[5] || ''))
-      if (!content) continue
-      const id = `${sourcePath}::${content}`
-      if (seen.has(id)) continue
-      seen.add(id)
-      items.push({
-        id,
-        sourceLabel,
-        sourcePath,
-        retrievalScore: String(match[2] || '').trim(),
-        compressionScore: String(match[4] || '').trim(),
-        content,
-      })
-    }
-
-    if (!matched) {
-      const compact = normalizeEvidenceContent(output.replace(/^Compressed contexts:\s*\d+\s*/i, ''))
-      if (!compact) continue
-      const id = `raw::${compact}`
-      if (seen.has(id)) continue
-      seen.add(id)
-      items.push({
-        id,
-        sourceLabel: '检索依据',
-        sourcePath: 'knowledge_search',
-        content: compact,
-      })
-    }
+    const compact = normalizeEvidenceContent(output)
+    if (!compact) continue
+    const id = `${entry.tool_call_id || 'raw'}::${compact}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    items.push({
+      id,
+      sourceLabel: '检索依据',
+      sourcePath: 'knowledge_search',
+      content: compact,
+    })
   }
 
   return items
 }
+
+const deriveMessageTurnId = (
+  msg: Message,
+  turnStore: ConversationTurnStore | undefined,
+): string | undefined => {
+  if (!turnStore?.entries?.length) return undefined
+  if (msg.role === 'assistant') {
+    return turnStore.entries.find((entry) => entry.assistant_message_id === msg.id)?.turn_id
+  }
+  if (msg.role === 'user') {
+    return turnStore.entries.find((entry) => entry.user_message_id === msg.id)?.turn_id
+  }
+  return undefined
+}
+
+const deriveHistorySteps = (
+  itemStream: ConversationItemStream | undefined,
+  turnId: string | undefined,
+): Array<{
+  type: string
+  iteration: number
+  content?: string
+  tool?: string
+  input?: Record<string, unknown>
+  output?: string
+  success?: boolean
+}> => {
+  if (!itemStream?.entries?.length || !turnId) return []
+  const steps: Array<{
+    type: string
+    iteration: number
+    content?: string
+    tool?: string
+    input?: Record<string, unknown>
+    output?: string
+    success?: boolean
+  }> = []
+  itemStream.entries
+    .filter((entry) => entry.turn_id === turnId)
+    .forEach((entry) => {
+      if (entry.kind === 'reasoning_summary' || entry.kind === 'tool_use_summary') {
+        steps.push({
+          type: 'thought',
+          iteration: entry.iteration || 0,
+          content: entry.summary || entry.content || '',
+        })
+        return
+      }
+      if (entry.kind === 'tool_call') {
+        steps.push({
+          type: 'action',
+          iteration: entry.iteration || 0,
+          tool: entry.tool_name,
+          input: entry.arguments,
+        })
+        return
+      }
+      if (entry.kind === 'tool_result') {
+        steps.push({
+          type: 'observation',
+          iteration: entry.iteration || 0,
+          tool: entry.tool_name,
+          output: entry.summary || entry.error || '',
+          success: entry.success,
+        })
+      }
+    })
+  return steps
+}
+
+const flattenMarkdownText = (value: ReactNode): string => {
+  if (value == null || typeof value === 'boolean') {
+    return ''
+  }
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => flattenMarkdownText(item)).join('')
+  }
+  if (isValidElement(value)) {
+    return flattenMarkdownText(value.props.children)
+  }
+  return ''
+}
+
+const parseEnhancedTermParts = (value: string): EnhancedTermParts | null => {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim()
+  if (!normalized) {
+    return null
+  }
+  const match = normalized.match(/^([A-Za-z][A-Za-z0-9/+:#&'’., -]{1,80}?)\s*[（(]\s*([^()（）\n]{1,40})\s*[）)]$/)
+  if (!match) {
+    return null
+  }
+  const primary = String(match[1] || '').trim()
+  const secondary = String(match[2] || '').trim()
+  if (!primary || !secondary) {
+    return null
+  }
+  return { primary, secondary }
+}
+
+const EnhancedTermChip = ({ primary, secondary }: EnhancedTermParts) => (
+  <span className="mx-0.5 inline-flex max-w-full items-center gap-2 rounded-full border border-emerald-400/18 bg-emerald-500/10 px-3 py-1 align-middle shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+    <span className="truncate text-[0.92em] font-semibold tracking-[0.01em] text-emerald-100">
+      {primary}
+    </span>
+    <span className="h-3.5 w-px bg-white/[0.08]" />
+    <span className="truncate text-[0.82em] font-medium text-cyan-200">
+      {secondary}
+    </span>
+  </span>
+)
 
 /** 消息气泡 - 美化版 */
 const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
   (
     {
       msg,
+      turnStore,
+      itemStream,
+      toolLedger,
+      showHistoryPrelude = true,
       isStreaming = false,
       streamingContent = '',
       isThinking = false,
@@ -154,15 +269,24 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
   ) => {
     const isUser = msg.role === 'user'
     const content = isStreaming ? streamingContent : msg.content
-    const thought = isStreaming ? '' : msg.thought
-    const reactSteps = isStreaming ? undefined : msg.react_steps
+    const turnId = useMemo(() => deriveMessageTurnId(msg, turnStore), [msg, turnStore])
+    const historySteps = useMemo(
+      () => (isStreaming ? [] : deriveHistorySteps(itemStream, turnId)),
+      [isStreaming, itemStream, turnId],
+    )
+    const derivedThought = useMemo(
+      () => historySteps.find((step) => step.type === 'thought')?.content || '',
+      [historySteps],
+    )
+    const thought = isStreaming ? '' : derivedThought || msg.thought || ''
+    const hasReasoningSummary = Boolean(derivedThought || msg.thought)
     const [thoughtExpanded, setThoughtExpanded] = useState(false)
     const [ragExpanded, setRagExpanded] = useState(false)
     const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
     const evidenceItems = useMemo(
-      () => (!isStreaming && !isUser ? parseKnowledgeEvidence(reactSteps) : []),
-      [isStreaming, isUser, reactSteps]
+      () => (!isStreaming && !isUser ? parseKnowledgeEvidence(toolLedger, turnId) : []),
+      [isStreaming, isUser, toolLedger, turnId]
     )
     const ragMetricCards = useMemo<RagMetricCardItem[]>(
       () =>
@@ -212,7 +336,15 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const userBubbleShellClass = 'inline-flex max-w-[min(76%,720px)] flex-col items-end'
     const assistantBubbleWidthClass = 'w-full max-w-[min(100%,860px)]'
     const hasAssistantPrelude =
-      !isUser && !isStreaming && ((reactSteps?.length ?? 0) > 0 || Boolean(thought))
+      showHistoryPrelude && !isUser && !isStreaming && (historySteps.length > 0 || String(thought || '').trim().length > 0)
+    const normalizedContent = String(content || '').trim()
+    const normalizedThought = String(thought || '').trim()
+    const shouldHideEmptyAssistantBubble =
+      !isUser && !isStreaming && !normalizedContent && !normalizedThought && historySteps.length === 0
+
+    if (shouldHideEmptyAssistantBubble) {
+      return null
+    }
 
     return (
       <motion.div
@@ -336,8 +468,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
               <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-6 pt-5 pb-6 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_30px_rgba(2,6,23,0.18)]">
                   {hasAssistantPrelude && (
                     <div className="mb-3 space-y-3 border-b border-white/[0.04] pb-3">
-                      {reactSteps && reactSteps.length > 0 && (
-                        <HistoryReActPanel steps={reactSteps} embedded />
+                      {historySteps.length > 0 && (
+                        <HistoryReActPanel steps={historySteps} embedded />
                       )}
                       {thought && (
                         <ThinkingPanel
@@ -346,6 +478,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                           isExpanded={thoughtExpanded}
                           onToggle={() => setThoughtExpanded(!thoughtExpanded)}
                           embedded
+                          label={hasReasoningSummary ? '推理摘要' : '最终思考'}
                         />
                       )}
                     </div>
@@ -396,6 +529,18 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                                 {children}
                               </li>
                             ),
+                            strong: ({ children, ...props }) => {
+                              const flattened = flattenMarkdownText(children)
+                              const enhancedTerm = parseEnhancedTermParts(flattened)
+                              if (enhancedTerm) {
+                                return <EnhancedTermChip {...enhancedTerm} />
+                              }
+                              return (
+                                <strong {...props} className="font-semibold text-white">
+                                  {children}
+                                </strong>
+                              )
+                            },
                           }}
                         >
                           {content}

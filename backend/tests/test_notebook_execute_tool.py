@@ -139,3 +139,61 @@ def test_notebook_execute_appends_new_cell_for_unrelated_code():
     assert result.data["new_cell"]["id"]
     assert len(notebooks_store[notebook_id]["cells"]) == 2
     assert notebooks_store[notebook_id]["cells"][0]["id"] == "cell-error"
+
+
+def test_notebook_execute_prefers_cell_id_over_cell_index_when_both_are_present():
+    notebook_id = "nb-execute-id-first"
+    notebook = {
+        "id": notebook_id,
+        "user_id": 11,
+        "cells": [
+            {
+                "id": "cell-one",
+                "cell_type": "code",
+                "source": "print('one')",
+                "outputs": [],
+                "execution_count": 1,
+                "metadata": {},
+            },
+            {
+                "id": "cell-two",
+                "cell_type": "code",
+                "source": "print('two')",
+                "outputs": [],
+                "execution_count": 2,
+                "metadata": {},
+            },
+        ],
+        "execution_count": 2,
+    }
+    notebooks_store = {notebook_id: notebook}
+    kernel = _DummyKernel(
+        {
+            "success": True,
+            "outputs": [{"output_type": "stream", "content": "patched", "mime_type": "text/plain"}],
+            "execution_count": 3,
+            "execution_time_ms": 15,
+        }
+    )
+    tool = NotebookExecuteTool(
+        kernel_manager=_DummyKernelManager(kernel),
+        notebook_id=notebook_id,
+        notebooks_store=notebooks_store,
+        user_authorized=True,
+    )
+
+    result = asyncio.run(
+        tool.execute(
+            "print('patched')",
+            description="覆盖指定 cell",
+            cell_id="cell-two",
+            cell_index=1,
+            write_mode="replace",
+        )
+    )
+
+    assert result.success is True
+    assert result.data["operation"] == "update"
+    assert result.data["updated_cell"]["id"] == "cell-two"
+    assert notebooks_store[notebook_id]["cells"][1]["source"] == "print('patched')"
+    assert notebooks_store[notebook_id]["cells"][0]["source"] == "print('one')"

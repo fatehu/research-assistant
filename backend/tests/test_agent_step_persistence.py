@@ -53,9 +53,6 @@ class _FakeRuntimeService:
     async def remember(self, **kwargs):
         return None
 
-    async def upsert_conversation_summary(self, *args, **kwargs):
-        return None
-
 
 @pytest.mark.asyncio
 async def test_agent_step_persistence_enabled(monkeypatch):

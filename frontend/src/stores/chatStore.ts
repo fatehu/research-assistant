@@ -1,5 +1,20 @@
 import { create } from 'zustand'
-import { chatApi, Conversation, Message } from '@/services/api'
+import {
+  chatApi,
+  type ChatContextDebug,
+  type ChatRagOverrides,
+  type ChatUserPreferences,
+  Conversation,
+  Message,
+  type MessageMetadata,
+  type ConversationHistoryLog,
+  type ConversationContextSnapshot,
+  type ConversationContextState,
+  type ConversationCompactedHistory,
+  type ConversationTurnStore,
+  type ConversationToolLedger,
+  type ConversationItemStream,
+} from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
 // 工具调用信息
@@ -22,6 +37,17 @@ export interface IterationStep {
   timestamp: number
 }
 
+export type SendPhase =
+  | 'idle'
+  | 'submitting'
+  | 'planning'
+  | 'loading_context'
+  | 'routing'
+  | 'waiting_model'
+  | 'thinking'
+  | 'tool'
+  | 'answering'
+
 interface ChatState {
   // 对话列表
   conversations: Conversation[]
@@ -32,10 +58,16 @@ interface ChatState {
   isLoading: boolean
   isSending: boolean
   isLoadingList: boolean  // 对话列表加载状态
+  isCompactingContext: boolean
 
   // 流式响应状态
+  sendPhase: SendPhase
+  sendPhaseLabel: string | null
+  sendPhaseHint: string | null
   streamingContent: string
   streamingThought: string
+  streamingContextDebug: ChatContextDebug | null
+  lastRunContextDebug: ChatContextDebug | null
   isThinking: boolean  // 是否正在思考中
 
   // ReAct 迭代状态
@@ -43,6 +75,7 @@ interface ChatState {
   currentIteration: number  // 当前迭代次数
   toolCalls: ToolCall[]
   currentToolCall: ToolCall | null
+  currentTurnId: string | null
 
   // 停止控制
   abortController: AbortController | null
@@ -53,7 +86,15 @@ interface ChatState {
   selectConversation: (conversationId: number) => Promise<void>
   deleteConversation: (conversationId: number) => Promise<void>
   archiveConversation: (conversationId: number) => Promise<void>
-  sendMessage: (message: string) => Promise<number | undefined>  // 返回新对话ID（如果有）
+  compactConversationContext: () => Promise<void>
+  sendMessage: (
+    message: string,
+    options?: {
+      sendPlanId?: string
+      chatPreferenceOverrides?: Partial<ChatUserPreferences>
+      ragOverrides?: ChatRagOverrides | null
+    },
+  ) => Promise<number | undefined>  // 返回新对话ID（如果有）
   stopGeneration: () => void  // 停止生成
   clearCurrentConversation: () => void
 }
@@ -65,13 +106,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isLoading: false,
   isSending: false,
   isLoadingList: false,
+  isCompactingContext: false,
+  sendPhase: 'idle',
+  sendPhaseLabel: null,
+  sendPhaseHint: null,
   streamingContent: '',
   streamingThought: '',
+  streamingContextDebug: null,
+  lastRunContextDebug: null,
   isThinking: false,
   iterationSteps: [],
   currentIteration: 0,
   toolCalls: [],
   currentToolCall: null,
+  currentTurnId: null,
   abortController: null,
 
   fetchConversations: async () => {
@@ -95,6 +143,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         conversations: [conversation, ...state.conversations],
         currentConversation: conversation,
         messages: [],
+        lastRunContextDebug: null,
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
       }))
       return conversation
     } catch (error) {
@@ -116,6 +168,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({
         currentConversation: conversation,
         messages: sortedMessages,
+        streamingContextDebug: null,
+        lastRunContextDebug: null,
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
         isLoading: false,
       })
     } catch (error) {
@@ -132,6 +189,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       conversations: state.conversations.filter((c) => c.id !== conversationId),
       currentConversation: currentConversation?.id === conversationId ? null : currentConversation,
       messages: currentConversation?.id === conversationId ? [] : state.messages,
+      lastRunContextDebug: currentConversation?.id === conversationId ? null : state.lastRunContextDebug,
+      sendPhase: currentConversation?.id === conversationId ? 'idle' : state.sendPhase,
+      sendPhaseLabel: currentConversation?.id === conversationId ? null : state.sendPhaseLabel,
+      sendPhaseHint: currentConversation?.id === conversationId ? null : state.sendPhaseHint,
     }))
   },
 
@@ -153,7 +214,71 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  sendMessage: async (message: string): Promise<number | undefined> => {
+  compactConversationContext: async () => {
+    const { currentConversation } = get()
+    if (!currentConversation?.id) return
+
+    set({ isCompactingContext: true })
+    try {
+      const payload = await chatApi.compactConversation(currentConversation.id)
+      const nextContextState =
+        payload.context_state && typeof payload.context_state === 'object'
+          ? (payload.context_state as ConversationContextState)
+          : undefined
+      const nextCompactedHistory =
+        payload.compacted_history && typeof payload.compacted_history === 'object'
+          ? (payload.compacted_history as ConversationCompactedHistory)
+          : undefined
+      const nextHistoryLog =
+        payload.history_log && typeof payload.history_log === 'object'
+          ? (payload.history_log as ConversationHistoryLog)
+          : undefined
+      const nextTurnStore =
+        payload.turn_store && typeof payload.turn_store === 'object'
+          ? (payload.turn_store as ConversationTurnStore)
+          : undefined
+      const nextToolLedger =
+        payload.tool_ledger && typeof payload.tool_ledger === 'object'
+          ? (payload.tool_ledger as ConversationToolLedger)
+          : undefined
+      const nextItemStream =
+        payload.item_stream && typeof payload.item_stream === 'object'
+          ? (payload.item_stream as ConversationItemStream)
+          : undefined
+      const nextContextSnapshots = Array.isArray(payload.context_snapshots)
+        ? (payload.context_snapshots as ConversationContextSnapshot[])
+        : undefined
+
+      set((state) => ({
+        currentConversation: state.currentConversation
+          ? {
+              ...state.currentConversation,
+              ...(nextContextState ? { context_state: nextContextState } : {}),
+              ...(nextCompactedHistory ? { compacted_history: nextCompactedHistory } : {}),
+              ...(nextHistoryLog ? { history_log: nextHistoryLog } : {}),
+              ...(nextTurnStore ? { turn_store: nextTurnStore } : {}),
+              ...(nextToolLedger ? { tool_ledger: nextToolLedger } : {}),
+              ...(nextItemStream ? { item_stream: nextItemStream } : {}),
+              ...(nextContextSnapshots ? { context_snapshots: nextContextSnapshots } : {}),
+            }
+          : state.currentConversation,
+        isCompactingContext: false,
+      }))
+    } catch (error) {
+      set({ isCompactingContext: false })
+      handleApiError(error, '压缩会话上下文')
+      throw error
+    }
+  },
+
+  sendMessage: async (
+    message: string,
+    options?: {
+      sendPlanId?: string
+      chatPreferenceOverrides?: Partial<ChatUserPreferences>
+      ragOverrides?: ChatRagOverrides | null
+    },
+  ): Promise<number | undefined> => {
     const { currentConversation, fetchConversations, isSending } = get()
 
     // 防止重复发送
@@ -178,12 +303,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: [...state.messages, userMessage],
       isSending: true,
       isThinking: false,  // 初始不是思考状态，等待 thinking_start 事件
+      sendPhase: 'submitting',
+      sendPhaseLabel: null,
+      sendPhaseHint: null,
       streamingContent: '',
       streamingThought: '',
+      streamingContextDebug: null,
       iterationSteps: [],  // 重置迭代步骤
       currentIteration: 0,  // 重置为0，thinking_start时会变为1（表示第1轮）
       toolCalls: [],
       currentToolCall: null,
+      currentTurnId: null,
       abortController,  // 保存 AbortController
     }))
 
@@ -199,6 +329,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         (event, data) => {
           switch (event) {
             case 'start':
+              set({
+                sendPhase: 'planning',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
+                currentTurnId:
+                  data && typeof data === 'object' && typeof data.turn_id === 'string' && data.turn_id.trim()
+                    ? data.turn_id.trim()
+                    : null,
+              })
               if (data.conversation_id && !currentConversation) {
                 // 新创建的对话
                 newConversationId = data.conversation_id
@@ -217,10 +356,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
               }
               break
 
+            case 'phase':
+              if (data && typeof data === 'object') {
+                const phaseKey = typeof data.key === 'string' ? data.key : ''
+                const nextPhase: SendPhase =
+                  phaseKey === 'loading_context' ||
+                  phaseKey === 'routing' ||
+                  phaseKey === 'waiting_model' ||
+                  phaseKey === 'planning' ||
+                  phaseKey === 'thinking' ||
+                  phaseKey === 'tool' ||
+                  phaseKey === 'answering'
+                    ? phaseKey
+                    : 'planning'
+                set({
+                  sendPhase: nextPhase,
+                  sendPhaseLabel: typeof data.label === 'string' && data.label.trim() ? data.label.trim() : null,
+                  sendPhaseHint: typeof data.hint === 'string' && data.hint.trim() ? data.hint.trim() : null,
+                })
+              }
+              break
+
             case 'thinking_start':
               // 新一轮迭代开始
               set((state) => ({
                 isThinking: true,
+                sendPhase: 'thinking',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
                 currentIteration: state.currentIteration + 1,
               }))
               currentThought = ''  // 重置当前思考
@@ -238,6 +401,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               set((state) => ({
                 streamingThought: currentThought,
                 isThinking: false,
+                sendPhase: 'thinking',
                 iterationSteps: [...state.iterationSteps, {
                   type: 'thought',
                   content: data,
@@ -257,6 +421,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 currentToolCall: toolCall,
                 toolCalls: [...state.toolCalls, toolCall],
                 isThinking: false,
+                sendPhase: 'tool',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
                 iterationSteps: [...state.iterationSteps, {
                   type: 'action',
                   content: `调用工具: ${data.tool}`,
@@ -283,6 +450,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   toolCalls: updatedToolCalls,
                   currentToolCall: null,
                   isThinking: true,  // 继续思考
+                  sendPhase: 'thinking',
+                  sendPhaseLabel: null,
+                  sendPhaseHint: null,
                   iterationSteps: [...state.iterationSteps, {
                     type: 'observation',
                     content: data.output,
@@ -300,7 +470,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
               fullContent += data
               set({
                 streamingContent: fullContent,
+                sendPhase: 'answering',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
                 isThinking: false
+              })
+              break
+
+            case 'context_debug':
+              set({
+                streamingContextDebug:
+                  data && typeof data === 'object' ? (data as ChatContextDebug) : null,
               })
               break
 
@@ -312,8 +492,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   return {
                     isSending: false,
                     isThinking: false,
+                    sendPhase: 'idle',
+                    sendPhaseLabel: null,
+                    sendPhaseHint: null,
                     streamingContent: '',
                     streamingThought: '',
+                    streamingContextDebug: null,
                     iterationSteps: [],
                     currentIteration: 0,
                     toolCalls: [],
@@ -329,28 +513,81 @@ export const useChatStore = create<ChatState>((set, get) => ({
               // 完成，添加助手消息
               const doneData = (data && typeof data === 'object') ? data as Record<string, any> : {}
               const ragMetrics = doneData.rag_metrics
-              const assistantMessage: Message = {
-                id: Date.now() + 1,
-                conversation_id: newConversationId || currentConversation?.id || 0,
-                role: 'assistant',
-                content: fullContent || doneData.answer || '',
-                message_type: 'text',
-                thought: currentThought || doneData.thought || undefined,
-                react_steps: doneData.react_steps || undefined,  // 保存ReAct步骤
-                metadata: ragMetrics ? { rag_metrics: ragMetrics } : undefined,
-                created_at: new Date().toISOString(),
-              }
+              const contextDebug = get().streamingContextDebug
+              const reasoningSummary =
+                typeof doneData.reasoning_summary === 'string' && doneData.reasoning_summary.trim()
+                  ? doneData.reasoning_summary.trim()
+                  : ''
+              const conversationContextState =
+                doneData.context_state && typeof doneData.context_state === 'object'
+                  ? (doneData.context_state as ConversationContextState)
+                  : undefined
+              const conversationTurnStore =
+                doneData.turn_store && typeof doneData.turn_store === 'object'
+                  ? (doneData.turn_store as ConversationTurnStore)
+                  : undefined
+              const conversationToolLedger =
+                doneData.tool_ledger && typeof doneData.tool_ledger === 'object'
+                  ? (doneData.tool_ledger as ConversationToolLedger)
+                  : undefined
+              const conversationItemStream =
+                doneData.item_stream && typeof doneData.item_stream === 'object'
+                  ? (doneData.item_stream as ConversationItemStream)
+                  : undefined
+              const metadata: MessageMetadata | undefined =
+                ragMetrics || reasoningSummary
+                  ? {
+                      ...(ragMetrics ? { rag_metrics: ragMetrics } : {}),
+                      ...(reasoningSummary ? { reasoning_summary: { summary: reasoningSummary } } : {}),
+                    }
+                  : undefined
+              const finalAssistantContent = String(fullContent || doneData.answer || '')
+              const finalAssistantThought =
+                typeof doneData.thought === 'string' && doneData.thought.trim()
+                  ? doneData.thought.trim()
+                  : currentThought || undefined
+              const shouldAppendLocalAssistantMessage =
+                Boolean(finalAssistantContent.trim()) || Boolean(String(finalAssistantThought || '').trim())
 
               set((state) => ({
-                messages: [...state.messages, assistantMessage],
+                messages: shouldAppendLocalAssistantMessage
+                  ? [
+                      ...state.messages,
+                      {
+                        id: Date.now() + 1,
+                        conversation_id: newConversationId || currentConversation?.id || 0,
+                        role: 'assistant',
+                        content: finalAssistantContent,
+                        message_type: 'text',
+                        thought: finalAssistantThought,
+                        metadata,
+                        created_at: new Date().toISOString(),
+                      },
+                    ]
+                  : state.messages,
+                currentConversation: state.currentConversation
+                  ? {
+                      ...state.currentConversation,
+                      ...(conversationContextState ? { context_state: conversationContextState } : {}),
+                      ...(conversationTurnStore ? { turn_store: conversationTurnStore } : {}),
+                      ...(conversationToolLedger ? { tool_ledger: conversationToolLedger } : {}),
+                      ...(conversationItemStream ? { item_stream: conversationItemStream } : {}),
+                    }
+                  : state.currentConversation,
                 isSending: false,
                 isThinking: false,
+                sendPhase: 'idle',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
                 streamingContent: '',
                 streamingThought: '',
+                streamingContextDebug: null,
+                lastRunContextDebug: contextDebug || state.streamingContextDebug,
                 iterationSteps: [],  // 清空迭代步骤
                 currentIteration: 0,
                 toolCalls: [],  // 清空工具调用记录
                 currentToolCall: null,
+                currentTurnId: null,
                 abortController: null,
               }))
 
@@ -362,16 +599,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
               set({
                 isSending: false,
                 isThinking: false,
+                sendPhase: 'idle',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
+                streamingContextDebug: null,
                 iterationSteps: [],
                 currentIteration: 0,
                 toolCalls: [],
                 currentToolCall: null,
+                lastRunContextDebug: null,
+                currentTurnId: null,
                 abortController: null,
               })
               throw new Error(data)
           }
         },
-        abortController
+        abortController,
+        options?.sendPlanId,
+        options?.chatPreferenceOverrides,
+        options?.ragOverrides,
       )
 
       return newConversationId
@@ -385,10 +631,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({
         isSending: false,
         isThinking: false,
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
+        streamingContextDebug: null,
         iterationSteps: [],
         currentIteration: 0,
         toolCalls: [],
         currentToolCall: null,
+        currentTurnId: null,
         abortController: null,
       })
       throw error
@@ -397,14 +648,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   stopGeneration: () => {
     const state = get()
-    const { abortController, isSending, currentConversation, streamingContent, streamingThought, iterationSteps } = state
+    const { abortController, isSending, currentConversation, streamingContent, streamingThought, iterationSteps, streamingContextDebug, currentTurnId } = state
 
     if (!abortController || !isSending) {
       return
     }
 
     // 立即设置 isSending 为 false，防止重复调用和 race condition
-    set({ isSending: false })
+    set({ isSending: false, sendPhase: 'idle', sendPhaseLabel: null, sendPhaseHint: null })
 
     // 保存当前内容
     const stoppedContent = streamingContent || ''
@@ -424,33 +675,31 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // 只有在有内容且有对话ID时才保存
     const conversationId = currentConversation?.id
     if ((finalContent || stoppedSteps.length > 0) && conversationId) {
-      const reactSteps = stoppedSteps.length > 0 ? stoppedSteps.map((step, idx) => ({
-        type: step.type,
-        iteration: Math.floor(idx / 3) + 1,
-        content: step.content,
-        tool: step.tool,
-        input: step.toolInput,
-        output: step.toolOutput,
-        success: step.success,
-      })) : undefined
-
       // 保存到数据库
       chatApi.saveStoppedMessage({
         conversation_id: conversationId,
         content: finalContent || '[已停止生成]',
         thought: stoppedThought || undefined,
-        react_steps: reactSteps,
+        metadata: {
+          ...(currentTurnId ? { turn_id: currentTurnId } : {}),
+        },
       }).then((savedMessage) => {
         // 使用数据库返回的消息更新 store
         set((currentState) => ({
           messages: [...currentState.messages, savedMessage],
           isThinking: false,
+          sendPhase: 'idle',
+          sendPhaseLabel: null,
+          sendPhaseHint: null,
           streamingContent: '',
           streamingThought: '',
+          streamingContextDebug: null,
+          lastRunContextDebug: streamingContextDebug || currentState.lastRunContextDebug,
           iterationSteps: [],
           currentIteration: 0,
           toolCalls: [],
           currentToolCall: null,
+          currentTurnId: null,
           abortController: null,
         }))
       }).catch((error) => {
@@ -463,19 +712,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           content: finalContent || '[已停止生成]',
           message_type: 'text',
           thought: stoppedThought || undefined,
-          react_steps: reactSteps,
+          metadata: undefined,
           created_at: new Date().toISOString(),
         }
 
         set((currentState) => ({
           messages: [...currentState.messages, localMessage],
           isThinking: false,
+          sendPhase: 'idle',
+          sendPhaseLabel: null,
+          sendPhaseHint: null,
           streamingContent: '',
           streamingThought: '',
+          streamingContextDebug: null,
+          lastRunContextDebug: streamingContextDebug || currentState.lastRunContextDebug,
           iterationSteps: [],
           currentIteration: 0,
           toolCalls: [],
           currentToolCall: null,
+          currentTurnId: null,
           abortController: null,
         }))
       })
@@ -483,12 +738,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 没有内容需要保存
       set({
         isThinking: false,
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
         streamingContent: '',
         streamingThought: '',
+        streamingContextDebug: null,
+        lastRunContextDebug: streamingContextDebug || state.lastRunContextDebug,
         iterationSteps: [],
         currentIteration: 0,
         toolCalls: [],
         currentToolCall: null,
+        currentTurnId: null,
         abortController: null,
       })
     }
@@ -501,12 +762,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       currentConversation: null,
       messages: [],
+      sendPhase: 'idle',
+      sendPhaseLabel: null,
+      sendPhaseHint: null,
       streamingContent: '',
       streamingThought: '',
+      streamingContextDebug: null,
+      lastRunContextDebug: null,
       iterationSteps: [],
       currentIteration: 0,
       toolCalls: [],
       currentToolCall: null,
+      currentTurnId: null,
       abortController: null,
     })
   },

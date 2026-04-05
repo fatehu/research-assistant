@@ -14,6 +14,7 @@ import json
 import re
 import sys
 import asyncio
+import math
 import subprocess
 import time
 from typing import Dict, Any, Optional, List
@@ -74,11 +75,34 @@ ALLOWED_PACKAGES = {
     'tabulate', 'prettytable', 'colorama',
 }
 
+SANDBOX_FORBIDDEN_IMPORT_ROOTS = {
+    "os", "subprocess", "socket", "pathlib", "shutil", "tempfile", "requests",
+    "httpx", "urllib", "aiohttp", "ftplib", "telnetlib", "paramiko",
+    "multiprocessing", "threading", "ctypes", "importlib", "pickle", "marshal",
+}
+
 # 网页爬取黑名单域名
 BLOCKED_DOMAINS = {
     'localhost', '127.0.0.1', '0.0.0.0',
     'internal', 'intranet', 'corp', 'private',
 }
+
+
+def _extract_sandbox_blocked_imports(source: str) -> List[str]:
+    blocked: List[str] = []
+    for line in str(source or "").splitlines():
+        stripped = line.strip()
+        module_name = ""
+        if stripped.startswith("import "):
+            module_name = stripped[len("import ") :].split(",")[0].strip().split()[0]
+        elif stripped.startswith("from "):
+            module_name = stripped[len("from ") :].split()[0].strip()
+        if not module_name:
+            continue
+        root = module_name.split(".")[0]
+        if root in SANDBOX_FORBIDDEN_IMPORT_ROOTS and root not in blocked:
+            blocked.append(root)
+    return blocked
 
 
 def _workspace_context_for_notebook_payload(notebook: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -105,7 +129,7 @@ class NotebookExecuteTool(Tool):
 1. 追加一个新的代码单元格；
 2. 覆盖已有单元格并把执行结果写回该单元格。
 适用于：运行数据分析代码、创建图表、测试代码片段，或修复已有报错单元格。
-如果是在修复当前/最近报错的单元格，优先使用 cell_index 或 cell_id 覆盖原单元格，而不是再新增一个修复版单元格。
+如果是在修复当前/最近报错的单元格，优先使用 cell_id 覆盖原单元格；cell_index 仅作为兼容参数，而不是再新增一个修复版单元格。
 注意：此操作需要用户授权。"""
     parameters = {
         "type": "object",
@@ -120,11 +144,11 @@ class NotebookExecuteTool(Tool):
             },
             "cell_id": {
                 "type": "string",
-                "description": "可选：要覆盖的目标单元格 ID。提供后会直接更新该单元格。"
+                "description": "可选：要覆盖的目标单元格 ID。首选此字段；提供后会直接更新该单元格。"
             },
             "cell_index": {
                 "type": "integer",
-                "description": "可选：要覆盖的目标单元格位置索引，从1开始。提供后会直接更新该单元格。"
+                "description": "可选：要覆盖的目标单元格位置索引，从1开始。仅兼容旧调用；如果同时提供 cell_id 和 cell_index，以 cell_id 为准。"
             },
             "write_mode": {
                 "type": "string",
@@ -144,17 +168,16 @@ class NotebookExecuteTool(Tool):
     @staticmethod
     def _resolve_target_cell(notebook: dict, cell_id: str = None, cell_index: int = None):
         cells = list(notebook.get('cells', []) or [])
+        if cell_id:
+            for idx, cell in enumerate(cells):
+                if cell.get('id') == cell_id:
+                    return cell, idx, cell_id
         if cell_index is not None:
             actual_index = int(cell_index) - 1
             if 0 <= actual_index < len(cells):
                 cell = cells[actual_index]
                 return cell, actual_index, cell.get('id')
             return None, None, None
-
-        if cell_id:
-            for idx, cell in enumerate(cells):
-                if cell.get('id') == cell_id:
-                    return cell, idx, cell_id
         return None, None, None
 
     @staticmethod
@@ -487,21 +510,21 @@ class NotebookCellTool(Tool):
     操作 Notebook 单元格 - 【增强版】
     
     支持添加、删除、更新、获取、移动单元格
-    【增强】支持通过索引（位置）操作，不仅限于 cell_id
+    【增强】以 cell_id 主定位，索引仅兼容旧调用
     """
     name = "notebook_cell"
     description = """操作 Notebook 的单元格。
 支持的操作:
 - get: 获取所有单元格列表（显示索引和 cell_id）
 - add: 添加新单元格
-- delete: 删除单元格（支持通过 cell_id 或索引）
-- update: 更新单元格内容
-- move: 移动单元格位置
+- delete: 删除单元格（优先用 cell_id，索引仅兼容）
+- update: 更新单元格内容（优先用 cell_id，索引仅兼容）
+- move: 移动单元格位置（优先用 cell_id，索引仅兼容）
 - get_one: 获取单个单元格详情
 
 【重要】删除/更新/移动时可以使用:
-1. cell_id: 单元格的唯一标识符（UUID格式）
-2. cell_index: 单元格位置索引（从1开始，如第一个单元格是1）
+1. cell_id: 单元格的唯一标识符（UUID格式，首选）
+2. cell_index: 单元格位置索引（从1开始，如第一个单元格是1，仅兼容）
 
 注意：修改操作需要用户授权。"""
     parameters = {
@@ -514,11 +537,11 @@ class NotebookCellTool(Tool):
             },
             "cell_id": {
                 "type": "string",
-                "description": "单元格 ID（UUID格式，delete/update/get_one/move 可用）"
+                "description": "单元格 ID（UUID格式，首选；delete/update/get_one/move 可用）"
             },
             "cell_index": {
                 "type": "integer",
-                "description": "单元格位置索引，从1开始（delete/update/get_one/move 可用，优先使用）"
+                "description": "单元格位置索引，从1开始（仅兼容旧调用；如果同时提供 cell_id 和 cell_index，以 cell_id 为准）"
             },
             "cell_type": {
                 "type": "string",
@@ -549,21 +572,10 @@ class NotebookCellTool(Tool):
     def _resolve_cell(self, notebook: dict, cell_id: str = None, cell_index: int = None) -> tuple:
         """
         解析单元格引用，返回 (cell, actual_index, cell_id)
-        支持通过 cell_id 或 cell_index 定位
+        支持通过 cell_id 或 cell_index 定位，优先使用 cell_id
         """
         cells = notebook.get('cells', [])
-        
-        # 优先使用 cell_index
-        if cell_index is not None:
-            # cell_index 是 1-based
-            actual_index = cell_index - 1
-            if 0 <= actual_index < len(cells):
-                cell = cells[actual_index]
-                return cell, actual_index, cell.get('id')
-            else:
-                return None, None, None
-        
-        # 使用 cell_id
+
         if cell_id:
             for i, cell in enumerate(cells):
                 if cell.get('id') == cell_id:
@@ -580,6 +592,13 @@ class NotebookCellTool(Tool):
                         return cell, actual_index, cell.get('id')
             except ValueError:
                 pass
+
+        if cell_index is not None:
+            actual_index = cell_index - 1
+            if 0 <= actual_index < len(cells):
+                cell = cells[actual_index]
+                return cell, actual_index, cell.get('id')
+            return None, None, None
         
         return None, None, None
     
@@ -665,11 +684,16 @@ class NotebookCellTool(Tool):
             has_output = bool(cell.get('outputs'))
             metadata = cell.get('metadata', {})
             created_by = metadata.get('created_by', 'user')
-            
+            blocked_imports = _extract_sandbox_blocked_imports(source)
+
             icon = "💻" if cell_type == "code" else "📝"
             status = f"[{exec_count}]" if exec_count else "[未执行]"
             output_indicator = " 📤有输出" if has_output else ""
             creator = " 🤖AI创建" if created_by == 'ai_agent' else ""
+            risk_indicator = ""
+            if blocked_imports:
+                imports_text = ",".join(blocked_imports[:2])
+                risk_indicator = f" ⚠️禁用导入:{imports_text}"
             
             # 截取代码预览
             preview = source.replace('\n', ' ')[:80]
@@ -678,7 +702,7 @@ class NotebookCellTool(Tool):
             
             # 格式化输出，确保显示 cell_id
             output_parts.append(
-                f"\n{icon} 【索引 {i+1}】{status}{output_indicator}{creator}\n"
+                f"\n{icon} 【索引 {i+1}】{status}{output_indicator}{creator}{risk_indicator}\n"
                 f"   ID: {cell_id}\n"
                 f"   内容: {preview}"
             )
@@ -690,11 +714,15 @@ class NotebookCellTool(Tool):
                 "preview": source[:200],
                 "execution_count": exec_count,
                 "has_output": has_output,
-                "created_by": created_by
+                "created_by": created_by,
+                "blocked_imports": blocked_imports,
+                "sandbox_risky": bool(blocked_imports),
             })
         
         output_parts.append("\n" + "=" * 60)
-        output_parts.append("\n💡 提示: 删除/更新时可使用 cell_index（如 1, 2, 3）或 cell_id")
+        output_parts.append("\n💡 提示: 删除/更新时优先使用 cell_id；cell_index（如 1, 2, 3）仅兼容旧调用。")
+        if any(bool(item.get("sandbox_risky")) for item in cells_data):
+            output_parts.append("⚠️ 若单元格包含禁用导入（如 os），不要直接建议执行该单元格。")
         
         return ToolResult(
             success=True,
@@ -721,6 +749,7 @@ class NotebookCellTool(Tool):
         exec_count = cell.get('execution_count')
         outputs = cell.get('outputs', [])
         metadata = cell.get('metadata', {})
+        blocked_imports = _extract_sandbox_blocked_imports(source)
         
         icon = "💻" if cell_type == "code" else "📝"
         
@@ -734,9 +763,17 @@ class NotebookCellTool(Tool):
             f"输出数量: {len(outputs)}",
             f"创建者: {metadata.get('created_by', 'user')}",
             f"=" * 40,
-            f"内容:\n{source}"
         ]
-        
+        if blocked_imports:
+            output_parts.extend(
+                [
+                    f"风险提示: 检测到沙箱禁用导入 {', '.join(blocked_imports)}",
+                    "建议: 不要直接建议执行该单元格；如果要修复，先移除这些导入并改用 Notebook 文件 helper。",
+                    f"=" * 40,
+                ]
+            )
+        output_parts.append(f"内容:\n{source}")
+
         return ToolResult(
             success=True,
             output="\n".join(output_parts),
@@ -747,7 +784,9 @@ class NotebookCellTool(Tool):
                 "source": source,
                 "execution_count": exec_count,
                 "outputs": outputs,
-                "metadata": metadata
+                "metadata": metadata,
+                "blocked_imports": blocked_imports,
+                "sandbox_risky": bool(blocked_imports),
             }
         )
     
@@ -2039,7 +2078,7 @@ class EnhancedLiteratureSearchTool(Tool):
     """
     name = "literature_search"
     description = """搜索学术论文和文献。
-支持的来源: semantic_scholar, arxiv, pubmed, openalex, crossref。
+支持的来源: auto, semantic_scholar, arxiv, pubmed, openalex, crossref, multi。
 可以按年份、领域过滤结果。"""
     parameters = {
         "type": "object",
@@ -2050,9 +2089,9 @@ class EnhancedLiteratureSearchTool(Tool):
             },
             "source": {
                 "type": "string",
-                "enum": ["semantic_scholar", "arxiv", "pubmed", "openalex", "crossref", "multi"],
+                "enum": ["auto", "semantic_scholar", "arxiv", "pubmed", "openalex", "crossref", "multi"],
                 "description": "搜索来源",
-                "default": "semantic_scholar"
+                "default": "auto"
             },
             "max_results": {
                 "type": "integer",
@@ -2082,7 +2121,7 @@ class EnhancedLiteratureSearchTool(Tool):
     async def execute(
         self,
         query: str,
-        source: str = "semantic_scholar",
+        source: str = "auto",
         max_results: int = 5,
         year_start: int = None,
         year_end: int = None,
@@ -2102,7 +2141,13 @@ class EnhancedLiteratureSearchTool(Tool):
             
             # 执行搜索
             if source == "multi":
-                per_source = max(1, int((max_results + 2) / 3))
+                multi_source_count = 4
+                if hasattr(self.service, "multi_source_count"):
+                    try:
+                        multi_source_count = int(self.service.multi_source_count())
+                    except Exception:
+                        multi_source_count = 4
+                per_source = max(1, int(math.ceil(max_results / max(1, multi_source_count))))
                 result = await self.service.search_multi(
                     query=query,
                     limit_per_source=per_source,
@@ -2125,25 +2170,35 @@ class EnhancedLiteratureSearchTool(Tool):
                 )
             
             papers = result.get("papers", [])
+            requested_source = str(source or "auto").strip() or "auto"
+            resolved_source = str(result.get("resolved_source") or requested_source).strip() or requested_source
             
             if not papers:
                 return ToolResult(
                     success=True,
                     output=f"未找到关于 '{query}' 的学术论文。",
-                    data={"papers": [], "query": query, "source": source}
+                    data={
+                        "papers": [],
+                        "query": query,
+                        "source": requested_source,
+                        "resolved_source": result.get("resolved_source"),
+                        "attempted_sources": result.get("attempted_sources", []),
+                        "partial_errors": result.get("partial_errors", {}),
+                    }
                 )
             
             # 格式化输出
             source_names = {
+                "auto": "自动学术搜索链",
                 "semantic_scholar": "Semantic Scholar",
                 "arxiv": "arXiv",
                 "pubmed": "PubMed",
                 "openalex": "OpenAlex",
                 "crossref": "Crossref",
-                "multi": "Semantic Scholar + arXiv + PubMed",
+                "multi": "OpenAlex + Semantic Scholar + arXiv + PubMed",
             }
             
-            output_parts = [f"📚 在 {source_names.get(source, source)} 搜索 '{query}' 的结果:\n"]
+            output_parts = [f"📚 在 {source_names.get(resolved_source, resolved_source)} 搜索 '{query}' 的结果:\n"]
             
             for i, paper in enumerate(papers, 1):
                 # 作者
@@ -2182,7 +2237,11 @@ class EnhancedLiteratureSearchTool(Tool):
                 data={
                     "papers": [self._paper_to_dict(p) for p in papers],
                     "query": query,
-                    "source": source,
+                    "source": requested_source,
+                    "resolved_source": resolved_source,
+                    "attempted_sources": result.get("attempted_sources", []),
+                    "partial_errors": result.get("partial_errors", {}),
+                    "sources": result.get("sources", {}),
                     "total": result.get("total", len(papers))
                 }
             )

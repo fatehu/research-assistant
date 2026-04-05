@@ -3,6 +3,7 @@ Reranker service based on sentence-transformers CrossEncoder.
 """
 import asyncio
 import math
+from pathlib import Path
 import threading
 from typing import List, Optional, Tuple
 
@@ -66,6 +67,8 @@ class RerankerService:
                 init_kwargs = {"device": device}
                 if cache_dir:
                     init_kwargs["cache_folder"] = cache_dir
+                if bool(self._resolve_cached_main_snapshot_dir(cache_dir, model_name)):
+                    init_kwargs["local_files_only"] = True
                 if int(settings.reranker_max_length or 0) > 0:
                     init_kwargs["max_length"] = int(settings.reranker_max_length)
 
@@ -94,6 +97,27 @@ class RerankerService:
             except Exception as exc:
                 logger.error(f"Failed to load reranker model: {exc}")
                 raise
+
+    @staticmethod
+    def _resolve_cached_main_snapshot_dir(cache_dir: Optional[str], model_name: str) -> Optional[Path]:
+        if not cache_dir:
+            return None
+        normalized_model_name = str(model_name or "").strip()
+        if not normalized_model_name:
+            return None
+
+        model_cache_dir = Path(cache_dir) / f"models--{normalized_model_name.replace('/', '--')}"
+        ref_file = model_cache_dir / "refs" / "main"
+        try:
+            snapshot_id = ref_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not snapshot_id:
+            return None
+        snapshot_dir = model_cache_dir / "snapshots" / snapshot_id
+        if snapshot_dir.exists():
+            return snapshot_dir
+        return None
 
     async def rerank(
         self,

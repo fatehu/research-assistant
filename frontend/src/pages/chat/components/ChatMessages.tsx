@@ -2,11 +2,11 @@ import { useRef, useEffect } from 'react'
 import { Spin, Button } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { AnimatePresence } from 'framer-motion'
-import type { Message, Conversation } from '@/services/api'
-import type { IterationStep } from '@/stores/chatStore'
+import type { Message, Conversation, ConversationItemStream, ConversationToolLedger, ConversationTurnStore } from '@/services/api'
+import type { IterationStep, SendPhase } from '@/stores/chatStore'
 import MessageBubble from './MessageBubble'
-import ReActPanel from './ReActPanel'
 import EmptyState from './EmptyState'
+import TurnTimeline from './TurnTimeline'
 
 interface ChatMessagesProps {
   messages: Message[]
@@ -14,12 +14,16 @@ interface ChatMessagesProps {
   isLoading: boolean
   loadError: string | null
   isSending: boolean
+  sendPhase: SendPhase
+  sendPhaseLabel?: string | null
+  sendPhaseHint?: string | null
   isThinking: boolean
   streamingContent: string
   streamingThought: string
   iterationSteps: IterationStep[]
   currentIteration: number
   currentToolCall: { tool: string; input: Record<string, any> } | null
+  currentTurnId: string | null
   highlightedMessageId: number | null
   onQuickPrompt: (prompt: string) => void
   onReload: () => void
@@ -32,12 +36,16 @@ const ChatMessages = ({
   isLoading,
   loadError,
   isSending,
+  sendPhase,
+  sendPhaseLabel,
+  sendPhaseHint,
   isThinking,
   streamingContent,
   streamingThought,
   iterationSteps,
   currentIteration,
   currentToolCall,
+  currentTurnId,
   highlightedMessageId,
   onQuickPrompt,
   onReload,
@@ -68,47 +76,38 @@ const ChatMessages = ({
           <EmptyState onQuickPrompt={onQuickPrompt} />
         ) : (
           <div className="space-y-7">
-            <AnimatePresence mode="popLayout">
-              {messages.map((msg, idx) => (
-                <MessageBubble
-                  key={msg.id || idx}
-                  msg={msg}
-                  isHighlighted={highlightedMessageId === msg.id}
-                />
-              ))}
-            </AnimatePresence>
-
-            {/* 流式响应 */}
-            {isSending && (
-              <div>
-                {/* ReAct 推理过程面板 */}
-                <ReActPanel
-                  steps={iterationSteps}
-                  currentIteration={currentIteration}
-                  isThinking={isThinking}
-                  currentThought={streamingThought}
-                  currentToolCall={currentToolCall}
-                />
-
-                {/* 只有当有内容时才显示消息气泡 */}
-                {(streamingContent ||
-                  (!isThinking && !currentToolCall && iterationSteps.length === 0)) && (
+            {currentConversation?.turn_store?.entries?.length || isSending ? (
+              <TurnTimeline
+                messages={messages}
+                turnStore={currentConversation?.turn_store as ConversationTurnStore | undefined}
+                itemStream={currentConversation?.item_stream as ConversationItemStream | undefined}
+                toolLedger={currentConversation?.tool_ledger as ConversationToolLedger | undefined}
+                highlightedMessageId={highlightedMessageId}
+                activeTurnId={currentTurnId}
+                isSending={isSending}
+                sendPhase={sendPhase}
+                sendPhaseLabel={sendPhaseLabel}
+                sendPhaseHint={sendPhaseHint}
+                isThinking={isThinking}
+                streamingContent={streamingContent}
+                streamingThought={streamingThought}
+                iterationSteps={iterationSteps}
+                currentIteration={currentIteration}
+                currentToolCall={currentToolCall}
+              />
+            ) : (
+              <AnimatePresence mode="popLayout">
+                {messages.map((msg, idx) => (
                   <MessageBubble
-                    msg={{
-                      id: -1,
-                      conversation_id: currentConversation?.id || 0,
-                      role: 'assistant',
-                      content: streamingContent,
-                      message_type: 'text',
-                      created_at: new Date().toISOString(),
-                    }}
-                    isStreaming={true}
-                    streamingContent={streamingContent}
-                    streamingThought=""
-                    isThinking={false}
+                    key={msg.id || idx}
+                    msg={msg}
+                    turnStore={currentConversation?.turn_store as ConversationTurnStore | undefined}
+                    itemStream={currentConversation?.item_stream as ConversationItemStream | undefined}
+                    toolLedger={currentConversation?.tool_ledger as ConversationToolLedger | undefined}
+                    isHighlighted={highlightedMessageId === msg.id}
                   />
-                )}
-              </div>
+                ))}
+              </AnimatePresence>
             )}
 
             <div ref={messagesEndRef} />

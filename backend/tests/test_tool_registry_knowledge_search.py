@@ -58,6 +58,18 @@ def test_knowledge_search_runtime_uses_configurable_threshold(monkeypatch):
     assert runtime.text_top_k == 11
 
 
+def test_knowledge_search_runtime_can_override_reranker_and_hybrid(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "enable_reranker", True)
+    monkeypatch.setattr(agent_tools.settings, "enable_hybrid_retrieval", True)
+    tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
+
+    runtime = tool._resolve_retrieve_runtime(top_k=4, use_reranker=False, use_hybrid=False)
+
+    assert runtime.use_reranker is False
+    assert runtime.use_hybrid is False
+    assert runtime.text_top_k == 0
+
+
 @pytest.mark.asyncio
 async def test_knowledge_search_vector_retrieve_passes_dimension_and_threshold(monkeypatch):
     class _Result:
@@ -128,6 +140,7 @@ async def test_knowledge_search_vector_retrieve_passes_dimension_and_threshold(m
         query="q",
         rewrite_result=rewrite_result,
         kb_ids=[1],
+        document_ids=[],
         runtime=runtime,
     )
 
@@ -142,13 +155,13 @@ async def test_knowledge_search_vector_retrieve_passes_dimension_and_threshold(m
 async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch):
     tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
     call_order = []
-    state = SimpleNamespace()
+    state = SimpleNamespace(resolved_kb_ids=set(), resolved_document_ids=set())
 
-    async def _rewrite(query):
+    async def _rewrite(query, *, use_query_rewrite=None):
         call_order.append("rewrite")
         return SimpleNamespace(enabled=True, vector_variants=[1], text_variants=[1])
 
-    async def _retrieve(db, query, rewrite_result, runtime):
+    async def _retrieve(db, query, rewrite_result, runtime, **kwargs):
         call_order.append("retrieve")
         return state
 
@@ -182,12 +195,12 @@ async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch)
 @pytest.mark.asyncio
 async def test_knowledge_search_execute_with_db_returns_guided_reading_payload(monkeypatch):
     tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
-    state = SimpleNamespace()
+    state = SimpleNamespace(resolved_kb_ids=set(), resolved_document_ids=set())
 
-    async def _rewrite(query):
+    async def _rewrite(query, *, use_query_rewrite=None):
         return SimpleNamespace(enabled=True, vector_variants=[1], text_variants=[1])
 
-    async def _retrieve(db, query, rewrite_result, runtime):
+    async def _retrieve(db, query, rewrite_result, runtime, **kwargs):
         return state
 
     async def _rerank(query, payload):
@@ -227,6 +240,68 @@ async def test_knowledge_search_execute_with_db_returns_guided_reading_payload(m
     assert result.data["structured_content"]["results"][0]["rank"] == 1
     assert result.data["structured_content"]["knowledge_base_hits"][0]["knowledge_base"] == "Exam KB"
     assert result.data["provenance"]["tool_kind"] == "knowledge_search"
+
+
+@pytest.mark.asyncio
+async def test_knowledge_search_rewrite_can_be_disabled(monkeypatch):
+    tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
+    captured = {}
+
+    async def _fake_rewrite_query(query, *, rewrite_mode="auto", use_query_rewrite=True):
+        captured["query"] = query
+        captured["use_query_rewrite"] = use_query_rewrite
+        return QueryRewriteResult(
+            original_query=query,
+            enabled=bool(use_query_rewrite),
+            strategies=["original"],
+            synonym_queries=[],
+            sub_queries=[],
+            hyde_document=None,
+            vector_variants=[QueryVariant(text=query, strategy="original")],
+            text_variants=[QueryVariant(text=query, strategy="original")],
+        )
+
+    monkeypatch.setattr(tool.query_rewrite_service, "rewrite_query", _fake_rewrite_query)
+
+    result = await tool._rewrite("attention", use_query_rewrite=False)
+
+    assert result.enabled is False
+    assert captured["use_query_rewrite"] is False
+
+
+@pytest.mark.asyncio
+async def test_knowledge_search_scope_can_resolve_requested_document_ids(monkeypatch):
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeDB:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, _stmt):
+            self.calls += 1
+            if self.calls == 1:
+                return _Result([(5,)])
+            return _Result([(8, 5), (9, 6)])
+
+    tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
+
+    async def _fake_shared_kb_ids(_db):
+        return {6}
+
+    monkeypatch.setattr(tool, "_get_shared_kb_ids", _fake_shared_kb_ids)
+
+    kb_ids, document_ids = await tool._resolve_scope(
+        _FakeDB(),
+        requested_document_ids=[8, 9],
+    )
+
+    assert kb_ids == {5, 6}
+    assert document_ids == {8, 9}
 
 
 def test_api_search_filters_embedding_dimension():

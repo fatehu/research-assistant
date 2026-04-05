@@ -193,7 +193,6 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
           user_authorized: authorized,
           stream: true,
           active_cell_id: activeCell?.id,
-          active_cell_index: activeCell ? currentCellIndex : undefined,
         },
         (event) => {
           if (event.type === 'content') {
