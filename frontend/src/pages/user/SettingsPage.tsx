@@ -294,6 +294,7 @@ const SettingsPage: React.FC = () => {
               styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
             >
               <Option value="deepseek">DeepSeek (deepseek-chat)</Option>
+              <Option value="deepseek_test">DeepSeek 测试档 (deepseek-chat-test)</Option>
               <Option value="openai">OpenAI (GPT-4o)</Option>
               <Option value="aliyun">Aliyun (qwen-plus)</Option>
               <Option value="ollama">本地 (Ollama)</Option>

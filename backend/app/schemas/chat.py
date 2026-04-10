@@ -47,10 +47,14 @@ class ConversationEvidenceLedgerEntryResponse(BaseModel):
     origin_kind: Literal["tool_result", "assistant_summary", "llm_inferred"] = "llm_inferred"
     summary: str
     status: Literal["confirmed", "provisional"] = "confirmed"
+    source_kind: Optional[str] = None
     source_labels: List[str] = Field(default_factory=list)
     tool_names: List[str] = Field(default_factory=list)
     turn_ids: List[str] = Field(default_factory=list)
     tool_call_ids: List[str] = Field(default_factory=list)
+    result_count: Optional[int] = None
+    provenance_hints: List[str] = Field(default_factory=list)
+    retrieval_scope: Optional[dict] = None
 
 
 class ConversationContextStateResponse(BaseModel):
@@ -135,6 +139,7 @@ class ConversationToolLedgerEntryResponse(BaseModel):
     output_tokens_estimate: Optional[int] = None
     truncated: Optional[bool] = None
     parallel_group: Optional[str] = None
+    metadata: Optional[dict] = None
     created_at: Optional[str] = None
 
 

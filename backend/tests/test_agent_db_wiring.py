@@ -60,7 +60,8 @@ def test_notebook_agent_done_payload_includes_rag_metrics():
 
 def test_chat_stream_persists_rag_metrics_to_message_metadata():
     source = inspect.getsource(chat.send_message)
-    assert 'metadata_={"rag_metrics": rag_metrics} if isinstance(rag_metrics, dict) else {}' in source
+    assert '"rag_metrics": response.get("rag_metrics")' in source
+    assert '"citation_index": response.get("citation_index")' in source
 
 
 def test_codelab_assistant_message_persists_rag_metrics_metadata():

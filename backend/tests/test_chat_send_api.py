@@ -70,7 +70,10 @@ class _FakeRuntimeService:
         return dict(raw or {})
 
     def normalize_chat_rag_overrides(self, raw):
-        return dict(raw or {})
+        payload = dict(raw or {})
+        if not payload:
+            return {}
+        return payload
 
     async def append_conversation_item_entries(self, conversation_id, entries):
         for entry in entries:

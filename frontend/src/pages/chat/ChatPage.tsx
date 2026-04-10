@@ -266,7 +266,7 @@ const ChatPage = () => {
 
   const handleRequestPreview = async () => {
     const trimmed = inputValue.trim()
-    if (!trimmed || isSending || !conversationId) return
+    if (!trimmed || isSending) return
 
     const requestId = previewRequestIdRef.current + 1
     previewRequestIdRef.current = requestId
@@ -276,7 +276,7 @@ const ChatPage = () => {
     try {
       const preview = await chatApi.previewContext(
         trimmed,
-        parseInt(conversationId, 10),
+        conversationId ? parseInt(conversationId, 10) : undefined,
         undefined,
         chatPreferenceOverrides,
         ragOverrides,

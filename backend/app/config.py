@@ -36,10 +36,12 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 1440
 
     # LLM providers
-    default_llm_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "deepseek"
+    default_llm_provider: Literal["deepseek", "deepseek_test", "openai", "aliyun", "ollama"] = "deepseek"
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+    deepseek_test_model_alias: str = "deepseek-chat-test"
+    deepseek_test_model_window: int = 4096
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o"
@@ -74,6 +76,8 @@ class Settings(BaseSettings):
     local_embedding_local_files_only: bool = False
     local_embedding_allow_legacy_pickle_fallback: bool = True
     local_embedding_allow_runtime_cpu_fallback: bool = True
+    local_embedding_use_official_bge_m3_backend: bool = True
+    local_embedding_use_fp16_on_cuda: bool = True
     mock_embedding_model: str = "mock/deterministic"
     mock_embedding_dimension: int = 256
     embedding_dimension_policy: Literal["fixed", "adaptive"] = "adaptive"
@@ -116,6 +120,8 @@ class Settings(BaseSettings):
 
     # Query rewrite
     enable_query_rewrite: bool = True
+    query_rewrite_default_profile: Literal["off", "light", "deep"] = "light"
+    query_rewrite_light_strategies: str = "synonym"
     query_rewrite_strategies: str = "synonym,hyde,decompose"
     query_rewrite_max_synonyms: int = 3
     query_rewrite_max_subqueries: int = 3
@@ -247,6 +253,9 @@ class Settings(BaseSettings):
     agent_tool_failure_streak_limit: int = 3
     agent_context_budget_enabled: bool = True
     agent_context_max_input_tokens: int = 10000
+    agent_context_budget_reserve_tokens: int = 3072
+    agent_context_budget_min_tokens: int = 1024
+    agent_context_model_window_overrides: str = "{}"
     agent_context_window_turns: int = 8
     agent_context_recently_slid_turns: int = 2
     agent_context_anchor_enabled: bool = True
@@ -459,6 +468,14 @@ class Settings(BaseSettings):
                 "api_key": self.deepseek_api_key,
                 "base_url": self.deepseek_base_url,
                 "model": self.deepseek_model,
+            },
+            "deepseek_test": {
+                "api_key": self.deepseek_api_key,
+                "base_url": self.deepseek_base_url,
+                "model": self.deepseek_model,
+                "display_model": self.deepseek_test_model_alias,
+                "context_window_model": self.deepseek_test_model_alias,
+                "provider_family": "deepseek",
             },
             "openai": {
                 "api_key": self.openai_api_key,

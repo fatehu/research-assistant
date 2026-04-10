@@ -430,16 +430,20 @@ EXPERIENCE_PLAN_CACHE_TTL_SECONDS = 3600
 _experience_plan_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 EXPERIENCE_SESSION_V2_CACHE_TTL_SECONDS = 3600
 _experience_session_v2_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_experience_session_v2_fast_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS = 3600
 _page_artifact_v2_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_page_artifact_v2_fast_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 ADJACENT_PAGE_STRUCTURED_V2_CACHE_TTL_SECONDS = 3600
 _adjacent_page_structured_v2_cache_memory: Dict[str, tuple[float, Dict[str, Any]]] = {}
 GENERATIVE_PLAN_CACHE_KIND = "generative_plan"
 EXPERIENCE_PLAN_CACHE_KIND = "experience_plan"
 EXPERIENCE_SESSION_V2_CACHE_KIND = "experience_session_v2"
 EXPERIENCE_SESSION_V2_CACHE_NAMESPACE = "lit:experience_session:v2"
+EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE = "lit:experience_session:v2:fast"
 PAGE_ARTIFACT_V2_CACHE_KIND = "page_artifact_v2"
 PAGE_ARTIFACT_V2_CACHE_NAMESPACE = "lit:page_artifact:v2"
+PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE = "lit:page_artifact:v2:fast"
 ADJACENT_PAGE_STRUCTURED_V2_CACHE_KIND = "adjacent_page_structured_v2"
 ADJACENT_PAGE_STRUCTURED_V2_CACHE_NAMESPACE = "lit:adjacent_page_structured:v2"
 PAGE_COUNT_CACHE_TTL_SECONDS = 3600
@@ -4109,6 +4113,24 @@ def _experience_v2_cache_key_like_pattern(
     )
 
 
+def _experience_v2_fast_cache_key(
+    *,
+    namespace: str,
+    user_id: int,
+    paper_id: int,
+    focus_page: int,
+    selected_kb_id: int,
+    user_intent: str,
+    reader_profile: str,
+) -> str:
+    intent_hash = hashlib.sha256(str(user_intent or "").strip().encode("utf-8")).hexdigest()[:12]
+    profile_hash = hashlib.sha256(str(reader_profile or "").strip().encode("utf-8")).hexdigest()[:12]
+    return (
+        f"{str(namespace or '').strip()}:{_READER_PLAN_CACHE_NAMESPACE_VERSION}:{int(user_id)}:{int(paper_id)}:"
+        f"{int(focus_page)}:{int(selected_kb_id)}:{_EXPERIENCE_V2_RUNTIME_VERSION}:{intent_hash}:{profile_hash}"
+    )
+
+
 def _plan_cache_ttl_seconds_from_expires_at(
     expires_at: Optional[datetime],
     *,
@@ -4179,6 +4201,90 @@ async def _experience_v2_cache_db_get_latest_stable(
         paper_id=paper_id,
         page=focus_page,
         cache_key_like=cache_key_like,
+    )
+
+
+async def _experience_v2_fast_cache_get(
+    cache_key: str,
+    *,
+    memory_store: Dict[str, tuple[float, Dict[str, Any]]],
+) -> tuple[Optional[Dict[str, Any]], str]:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            payload = await redis_client.get(cache_key)
+            if payload:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data, "redis"
+        except Exception as exc:
+            logger.warning(f"[Literature ExperienceV2 FastCache] Redis读取失败，降级内存缓存: {exc}")
+
+    now_ts = time.time()
+    item = memory_store.get(cache_key)
+    if not item:
+        return None, "none"
+    expire_at, payload = item
+    if expire_at <= now_ts:
+        memory_store.pop(cache_key, None)
+        return None, "none"
+    return payload, "memory"
+
+
+async def _experience_v2_fast_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    *,
+    ttl_seconds: int,
+    memory_store: Dict[str, tuple[float, Dict[str, Any]]],
+) -> None:
+    redis_client = await _get_redis_client()
+    if redis_client is not None:
+        try:
+            await redis_client.set(cache_key, json.dumps(payload, ensure_ascii=False), ex=max(1, int(ttl_seconds)))
+        except Exception as exc:
+            logger.warning(f"[Literature ExperienceV2 FastCache] Redis写入失败，降级内存缓存: {exc}")
+
+    memory_store[cache_key] = (time.time() + max(1, int(ttl_seconds)), payload)
+
+
+async def _experience_session_v2_fast_cache_get(cache_key: str) -> tuple[Optional[Dict[str, Any]], str]:
+    return await _experience_v2_fast_cache_get(
+        cache_key,
+        memory_store=_experience_session_v2_fast_cache_memory,
+    )
+
+
+async def _experience_session_v2_fast_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = EXPERIENCE_SESSION_V2_CACHE_TTL_SECONDS,
+) -> None:
+    await _experience_v2_fast_cache_set(
+        cache_key,
+        payload,
+        ttl_seconds=ttl_seconds,
+        memory_store=_experience_session_v2_fast_cache_memory,
+    )
+
+
+async def _page_artifact_v2_fast_cache_get(cache_key: str) -> tuple[Optional[Dict[str, Any]], str]:
+    return await _experience_v2_fast_cache_get(
+        cache_key,
+        memory_store=_page_artifact_v2_fast_cache_memory,
+    )
+
+
+async def _page_artifact_v2_fast_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS,
+) -> None:
+    await _experience_v2_fast_cache_set(
+        cache_key,
+        payload,
+        ttl_seconds=ttl_seconds,
+        memory_store=_page_artifact_v2_fast_cache_memory,
     )
 
 
@@ -12606,6 +12712,28 @@ async def _prepare_reader_experience_v2_runtime(
                 status_code=409,
                 detail="completed page_artifact_v2 not available: cached artifact failed validation",
             )
+        await _backfill_reader_experience_v2_fast_caches(
+            session_fast_key=_experience_v2_fast_cache_key(
+                namespace=EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE,
+                user_id=int(current_user.id),
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                selected_kb_id=selected_kb_id,
+                user_intent=user_intent,
+                reader_profile=reader_profile,
+            ),
+            artifact_fast_key=_experience_v2_fast_cache_key(
+                namespace=PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE,
+                user_id=int(current_user.id),
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                selected_kb_id=selected_kb_id,
+                user_intent=user_intent,
+                reader_profile=reader_profile,
+            ),
+            session_payload=cached_session if isinstance(cached_session, Mapping) else None,
+            artifact_payload=cached_artifact,
+        )
     return {
         "paper": paper,
         "focus_page": focus_page,
@@ -12799,6 +12927,24 @@ async def _run_reader_experience_v2_build(
     artifact_cache_key = str(runtime_state["artifact_cache_key"] or "").strip()
     reader_profile = str(runtime_state["reader_profile"] or "").strip()
     user_intent = str(runtime_state.get("user_intent") or "").strip()
+    session_fast_key = _experience_v2_fast_cache_key(
+        namespace=EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=selected_kb_id,
+        user_intent=user_intent,
+        reader_profile=reader_profile,
+    )
+    artifact_fast_key = _experience_v2_fast_cache_key(
+        namespace=PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=selected_kb_id,
+        user_intent=user_intent,
+        reader_profile=reader_profile,
+    )
     compose_source_signature = str(compose_source_signature or "").strip()
     session_payload = _jsonable_dict(runtime_state.get("cached_session") or {})
     if session_payload and str(session_payload.get("status") or "").strip() == "failed":
@@ -12880,6 +13026,12 @@ async def _run_reader_experience_v2_build(
             page=focus_page,
             compose_source_signature=compose_source_signature,
         )
+        await _backfill_reader_experience_v2_fast_caches(
+            session_fast_key=session_fast_key,
+            artifact_fast_key=artifact_fast_key,
+            session_payload=session_payload,
+            artifact_payload=artifact_payload,
+        )
         return session_payload, artifact_payload, artifact_validation, resource_bundle
     except HTTPException:
         failed_session = _mark_experience_session_v2_failed(
@@ -12913,12 +13065,209 @@ async def _run_reader_experience_v2_build(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def _backfill_reader_experience_v2_fast_caches(
+    *,
+    session_fast_key: str,
+    artifact_fast_key: str,
+    session_payload: Optional[Mapping[str, Any]] = None,
+    artifact_payload: Optional[Mapping[str, Any]] = None,
+    session_ttl_seconds: int = EXPERIENCE_SESSION_V2_CACHE_TTL_SECONDS,
+    artifact_ttl_seconds: int = PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS,
+) -> None:
+    if session_fast_key and isinstance(session_payload, Mapping):
+        await _experience_session_v2_fast_cache_set(
+            session_fast_key,
+            _jsonable_dict(session_payload),
+            ttl_seconds=session_ttl_seconds,
+        )
+    if artifact_fast_key and isinstance(artifact_payload, Mapping):
+        await _page_artifact_v2_fast_cache_set(
+            artifact_fast_key,
+            _jsonable_dict(artifact_payload),
+            ttl_seconds=artifact_ttl_seconds,
+        )
+
+
+def _build_reader_experience_v2_fast_cache_layer(
+    *,
+    layer: str,
+    db_cache_key: Optional[str] = None,
+) -> str:
+    normalized = str(layer or "").strip().lower()
+    if normalized in {"memory", "redis"}:
+        return f"fast_{normalized}"
+    if normalized == "db":
+        return f"db_stable_fast:{db_cache_key}" if str(db_cache_key or "").strip() else "db_stable_fast"
+    return normalized or "none"
+
+
+async def _build_reader_experience_v2_cached_fast_payload(
+    paper_id: int,
+    payload: ReaderExperiencePlanRequest,
+    db: AsyncSession,
+    current_user: User,
+) -> Optional[Dict[str, Any]]:
+    if bool(payload.force_refresh or payload.regenerate):
+        return None
+
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    focus_page = max(1, int(payload.focus_page or payload.page or 1))
+    normalized_selected_kb_id = await _normalize_reader_selected_kb_id(
+        db=db,
+        current_user=current_user,
+        selected_kb_id=payload.selected_kb_id,
+    )
+    selected_kb_id = int(normalized_selected_kb_id or 0)
+    reader_profile = str(payload.reader_profile or "").strip() or "curious_generalist"
+    user_intent = str(payload.user_intent or "").strip()
+
+    artifact_fast_key = _experience_v2_fast_cache_key(
+        namespace=PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=selected_kb_id,
+        user_intent=user_intent,
+        reader_profile=reader_profile,
+    )
+    session_fast_key = _experience_v2_fast_cache_key(
+        namespace=EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE,
+        user_id=int(current_user.id),
+        paper_id=int(paper.id),
+        focus_page=focus_page,
+        selected_kb_id=selected_kb_id,
+        user_intent=user_intent,
+        reader_profile=reader_profile,
+    )
+
+    cached_artifact, artifact_layer = await _page_artifact_v2_fast_cache_get(artifact_fast_key)
+    stable_artifact_key: Optional[str] = None
+    artifact_expires_at: Optional[datetime] = None
+    if not isinstance(cached_artifact, Mapping):
+        stable_artifact, artifact_expires_at, stable_artifact_key = await _experience_v2_cache_db_get_latest_stable(
+            plan_kind=PAGE_ARTIFACT_V2_CACHE_KIND,
+            namespace=PAGE_ARTIFACT_V2_CACHE_NAMESPACE,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            focus_page=focus_page,
+            selected_kb_id=selected_kb_id,
+            user_intent=user_intent,
+            reader_profile=reader_profile,
+        )
+        if isinstance(stable_artifact, Mapping):
+            cached_artifact = _jsonable_dict(stable_artifact)
+            artifact_layer = "db"
+            await _page_artifact_v2_fast_cache_set(
+                artifact_fast_key,
+                cached_artifact,
+                ttl_seconds=_plan_cache_ttl_seconds_from_expires_at(
+                    artifact_expires_at,
+                    default_ttl_seconds=PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS,
+                ),
+            )
+
+    artifact_validation: Dict[str, Any] = {}
+    if isinstance(cached_artifact, Mapping):
+        artifact_validation = _validate_page_artifact_v2_contract(cached_artifact)
+        if not artifact_validation.get("valid") or not artifact_validation.get("renderable"):
+            cached_artifact = None
+            artifact_layer = "none"
+            artifact_validation = {}
+
+    cached_session, session_layer = await _experience_session_v2_fast_cache_get(session_fast_key)
+    stable_session_key: Optional[str] = None
+    session_expires_at: Optional[datetime] = None
+    if not isinstance(cached_session, Mapping):
+        stable_session, session_expires_at, stable_session_key = await _experience_v2_cache_db_get_latest_stable(
+            plan_kind=EXPERIENCE_SESSION_V2_CACHE_KIND,
+            namespace=EXPERIENCE_SESSION_V2_CACHE_NAMESPACE,
+            user_id=int(current_user.id),
+            paper_id=int(paper.id),
+            focus_page=focus_page,
+            selected_kb_id=selected_kb_id,
+            user_intent=user_intent,
+            reader_profile=reader_profile,
+        )
+        if isinstance(stable_session, Mapping):
+            cached_session = _jsonable_dict(stable_session)
+            session_layer = "db"
+            await _experience_session_v2_fast_cache_set(
+                session_fast_key,
+                cached_session,
+                ttl_seconds=_plan_cache_ttl_seconds_from_expires_at(
+                    session_expires_at,
+                    default_ttl_seconds=EXPERIENCE_SESSION_V2_CACHE_TTL_SECONDS,
+                ),
+            )
+
+    if isinstance(cached_artifact, Mapping):
+        return _build_reader_experience_v2_response_payload(
+            focus_page=focus_page,
+            status="ready",
+            artifact=cached_artifact,
+            compose_payload={},
+            compose_status="done",
+            compose_build_mode="cached_fast_path",
+            compose_source_signature="",
+            source_sig_hash="",
+            artifact_cache_hit=True,
+            artifact_cache_layer=_build_reader_experience_v2_fast_cache_layer(
+                layer=artifact_layer,
+                db_cache_key=stable_artifact_key,
+            ),
+            session_cache_hit=isinstance(cached_session, Mapping),
+            session_cache_layer=_build_reader_experience_v2_fast_cache_layer(
+                layer=session_layer,
+                db_cache_key=stable_session_key,
+            ),
+            session_payload=cached_session if isinstance(cached_session, Mapping) else None,
+            meta={
+                "artifact_validation": artifact_validation,
+                "cache_mode": "fast_path",
+                "compose_payload_deferred": True,
+            },
+        )
+
+    if isinstance(cached_session, Mapping) and str(cached_session.get("status") or "").strip() == "failed":
+        return _build_reader_experience_v2_response_payload(
+            focus_page=focus_page,
+            status="failed",
+            artifact=None,
+            compose_payload={},
+            compose_status="done",
+            compose_build_mode="cached_fast_path",
+            compose_source_signature="",
+            source_sig_hash="",
+            artifact_cache_hit=False,
+            artifact_cache_layer="none",
+            session_cache_hit=True,
+            session_cache_layer=_build_reader_experience_v2_fast_cache_layer(
+                layer=session_layer,
+                db_cache_key=stable_session_key,
+            ),
+            session_payload=cached_session,
+            failure_detail=str(cached_session.get("stop_reason") or "completed page_artifact_v2 not available").strip(),
+            meta={"cache_mode": "fast_path"},
+        )
+
+    return None
+
+
 async def _build_reader_experience_v2_cached_payload(
     paper_id: int,
     payload: ReaderExperiencePlanRequest,
     db: AsyncSession,
     current_user: User,
 ) -> Dict[str, Any]:
+    fast_response = await _build_reader_experience_v2_cached_fast_payload(
+        paper_id=paper_id,
+        payload=payload,
+        db=db,
+        current_user=current_user,
+    )
+    if isinstance(fast_response, dict):
+        return fast_response
+
     runtime_state = await _prepare_reader_experience_v2_runtime(
         paper_id=paper_id,
         payload=payload,

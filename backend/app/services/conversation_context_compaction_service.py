@@ -142,11 +142,42 @@ class ConversationContextCompactionService:
                 preview["success"] = bool(item.get("success"))
             if item.get("permission_required") is not None:
                 preview["permission_required"] = bool(item.get("permission_required"))
+            metadata = dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else {}
+            source_kind = str(metadata.get("source_kind") or "").strip()
+            if source_kind:
+                preview["source_kind"] = source_kind
+            source_labels = [
+                ReActAgent._compact_debug_text(label, 32)
+                for label in list(metadata.get("source_labels") or [])
+                if ReActAgent._compact_debug_text(label, 32)
+            ]
+            if source_labels:
+                preview["source_labels"] = source_labels[:4]
             previews.append(preview)
 
         if previews:
             return previews[-16:]
         return fallback_calls[-12:]
+
+    @classmethod
+    def _metadata_provenance_hints(cls, metadata: Dict[str, Any]) -> List[str]:
+        hints: List[str] = []
+        for item in list(metadata.get("evidence_preview") or [])[:4]:
+            if not isinstance(item, dict):
+                continue
+            title = ReActAgent._compact_debug_text(item.get("title") or "", 120)
+            domain = ReActAgent._compact_debug_text(item.get("domain") or "", 48)
+            if title:
+                hints.append(f"{title} ({domain})" if domain else title)
+                continue
+            kb_name = ReActAgent._compact_debug_text(item.get("knowledge_base") or "", 60)
+            document = ReActAgent._compact_debug_text(item.get("document") or "", 80)
+            citation_label = ReActAgent._compact_debug_text(item.get("citation_label") or "", 80)
+            if kb_name and document:
+                hints.append(f"{kb_name} / {document}")
+            elif citation_label:
+                hints.append(citation_label)
+        return cls._normalize_string_list(hints, max_items=4, max_chars=140)
 
     @classmethod
     def _tool_rows_to_evidence_candidates(cls, entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -159,6 +190,7 @@ class ConversationContextCompactionService:
                 continue
             if item.get("success") is False:
                 continue
+            metadata = dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else {}
             summary = ReActAgent._compact_debug_text(item.get("summary", ""), 180)
             if not summary:
                 continue
@@ -166,14 +198,18 @@ class ConversationContextCompactionService:
             if normalized_key in seen:
                 continue
             seen.add(normalized_key)
-            source_labels = [
-                label
-                for label in re.findall(r"来源\d+", summary)
-                if label
-            ][:4]
+            source_labels = cls._normalize_string_list(
+                metadata.get("source_labels") or re.findall(r"(?:来源|网页)\d+", summary),
+                max_items=6,
+                max_chars=32,
+            )
             tool_name = str(item.get("tool_name") or "").strip()
             turn_ids = [str(item.get("turn_id") or "").strip()] if str(item.get("turn_id") or "").strip() else []
             tool_call_ids = [str(item.get("tool_call_id") or "").strip()] if str(item.get("tool_call_id") or "").strip() else []
+            source_kind = str(metadata.get("source_kind") or "").strip() or None
+            result_count = cls._coerce_int(metadata.get("result_count"))
+            retrieval_scope = dict(metadata.get("retrieval_scope") or {}) if isinstance(metadata.get("retrieval_scope"), dict) else None
+            provenance_hints = cls._metadata_provenance_hints(metadata)
             candidates.append(
                 {
                     "entry_id": cls._build_evidence_entry_id(
@@ -184,10 +220,14 @@ class ConversationContextCompactionService:
                     "origin_kind": "tool_result",
                     "summary": summary,
                     "status": "confirmed",
+                    "source_kind": source_kind,
                     "source_labels": source_labels,
                     "tool_names": [tool_name] if tool_name else [],
                     "turn_ids": turn_ids,
                     "tool_call_ids": tool_call_ids,
+                    "result_count": result_count,
+                    "provenance_hints": provenance_hints,
+                    "retrieval_scope": retrieval_scope,
                 }
             )
             if len(candidates) >= 8:
@@ -228,7 +268,7 @@ class ConversationContextCompactionService:
                 continue
             kind = str(item.get("kind") or "").strip().lower()
             role = str(item.get("role") or "").strip().lower()
-            if kind in {"reasoning_summary", "tool_use_summary"}:
+            if kind in {"reasoning_summary", "tool_use_summary", "permission_denial"}:
                 rows.append(
                     {
                         "role": "assistant",
@@ -275,6 +315,7 @@ class ConversationContextCompactionService:
                 "output_tokens_estimate": item.get("output_tokens_estimate"),
                 "truncated": bool(item.get("truncated")) if item.get("truncated") is not None else None,
                 "parallel_group": str(item.get("parallel_group") or "").strip() or None,
+                "metadata": dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else None,
                 "created_at": str(item.get("created_at") or "").strip() or None,
             }
             rows.append(row)
@@ -305,10 +346,14 @@ class ConversationContextCompactionService:
                         "origin_kind": "llm_inferred",
                         "summary": summary,
                         "status": "confirmed",
+                        "source_kind": None,
                         "source_labels": [],
                         "tool_names": [],
                         "turn_ids": [],
                         "tool_call_ids": [],
+                        "result_count": None,
+                        "provenance_hints": [],
+                        "retrieval_scope": None,
                     }
                 )
             elif isinstance(item, dict):
@@ -322,9 +367,13 @@ class ConversationContextCompactionService:
                 tool_names = cls._normalize_string_list(item.get("tool_names") or [], max_items=4, max_chars=48)
                 turn_ids = cls._normalize_string_list(item.get("turn_ids") or [], max_items=6, max_chars=48)
                 tool_call_ids = cls._normalize_string_list(item.get("tool_call_ids") or [], max_items=8, max_chars=64)
+                provenance_hints = cls._normalize_string_list(item.get("provenance_hints") or [], max_items=4, max_chars=140)
                 origin_kind = str(item.get("origin_kind") or "llm_inferred").strip().lower()
                 if origin_kind not in {"tool_result", "assistant_summary", "llm_inferred"}:
                     origin_kind = "llm_inferred"
+                source_kind = str(item.get("source_kind") or "").strip() or None
+                result_count = cls._coerce_int(item.get("result_count"))
+                retrieval_scope = dict(item.get("retrieval_scope") or {}) if isinstance(item.get("retrieval_scope"), dict) else None
                 normalized.append(
                     {
                         "entry_id": str(item.get("entry_id") or "").strip() or cls._build_evidence_entry_id(
@@ -335,10 +384,14 @@ class ConversationContextCompactionService:
                         "origin_kind": origin_kind,
                         "summary": summary,
                         "status": status,
+                        "source_kind": source_kind,
                         "source_labels": source_labels,
                         "tool_names": tool_names,
                         "turn_ids": turn_ids,
                         "tool_call_ids": tool_call_ids,
+                        "result_count": result_count,
+                        "provenance_hints": provenance_hints,
+                        "retrieval_scope": retrieval_scope,
                     }
                 )
             if len(normalized) >= max_items:
@@ -389,10 +442,25 @@ class ConversationContextCompactionService:
             max_items=8,
             max_chars=64,
         )
+        merged_provenance_hints = cls._normalize_string_list(
+            list(merged.get("provenance_hints") or []) + list(incoming.get("provenance_hints") or []),
+            max_items=4,
+            max_chars=140,
+        )
         merged["source_labels"] = merged_source_labels
         merged["tool_names"] = merged_tool_names
         merged["turn_ids"] = merged_turn_ids
         merged["tool_call_ids"] = merged_tool_call_ids
+        merged["provenance_hints"] = merged_provenance_hints
+        merged["source_kind"] = str(merged.get("source_kind") or incoming.get("source_kind") or "").strip() or None
+        merged["result_count"] = cls._coerce_int(merged.get("result_count")) or cls._coerce_int(incoming.get("result_count"))
+        merged["retrieval_scope"] = (
+            dict(merged.get("retrieval_scope") or {})
+            if isinstance(merged.get("retrieval_scope"), dict) and merged.get("retrieval_scope")
+            else dict(incoming.get("retrieval_scope") or {})
+            if isinstance(incoming.get("retrieval_scope"), dict)
+            else None
+        )
         merged["entry_id"] = str(merged.get("entry_id") or incoming.get("entry_id") or "").strip() or cls._build_evidence_entry_id(
             summary=str(merged.get("summary") or ""),
             tool_call_ids=merged_tool_call_ids,

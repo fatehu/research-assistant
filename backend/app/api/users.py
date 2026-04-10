@@ -77,6 +77,12 @@ async def get_llm_providers(current_user: User = Depends(get_current_user)):
             "available": bool(settings.deepseek_api_key),
         },
         {
+            "id": "deepseek_test",
+            "name": "DeepSeek (测试上下文)",
+            "model": settings.deepseek_test_model_alias,
+            "available": bool(settings.deepseek_api_key),
+        },
+        {
             "id": "openai",
             "name": "OpenAI",
             "model": settings.openai_model,

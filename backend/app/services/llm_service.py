@@ -35,6 +35,7 @@ class LLMService:
     def __init__(self, provider: Optional[str] = None):
         self.provider = provider or settings.default_llm_provider
         self.config = settings.get_llm_config(self.provider)
+        self.provider_family = str(self.config.get("provider_family") or self.provider).strip().lower()
         self.client = AsyncOpenAI(
             api_key=self.config["api_key"],
             base_url=self.config["base_url"],
@@ -44,9 +45,9 @@ class LLMService:
         """Whether to use native function calling."""
         if not bool(getattr(settings, "agent_function_calling_enabled", True)):
             return False
-        if self.provider == "ollama":
+        if self.provider_family == "ollama":
             return False
-        return self.provider in {"openai", "deepseek", "aliyun"}
+        return self.provider_family in {"openai", "deepseek", "aliyun"}
 
     @staticmethod
     def _normalize_usage(usage: Any) -> Dict[str, int]:

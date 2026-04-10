@@ -139,11 +139,14 @@ const buildHistorySteps = (
 
   for (const item of items) {
     const kind = String(item.kind || '').trim().toLowerCase()
-    if (kind === 'reasoning_summary' || kind === 'tool_use_summary') {
+    if (kind === 'reasoning_summary' || kind === 'tool_use_summary' || kind === 'permission_denial') {
       steps.push({
         type: 'thought',
         iteration: item.iteration || 0,
-        content: item.summary || item.content || '',
+        content:
+          kind === 'permission_denial'
+            ? `权限限制：${item.summary || item.content || ''}`
+            : item.summary || item.content || '',
       })
       continue
     }

@@ -10,7 +10,7 @@ import httpx
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol, Mapping, Sequence
+from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol, Mapping, Sequence, Literal
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from loguru import logger
@@ -35,6 +35,10 @@ from app.services.contextual_retrieval_service import (
     build_reranker_input,
     merge_adjacent_context,
     normalize_adjacent_window,
+)
+from app.services.contextual_compression_service import (
+    CompressionInput,
+    get_contextual_compression_service,
 )
 from app.services.agent_tool_error_contract import (
     build_tool_error_contract,
@@ -1084,6 +1088,8 @@ class KnowledgeSearchInput(BaseModel):
     use_reranker: Optional[bool] = None
     use_hybrid: Optional[bool] = None
     use_query_rewrite: Optional[bool] = None
+    query_rewrite_profile: Optional[Literal["off", "light", "deep"]] = None
+    use_contextual_compression: Optional[bool] = None
 
 
 @dataclass
@@ -1161,6 +1167,15 @@ class KnowledgeSearchTool(ToolBase):
             "use_query_rewrite": {
                 "type": "boolean",
                 "description": "可选：覆盖默认 query rewrite 开关"
+            },
+            "query_rewrite_profile": {
+                "type": "string",
+                "enum": ["off", "light", "deep"],
+                "description": "可选：覆盖 query rewrite 层级。light 仅轻量同义扩展，deep 使用完整多策略改写。"
+            },
+            "use_contextual_compression": {
+                "type": "boolean",
+                "description": "可选：覆盖默认 contextual compression 开关"
             }
         },
         "required": ["query"]
@@ -1194,6 +1209,8 @@ class KnowledgeSearchTool(ToolBase):
         use_reranker: Optional[bool] = None,
         use_hybrid: Optional[bool] = None,
         use_query_rewrite: Optional[bool] = None,
+        query_rewrite_profile: Optional[str] = None,
+        use_contextual_compression: Optional[bool] = None,
     ) -> ToolResult:
         """执行知识库搜索（自动选择会话策略）"""
         if self.db is not None:
@@ -1208,6 +1225,8 @@ class KnowledgeSearchTool(ToolBase):
                 use_reranker=use_reranker,
                 use_hybrid=use_hybrid,
                 use_query_rewrite=use_query_rewrite,
+                query_rewrite_profile=query_rewrite_profile,
+                use_contextual_compression=use_contextual_compression,
             )
 
         if self.db_session_factory is None:
@@ -1230,6 +1249,8 @@ class KnowledgeSearchTool(ToolBase):
                     use_reranker=use_reranker,
                     use_hybrid=use_hybrid,
                     use_query_rewrite=use_query_rewrite,
+                    query_rewrite_profile=query_rewrite_profile,
+                    use_contextual_compression=use_contextual_compression,
                 )
         except Exception as e:
             logger.error(f"知识库搜索失败（短会话模式）: {e}")
@@ -1251,6 +1272,8 @@ class KnowledgeSearchTool(ToolBase):
         use_reranker: Optional[bool] = None,
         use_hybrid: Optional[bool] = None,
         use_query_rewrite: Optional[bool] = None,
+        query_rewrite_profile: Optional[str] = None,
+        use_contextual_compression: Optional[bool] = None,
     ) -> ToolResult:
         """执行知识库搜索 - 使用 pgvector 原生向量搜索，支持共享知识库"""
         try:
@@ -1262,9 +1285,15 @@ class KnowledgeSearchTool(ToolBase):
             )
 
             # 1) Rewrite
+            rewrite_kwargs: dict[str, Any] = {
+                "use_query_rewrite": use_query_rewrite,
+            }
+            if query_rewrite_profile is not None:
+                rewrite_kwargs["query_rewrite_profile"] = query_rewrite_profile
+
             rewrite_result = await self._rewrite(
                 query,
-                use_query_rewrite=use_query_rewrite,
+                **rewrite_kwargs,
             )
 
             # 2) Retrieve
@@ -1285,10 +1314,12 @@ class KnowledgeSearchTool(ToolBase):
             # 4) Compress
             results = await self._compress(
                 db=db,
+                query=query,
                 state=retrieve_payload,
                 selected_candidates=selected_candidates,
                 include_adjacent_chunks=include_adjacent_chunks,
                 adjacent_window=adjacent_window,
+                use_contextual_compression=use_contextual_compression,
             )
 
             search_time = (time.time() - start_time) * 1000
@@ -1310,6 +1341,11 @@ class KnowledgeSearchTool(ToolBase):
                 "use_hybrid": runtime.use_hybrid,
                 "final_top_k": runtime.final_top_k,
             }
+            if getattr(rewrite_result, "enabled", False):
+                rewrite_strategies = list(getattr(rewrite_result, "strategies", []) or [])
+                payload["retrieval_runtime"]["query_rewrite_profile"] = (
+                    "light" if rewrite_strategies == ["synonym"] else "deep"
+                )
             payload["retrieval_scope"] = {
                 "knowledge_base_ids": sorted(int(item) for item in retrieve_payload.resolved_kb_ids),
                 "document_ids": sorted(int(item) for item in retrieve_payload.resolved_document_ids),
@@ -1369,12 +1405,20 @@ class KnowledgeSearchTool(ToolBase):
             fusion_limit=reranker_candidate_k,
         )
 
-    async def _rewrite(self, query: str, *, use_query_rewrite: Optional[bool] = None) -> QueryRewriteResult:
-        return await self.query_rewrite_service.rewrite_query(
-            query,
-            rewrite_mode="auto",
-            use_query_rewrite=True if use_query_rewrite is None else bool(use_query_rewrite),
-        )
+    async def _rewrite(
+        self,
+        query: str,
+        *,
+        use_query_rewrite: Optional[bool] = None,
+        query_rewrite_profile: Optional[str] = None,
+    ) -> QueryRewriteResult:
+        kwargs: Dict[str, Any] = {
+            "rewrite_mode": "auto",
+            "use_query_rewrite": True if use_query_rewrite is None else bool(use_query_rewrite),
+        }
+        if query_rewrite_profile:
+            kwargs["rewrite_profile"] = query_rewrite_profile
+        return await self.query_rewrite_service.rewrite_query(query, **kwargs)
 
     async def _resolve_scope(
         self,
@@ -1545,7 +1589,9 @@ class KnowledgeSearchTool(ToolBase):
         ).fetchall()
 
         vector_group_rows: list[tuple[str, str, list[Any]]] = []
-        vector_variants = rewrite_result.vector_variants or [QueryVariant(text=query, strategy="original")]
+        vector_variants = getattr(rewrite_result, "vector_variants", None) or [
+            QueryVariant(text=query, strategy="original")
+        ]
         total_chunks = 0
         resolved_ef_search = int(settings.pgvector_hnsw_ef_search)
         retrieval_dimensions: set[int] = set()
@@ -1694,7 +1740,9 @@ class KnowledgeSearchTool(ToolBase):
         if not runtime.use_hybrid:
             return []
 
-        text_variants = rewrite_result.text_variants or [QueryVariant(text=query, strategy="original")]
+        text_variants = getattr(rewrite_result, "text_variants", None) or [
+            QueryVariant(text=query, strategy="original")
+        ]
         text_sql = text(
             """
             SELECT
@@ -1804,10 +1852,12 @@ class KnowledgeSearchTool(ToolBase):
         self,
         *,
         db: AsyncSession,
+        query: str,
         state: KnowledgeRetrieveState,
         selected_candidates: List[tuple[Any, Optional[float]]],
         include_adjacent_chunks: bool,
         adjacent_window: int,
+        use_contextual_compression: Optional[bool],
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         adjacent_targets: list[tuple[int, int, int]] = []
@@ -1815,8 +1865,34 @@ class KnowledgeSearchTool(ToolBase):
         use_hybrid = state.runtime.use_hybrid
         rewrite_result = state.rewrite_result
         retrieval_dimensions = state.retrieval_dimensions
+        contextual_compression = get_contextual_compression_service()
+        compression_inputs: list[CompressionInput] = []
 
-        for candidate, reranker_score in selected_candidates:
+        for source_id, (candidate, reranker_score) in enumerate(selected_candidates, start=1):
+            row = candidate.row
+            compression_inputs.append(
+                CompressionInput(
+                    source_id=source_id,
+                    doc_name=(row.document_name or "未知文档"),
+                    chunk_idx=int(getattr(row, "chunk_index", 0) or 0),
+                    chunk_content=getattr(row, "content", "") or "",
+                    reranker_score=float(reranker_score) if reranker_score is not None else None,
+                )
+            )
+
+        compression_results = await contextual_compression.compress_chunks(
+            query,
+            compression_inputs,
+            use_contextual_compression=(
+                True if use_contextual_compression is None else bool(use_contextual_compression)
+            ),
+        )
+        compression_by_source_id = {
+            item.source_id: item
+            for item in compression_results
+        }
+
+        for source_id, (candidate, reranker_score) in enumerate(selected_candidates, start=1):
             row = candidate.row
             vector_score = (
                 round(float(candidate.vector_score), 4)
@@ -1838,12 +1914,30 @@ class KnowledgeSearchTool(ToolBase):
             else:
                 score = 0.0
 
+            compression_result = compression_by_source_id.get(source_id)
+            compressed_content = (
+                compression_result.relevant_content
+                if compression_result
+                else ""
+            )
+            compression_score = (
+                round(float(compression_result.relevance_score), 2)
+                if compression_result
+                else 0.0
+            )
+            compression_fallback = (
+                compression_result.fallback_reason
+                if compression_result
+                else "not_attempted"
+            )
+            source_label = f"来源{source_id}"
+
             retrieval_dimension = int(getattr(row, "embedding_dimension", 0) or 0)
             if retrieval_dimension <= 0 and retrieval_dimensions:
                 retrieval_dimension = int(sorted(retrieval_dimensions)[0])
 
             result_item = {
-                "content": row.content,
+                "content": compressed_content or row.content,
                 "score": score,
                 "document": row.document_name or "未知",
                 "knowledge_base": row.knowledge_base_name or "未知",
@@ -1851,12 +1945,12 @@ class KnowledgeSearchTool(ToolBase):
                 "chunk_id": row.id,
                 "chunk_index": row.chunk_index,
                 "retrieval_mode": "hybrid" if use_hybrid else "vector",
-                "query_rewrite_enabled": rewrite_result.enabled,
-                "query_rewrite_strategies": rewrite_result.strategies,
-                "query_rewrite_fallback": rewrite_result.fallback_reason,
-                "query_rewrite_cache_hit": rewrite_result.cache_hit,
-                "query_rewrite_skip_reason": rewrite_result.skip_reason,
-                "query_rewrite_llm_called": rewrite_result.llm_called,
+                "query_rewrite_enabled": getattr(rewrite_result, "enabled", False),
+                "query_rewrite_strategies": list(getattr(rewrite_result, "strategies", []) or []),
+                "query_rewrite_fallback": getattr(rewrite_result, "fallback_reason", None),
+                "query_rewrite_cache_hit": bool(getattr(rewrite_result, "cache_hit", False)),
+                "query_rewrite_skip_reason": getattr(rewrite_result, "skip_reason", None),
+                "query_rewrite_llm_called": bool(getattr(rewrite_result, "llm_called", False)),
                 "matched_vector_query": getattr(row, "matched_vector_query", None),
                 "matched_vector_strategy": getattr(row, "matched_vector_strategy", None),
                 "matched_text_query": getattr(row, "matched_text_query", None),
@@ -1869,7 +1963,15 @@ class KnowledgeSearchTool(ToolBase):
                 "reranker_score": round(float(reranker_score), 4) if reranker_score is not None else None,
                 "retrieval_dimension": retrieval_dimension,
                 "retrieval_embedding_model": getattr(row, "embedding_model", None),
+                "contextual_compression_enabled": bool(
+                    compression_result and compression_result.used_compression
+                ),
+                "contextual_compression_source": source_label,
+                "contextual_compression_score": compression_score,
+                "contextual_compression_fallback": compression_fallback,
             }
+            if compressed_content:
+                result_item["contextual_compression_excerpt"] = compressed_content
             results.append(result_item)
 
             chunk_index = int(getattr(row, "chunk_index", -1) or -1)
@@ -1936,8 +2038,8 @@ class KnowledgeSearchTool(ToolBase):
         logger.info(
             f"[KnowledgeSearch] query='{query[:50]}...', results={result_count}, "
             f"hybrid={state.runtime.use_hybrid}, reranker={state.runtime.use_reranker}, "
-            f"query_rewrite={rewrite_result.enabled}, "
-            f"rewrite_variants={len(rewrite_result.vector_variants)}, "
+            f"query_rewrite={getattr(rewrite_result, 'enabled', False)}, "
+            f"rewrite_variants={len(getattr(rewrite_result, 'vector_variants', []) or [])}, "
             f"vector_hits={len(state.vector_rows)}, text_hits={len(state.text_rows)}, "
             f"ef_search={state.resolved_ef_search}, corpus_size={state.total_chunks}, "
             f"dims={sorted(state.retrieval_dimensions)}, ef_detail={state.ef_search_debug}, "

@@ -188,10 +188,14 @@ export interface ConversationEvidenceLedgerEntry {
   origin_kind: 'tool_result' | 'assistant_summary' | 'llm_inferred'
   summary: string
   status: 'confirmed' | 'provisional'
+  source_kind?: string
   source_labels: string[]
   tool_names: string[]
   turn_ids: string[]
   tool_call_ids: string[]
+  result_count?: number
+  provenance_hints: string[]
+  retrieval_scope?: Record<string, unknown>
 }
 
 export interface ConversationContextState {
@@ -235,6 +239,7 @@ export interface ChatUserPreferences {
 export type ChatPreferenceKey = 'response_language' | 'response_verbosity' | 'web_search'
 
 export type ChatRagScopeMode = 'all' | 'knowledge_base' | 'document'
+export type ChatRagRewriteProfile = 'off' | 'light' | 'deep'
 
 export interface ChatRagOverrides {
   version?: string
@@ -245,6 +250,7 @@ export interface ChatRagOverrides {
   use_reranker?: boolean
   use_hybrid?: boolean
   use_query_rewrite?: boolean
+  query_rewrite_profile?: ChatRagRewriteProfile
   use_contextual_compression?: boolean
 }
 
@@ -287,6 +293,7 @@ export interface ConversationToolLedgerEntry {
   output_tokens_estimate?: number
   truncated?: boolean
   parallel_group?: string
+  metadata?: Record<string, unknown>
   created_at?: string
 }
 
@@ -447,6 +454,16 @@ export interface ChatContextDebug {
   context_truncated: boolean
   estimated_tokens: number
   budget: number
+  effective_budget?: number
+  budget_mode?: string
+  model_context_window?: number | null
+  system_budget_cap?: number
+  model_budget_before_cap?: number | null
+  budget_reserve_tokens?: number
+  configured_budget_reserve_tokens?: number
+  completion_reserve_tokens?: number
+  system_prompt_tokens?: number
+  tool_schema_tokens_estimate?: number
   window_turns: number
   message_count_before_trim: number
   message_count_sent: number
@@ -479,7 +496,14 @@ export interface ChatContextDebug {
   reasoning_summary_provider?: string
   compact_boundary_message_id?: number
   replacement_history_count?: number
+  stable_prefix_cache_hits?: number
+  stable_prefix_cache_misses?: number
+  stable_prefix_cache_active?: boolean
   user_chat_preferences?: ChatUserPreferences
+  rag_overrides?: ChatRagOverrides
+  rag_force_initial_knowledge_search?: boolean
+  rag_force_initial_knowledge_search_executed?: boolean
+  rag_force_initial_query?: string
   model_request_mode?: 'direct' | 'function_calling' | 'xml' | string
   model_system_prompt?: string
   model_messages_raw?: ChatModelRequestMessageRaw[]
@@ -491,9 +515,30 @@ export interface ReasoningSummary {
   summary: string
 }
 
+export interface MessageCitationSourceItem {
+  label: string
+  source_kind?: string
+  tool_name?: string
+  title?: string
+  domain?: string
+  url?: string
+  knowledge_base?: string
+  document?: string
+  source_label?: string
+  citation_label?: string
+  provider?: string
+  provider_route?: string
+  content_preview?: string
+  retrieval_scope?: Record<string, unknown>
+  rank?: number
+  chunk_index?: number
+  retrieval_score?: number
+}
+
 export interface MessageMetadata extends Record<string, unknown> {
   rag_metrics?: RagMetrics
   reasoning_summary?: ReasoningSummary
+  citation_index?: Record<string, MessageCitationSourceItem>
 }
 
 export interface Message {
@@ -656,6 +701,7 @@ export interface KnowledgeSearchOptions {
   useHybrid?: boolean
   useQueryRewrite?: boolean
   rewriteMode?: 'auto' | 'force' | 'off'
+  queryRewriteProfile?: ChatRagRewriteProfile
   useContextualCompression?: boolean
   includeAdjacentChunks?: boolean
   adjacentWindow?: number
@@ -981,25 +1027,52 @@ export const chatApi = {
 
       const decoder = new TextDecoder()
       let buffer = ''
+      const processStreamChunk = (
+        chunk: string,
+        options?: { flush?: boolean },
+      ): string => {
+        const flush = Boolean(options?.flush)
+        if (!chunk) {
+          return ''
+        }
+        const lines = chunk.split('\n')
+        const remainder = flush ? '' : (lines.pop() || '')
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (!line.startsWith('data: ')) continue
+          try {
+            const data = JSON.parse(line.slice(6))
+            onEvent?.(data.event, data.data)
+          } catch {
+            // ignore malformed stream chunk
+          }
+        }
+
+        if (flush) {
+          const trailing = remainder.trim()
+          if (trailing.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trailing.slice(6))
+              onEvent?.(data.event, data.data)
+            } catch {
+              // ignore malformed trailing chunk
+            }
+          }
+          return ''
+        }
+        return remainder
+      }
 
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          processStreamChunk(buffer, { flush: true })
+          break
+        }
 
         buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6))
-              onEvent?.(data.event, data.data)
-            } catch {
-              // ignore malformed stream chunk
-            }
-          }
-        }
+        buffer = processStreamChunk(buffer)
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -1178,6 +1251,7 @@ export const knowledgeApi = {
       useHybrid = true,
       useQueryRewrite = true,
       rewriteMode = 'auto',
+      queryRewriteProfile,
       useContextualCompression = true,
       includeAdjacentChunks = false,
       adjacentWindow = 1,
@@ -1196,6 +1270,7 @@ export const knowledgeApi = {
       use_hybrid: useHybrid,
       use_query_rewrite: useQueryRewrite,
       rewrite_mode: rewriteMode,
+      query_rewrite_profile: queryRewriteProfile,
       use_contextual_compression: useContextualCompression,
       include_adjacent_chunks: includeAdjacentChunks,
       adjacent_window: normalizedAdjacentWindow,

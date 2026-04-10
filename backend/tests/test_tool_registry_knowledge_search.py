@@ -156,6 +156,7 @@ async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch)
     tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
     call_order = []
     state = SimpleNamespace(resolved_kb_ids=set(), resolved_document_ids=set())
+    captured = {}
 
     async def _rewrite(query, *, use_query_rewrite=None):
         call_order.append("rewrite")
@@ -171,6 +172,7 @@ async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch)
 
     async def _compress(**kwargs):
         call_order.append("compress")
+        captured["use_contextual_compression"] = kwargs.get("use_contextual_compression")
         return [{"content": "ok", "score": 1.0, "knowledge_base": "kb", "document": "doc"}]
 
     monkeypatch.setattr(tool, "_rewrite", _rewrite)
@@ -186,10 +188,12 @@ async def test_knowledge_search_execute_with_db_uses_pipeline_steps(monkeypatch)
         top_k=3,
         include_adjacent_chunks=False,
         adjacent_window=1,
+        use_contextual_compression=False,
     )
 
     assert result.success is True
     assert call_order == ["rewrite", "retrieve", "rerank", "compress"]
+    assert captured["use_contextual_compression"] is False
 
 
 @pytest.mark.asyncio
@@ -267,6 +271,35 @@ async def test_knowledge_search_rewrite_can_be_disabled(monkeypatch):
 
     assert result.enabled is False
     assert captured["use_query_rewrite"] is False
+
+
+@pytest.mark.asyncio
+async def test_knowledge_search_rewrite_can_pass_profile(monkeypatch):
+    tool = agent_tools.KnowledgeSearchTool(db=None, user_id=1)
+    captured = {}
+
+    async def _fake_rewrite_query(query, *, rewrite_mode="auto", use_query_rewrite=True, rewrite_profile=None):
+        captured["query"] = query
+        captured["use_query_rewrite"] = use_query_rewrite
+        captured["rewrite_profile"] = rewrite_profile
+        return QueryRewriteResult(
+            original_query=query,
+            enabled=bool(use_query_rewrite),
+            strategies=["synonym"],
+            synonym_queries=[],
+            sub_queries=[],
+            hyde_document=None,
+            vector_variants=[QueryVariant(text=query, strategy="original")],
+            text_variants=[QueryVariant(text=query, strategy="original")],
+        )
+
+    monkeypatch.setattr(tool.query_rewrite_service, "rewrite_query", _fake_rewrite_query)
+
+    result = await tool._rewrite("attention", query_rewrite_profile="light")
+
+    assert result.enabled is True
+    assert captured["use_query_rewrite"] is True
+    assert captured["rewrite_profile"] == "light"
 
 
 @pytest.mark.asyncio

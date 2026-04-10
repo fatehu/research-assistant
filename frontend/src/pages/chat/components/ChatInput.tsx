@@ -8,6 +8,7 @@ import type {
   ChatPreferenceKey,
   ChatContextPreviewResponse,
   ChatRagOverrides,
+  ChatRagRewriteProfile,
   ChatRagScopeMode,
   ChatUserPreferences,
   ConversationCompactedHistory,
@@ -57,15 +58,21 @@ const normalizePreviewScalar = (value: unknown): string => String(value || '').t
 type RagFeatureKey =
   | 'use_reranker'
   | 'use_hybrid'
-  | 'use_query_rewrite'
   | 'use_contextual_compression'
 type RagFeatureMode = 'inherit' | 'on' | 'off'
+type RagRewriteMode = 'inherit' | ChatRagRewriteProfile
 
 const RAG_FEATURE_LABELS: Record<RagFeatureKey, string> = {
   use_reranker: 'Reranker',
   use_hybrid: 'Hybrid',
-  use_query_rewrite: 'Rewrite',
   use_contextual_compression: 'Compact',
+}
+
+const RAG_REWRITE_LABELS: Record<RagRewriteMode, string> = {
+  inherit: '继承默认',
+  off: '关闭',
+  light: '轻量',
+  deep: '深度',
 }
 
 const buildFeatureModesFromOverrides = (
@@ -75,8 +82,6 @@ const buildFeatureModesFromOverrides = (
     overrides?.use_reranker == null ? 'inherit' : overrides.use_reranker ? 'on' : 'off',
   use_hybrid:
     overrides?.use_hybrid == null ? 'inherit' : overrides.use_hybrid ? 'on' : 'off',
-  use_query_rewrite:
-    overrides?.use_query_rewrite == null ? 'inherit' : overrides.use_query_rewrite ? 'on' : 'off',
   use_contextual_compression:
     overrides?.use_contextual_compression == null
       ? 'inherit'
@@ -84,6 +89,22 @@ const buildFeatureModesFromOverrides = (
         ? 'on'
         : 'off',
 })
+
+const buildRewriteModeFromOverrides = (
+  overrides: ChatRagOverrides | null | undefined,
+): RagRewriteMode => {
+  const profile = String(overrides?.query_rewrite_profile || '').trim()
+  if (profile === 'off' || profile === 'light' || profile === 'deep') {
+    return profile
+  }
+  if (overrides?.use_query_rewrite === false) {
+    return 'off'
+  }
+  if (overrides?.use_query_rewrite === true) {
+    return 'light'
+  }
+  return 'inherit'
+}
 
 const serializeRagOverrides = (overrides: ChatRagOverrides | null | undefined): string =>
   JSON.stringify(overrides ?? null)
@@ -191,6 +212,9 @@ const ChatInput = ({
   const [ragFeatureModes, setRagFeatureModes] = useState<Record<RagFeatureKey, RagFeatureMode>>(
     buildFeatureModesFromOverrides(ragOverrides),
   )
+  const [ragRewriteMode, setRagRewriteMode] = useState<RagRewriteMode>(
+    buildRewriteModeFromOverrides(ragOverrides),
+  )
   const [knowledgeBaseOptions, setKnowledgeBaseOptions] = useState<RagKnowledgeBaseOption[]>([])
   const [documentOptions, setDocumentOptions] = useState<Document[]>([])
   const [documentSearchInput, setDocumentSearchInput] = useState('')
@@ -218,6 +242,7 @@ const ChatInput = ({
     setRagDocumentKnowledgeBaseId(nextOverrides?.knowledge_base_ids?.[0] || null)
     setRagDocumentIds(nextOverrides?.document_ids || [])
     setRagFeatureModes(buildFeatureModesFromOverrides(nextOverrides))
+    setRagRewriteMode(buildRewriteModeFromOverrides(nextOverrides))
     setIsRagPanelOpen(Boolean(nextOverrides?.enabled))
     setDocumentOptions([])
     setDocumentSearchInput('')
@@ -366,6 +391,10 @@ const ChatInput = ({
       if (mode === 'inherit') return
       next[key] = mode === 'on'
     })
+    if (ragRewriteMode !== 'inherit') {
+      next.query_rewrite_profile = ragRewriteMode
+      next.use_query_rewrite = ragRewriteMode !== 'off'
+    }
     if (serializeRagOverrides(ragOverridesRef.current) !== serializeRagOverrides(next)) {
       onRagOverridesChange(next)
     }
@@ -375,6 +404,7 @@ const ChatInput = ({
     ragDocumentKnowledgeBaseId,
     ragEnabled,
     ragFeatureModes,
+    ragRewriteMode,
     ragKnowledgeBaseIds,
     ragScopeMode,
   ])
@@ -566,9 +596,15 @@ const ChatInput = ({
         effectiveRagOverrides.use_hybrid != null
           ? `Hybrid ${effectiveRagOverrides.use_hybrid ? '开启' : '关闭'}`
           : '',
-        effectiveRagOverrides.use_query_rewrite != null
-          ? `Rewrite ${effectiveRagOverrides.use_query_rewrite ? '开启' : '关闭'}`
-          : '',
+        effectiveRagOverrides.query_rewrite_profile
+          ? `Rewrite ${effectiveRagOverrides.query_rewrite_profile === 'light'
+              ? '轻量'
+              : effectiveRagOverrides.query_rewrite_profile === 'deep'
+                ? '深度'
+                : '关闭'}`
+          : effectiveRagOverrides.use_query_rewrite != null
+            ? `Rewrite ${effectiveRagOverrides.use_query_rewrite ? '轻量' : '关闭'}`
+            : '',
         effectiveRagOverrides.use_contextual_compression != null
           ? `Compact ${effectiveRagOverrides.use_contextual_compression ? '开启' : '关闭'}`
           : '',
@@ -587,6 +623,9 @@ const ChatInput = ({
       return String(name).trim()
     })
     .filter(Boolean)
+  const previewRagEnabled = Boolean(contextPreview?.effective_rag_overrides?.enabled || effectiveRagOverrides?.enabled)
+  const previewRagForceInitialSearch = Boolean(previewDebug?.rag_force_initial_knowledge_search)
+  const previewRagForceInitialQuery = normalizePreviewScalar(previewDebug?.rag_force_initial_query)
 
   return (
     <div className="border-t border-white/[0.06] bg-slate-950/88 backdrop-blur-2xl">
@@ -828,6 +867,29 @@ const ChatInput = ({
                   <div className="space-y-2">
                     <div className="text-[11px] uppercase tracking-[0.14em] text-slate-500">检索策略</div>
                     <div className="space-y-2">
+                      <div className="rounded-2xl border border-white/[0.06] bg-slate-900/60 px-3 py-3">
+                        <div className="mb-2 text-sm font-medium text-slate-100">Rewrite</div>
+                        <div className="flex flex-wrap gap-2">
+                          {(Object.keys(RAG_REWRITE_LABELS) as RagRewriteMode[]).map((mode) => (
+                            <Button
+                              key={mode}
+                              size="small"
+                              type={ragRewriteMode === mode ? 'primary' : 'default'}
+                              onClick={() => setRagRewriteMode(mode)}
+                              className={
+                                ragRewriteMode === mode
+                                  ? 'rounded-xl border-none bg-emerald-500 text-slate-950 shadow-none hover:!bg-emerald-400'
+                                  : 'rounded-xl border-white/10 bg-white/[0.04] text-slate-300 hover:border-emerald-400/30 hover:text-emerald-100'
+                              }
+                            >
+                              {RAG_REWRITE_LABELS[mode]}
+                            </Button>
+                          ))}
+                        </div>
+                        <div className="mt-2 text-xs leading-5 text-slate-500">
+                          轻量 = 仅同义扩展；深度 = 同义扩展 + HyDE + 子问题分解。
+                        </div>
+                      </div>
                       {(Object.keys(RAG_FEATURE_LABELS) as RagFeatureKey[]).map((key) => (
                         <div
                           key={key}
@@ -992,6 +1054,36 @@ const ChatInput = ({
                       </div>
                     </div>
                   </div>
+
+                  {previewRagEnabled ? (
+                    <div className="rounded-2xl border border-emerald-400/14 bg-emerald-500/5 px-3 py-3">
+                      <div className="mb-2 text-[11px] uppercase tracking-[0.14em] text-emerald-200/90">
+                        本轮 RAG 注入
+                      </div>
+                      {effectiveRagBadges.length ? (
+                        <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] text-emerald-100/90">
+                          {effectiveRagBadges.map((item) => (
+                            <span
+                              key={`preview-${item}`}
+                              className="rounded-full border border-emerald-400/18 bg-emerald-500/10 px-2.5 py-1"
+                            >
+                              {item}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="space-y-1.5 text-sm leading-6 text-slate-200">
+                        <div>这轮发送会带上临时 RAG 约束，不会写入长期偏好。</div>
+                        {previewRagForceInitialSearch ? (
+                          <div className="text-emerald-100">
+                            发送后会先自动执行一次 <code>knowledge_search</code>
+                            {previewRagForceInitialQuery ? `（query: ${previewRagForceInitialQuery}）` : ''}
+                            ，再继续请求模型回答。
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
 
                   <div className="space-y-2">
                     <div className="text-[11px] uppercase tracking-[0.14em] text-slate-500">这次会输入给模型的内容</div>

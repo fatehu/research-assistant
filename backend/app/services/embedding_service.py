@@ -70,6 +70,89 @@ MODEL_QUERY_PREFIXES: Dict[str, str] = {
 }
 
 
+class _BgeM3FlagEmbeddingAdapter:
+    """Thin adapter around the official BGEM3FlagModel dense output path."""
+
+    def __init__(
+        self,
+        *,
+        model_name_or_path: str,
+        cache_dir: Optional[str],
+        device: str,
+        normalize_embeddings: bool,
+        use_fp16: bool,
+        max_length: int,
+    ):
+        from FlagEmbedding import BGEM3FlagModel
+
+        self._dimension = MODEL_DIMENSIONS["BAAI/bge-m3"]
+        self._normalize_embeddings = bool(normalize_embeddings)
+        self._max_length = max(1, int(max_length or 8192))
+        self._model = BGEM3FlagModel(
+            model_name_or_path,
+            normalize_embeddings=bool(normalize_embeddings),
+            use_fp16=bool(use_fp16),
+            devices=device,
+            trust_remote_code=True,
+            cache_dir=cache_dir,
+            query_max_length=self._max_length,
+            passage_max_length=self._max_length,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._dimension
+
+    def encode(
+        self,
+        texts: List[str],
+        *,
+        batch_size: int,
+        show_progress_bar: bool = False,
+        normalize_embeddings: bool = True,
+        convert_to_numpy: bool = True,
+    ) -> np.ndarray:
+        outputs = self._model.encode(
+            texts,
+            batch_size=max(1, int(batch_size or 1)),
+            max_length=self._max_length,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+        dense_vecs = outputs.get("dense_vecs") if isinstance(outputs, dict) else outputs
+        embeddings = np.asarray(dense_vecs, dtype=np.float32)
+        if embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+
+        if embeddings.size > 0 and not np.isfinite(embeddings).all():
+            logger.warning(
+                "官方 BGEM3 输出包含非有限值，已执行数值清洗: "
+                f"nan_count={int(np.isnan(embeddings).sum())}, "
+                f"posinf_count={int(np.isposinf(embeddings).sum())}, "
+                f"neginf_count={int(np.isneginf(embeddings).sum())}"
+            )
+            embeddings = np.nan_to_num(
+                embeddings,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        # BGEM3FlagModel can normalize at model init; keep a defensive branch here
+        # so behavior stays aligned with the service-level normalize flag.
+        if normalize_embeddings and embeddings.size > 0:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1, norms)
+            embeddings = embeddings / norms
+
+        if convert_to_numpy:
+            return embeddings
+        return embeddings
+
+
 class LocalEmbeddingModel:
     """
     本地嵌入模型封装 - 基于 sentence-transformers
@@ -89,6 +172,7 @@ class LocalEmbeddingModel:
         self._device: Optional[str] = None
         self._loaded = False
         self._runtime_device_override: Optional[str] = None
+        self._load_lock = threading.Lock()
 
     @staticmethod
     def _instantiate_sentence_transformer(sentence_transformer_cls, model_name: str, init_kwargs: Dict[str, object]):
@@ -113,11 +197,83 @@ class LocalEmbeddingModel:
 
         raise RuntimeError("SentenceTransformer 初始化失败：没有可用的兼容构造参数")
 
+    def _resolve_sentence_transformer_model_kwargs(
+        self,
+        *,
+        device: str,
+        torch_module,
+        use_safetensors: bool = False,
+    ) -> Dict[str, object]:
+        model_kwargs: Dict[str, object] = {}
+        if use_safetensors:
+            model_kwargs["use_safetensors"] = True
+
+        use_fp16_on_cuda = bool(getattr(settings, "local_embedding_use_fp16_on_cuda", True))
+        if (
+            use_fp16_on_cuda
+            and str(device or "").lower() == "cuda"
+            and hasattr(torch_module, "float16")
+        ):
+            model_kwargs["torch_dtype"] = torch_module.float16
+
+        return model_kwargs
+
+    def _should_use_official_bge_m3_backend(self, device: str) -> bool:
+        return (
+            str(self._model_name or "").strip() == "BAAI/bge-m3"
+            and bool(getattr(settings, "local_embedding_use_official_bge_m3_backend", True))
+            and str(device or "").lower() in {"cpu", "cuda"}
+        )
+
+    def _resolve_bge_m3_model_source(self, cache_dir: Optional[str]) -> str:
+        snapshot_dir = self._resolve_cached_main_snapshot_dir(cache_dir)
+        if snapshot_dir is not None:
+            return str(snapshot_dir)
+        return self._model_name
+
+    def _instantiate_official_bge_m3_backend(
+        self,
+        *,
+        cache_dir: Optional[str],
+        device: str,
+        torch_module,
+    ) -> _BgeM3FlagEmbeddingAdapter:
+        if not self._should_use_official_bge_m3_backend(device):
+            raise RuntimeError("official BGEM3 backend requested for unsupported model/device")
+
+        model_source = self._resolve_bge_m3_model_source(cache_dir)
+        use_fp16 = bool(
+            getattr(settings, "local_embedding_use_fp16_on_cuda", True)
+            and str(device or "").lower() == "cuda"
+            and hasattr(torch_module, "float16")
+        )
+        try:
+            model = _BgeM3FlagEmbeddingAdapter(
+                model_name_or_path=model_source,
+                cache_dir=cache_dir,
+                device=device,
+                normalize_embeddings=bool(settings.local_embedding_normalize),
+                use_fp16=use_fp16,
+                max_length=int(settings.local_embedding_max_length or 8192),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "官方 BGEM3FlagModel 加载失败，请确认 FlagEmbedding 及其依赖已完整安装 "
+                f"(model={self._model_name}, device={device}, source={model_source}): {exc}"
+            ) from exc
+
+        logger.info(
+            f"本地嵌入模型加载成功: profile=flagembedding_official, "
+            f"model={self._model_name}, source={model_source}, device={device}, fp16={use_fp16}"
+        )
+        return model
+
     def _build_sentence_transformer_load_profiles(
         self,
         *,
         cache_dir: Optional[str],
         device: str,
+        torch_module,
     ) -> List[Tuple[str, Dict[str, object]]]:
         base_kwargs: Dict[str, object] = {
             "device": device,
@@ -131,6 +287,7 @@ class LocalEmbeddingModel:
         local_files_only = bool(getattr(settings, "local_embedding_local_files_only", False))
         allow_legacy_fallback = bool(getattr(settings, "local_embedding_allow_legacy_pickle_fallback", True))
         safetensors_viable = self._cached_main_snapshot_supports_safetensors(cache_dir)
+        legacy_snapshot_viable = self._cached_main_snapshot_supports_legacy_weights(cache_dir)
         cached_snapshot_available = self._resolve_cached_main_snapshot_dir(cache_dir) is not None
 
         if prefer_safetensors and safetensors_viable is False:
@@ -138,6 +295,10 @@ class LocalEmbeddingModel:
                 f"检测到本地模型主快照不支持 safetensors，跳过优先 safetensors 加载: model={self._model_name}"
             )
             prefer_safetensors = False
+        if cached_snapshot_available and legacy_snapshot_viable is False:
+            logger.warning(
+                f"检测到本地模型主快照不完整，将允许远端补齐后再加载: model={self._model_name}"
+            )
 
         if prefer_safetensors:
             if local_files_only or cache_dir:
@@ -146,7 +307,11 @@ class LocalEmbeddingModel:
                         "safetensors_local_only",
                         {
                             **base_kwargs,
-                            "model_kwargs": {"use_safetensors": True},
+                            "model_kwargs": self._resolve_sentence_transformer_model_kwargs(
+                                device=device,
+                                torch_module=torch_module,
+                                use_safetensors=True,
+                            ),
                             "local_files_only": True,
                         },
                     )
@@ -157,20 +322,77 @@ class LocalEmbeddingModel:
                         "safetensors_remote_allowed",
                         {
                             **base_kwargs,
-                            "model_kwargs": {"use_safetensors": True},
+                            "model_kwargs": self._resolve_sentence_transformer_model_kwargs(
+                                device=device,
+                                torch_module=torch_module,
+                                use_safetensors=True,
+                            ),
                         },
                     )
                 )
 
         if allow_legacy_fallback:
             legacy_kwargs = dict(base_kwargs)
-            if local_files_only or cached_snapshot_available:
+            legacy_model_kwargs = self._resolve_sentence_transformer_model_kwargs(
+                device=device,
+                torch_module=torch_module,
+                use_safetensors=False,
+            )
+            if legacy_model_kwargs:
+                legacy_kwargs["model_kwargs"] = legacy_model_kwargs
+            if local_files_only or legacy_snapshot_viable is True:
                 legacy_kwargs["local_files_only"] = True
             profiles.append(("legacy_default", legacy_kwargs))
 
         if not profiles:
             profiles.append(("default", dict(base_kwargs)))
         return profiles
+
+    @staticmethod
+    def _required_sentence_transformer_allow_patterns() -> List[str]:
+        return [
+            "*.json",
+            "*.txt",
+            "*.model",
+            "*.bin",
+            "*.safetensors",
+            "*.index.json",
+            "modules.json",
+            "1_Pooling/*",
+            "2_Normalize/*",
+            "sentencepiece*",
+            "spiece.model",
+            "tokenizer.*",
+            "vocab.*",
+            "special_tokens_map.json",
+        ]
+
+    def _ensure_cached_sentence_transformer_snapshot(self, cache_dir: Optional[str]) -> None:
+        if not cache_dir:
+            return
+        if bool(getattr(settings, "local_embedding_local_files_only", False)):
+            return
+        if self._cached_main_snapshot_supports_legacy_weights(cache_dir) is True:
+            return
+
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as exc:
+            logger.warning(f"无法导入 huggingface_hub，跳过嵌入模型缓存补齐: {exc}")
+            return
+
+        try:
+            logger.info(
+                f"检测到嵌入模型缓存不完整，开始补齐必要文件: model={self._model_name}, cache_dir={cache_dir}"
+            )
+            snapshot_download(
+                self._model_name,
+                cache_dir=cache_dir,
+                local_files_only=False,
+                allow_patterns=self._required_sentence_transformer_allow_patterns(),
+            )
+        except Exception as exc:
+            logger.warning(f"嵌入模型缓存补齐失败，将继续尝试常规加载: model={self._model_name}, error={exc}")
 
     def _cached_main_snapshot_supports_safetensors(self, cache_dir: Optional[str]) -> Optional[bool]:
         """检查当前 refs/main 指向的本地快照是否具备 safetensors 权重文件。
@@ -198,6 +420,36 @@ class LocalEmbeddingModel:
         if has_legacy_bin:
             return False
         return None
+
+    def _cached_main_snapshot_supports_legacy_weights(self, cache_dir: Optional[str]) -> Optional[bool]:
+        """检查当前 refs/main 主快照是否足以完成 legacy Transformers 加载。"""
+        snapshot_dir = self._resolve_cached_main_snapshot_dir(cache_dir)
+        if snapshot_dir is None:
+            return None
+
+        has_weight = any(
+            (snapshot_dir / name).exists()
+            for name in (
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+                "model.safetensors",
+                "model.safetensors.index.json",
+            )
+        )
+        has_config = (snapshot_dir / "config.json").exists()
+        has_tokenizer = any(
+            (snapshot_dir / name).exists()
+            for name in (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "sentencepiece.bpe.model",
+                "spiece.model",
+                "vocab.txt",
+            )
+        )
+        if has_weight and has_config and has_tokenizer:
+            return True
+        return False
 
     def _resolve_cached_main_snapshot_dir(self, cache_dir: Optional[str]) -> Optional[Path]:
         if not cache_dir:
@@ -309,98 +561,113 @@ class LocalEmbeddingModel:
         if self._loaded:
             return
 
-        try:
-            from sentence_transformers import SentenceTransformer
-            import torch
+        with self._load_lock:
+            if self._loaded:
+                return
 
-            model_name = self._model_name
-            cache_dir = settings.local_embedding_cache_dir or None
+            try:
+                import torch
 
-            # 设备选择（显式 cuda/mps 也要做可用性校验，避免容器内无驱动直接失败）
-            requested_device = str(
-                self._runtime_device_override or settings.local_embedding_device or "auto"
-            ).strip().lower()
-            device = requested_device
-            if device == "auto":
-                if torch.cuda.is_available():
-                    device = "cuda"
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    device = "mps"
+                model_name = self._model_name
+                cache_dir = settings.local_embedding_cache_dir or None
+
+                # 设备选择（显式 cuda/mps 也要做可用性校验，避免容器内无驱动直接失败）
+                requested_device = str(
+                    self._runtime_device_override or settings.local_embedding_device or "auto"
+                ).strip().lower()
+                device = requested_device
+                if device == "auto":
+                    if torch.cuda.is_available():
+                        device = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        device = "mps"
+                    else:
+                        device = "cpu"
+                elif device == "cuda":
+                    cuda_ok = False
+                    try:
+                        cuda_ok = bool(torch.cuda.is_available())
+                    except Exception as exc:
+                        logger.warning(f"检测 CUDA 可用性失败，将回退 CPU: {exc}")
+                    if not cuda_ok:
+                        logger.warning("LOCAL_EMBEDDING_DEVICE=cuda 但当前环境无可用 CUDA，自动回退到 CPU")
+                        device = "cpu"
+                elif device == "mps":
+                    mps_ok = False
+                    try:
+                        mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+                    except Exception as exc:
+                        logger.warning(f"检测 MPS 可用性失败，将回退 CPU: {exc}")
+                    if not mps_ok:
+                        logger.warning("LOCAL_EMBEDDING_DEVICE=mps 但当前环境无可用 MPS，自动回退到 CPU")
+                        device = "cpu"
+
+                if device != requested_device and requested_device != "auto":
+                    logger.info(f"Embedding 设备已从 {requested_device} 回退到 {device}")
+
+                logger.info(f"加载本地嵌入模型: {model_name}, device={device}")
+                if self._should_use_official_bge_m3_backend(device):
+                    self._model = self._instantiate_official_bge_m3_backend(
+                        cache_dir=cache_dir,
+                        device=device,
+                        torch_module=torch,
+                    )
                 else:
-                    device = "cpu"
-            elif device == "cuda":
-                cuda_ok = False
-                try:
-                    cuda_ok = bool(torch.cuda.is_available())
-                except Exception as exc:
-                    logger.warning(f"检测 CUDA 可用性失败，将回退 CPU: {exc}")
-                if not cuda_ok:
-                    logger.warning("LOCAL_EMBEDDING_DEVICE=cuda 但当前环境无可用 CUDA，自动回退到 CPU")
-                    device = "cpu"
-            elif device == "mps":
-                mps_ok = False
-                try:
-                    mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-                except Exception as exc:
-                    logger.warning(f"检测 MPS 可用性失败，将回退 CPU: {exc}")
-                if not mps_ok:
-                    logger.warning("LOCAL_EMBEDDING_DEVICE=mps 但当前环境无可用 MPS，自动回退到 CPU")
-                    device = "cpu"
+                    from sentence_transformers import SentenceTransformer
 
-            if device != requested_device and requested_device != "auto":
-                logger.info(f"Embedding 设备已从 {requested_device} 回退到 {device}")
+                    self._ensure_cached_sentence_transformer_snapshot(cache_dir)
 
-            logger.info(f"加载本地嵌入模型: {model_name}, device={device}")
-            load_profiles = self._build_sentence_transformer_load_profiles(
-                cache_dir=cache_dir,
-                device=device,
-            )
-            last_error: Optional[Exception] = None
-            for profile_name, init_kwargs in load_profiles:
-                try:
-                    self._model = self._instantiate_sentence_transformer(
-                        SentenceTransformer,
-                        model_name,
-                        init_kwargs,
+                    load_profiles = self._build_sentence_transformer_load_profiles(
+                        cache_dir=cache_dir,
+                        device=device,
+                        torch_module=torch,
                     )
-                    logger.info(
-                        f"本地嵌入模型加载成功: profile={profile_name}, model={model_name}, device={device}"
-                    )
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning(
-                        f"本地嵌入模型加载失败，尝试下一配置: profile={profile_name}, model={model_name}, error={exc}"
-                    )
+                    last_error: Optional[Exception] = None
+                    for profile_name, init_kwargs in load_profiles:
+                        try:
+                            self._model = self._instantiate_sentence_transformer(
+                                SentenceTransformer,
+                                model_name,
+                                init_kwargs,
+                            )
+                            logger.info(
+                                f"本地嵌入模型加载成功: profile={profile_name}, model={model_name}, device={device}"
+                            )
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            logger.warning(
+                                f"本地嵌入模型加载失败，尝试下一配置: profile={profile_name}, model={model_name}, error={exc}"
+                            )
 
-            if self._model is None:
-                raise last_error or RuntimeError(f"加载本地嵌入模型失败: {model_name}")
-            self._device = device
+                    if self._model is None:
+                        raise last_error or RuntimeError(f"加载本地嵌入模型失败: {model_name}")
+                self._device = device
 
-            # LocalEmbeddingModel 只表示底座模型本身的原始维度。
-            # Matryoshka 截断在 encode 阶段按调用方目标维度处理，
-            # 避免同一模型因为 1024/default/256 等输出维度重复加载。
-            self._dimension = self._model.get_sentence_embedding_dimension()
+                # LocalEmbeddingModel 只表示底座模型本身的原始维度。
+                # Matryoshka 截断在 encode 阶段按调用方目标维度处理，
+                # 避免同一模型因为 1024/default/256 等输出维度重复加载。
+                self._dimension = self._model.get_sentence_embedding_dimension()
 
-            logger.info(
-                f"本地嵌入模型加载完成: {model_name}, "
-                f"dimension={self._dimension}, device={device}"
-            )
-            self._loaded = True
-            if device == "cpu":
-                self._runtime_device_override = "cpu"
-            else:
-                self._runtime_device_override = None
+                logger.info(
+                    f"本地嵌入模型加载完成: {model_name}, "
+                    f"dimension={self._dimension}, device={device}"
+                )
+                self._loaded = True
+                if device == "cpu":
+                    self._runtime_device_override = "cpu"
+                else:
+                    self._runtime_device_override = None
 
-        except ImportError:
-            raise RuntimeError(
-                "使用本地嵌入模型需要安装依赖:\n"
-                "  pip install sentence-transformers torch\n"
-                "如不需要 GPU 可安装 CPU 版本的 torch。"
-            )
-        except Exception as e:
-            logger.error(f"加载本地嵌入模型失败: {e}")
-            raise
+            except ImportError:
+                raise RuntimeError(
+                    "使用本地嵌入模型需要安装依赖:\n"
+                    "  pip install sentence-transformers torch\n"
+                    "如不需要 GPU 可安装 CPU 版本的 torch。"
+                )
+            except Exception as e:
+                logger.error(f"加载本地嵌入模型失败: {e}")
+                raise
 
     @property
     def is_loaded(self) -> bool:
@@ -500,6 +767,8 @@ class EmbeddingModelPool:
             str(bool(settings.local_embedding_local_files_only)),
             str(bool(settings.local_embedding_allow_legacy_pickle_fallback)),
             str(bool(settings.local_embedding_allow_runtime_cpu_fallback)),
+            str(bool(settings.local_embedding_use_official_bge_m3_backend)),
+            str(bool(settings.local_embedding_use_fp16_on_cuda)),
         )
 
     def get(self, model_name: str) -> LocalEmbeddingModel:
@@ -675,6 +944,18 @@ class EmbeddingService:
         metadata["ready"] = False
         return metadata
 
+    def _get_dimension_hint(self) -> int:
+        if self._target_dimension_override > 0:
+            return self._target_dimension_override
+        if self.provider == "local":
+            configured_target = max(0, int(settings.local_embedding_dimension or 0))
+            if configured_target > 0:
+                return configured_target
+            return int(MODEL_DIMENSIONS.get(self._get_model(), 0) or 0)
+        if self.provider == "mock":
+            return max(1, int(settings.mock_embedding_dimension or MODEL_DIMENSIONS["mock/deterministic"]))
+        return int(MODEL_DIMENSIONS.get(self._get_model(), 0) or 0)
+
     async def warmup(self) -> Dict[str, object]:
         """Preload local/mock embedding runtime for the first retrieval request."""
         provider = str(self.provider or "").strip().lower()
@@ -682,7 +963,7 @@ class EmbeddingService:
         metadata: Dict[str, object] = {
             "provider": provider,
             "model": model_name,
-            "dimension": int(self.get_dimension() or 0),
+            "dimension": int(self._get_dimension_hint() or 0),
         }
 
         if provider not in {"local", "mock"}:
@@ -994,6 +1275,8 @@ def _provider_runtime_signature(provider: str) -> Tuple[str, ...]:
             str(bool(settings.local_embedding_local_files_only)),
             str(bool(settings.local_embedding_allow_legacy_pickle_fallback)),
             str(bool(settings.local_embedding_allow_runtime_cpu_fallback)),
+            str(bool(settings.local_embedding_use_official_bge_m3_backend)),
+            str(bool(settings.local_embedding_use_fp16_on_cuda)),
             str(int(settings.local_embedding_batch_size or 0)),
             str(bool(settings.local_embedding_normalize)),
         )

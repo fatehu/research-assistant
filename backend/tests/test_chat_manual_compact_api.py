@@ -567,6 +567,14 @@ async def test_get_conversation_sanitizes_legacy_message_metadata_payloads():
                     "content": "回答内容",
                     "metadata": {
                         "rag_metrics": {"knowledge_search_calls": 1},
+                        "citation_index": {
+                            "来源1": {
+                                "label": "来源1",
+                                "source_kind": "knowledge_base_search",
+                                "knowledge_base": "Transformer",
+                                "document": "Attention Is All You Need.pdf",
+                            }
+                        },
                         "reasoning_summary": {"summary": "先检索再回答"},
                         "context_debug": {"intent": "knowledge_query"},
                         "react_steps": [{"type": "thought", "content": "legacy"}],
@@ -587,6 +595,14 @@ async def test_get_conversation_sanitizes_legacy_message_metadata_payloads():
     assert len(response.messages) == 1
     assert response.messages[0].metadata == {
         "rag_metrics": {"knowledge_search_calls": 1},
+        "citation_index": {
+            "来源1": {
+                "label": "来源1",
+                "source_kind": "knowledge_base_search",
+                "knowledge_base": "Transformer",
+                "document": "Attention Is All You Need.pdf",
+            }
+        },
     }
 
 

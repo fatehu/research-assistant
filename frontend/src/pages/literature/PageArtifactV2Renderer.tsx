@@ -840,8 +840,15 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
   const derived = useMemo(() => {
     const readingBlocks = artifact.reading_blocks || []
     const supportBlocks = readingBlocks.filter((block) => SUPPORT_SEGMENT_KINDS.has(block.segment_kind))
-    const railBlocks = readingBlocks.filter((block) => shouldRenderInRail(block))
-    const flowBlocks = readingBlocks.filter((block) => !shouldRenderInRail(block))
+    const explicitRailBlocks = readingBlocks.filter((block) => shouldRenderInRail(block))
+    const shouldPromoteSupportBlocksToRail = mode === 'reader' && explicitRailBlocks.length === 0 && supportBlocks.length > 0
+    const railBlocks = shouldPromoteSupportBlocksToRail ? supportBlocks : explicitRailBlocks
+    const flowBlocks = readingBlocks.filter((block) => {
+      if (shouldPromoteSupportBlocksToRail && SUPPORT_SEGMENT_KINDS.has(block.segment_kind)) {
+        return false
+      }
+      return !shouldRenderInRail(block)
+    })
     const headingBlocks = flowBlocks.filter((block) => block.segment_kind === 'heading')
     const paragraphBlocks = flowBlocks.filter((block) => block.segment_kind === 'paragraph')
     const explanationBlocks = flowBlocks.filter((block) => (
@@ -864,6 +871,7 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
     const mainBlockGroups: MainBlockGroup[] = []
     let fallbackGroupIndex = 0
     let currentGroup: MainBlockGroup | null = null
+    const groupIdCounts = new Map<string, number>()
 
     for (const block of flowBlocks) {
       const meta = block.meta || {}
@@ -872,7 +880,10 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
       const shouldStartNewGroup = block.segment_kind === 'heading' || Boolean(explicitGroupId) || currentGroup === null
 
       if (shouldStartNewGroup) {
-        const nextGroupId = explicitGroupId || `group-${++fallbackGroupIndex}`
+        const baseGroupId = explicitGroupId || `group-${++fallbackGroupIndex}`
+        const seenCount = groupIdCounts.get(baseGroupId) || 0
+        groupIdCounts.set(baseGroupId, seenCount + 1)
+        const nextGroupId = seenCount === 0 ? baseGroupId : `${baseGroupId}-${seenCount + 1}`
         currentGroup = {
           groupId: nextGroupId,
           groupLabel: explicitGroupLabel,
@@ -922,7 +933,7 @@ export default function PageArtifactV2Renderer(props: PageArtifactV2RendererProp
       localExcerptBySegmentId,
       useSideRail,
     }
-  }, [artifact])
+  }, [artifact, mode])
 
   useEffect(() => () => {
     askAbortRef.current?.abort()

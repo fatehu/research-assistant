@@ -513,6 +513,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
               // 完成，添加助手消息
               const doneData = (data && typeof data === 'object') ? data as Record<string, any> : {}
               const ragMetrics = doneData.rag_metrics
+              const citationIndex =
+                doneData.citation_index && typeof doneData.citation_index === 'object'
+                  ? doneData.citation_index
+                  : null
               const contextDebug = get().streamingContextDebug
               const reasoningSummary =
                 typeof doneData.reasoning_summary === 'string' && doneData.reasoning_summary.trim()
@@ -535,10 +539,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   ? (doneData.item_stream as ConversationItemStream)
                   : undefined
               const metadata: MessageMetadata | undefined =
-                ragMetrics || reasoningSummary
+                ragMetrics || reasoningSummary || citationIndex
                   ? {
                       ...(ragMetrics ? { rag_metrics: ragMetrics } : {}),
                       ...(reasoningSummary ? { reasoning_summary: { summary: reasoningSummary } } : {}),
+                      ...(citationIndex ? { citation_index: citationIndex } : {}),
                     }
                   : undefined
               const finalAssistantContent = String(fullContent || doneData.answer || '')

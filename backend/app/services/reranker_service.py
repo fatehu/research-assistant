@@ -64,7 +64,10 @@ class RerankerService:
                 device = self._resolve_device()
 
                 logger.info(f"Loading reranker model: {model_name}, device={device}")
-                init_kwargs = {"device": device}
+                init_kwargs = {
+                    "device": device,
+                    "automodel_args": {"torch_dtype": "auto"},
+                }
                 if cache_dir:
                     init_kwargs["cache_folder"] = cache_dir
                 if bool(self._resolve_cached_main_snapshot_dir(cache_dir, model_name)):
@@ -81,6 +84,7 @@ class RerankerService:
                 except TypeError:
                     # Compatibility fallback for older sentence-transformers versions.
                     init_kwargs.pop("max_length", None)
+                    init_kwargs.pop("automodel_args", None)
                     self._model = CrossEncoder(model_name, **init_kwargs)
                     if int(settings.reranker_max_length or 0) > 0 and hasattr(self._model, "max_length"):
                         self._model.max_length = int(settings.reranker_max_length)
@@ -134,29 +138,30 @@ class RerankerService:
         if not query.strip() or not documents or top_k <= 0:
             return []
 
-        self._load_model()
+        def _predict_sync() -> List[Tuple[int, float]]:
+            self._load_model()
+            pairs = [[query, doc] for doc in documents]
+            batch_size = max(1, int(settings.reranker_batch_size or 1))
+            scores = self._model.predict(
+                pairs,
+                batch_size=batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
 
-        pairs = [[query, doc] for doc in documents]
-        batch_size = max(1, int(settings.reranker_batch_size or 1))
-        scores = await asyncio.to_thread(
-            self._model.predict,
-            pairs,
-            batch_size=batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
+            if hasattr(scores, "tolist"):
+                scores = scores.tolist()
+            if isinstance(scores, (float, int)):
+                scores = [scores]
 
-        if hasattr(scores, "tolist"):
-            scores = scores.tolist()
-        if isinstance(scores, (float, int)):
-            scores = [scores]
+            ranked = sorted(
+                ((idx, float(score)) for idx, score in enumerate(scores)),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            return ranked[:top_k]
 
-        ranked = sorted(
-            ((idx, float(score)) for idx, score in enumerate(scores)),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        return ranked[:top_k]
+        return await asyncio.to_thread(_predict_sync)
 
     async def warmup(self) -> dict[str, object]:
         """Preload reranker weights and a tiny inference pass."""

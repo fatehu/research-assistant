@@ -3413,31 +3413,6 @@ async def search_knowledge(
     )
     await _ensure_client_connected("access_resolved")
 
-    rewrite_service = get_query_rewrite_service()
-    rewrite_started_at = time.perf_counter()
-    await _ensure_client_connected("before_query_rewrite")
-    rewrite_result = await rewrite_service.rewrite_query(
-        request.query,
-        rewrite_mode=request.rewrite_mode,
-        use_query_rewrite=request.use_query_rewrite,
-        requested_strategies=request.query_rewrite_strategies,
-    )
-    logger.info(
-        f"[search:{search_trace_id}] 查询改写完成: 启用={rewrite_result.enabled}, "
-        f"缓存命中={rewrite_result.cache_hit}, 调用LLM={rewrite_result.llm_called}, "
-        f"跳过原因={rewrite_result.skip_reason or '-'}, "
-        f"向量变体数={len(rewrite_result.vector_variants)}, "
-        f"文本变体数={len(rewrite_result.text_variants)}, "
-        f"stage_ms={(time.perf_counter() - rewrite_started_at) * 1000:.2f}, "
-        f"elapsed={_elapsed_ms():.2f}ms"
-    )
-    await _ensure_client_connected("query_rewrite_done")
-    
-    # 使用 pgvector 进行向量相似度搜索
-    # <=> 是余弦距离运算符 (cosine distance = 1 - cosine similarity)
-    # 距离越小，相似度越高
-    # 我们需要将距离阈值转换为：score_threshold 对应 distance_threshold = 1 - score_threshold
-    distance_threshold = 1 - request.score_threshold
     use_reranker = settings.enable_reranker and request.use_reranker
     use_hybrid = settings.enable_hybrid_retrieval and request.use_hybrid
     final_top_k = request.top_k
@@ -3457,7 +3432,7 @@ async def search_knowledge(
         else 0
     )
     fusion_limit = reranker_candidate_k
-    
+
     # 构建 pgvector 原生查询，按 (embedding_model, embedding_dimension) 分组检索
     from sqlalchemy import text
 
@@ -3509,6 +3484,96 @@ async def search_knowledge(
         f"elapsed={_elapsed_ms():.2f}ms"
     )
 
+    async def _warm_embedding_runtime(
+        group_model: str,
+        group_dimension: int,
+    ) -> dict[str, object]:
+        warm_started_at = time.perf_counter()
+        service = get_embedding_service_for_model_and_dimension(group_model, group_dimension)
+        payload = await service.warmup()
+        logger.info(
+            f"[search:{search_trace_id}] 嵌入预热完成: 模型={group_model}, 维度={group_dimension}, "
+            f"状态={payload.get('status')}, stage_ms={(time.perf_counter() - warm_started_at) * 1000:.2f}, "
+            f"elapsed={_elapsed_ms():.2f}ms"
+        )
+        return payload
+
+    async def _warm_reranker_runtime() -> dict[str, object]:
+        warm_started_at = time.perf_counter()
+        payload = await get_reranker_service().warmup()
+        logger.info(
+            f"[search:{search_trace_id}] 精排预热完成: 状态={payload.get('status')}, "
+            f"stage_ms={(time.perf_counter() - warm_started_at) * 1000:.2f}, "
+            f"elapsed={_elapsed_ms():.2f}ms"
+        )
+        return payload
+
+    def _log_warmup_task_exception(label: str, task: asyncio.Task[dict[str, object]]) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.info(f"[search:{search_trace_id}] 预热任务已取消: {label}")
+            return
+        except Exception as callback_exc:
+            logger.warning(f"[search:{search_trace_id}] 读取预热任务结果失败: {label}, error={callback_exc}")
+            return
+        if exc is not None:
+            logger.error(f"[search:{search_trace_id}] 预热任务失败: {label}, error={exc}")
+
+    embedding_warmup_tasks: dict[tuple[str, int], asyncio.Task[dict[str, object]]] = {}
+    for group in vector_groups:
+        group_model = str(getattr(group, "embedding_model", "") or settings.local_embedding_model).strip()
+        group_dimension = int(getattr(group, "embedding_dimension", 0) or 0)
+        if group_dimension <= 0:
+            continue
+        warmup_key = (group_model, group_dimension)
+        if warmup_key in embedding_warmup_tasks:
+            continue
+        task = asyncio.create_task(
+            _warm_embedding_runtime(group_model, group_dimension)
+        )
+        task.add_done_callback(
+            lambda completed, label=f"embedding:{group_model}:{group_dimension}": _log_warmup_task_exception(label, completed)
+        )
+        embedding_warmup_tasks[warmup_key] = task
+
+    reranker_warmup_task: Optional[asyncio.Task[dict[str, object]]] = None
+    if use_reranker:
+        reranker_warmup_task = asyncio.create_task(_warm_reranker_runtime())
+        reranker_warmup_task.add_done_callback(
+            lambda completed: _log_warmup_task_exception("reranker", completed)
+        )
+
+    if embedding_warmup_tasks or reranker_warmup_task is not None:
+        await asyncio.sleep(0)
+
+    rewrite_service = get_query_rewrite_service()
+    rewrite_started_at = time.perf_counter()
+    await _ensure_client_connected("before_query_rewrite")
+    rewrite_result = await rewrite_service.rewrite_query(
+        request.query,
+        rewrite_mode=request.rewrite_mode,
+        rewrite_profile=request.query_rewrite_profile,
+        use_query_rewrite=request.use_query_rewrite,
+        requested_strategies=request.query_rewrite_strategies,
+    )
+    logger.info(
+        f"[search:{search_trace_id}] 查询改写完成: 启用={rewrite_result.enabled}, "
+        f"缓存命中={rewrite_result.cache_hit}, 调用LLM={rewrite_result.llm_called}, "
+        f"跳过原因={rewrite_result.skip_reason or '-'}, "
+        f"向量变体数={len(rewrite_result.vector_variants)}, "
+        f"文本变体数={len(rewrite_result.text_variants)}, "
+        f"stage_ms={(time.perf_counter() - rewrite_started_at) * 1000:.2f}, "
+        f"elapsed={_elapsed_ms():.2f}ms"
+    )
+    await _ensure_client_connected("query_rewrite_done")
+
+    # 使用 pgvector 进行向量相似度搜索
+    # <=> 是余弦距离运算符 (cosine distance = 1 - cosine similarity)
+    # 距离越小，相似度越高
+    # 我们需要将距离阈值转换为：score_threshold 对应 distance_threshold = 1 - score_threshold
+    distance_threshold = 1 - request.score_threshold
+
     vector_rows = []
     vector_group_rows = []
     vector_variants = rewrite_result.vector_variants
@@ -3533,6 +3598,11 @@ async def search_knowledge(
 
         retrieval_dimensions.add(group_dimension)
         total_chunks += group_chunks
+
+        warmup_task = embedding_warmup_tasks.get((group_model, group_dimension))
+        if warmup_task is not None:
+            await _ensure_client_connected("await_embedding_warmup")
+            await warmup_task
 
         group_embedding_svc = get_embedding_service_for_model_and_dimension(
             group_model,
@@ -3777,6 +3847,9 @@ async def search_knowledge(
         await _ensure_client_connected("before_rerank")
         rerank_started_at = time.perf_counter()
         try:
+            if reranker_warmup_task is not None:
+                await _ensure_client_connected("await_reranker_warmup")
+                await reranker_warmup_task
             reranker = get_reranker_service()
             rerank_documents = _build_reranker_documents(fused_candidates)
             rerank_lengths = [len(doc) for doc in rerank_documents if doc]

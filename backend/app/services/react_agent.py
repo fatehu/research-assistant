@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import uuid
@@ -8,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence
+from urllib.parse import urlparse
 
 from loguru import logger
 
@@ -105,6 +107,14 @@ class AgentContext:
     context_debug: Dict[str, Any] = field(default_factory=dict)
     reasoning_summary: str = ""
     mid_run_compactions: int = 0
+    stable_prefix_cache_key: str = ""
+    stable_prefix_cache_messages: List[Dict[str, Any]] = field(default_factory=list)
+    stable_prefix_cache_hits: int = 0
+    stable_prefix_cache_misses: int = 0
+    source_items_by_label: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    prefetched_rag_messages: List[Dict[str, Any]] = field(default_factory=list)
+    prefetched_rag_metadata: Dict[str, Any] = field(default_factory=dict)
+    prefetched_rag_search_count: int = 0
 
 
 @dataclass
@@ -130,6 +140,7 @@ class ExecutedToolCall:
     execution_time_ms: float
     output_tokens_estimate: int
     truncated: bool
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -429,6 +440,20 @@ class AgentCore:
         if not latest_user_text:
             self._routing_decision = None
             return None
+        active_rag_overrides = dict(self._active_rag_overrides or {})
+        if bool(active_rag_overrides.get("enabled", False)):
+            decision = RoutingDecision(
+                intent="general_chat",
+                intent_user_text=self._intent_user_text(messages),
+                carry_over_previous_goal=False,
+                needs_tools=True,
+                confidence=1.0,
+                reason="current_turn_rag_enabled",
+                source="rag_override",
+                latest_user_text=latest_user_text,
+            )
+            self._routing_decision = decision
+            return decision
         decision = self._maybe_short_circuit_direct_routing(messages)
         if decision is None:
             decision = self._maybe_short_circuit_followup_direct_routing(messages)
@@ -445,7 +470,7 @@ class AgentCore:
         return self._routing_decision_for_messages(sanitized)
 
     def _build_direct_response_system_prompt(self) -> str:
-        prompt = f"{self.DIRECT_RESPONSE_SYSTEM_PROMPT}\n\n{self.CITATION_POLICY_PROMPT}"
+        prompt = self.DIRECT_RESPONSE_SYSTEM_PROMPT
         user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
         if user_pref_prompt:
             prompt = f"{prompt}\n\n## 用户已确认的聊天偏好\n{user_pref_prompt}"
@@ -514,6 +539,8 @@ class AgentCore:
             use_fc = self._supports_function_calling()
             system_prompt = self._build_system_prompt(context.messages, function_calling=use_fc)
         llm_messages = await self._prepare_llm_messages(context, system_prompt)
+        if self._should_force_initial_rag_retrieval(context):
+            self._mark_forced_rag_search_debug(context, planned=True, executed=False)
         self._augment_context_debug_with_model_request(
             context=context,
             system_prompt=system_prompt,
@@ -696,6 +723,578 @@ class AgentCore:
         return sum(4 + estimate_tokens(str(m.get("content", "") or "")) for m in messages)
 
     @staticmethod
+    def _stable_json_hash(payload: Dict[str, Any]) -> str:
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            encoded = str(payload)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _context_window_overrides(cls) -> Dict[str, int]:
+        raw = str(getattr(settings, "agent_context_model_window_overrides", "{}") or "{}").strip()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        normalized: Dict[str, int] = {}
+        for key, value in parsed.items():
+            normalized_key = cls._normalize_model_window_key(str(key or "").strip())
+            if isinstance(value, dict):
+                provider_key = cls._normalize_provider_name(str(key or "").strip())
+                for nested_key, nested_value in value.items():
+                    try:
+                        window = int(nested_value)
+                    except Exception:
+                        continue
+                    nested_name = str(nested_key or "").strip()
+                    if not nested_name or window <= 0:
+                        continue
+                    if nested_name in {"*", "default"}:
+                        normalized[provider_key] = window
+                        continue
+                    normalized_nested_key = cls._normalize_model_window_key(f"{provider_key}:{nested_name}")
+                    if normalized_nested_key:
+                        normalized[normalized_nested_key] = window
+                continue
+            try:
+                window = int(value)
+            except Exception:
+                continue
+            if normalized_key and window > 0:
+                normalized[normalized_key] = window
+        return normalized
+
+    @classmethod
+    def _normalize_provider_name(cls, provider: str) -> str:
+        normalized = str(provider or "").strip().lower()
+        aliases = {
+            "dashscope": "aliyun",
+            "aliyun": "aliyun",
+            "deepseek_test": "deepseek",
+            "azure_openai": "openai",
+            "azure-openai": "openai",
+            "openai_compat": "openai",
+        }
+        return aliases.get(normalized, normalized)
+
+    @classmethod
+    def _normalize_model_window_key(cls, key: str) -> str:
+        raw = str(key or "").strip().lower()
+        if not raw:
+            return ""
+        if ":" not in raw:
+            return raw
+        provider, model_name = raw.split(":", 1)
+        normalized_provider = cls._normalize_provider_name(provider)
+        normalized_model_name = str(model_name or "").strip().lower()
+        if not normalized_provider:
+            return normalized_model_name
+        if not normalized_model_name:
+            return normalized_provider
+        return f"{normalized_provider}:{normalized_model_name}"
+
+    @classmethod
+    def _builtin_model_context_windows(cls) -> Dict[str, int]:
+        deepseek_test_alias = str(getattr(settings, "deepseek_test_model_alias", "deepseek-chat-test") or "deepseek-chat-test").strip().lower()
+        deepseek_test_window = max(int(getattr(settings, "deepseek_test_model_window", 4096) or 4096), 1024)
+        return {
+            "openai:gpt-4.1": 128000,
+            "openai:gpt-4o": 128000,
+            "openai:gpt-5": 128000,
+            "openai:o1": 128000,
+            "openai:o3": 128000,
+            "deepseek:deepseek-chat": 64000,
+            "deepseek:deepseek-reasoner": 64000,
+            f"deepseek:{deepseek_test_alias}": deepseek_test_window,
+            "aliyun:qwen-max": 131072,
+            "aliyun:qwen-plus": 131072,
+            "aliyun:qwen-turbo": 65536,
+        }
+
+    @classmethod
+    def _resolve_model_context_window(cls, provider: str, model_name: str) -> Optional[int]:
+        normalized_provider = cls._normalize_provider_name(provider)
+        normalized_model = str(model_name or "").strip().lower()
+        overrides = cls._context_window_overrides()
+        for key in (
+            cls._normalize_model_window_key(f"{normalized_provider}:{normalized_model}"),
+            normalized_model,
+            normalized_provider,
+        ):
+            if key and key in overrides:
+                return overrides[key]
+
+        builtin = cls._builtin_model_context_windows()
+        for key in (
+            cls._normalize_model_window_key(f"{normalized_provider}:{normalized_model}"),
+            normalized_model,
+            normalized_provider,
+        ):
+            if key and key in builtin:
+                return builtin[key]
+
+        heuristics: List[tuple[str, int]] = []
+        if normalized_provider == "openai":
+            heuristics = [
+                ("gpt-4.1", 128000),
+                ("gpt-4o", 128000),
+                ("gpt-5", 128000),
+                ("o3", 128000),
+                ("o1", 128000),
+            ]
+        elif normalized_provider == "deepseek":
+            heuristics = [("deepseek", 64000)]
+        elif normalized_provider == "aliyun":
+            heuristics = [
+                ("qwen3", 131072),
+                ("qwen-max", 131072),
+                ("qwen-plus", 131072),
+                ("qwen-turbo", 65536),
+            ]
+        elif normalized_provider == "ollama":
+            heuristics = [("", 32768)]
+
+        for needle, window in heuristics:
+            if not needle or needle in normalized_model:
+                return window
+        return None
+
+    def _current_model_context_window(self) -> Optional[int]:
+        provider = self._normalize_provider_name(
+            str(getattr(self.llm, "provider", "") or settings.default_llm_provider).strip()
+        )
+        llm_config = getattr(self.llm, "config", {}) or {}
+        model_name = str(
+            llm_config.get("context_window_model")
+            or llm_config.get("display_model")
+            or llm_config.get("model")
+            or ""
+        ).strip()
+        return self._resolve_model_context_window(provider, model_name)
+
+    def _estimate_tool_schema_tokens(self, user_text: str) -> int:
+        if not self._supports_function_calling():
+            return 0
+        try:
+            schemas = self._collect_llm_tool_schemas(user_text)
+        except Exception:
+            return 0
+        if not schemas:
+            return 0
+        try:
+            raw = json.dumps(schemas, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            raw = str(schemas)
+        return max(estimate_tokens(raw), 0)
+
+    def _build_budget_state(self, *, user_text: str, system_prompt: str) -> Dict[str, Any]:
+        system_cap = max(int(getattr(settings, "agent_context_max_input_tokens", 10000) or 10000), 1024)
+        min_budget = max(int(getattr(settings, "agent_context_budget_min_tokens", 1024) or 1024), 256)
+        configured_reserve_tokens = max(int(getattr(settings, "agent_context_budget_reserve_tokens", 3072) or 3072), 0)
+        completion_reserve_tokens = max(int(getattr(settings, "llm_max_tokens", 0) or 0), 0)
+        reserve_tokens = max(configured_reserve_tokens, completion_reserve_tokens)
+        system_prompt_tokens = max(estimate_tokens(system_prompt), 0)
+        tool_schema_tokens = self._estimate_tool_schema_tokens(user_text)
+        model_context_window = self._current_model_context_window()
+
+        if model_context_window is None:
+            effective_budget = max(min_budget, system_cap - system_prompt_tokens - tool_schema_tokens)
+            return {
+                "budget_mode": "system_cap",
+                "model_context_window": None,
+                "system_budget_cap": system_cap,
+                "budget_reserve_tokens": reserve_tokens,
+                "configured_budget_reserve_tokens": configured_reserve_tokens,
+                "completion_reserve_tokens": completion_reserve_tokens,
+                "system_prompt_tokens": system_prompt_tokens,
+                "tool_schema_tokens_estimate": tool_schema_tokens,
+                "effective_budget": effective_budget,
+                "model_budget_before_cap": None,
+            }
+
+        model_budget = max(
+            int(model_context_window) - int(system_prompt_tokens) - int(tool_schema_tokens) - int(reserve_tokens),
+            256,
+        )
+        effective_budget = max(min_budget, min(system_cap, model_budget))
+        return {
+            "budget_mode": "model_aware",
+            "model_context_window": int(model_context_window),
+            "system_budget_cap": system_cap,
+            "budget_reserve_tokens": reserve_tokens,
+            "configured_budget_reserve_tokens": configured_reserve_tokens,
+            "completion_reserve_tokens": completion_reserve_tokens,
+            "system_prompt_tokens": system_prompt_tokens,
+            "tool_schema_tokens_estimate": tool_schema_tokens,
+            "effective_budget": effective_budget,
+            "model_budget_before_cap": int(model_budget),
+        }
+
+    @staticmethod
+    def _extract_citation_tokens_in_order(text: str) -> List[str]:
+        seen: set[str] = set()
+        labels: List[str] = []
+        for match in re.finditer(r"\[(来源\d+|网页\d+)\]", text or ""):
+            label = str(match.group(1) or "").strip()
+            if label and label not in seen:
+                seen.add(label)
+                labels.append(label)
+        return labels
+
+    @classmethod
+    def _build_tool_result_source_items(
+        cls,
+        *,
+        tool_name: str,
+        observation_output: str,
+        result_data: Optional[Dict[str, Any]],
+        result_metadata: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        metadata = dict(result_metadata or {}) if isinstance(result_metadata, dict) else {}
+        data = dict(result_data or {}) if isinstance(result_data, dict) else {}
+        labels = [
+            str(item).strip()
+            for item in list(metadata.get("source_labels") or cls._extract_citation_tokens_in_order(observation_output))
+            if str(item).strip()
+        ]
+        if not labels:
+            return []
+
+        rows = cls._citation_result_rows(tool_name=tool_name, result_data=data)
+        source_kind = str(metadata.get("source_kind") or tool_name).strip() or tool_name
+        retrieval_scope = dict(metadata.get("retrieval_scope") or {}) if isinstance(metadata.get("retrieval_scope"), dict) else None
+        provenance = dict(metadata.get("provenance") or data.get("provenance") or {}) if isinstance(metadata.get("provenance") or data.get("provenance"), dict) else {}
+        items: List[Dict[str, Any]] = []
+
+        for index, label in enumerate(labels):
+            row = rows[index] if index < len(rows) else {}
+            item: Dict[str, Any] = {
+                "label": label,
+                "source_kind": source_kind,
+                "tool_name": tool_name,
+            }
+
+            if retrieval_scope:
+                item["retrieval_scope"] = dict(retrieval_scope)
+            for key in ("provider", "provider_route"):
+                value = provenance.get(key) or row.get(key)
+                if value is not None:
+                    text = str(value).strip()
+                    if text:
+                        item[key] = text
+
+            for key in (
+                "title",
+                "domain",
+                "url",
+                "knowledge_base",
+                "document",
+                "source_label",
+                "citation_label",
+            ):
+                value = row.get(key)
+                if value is not None:
+                    text = str(value).strip()
+                    if text:
+                        item[key] = text
+
+            excerpt = (
+                row.get("reader_excerpt")
+                or row.get("snippet")
+                or row.get("summary")
+                or row.get("content")
+                or row.get("description")
+            )
+            if excerpt is not None:
+                compacted = cls._compact_debug_text(excerpt, 220)
+                if compacted:
+                    item["content_preview"] = compacted
+
+            for key in ("rank", "chunk_index"):
+                try:
+                    value = row.get(key)
+                    if value is not None:
+                        item[key] = int(value)
+                except Exception:
+                    pass
+
+            try:
+                score = row.get("score")
+                if score is not None:
+                    item["retrieval_score"] = round(float(score) * 100.0, 1)
+            except Exception:
+                pass
+
+            items.append(item)
+
+        return items
+
+    @classmethod
+    def _citation_tool_name(
+        cls,
+        tool_name: str,
+        result_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        normalized_name = str(tool_name or "").strip()
+        lowered_name = normalized_name.lower()
+        data = dict(result_data or {}) if isinstance(result_data, dict) else {}
+        if normalized_name in {"knowledge_search", "web_search"}:
+            return normalized_name
+
+        source_kind = str(data.get("source_kind") or "").strip().lower()
+        if source_kind == "knowledge_base_search":
+            return "knowledge_search"
+        if source_kind in {"public_web_search", "public_web_page"}:
+            return "web_search"
+
+        provenance = dict(data.get("provenance") or {}) if isinstance(data.get("provenance"), dict) else {}
+        tool_kind = str(
+            data.get("tool_kind")
+            or provenance.get("tool_kind")
+            or data.get("local_tool_name")
+            or ""
+        ).strip().lower()
+        if tool_kind == "knowledge_search":
+            return "knowledge_search"
+        if tool_kind in {"web_search", "web_scrape"}:
+            return "web_search"
+
+        if lowered_name.startswith("mcp.") and any(
+            token in lowered_name for token in ("tavily", "firecrawl")
+        ) and any(
+            token in lowered_name
+            for token in ("search", "scrape", "extract", "crawl")
+        ):
+            return "web_search"
+        return ""
+
+    @classmethod
+    def _citation_result_rows(
+        cls,
+        *,
+        tool_name: str,
+        result_data: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        data = dict(result_data or {}) if isinstance(result_data, dict) else {}
+        rows = [dict(item) for item in list(data.get("results") or []) if isinstance(item, dict)]
+        if rows:
+            return rows
+
+        citation_tool = cls._citation_tool_name(tool_name, data)
+        if citation_tool != "web_search":
+            return []
+
+        public_links = [dict(item) for item in list(data.get("public_links") or []) if isinstance(item, dict)]
+        if public_links:
+            normalized_rows: List[Dict[str, Any]] = []
+            for index, item in enumerate(public_links, start=1):
+                href = str(item.get("href") or item.get("url") or "").strip()
+                if not href:
+                    continue
+                normalized_rows.append(
+                    {
+                        "rank": index,
+                        "title": str(item.get("label") or href).strip(),
+                        "url": href,
+                        "domain": cls._extract_hostname(href),
+                        "snippet": str(item.get("snippet") or data.get("reader_summary") or "").strip(),
+                        "reader_excerpt": cls._compact_debug_text(
+                            item.get("snippet") or data.get("reader_summary") or "",
+                            220,
+                        ),
+                    }
+                )
+            if normalized_rows:
+                return normalized_rows
+
+        metadata = dict(data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {}
+        url = str(data.get("url") or metadata.get("url") or "").strip()
+        title = str(
+            metadata.get("title")
+            or data.get("title")
+            or data.get("source_domain")
+            or url
+            or "Public web result"
+        ).strip()
+        snippet = str(
+            data.get("reader_summary")
+            or data.get("summary")
+            or data.get("description")
+            or data.get("text")
+            or data.get("content")
+            or data.get("markdown")
+            or ""
+        ).strip()
+        if not (url or title or snippet):
+            return []
+        return [
+            {
+                "rank": 1,
+                "title": title,
+                "url": url,
+                "domain": str(data.get("source_domain") or cls._extract_hostname(url)).strip(),
+                "snippet": snippet,
+                "reader_excerpt": cls._compact_debug_text(snippet or title, 220),
+            }
+        ]
+
+    @staticmethod
+    def _remember_source_items(context: AgentContext, items: Sequence[Dict[str, Any]]) -> None:
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            context.source_items_by_label[label] = dict(item)
+
+    @classmethod
+    def _build_citation_index(cls, answer: str, context: AgentContext) -> Dict[str, Dict[str, Any]]:
+        citation_index: Dict[str, Dict[str, Any]] = {}
+        for label in cls._extract_citation_tokens_in_order(answer):
+            item = dict((context.source_items_by_label or {}).get(label) or {})
+            if not item:
+                item = {
+                    "label": label,
+                    "source_kind": "knowledge_base_search" if label.startswith("来源") else "public_web_search",
+                }
+            else:
+                item["label"] = label
+            citation_index[label] = item
+        return citation_index
+
+    @classmethod
+    def _normalize_tool_result_metadata(
+        cls,
+        *,
+        tool_name: str,
+        observation_output: str,
+        result_data: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        data = dict(result_data or {}) if isinstance(result_data, dict) else {}
+        metadata: Dict[str, Any] = {}
+        source_kind = str(data.get("source_kind") or "").strip()
+        if source_kind:
+            metadata["source_kind"] = source_kind
+
+        source_labels = sorted(
+            {
+                f"来源{label}" for label in ReActAgent._extract_source_labels(observation_output or "")
+            }
+            | {
+                f"网页{label}" for label in ReActAgent._extract_web_source_labels(observation_output or "")
+            }
+        )
+        if source_labels:
+            metadata["source_labels"] = source_labels[:12]
+
+        total = data.get("total")
+        try:
+            if total is None and isinstance(data.get("results"), list):
+                total = len(data.get("results") or [])
+            total_int = int(total) if total is not None else None
+        except Exception:
+            total_int = None
+        if total_int is not None:
+            metadata["result_count"] = max(total_int, 0)
+
+        if isinstance(data.get("retrieval_scope"), dict):
+            metadata["retrieval_scope"] = dict(data.get("retrieval_scope") or {})
+        if isinstance(data.get("retrieval_runtime"), dict):
+            metadata["retrieval_runtime"] = dict(data.get("retrieval_runtime") or {})
+        if isinstance(data.get("provenance"), dict):
+            metadata["provenance"] = {
+                key: value
+                for key, value in dict(data.get("provenance") or {}).items()
+                if value is not None and str(value).strip()
+            }
+
+        previews: List[Dict[str, Any]] = []
+        for row in list(data.get("results") or [])[:4]:
+            if not isinstance(row, dict):
+                continue
+            preview: Dict[str, Any] = {}
+            for key in (
+                "title",
+                "url",
+                "domain",
+                "knowledge_base",
+                "document",
+                "source_label",
+                "citation_label",
+                "provider",
+            ):
+                value = row.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    preview[key] = text
+            rank = row.get("rank")
+            try:
+                if rank is not None:
+                    preview["rank"] = int(rank)
+            except Exception:
+                pass
+            if preview:
+                previews.append(preview)
+        if previews:
+            metadata["evidence_preview"] = previews
+        source_items = cls._build_tool_result_source_items(
+            tool_name=tool_name,
+            observation_output=observation_output,
+            result_data=data,
+            result_metadata=metadata,
+        )
+        if source_items:
+            metadata.setdefault("source_kind", tool_name)
+            metadata["source_items"] = source_items
+
+        if not metadata and tool_name:
+            metadata["source_kind"] = tool_name
+        return metadata
+
+    def _build_stable_prefix_messages(
+        self,
+        *,
+        context: AgentContext,
+        conversation_state_prompt: str,
+        persisted_anchor_summary: str,
+        persisted_summary: str,
+        replacement_history_entries: Sequence[Dict[str, Any]],
+        memory_prompt: str,
+    ) -> List[Dict[str, Any]]:
+        payload = {
+            "conversation_state_prompt": conversation_state_prompt,
+            "persisted_anchor_summary": persisted_anchor_summary,
+            "persisted_summary": persisted_summary if not replacement_history_entries else "",
+            "memory_prompt": memory_prompt,
+            "replacement_history_present": bool(replacement_history_entries),
+        }
+        cache_key = self._stable_json_hash(payload)
+        if cache_key and cache_key == str(context.stable_prefix_cache_key or "") and context.stable_prefix_cache_messages:
+            context.stable_prefix_cache_hits += 1
+            return [dict(item) for item in list(context.stable_prefix_cache_messages or [])]
+
+        prefixes: List[Dict[str, Any]] = []
+        if conversation_state_prompt:
+            prefixes.append({"role": "system", "content": f"会话上下文状态：\n{conversation_state_prompt}"})
+        if persisted_anchor_summary:
+            prefixes.append({"role": "system", "content": f"持久历史锚点：\n{persisted_anchor_summary}"})
+        if persisted_summary and not replacement_history_entries:
+            prefixes.append({"role": "system", "content": f"历史摘要：\n{persisted_summary}"})
+        if memory_prompt:
+            prefixes.append({"role": "system", "content": memory_prompt})
+
+        context.stable_prefix_cache_key = cache_key
+        context.stable_prefix_cache_messages = [dict(item) for item in prefixes]
+        context.stable_prefix_cache_misses += 1
+        return prefixes
+
+    @staticmethod
     def _extract_reasoning_summary_from_message(message: Dict[str, Any]) -> str:
         thought = str(message.get("thought") or "").strip()
         if thought:
@@ -747,11 +1346,21 @@ class AgentCore:
                 for name in list(item.get("tool_names") or [])
                 if cls._compact_debug_text(name, 48)
             ]
+            provenance_hints = [
+                cls._compact_debug_text(name, 72)
+                for name in list(item.get("provenance_hints") or [])
+                if cls._compact_debug_text(name, 72)
+            ]
+            source_kind = cls._compact_debug_text(item.get("source_kind") or "", 48)
             suffix_parts: List[str] = []
             if source_labels:
                 suffix_parts.append("来源: " + "、".join(source_labels[:3]))
             if tool_names:
                 suffix_parts.append("工具: " + "、".join(tool_names[:2]))
+            if source_kind:
+                suffix_parts.append("类型: " + source_kind)
+            if provenance_hints:
+                suffix_parts.append("线索: " + "、".join(provenance_hints[:2]))
             suffix = f"（{'；'.join(suffix_parts)}）" if suffix_parts else ""
             evidence_ledger.append(f"{summary}{suffix}")
         last_reasoning_summary = cls._compact_debug_text(state.get("last_reasoning_summary") or "", 180)
@@ -826,7 +1435,6 @@ class AgentCore:
         feature_labels = {
             "use_reranker": "reranker",
             "use_hybrid": "hybrid retrieval",
-            "use_query_rewrite": "query rewrite",
             "use_contextual_compression": "contextual compression",
         }
         feature_lines = [
@@ -834,8 +1442,21 @@ class AgentCore:
             for key, label in feature_labels.items()
             if key in overrides and overrides.get(key) is not None
         ]
+        rewrite_profile = str(overrides.get("query_rewrite_profile") or "").strip().lower()
+        if rewrite_profile in {"off", "light", "deep"}:
+            rewrite_labels = {
+                "off": "关闭",
+                "light": "轻量（仅同义扩展）",
+                "deep": "深度（同义扩展 + HyDE + 子问题分解）",
+            }
+            feature_lines.append(f"- query rewrite: {rewrite_labels[rewrite_profile]}")
+        elif "use_query_rewrite" in overrides and overrides.get("use_query_rewrite") is not None:
+            feature_lines.append(
+                f"- query rewrite: {'开启' if bool(overrides.get('use_query_rewrite')) else '关闭'}"
+            )
         lines.extend(feature_lines)
-        lines.append("- 如果需要调用 `knowledge_search`，系统会自动把以上临时约束注入到本轮检索执行。")
+        lines.append("- 本轮已显式开启 RAG：系统会先按以上范围和策略预取一轮 `knowledge_search` 证据并注入当前上下文。")
+        lines.append("- 若预取证据仍不足，可继续调用 `knowledge_search`；后续检索也会继续继承以上临时约束。")
         return "\n".join(lines).strip()
 
     def _apply_tool_call_overrides(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -877,11 +1498,226 @@ class AgentCore:
             "use_reranker",
             "use_hybrid",
             "use_query_rewrite",
+            "use_contextual_compression",
         ):
             if key in overrides and overrides.get(key) is not None:
                 effective_arguments[key] = bool(overrides.get(key))
+        rewrite_profile = str(overrides.get("query_rewrite_profile") or "").strip().lower()
+        if rewrite_profile in {"off", "light", "deep"}:
+            effective_arguments["query_rewrite_profile"] = rewrite_profile
+            effective_arguments["use_query_rewrite"] = rewrite_profile != "off"
 
         return effective_arguments
+
+    def _should_force_initial_rag_retrieval(self, context: AgentContext) -> bool:
+        overrides = dict(context.active_rag_overrides or self._active_rag_overrides or {})
+        if not overrides or not bool(overrides.get("enabled", False)):
+            return False
+        if list(context.prefetched_rag_messages or []) or int(context.prefetched_rag_search_count or 0) > 0:
+            return False
+        if int(context.knowledge_search_calls or 0) > 0:
+            return False
+        query = self._current_user_text(context)
+        if not str(query or "").strip():
+            return False
+        get_tool = getattr(self.tools, "get", None)
+        if callable(get_tool):
+            try:
+                return get_tool("knowledge_search") is not None
+            except Exception:
+                pass
+        list_tools = getattr(self.tools, "list_tools", None)
+        if callable(list_tools):
+            try:
+                raw_tools = list_tools()
+            except TypeError:
+                raw_tools = []
+            except Exception:
+                raw_tools = []
+            for tool in list(raw_tools or []):
+                if not isinstance(tool, dict):
+                    continue
+                function_payload = tool.get("function")
+                if isinstance(function_payload, dict):
+                    name = str(function_payload.get("name") or "").strip()
+                else:
+                    name = str(tool.get("name") or "").strip()
+                if name == "knowledge_search":
+                    return True
+        return False
+
+    def _build_forced_rag_tool_call(self, context: AgentContext) -> Optional[ParsedToolCall]:
+        query = str(self._current_user_text(context) or "").strip()
+        if not query:
+            return None
+        return ParsedToolCall(
+            call_id=f"rag-bootstrap-{context.iteration or 1}",
+            name="knowledge_search",
+            arguments={"query": query},
+            arguments_raw=json.dumps({"query": query}, ensure_ascii=False),
+        )
+
+    def _mark_forced_rag_search_debug(
+        self,
+        context: AgentContext,
+        *,
+        planned: bool,
+        executed: bool,
+    ) -> None:
+        payload = dict(context.context_debug or {})
+        payload["rag_force_initial_knowledge_search"] = bool(planned)
+        payload["rag_force_initial_knowledge_search_executed"] = bool(executed)
+        payload["rag_force_initial_query"] = self._compact_debug_text(self._current_user_text(context), 220)
+        context.context_debug = payload
+
+    @staticmethod
+    def _build_prefetched_rag_message(observation_output: str) -> Dict[str, Any]:
+        return {
+            "role": "system",
+            "content": (
+                "本轮 RAG 预取证据：\n"
+                f"{str(observation_output or '').strip()}\n\n"
+                "请优先基于以上证据回答；若证据不足，可继续调用工具补充。"
+            ).strip(),
+        }
+
+    def _mark_prefetched_rag_debug(
+        self,
+        context: AgentContext,
+        *,
+        query: str,
+        succeeded: bool,
+        result_count: int,
+        source_labels: Sequence[str],
+        reused_from_plan: bool = False,
+        failed_reason: Optional[str] = None,
+    ) -> None:
+        payload = dict(context.context_debug or {})
+        payload["rag_prefetch_enabled"] = True
+        payload["rag_prefetch_succeeded"] = bool(succeeded)
+        payload["rag_prefetch_reused_from_plan"] = bool(reused_from_plan)
+        payload["rag_prefetch_query"] = self._compact_debug_text(query, 220)
+        payload["rag_prefetch_result_count"] = int(max(0, result_count))
+        payload["rag_prefetch_source_labels"] = [str(item) for item in list(source_labels or [])[:12] if str(item or "").strip()]
+        if failed_reason:
+            payload["rag_prefetch_failed_reason"] = self._compact_debug_text(failed_reason, 220)
+        context.context_debug = payload
+
+    def _hydrate_prefetched_rag_context(self, context: AgentContext) -> None:
+        metadata = dict(context.prefetched_rag_metadata or {}) if isinstance(context.prefetched_rag_metadata, dict) else {}
+        labels = [
+            str(item)
+            for item in list(metadata.get("source_labels") or [])
+            if re.fullmatch(r"来源\d+", str(item or "").strip())
+        ]
+        if not labels:
+            for message in list(context.prefetched_rag_messages or []):
+                if not isinstance(message, dict):
+                    continue
+                labels.extend(f"来源{idx}" for idx in self._extract_source_labels(str(message.get("content", "") or "")))
+        numeric_labels: set[str] = set()
+        for label in labels:
+            match = re.fullmatch(r"来源(\d+)", label)
+            if match:
+                numeric_labels.add(match.group(1))
+        if numeric_labels:
+            context.allowed_source_labels.update(numeric_labels)
+            try:
+                context.next_knowledge_source_label = max(int(item) for item in numeric_labels) + 1
+            except Exception:
+                pass
+        source_items = list(metadata.get("source_items") or []) if isinstance(metadata.get("source_items"), list) else []
+        if source_items:
+            self._remember_source_items(context, source_items)
+        if list(context.prefetched_rag_messages or []):
+            context.prefetched_rag_search_count = max(int(context.prefetched_rag_search_count or 0), 1)
+            self._mark_prefetched_rag_debug(
+                context,
+                query=str(metadata.get("query") or self._current_user_text(context) or ""),
+                succeeded=True,
+                result_count=int(metadata.get("result_count") or len(source_items) or 0),
+                source_labels=labels,
+                reused_from_plan=True,
+            )
+
+    async def _maybe_prefetch_rag_context(self, context: AgentContext) -> None:
+        overrides = dict(context.active_rag_overrides or self._active_rag_overrides or {})
+        if not overrides or not bool(overrides.get("enabled", False)):
+            return
+        if list(context.prefetched_rag_messages or []):
+            self._hydrate_prefetched_rag_context(context)
+            return
+        query = str(self._current_user_text(context) or "").strip()
+        if not query:
+            return
+        if not self._should_force_initial_rag_retrieval(context):
+            return
+
+        effective_arguments = self._apply_tool_call_overrides("knowledge_search", {"query": query})
+        try:
+            result = await self.tools.execute("knowledge_search", **effective_arguments)
+        except Exception as exc:
+            logger.warning(f"[AgentCore] rag prefetch knowledge_search failed: {exc}")
+            self._mark_prefetched_rag_debug(
+                context,
+                query=query,
+                succeeded=False,
+                result_count=0,
+                source_labels=[],
+                failed_reason=str(exc),
+            )
+            return
+
+        if not bool(getattr(result, "success", False)):
+            self._mark_prefetched_rag_debug(
+                context,
+                query=query,
+                succeeded=False,
+                result_count=0,
+                source_labels=[],
+                failed_reason=str(getattr(result, "error", "") or "tool_failed"),
+            )
+            return
+
+        observation_output = await self._compress_knowledge_observation(query, result, context=context)
+        if not str(observation_output or "").strip():
+            self._mark_prefetched_rag_debug(
+                context,
+                query=query,
+                succeeded=False,
+                result_count=0,
+                source_labels=[],
+                failed_reason="empty_observation",
+            )
+            return
+
+        result_data = result.data if isinstance(result.data, dict) else {}
+        result_metadata = self._normalize_tool_result_metadata(
+            tool_name="knowledge_search",
+            observation_output=observation_output,
+            result_data=result_data,
+        )
+        source_items = list(result_metadata.get("source_items") or []) if isinstance(result_metadata.get("source_items"), list) else []
+        self._remember_source_items(context, source_items)
+        labels = [f"来源{idx}" for idx in sorted(self._extract_source_labels(observation_output), key=int)]
+        context.allowed_source_labels.update(self._extract_source_labels(observation_output))
+        context.prefetched_rag_messages = [self._build_prefetched_rag_message(observation_output)]
+        context.prefetched_rag_metadata = {
+            "query": query,
+            "result_count": int(result_metadata.get("result_count") or len(source_items) or 0),
+            "source_labels": labels,
+            "retrieval_scope": dict(result_metadata.get("retrieval_scope") or {}) if isinstance(result_metadata.get("retrieval_scope"), dict) else {},
+            "retrieval_runtime": dict(result_metadata.get("retrieval_runtime") or {}) if isinstance(result_metadata.get("retrieval_runtime"), dict) else {},
+            "source_items": source_items,
+        }
+        context.prefetched_rag_search_count += 1
+        self._mark_prefetched_rag_debug(
+            context,
+            query=query,
+            succeeded=True,
+            result_count=int(context.prefetched_rag_metadata.get("result_count") or 0),
+            source_labels=labels,
+        )
 
     @staticmethod
     def _summarize_messages(messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
@@ -990,8 +1826,16 @@ class AgentCore:
     def _build_observation_message_multi(cls, observations: Sequence[ExecutedToolCall]) -> str:
         if not observations:
             return cls._build_observation_message("", "")
-        has_knowledge = any(item.tool_name == "knowledge_search" for item in observations)
-        has_web = any(item.tool_name == "web_search" for item in observations)
+        has_knowledge = any(
+            cls._citation_tool_name(item.tool_name, item.metadata) == "knowledge_search"
+            or bool(cls._extract_source_labels(item.observation_output))
+            for item in observations
+        )
+        has_web = any(
+            cls._citation_tool_name(item.tool_name, item.metadata) == "web_search"
+            or bool(cls._extract_web_source_labels(item.observation_output))
+            for item in observations
+        )
         output = "\n\n".join(f"[{item.tool_name}]\n{item.observation_output}" for item in observations)
         if has_knowledge and has_web:
             followup = (
@@ -1065,6 +1909,7 @@ class AgentCore:
         )
         return {
             "knowledge_search_calls": context.knowledge_search_calls,
+            "prefetched_knowledge_search_count": int(max(0, context.prefetched_rag_search_count)),
             "web_search_calls": context.web_search_calls,
             "source_labels_count": len(allowed),
             "source_labels": (
@@ -1081,13 +1926,56 @@ class AgentCore:
             "compression_fallback_chunks": context.compression_fallback_chunks,
         }
 
+    @classmethod
+    def _strip_unsupported_citation_tokens(
+        cls,
+        answer: str,
+        *,
+        allowed_source_labels: Optional[set[str]] = None,
+        allowed_web_source_labels: Optional[set[str]] = None,
+    ) -> str:
+        clean = str(answer or "").strip()
+        if not clean:
+            return ""
+        allowed = cls._allowed_citation_tokens(allowed_source_labels or set(), allowed_web_source_labels or set())
+
+        def _replace(match: re.Match[str]) -> str:
+            token = str(match.group(1) or "").strip()
+            return match.group(0) if token in allowed else ""
+
+        stripped = re.sub(r"\[(来源\d+|网页\d+)\]", _replace, clean)
+        stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+        stripped = re.sub(r"\s+([，。；：！？,.;!?])", r"\1", stripped)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+        return stripped.strip()
+
+    @classmethod
+    def _seed_allowed_citations_from_messages(cls, context: AgentContext) -> None:
+        for item in list(context.messages or []):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            if role not in {"assistant", "tool", "system"}:
+                continue
+            content = str(item.get("content", "") or "")
+            context.allowed_source_labels.update(cls._extract_source_labels(content))
+            context.allowed_web_source_labels.update(cls._extract_web_source_labels(content))
+
     async def _ensure_citation_compliance(self, answer: str, context: AgentContext) -> str:
         clean = (answer or "").strip()
         allowed = self._allowed_citation_tokens(
             context.allowed_source_labels,
             context.allowed_web_source_labels,
         )
-        if not clean or not allowed or self._citations_are_valid(
+        if not clean:
+            return clean
+        if not allowed:
+            return self._strip_unsupported_citation_tokens(
+                clean,
+                allowed_source_labels=context.allowed_source_labels,
+                allowed_web_source_labels=context.allowed_web_source_labels,
+            )
+        if self._citations_are_valid(
             clean,
             context.allowed_source_labels,
             context.allowed_web_source_labels,
@@ -1259,6 +2147,17 @@ class AgentCore:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _extract_hostname(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        host = str(parsed.netloc or parsed.path or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+
     async def _compress_knowledge_observation(
         self,
         query: str,
@@ -1379,10 +2278,7 @@ class AgentCore:
         context: Optional[AgentContext] = None,
     ) -> str:
         data = result.data if isinstance(result.data, dict) else {}
-        rows = data.get("results")
-        if not isinstance(rows, list) or not rows:
-            return result.output
-        valid_rows = [row for row in rows if isinstance(row, dict)]
+        valid_rows = self._citation_result_rows(tool_name="web_search", result_data=data)
         if not valid_rows:
             return result.output
 
@@ -1428,57 +2324,57 @@ class AgentCore:
             except Exception as exc:
                 logger.warning(f"[AgentCore] MCP tool refresh failed, continue with local tools: {exc}")
 
-        if not self.runtime_context.user_id:
-            return
         user_text = self._latest_user_text(context.messages)
 
-        try:
-            memory_control = await self.runtime_service.get_user_memory_control(
-                user_id=self.runtime_context.user_id,
-                channel=self.runtime_context.channel,
-            )
-            context.memory_enabled = bool(memory_control.get("effective_enabled", False))
-        except Exception as exc:
-            context.memory_enabled = False
-            logger.warning(f"[AgentCore] load memory control failed: {exc}")
-
-        if self.runtime_context.conversation_id is not None:
+        if self.runtime_context.user_id:
             try:
-                latest_state = await self.runtime_service.get_conversation_context_state(
-                    int(self.runtime_context.conversation_id)
+                memory_control = await self.runtime_service.get_user_memory_control(
+                    user_id=self.runtime_context.user_id,
+                    channel=self.runtime_context.channel,
                 )
-                if isinstance(latest_state, dict):
-                    context.conversation_state = latest_state
-                latest_compacted_history = await self.runtime_service.get_conversation_compacted_history(
-                    int(self.runtime_context.conversation_id)
-                )
-                if isinstance(latest_compacted_history, dict):
-                    context.compacted_history = latest_compacted_history
-                    persisted_summary = str(latest_compacted_history.get("history_summary") or "").strip()
-                    if persisted_summary:
-                        context.context_summary = persisted_summary
-                item_stream = await self.runtime_service.get_conversation_item_stream(
-                    int(self.runtime_context.conversation_id)
-                )
-                if isinstance(item_stream, dict):
-                    context.item_stream = item_stream
-                    boundary_message_id = (
-                        latest_compacted_history.get("compact_boundary_message_id")
-                        if isinstance(latest_compacted_history, dict)
-                        else None
-                    )
-                    try:
-                        normalized_boundary_message_id = int(boundary_message_id) if boundary_message_id is not None else None
-                    except Exception:
-                        normalized_boundary_message_id = None
-                    context.history_messages = self._history_messages_from_item_stream(
-                        list(item_stream.get("entries") or []),
-                        fallback_boundary_message_id=normalized_boundary_message_id,
-                    )
+                context.memory_enabled = bool(memory_control.get("effective_enabled", False))
             except Exception as exc:
-                logger.warning(f"[AgentCore] load conversation context artifacts failed: {exc}")
+                context.memory_enabled = False
+                logger.warning(f"[AgentCore] load memory control failed: {exc}")
+
+            if self.runtime_context.conversation_id is not None:
+                try:
+                    latest_state = await self.runtime_service.get_conversation_context_state(
+                        int(self.runtime_context.conversation_id)
+                    )
+                    if isinstance(latest_state, dict):
+                        context.conversation_state = latest_state
+                    latest_compacted_history = await self.runtime_service.get_conversation_compacted_history(
+                        int(self.runtime_context.conversation_id)
+                    )
+                    if isinstance(latest_compacted_history, dict):
+                        context.compacted_history = latest_compacted_history
+                        persisted_summary = str(latest_compacted_history.get("history_summary") or "").strip()
+                        if persisted_summary:
+                            context.context_summary = persisted_summary
+                    item_stream = await self.runtime_service.get_conversation_item_stream(
+                        int(self.runtime_context.conversation_id)
+                    )
+                    if isinstance(item_stream, dict):
+                        context.item_stream = item_stream
+                        boundary_message_id = (
+                            latest_compacted_history.get("compact_boundary_message_id")
+                            if isinstance(latest_compacted_history, dict)
+                            else None
+                        )
+                        try:
+                            normalized_boundary_message_id = int(boundary_message_id) if boundary_message_id is not None else None
+                        except Exception:
+                            normalized_boundary_message_id = None
+                        context.history_messages = self._active_history_messages_from_item_stream(
+                            list(item_stream.get("entries") or []),
+                            fallback_boundary_message_id=normalized_boundary_message_id,
+                        )
+                except Exception as exc:
+                    logger.warning(f"[AgentCore] load conversation context artifacts failed: {exc}")
 
         context.messages = self._merge_history_messages(context.history_messages, context.messages)
+        self._seed_allowed_citations_from_messages(context)
 
         if self.runtime_context.user_id:
             try:
@@ -1495,12 +2391,18 @@ class AgentCore:
                 overrides,
             )
         self._active_chat_preferences = dict(context.user_chat_preferences or {})
-        context.active_rag_overrides = self.runtime_service.normalize_chat_rag_overrides(
-            self.runtime_context.rag_overrides
-        )
+        normalize_rag_overrides = getattr(self.runtime_service, "normalize_chat_rag_overrides", None)
+        if callable(normalize_rag_overrides):
+            context.active_rag_overrides = normalize_rag_overrides(self.runtime_context.rag_overrides)
+        else:
+            context.active_rag_overrides = dict(self.runtime_context.rag_overrides or {})
         self._active_rag_overrides = dict(context.active_rag_overrides or {})
+        if list(context.prefetched_rag_messages or []):
+            self._hydrate_prefetched_rag_context(context)
+        else:
+            await self._maybe_prefetch_rag_context(context)
 
-        if context.memory_enabled:
+        if context.memory_enabled and self.runtime_context.user_id:
             try:
                 if self.runtime_context.conversation_id is not None:
                     scope_type, scope_id = "conversation", str(self.runtime_context.conversation_id)
@@ -1683,6 +2585,7 @@ class AgentCore:
         recently_slid_messages: Sequence[Dict[str, Any]],
         estimated_tokens: int,
         budget: int,
+        budget_state: Optional[Dict[str, Any]] = None,
         window_turns: int,
         total_messages: int,
         older_messages_count: int,
@@ -1729,6 +2632,7 @@ class AgentCore:
         ]
         user_chat_preferences = dict(context.user_chat_preferences or {}) if isinstance(context.user_chat_preferences, dict) else {}
         active_rag_overrides = dict(context.active_rag_overrides or {}) if isinstance(context.active_rag_overrides, dict) else {}
+        effective_budget_state = dict(budget_state or {})
 
         payload = {
             "version": "chat_context_debug.v1",
@@ -1736,6 +2640,16 @@ class AgentCore:
             "context_truncated": bool(context.context_truncated),
             "estimated_tokens": int(max(0, estimated_tokens)),
             "budget": int(max(0, budget)),
+            "effective_budget": int(max(0, effective_budget_state.get("effective_budget") or budget)),
+            "budget_mode": str(effective_budget_state.get("budget_mode") or "system_cap"),
+            "model_context_window": effective_budget_state.get("model_context_window"),
+            "system_budget_cap": int(max(0, effective_budget_state.get("system_budget_cap") or budget)),
+            "model_budget_before_cap": effective_budget_state.get("model_budget_before_cap"),
+            "budget_reserve_tokens": int(max(0, effective_budget_state.get("budget_reserve_tokens") or 0)),
+            "configured_budget_reserve_tokens": int(max(0, effective_budget_state.get("configured_budget_reserve_tokens") or 0)),
+            "completion_reserve_tokens": int(max(0, effective_budget_state.get("completion_reserve_tokens") or 0)),
+            "system_prompt_tokens": int(max(0, effective_budget_state.get("system_prompt_tokens") or 0)),
+            "tool_schema_tokens_estimate": int(max(0, effective_budget_state.get("tool_schema_tokens_estimate") or 0)),
             "window_turns": int(max(1, window_turns)),
             "message_count_before_trim": int(max(0, total_messages)),
             "message_count_sent": int(max(0, len(llm_messages))),
@@ -1759,11 +2673,16 @@ class AgentCore:
             "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
             "replacement_history_count": int(len(replacement_history)),
             "mid_run_compactions": int(max(0, context.mid_run_compactions)),
+            "stable_prefix_cache_hits": int(max(0, context.stable_prefix_cache_hits)),
+            "stable_prefix_cache_misses": int(max(0, context.stable_prefix_cache_misses)),
+            "stable_prefix_cache_active": bool(context.stable_prefix_cache_messages),
             "memory_enabled": bool(context.memory_enabled),
             "memory_count": int(len(context.memory_contexts or [])),
             "memory_lines": memory_lines,
             "user_chat_preferences": user_chat_preferences,
             "rag_overrides": active_rag_overrides,
+            "prefetched_rag_search_count": int(max(0, context.prefetched_rag_search_count)),
+            "prefetched_rag_message_count": int(len(context.prefetched_rag_messages or [])),
             "recently_slid_messages": recently_slid_previews,
             "recent_messages": recent_messages,
             "successful_knowledge_queries": successful_queries[:6],
@@ -1814,6 +2733,8 @@ class AgentCore:
         if str(message.get("role", "")).lower() != "system":
             return ""
         content = str(message.get("content", "") or "")
+        if content.startswith("本轮 RAG 预取证据："):
+            return "rag_prefetch"
         if content.startswith("关键历史锚点："):
             return "anchor"
         if content.startswith("持久历史锚点："):
@@ -1873,6 +2794,33 @@ class AgentCore:
             )
         return history_messages
 
+    @classmethod
+    def _active_history_messages_from_item_stream(
+        cls,
+        entries: Sequence[Dict[str, Any]],
+        *,
+        fallback_boundary_message_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        store = ConversationItemStreamStore.from_payload(
+            {"version": "conversation_item_stream.v1", "entries": list(entries or [])}
+        )
+        replay_rows = store.canonical_active_message_rows(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        history_messages: List[Dict[str, Any]] = []
+        for row in replay_rows:
+            history_messages.append(
+                cls._sanitize_message_for_context(
+                    {
+                        "role": str(row.get("role") or "assistant").strip().lower() or "assistant",
+                        "content": str(row.get("content") or ""),
+                        "thought": str(row.get("thought") or "").strip() or None,
+                        "metadata": dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {},
+                    }
+                )
+            )
+        return history_messages
+
     @staticmethod
     def _split_context_windows(
         messages: Sequence[Dict[str, Any]],
@@ -1904,6 +2852,10 @@ class AgentCore:
         context.message_tokens_before_trim = 0
         context.message_tokens_after_trim = 0
         sanitized = [self._sanitize_message_for_context(item) for item in context.messages]
+        budget_state = self._build_budget_state(
+            user_text=self._current_user_text(context),
+            system_prompt=system_prompt,
+        )
         history_source = [
             self._sanitize_message_for_context(item)
             for item in list(context.history_messages or [])
@@ -1926,7 +2878,8 @@ class AgentCore:
                 llm_messages=sanitized,
                 recently_slid_messages=recently_slid,
                 estimated_tokens=self._estimate_messages_tokens(sanitized),
-                budget=max(int(getattr(settings, "agent_context_max_input_tokens", 10000)), 1024),
+                budget=int(budget_state.get("effective_budget") or max(int(getattr(settings, "agent_context_max_input_tokens", 10000)), 1024)),
+                budget_state=budget_state,
                 window_turns=max(int(getattr(settings, "agent_context_window_turns", 8)), 1),
                 total_messages=len(sanitized),
                 older_messages_count=0,
@@ -1942,7 +2895,6 @@ class AgentCore:
             recently_slid_turns=recently_slid_turns,
         )
 
-        prefixes: List[Dict[str, Any]] = []
         persisted_history = dict(context.compacted_history or {}) if isinstance(context.compacted_history, dict) else {}
         persisted_anchor_summary = self._compact_debug_text(persisted_history.get("history_anchors", ""), 600)
         persisted_summary = self._compact_debug_text(
@@ -1959,14 +2911,15 @@ class AgentCore:
         ]
         older_summary = ""
         conversation_state_prompt = self._render_conversation_context_state(context.conversation_state)
-        if conversation_state_prompt:
-            prefixes.append({"role": "system", "content": f"会话上下文状态：\n{conversation_state_prompt}"})
-        if persisted_anchor_summary:
-            prefixes.append({"role": "system", "content": f"持久历史锚点：\n{persisted_anchor_summary}"})
-        if persisted_summary and not replacement_history_entries:
-            prefixes.append({"role": "system", "content": f"历史摘要：\n{persisted_summary}"})
-        if context.memory_contexts:
-            prefixes.append({"role": "system", "content": self._memory_prompt(context.memory_contexts)})
+        memory_prompt = self._memory_prompt(context.memory_contexts) if context.memory_contexts else ""
+        prefixes = self._build_stable_prefix_messages(
+            context=context,
+            conversation_state_prompt=conversation_state_prompt,
+            persisted_anchor_summary=persisted_anchor_summary,
+            persisted_summary=persisted_summary,
+            replacement_history_entries=replacement_history_entries,
+            memory_prompt=memory_prompt,
+        )
         summary_trigger_tokens = max(int(getattr(settings, "agent_context_summary_trigger_tokens", 7000) or 7000), 0)
         history_summary_source = older if older else recently_slid
         if (
@@ -1978,10 +2931,16 @@ class AgentCore:
             prefixes.append({"role": "system", "content": f"更早历史摘要：\n{older_summary}"})
             context.context_summary = older_summary
 
-        candidate = prefixes + replacement_history_entries + recently_slid + recent + ephemeral_messages
+        candidate = (
+            prefixes
+            + replacement_history_entries
+            + [dict(item) for item in list(context.prefetched_rag_messages or []) if isinstance(item, dict)]
+            + recently_slid
+            + recent
+            + ephemeral_messages
+        )
         context.message_tokens_before_trim = self._estimate_messages_tokens(candidate)
-        max_input_tokens = max(int(getattr(settings, "agent_context_max_input_tokens", 10000)), 1024)
-        budget = max(256, max_input_tokens - estimate_tokens(system_prompt))
+        budget = max(int(budget_state.get("effective_budget") or 0), 256)
 
         def is_observation(msg: Dict[str, Any]) -> bool:
             role = str(msg.get("role", "")).lower()
@@ -2013,13 +2972,13 @@ class AgentCore:
                         break
             if drop is None:
                 for idx in range(last_user):
-                    if self._context_prefix_kind(candidate[idx]) in {"anchor", "persisted_anchor"}:
+                    if self._context_prefix_kind(candidate[idx]) in {"anchor", "persisted_anchor", "rag_prefetch"}:
                         continue
                     drop = idx
                     break
             if drop is None:
                 for idx in range(len(candidate)):
-                    if idx != last_user and self._context_prefix_kind(candidate[idx]) not in {"anchor", "persisted_anchor"}:
+                    if idx != last_user and self._context_prefix_kind(candidate[idx]) not in {"anchor", "persisted_anchor", "rag_prefetch"}:
                         drop = idx
                         break
             if drop is None:
@@ -2044,6 +3003,7 @@ class AgentCore:
             recently_slid_messages=recently_slid,
             estimated_tokens=estimated_tokens,
             budget=budget,
+            budget_state=budget_state,
             window_turns=window_turns,
             total_messages=len(history_source) + len(ephemeral_messages),
             older_messages_count=len(older),
@@ -2067,24 +3027,25 @@ class AgentCore:
     async def _maybe_mid_run_compact(self, context: AgentContext, system_prompt: str) -> bool:
         if not bool(getattr(settings, "agent_mid_run_compaction_enabled", True)):
             return False
-        if int(context.iteration or 0) < max(int(getattr(settings, "agent_mid_run_compaction_min_iteration", 2) or 2), 1):
+        min_iteration = max(int(getattr(settings, "agent_mid_run_compaction_min_iteration", 2) or 2), 1)
+        if int(context.iteration or 0) < min_iteration:
             return False
         if int(context.mid_run_compactions or 0) >= max(
             int(getattr(settings, "agent_mid_run_compaction_max_per_run", 2) or 2),
             1,
         ):
             return False
-        trigger_tokens = max(
+        effective_budget = max(
             int(
-                getattr(
-                    settings,
-                    "agent_mid_run_compaction_message_tokens_trigger",
-                    max(int(getattr(settings, "agent_context_max_input_tokens", 10000) * 0.6), 2048),
-                )
+                (context.context_debug or {}).get("effective_budget")
+                or getattr(settings, "agent_context_max_input_tokens", 10000)
                 or 0
             ),
-            256,
+            1024,
         )
+        configured_trigger = int(getattr(settings, "agent_mid_run_compaction_message_tokens_trigger", 0) or 0)
+        default_trigger = max(int(effective_budget * 0.6), 2048)
+        trigger_tokens = max(configured_trigger or default_trigger, 256)
         message_pressure_triggered = int(context.message_tokens_before_trim or 0) >= trigger_tokens
         if not bool(context.context_truncated) and not message_pressure_triggered:
             return False
@@ -2253,7 +3214,7 @@ class AgentCore:
         context.conversation_state = dict(artifacts.context_state or {})
         context.compacted_history = compacted_history
         context.item_stream = refreshed_item_stream
-        context.history_messages = self._history_messages_from_item_stream(
+        context.history_messages = self._active_history_messages_from_item_stream(
             list(refreshed_item_stream.get("entries") or []),
             fallback_boundary_message_id=latest_message_id,
         )
@@ -2612,7 +3573,11 @@ class AgentCore:
 
         observation_output = result.output
         permission_required = self._tool_result_requires_permission(result)
-        if call.name == "knowledge_search":
+        citation_tool_name = self._citation_tool_name(
+            call.name,
+            result.data if isinstance(result.data, dict) else {},
+        )
+        if citation_tool_name == "knowledge_search":
             context.knowledge_search_calls += 1
             observation_output = await self._compress_knowledge_observation(
                 str(effective_arguments.get("query", "")),
@@ -2620,7 +3585,7 @@ class AgentCore:
                 context=context,
             )
             context.allowed_source_labels.update(self._extract_source_labels(observation_output))
-        elif call.name == "web_search":
+        elif citation_tool_name == "web_search":
             context.web_search_calls += 1
             observation_output = await self._compress_web_search_observation(
                 str(call.arguments.get("query", "")),
@@ -2628,6 +3593,15 @@ class AgentCore:
                 context=context,
             )
             context.allowed_web_source_labels.update(self._extract_web_source_labels(observation_output))
+        result_metadata = self._normalize_tool_result_metadata(
+            tool_name=call.name,
+            observation_output=observation_output,
+            result_data=result.data if isinstance(result.data, dict) else {},
+        )
+        self._remember_source_items(
+            context,
+            list(result_metadata.get("source_items") or []) if isinstance(result_metadata.get("source_items"), list) else [],
+        )
 
         observation_event = {
             "type": "observation",
@@ -2636,6 +3610,7 @@ class AgentCore:
                 "success": bool(result.success),
                 "output": observation_output,
                 "data": result.data,
+                "metadata": result_metadata,
                 "error": result.error,
                 "error_contract": (result.data or {}).get("error_contract") if isinstance(result.data, dict) else None,
                 "execution_time_ms": float(getattr(result, "execution_time_ms", 0.0) or 0.0),
@@ -2661,6 +3636,7 @@ class AgentCore:
             execution_time_ms=float(getattr(result, "execution_time_ms", 0.0) or 0.0),
             output_tokens_estimate=int(getattr(result, "output_tokens_estimate", 0) or 0),
             truncated=bool(getattr(result, "truncated", False)),
+            metadata=result_metadata,
             tool_message={
                 "role": "tool",
                 "tool_call_id": call.call_id,
@@ -2738,12 +3714,16 @@ class AgentCore:
         if conversation_id is None:
             return
         summary_text = self._tool_use_summary_text(executed_calls)
-        if not summary_text:
+        permission_rows = [
+            item for item in executed_calls
+            if isinstance(item, ExecutedToolCall) and item.permission_required
+        ]
+        if not summary_text and not permission_rows:
             return
         try:
-            await self.runtime_service.append_conversation_item_entries(
-                int(conversation_id),
-                [
+            items_to_append: List[Dict[str, Any]] = []
+            if summary_text:
+                items_to_append.append(
                     {
                         "kind": "tool_use_summary",
                         "turn_id": context.turn_id,
@@ -2768,7 +3748,44 @@ class AgentCore:
                         },
                         "created_at": datetime.utcnow().isoformat(),
                     }
-                ],
+                )
+            if permission_rows:
+                permission_text = "；".join(
+                    self._truncate_failure_text(
+                        item.observation_output or item.error or f"`{item.tool_name}` 需要授权后才能继续。",
+                        limit=120,
+                    )
+                    for item in permission_rows[:2]
+                )
+                items_to_append.append(
+                    {
+                        "kind": "permission_denial",
+                        "turn_id": context.turn_id,
+                        "role": "assistant",
+                        "run_id": context.run_id,
+                        "iteration": context.iteration,
+                        "summary": permission_text or "本轮有工具因权限限制未执行。",
+                        "content": permission_text or "本轮有工具因权限限制未执行。",
+                        "status": "authorization_required",
+                        "parallel_group": parallel_group,
+                        "metadata": {
+                            "tool_names": [
+                                item.tool_name
+                                for item in permission_rows
+                                if str(item.tool_name or "").strip()
+                            ],
+                            "tool_call_ids": [
+                                item.tool_call_id
+                                for item in permission_rows
+                                if str(item.tool_call_id or "").strip()
+                            ],
+                        },
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                )
+            await self.runtime_service.append_conversation_item_entries(
+                int(conversation_id),
+                items_to_append,
             )
         except Exception as exc:
             logger.warning(f"[AgentCore] append tool use summary item failed: {exc}")
@@ -2848,6 +3865,7 @@ class AgentCore:
                     "execution_time_ms": item.execution_time_ms,
                     "output_tokens_estimate": item.output_tokens_estimate,
                     "truncated": item.truncated,
+                    "metadata": dict(item.metadata or {}) if isinstance(item.metadata, dict) else None,
                     "created_at": datetime.utcnow().isoformat(),
                 }
             )
@@ -3145,10 +4163,25 @@ class AgentCore:
         stream: bool = True,
         prepared_plan: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        prepared_prefetched_rag_messages: List[Dict[str, Any]] = []
+        prepared_prefetched_rag_metadata: Dict[str, Any] = {}
+        if isinstance(prepared_plan, dict):
+            prepared_prefetched_rag_messages = [
+                dict(item)
+                for item in list(prepared_plan.get("prefetched_rag_messages") or [])
+                if isinstance(item, dict)
+            ]
+            prepared_prefetched_rag_metadata = (
+                dict(prepared_plan.get("prefetched_rag_metadata") or {})
+                if isinstance(prepared_plan.get("prefetched_rag_metadata"), dict)
+                else {}
+            )
         context = AgentContext(
             messages=[self._sanitize_message_for_context(item) for item in messages],
             turn_id=self.runtime_context.turn_id,
             max_iterations=self.max_iterations,
+            prefetched_rag_messages=prepared_prefetched_rag_messages,
+            prefetched_rag_metadata=prepared_prefetched_rag_metadata,
         )
         self._routing_decision = None
         await self._prepare_runtime_context(context)
@@ -3203,9 +4236,47 @@ class AgentCore:
                 context.state = AgentState.THINKING
                 yield {"type": "thinking_start", "data": ""}
                 yield {"type": "thinking", "data": "正在分析问题并规划下一步..."}
+                forced_initial_rag_retrieval = False
+                if i == 1 and self._should_force_initial_rag_retrieval(context):
+                    forced_initial_rag_retrieval = True
+                    await self._ensure_run_created(context)
+                    self._mark_forced_rag_search_debug(context, planned=True, executed=True)
+                    thought_event = {
+                        "type": "thought",
+                        "data": "本轮已启用 RAG 注入，先执行一次 knowledge_search 以载入知识库证据。",
+                    }
+                    self._append_step_from_event(context, thought_event)
+                    context.persist_events.append(thought_event)
+                    yield thought_event
+                    forced_call = self._build_forced_rag_tool_call(context)
+                    if forced_call is not None:
+                        context.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": forced_call.call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": forced_call.name,
+                                            "arguments": forced_call.arguments_raw,
+                                        },
+                                    }
+                                ],
+                            }
+                        )
+                        forced_executed = await self._execute_tool_calls(context, [forced_call])
+                        for item in forced_executed:
+                            for event in (item.action_event, item.observation_event):
+                                self._append_step_from_event(context, event)
+                                context.persist_events.append(event)
+                                yield event
+                            context.messages.append(item.tool_message)
+
                 use_fc = self._supports_function_calling()
 
-                if i == 1 and prepared_system_prompt and prepared_llm_messages:
+                if i == 1 and prepared_system_prompt and prepared_llm_messages and not forced_initial_rag_retrieval:
                     system_prompt = prepared_system_prompt
                     llm_messages = [dict(item) for item in prepared_llm_messages]
                 else:
@@ -3294,6 +4365,7 @@ class AgentCore:
             )
             await self._persist_memory(context)
             rag_metrics = self._build_rag_metrics(context)
+            citation_index = self._build_citation_index(context.final_answer, context)
             yield {
                 "type": "done",
                 "data": {
@@ -3305,6 +4377,7 @@ class AgentCore:
                     "answer": context.final_answer,
                     "rag_metrics": rag_metrics,
                     "reasoning_summary": reasoning_summary or None,
+                    "citation_index": citation_index or None,
                 },
             }
             await self._persist_run_completion(context, status="success")

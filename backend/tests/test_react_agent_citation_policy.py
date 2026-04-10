@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.agent_tools import ToolResult
-from app.services.react_agent import AgentContext, AgentRuntimeContext, ReActAgent, RoutingDecision
+from app.services.react_agent import AgentContext, AgentRuntimeContext, ExecutedToolCall, ReActAgent, RoutingDecision
 from app.config import settings
 
 
@@ -160,6 +160,40 @@ class _CapturingKnowledgeTools:
                         "chunk_index": 0,
                     }
                 ]
+            },
+        )
+
+
+class _CapturingMcpWebTools:
+    def __init__(self):
+        self.calls = []
+
+    def get_tools_description(self) -> str:
+        return "- mcp.firecrawl.firecrawl_search: 搜索网页"
+
+    def list_tools(self):
+        return _tool_defs("mcp.firecrawl.firecrawl_search")
+
+    async def execute(self, tool_name: str, **kwargs):
+        self.calls.append((tool_name, dict(kwargs)))
+        return ToolResult(
+            success=True,
+            output='{"web":[{"url":"https://example.com/agentic-search","title":"Agentic Search","description":"An overview of agentic search."}]}',
+            data={
+                "source_kind": "public_web_search",
+                "provider": "firecrawl",
+                "results": [
+                    {
+                        "title": "Agentic Search",
+                        "url": "https://example.com/agentic-search",
+                        "snippet": "An overview of agentic search.",
+                        "domain": "example.com",
+                    }
+                ],
+                "provenance": {
+                    "provider": "firecrawl",
+                    "tool_kind": "web_search",
+                },
             },
         )
 
@@ -331,6 +365,34 @@ async def test_prepare_direct_response_short_circuits_obvious_single_turn_direct
 
 
 @pytest.mark.asyncio
+async def test_prepare_direct_response_returns_none_when_current_turn_rag_is_enabled(monkeypatch):
+    tools = _SelectableTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="chat",
+            rag_overrides={"enabled": True, "scope_mode": "all"},
+        ),
+    )
+
+    async def _fake_prepare_runtime_context(context):
+        context.active_rag_overrides = {"enabled": True, "scope_mode": "all"}
+        agent._active_rag_overrides = dict(context.active_rag_overrides)
+
+    monkeypatch.setattr(agent, "_prepare_runtime_context", _fake_prepare_runtime_context)
+
+    prepared = await agent.prepare_direct_response([{"role": "user", "content": "一句话解释注意力机制"}])
+
+    assert prepared is None
+    assert agent._routing_decision is not None
+    assert agent._routing_decision.source == "rag_override"
+    assert agent._routing_decision.needs_tools is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message_text",
     [
@@ -382,6 +444,58 @@ async def test_prepare_context_preview_exposes_full_function_calling_request(mon
     assert prepared.context.context_debug["model_system_prompt"] == prepared.system_prompt
     assert prepared.context.context_debug["model_messages_raw"]
     assert prepared.context.context_debug["model_tool_schemas_raw"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_preview_prefetches_rag_evidence_and_injects_into_messages():
+    tools = _CapturingKnowledgeTools()
+    agent = ReActAgent(
+        _FunctionCallingPreviewLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            channel="chat",
+            rag_overrides={
+                "enabled": True,
+                "scope_mode": "knowledge_base",
+                "knowledge_base_ids": [148],
+                "use_reranker": True,
+                "use_hybrid": True,
+                "query_rewrite_profile": "light",
+                "use_contextual_compression": True,
+            },
+        ),
+    )
+    agent.contextual_compression_service = _NoCompression()
+
+    prepared = await agent.prepare_context_preview([{"role": "user", "content": "一句话解释注意力机制"}])
+
+    assert prepared.preview_mode == "agent"
+    assert prepared.routing_decision is not None
+    assert prepared.routing_decision.source == "rag_override"
+    assert prepared.routing_decision.needs_tools is True
+    assert prepared.context.context_debug["model_request_mode"] == "function_calling"
+    assert "本轮临时 RAG 注入" in prepared.system_prompt
+    assert "系统会先按以上范围和策略预取一轮 `knowledge_search` 证据并注入当前上下文" in prepared.system_prompt
+    assert tools.calls and tools.calls[0][0] == "knowledge_search"
+    assert tools.calls[0][1]["query"] == "一句话解释注意力机制"
+    assert tools.calls[0][1]["knowledge_base_ids"] == [148]
+    assert tools.calls[0][1]["use_reranker"] is True
+    assert tools.calls[0][1]["use_hybrid"] is True
+    assert tools.calls[0][1]["query_rewrite_profile"] == "light"
+    assert tools.calls[0][1]["use_contextual_compression"] is True
+    assert prepared.context.context_debug["rag_prefetch_enabled"] is True
+    assert prepared.context.context_debug["rag_prefetch_succeeded"] is True
+    assert prepared.context.context_debug["rag_prefetch_reused_from_plan"] is False
+    assert prepared.context.context_debug.get("rag_force_initial_knowledge_search") is None
+    assert prepared.context.prefetched_rag_search_count == 1
+    assert prepared.context.prefetched_rag_messages
+    assert prepared.context.prefetched_rag_messages[0]["content"].startswith("本轮 RAG 预取证据：")
+    assert any(
+        str(item.get("content") or "").startswith("本轮 RAG 预取证据：")
+        for item in prepared.llm_messages
+        if isinstance(item, dict)
+    )
 
 
 def test_function_calling_system_prompt_does_not_repeat_tool_catalog():
@@ -486,6 +600,68 @@ def test_observation_message_for_web_search_requires_web_citation():
     assert "只能使用 observation 中出现过的网页编号" in message
 
 
+def test_build_tool_result_ledger_entries_carries_structured_metadata():
+    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
+    context = AgentContext(messages=[], turn_id="turn:1", run_id="run-1", iteration=1)
+
+    rows = agent._build_tool_result_ledger_entries(
+        context,
+        [
+            ExecutedToolCall(
+                action_event={},
+                observation_event={},
+                tool_message={},
+                tool_name="knowledge_search",
+                observation_output="[来源1] 命中 Transformer / Attention Is All You Need.pdf",
+                tool_call_id="call-1",
+                arguments={"query": "attention"},
+                success=True,
+                error=None,
+                permission_required=False,
+                execution_time_ms=10.0,
+                output_tokens_estimate=42,
+                truncated=False,
+                metadata={
+                    "source_kind": "knowledge_base_search",
+                    "source_labels": ["来源1"],
+                    "result_count": 1,
+                    "retrieval_scope": {"knowledge_base_ids": [12], "document_ids": [34]},
+                },
+            )
+        ],
+    )
+
+    assert rows[0]["metadata"]["source_kind"] == "knowledge_base_search"
+    assert rows[0]["metadata"]["source_labels"] == ["来源1"]
+    assert rows[0]["metadata"]["result_count"] == 1
+
+
+def test_normalize_tool_result_metadata_carries_source_items():
+    metadata = ReActAgent._normalize_tool_result_metadata(
+        tool_name="knowledge_search",
+        observation_output="[来源1] 命中 Transformer / Attention Is All You Need.pdf",
+        result_data={
+            "source_kind": "knowledge_base_search",
+            "retrieval_scope": {"knowledge_base_ids": [12], "document_ids": [34]},
+            "results": [
+                {
+                    "knowledge_base": "Transformer",
+                    "document": "Attention Is All You Need.pdf",
+                    "chunk_index": 4,
+                    "reader_excerpt": "自注意力是核心机制。",
+                }
+            ],
+        },
+    )
+
+    source_items = metadata.get("source_items") or []
+    assert len(source_items) == 1
+    assert source_items[0]["label"] == "来源1"
+    assert source_items[0]["knowledge_base"] == "Transformer"
+    assert source_items[0]["document"] == "Attention Is All You Need.pdf"
+    assert source_items[0]["retrieval_scope"] == {"knowledge_base_ids": [12], "document_ids": [34]}
+
+
 def test_extract_source_labels_and_validation():
     labels = ReActAgent._extract_source_labels("A[来源1] B[来源2] C")
     web_labels = ReActAgent._extract_web_source_labels("A[网页1] B[网页2] C")
@@ -497,6 +673,39 @@ def test_extract_source_labels_and_validation():
     assert ReActAgent._citations_are_valid("结论 [网页1]", set(), {"1", "2"}) is True
     assert ReActAgent._citations_are_valid("结论 [来源1] [网页2]", {"1", "3"}, {"2"}) is True
     assert ReActAgent._citations_are_valid("结论 [网页3]", set(), {"1", "2"}) is False
+
+
+def test_strip_unsupported_citation_tokens_removes_unbacked_labels():
+    stripped = ReActAgent._strip_unsupported_citation_tokens(
+        "这是直答内容 [网页1]，没有真实联网来源。",
+        allowed_source_labels=set(),
+        allowed_web_source_labels=set(),
+    )
+
+    assert "[网页1]" not in stripped
+    assert "这是直答内容" in stripped
+
+
+def test_direct_response_prompt_does_not_include_tool_citation_policy():
+    agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
+    prompt = agent._build_direct_response_system_prompt()
+
+    assert "当你基于 `knowledge_search` 返回内容作答时" not in prompt
+    assert "不能编造新的来源编号" in prompt
+
+
+def test_seed_allowed_citations_from_messages_recovers_prior_labels():
+    context = AgentContext(
+        messages=[
+            {"role": "assistant", "content": "上一轮结论 [来源2] [网页3]"},
+            {"role": "user", "content": "用户自己写的 [网页9] 不应计入"},
+        ]
+    )
+
+    ReActAgent._seed_allowed_citations_from_messages(context)
+
+    assert context.allowed_source_labels == {"2"}
+    assert context.allowed_web_source_labels == {"3"}
 
 
 @pytest.mark.asyncio
@@ -736,6 +945,7 @@ async def test_run_done_event_contains_rag_metrics_baseline():
     assert metrics["citation_valid"] is True
     assert metrics["answer_citation_count"] >= 1
     assert "来源1" in metrics["source_labels"]
+    assert payload["citation_index"]["来源1"]["document"] == "chapter3.md"
 
 
 @pytest.mark.asyncio
@@ -755,6 +965,7 @@ async def test_execute_single_tool_call_applies_rag_overrides_to_knowledge_searc
                 "use_reranker": True,
                 "use_hybrid": False,
                 "use_query_rewrite": False,
+                "use_contextual_compression": False,
             },
         ),
     )
@@ -779,5 +990,59 @@ async def test_execute_single_tool_call_applies_rag_overrides_to_knowledge_searc
     assert tools.calls[0][1]["knowledge_base_ids"] == [12]
     assert tools.calls[0][1]["document_ids"] == [34]
     assert tools.calls[0][1]["use_hybrid"] is False
+    assert tools.calls[0][1]["use_contextual_compression"] is False
     assert executed.arguments["use_query_rewrite"] is False
     assert executed.action_event["data"]["input"]["use_reranker"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_forces_initial_knowledge_search_when_one_turn_rag_is_enabled():
+    tools = _CapturingKnowledgeTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            rag_overrides={
+                "enabled": True,
+                "scope_mode": "all",
+                "use_reranker": True,
+            },
+        ),
+    )
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "请解释 agentic search"}], stream=False):
+        events.append(event)
+
+    assert tools.calls
+    assert tools.calls[0][0] == "knowledge_search"
+    assert tools.calls[0][1]["query"] == "请解释 agentic search"
+    done_event = next(event for event in events if event.get("type") == "done")
+    assert done_event["data"]["rag_metrics"]["prefetched_knowledge_search_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_single_tool_call_treats_direct_mcp_web_search_as_citable_web_source():
+    tools = _CapturingMcpWebTools()
+    agent = ReActAgent(_DummyLLM(), tools, max_iterations=1)
+    context = AgentContext(messages=[])
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        agent._normalize_tool_calls([
+            {
+                "id": "call_1",
+                "name": "mcp.firecrawl.firecrawl_search",
+                "arguments": "{\"query\":\"agentic search\"}",
+            }
+        ])[0],
+        parallel_group="group_1",
+    )
+
+    assert tools.calls[0][0] == "mcp.firecrawl.firecrawl_search"
+    assert "[网页1]" in executed.observation_output
+    assert context.allowed_web_source_labels == {"1"}
+    assert executed.metadata["source_items"][0]["label"] == "网页1"
+    followup = agent._build_observation_message_multi([executed])
+    assert "公网引用必须只使用 observation 已出现过的 [网页X]" in followup

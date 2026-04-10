@@ -17,6 +17,7 @@ import remarkGfm from 'remark-gfm'
 import {
   SHOW_RAG_METRICS,
   type Message,
+  type MessageCitationSourceItem,
   type RagMetrics,
   type ConversationItemStream,
   type ConversationToolLedger,
@@ -39,13 +40,25 @@ interface MessageBubbleProps {
   isHighlighted?: boolean
 }
 
-interface KnowledgeEvidenceItem {
+interface CitationExplanationItem {
   id: string
-  sourceLabel: string
-  sourcePath: string
-  retrievalScore?: string
-  compressionScore?: string
-  content: string
+  label: string
+  sourceKind: string
+  toolName?: string
+  title?: string
+  domain?: string
+  url?: string
+  knowledgeBase?: string
+  document?: string
+  sourceLabel?: string
+  citationLabel?: string
+  provider?: string
+  providerRoute?: string
+  contentPreview?: string
+  retrievalScope?: Record<string, unknown>
+  rank?: number
+  chunkIndex?: number
+  retrievalScore?: number
 }
 
 interface RagMetricCardItem {
@@ -95,46 +108,185 @@ const parseRagMetrics = (value: unknown): RagMetrics | null => {
   return ragUsed ? normalized : null
 }
 
-const normalizeEvidenceContent = (value: string): string =>
-  value.replace(/^\[来源\d+\]\s*/i, '').replace(/\s+/g, ' ').trim()
-
-const parseKnowledgeEvidence = (
-  toolLedger: ConversationToolLedger | undefined,
-  turnId: string | undefined,
-): KnowledgeEvidenceItem[] => {
-  if (!toolLedger?.entries?.length || !turnId) {
-    return []
-  }
-
-  const items: KnowledgeEvidenceItem[] = []
+const extractCitationLabels = (value: string): string[] => {
+  const labels: string[] = []
   const seen = new Set<string>()
-
-  for (const entry of toolLedger.entries) {
-    if (
-      entry.kind !== 'tool_result' ||
-      entry.tool_name !== 'knowledge_search' ||
-      entry.turn_id !== turnId ||
-      !entry.summary
-    ) {
+  const matches = value.matchAll(/\[(来源\d+|网页\d+)\]/g)
+  for (const match of matches) {
+    const label = String(match[1] || '').trim()
+    if (!label || seen.has(label)) {
       continue
     }
+    seen.add(label)
+    labels.push(label)
+  }
+  return labels
+}
 
-    const output = String(entry.summary || '').trim()
-    if (!output) continue
-    const compact = normalizeEvidenceContent(output)
-    if (!compact) continue
-    const id = `${entry.tool_call_id || 'raw'}::${compact}`
-    if (seen.has(id)) continue
-    seen.add(id)
-    items.push({
-      id,
-      sourceLabel: '检索依据',
-      sourcePath: 'knowledge_search',
-      content: compact,
-    })
+const normalizeCitationSourceItem = (
+  value: unknown,
+  fallbackLabel?: string,
+): CitationExplanationItem | null => {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+  const payload = value as Record<string, unknown>
+  const label = String(payload.label || fallbackLabel || '').trim()
+  if (!label) {
+    return null
   }
 
+  const toOptionalString = (key: string): string | undefined => {
+    const raw = payload[key]
+    const text = typeof raw === 'string' ? raw.trim() : String(raw || '').trim()
+    return text || undefined
+  }
+  const toOptionalNumber = (key: string): number | undefined => {
+    const raw = payload[key]
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return raw
+    }
+    if (typeof raw === 'string' && raw.trim()) {
+      const parsed = Number(raw)
+      return Number.isFinite(parsed) ? parsed : undefined
+    }
+    return undefined
+  }
+
+  return {
+    id: label,
+    label,
+    sourceKind: toOptionalString('source_kind') || (label.startsWith('网页') ? 'public_web_search' : 'knowledge_base_search'),
+    toolName: toOptionalString('tool_name'),
+    title: toOptionalString('title'),
+    domain: toOptionalString('domain'),
+    url: toOptionalString('url'),
+    knowledgeBase: toOptionalString('knowledge_base'),
+    document: toOptionalString('document'),
+    sourceLabel: toOptionalString('source_label'),
+    citationLabel: toOptionalString('citation_label'),
+    provider: toOptionalString('provider'),
+    providerRoute: toOptionalString('provider_route'),
+    contentPreview: toOptionalString('content_preview'),
+    retrievalScope:
+      payload.retrieval_scope && typeof payload.retrieval_scope === 'object'
+        ? (payload.retrieval_scope as Record<string, unknown>)
+        : undefined,
+    rank: toOptionalNumber('rank'),
+    chunkIndex: toOptionalNumber('chunk_index'),
+    retrievalScore: toOptionalNumber('retrieval_score'),
+  }
+}
+
+const buildCitationIndexFromMessage = (
+  msg: Message,
+): Map<string, CitationExplanationItem> => {
+  const items = new Map<string, CitationExplanationItem>()
+  const rawIndex = msg.metadata?.citation_index as Record<string, MessageCitationSourceItem> | undefined
+  if (!rawIndex || typeof rawIndex !== 'object') {
+    return items
+  }
+  for (const [label, value] of Object.entries(rawIndex)) {
+    const item = normalizeCitationSourceItem(value, label)
+    if (item) {
+      items.set(item.label, item)
+    }
+  }
   return items
+}
+
+const buildCitationIndexFromLedger = (
+  toolLedger: ConversationToolLedger | undefined,
+  turnId: string | undefined,
+): Map<string, CitationExplanationItem> => {
+  const items = new Map<string, CitationExplanationItem>()
+  if (!toolLedger?.entries?.length || !turnId) {
+    return items
+  }
+
+  for (const entry of toolLedger.entries) {
+    if (entry.kind !== 'tool_result' || entry.turn_id !== turnId) {
+      continue
+    }
+    const metadata = entry.metadata
+    if (!metadata || typeof metadata !== 'object') {
+      continue
+    }
+    const sourceItems = Array.isArray((metadata as Record<string, unknown>).source_items)
+      ? ((metadata as Record<string, unknown>).source_items as unknown[])
+      : []
+    for (const rawItem of sourceItems) {
+      const item = normalizeCitationSourceItem(rawItem)
+      if (item && !items.has(item.label)) {
+        items.set(item.label, item)
+      }
+    }
+  }
+  return items
+}
+
+const parseCitationExplanationItems = (
+  msg: Message,
+  toolLedger: ConversationToolLedger | undefined,
+  turnId: string | undefined,
+): CitationExplanationItem[] => {
+  const labels = extractCitationLabels(String(msg.content || ''))
+  if (!labels.length) {
+    return []
+  }
+  const messageIndex = buildCitationIndexFromMessage(msg)
+  const ledgerIndex = buildCitationIndexFromLedger(toolLedger, turnId)
+  return labels.map((label) => {
+    const item = messageIndex.get(label) || ledgerIndex.get(label)
+    if (item) {
+      return item
+    }
+    return {
+      id: label,
+      label,
+      sourceKind: 'unresolved_citation',
+      sourceLabel: '该引用标签在当前消息中没有对应来源记录',
+    }
+  })
+}
+
+const renderCitationSourceKind = (item: CitationExplanationItem): string => {
+  if (item.sourceKind === 'unresolved_citation') {
+    return '未解析引用'
+  }
+  if (item.sourceKind === 'public_web_search') {
+    return '公网搜索'
+  }
+  if (item.sourceKind === 'knowledge_base_search') {
+    return '知识库检索'
+  }
+  return item.sourceKind || '引用来源'
+}
+
+const renderCitationScope = (scope: Record<string, unknown> | undefined): string => {
+  if (!scope) {
+    return ''
+  }
+  const scopeMode = String(scope.scope_mode || '').trim()
+  const knowledgeBaseIds = Array.isArray(scope.knowledge_base_ids)
+    ? scope.knowledge_base_ids.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0)
+    : []
+  const documentIds = Array.isArray(scope.document_ids)
+    ? scope.document_ids.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0)
+    : []
+  if (documentIds.length > 0) {
+    return `直达文档 ${documentIds.join(', ')}`
+  }
+  if (knowledgeBaseIds.length > 0) {
+    return `知识库 ${knowledgeBaseIds.join(', ')}`
+  }
+  if (scopeMode === 'knowledge_base') {
+    return '指定知识库'
+  }
+  if (scopeMode === 'document') {
+    return '直达文档'
+  }
+  return '全部知识库'
 }
 
 const deriveMessageTurnId = (
@@ -284,9 +436,9 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const [ragExpanded, setRagExpanded] = useState(false)
     const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
-    const evidenceItems = useMemo(
-      () => (!isStreaming && !isUser ? parseKnowledgeEvidence(toolLedger, turnId) : []),
-      [isStreaming, isUser, toolLedger, turnId]
+    const citationItems = useMemo(
+      () => (!isStreaming && !isUser ? parseCitationExplanationItems(msg, toolLedger, turnId) : []),
+      [isStreaming, isUser, msg, toolLedger, turnId]
     )
     const ragMetricCards = useMemo<RagMetricCardItem[]>(
       () =>
@@ -547,7 +699,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                         </ReactMarkdown>
                       </div>
 
-                      {evidenceItems.length > 0 && (
+                      {citationItems.length > 0 && (
                         <div className="mt-6 overflow-hidden rounded-xl border border-white/[0.05] bg-slate-950/75 shadow-sm">
                           <button
                             type="button"
@@ -555,14 +707,14 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                             className="flex w-full items-center justify-between gap-3 bg-slate-950/70 px-5 py-3.5 text-left text-slate-200 transition-colors hover:bg-slate-900/80"
                           >
                             <div>
-                              <div className="text-sm font-semibold text-slate-100">检索依据</div>
+                              <div className="text-sm font-semibold text-slate-100">引用说明</div>
                               <div className="text-xs text-slate-500">
-                                来自本轮 `knowledge_search` 的命中片段
+                                按本条回答实际使用的引用标签展开来源解释
                               </div>
                             </div>
                             <div className="flex items-center gap-2">
                               <div className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2.5 py-1 text-[11px] text-slate-300">
-                                {evidenceItems.length} 条
+                                {citationItems.length} 条
                               </div>
                               <span className="flex h-7 w-7 items-center justify-center rounded-full border border-white/[0.08] bg-slate-900/80 text-slate-300">
                                 {evidenceExpanded ? <UpOutlined className="text-[11px]" /> : <DownOutlined className="text-[11px]" />}
@@ -581,35 +733,53 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                               >
                                 <div className="bg-slate-950/75 px-5 pb-4">
                                   <div className="space-y-3 pt-0.5">
-                                  {evidenceItems.map((item) => (
+                                  {citationItems.map((item) => (
                                     <div
                                       key={item.id}
                                       className="rounded-xl border border-slate-700/70 bg-slate-950/70 px-3.5 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
                                     >
                                       <div className="flex flex-wrap items-center gap-2 text-xs">
                                         <span className="rounded-full border border-emerald-400/20 bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-200">
-                                          {item.sourceLabel}
+                                          {item.label}
                                         </span>
-                                        {item.retrievalScore ? (
+                                        <span className="rounded-full border border-slate-600/70 bg-slate-800 px-2 py-0.5 text-slate-300">
+                                          {renderCitationSourceKind(item)}
+                                        </span>
+                                        {item.retrievalScore !== undefined ? (
                                           <span className="rounded-full border border-slate-600/70 bg-slate-800 px-2 py-0.5 text-slate-300">
                                             检索 {item.retrievalScore}%
                                           </span>
                                         ) : null}
-                                        {item.compressionScore ? (
-                                          <span className="rounded-full border border-slate-600/70 bg-slate-800 px-2 py-0.5 text-slate-300">
-                                            片段相关度 {item.compressionScore}/10
+                                        {renderCitationScope(item.retrievalScope) ? (
+                                          <span className="rounded-full border border-cyan-400/15 bg-cyan-500/10 px-2 py-0.5 text-cyan-200">
+                                            {renderCitationScope(item.retrievalScope)}
                                           </span>
                                         ) : null}
                                       </div>
 
-                                      <Tooltip title={item.sourcePath}>
-                                        <div className="mt-2 truncate text-xs text-slate-500">
-                                          {item.sourcePath}
-                                        </div>
-                                      </Tooltip>
-                                      <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100">
-                                        {item.content}
+                                      <div className="mt-2 text-sm font-medium leading-6 text-slate-100">
+                                        {item.title || [item.knowledgeBase, item.document].filter(Boolean).join(' / ') || item.sourceLabel || '未解析到更详细来源'}
                                       </div>
+                                      {(item.citationLabel || item.domain || item.provider) && (
+                                        <div className="mt-1 text-xs text-slate-500">
+                                          {[item.citationLabel, item.domain, item.provider].filter(Boolean).join(' · ')}
+                                        </div>
+                                      )}
+                                      {item.url ? (
+                                        <a
+                                          href={item.url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          className="mt-2 block truncate text-xs text-emerald-300 hover:text-emerald-200 hover:underline"
+                                        >
+                                          {item.url}
+                                        </a>
+                                      ) : null}
+                                      {item.contentPreview ? (
+                                        <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100">
+                                          {item.contentPreview}
+                                        </div>
+                                      ) : null}
                                     </div>
                                   ))}
                                   </div>

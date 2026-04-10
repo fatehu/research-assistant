@@ -253,15 +253,94 @@ def _normalized_chat_rag_overrides_payload(payload: object) -> Optional[dict]:
         "knowledge_base_ids": _normalize_ids(payload.get("knowledge_base_ids")),
         "document_ids": _normalize_ids(payload.get("document_ids")),
     }
+    query_rewrite_profile = str(payload.get("query_rewrite_profile") or "").strip().lower()
+    if query_rewrite_profile not in {"off", "light", "deep"}:
+        if payload.get("use_query_rewrite") is not None:
+            query_rewrite_profile = "light" if bool(payload.get("use_query_rewrite")) else "off"
+        else:
+            query_rewrite_profile = ""
+    if query_rewrite_profile:
+        normalized["query_rewrite_profile"] = query_rewrite_profile
+        normalized["use_query_rewrite"] = query_rewrite_profile != "off"
     for key in (
         "use_reranker",
         "use_hybrid",
-        "use_query_rewrite",
         "use_contextual_compression",
     ):
         if key in payload and payload.get(key) is not None:
             normalized[key] = bool(payload.get(key))
     return normalized
+
+
+def _normalized_message_citation_source_item(payload: object, *, label_hint: Optional[str] = None) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+
+    label = str(payload.get("label") or label_hint or "").strip()
+    if not label:
+        return None
+    if not (
+        (label.startswith("来源") and label[2:].isdigit())
+        or (label.startswith("网页") and label[2:].isdigit())
+    ):
+        return None
+
+    normalized: dict[str, Any] = {"label": label}
+    for key in (
+        "source_kind",
+        "tool_name",
+        "title",
+        "domain",
+        "url",
+        "knowledge_base",
+        "document",
+        "source_label",
+        "citation_label",
+        "provider",
+        "provider_route",
+        "content_preview",
+    ):
+        text = str(payload.get(key) or "").strip()
+        if text:
+            normalized[key] = text
+
+    for key in ("rank", "chunk_index"):
+        try:
+            value = payload.get(key)
+            if value is not None:
+                normalized[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+
+    try:
+        score = payload.get("retrieval_score")
+        if score is not None:
+            normalized["retrieval_score"] = round(float(score), 1)
+    except (TypeError, ValueError):
+        pass
+
+    retrieval_scope = payload.get("retrieval_scope")
+    if isinstance(retrieval_scope, dict):
+        normalized["retrieval_scope"] = _normalized_chat_rag_overrides_payload(
+            {"enabled": True, **dict(retrieval_scope)}
+        ) or {
+            key: value
+            for key, value in dict(retrieval_scope).items()
+            if key in {"scope_mode", "knowledge_base_ids", "document_ids"}
+        }
+
+    return normalized
+
+
+def _normalized_message_citation_index(payload: object) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        item = _normalized_message_citation_source_item(value, label_hint=str(key or "").strip())
+        if item is not None:
+            normalized[str(item["label"])] = item
+    return normalized or None
 
 
 def _serialize_routing_decision(decision: object) -> Optional[dict]:
@@ -631,6 +710,9 @@ def _sanitized_persisted_chat_metadata(payload: object) -> Optional[dict]:
     rag_metrics = payload.get("rag_metrics")
     if isinstance(rag_metrics, dict):
         metadata["rag_metrics"] = dict(rag_metrics)
+    citation_index = _normalized_message_citation_index(payload.get("citation_index"))
+    if citation_index:
+        metadata["citation_index"] = citation_index
     return metadata or None
 
 
@@ -1107,6 +1189,8 @@ async def preview_chat_context(
         rag_overrides=effective_rag_overrides,
         conversation_state=prepared.context.conversation_state,
         compacted_history=prepared.context.compacted_history,
+        prefetched_rag_messages=getattr(prepared.context, "prefetched_rag_messages", None),
+        prefetched_rag_metadata=getattr(prepared.context, "prefetched_rag_metadata", None),
     )
     context_state = (
         _normalized_context_state_payload(await runtime_service.get_conversation_context_state(conversation_id))
@@ -1342,6 +1426,7 @@ async def send_message(
             full_content = ""
             thought = ""
             rag_metrics = None
+            citation_index = None
             context_debug = None
             reasoning_summary = None
             current_iteration = 0
@@ -1662,6 +1747,8 @@ async def send_message(
                                     rag_metrics = event_data["rag_metrics"]
                                 if isinstance(event_data.get("reasoning_summary"), str):
                                     reasoning_summary = event_data["reasoning_summary"]
+                                if isinstance(event_data.get("citation_index"), dict):
+                                    citation_index = dict(event_data.get("citation_index") or {})
                             
                             logger.info(f"[Chat] 对话完成: iterations={current_iteration}, content_len={len(full_content)}")
                             
@@ -1670,6 +1757,8 @@ async def send_message(
                                 message_metadata: dict[str, Any] = {}
                                 if isinstance(rag_metrics, dict):
                                     message_metadata["rag_metrics"] = rag_metrics
+                                if isinstance(citation_index, dict):
+                                    message_metadata["citation_index"] = citation_index
                                 persisted_message_metadata = _sanitized_persisted_chat_metadata(message_metadata) or {}
                                 assistant_message = Message(
                                     conversation_id=conversation_id,
@@ -1727,6 +1816,8 @@ async def send_message(
                                 }
                                 if isinstance(rag_metrics, dict):
                                     done_payload["rag_metrics"] = rag_metrics
+                                if isinstance(citation_index, dict):
+                                    done_payload["citation_index"] = citation_index
                                 if conversation_context_state:
                                     done_payload["context_state"] = conversation_context_state
                                 if conversation_turn_store:
@@ -1904,6 +1995,7 @@ async def send_message(
                         thought = ""
                         reasoning_summary = ""
                         rag_metrics = None
+                        citation_index = None
                         async for event in agent.run(agent_messages, stream=False, prepared_plan=prepared_send_plan):
                             event_type = str(event.get("type") or "")
                             event_data = event.get("data")
@@ -1922,6 +2014,8 @@ async def send_message(
                                     reasoning_summary = str(event_data.get("reasoning_summary") or "")
                                 if isinstance(event_data.get("rag_metrics"), dict):
                                     rag_metrics = dict(event_data.get("rag_metrics") or {})
+                                if isinstance(event_data.get("citation_index"), dict):
+                                    citation_index = dict(event_data.get("citation_index") or {})
                             elif event_type == "error":
                                 raise RuntimeError(str(event_data or "agent run failed"))
                         response = {
@@ -1929,6 +2023,7 @@ async def send_message(
                             "thought": reasoning_summary or thought or None,
                             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                             "rag_metrics": rag_metrics,
+                            "citation_index": citation_index,
                         }
                         llm_messages = []
                         system_prompt = ""
@@ -1971,7 +2066,14 @@ async def send_message(
                     "thought": None,
                     "usage": llm_response["usage"],
                     "rag_metrics": None,
+                    "citation_index": None,
                 }
+            persisted_message_metadata = _sanitized_persisted_chat_metadata(
+                {
+                    "rag_metrics": response.get("rag_metrics"),
+                    "citation_index": response.get("citation_index"),
+                }
+            ) or {}
             assistant_message = Message(
                 conversation_id=conversation.id,
                 role=MessageRole.ASSISTANT,
@@ -1981,6 +2083,7 @@ async def send_message(
                 completion_tokens=response["usage"]["completion_tokens"],
                 total_tokens=response["usage"]["total_tokens"],
                 thought=response.get("thought"),
+                metadata_=persisted_message_metadata or None,
             )
             db.add(assistant_message)
             await db.commit()
@@ -1993,6 +2096,7 @@ async def send_message(
                 message_id=assistant_message.id,
                 created_at=assistant_message.created_at,
                 thought=response.get("thought"),
+                metadata=persisted_message_metadata or None,
                 kind="assistant_message",
             )
             await runtime_service.append_conversation_item_entries(

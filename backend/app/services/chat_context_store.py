@@ -181,6 +181,7 @@ class ToolLedgerEntry:
     output_tokens_estimate: Optional[int] = None
     truncated: Optional[bool] = None
     parallel_group: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
     created_at: Optional[str] = None
 
 
@@ -266,6 +267,7 @@ class ToolLedgerStore:
                         output_tokens_estimate=output_tokens_estimate,
                         truncated=bool(item.get("truncated")) if item.get("truncated") is not None else None,
                         parallel_group=str(item.get("parallel_group") or "").strip() or None,
+                        metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else None,
                         created_at=str(item.get("created_at") or "").strip() or None,
                     )
                 )
@@ -467,7 +469,46 @@ class ConversationItemStreamStore:
         for item in canonical.active_entries:
             kind = str(item.kind or "").strip().lower()
             role = str(item.role or "").strip().lower()
-            if kind in {"reasoning_summary", "tool_use_summary"}:
+            if kind in {"reasoning_summary", "tool_use_summary", "permission_denial"}:
+                rows.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "thought": str(item.summary or item.content or "").strip() or None,
+                    }
+                )
+                continue
+            if kind not in {"message", "user_message", "assistant_message", "system_message"} and role not in {
+                "user",
+                "assistant",
+                "system",
+            }:
+                continue
+            if role not in {"user", "assistant", "system"}:
+                continue
+            rows.append(
+                {
+                    "role": role,
+                    "content": str(item.content or ""),
+                    "thought": str(item.thought or "").strip() or None,
+                    "metadata": dict(item.metadata or {}) if isinstance(item.metadata, dict) else {},
+                }
+            )
+        return rows
+
+    def canonical_active_message_rows(
+        self,
+        *,
+        fallback_boundary_message_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        canonical = self.canonical_history(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        rows: List[Dict[str, Any]] = []
+        for item in canonical.active_entries:
+            kind = str(item.kind or "").strip().lower()
+            role = str(item.role or "").strip().lower()
+            if kind in {"reasoning_summary", "tool_use_summary", "permission_denial"}:
                 rows.append(
                     {
                         "role": "assistant",

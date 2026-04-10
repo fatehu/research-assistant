@@ -147,8 +147,12 @@ export default function PaperReaderExperienceV2Page() {
     () => buildExperienceV2LocalCacheKey(numericPaperId, request),
     [numericPaperId, request],
   )
-  const [response, setResponse] = useState<ReaderExperienceV2Response | null>(null)
-  const [loading, setLoading] = useState(true)
+  const initialSnapshot = useMemo(
+    () => readLocalExperienceV2Snapshot(localCacheKey),
+    [localCacheKey],
+  )
+  const [response, setResponse] = useState<ReaderExperienceV2Response | null>(initialSnapshot)
+  const [loading, setLoading] = useState(!initialSnapshot?.artifact)
   const [building, setBuilding] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [rewriteTarget, setRewriteTarget] = useState<PageArtifactV2ReadingBlock | null>(null)

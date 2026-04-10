@@ -139,6 +139,10 @@ class SearchRequest(BaseModel):
         default="auto",
         description="改写模式，优先级高于 use_query_rewrite",
     )
+    query_rewrite_profile: Optional[Literal["off", "light", "deep"]] = Field(
+        default=None,
+        description="改写层级：off 关闭，light 仅轻量同义扩展，deep 使用完整多策略改写。",
+    )
     query_rewrite_strategies: Optional[List[str]] = Field(
         default=None,
         description="可选改写策略：synonym/hyde/decompose",

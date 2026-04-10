@@ -60,6 +60,8 @@ class PreparedSendPlanRecord:
     rag_overrides: Dict[str, Any]
     conversation_state: Dict[str, Any]
     compacted_history: Dict[str, Any]
+    prefetched_rag_messages: List[Dict[str, Any]]
+    prefetched_rag_metadata: Dict[str, Any]
     created_at: str
     expires_at: str
 
@@ -157,10 +159,18 @@ class AgentRuntimeService:
             "knowledge_base_ids": knowledge_base_ids,
             "document_ids": document_ids,
         }
+        query_rewrite_profile = str(payload.get("query_rewrite_profile") or "").strip().lower()
+        if query_rewrite_profile not in {"off", "light", "deep"}:
+            if payload.get("use_query_rewrite") is not None:
+                query_rewrite_profile = "light" if bool(payload.get("use_query_rewrite")) else "off"
+            else:
+                query_rewrite_profile = ""
+        if query_rewrite_profile:
+            normalized["query_rewrite_profile"] = query_rewrite_profile
+            normalized["use_query_rewrite"] = query_rewrite_profile != "off"
         for key in (
             "use_reranker",
             "use_hybrid",
-            "use_query_rewrite",
             "use_contextual_compression",
         ):
             if key in payload and payload.get(key) is not None:
@@ -823,6 +833,7 @@ class AgentRuntimeService:
                     output_tokens_estimate=output_tokens_estimate,
                     truncated=bool(item.get("truncated")) if item.get("truncated") is not None else None,
                     parallel_group=str(item.get("parallel_group") or "").strip() or None,
+                    metadata=dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), dict) else None,
                     created_at=str(item.get("created_at") or "").strip() or datetime.utcnow().isoformat(),
                 )
             )
@@ -852,6 +863,7 @@ class AgentRuntimeService:
                     "output_tokens_estimate": entry.output_tokens_estimate,
                     "truncated": entry.truncated,
                     "parallel_group": entry.parallel_group,
+                    "metadata": dict(entry.metadata or {}) if isinstance(entry.metadata, dict) else None,
                     "created_at": entry.created_at or datetime.utcnow().isoformat(),
                 }
                 for entry in prepared
@@ -905,6 +917,8 @@ class AgentRuntimeService:
         rag_overrides: Optional[Dict[str, Any]] = None,
         conversation_state: Optional[Dict[str, Any]] = None,
         compacted_history: Optional[Dict[str, Any]] = None,
+        prefetched_rag_messages: Optional[List[Dict[str, Any]]] = None,
+        prefetched_rag_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         self._cleanup_expired_send_plans()
         plan_id = uuid.uuid4().hex
@@ -928,6 +942,16 @@ class AgentRuntimeService:
             rag_overrides=self.normalize_chat_rag_overrides(rag_overrides),
             conversation_state=dict(conversation_state or {}) if isinstance(conversation_state, dict) else {},
             compacted_history=dict(compacted_history or {}) if isinstance(compacted_history, dict) else {},
+            prefetched_rag_messages=[
+                dict(item)
+                for item in list(prefetched_rag_messages or [])
+                if isinstance(item, dict)
+            ],
+            prefetched_rag_metadata=(
+                dict(prefetched_rag_metadata or {})
+                if isinstance(prefetched_rag_metadata, dict)
+                else {}
+            ),
             created_at=created_at.isoformat(),
             expires_at=expires_at.isoformat(),
         )
@@ -985,6 +1009,8 @@ class AgentRuntimeService:
             "rag_overrides": dict(record.rag_overrides or {}),
             "conversation_state": dict(record.conversation_state or {}),
             "compacted_history": dict(record.compacted_history or {}),
+            "prefetched_rag_messages": [dict(item) for item in record.prefetched_rag_messages],
+            "prefetched_rag_metadata": dict(record.prefetched_rag_metadata or {}),
             "created_at": record.created_at,
             "expires_at": record.expires_at,
         }

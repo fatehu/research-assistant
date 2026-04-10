@@ -121,6 +121,19 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
                 "status": "succeeded",
                 "summary": "检索到 attention mechanism 定义以及 Bahdanau 2014 相关资料。",
                 "success": True,
+                "metadata": {
+                    "source_kind": "knowledge_base_search",
+                    "source_labels": ["来源1", "来源2"],
+                    "result_count": 2,
+                    "retrieval_scope": {"knowledge_base_ids": [12], "document_ids": [34]},
+                    "evidence_preview": [
+                        {
+                            "knowledge_base": "Transformer",
+                            "document": "Attention Is All You Need.pdf",
+                            "citation_label": "Attention Is All You Need.pdf · chunk 3",
+                        }
+                    ],
+                },
             },
         ],
     )
@@ -133,6 +146,10 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert artifacts.context_state["evidence_ledger"][0]["entry_id"].startswith("evidence:")
     assert artifacts.context_state["evidence_ledger"][0]["origin_kind"] == "tool_result"
     assert artifacts.context_state["evidence_ledger"][0]["tool_names"] == ["knowledge_search"]
+    assert artifacts.context_state["evidence_ledger"][0]["source_kind"] == "knowledge_base_search"
+    assert artifacts.context_state["evidence_ledger"][0]["result_count"] == 2
+    assert artifacts.context_state["evidence_ledger"][0]["retrieval_scope"] == {"knowledge_base_ids": [12], "document_ids": [34]}
+    assert artifacts.context_state["evidence_ledger"][0]["provenance_hints"] == ["Transformer / Attention Is All You Need.pdf"]
     assert artifacts.compacted_history["version"] == "conversation_compacted_history.v2"
     assert "开场目标" in artifacts.compacted_history["history_anchors"]
     assert "注意力机制" in artifacts.compacted_history["history_summary"]
@@ -146,8 +163,10 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert all("reasoning_summary" not in row for row in recent_messages_preview)
     assert _FakeStateLLM.calls[0]["payload"]["tool_ledger_preview"][0]["tool_name"] == "knowledge_search"
     assert _FakeStateLLM.calls[0]["payload"]["tool_ledger_preview"][0]["summary"].startswith("检索到")
+    assert _FakeStateLLM.calls[0]["payload"]["tool_ledger_preview"][0]["source_kind"] == "knowledge_base_search"
     assert _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["tool_names"] == ["knowledge_search"]
     assert "检索到 attention mechanism 定义" in _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["summary"]
+    assert _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["source_kind"] == "knowledge_base_search"
     assert _FakeStateLLM.calls[1]["payload"]["tool_ledger_preview"][0]["tool_name"] == "knowledge_search"
 
 def test_require_item_stream_payload_raises_on_missing_entries():
@@ -220,6 +239,12 @@ async def test_build_artifacts_preserves_evidence_provenance_when_merging_candid
                 "status": "succeeded",
                 "summary": "检索到 attention mechanism 定义以及 Bahdanau 2014 相关资料。",
                 "success": True,
+                "metadata": {
+                    "source_kind": "knowledge_base_search",
+                    "source_labels": ["来源7"],
+                    "result_count": 1,
+                    "retrieval_scope": {"knowledge_base_ids": [7], "document_ids": []},
+                },
             },
         ],
     )
@@ -230,6 +255,9 @@ async def test_build_artifacts_preserves_evidence_provenance_when_merging_candid
     assert evidence["tool_names"] == ["knowledge_search"]
     assert evidence["turn_ids"] == ["turn:42"]
     assert evidence["tool_call_ids"] == ["call_42"]
+    assert evidence["source_kind"] == "knowledge_base_search"
+    assert evidence["source_labels"] == ["来源7"]
+    assert evidence["result_count"] == 1
 
 
 @pytest.mark.asyncio

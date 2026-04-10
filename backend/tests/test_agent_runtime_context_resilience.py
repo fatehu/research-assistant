@@ -491,6 +491,71 @@ def test_history_messages_from_item_stream_includes_summary_items_as_thought_row
     assert history_messages[1]["thought"] == "knowledge_search 已执行：找到 Bahdanau 2014 相关资料。"
 
 
+def test_active_history_messages_from_item_stream_excludes_replacement_history_rows():
+    history_messages = ReActAgent._active_history_messages_from_item_stream(
+        [
+            {
+                "item_id": "item-1",
+                "kind": "compact_boundary",
+                "role": "system",
+                "message_id": 11,
+                "metadata": {
+                    "compact_boundary_message_id": 11,
+                    "replacement_history": [
+                        {"role": "system", "content": "此前已经解释旧问题。"},
+                    ],
+                },
+            },
+            {
+                "item_id": "item-2",
+                "kind": "user_message",
+                "role": "user",
+                "content": "新问题",
+                "message_id": 12,
+            },
+            {
+                "item_id": "item-3",
+                "kind": "assistant_message",
+                "role": "assistant",
+                "content": "新回答",
+                "message_id": 13,
+            },
+        ]
+    )
+
+    assert [item["role"] for item in history_messages] == ["user", "assistant"]
+    assert [item["content"] for item in history_messages] == ["新问题", "新回答"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_messages_does_not_duplicate_replacement_history_prefix():
+    agent = ReActAgent(_SimpleLLM(), _BrokenIntentTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[
+            {"role": "user", "content": "当前问题"},
+        ],
+        history_messages=[
+            {"role": "user", "content": "当前问题"},
+        ],
+        compacted_history={
+            "version": "conversation_compacted_history.v2",
+            "replacement_history": [
+                {"role": "system", "content": "此前已经解释旧问题。"},
+            ],
+        },
+    )
+
+    prepared = await agent._prepare_llm_messages(context, system_prompt="system")
+
+    matching = [
+        item
+        for item in prepared
+        if str(item.get("role") or "").lower() == "system"
+        and str(item.get("content") or "") == "此前已经解释旧问题。"
+    ]
+    assert len(matching) == 1
+
+
 @pytest.mark.asyncio
 async def test_mid_run_compaction_appends_boundary_and_refreshes_context(monkeypatch):
     monkeypatch.setattr(settings, "agent_context_window_turns", 1)
@@ -533,10 +598,11 @@ async def test_mid_run_compaction_appends_boundary_and_refreshes_context(monkeyp
     boundary_entry = runtime.item_stream_payload["entries"][-1]
     assert boundary_entry["kind"] == "compact_boundary"
     assert boundary_entry["metadata"]["keep_turn_id"] == "turn:200"
-    assert [item["role"] for item in run_context.history_messages] == ["system", "user"]
-    assert [item["content"] for item in run_context.history_messages] == ["此前已经解释旧问题。", "当前问题"]
-    assert [item["role"] for item in run_context.messages] == ["system", "user"]
-    assert [item["content"] for item in run_context.messages] == ["此前已经解释旧问题。", "当前问题"]
+    assert [item["role"] for item in run_context.history_messages] == ["user"]
+    assert [item["content"] for item in run_context.history_messages] == ["当前问题"]
+    assert run_context.compacted_history["replacement_history"][0]["content"] == "此前已经解释旧问题。"
+    assert [item["role"] for item in run_context.messages] == ["user"]
+    assert [item["content"] for item in run_context.messages] == ["当前问题"]
 
 
 @pytest.mark.asyncio

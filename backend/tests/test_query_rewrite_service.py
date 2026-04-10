@@ -30,6 +30,15 @@ def test_resolve_strategy_aliases():
     assert strategies == ["synonym", "hyde", "decompose"]
 
 
+def test_resolve_light_profile_strategies(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "query_rewrite_light_strategies", "synonym")
+
+    strategies = service._resolve_strategies_for_profile(None, profile="light")
+
+    assert strategies == ["synonym"]
+
+
 @pytest.mark.asyncio
 async def test_rewrite_disabled_returns_original(monkeypatch):
     service = QueryRewriteService()
@@ -85,6 +94,36 @@ async def test_rewrite_generates_multi_strategy_variants(monkeypatch):
     assert "hyde" not in text_strategies
     assert result.llm_called is True
     assert result.cache_hit is False
+
+
+@pytest.mark.asyncio
+async def test_rewrite_default_light_profile_only_uses_synonym(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+    monkeypatch.setattr(settings, "query_rewrite_default_profile", "light")
+    monkeypatch.setattr(settings, "query_rewrite_light_strategies", "synonym")
+    monkeypatch.setattr(settings, "query_rewrite_skip_short_chars", 1)
+    monkeypatch.setattr(service, "_llm_available", lambda: True)
+
+    captured = {}
+
+    async def fake_rewrite_with_llm(query: str, strategies: list[str]):
+        captured["strategies"] = list(strategies)
+        return {
+            "synonym_queries": ["agent search"],
+            "hyde_document": "This should be ignored because light profile only asks for synonym.",
+            "sub_queries": ["should be ignored"],
+        }
+
+    monkeypatch.setattr(service, "_rewrite_with_llm", fake_rewrite_with_llm)
+
+    result = await service.rewrite_query("agentic search", rewrite_mode="force")
+
+    assert captured["strategies"] == ["synonym"]
+    assert result.synonym_queries == ["agent search"]
+    assert result.sub_queries == []
+    assert result.hyde_document is None
+    assert [item.strategy for item in result.vector_variants] == ["original", "synonym"]
 
 
 @pytest.mark.asyncio
@@ -198,3 +237,19 @@ async def test_rewrite_mode_compat_with_legacy_param(monkeypatch):
     assert forced.fallback_reason == "llm_unavailable"
     assert forced.fallback_reason != "disabled"
 
+
+@pytest.mark.asyncio
+async def test_rewrite_profile_off_disables_even_when_query_rewrite_enabled(monkeypatch):
+    service = QueryRewriteService()
+    monkeypatch.setattr(settings, "enable_query_rewrite", True)
+
+    result = await service.rewrite_query(
+        "attention mechanism",
+        use_query_rewrite=True,
+        rewrite_mode="auto",
+        rewrite_profile="off",
+    )
+
+    assert result.enabled is False
+    assert result.fallback_reason == "disabled"
+    assert result.skip_reason == "profile_off"

@@ -23,6 +23,7 @@ from app.services.llm_service import LLMService
 
 
 _ALLOWED_STRATEGIES = {"synonym", "hyde", "decompose"}
+_ALLOWED_REWRITE_PROFILES = {"off", "light", "deep"}
 
 
 @dataclass
@@ -118,15 +119,30 @@ class QueryRewriteService:
         normalized = alias_map.get(s, s)
         return normalized if normalized in _ALLOWED_STRATEGIES else None
 
+    @staticmethod
+    def _normalize_rewrite_profile(profile: Optional[str]) -> Optional[str]:
+        value = str(profile or "").strip().lower()
+        return value if value in _ALLOWED_REWRITE_PROFILES else None
+
     def _resolve_strategies(self, requested: Optional[list[str]]) -> list[str]:
+        return self._resolve_strategies_for_profile(requested, profile="deep")
+
+    def _resolve_strategies_for_profile(
+        self,
+        requested: Optional[list[str]],
+        *,
+        profile: str,
+    ) -> list[str]:
+        normalized_profile = self._normalize_rewrite_profile(profile) or "deep"
         if requested:
             raw_list = requested
         else:
-            raw_list = [
-                item.strip()
-                for item in (settings.query_rewrite_strategies or "").split(",")
-                if item.strip()
-            ]
+            source = (
+                settings.query_rewrite_light_strategies
+                if normalized_profile == "light"
+                else settings.query_rewrite_strategies
+            )
+            raw_list = [item.strip() for item in (source or "").split(",") if item.strip()]
 
         strategies: list[str] = []
         seen: set[str] = set()
@@ -314,6 +330,21 @@ class QueryRewriteService:
             return mode, True
         return mode, bool(use_query_rewrite)
 
+    @classmethod
+    def _resolve_rewrite_profile(
+        cls,
+        rewrite_profile: Optional[str],
+        *,
+        use_query_rewrite: bool,
+    ) -> str:
+        normalized = cls._normalize_rewrite_profile(rewrite_profile)
+        if normalized:
+            return normalized
+        if not use_query_rewrite:
+            return "off"
+        configured = cls._normalize_rewrite_profile(settings.query_rewrite_default_profile)
+        return configured or "light"
+
     def _build_prompt(self, query: str, strategies: list[str]) -> str:
         synonym_hint = (
             f"- synonym_queries: 生成 2 到 {settings.query_rewrite_max_synonyms} 条语义等价查询。"
@@ -372,6 +403,7 @@ class QueryRewriteService:
         use_query_rewrite: bool = True,
         requested_strategies: Optional[list[str]] = None,
         rewrite_mode: Optional[str] = None,
+        rewrite_profile: Optional[str] = None,
     ) -> QueryRewriteResult:
         clean_query = self._normalize_query(query)
         if not clean_query:
@@ -381,7 +413,19 @@ class QueryRewriteService:
         if not settings.enable_query_rewrite or not should_rewrite:
             return self._base_result(clean_query, enabled=False, fallback_reason="disabled")
 
-        strategies = self._resolve_strategies(requested_strategies)
+        profile = self._resolve_rewrite_profile(
+            rewrite_profile,
+            use_query_rewrite=should_rewrite,
+        )
+        if profile == "off":
+            return self._base_result(
+                clean_query,
+                enabled=False,
+                fallback_reason="disabled",
+                skip_reason="profile_off",
+            )
+
+        strategies = self._resolve_strategies_for_profile(requested_strategies, profile=profile)
         if not strategies:
             return self._base_result(
                 clean_query,
@@ -492,4 +536,3 @@ _query_rewrite_service = QueryRewriteService()
 def get_query_rewrite_service() -> QueryRewriteService:
     """Get global query rewrite service instance."""
     return _query_rewrite_service
-

@@ -180,6 +180,7 @@ class _FakeRuntimeService:
             "use_reranker",
             "use_hybrid",
             "use_query_rewrite",
+            "query_rewrite_profile",
             "use_contextual_compression",
         ):
             if key in payload:
@@ -336,6 +337,15 @@ def test_sanitized_persisted_chat_metadata_drops_context_debug():
     payload = chat_api._sanitized_persisted_chat_metadata(
         {
             "rag_metrics": {"knowledge_search_calls": 1},
+            "citation_index": {
+                "来源1": {
+                    "label": "来源1",
+                    "source_kind": "knowledge_base_search",
+                    "knowledge_base": "Transformer",
+                    "document": "Attention Is All You Need.pdf",
+                    "retrieval_scope": {"enabled": True, "scope_mode": "document", "document_ids": [34]},
+                }
+            },
             "context_debug": {"intent": "knowledge_query"},
             "reasoning_summary": {"summary": "采用知识检索回答。"},
             "turn_id": "turn:54",
@@ -344,6 +354,21 @@ def test_sanitized_persisted_chat_metadata_drops_context_debug():
 
     assert payload == {
         "rag_metrics": {"knowledge_search_calls": 1},
+        "citation_index": {
+            "来源1": {
+                "label": "来源1",
+                "source_kind": "knowledge_base_search",
+                "knowledge_base": "Transformer",
+                "document": "Attention Is All You Need.pdf",
+                "retrieval_scope": {
+                    "version": "chat_rag_overrides.v1",
+                    "enabled": True,
+                    "scope_mode": "document",
+                    "knowledge_base_ids": [],
+                    "document_ids": [34],
+                },
+            }
+        },
     }
 
 
@@ -536,6 +561,8 @@ def test_prepared_send_plan_requires_same_conversation_revision():
         llm_messages=[{"role": "user", "content": "继续解释"}],
         routing_decision={"intent": "general_chat"},
         rag_overrides={"enabled": True, "scope_mode": "document", "document_ids": [9]},
+        prefetched_rag_messages=[{"role": "system", "content": "本轮 RAG 预取证据：\n片段A"}],
+        prefetched_rag_metadata={"query": "继续解释", "result_count": 1},
     )
 
     reused = service.take_prepared_send_plan(
@@ -548,6 +575,8 @@ def test_prepared_send_plan_requires_same_conversation_revision():
     )
     assert reused is not None
     assert reused["rag_overrides"]["document_ids"] == [9]
+    assert reused["prefetched_rag_messages"][0]["content"].startswith("本轮 RAG 预取证据：")
+    assert reused["prefetched_rag_metadata"]["result_count"] == 1
 
     stored_again = service.store_prepared_send_plan(
         user_id=7,

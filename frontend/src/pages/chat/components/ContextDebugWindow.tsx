@@ -72,8 +72,14 @@ const formatEvidenceLedgerSummary = (
       if (item?.source_labels?.length) {
         suffixParts.push(`来源: ${item.source_labels.join('/')}`)
       }
+      if (item?.source_kind) {
+        suffixParts.push(`类型: ${item.source_kind}`)
+      }
       if (item?.tool_names?.length) {
         suffixParts.push(`工具: ${item.tool_names.join('/')}`)
+      }
+      if (item?.provenance_hints?.length) {
+        suffixParts.push(`线索: ${item.provenance_hints.join('/')}`)
       }
       if (item?.turn_ids?.length) {
         suffixParts.push(`回合: ${item.turn_ids.join('/')}`)
@@ -236,14 +242,23 @@ const ContextDebugWindow = ({
         ? [
             {
               key: 'tokens',
-              label: '上下文 Token',
-              value: `${contextDebug.estimated_tokens}/${contextDebug.budget}`,
+              label: '上下文预算',
+              value: `${contextDebug.estimated_tokens}/${contextDebug.effective_budget || contextDebug.budget}`,
             },
             {
               key: 'messages',
               label: '送入消息',
               value: `${contextDebug.message_count_sent}/${contextDebug.message_count_before_trim}`,
             },
+            ...(contextDebug.model_context_window
+              ? [
+                  {
+                    key: 'model-window',
+                    label: '模型窗口',
+                    value: `${contextDebug.model_context_window}`,
+                  },
+                ]
+              : []),
             {
               key: 'window',
               label: '最近窗口',
@@ -258,6 +273,13 @@ const ContextDebugWindow = ({
               key: 'memory',
               label: '记忆',
               value: contextDebug.memory_enabled ? `${contextDebug.memory_count} 条` : '关闭',
+            },
+            {
+              key: 'cache',
+              label: '前缀缓存',
+              value: contextDebug.stable_prefix_cache_active
+                ? `${contextDebug.stable_prefix_cache_hits || 0}/${contextDebug.stable_prefix_cache_misses || 0}`
+                : '未命中',
             },
           ]
         : [],
@@ -411,12 +433,27 @@ const ContextDebugWindow = ({
                                     {item.source_labels.slice(0, 3).join(' / ')}
                                   </span>
                                 ) : null}
+                                {item.source_kind ? (
+                                  <span className="rounded-full border border-fuchsia-400/18 bg-fuchsia-500/10 px-2 py-0.5 text-fuchsia-200">
+                                    {item.source_kind}
+                                  </span>
+                                ) : null}
                                 {item.tool_names?.length ? (
                                   <span className="rounded-full border border-emerald-400/18 bg-emerald-500/10 px-2 py-0.5 text-emerald-200">
                                     {item.tool_names.slice(0, 2).join(' / ')}
                                   </span>
                                 ) : null}
+                                {item.result_count ? (
+                                  <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                                    结果 {item.result_count}
+                                  </span>
+                                ) : null}
                               </div>
+                              {item.provenance_hints?.length ? (
+                                <div className="mt-1.5 text-[12px] leading-5 text-slate-400">
+                                  {item.provenance_hints.slice(0, 2).join('；')}
+                                </div>
+                              ) : null}
                             </div>
                           ))}
                         </div>

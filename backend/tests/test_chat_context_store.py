@@ -63,6 +63,7 @@ def test_tool_ledger_store_compacts_and_replays_entries():
             status="succeeded",
             summary="检索到 Bahdanau 2014 相关资料。",
             success=True,
+            metadata={"source_kind": "knowledge_base_search", "source_labels": ["来源1"]},
         )
     )
     store.compact(keep_last=1)
@@ -72,8 +73,10 @@ def test_tool_ledger_store_compacts_and_replays_entries():
     assert payload["version"] == "conversation_tool_ledger.v1"
     assert len(payload["entries"]) == 1
     assert payload["entries"][0]["kind"] == "tool_result"
+    assert payload["entries"][0]["metadata"]["source_kind"] == "knowledge_base_search"
     restored = ToolLedgerStore.from_payload(payload)
     assert restored.entries[0].tool_name == "knowledge_search"
+    assert restored.entries[0].metadata == {"source_kind": "knowledge_base_search", "source_labels": ["来源1"]}
 
 
 def test_turn_store_compacts_and_replays_entries():
@@ -424,6 +427,47 @@ def test_item_stream_store_canonical_replay_rows_include_replacement_history_and
     assert replay_rows[2]["role"] == "assistant"
     assert replay_rows[2]["thought"] == "需要先解释核心概念，再补充背景。"
     assert replay_rows[3]["content"] == "这是当前回答。"
+
+
+def test_item_stream_store_canonical_active_message_rows_exclude_replacement_history():
+    store = ConversationItemStreamStore.from_payload(
+        {
+            "version": "conversation_item_stream.v1",
+            "entries": [
+                {
+                    "item_id": "item-1",
+                    "kind": "compact_boundary",
+                    "role": "system",
+                    "message_id": 10,
+                    "metadata": {
+                        "compact_boundary_message_id": 10,
+                        "replacement_history": [
+                            {"role": "system", "content": "此前已经建立任务背景。"},
+                        ],
+                    },
+                },
+                {
+                    "item_id": "item-2",
+                    "kind": "user_message",
+                    "role": "user",
+                    "content": "解释当前问题",
+                    "message_id": 20,
+                },
+                {
+                    "item_id": "item-3",
+                    "kind": "assistant_message",
+                    "role": "assistant",
+                    "content": "这是当前回答。",
+                    "message_id": 21,
+                },
+            ],
+        }
+    )
+
+    replay_rows = store.canonical_active_message_rows()
+
+    assert [item["role"] for item in replay_rows] == ["user", "assistant"]
+    assert [item["content"] for item in replay_rows] == ["解释当前问题", "这是当前回答。"]
 
 
 def test_item_stream_store_compact_preserves_latest_boundary_and_kept_turn():

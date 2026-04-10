@@ -8642,6 +8642,83 @@ async def test_reader_experience_v2_cached_payload_should_return_generation_shel
 
 
 @pytest.mark.asyncio
+async def test_reader_experience_v2_cached_payload_should_fast_return_latest_stable_artifact_without_runtime_prepare(monkeypatch):
+    paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
+    stable_artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+        authored_plan=_build_sample_page_artifact_v2_authored_plan(),
+    )
+    fast_session_writes: list[dict[str, object]] = []
+    fast_artifact_writes: list[dict[str, object]] = []
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    async def _fake_normalize(**_kwargs):
+        return 146
+
+    async def _fake_fast_session_get(_cache_key):
+        return None, "none"
+
+    async def _fake_fast_artifact_get(_cache_key):
+        return None, "none"
+
+    async def _fake_fast_session_set(cache_key, payload, ttl_seconds=literature_api.EXPERIENCE_SESSION_V2_CACHE_TTL_SECONDS):
+        fast_session_writes.append({"cache_key": cache_key, "payload": payload, "ttl_seconds": ttl_seconds})
+
+    async def _fake_fast_artifact_set(cache_key, payload, ttl_seconds=literature_api.PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS):
+        fast_artifact_writes.append({"cache_key": cache_key, "payload": payload, "ttl_seconds": ttl_seconds})
+
+    async def _fake_latest_stable(**kwargs):
+        if kwargs["plan_kind"] == literature_api.PAGE_ARTIFACT_V2_CACHE_KIND:
+            return stable_artifact, None, "stable-artifact-key"
+        if kwargs["plan_kind"] == literature_api.EXPERIENCE_SESSION_V2_CACHE_KIND:
+            return {"session_id": "sess-fast", "status": "completed"}, None, "stable-session-key"
+        raise AssertionError(f"unexpected plan_kind: {kwargs['plan_kind']}")
+
+    async def _fail_prepare(**_kwargs):
+        raise AssertionError("full runtime should not run when fast stable artifact exists")
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", _fake_normalize)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_fast_cache_get", _fake_fast_session_get)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_fast_cache_get", _fake_fast_artifact_get)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_fast_cache_set", _fake_fast_session_set)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_fast_cache_set", _fake_fast_artifact_set)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_latest_stable)
+    monkeypatch.setattr(literature_api, "_prepare_reader_experience_v2_runtime", _fail_prepare)
+
+    response = await literature_api._build_reader_experience_v2_cached_payload(
+        paper_id=78,
+        payload=literature_api.ReaderExperiencePlanRequest(
+            page=7,
+            focus_page=7,
+            reader_profile="curious_generalist",
+            selected_kb_id=146,
+            user_intent="build v2 experience",
+        ),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert response["status"] == "ready"
+    assert response["artifact"]["version"] == "page_artifact_v2"
+    assert response["compose_build_mode"] == "cached_fast_path"
+    assert response["artifact_cache_hit"] is True
+    assert response["artifact_cache_layer"].startswith("db_stable_fast")
+    assert response["session_cache_hit"] is True
+    assert response["session_cache_layer"].startswith("db_stable_fast")
+    assert response["meta"]["cache_mode"] == "fast_path"
+    assert response["meta"]["compose_payload_deferred"] is True
+    assert fast_artifact_writes and fast_artifact_writes[0]["cache_key"].startswith(
+        f"{literature_api.PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE}:"
+    )
+    assert fast_session_writes and fast_session_writes[0]["cache_key"].startswith(
+        f"{literature_api.EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE}:"
+    )
+
+
+@pytest.mark.asyncio
 async def test_prepare_reader_experience_v2_runtime_should_degrade_when_structured_adjacent_context_is_unavailable(monkeypatch):
     paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
     compose_payload = _build_sample_compose_payload_for_dossier_v2()
