@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.api.codelab import ExecuteRequest, execute_code_directly
+from app.api.codelab import ExecuteRequest, PythonKernel, execute_code_directly
 from app.config import settings
 
 
@@ -50,3 +50,24 @@ async def test_direct_execute_allowed_for_admin(monkeypatch):
     assert result.success is True
     assert result.terminated_reason == "none"
 
+
+def test_python_kernel_non_sandbox_preserves_last_line_inside_else(monkeypatch):
+    monkeypatch.setattr(settings, "codelab_sandbox_enabled", False)
+    kernel = PythonKernel("test-nonsandbox-control-flow")
+    try:
+        result = kernel.execute(
+            "items = []\n"
+            "if items:\n"
+            "    print('has items')\n"
+            "else:\n"
+            "    print('empty branch reached')",
+            timeout=2,
+        )
+        assert result["success"] is True
+        assert any(
+            getattr(output, "output_type", "") == "stream"
+            and "empty branch reached" in str(getattr(output, "content", "") or "")
+            for output in result["outputs"]
+        )
+    finally:
+        kernel.close()

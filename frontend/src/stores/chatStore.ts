@@ -14,6 +14,7 @@ import {
   type ConversationTurnStore,
   type ConversationToolLedger,
   type ConversationItemStream,
+  type MessageSpanRewriteResponse,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
@@ -48,6 +49,53 @@ export type SendPhase =
   | 'tool'
   | 'answering'
 
+const assistantSummaryText = (content: string, limit = 160): string => {
+  const normalized = String(content || '').replace(/\s+/g, ' ').trim()
+  if (normalized.length <= limit) return normalized
+  return `${normalized.slice(0, Math.max(1, limit - 1)).trimEnd()}…`
+}
+
+const applySpanRewriteToConversation = (
+  conversation: Conversation | null,
+  response: MessageSpanRewriteResponse,
+): Conversation | null => {
+  if (!conversation) return conversation
+  const messageId = response.message.id
+  const nextItemStream = conversation.item_stream
+    ? {
+        ...conversation.item_stream,
+        entries: conversation.item_stream.entries.map((entry) =>
+          entry.message_id === messageId && entry.role === 'assistant'
+            ? {
+                ...entry,
+                content: response.new_content,
+                metadata: response.message.metadata || entry.metadata,
+              }
+            : entry,
+        ),
+      }
+    : conversation.item_stream
+  const nextTurnStore = conversation.turn_store
+    ? {
+        ...conversation.turn_store,
+        entries: conversation.turn_store.entries.map((entry) =>
+          entry.assistant_message_id === messageId
+            ? {
+                ...entry,
+                assistant_summary: assistantSummaryText(response.new_content),
+              }
+            : entry,
+        ),
+      }
+    : conversation.turn_store
+
+  return {
+    ...conversation,
+    ...(nextItemStream ? { item_stream: nextItemStream } : {}),
+    ...(nextTurnStore ? { turn_store: nextTurnStore } : {}),
+  }
+}
+
 interface ChatState {
   // 对话列表
   conversations: Conversation[]
@@ -79,6 +127,7 @@ interface ChatState {
 
   // 停止控制
   abortController: AbortController | null
+  currentBackgroundRunId: string | null
 
   // Actions
   fetchConversations: () => Promise<void>
@@ -87,6 +136,16 @@ interface ChatState {
   deleteConversation: (conversationId: number) => Promise<void>
   archiveConversation: (conversationId: number) => Promise<void>
   compactConversationContext: () => Promise<void>
+  rewriteMessageSpan: (
+    messageId: number,
+    payload: {
+      instruction: string
+      selected_text: string
+      before_context?: string
+      after_context?: string
+      occurrence_index?: number
+    },
+  ) => Promise<MessageSpanRewriteResponse>
   sendMessage: (
     message: string,
     options?: {
@@ -121,6 +180,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentToolCall: null,
   currentTurnId: null,
   abortController: null,
+  currentBackgroundRunId: null,
 
   fetchConversations: async () => {
     // 防止重复加载
@@ -271,6 +331,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  rewriteMessageSpan: async (messageId, payload) => {
+    try {
+      const response = await chatApi.rewriteMessageSpan(messageId, payload)
+      set((state) => ({
+        messages: state.messages.map((message) =>
+          message.id === response.message.id ? response.message : message,
+        ),
+        currentConversation: applySpanRewriteToConversation(state.currentConversation, response),
+      }))
+      return response
+    } catch (error) {
+      handleApiError(error, '改写消息片段')
+      throw error
+    }
+  },
+
   sendMessage: async (
     message: string,
     options?: {
@@ -315,6 +391,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       currentToolCall: null,
       currentTurnId: null,
       abortController,  // 保存 AbortController
+      currentBackgroundRunId: null,
     }))
 
     let newConversationId: number | undefined = undefined
@@ -323,11 +400,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       let fullContent = ''
       let currentThought = ''  // 当前迭代的思考
 
-      await chatApi.sendMessageStream(
-        message,
-        currentConversation?.id,
-        (event, data) => {
+      const handleStreamEvent = (event: string, data: any) => {
           switch (event) {
+            case 'run_status':
+              if (data && typeof data === 'object' && typeof data.run_id === 'string') {
+                set({ currentBackgroundRunId: data.run_id })
+              }
+              break
+
             case 'start':
               set({
                 sendPhase: 'planning',
@@ -503,6 +583,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     toolCalls: [],
                     currentToolCall: null,
                     abortController: null,
+                    currentBackgroundRunId: null,
                   }
                 }
                 return state
@@ -594,6 +675,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 currentToolCall: null,
                 currentTurnId: null,
                 abortController: null,
+                currentBackgroundRunId: null,
               }))
 
               // 刷新对话列表（新对话或更新标题）
@@ -615,14 +697,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 lastRunContextDebug: null,
                 currentTurnId: null,
                 abortController: null,
+                currentBackgroundRunId: null,
               })
               throw new Error(data)
           }
-        },
-        abortController,
+        }
+
+      const run = await chatApi.createChatRun(
+        message,
+        currentConversation?.id,
         options?.sendPlanId,
         options?.chatPreferenceOverrides,
         options?.ragOverrides,
+      )
+      set({ currentBackgroundRunId: run.run_id })
+      if (abortController.signal.aborted) {
+        void chatApi.cancelChatRun(run.run_id).catch((error) => {
+          console.error('[ChatStore] 取消后台对话任务失败:', error)
+        })
+        set({ currentBackgroundRunId: null })
+        return newConversationId
+      }
+
+      await chatApi.streamChatRun(
+        run.run_id,
+        handleStreamEvent,
+        abortController,
       )
 
       return newConversationId
@@ -646,6 +746,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         currentToolCall: null,
         currentTurnId: null,
         abortController: null,
+        currentBackgroundRunId: null,
       })
       throw error
     }
@@ -653,7 +754,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   stopGeneration: () => {
     const state = get()
-    const { abortController, isSending, currentConversation, streamingContent, streamingThought, iterationSteps, streamingContextDebug, currentTurnId } = state
+    const { abortController, isSending, currentConversation, streamingContent, streamingThought, iterationSteps, streamingContextDebug, currentTurnId, currentBackgroundRunId } = state
 
     if (!abortController || !isSending) {
       return
@@ -661,6 +762,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // 立即设置 isSending 为 false，防止重复调用和 race condition
     set({ isSending: false, sendPhase: 'idle', sendPhaseLabel: null, sendPhaseHint: null })
+    if (currentBackgroundRunId) {
+      void chatApi.cancelChatRun(currentBackgroundRunId).catch((error) => {
+        console.error('[ChatStore] 取消后台对话任务失败:', error)
+      })
+    }
 
     // 保存当前内容
     const stoppedContent = streamingContent || ''
@@ -706,6 +812,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           currentToolCall: null,
           currentTurnId: null,
           abortController: null,
+          currentBackgroundRunId: null,
         }))
       }).catch((error) => {
         console.error('[ChatStore] 保存消息到数据库失败:', error)
@@ -737,6 +844,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           currentToolCall: null,
           currentTurnId: null,
           abortController: null,
+          currentBackgroundRunId: null,
         }))
       })
     } else {
@@ -756,6 +864,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         currentToolCall: null,
         currentTurnId: null,
         abortController: null,
+        currentBackgroundRunId: null,
       })
     }
 
@@ -780,6 +889,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       currentToolCall: null,
       currentTurnId: null,
       abortController: null,
+      currentBackgroundRunId: null,
     })
   },
 }))

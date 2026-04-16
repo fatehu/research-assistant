@@ -60,6 +60,34 @@ class _DirectAnswerFCLLM:
         return {"content": "<answer>fallback</answer>"}
 
 
+class _StreamingDirectAnswerFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools_stream(self, *args, **kwargs):
+        yield {"type": "content", "data": "第一段，"}
+        yield {"type": "content", "data": "第二段"}
+        yield {
+            "type": "done",
+            "data": {
+                "content": "第一段，第二段",
+                "reasoning": "",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                "function_calling_streaming": True,
+            },
+        }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        raise AssertionError("streaming path should not call non-stream chat_with_tools")
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
 class _ThinkingAliasDirectAnswerFCLLM:
     provider = "test"
     config = {"model": "test-model"}
@@ -394,6 +422,23 @@ async def test_function_calling_direct_answer_emits_thought_step():
     assert thought_events
     assert "问题分析" in str(thought_events[0].get("data", ""))
     assert done_events and "直接回答" in str(done_events[0]["data"]["answer"])
+
+
+@pytest.mark.asyncio
+async def test_function_calling_streams_direct_answer_before_done():
+    agent = ReActAgent(_StreamingDirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "直接回答"}], stream=True):
+        events.append(event)
+
+    content_events = [event for event in events if event.get("type") == "content"]
+    done_index = next(index for index, event in enumerate(events) if event.get("type") == "done")
+    first_content_index = next(index for index, event in enumerate(events) if event.get("type") == "content")
+
+    assert first_content_index < done_index
+    assert "".join(str(event.get("data") or "") for event in content_events) == "第一段，第二段"
+    assert events[done_index]["data"]["answer"] == "第一段，第二段"
 
 
 @pytest.mark.asyncio

@@ -124,6 +124,28 @@ const mergeDocumentOptions = (base: Document[], incoming: Document[]): Document[
 
 type RagKnowledgeBaseOption = AvailableKnowledgeBaseSummary | SharedKnowledgeBaseSummary
 
+const renderKnowledgeBaseOptionLabel = (item: RagKnowledgeBaseOption): string => {
+  return 'owner_name' in item && item.owner_name ? `${item.name} · ${item.owner_name}` : item.name
+}
+
+const renderKnownEntityList = (
+  ids: number[] | undefined,
+  resolveName: (id: number) => string | undefined,
+  fallbackPrefix: string,
+): string => {
+  const labels = (ids || [])
+    .map((id) => {
+      const normalizedId = Number(id)
+      if (!Number.isFinite(normalizedId) || normalizedId <= 0) return ''
+      return resolveName(normalizedId) || `${fallbackPrefix} #${normalizedId}`
+    })
+    .filter(Boolean)
+  if (labels.length <= 3) {
+    return labels.join('、')
+  }
+  return `${labels.slice(0, 3).join('、')} 等 ${labels.length} 个`
+}
+
 const renderPreviewMessagePayload = (message: Record<string, any>) => {
   const content = typeof message.content === 'string'
     ? message.content.trim()
@@ -275,7 +297,7 @@ const ChatInput = ({
 
   useEffect(() => {
     let cancelled = false
-    if (!isRagPanelOpen) {
+    if (!isRagPanelOpen && !ragEnabled && !effectiveRagOverrides?.enabled) {
       return () => {
         cancelled = true
       }
@@ -306,7 +328,7 @@ const ChatInput = ({
     return () => {
       cancelled = true
     }
-  }, [isRagPanelOpen])
+  }, [effectiveRagOverrides?.enabled, isRagPanelOpen, ragEnabled])
 
   useEffect(() => {
     let cancelled = false
@@ -583,13 +605,29 @@ const ChatInput = ({
           : '',
       ].filter(Boolean)
     : []
+  const knowledgeBaseLabelById = new Map(
+    knowledgeBaseOptions.map((item) => [item.id, renderKnowledgeBaseOptionLabel(item)]),
+  )
+  const documentLabelById = new Map(
+    documentOptions.map((item) => [item.id, item.original_filename || item.filename]),
+  )
+  const effectiveRagScopeLabel =
+    effectiveRagOverrides?.scope_mode === 'knowledge_base' && effectiveRagOverrides.knowledge_base_ids?.length
+      ? `本轮 RAG: ${renderKnownEntityList(
+          effectiveRagOverrides.knowledge_base_ids,
+          (id) => knowledgeBaseLabelById.get(id),
+          '知识库',
+        )}`
+      : effectiveRagOverrides?.scope_mode === 'document' && effectiveRagOverrides.document_ids?.length
+        ? `本轮 RAG: ${renderKnownEntityList(
+            effectiveRagOverrides.document_ids,
+            (id) => documentLabelById.get(id),
+            '文档',
+          )}`
+        : '本轮 RAG: 全部知识库'
   const effectiveRagBadges = effectiveRagOverrides?.enabled
     ? [
-        effectiveRagOverrides.scope_mode === 'knowledge_base' && effectiveRagOverrides.knowledge_base_ids?.length
-          ? `本轮 RAG: 知识库 ${effectiveRagOverrides.knowledge_base_ids.join(', ')}`
-          : effectiveRagOverrides.scope_mode === 'document' && effectiveRagOverrides.document_ids?.length
-            ? `本轮 RAG: 文档 ${effectiveRagOverrides.document_ids.join(', ')}`
-            : '本轮 RAG: 全部知识库',
+        effectiveRagScopeLabel,
         effectiveRagOverrides.use_reranker != null
           ? `Reranker ${effectiveRagOverrides.use_reranker ? '开启' : '关闭'}`
           : '',
@@ -764,10 +802,7 @@ const ChatInput = ({
                         onChange={(value) => setRagKnowledgeBaseIds((value as number[]) || [])}
                         options={knowledgeBaseOptions.map((item) => ({
                           value: item.id,
-                          label:
-                            'owner_name' in item && item.owner_name
-                              ? `${item.name} · ${item.owner_name}`
-                              : item.name,
+                          label: renderKnowledgeBaseOptionLabel(item),
                         }))}
                         className="w-full"
                       />
@@ -792,10 +827,7 @@ const ChatInput = ({
                           }}
                           options={knowledgeBaseOptions.map((item) => ({
                             value: item.id,
-                            label:
-                              'owner_name' in item && item.owner_name
-                                ? `${item.name} · ${item.owner_name}`
-                                : item.name,
+                            label: renderKnowledgeBaseOptionLabel(item),
                           }))}
                           className="w-full"
                         />

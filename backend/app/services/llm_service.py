@@ -313,20 +313,151 @@ class LLMService:
         max_tokens: Optional[int] = None,
         tool_choice: str = "auto",
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Compatibility stream wrapper for function-calling."""
-        result = await self.chat_with_tools(
-            messages=messages,
-            tools=tools,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tool_choice=tool_choice,
-        )
-        if result.get("content"):
-            yield {"type": "content", "data": result["content"]}
-        for call in result.get("tool_calls", []):
-            yield {"type": "tool_call", "data": call}
-        yield {"type": "done", "data": result}
+        """Stream native function-calling deltas and return a final normalized payload.
+
+        Tool calls are emitted as deltas while arguments are accumulated locally.
+        Callers should execute tools only after the final ``done`` payload, where
+        arguments have been reconstructed into complete JSON strings.
+        """
+        if temperature is None:
+            temperature = settings.llm_temperature
+        if max_tokens is None:
+            max_tokens = settings.llm_max_tokens
+
+        full_messages = self._build_messages(messages, system_prompt)
+        safe_tools, alias_to_actual = self._build_provider_safe_tools(tools)
+
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_call_parts: Dict[int, Dict[str, str]] = {}
+        usage_payload: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        model_name = str(self.config.get("model") or "")
+        finish_reason = ""
+
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.config["model"],
+                messages=full_messages,
+                tools=safe_tools or None,
+                tool_choice=tool_choice if safe_tools else None,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+
+            async for chunk in stream:
+                model_name = str(getattr(chunk, "model", "") or model_name)
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    usage_payload = self._normalize_usage(usage)
+
+                choices = list(getattr(chunk, "choices", []) or [])
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                finish_reason = str(getattr(choice, "finish_reason", "") or finish_reason)
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                content_delta = getattr(delta, "content", None)
+                if content_delta:
+                    content = str(content_delta)
+                    content_parts.append(content)
+                    yield {"type": "content", "data": content}
+
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if not reasoning_delta:
+                    reasoning_delta = getattr(delta, "reasoning", None)
+                if reasoning_delta:
+                    reasoning_text = str(reasoning_delta)
+                    reasoning_parts.append(reasoning_text)
+                    yield {"type": "reasoning", "data": reasoning_text}
+
+                for raw_call in list(getattr(delta, "tool_calls", None) or []):
+                    try:
+                        index = int(getattr(raw_call, "index"))
+                    except Exception:
+                        index = len(tool_call_parts)
+                    state = tool_call_parts.setdefault(
+                        index,
+                        {"id": "", "type": "function", "name": "", "arguments": ""},
+                    )
+                    call_id = str(getattr(raw_call, "id", "") or "")
+                    call_type = str(getattr(raw_call, "type", "") or "")
+                    if call_id:
+                        state["id"] = call_id
+                    if call_type:
+                        state["type"] = call_type
+
+                    function_delta = getattr(raw_call, "function", None)
+                    if function_delta is not None:
+                        name_delta = str(getattr(function_delta, "name", "") or "")
+                        arguments_delta = str(getattr(function_delta, "arguments", "") or "")
+                        if name_delta:
+                            state["name"] += name_delta
+                        if arguments_delta:
+                            state["arguments"] += arguments_delta
+
+                    yield {
+                        "type": "tool_call_delta",
+                        "data": {
+                            "index": index,
+                            "id": state["id"],
+                            "type": state["type"],
+                            "name": alias_to_actual.get(state["name"], state["name"]),
+                            "arguments": state["arguments"],
+                        },
+                    }
+
+            tool_calls: List[Dict[str, Any]] = []
+            for index in sorted(tool_call_parts):
+                state = tool_call_parts[index]
+                raw_name = str(state.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                tool_calls.append(
+                    {
+                        "id": str(state.get("id") or f"call_{index}"),
+                        "type": str(state.get("type") or "function"),
+                        "name": alias_to_actual.get(raw_name, raw_name),
+                        "arguments": str(state.get("arguments") or "{}"),
+                    }
+                )
+
+            yield {
+                "type": "done",
+                "data": {
+                    "content": "".join(content_parts),
+                    "reasoning": "".join(reasoning_parts).strip(),
+                    "tool_calls": tool_calls,
+                    "usage": usage_payload,
+                    "model": model_name,
+                    "finish_reason": finish_reason,
+                    "function_calling_streaming": True,
+                },
+            }
+        except Exception as exc:
+            logger.warning(
+                f"LLM function-calling stream failed [{self.provider}], fallback to non-stream: "
+                f"{self._format_exception(exc)}"
+            )
+            result = await self.chat_with_tools(
+                messages=messages,
+                tools=tools,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
+            if result.get("content") and not list(result.get("tool_calls") or []):
+                yield {"type": "content", "data": result["content"]}
+            for call in result.get("tool_calls", []):
+                yield {"type": "tool_call_delta", "data": call}
+            payload = dict(result)
+            payload["function_calling_streaming"] = False
+            yield {"type": "done", "data": payload}
 
     async def react_chat_stream(
         self,

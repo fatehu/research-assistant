@@ -189,6 +189,8 @@ async def notebook_agent_chat(
             user_id=current_user.id,
             channel="notebook_agent",
             notebook_id=notebook_id,
+            scope_type="notebook",
+            scope_id=str(notebook_id),
         ),
     )
 

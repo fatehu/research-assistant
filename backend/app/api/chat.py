@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+import re
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
@@ -18,12 +19,14 @@ from app.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
+from app.models.agent import AgentRun
 from app.models.conversation import Conversation, Message, MessageRole, MessageType
 from app.models.knowledge import KnowledgeBase
 from app.schemas.chat import (
     ConversationCreate, ConversationResponse, ConversationListResponse,
     MessageResponse, ChatRequest, SaveStoppedMessageRequest, ConversationCompactResponse,
     ChatContextPreviewRequest, ChatContextPreviewResponse,
+    MessageSpanRewriteRequest, MessageSpanRewriteResponse,
 )
 from app.services.llm_service import LLMService
 from app.services.agent_tools import get_tool_registry
@@ -33,8 +36,23 @@ from app.services.conversation_context_compaction_service import (
     ConversationItemStreamUnavailableError,
     get_conversation_context_compaction_service,
 )
+from app.services.chat_background_run_service import get_chat_background_run_manager
 
 router = APIRouter()
+
+_PERSISTED_CHAT_BACKGROUND_EVENTS = {
+    "run_status",
+    "start",
+    "phase",
+    "thinking_start",
+    "thought",
+    "action",
+    "observation",
+    "context_debug",
+    "done",
+    "error",
+    "cancelled",
+}
 
 
 def _normalized_optional_text(value: object) -> Optional[str]:
@@ -713,12 +731,335 @@ def _sanitized_persisted_chat_metadata(payload: object) -> Optional[dict]:
     citation_index = _normalized_message_citation_index(payload.get("citation_index"))
     if citation_index:
         metadata["citation_index"] = citation_index
+    rewrites = [
+        {
+            "rewritten_at": str(item.get("rewritten_at") or "").strip(),
+            "instruction": str(item.get("instruction") or "").strip(),
+            "selected_text": str(item.get("selected_text") or "").strip()[:240],
+        }
+        for item in list(payload.get("rewrites") or [])
+        if isinstance(item, dict) and str(item.get("rewritten_at") or "").strip()
+    ]
+    if rewrites:
+        metadata["rewrites"] = rewrites[-10:]
     return metadata or None
 
 
 def _sanitized_chat_message_response_metadata(payload: object) -> Optional[dict]:
     """Expose only stable chat UI metadata from persisted messages."""
     return _sanitized_persisted_chat_metadata(payload)
+
+
+_CHAT_CITATION_LABEL_RE = re.compile(r"\[(网页\d+|来源\d+)\]")
+_CHAT_MARKDOWN_LINE_PREFIX_RE = re.compile(r"^(\s{0,3}(?:#{1,6}\s+)?(?:(?:[-*+]\s+)|(?:\d+[.)]\s+)|(?:>\s+))*)")
+_CHAT_MARKDOWN_BOLD_LEADING_LABEL_RE = re.compile(r"^(\*\*)([^*\n]{1,120}?)(\*\*)([:：]?)")
+
+
+def _extract_chat_citation_labels(text: str) -> set[str]:
+    return {str(match.group(1) or "").strip() for match in _CHAT_CITATION_LABEL_RE.finditer(str(text or ""))}
+
+
+def _chat_span_has_markdown_heading(text: str) -> bool:
+    return any(
+        re.match(r"^\s{0,3}#{1,6}\s+", line)
+        for line in str(text or "").strip().splitlines()
+    )
+
+
+def _markdown_line_prefix(text: str) -> str:
+    match = _CHAT_MARKDOWN_LINE_PREFIX_RE.match(str(text or ""))
+    return str(match.group(1) or "") if match else ""
+
+
+def _preserve_markdown_leading_bold_label(original_line: str, replacement_line: str, prefix: str) -> str:
+    original_body = str(original_line or "")[len(prefix):]
+    replacement = str(replacement_line or "")
+    original_match = _CHAT_MARKDOWN_BOLD_LEADING_LABEL_RE.match(original_body)
+    if not original_match:
+        return replacement
+    if replacement[len(prefix):].startswith("**"):
+        return replacement
+    label = str(original_match.group(2) or "").strip()
+    if not label:
+        return replacement
+    replacement_body = replacement[len(prefix):]
+    original_suffix = original_body[original_match.end():].strip()
+    if not original_suffix and replacement_body:
+        return f"{prefix}**{replacement_body}**"
+    if not replacement_body.startswith(label):
+        return replacement
+    return f"{prefix}**{label}**{replacement_body[len(label):]}"
+
+
+def _preserve_markdown_line_scaffold(original_line: str, replacement_line: str) -> str:
+    original = str(original_line or "")
+    replacement = str(replacement_line or "")
+    prefix = _markdown_line_prefix(original)
+    if prefix and not replacement.startswith(prefix):
+        replacement_prefix = _markdown_line_prefix(replacement)
+        if replacement_prefix:
+            replacement = f"{prefix}{replacement[len(replacement_prefix):].lstrip()}"
+        else:
+            replacement = f"{prefix}{replacement.lstrip()}"
+    elif not prefix:
+        replacement_prefix = _markdown_line_prefix(replacement)
+        if replacement_prefix:
+            replacement = replacement[len(replacement_prefix):].lstrip()
+    return _preserve_markdown_leading_bold_label(original, replacement, prefix)
+
+
+def _preserve_span_rewrite_markdown_scaffold(*, selected_text: str, replacement_text: str) -> str:
+    original_lines = str(selected_text or "").splitlines()
+    replacement_lines = str(replacement_text or "").strip().splitlines()
+    if not original_lines or not replacement_lines:
+        return str(replacement_text or "").strip()
+    if len(original_lines) != len(replacement_lines):
+        return _preserve_markdown_line_scaffold(original_lines[0], str(replacement_text or "").strip())
+    return "\n".join(
+        _preserve_markdown_line_scaffold(original_line, replacement_line)
+        for original_line, replacement_line in zip(original_lines, replacement_lines)
+    ).strip()
+
+
+def _resolve_message_span_offsets(
+    content: str,
+    selected_text: str,
+    *,
+    occurrence_index: Optional[int] = None,
+    before_context: str = "",
+    after_context: str = "",
+) -> tuple[int, int]:
+    body = str(content or "")
+    selected = str(selected_text or "")
+    if not selected:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "empty_selected_text", "message": "选区不能为空"},
+        )
+
+    starts: List[int] = []
+    start = body.find(selected)
+    while start >= 0:
+        starts.append(start)
+        start = body.find(selected, start + max(len(selected), 1))
+
+    if not starts:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "selected_span_not_found", "message": "选区已变化或不在原始 Markdown 中，请重新选择。"},
+        )
+
+    chosen_start: Optional[int] = None
+    if occurrence_index is not None:
+        try:
+            idx = int(occurrence_index)
+        except (TypeError, ValueError):
+            idx = -1
+        if 0 <= idx < len(starts):
+            chosen_start = starts[idx]
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "selected_span_occurrence_mismatch", "message": "选区出现次数已变化，请重新选择。"},
+            )
+
+    if chosen_start is None and len(starts) == 1:
+        chosen_start = starts[0]
+
+    if chosen_start is None:
+        before = str(before_context or "").strip()
+        after = str(after_context or "").strip()
+        scored: List[tuple[int, int]] = []
+        for candidate in starts:
+            score = 0
+            if before:
+                tail = body[max(0, candidate - len(before) - 200) : candidate]
+                if tail.endswith(before) or before.endswith(tail[-min(len(tail), len(before)) :]):
+                    score += 1
+            if after:
+                head = body[candidate + len(selected) : candidate + len(selected) + len(after) + 200]
+                if head.startswith(after) or after.startswith(head[: min(len(head), len(after))]):
+                    score += 1
+            if score:
+                scored.append((score, candidate))
+        scored = sorted(scored, key=lambda item: item[0], reverse=True)
+        if len(scored) == 1 or (len(scored) > 1 and scored[0][0] > scored[1][0]):
+            chosen_start = scored[0][1]
+
+    if chosen_start is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "selected_span_ambiguous", "message": "这段文本在消息中出现多次，请缩小选区后重试。"},
+        )
+
+    return chosen_start, chosen_start + len(selected)
+
+
+def _build_message_span_rewrite_prompt(
+    *,
+    instruction: str,
+    selected_text: str,
+    before_context: str,
+    after_context: str,
+) -> str:
+    return (
+        "You are rewriting only one selected span inside an existing assistant answer.\n\n"
+        "Task:\n"
+        "Rewrite the selected span according to the user's instruction.\n\n"
+        "Hard constraints:\n"
+        "1. Output only the replacement text for the selected span.\n"
+        "2. Do not output the full answer.\n"
+        "3. Do not include the surrounding before/after text.\n"
+        "4. Do not add new facts, examples, URLs, or citation labels.\n"
+        "5. Preserve the factual meaning of the selected span unless the instruction explicitly asks to simplify or remove details.\n"
+        "6. Preserve any citation labels already present in the selected span, such as [网页1] or [来源1].\n"
+        "7. If the selected span has no citation labels, do not add citation labels.\n"
+        "8. Preserve Markdown scaffolding exactly: heading markers, leading numbering, list bullets, blockquote markers, and bold wrappers such as **label**.\n"
+        "9. If the selected span has multiple Markdown lines, keep the same line structure and rewrite only the prose inside those lines.\n"
+        "10. Do not mention that this is a rewrite. No preface, no explanation.\n\n"
+        "Language and style:\n"
+        "- Match the language of the selected span unless the instruction explicitly asks otherwise.\n"
+        "- Match the surrounding answer's tone and formatting.\n"
+        "- Preserve Markdown syntax if the selected span contains Markdown.\n\n"
+        f"User rewrite instruction:\n{instruction}\n\n"
+        f"Selected span to rewrite:\n<selected_span>\n{selected_text}\n</selected_span>\n\n"
+        "Surrounding context for continuity only. Do not rewrite or repeat it:\n"
+        f"<before>\n{before_context}\n</before>\n\n"
+        f"<after>\n{after_context}\n</after>\n"
+    )
+
+
+def _validate_span_rewrite_replacement(*, selected_text: str, replacement_text: str) -> str:
+    replacement = str(replacement_text or "").strip()
+    if not replacement:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "empty_rewrite_result", "message": "模型没有返回可用的改写结果。"},
+        )
+    if len(replacement) > max(len(str(selected_text or "")) * 4, 2000):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rewrite_result_too_long", "message": "模型返回内容过长，已拒绝替换。"},
+        )
+    if not _chat_span_has_markdown_heading(selected_text) and _chat_span_has_markdown_heading(replacement):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "rewrite_added_markdown_heading",
+                "message": "模型改写新增了 Markdown 标题，已拒绝替换。",
+            },
+        )
+    original_labels = _extract_chat_citation_labels(selected_text)
+    replacement_labels = _extract_chat_citation_labels(replacement)
+    added_labels = replacement_labels - original_labels
+    if added_labels:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "rewrite_added_citation_label",
+                "message": "模型改写时新增了不存在的引用标签，已拒绝替换。",
+                "added_labels": sorted(added_labels),
+            },
+        )
+    missing_labels = original_labels - replacement_labels
+    if missing_labels:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "rewrite_dropped_citation_label",
+                "message": "模型改写时删除了原选区引用标签，已拒绝替换。",
+                "missing_labels": sorted(missing_labels),
+            },
+        )
+    return replacement
+
+
+def _iter_sse_payloads_from_buffer(buffer: str, *, flush: bool = False) -> tuple[List[dict], str]:
+    if not buffer:
+        return [], ""
+    lines = buffer.split("\n")
+    remainder = "" if flush else (lines.pop() or "")
+    payloads: List[dict] = []
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line.startswith("data:"):
+            continue
+        raw_payload = line[5:].strip()
+        if not raw_payload:
+            continue
+        try:
+            parsed = json.loads(raw_payload)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+    if flush and remainder.strip().startswith("data:"):
+        try:
+            parsed = json.loads(remainder.strip()[5:].strip())
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+    return payloads, remainder
+
+
+def _update_message_content_in_item_stream_payload(
+    item_stream_payload: Optional[dict],
+    *,
+    message_id: int,
+    new_content: str,
+    rewrite_metadata: Optional[dict] = None,
+) -> Optional[dict]:
+    if not isinstance(item_stream_payload, dict):
+        return None
+    payload = dict(item_stream_payload)
+    entries = [
+        dict(item) if isinstance(item, dict) else item
+        for item in list(payload.get("entries") or [])
+    ]
+    changed = False
+    next_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            next_entries.append(entry)
+            continue
+        try:
+            entry_message_id = int(entry.get("message_id") or 0)
+        except Exception:
+            entry_message_id = 0
+        if entry_message_id == int(message_id) and str(entry.get("role") or "").strip().lower() == "assistant":
+            metadata = dict(entry.get("metadata") or {}) if isinstance(entry.get("metadata"), dict) else {}
+            if rewrite_metadata:
+                rewrites = [dict(item) for item in list(metadata.get("rewrites") or []) if isinstance(item, dict)]
+                rewrites.append(dict(rewrite_metadata))
+                metadata["rewrites"] = rewrites[-10:]
+            next_entries.append({**entry, "content": new_content, "metadata": metadata})
+            changed = True
+            continue
+        next_entries.append(entry)
+    if not changed:
+        return None
+    payload["updated_at"] = datetime.utcnow().isoformat()
+    payload["entries"] = next_entries
+    payload["version"] = str(payload.get("version") or "conversation_item_stream.v1")
+    return payload
+
+
+def _agent_run_to_chat_run_response(record: AgentRun) -> dict:
+    metadata = dict(record.metadata_ or {}) if isinstance(record.metadata_, dict) else {}
+    return {
+        "run_id": str(record.id),
+        "user_id": int(record.user_id),
+        "status": str(record.status or ""),
+        "conversation_id": int(record.conversation_id) if record.conversation_id is not None else None,
+        "channel": str(record.channel or ""),
+        "created_at": record.started_at.isoformat() if record.started_at else None,
+        "updated_at": (record.finished_at or record.started_at).isoformat() if (record.finished_at or record.started_at) else None,
+        "completed_at": record.finished_at.isoformat() if record.finished_at else None,
+        "error": str(metadata.get("error") or "").strip() or None,
+        "result": dict(metadata.get("background_result") or {}) if isinstance(metadata.get("background_result"), dict) else {},
+        "event_count": 0,
+    }
 
 
 @router.get("/conversations", response_model=List[ConversationListResponse])
@@ -1258,6 +1599,217 @@ async def preview_chat_context(
             if item is not None
         ],
         send_plan=send_plan,
+    )
+
+
+@router.post("/runs")
+async def create_chat_background_run(
+    request: ChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Start a chat run that continues in the backend after the SSE client disconnects."""
+    from app.core.database import async_session_factory
+
+    runtime_service = get_agent_runtime_service()
+    llm_provider = request.llm_provider or current_user.preferred_llm_provider
+    run_id = await runtime_service.create_run(
+        user_id=current_user.id,
+        channel="chat_background",
+        conversation_id=request.conversation_id,
+        intent="chat",
+        selected_tools=[],
+        model_provider=llm_provider,
+        model_name=(settings.get_llm_config(llm_provider) or {}).get("model"),
+        metadata={
+            "path": "chat_background_run",
+            "request_conversation_id": request.conversation_id,
+            "stream_source": "/api/v1/chat/send",
+        },
+    )
+    manager = get_chat_background_run_manager()
+    user_snapshot = SimpleNamespace(
+        id=current_user.id,
+        preferred_llm_provider=current_user.preferred_llm_provider,
+    )
+    background_request = request.model_copy(update={"stream": True})
+
+    async def _persist_event(payload: dict) -> None:
+        event = str(payload.get("event") or "").strip()
+        if event not in _PERSISTED_CHAT_BACKGROUND_EVENTS:
+            return
+        await runtime_service.append_chat_run_event(
+            run_id,
+            event=event,
+            data=payload.get("data"),
+            created_at=str(payload.get("created_at") or ""),
+        )
+
+    async def _execute(publish):
+        await publish("run_status", {"run_id": run_id, "status": "running"})
+        buffer = ""
+        start_payload: dict[str, Any] = {}
+        done_payload: dict[str, Any] = {}
+        try:
+            async with async_session_factory() as run_db:
+                response = await send_message(background_request, current_user=user_snapshot, db=run_db)
+                if not isinstance(response, StreamingResponse):
+                    done_payload = response if isinstance(response, dict) else {"response": str(response)}
+                    await publish("done", done_payload)
+                else:
+                    async for raw_chunk in response.body_iterator:
+                        chunk = raw_chunk.decode("utf-8") if isinstance(raw_chunk, (bytes, bytearray)) else str(raw_chunk)
+                        buffer += chunk
+                        payloads, buffer = _iter_sse_payloads_from_buffer(buffer)
+                        for payload in payloads:
+                            event = str(payload.get("event") or "").strip()
+                            data = payload.get("data")
+                            if event == "start" and isinstance(data, dict):
+                                start_payload = dict(data)
+                            if event == "done" and isinstance(data, dict):
+                                done_payload = dict(data)
+                            if event:
+                                await publish(event, data)
+                    payloads, _ = _iter_sse_payloads_from_buffer(buffer, flush=True)
+                    for payload in payloads:
+                        event = str(payload.get("event") or "").strip()
+                        data = payload.get("data")
+                        if event == "start" and isinstance(data, dict):
+                            start_payload = dict(data)
+                        if event == "done" and isinstance(data, dict):
+                            done_payload = dict(data)
+                        if event:
+                            await publish(event, data)
+            await runtime_service.complete_run(
+                run_id,
+                status="completed",
+                metadata={
+                    "background_result": {
+                        "start": start_payload,
+                        "done": done_payload,
+                    },
+                    "conversation_id": start_payload.get("conversation_id") or request.conversation_id,
+                    "turn_id": start_payload.get("turn_id"),
+                    "agent_run_id": done_payload.get("run_id"),
+                },
+            )
+            return {"start": start_payload, "done": done_payload}
+        except asyncio.CancelledError:
+            await runtime_service.complete_run(
+                run_id,
+                status="cancelled",
+                metadata={"error": "cancelled", "background_result": {"start": start_payload}},
+            )
+            raise
+        except Exception as exc:
+            await runtime_service.complete_run(
+                run_id,
+                status="error",
+                metadata={"error": str(exc), "background_result": {"start": start_payload}},
+            )
+            raise
+
+    return await manager.start(
+        run_id=run_id,
+        user_id=current_user.id,
+        execute_fn=_execute,
+        persist_event_fn=_persist_event,
+    )
+
+
+@router.get("/runs/{run_id}")
+async def get_chat_background_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    manager = get_chat_background_run_manager()
+    snapshot = await manager.get(run_id, user_id=current_user.id)
+    if snapshot is not None:
+        return snapshot
+    record = await db.get(AgentRun, str(run_id or "").strip())
+    if not record or int(record.user_id) != int(current_user.id) or not str(record.channel or "").startswith("chat"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="后台对话任务不存在")
+    return _agent_run_to_chat_run_response(record)
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_chat_background_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    runtime_service = get_agent_runtime_service()
+    manager = get_chat_background_run_manager()
+    snapshot = await manager.cancel(run_id, user_id=current_user.id)
+    if snapshot is not None:
+        await runtime_service.complete_run(
+            str(run_id),
+            status="cancelled",
+            metadata={"error": "cancel_requested"},
+        )
+        return snapshot
+    record = await db.get(AgentRun, str(run_id or "").strip())
+    if not record or int(record.user_id) != int(current_user.id) or not str(record.channel or "").startswith("chat"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="后台对话任务不存在")
+    await runtime_service.complete_run(
+        str(run_id),
+        status="cancelled",
+        metadata={"error": "cancel_requested"},
+    )
+    await db.refresh(record)
+    return _agent_run_to_chat_run_response(record)
+
+
+@router.get("/runs/{run_id}/stream")
+async def stream_chat_background_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    manager = get_chat_background_run_manager()
+    runtime_service = get_agent_runtime_service()
+    snapshot = await manager.get(run_id, user_id=current_user.id)
+    has_memory_record = snapshot is not None
+    persisted_events: List[dict] = []
+    if snapshot is None:
+        record = await db.get(AgentRun, str(run_id or "").strip())
+        if not record or int(record.user_id) != int(current_user.id) or not str(record.channel or "").startswith("chat"):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="后台对话任务不存在")
+        if str(record.status or "").strip().lower() == "running":
+            await runtime_service.complete_run(
+                str(run_id),
+                status="error",
+                metadata={"error": "background_run_interrupted"},
+            )
+            await db.refresh(record)
+        snapshot = _agent_run_to_chat_run_response(record)
+        persisted_events = await runtime_service.list_chat_run_events(str(run_id), limit=1000)
+
+    async def _generate():
+        yield f"data: {json.dumps({'event': 'run_status', 'data': snapshot}, ensure_ascii=False)}\n\n"
+        if not has_memory_record:
+            for payload in persisted_events:
+                event = str(payload.get("event") or "").strip()
+                if not event or event == "run_status":
+                    continue
+                yield f"data: {json.dumps({'event': event, 'data': payload.get('data')}, ensure_ascii=False)}\n\n"
+            if snapshot.get("status") == "error" and snapshot.get("error") == "background_run_interrupted":
+                yield f"data: {json.dumps({'event': 'error', 'data': '后台对话任务已中断，可能是服务重启或进程切换导致。'}, ensure_ascii=False)}\n\n"
+            return
+        async for payload in manager.subscribe(run_id, user_id=current_user.id, replay=True):
+            event = str(payload.get("event") or "").strip()
+            if not event:
+                continue
+            yield f"data: {json.dumps({'event': event, 'data': payload.get('data')}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -2198,6 +2750,154 @@ async def get_messages(
         item_stream_payload=item_stream,
         skip=skip,
         limit=limit,
+    )
+
+
+@router.post("/messages/{message_id}/rewrite-span", response_model=MessageSpanRewriteResponse)
+async def rewrite_message_span(
+    message_id: int,
+    request: MessageSpanRewriteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rewrite only a selected span inside one assistant message."""
+    result = await db.execute(
+        select(Message, Conversation)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Message.id == int(message_id),
+            Conversation.user_id == current_user.id,
+        )
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="消息不存在",
+        )
+    message, conversation = row
+    role_value = message.role.value if hasattr(message.role, "value") else str(message.role)
+    if role_value != MessageRole.ASSISTANT.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "rewrite_only_assistant_message", "message": "只能改写 AI 回复。"},
+        )
+
+    old_content = str(message.content or "")
+    start_offset, end_offset = _resolve_message_span_offsets(
+        old_content,
+        request.selected_text,
+        occurrence_index=request.occurrence_index,
+        before_context=request.before_context,
+        after_context=request.after_context,
+    )
+    selected_text = old_content[start_offset:end_offset]
+    selected_labels = _extract_chat_citation_labels(selected_text)
+
+    prompt = _build_message_span_rewrite_prompt(
+        instruction=request.instruction,
+        selected_text=selected_text,
+        before_context=request.before_context,
+        after_context=request.after_context,
+    )
+    try:
+        llm = LLMService(conversation.llm_provider or current_user.preferred_llm_provider)
+        response = await llm.chat(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are a precise text rewriting engine. Return only the requested replacement span.",
+            temperature=0.2,
+            max_tokens=min(max(len(selected_text) * 2, 256), 2048),
+        )
+    except Exception as exc:
+        logger.warning(f"[ChatRewrite] LLM rewrite failed message_id={message_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rewrite_llm_failed", "message": "改写模型调用失败，请稍后重试。"},
+        )
+
+    replacement_text = _preserve_span_rewrite_markdown_scaffold(
+        selected_text=selected_text,
+        replacement_text=str(response.get("content") or ""),
+    )
+    replacement_text = _validate_span_rewrite_replacement(
+        selected_text=selected_text,
+        replacement_text=replacement_text,
+    )
+    new_content = old_content[:start_offset] + replacement_text + old_content[end_offset:]
+
+    if new_content == old_content:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "rewrite_noop", "message": "改写结果没有变化。"},
+        )
+
+    rewrite_metadata = {
+        "rewritten_at": datetime.utcnow().isoformat(),
+        "instruction": str(request.instruction or "").strip(),
+        "selected_text": selected_text,
+        "replacement_text": replacement_text,
+        "start_offset": start_offset,
+        "end_offset": end_offset,
+        "citation_labels": sorted(selected_labels),
+        "model": str(response.get("model") or "").strip() or None,
+    }
+
+    metadata = dict(message.metadata_ or {}) if isinstance(message.metadata_, dict) else {}
+    rewrites = [dict(item) for item in list(metadata.get("rewrites") or []) if isinstance(item, dict)]
+    rewrites.append(dict(rewrite_metadata))
+    metadata["rewrites"] = rewrites[-10:]
+    message.content = new_content
+    message.metadata_ = metadata
+
+    conversation_metadata = dict(conversation.metadata_ or {}) if isinstance(conversation.metadata_, dict) else {}
+    item_stream = _update_message_content_in_item_stream_payload(
+        conversation_metadata.get("item_stream"),
+        message_id=message.id,
+        new_content=new_content,
+        rewrite_metadata=rewrite_metadata,
+    )
+    if isinstance(conversation_metadata.get("item_stream"), dict) and item_stream is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "message_item_stream_entry_not_found", "message": "没有找到可同步的消息条目，请刷新后重试。"},
+        )
+    if item_stream is not None:
+        conversation_metadata["item_stream"] = item_stream
+
+    turn_store = conversation_metadata.get("turn_store")
+    if isinstance(turn_store, dict):
+        turn_entries = [
+            dict(item) if isinstance(item, dict) else item
+            for item in list(turn_store.get("entries") or [])
+        ]
+        for item in turn_entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                assistant_message_id = int(item.get("assistant_message_id"))
+            except Exception:
+                assistant_message_id = 0
+            if assistant_message_id == int(message.id):
+                item["assistant_summary"] = _assistant_summary_text(new_content)
+        conversation_metadata["turn_store"] = {
+            **dict(turn_store),
+            "updated_at": datetime.utcnow().isoformat(),
+            "entries": turn_entries,
+        }
+
+    conversation.metadata_ = conversation_metadata
+    conversation.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(message)
+
+    return MessageSpanRewriteResponse(
+        message=message_to_response(message),
+        old_content=old_content,
+        new_content=new_content,
+        selected_text=selected_text,
+        replacement_text=replacement_text,
+        start_offset=start_offset,
+        end_offset=end_offset,
     )
 
 

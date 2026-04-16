@@ -9,6 +9,7 @@ import type {
   ConversationTurnEntry,
   ConversationTurnStore,
   Message,
+  MessageSpanRewriteResponse,
 } from '@/services/api'
 import type { IterationStep, SendPhase } from '@/stores/chatStore'
 import MessageBubble from './MessageBubble'
@@ -32,6 +33,16 @@ interface TurnTimelineProps {
   iterationSteps?: IterationStep[]
   currentIteration?: number
   currentToolCall?: { tool: string; input: Record<string, any> } | null
+  onRewriteSpan?: (
+    messageId: number,
+    payload: {
+      instruction: string
+      selected_text: string
+      before_context?: string
+      after_context?: string
+      occurrence_index?: number
+    },
+  ) => Promise<MessageSpanRewriteResponse>
 }
 
 const getSendPhaseCopy = (
@@ -256,6 +267,7 @@ const TurnTimeline = ({
   iterationSteps = [],
   currentIteration = 0,
   currentToolCall = null,
+  onRewriteSpan,
 }: TurnTimelineProps) => {
   const persistedTurns = turnStore?.entries || []
   const trimmedActiveTurnId = String(activeTurnId || '').trim()
@@ -346,6 +358,7 @@ const TurnTimeline = ({
                   toolLedger={toolLedger || undefined}
                   showHistoryPrelude={false}
                   isHighlighted={highlightedMessageId === userMessage.id}
+                  onRewriteSpan={onRewriteSpan}
                 />
               ) : turn.user_content ? (
                 <div className="rounded-2xl border border-white/[0.06] bg-slate-800/60 px-4 py-3 text-sm leading-6 text-slate-100">
@@ -384,6 +397,7 @@ const TurnTimeline = ({
                   toolLedger={toolLedger || undefined}
                   showHistoryPrelude={false}
                   isHighlighted={highlightedMessageId === assistantMessage.id}
+                  onRewriteSpan={onRewriteSpan}
                 />
               ) : turn.assistant_summary ? (
                 <div className="rounded-2xl border border-white/[0.06] bg-slate-900/60 px-4 py-3 text-sm leading-6 text-slate-200">
@@ -422,6 +436,7 @@ const TurnTimeline = ({
               toolLedger={toolLedger || undefined}
               showHistoryPrelude={false}
               isHighlighted={highlightedMessageId === latestUserMessage.id}
+              onRewriteSpan={onRewriteSpan}
             />
 
             <ReActPanel
@@ -456,6 +471,7 @@ const TurnTimeline = ({
                 streamingThought=""
                 isThinking={false}
                 showHistoryPrelude={false}
+                onRewriteSpan={onRewriteSpan}
               />
             ) : null}
           </div>

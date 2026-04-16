@@ -26,7 +26,7 @@ class RunnerUnavailableError(RuntimeError):
 class CodeLabExecutor:
     def __init__(self, notebook_id: str, hard_timeout_seconds: int) -> None:
         self.notebook_id = notebook_id
-        self.hard_timeout_seconds = max(1, int(hard_timeout_seconds))
+        self.hard_timeout_seconds = max(0, int(hard_timeout_seconds))
         self._runner_enabled = bool(getattr(settings, "codelab_runner_enabled", True))
         self._runner_url = str(getattr(settings, "codelab_runner_url", "http://codelab-runner:8099")).rstrip("/")
         self._runner_token = str(getattr(settings, "codelab_runner_token", "") or "").strip()
@@ -95,6 +95,20 @@ class CodeLabExecutor:
             logger.warning(f"[CodeLabExecutor] close skipped: runner unavailable notebook_id={self.notebook_id}")
         except Exception:
             logger.debug("[CodeLabExecutor] close异常", exc_info=True)
+
+    def interrupt(self) -> None:
+        if self._local_executor is not None:
+            self._local_executor.interrupt()
+            return
+
+        self._request(
+            "POST",
+            "/internal/codelab/interrupt",
+            json_payload={
+                "notebook_id": self.notebook_id,
+                "hard_timeout_seconds": max(0, int(self.hard_timeout_seconds)),
+            },
+        )
 
     def reset(self, workspace_context: Optional[Dict[str, Any]] = None) -> None:
         if workspace_context is not None:
@@ -165,7 +179,16 @@ class CodeLabExecutor:
             self._last_execution_count = int(result.get("execution_count", self._last_execution_count) or 0)
             return result
 
-        timeout_value = max(1, min(int(timeout_seconds or 1), self.hard_timeout_seconds))
+        no_timeout = int(timeout_seconds or 0) <= 0
+        if no_timeout:
+            timeout_value = 0
+            hard_timeout_value = 0
+        elif self.hard_timeout_seconds > 0:
+            timeout_value = max(1, min(int(timeout_seconds or 1), self.hard_timeout_seconds))
+            hard_timeout_value = max(0, int(self.hard_timeout_seconds))
+        else:
+            timeout_value = max(1, int(timeout_seconds or 1))
+            hard_timeout_value = 0
         if workspace_context is not None:
             self._last_workspace_context = dict(workspace_context)
         effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
@@ -177,7 +200,7 @@ class CodeLabExecutor:
                 "notebook_id": self.notebook_id,
                 "code": code,
                 "timeout_seconds": timeout_value,
-                "hard_timeout_seconds": self.hard_timeout_seconds,
+                "hard_timeout_seconds": hard_timeout_value,
                 "workspace": effective_workspace,
             },
         )

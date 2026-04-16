@@ -79,3 +79,32 @@ async def test_agent_step_persistence_enabled(monkeypatch):
     assert runtime.completed
     assert runtime.completed[0][1]["status"] == "success"
     assert any(event.get("type") == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_literature_run_persistence_uses_explicit_scope_without_conversation_binding(monkeypatch):
+    monkeypatch.setattr(settings, "agent_persist_steps_enabled", True)
+
+    runtime = _FakeRuntimeService()
+    agent = ReActAgent(
+        _PersistLLM(),
+        _PersistTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="literature",
+            conversation_id=321,
+            scope_type="literature_session",
+            scope_id="321",
+        ),
+        runtime_service=runtime,
+    )
+
+    async for _event in agent.run([{"role": "user", "content": "解释这篇论文"}], stream=False):
+        pass
+
+    assert runtime.created
+    created = runtime.created[0]
+    assert created["conversation_id"] is None
+    assert created["metadata"]["scope_type"] == "literature_session"
+    assert created["metadata"]["scope_id"] == "321"

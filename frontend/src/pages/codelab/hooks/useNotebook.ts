@@ -1,10 +1,12 @@
-import { useState, useCallback, useTransition, useDeferredValue } from 'react'
+import { useState, useCallback, useTransition, useDeferredValue, useEffect, useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { message, Modal } from 'antd'
 import { codelabApi, Notebook, Cell } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
 
-const CELL_EXECUTION_TIMEOUT_SECONDS = 20
+const CELL_EXECUTION_TIMEOUT_SECONDS = 0
+const BACKGROUND_RUNNING_STATUSES = new Set(['pending', 'running'])
+const BACKGROUND_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled'])
 
 /**
  * useNotebook - 封装 Notebook 的全部 CRUD 操作和 Cell 管理
@@ -36,6 +38,20 @@ export function useNotebook() {
   // React 18 并发优化
   const [, startTransition] = useTransition()
   const deferredNotebooks = useDeferredValue(notebooks)
+  const terminalBackgroundRefreshes = useRef<Set<string>>(new Set())
+  const backgroundExecutionPollKey = useMemo(() => {
+    if (!currentNotebook) return ''
+    return currentNotebook.cells
+      .map((cell) => {
+        const execution = cell.metadata?.background_execution
+        const executionId = String(execution?.execution_id || '').trim()
+        const status = String(execution?.status || '').trim().toLowerCase()
+        if (!executionId || !BACKGROUND_RUNNING_STATUSES.has(status)) return ''
+        return `${executionId}:${status}`
+      })
+      .filter(Boolean)
+      .join('|')
+  }, [currentNotebook])
 
   // ========== Notebook 列表操作 ==========
 
@@ -53,12 +69,16 @@ export function useNotebook() {
     }
   }, [])
 
-  const loadNotebook = useCallback(async (id: string) => {
+  const loadNotebook = useCallback(async (id: string, options?: { preserveSelection?: boolean }) => {
     setIsLoading(true)
     try {
       const data = await codelabApi.getNotebook(id)
       setCurrentNotebook(data)
-      setSelectedCellIndex(0)
+      if (!options?.preserveSelection) {
+        setSelectedCellIndex(0)
+      } else {
+        setSelectedCellIndex(prev => Math.max(0, Math.min(prev, Math.max(0, data.cells.length - 1))))
+      }
     } catch (error) {
       handleApiError(error, '加载 Notebook 失败')
       navigate('/code')
@@ -66,6 +86,10 @@ export function useNotebook() {
       setIsLoading(false)
     }
   }, [navigate])
+
+  const refreshNotebook = useCallback(async (id: string) => {
+    await loadNotebook(id, { preserveSelection: true })
+  }, [loadNotebook])
 
   const createNotebook = useCallback(async () => {
     try {
@@ -154,7 +178,7 @@ export function useNotebook() {
           : ''
 
         if (result.terminated_reason === 'timeout') {
-          message.warning(errorDetail || `代码执行超时（>${CELL_EXECUTION_TIMEOUT_SECONDS}s）`)
+          message.warning(errorDetail || '代码执行超时')
         } else if (result.terminated_reason === 'policy_violation') {
           message.warning(errorDetail || '代码触发沙箱限制')
         } else if (result.terminated_reason === 'resource_limit') {
@@ -182,6 +206,18 @@ export function useNotebook() {
       }
     }
   }, [currentNotebook, runCell])
+
+  const interruptRunningExecution = useCallback(async () => {
+    if (!currentNotebook) return
+    try {
+      await codelabApi.interruptKernel(currentNotebook.id)
+      setRunningCells(new Set())
+      await refreshNotebook(currentNotebook.id)
+      message.success('已请求中断当前执行')
+    } catch (error) {
+      handleApiError(error, '中断执行失败')
+    }
+  }, [currentNotebook, refreshNotebook])
 
   const restartKernel = useCallback(async () => {
     if (!currentNotebook) return
@@ -211,6 +247,17 @@ export function useNotebook() {
       },
     })
   }, [currentNotebook])
+
+  const cancelBackgroundExecution = useCallback(async (executionId: string) => {
+    if (!currentNotebook || !executionId) return
+    try {
+      await codelabApi.cancelBackgroundExecution(currentNotebook.id, executionId)
+      await refreshNotebook(currentNotebook.id)
+      message.success('已请求停止后台任务')
+    } catch (error) {
+      handleApiError(error, '停止后台任务失败')
+    }
+  }, [currentNotebook, refreshNotebook])
 
   const updateCell = useCallback((cellId: string, source: string) => {
     startTransition(() => {
@@ -436,6 +483,113 @@ export function useNotebook() {
     })
   }, [])
 
+  useEffect(() => {
+    const notebookId = currentNotebook?.id
+    if (!notebookId || !backgroundExecutionPollKey) return
+
+    const runningExecutionIds = new Set(
+      backgroundExecutionPollKey
+        .split('|')
+        .map((item) => item.split(':')[0])
+        .filter(Boolean)
+    )
+    let disposed = false
+
+    const pollBackgroundExecutions = async () => {
+      try {
+        const executions = await codelabApi.listBackgroundExecutions(notebookId)
+        if (disposed) return
+
+        const executionsById = new Map(
+          executions
+            .filter((execution) => execution.execution_id)
+            .map((execution) => [execution.execution_id, execution])
+        )
+        const terminalExecutionIds = executions
+          .filter((execution) => {
+            const executionId = String(execution.execution_id || '').trim()
+            const status = String(execution.status || '').trim().toLowerCase()
+            return (
+              executionId &&
+              runningExecutionIds.has(executionId) &&
+              BACKGROUND_TERMINAL_STATUSES.has(status) &&
+              !terminalBackgroundRefreshes.current.has(executionId)
+            )
+          })
+          .map((execution) => String(execution.execution_id))
+
+        terminalExecutionIds.forEach((executionId) => {
+          terminalBackgroundRefreshes.current.add(executionId)
+        })
+
+        setCurrentNotebook(prev => {
+          if (!prev || prev.id !== notebookId) return prev
+          let changed = false
+          const cells = prev.cells.map((cell) => {
+            const currentBackground = cell.metadata?.background_execution
+            const executionId = String(currentBackground?.execution_id || '').trim()
+            if (!executionId) return cell
+
+            const execution = executionsById.get(executionId)
+            if (!execution) return cell
+
+            const nextBackground = {
+              ...(currentBackground || {}),
+              execution_id: execution.execution_id,
+              status: execution.status,
+              description: execution.description || currentBackground?.description,
+              created_at: execution.created_at || currentBackground?.created_at,
+              started_at: execution.started_at ?? currentBackground?.started_at,
+              completed_at: execution.completed_at ?? currentBackground?.completed_at,
+              cancel_requested: Boolean(execution.cancel_requested),
+              success: execution.success ?? currentBackground?.success,
+              terminated_reason: execution.terminated_reason ?? currentBackground?.terminated_reason,
+              policy_violation_code: execution.policy_violation_code ?? currentBackground?.policy_violation_code,
+              execution_count: execution.execution_count ?? currentBackground?.execution_count,
+              error: execution.error ?? currentBackground?.error,
+            }
+            const nextStatus = String(nextBackground.status || '').trim().toLowerCase()
+            const currentStatus = String(currentBackground?.status || '').trim().toLowerCase()
+            const nextExecutionCount = execution.execution_count ?? cell.execution_count
+            if (
+              nextStatus === currentStatus &&
+              nextBackground.completed_at === currentBackground?.completed_at &&
+              nextBackground.cancel_requested === Boolean(currentBackground?.cancel_requested) &&
+              nextExecutionCount === cell.execution_count
+            ) {
+              return cell
+            }
+            changed = true
+            return {
+              ...cell,
+              execution_count: nextExecutionCount,
+              metadata: {
+                ...(cell.metadata || {}),
+                background_execution: nextBackground,
+              },
+            }
+          })
+          return changed ? { ...prev, cells } : prev
+        })
+
+        if (terminalExecutionIds.length > 0) {
+          await refreshNotebook(notebookId)
+        }
+      } catch {
+        // Keep polling quietly; the visible notebook state remains the last confirmed snapshot.
+      }
+    }
+
+    void pollBackgroundExecutions()
+    const timer = window.setInterval(() => {
+      void pollBackgroundExecutions()
+    }, 3000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [backgroundExecutionPollKey, currentNotebook?.id, refreshNotebook])
+
   return {
     // 列表
     notebooks, deferredNotebooks, isListLoading, loadError,
@@ -445,8 +599,10 @@ export function useNotebook() {
     selectedCellIndex, setSelectedCellIndex,
     runningCells, isLoading, isSaving,
     loadNotebook, saveNotebook, setTitle,
+    refreshNotebook,
     // Cell 操作
-    runCell, runAllCells, restartKernel,
+    runCell, runAllCells, restartKernel, interruptRunningExecution,
+    cancelBackgroundExecution,
     updateCell, addCell, deleteCell, toggleCellType, moveCell,
     // Agent 回调
     handleAgentInsertCode, handleAgentRunCode, handleAgentFocusCell,

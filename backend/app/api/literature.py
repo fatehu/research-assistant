@@ -9463,7 +9463,12 @@ class LiteratureAskAgentCore(AgentCore):
             "schema_scope": "selected",
             "tool_selection_enabled": True,
         }
-        return f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
+        base_prompt = f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
+        return self._compose_profile_prompt_sections(
+            base_prompt,
+            available_tools=selected_tools,
+            include_generic_citation_policy=False,
+        )
 
     async def _execute_single_tool_call(self, context: Any, call: Any, *, parallel_group: str):  # type: ignore[override]
         executed = await super()._execute_single_tool_call(context, call, parallel_group=parallel_group)
@@ -15787,7 +15792,8 @@ async def literature_ask(
                 runtime_context = AgentRuntimeContext(
                     user_id=int(current_user.id),
                     channel="literature",
-                    conversation_id=session_id,
+                    scope_type="literature_session",
+                    scope_id=str(session_id),
                 )
                 agent = LiteratureAskAgentCore(
                     llm_service=llm_service,

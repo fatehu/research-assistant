@@ -54,3 +54,100 @@ async def test_append_steps_persists_text_from_event_data(monkeypatch):
 
     assert observation_row.step_type == "observation"
     assert observation_row.content == "4"
+
+
+@pytest.mark.asyncio
+async def test_append_chat_run_event_persists_json_payload(monkeypatch):
+    captured = []
+
+    class _ScalarResult:
+        def scalar(self):
+            return 7
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            return _ScalarResult()
+
+        def add(self, record):
+            captured.append(record)
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    service = AgentRuntimeService()
+    await service.append_chat_run_event(
+        "run-chat",
+        event="done",
+        data={"answer": "最终答案", "extra": object()},
+        created_at="2026-04-13T00:00:00",
+    )
+
+    assert len(captured) == 1
+    row = captured[0]
+    assert row.run_id == "run-chat"
+    assert row.step_index == 8
+    assert row.step_type == "chat_event"
+    assert row.content == "最终答案"
+    assert row.metadata_["event"] == "done"
+    assert row.metadata_["payload"]["answer"] == "最终答案"
+    assert isinstance(row.metadata_["payload"]["extra"], str)
+
+
+@pytest.mark.asyncio
+async def test_list_chat_run_events_loads_persisted_payloads(monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    rows = [
+        SimpleNamespace(
+            metadata_={
+                "event": "start",
+                "payload": {"conversation_id": 42},
+                "created_at": "2026-04-13T00:00:01",
+            },
+            created_at=datetime(2026, 4, 13, 0, 0, 1),
+        ),
+        SimpleNamespace(
+            metadata_={
+                "event": "done",
+                "payload": {"answer": "ok"},
+                "created_at": "2026-04-13T00:00:02",
+            },
+            created_at=datetime(2026, 4, 13, 0, 0, 2),
+        ),
+    ]
+
+    class _Scalars:
+        def all(self):
+            return rows
+
+    class _RowsResult:
+        def scalars(self):
+            return _Scalars()
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            return _RowsResult()
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    service = AgentRuntimeService()
+    events = await service.list_chat_run_events("run-chat")
+
+    assert [item["event"] for item in events] == ["start", "done"]
+    assert events[0]["data"]["conversation_id"] == 42
+    assert events[1]["data"]["answer"] == "ok"

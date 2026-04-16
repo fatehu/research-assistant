@@ -26,6 +26,8 @@ interface NotebookEditorViewProps {
   onSelectCell: (index: number) => void
   onRunCell: (cellId: string, code: string) => void
   onRunAllCells: () => void
+  onInterruptRunningExecution: () => void
+  onCancelBackgroundExecution: (executionId: string) => void
   onRestartKernel: () => void
   onSave: () => void
   onDeleteCell: (cellId: string) => void
@@ -58,6 +60,8 @@ const NotebookEditorView = ({
   onSelectCell,
   onRunCell,
   onRunAllCells,
+  onInterruptRunningExecution,
+  onCancelBackgroundExecution,
   onRestartKernel,
   onSave,
   onDeleteCell,
@@ -159,6 +163,8 @@ const NotebookEditorView = ({
                       index={index}
                       isSelected={selectedCellIndex === index}
                       isRunning={runningCells.has(cell.id)}
+                      onInterruptRunningExecution={onInterruptRunningExecution}
+                      onCancelBackgroundExecution={onCancelBackgroundExecution}
                       onSelect={() => onSelectCell(index)}
                       onRun={() => onRunCell(cell.id, cell.source)}
                       onDelete={() => onDeleteCell(cell.id)}

@@ -2,7 +2,14 @@ import { useRef, useEffect } from 'react'
 import { Spin, Button } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { AnimatePresence } from 'framer-motion'
-import type { Message, Conversation, ConversationItemStream, ConversationToolLedger, ConversationTurnStore } from '@/services/api'
+import type {
+  Message,
+  Conversation,
+  ConversationItemStream,
+  ConversationToolLedger,
+  ConversationTurnStore,
+  MessageSpanRewriteResponse,
+} from '@/services/api'
 import type { IterationStep, SendPhase } from '@/stores/chatStore'
 import MessageBubble from './MessageBubble'
 import EmptyState from './EmptyState'
@@ -25,6 +32,16 @@ interface ChatMessagesProps {
   currentToolCall: { tool: string; input: Record<string, any> } | null
   currentTurnId: string | null
   highlightedMessageId: number | null
+  onRewriteSpan: (
+    messageId: number,
+    payload: {
+      instruction: string
+      selected_text: string
+      before_context?: string
+      after_context?: string
+      occurrence_index?: number
+    },
+  ) => Promise<MessageSpanRewriteResponse>
   onQuickPrompt: (prompt: string) => void
   onReload: () => void
 }
@@ -47,15 +64,30 @@ const ChatMessages = ({
   currentToolCall,
   currentTurnId,
   highlightedMessageId,
+  onRewriteSpan,
   onQuickPrompt,
   onReload,
 }: ChatMessagesProps) => {
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const lastAutoScrollStateRef = useRef<{ count: number; lastMessageId: number | null }>({
+    count: 0,
+    lastMessageId: null,
+  })
 
   // 自动滚动
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingContent])
+    const lastMessageId = messages.length > 0 ? messages[messages.length - 1].id : null
+    const previous = lastAutoScrollStateRef.current
+    const hasNewMessage = previous.count !== messages.length || previous.lastMessageId !== lastMessageId
+    lastAutoScrollStateRef.current = {
+      count: messages.length,
+      lastMessageId,
+    }
+
+    if (hasNewMessage || isSending || streamingContent) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [isSending, messages, streamingContent])
 
   return (
     <div className="flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
@@ -94,6 +126,7 @@ const ChatMessages = ({
                 iterationSteps={iterationSteps}
                 currentIteration={currentIteration}
                 currentToolCall={currentToolCall}
+                onRewriteSpan={onRewriteSpan}
               />
             ) : (
               <AnimatePresence mode="popLayout">
@@ -105,6 +138,7 @@ const ChatMessages = ({
                     itemStream={currentConversation?.item_stream as ConversationItemStream | undefined}
                     toolLedger={currentConversation?.tool_ledger as ConversationToolLedger | undefined}
                     isHighlighted={highlightedMessageId === msg.id}
+                    onRewriteSpan={onRewriteSpan}
                   />
                 ))}
               </AnimatePresence>

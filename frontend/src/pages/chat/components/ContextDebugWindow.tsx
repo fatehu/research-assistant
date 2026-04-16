@@ -305,9 +305,17 @@ const ContextDebugWindow = ({
         layout
         className="pointer-events-auto overflow-hidden rounded-[24px] border border-white/[0.08] bg-slate-950/88 shadow-[0_20px_60px_rgba(2,6,23,0.42)] backdrop-blur-2xl"
       >
-        <button
-          type="button"
+        <div
+          role="button"
+          tabIndex={0}
           onClick={() => setExpanded((value) => !value)}
+          onKeyDown={(event) => {
+            if (event.target !== event.currentTarget) return
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              setExpanded((value) => !value)
+            }
+          }}
           className="flex w-full items-center justify-between gap-3 border-b border-white/[0.06] bg-[linear-gradient(135deg,rgba(15,23,42,0.96),rgba(17,24,39,0.88))] px-4 py-3.5 text-left"
         >
           <div className="min-w-0">
@@ -367,7 +375,7 @@ const ContextDebugWindow = ({
               {expanded ? <UpOutlined className="text-[11px]" /> : <DownOutlined className="text-[11px]" />}
             </span>
           </div>
-        </button>
+        </div>
 
         <AnimatePresence initial={false}>
           {expanded && (

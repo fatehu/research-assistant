@@ -19,29 +19,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from app.services.codelab_sandbox_policy import (
+    SANDBOX_ALLOWED_IMPORT_ROOTS,
+    SANDBOX_FORBIDDEN_IMPORT_ROOTS,
+)
 
 
-POLICY_DENIED_IMPORTS = {
-    "os",
-    "subprocess",
-    "socket",
-    "pathlib",
-    "shutil",
-    "tempfile",
-    "requests",
-    "httpx",
-    "urllib",
-    "aiohttp",
-    "ftplib",
-    "telnetlib",
-    "paramiko",
-    "multiprocessing",
-    "threading",
-    "ctypes",
-    "importlib",
-    "pickle",
-    "marshal",
-}
+POLICY_DENIED_IMPORTS = set(SANDBOX_FORBIDDEN_IMPORT_ROOTS)
 
 POLICY_DENIED_CALLS = {
     "__import__",
@@ -67,29 +51,7 @@ POLICY_DENIED_ATTRS = {
     "kill",
 }
 
-ALLOWED_IMPORT_ROOTS = {
-    "math",
-    "random",
-    "statistics",
-    "datetime",
-    "time",
-    "warnings",
-    "json",
-    "re",
-    "collections",
-    "itertools",
-    "functools",
-    "typing",
-    "decimal",
-    "fractions",
-    "numpy",
-    "pandas",
-    "matplotlib",
-    "sklearn",
-    "torch",
-    "seaborn",
-    "joblib",
-}
+ALLOWED_IMPORT_ROOTS = set(SANDBOX_ALLOWED_IMPORT_ROOTS)
 
 
 @dataclass
@@ -144,7 +106,11 @@ def validate_code_policy(code: str) -> Optional[PolicyViolation]:
     return None
 
 
-_WORKER_CODE = r"""
+def _python_set_literal(values: set[str]) -> str:
+    return "{" + ", ".join(repr(item) for item in sorted(values)) + "}"
+
+
+_WORKER_CODE_TEMPLATE = r"""
 import ast
 import base64
 import io
@@ -156,19 +122,11 @@ from contextlib import redirect_stdout, redirect_stderr
 
 _ORIGINAL_IMPORT = __import__
 
-POLICY_DENIED_IMPORTS = {
-    "os", "subprocess", "socket", "pathlib", "shutil", "tempfile", "requests",
-    "httpx", "urllib", "aiohttp", "ftplib", "telnetlib", "paramiko",
-    "multiprocessing", "threading", "ctypes", "importlib", "pickle", "marshal"
-}
+POLICY_DENIED_IMPORTS = __POLICY_DENIED_IMPORTS__
 POLICY_DENIED_CALLS = {"__import__", "eval", "exec", "open", "compile", "input", "breakpoint", "globals", "locals", "vars"}
 POLICY_DENIED_ATTRS = {"system", "popen", "spawn", "fork", "execv", "execve", "run", "kill"}
 
-ALLOWED_IMPORT_ROOTS = {
-    "math", "random", "statistics", "datetime", "time", "warnings", "json", "re", "collections",
-    "itertools", "functools", "typing", "decimal", "fractions", "numpy",
-    "pandas", "matplotlib", "sklearn", "torch", "seaborn", "joblib"
-}
+ALLOWED_IMPORT_ROOTS = __ALLOWED_IMPORT_ROOTS__
 
 
 def _policy_check(code: str):
@@ -216,7 +174,9 @@ def _safe_builtins():
         "list", "max", "min", "pow", "print", "range", "round", "set", "slice",
         "sorted", "str", "sum", "tuple", "zip", "map", "filter", "format",
         "getattr", "hasattr", "isinstance", "issubclass", "type", "Exception",
-        "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError"
+        "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError",
+        "NameError", "AttributeError", "ImportError", "ModuleNotFoundError",
+        "FileNotFoundError", "PermissionError", "OSError"
     ]
     safe = {name: builtins_map[name] for name in allowed if name in builtins_map}
     safe["__import__"] = _safe_import
@@ -400,6 +360,60 @@ def _variable_snapshot():
     return vars_map, previews
 
 
+def _split_top_level_last_expression(code: str):
+    source = str(code or "")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, None
+
+    body = list(getattr(tree, "body", []) or [])
+    if not body or not isinstance(body[-1], ast.Expr):
+        return source, None
+
+    last_stmt = body[-1]
+    start_line = getattr(last_stmt, "lineno", None)
+    end_line = getattr(last_stmt, "end_lineno", None)
+    start_col = getattr(last_stmt, "col_offset", None)
+    end_col = getattr(last_stmt, "end_col_offset", None)
+    if None in {start_line, end_line, start_col, end_col}:
+        return source, None
+
+    lines = source.splitlines(keepends=True)
+    if not (
+        isinstance(start_line, int)
+        and isinstance(end_line, int)
+        and 1 <= start_line <= len(lines)
+        and 1 <= end_line <= len(lines)
+    ):
+        return source, None
+
+    expr_parts = []
+    if start_line == end_line:
+        expr_parts.append(lines[start_line - 1][start_col:end_col])
+    else:
+        expr_parts.append(lines[start_line - 1][start_col:])
+        for idx in range(start_line, end_line - 1):
+            expr_parts.append(lines[idx])
+        expr_parts.append(lines[end_line - 1][:end_col])
+    expr_code = "".join(expr_parts)
+    if not expr_code.strip():
+        return source, None
+
+    rewritten_lines = list(lines)
+    if start_line == end_line:
+        rewritten_lines[start_line - 1] = (
+            lines[start_line - 1][:start_col] + lines[start_line - 1][end_col:]
+        )
+    else:
+        rewritten_lines[start_line - 1] = lines[start_line - 1][:start_col]
+        for idx in range(start_line, end_line - 1):
+            rewritten_lines[idx] = ""
+        rewritten_lines[end_line - 1] = lines[end_line - 1][end_col:]
+
+    return "".join(rewritten_lines), expr_code
+
+
 def _execute_code(code: str):
     global execution_count
     execution_count += 1
@@ -427,37 +441,17 @@ def _execute_code(code: str):
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
     try:
-        lines = code.strip().split("\n")
-        last_line = lines[-1].strip() if lines else ""
         last_expr_value = None
-        main_code = code
-
-        try:
-            if last_line and not any(
-                last_line.startswith(kw)
-                for kw in ["import ", "from ", "def ", "class ", "if ", "for ", "while ", "try:", "with ", "return ", "raise ", "pass", "break", "continue", "#", "@"]
-            ):
-                if "=" in last_line and not any(op in last_line for op in ["==", "!=", "<=", ">=", "+=", "-=", "*=", "/="]):
-                    pass
-                else:
-                    compile(last_line, "<string>", "eval")
-                    main_code = "\n".join(lines[:-1]) if len(lines) > 1 else ""
-        except SyntaxError:
-            pass
+        main_code, last_expr_code = _split_top_level_last_expression(code)
 
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             if main_code.strip():
                 exec(main_code, namespace)
-            if main_code != code and last_line:
+            if last_expr_code:
                 try:
-                    last_expr_value = eval(last_line, namespace)
+                    last_expr_value = eval(last_expr_code, namespace)
                 except Exception:
-                    exec(last_line, namespace)
-            elif not main_code.strip() and last_line:
-                try:
-                    last_expr_value = eval(code, namespace)
-                except Exception:
-                    exec(code, namespace)
+                    exec(last_expr_code, namespace)
 
         stdout_text = stdout_capture.getvalue()
         if stdout_text:
@@ -552,6 +546,12 @@ for line in sys.stdin:
         })
 """
 
+_WORKER_CODE = (
+    _WORKER_CODE_TEMPLATE
+    .replace("__POLICY_DENIED_IMPORTS__", _python_set_literal(POLICY_DENIED_IMPORTS))
+    .replace("__ALLOWED_IMPORT_ROOTS__", _python_set_literal(ALLOWED_IMPORT_ROOTS))
+)
+
 
 class _WorkerProcess:
     def __init__(self) -> None:
@@ -621,22 +621,29 @@ class _WorkerProcess:
         self.close()
         self._start()
 
-    def call(self, cmd: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
+    def call(self, cmd: Dict[str, Any], timeout_seconds: Optional[float]) -> Dict[str, Any]:
         with self._lock:
             if not self.is_alive():
                 self.restart()
             if self.process is None or self.process.stdin is None:
                 raise RuntimeError("worker_not_ready")
 
+            active_process = self.process
             request_id = str(uuid.uuid4())
             payload = dict(cmd)
             payload["request_id"] = request_id
             self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self.process.stdin.flush()
 
-            deadline = time.time() + timeout_seconds
-            while time.time() < deadline:
-                remaining = max(0.01, deadline - time.time())
+            deadline = None
+            if timeout_seconds is not None and float(timeout_seconds) > 0:
+                deadline = time.time() + float(timeout_seconds)
+            while True:
+                if self.process is not active_process or active_process.poll() is not None:
+                    raise RuntimeError("worker_restarted")
+                if deadline is not None and time.time() >= deadline:
+                    raise TimeoutError("worker_timeout")
+                remaining = 0.25 if deadline is None else max(0.01, deadline - time.time())
                 try:
                     item = self._stdout_queue.get(timeout=remaining)
                 except queue.Empty:
@@ -646,21 +653,25 @@ class _WorkerProcess:
                     if isinstance(response_payload, dict):
                         return response_payload
                     raise RuntimeError("invalid_worker_payload")
-            raise TimeoutError("worker_timeout")
 
 
 class CodeLabExecutor:
     def __init__(self, notebook_id: str, hard_timeout_seconds: int) -> None:
         self.notebook_id = notebook_id
-        self.hard_timeout_seconds = max(1, int(hard_timeout_seconds))
+        self.hard_timeout_seconds = max(0, int(hard_timeout_seconds))
         self._worker = _WorkerProcess()
         self._last_variables: Dict[str, str] = {}
         self._last_variable_previews: Dict[str, str] = {}
         self._last_execution_count: int = 0
         self._last_workspace_context: Optional[Dict[str, Any]] = None
+        self._interrupt_generation: int = 0
 
     def close(self) -> None:
         self._worker.close()
+
+    def interrupt(self) -> None:
+        self._interrupt_generation += 1
+        self._worker.restart()
 
     def reset(self, workspace_context: Optional[Dict[str, Any]] = None) -> None:
         if workspace_context is not None:
@@ -707,7 +718,7 @@ class CodeLabExecutor:
     def execute(
         self,
         code: str,
-        timeout_seconds: int,
+        timeout_seconds: Optional[int],
         workspace_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if workspace_context is not None:
@@ -735,12 +746,20 @@ class CodeLabExecutor:
                 "variable_previews": dict(self._last_variable_previews),
             }
 
-        timeout_value = max(1, min(int(timeout_seconds or 1), self.hard_timeout_seconds))
+        no_timeout = timeout_seconds is not None and int(timeout_seconds) <= 0
+        timeout_value: Optional[int]
+        if no_timeout:
+            timeout_value = None
+        elif self.hard_timeout_seconds > 0:
+            timeout_value = max(1, min(int(timeout_seconds or 1), self.hard_timeout_seconds))
+        else:
+            timeout_value = max(1, int(timeout_seconds or 1))
         started = time.time()
+        interrupt_generation = self._interrupt_generation
         try:
             payload = self._worker.call(
                 {"cmd": "execute", "code": code, "workspace": effective_workspace},
-                timeout_seconds=float(timeout_value),
+                timeout_seconds=float(timeout_value) if timeout_value is not None else None,
             )
             self._last_variables = dict(payload.get("variables", {}) or {})
             self._last_variable_previews = dict(payload.get("variable_previews", {}) or {})
@@ -774,6 +793,28 @@ class CodeLabExecutor:
                 "variables": dict(self._last_variables),
                 "variable_previews": dict(self._last_variable_previews),
             }
+        except RuntimeError as exc:
+            if str(exc) == "worker_restarted" and self._interrupt_generation != interrupt_generation:
+                return {
+                    "success": False,
+                    "outputs": [
+                        {
+                            "output_type": "error",
+                            "content": {
+                                "ename": "ExecutionCancelled",
+                                "evalue": "执行已被用户停止",
+                                "traceback": [],
+                            },
+                        }
+                    ],
+                    "execution_count": self._last_execution_count,
+                    "execution_time_ms": int((time.time() - started) * 1000),
+                    "terminated_reason": "cancelled",
+                    "policy_violation_code": None,
+                    "variables": dict(self._last_variables),
+                    "variable_previews": dict(self._last_variable_previews),
+                }
+            raise
         except Exception as exc:
             logger.error(
                 f"[CodeLabExecutor] 执行异常 notebook_id={self.notebook_id}: {exc}\n{traceback.format_exc()}"

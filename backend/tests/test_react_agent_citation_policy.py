@@ -6,7 +6,8 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.agent_tools import ToolResult
-from app.services.react_agent import AgentContext, AgentRuntimeContext, ExecutedToolCall, ReActAgent, RoutingDecision
+from app.services.agent_profiles import resolve_agent_profile
+from app.services.react_agent import AgentContext, AgentRuntimeContext, ExecutedToolCall, ParsedToolCall, ReActAgent, RoutingDecision
 from app.config import settings
 
 
@@ -111,6 +112,35 @@ class _CodelabTools:
 
     def list_tools(self, **kwargs):
         return _tool_defs("notebook_cell", "notebook_variables", "notebook_execute", "knowledge_search")
+
+
+class _IntentFilteredCodelabTools:
+    route_profile = "codelab"
+    notebook_id = "nb-filtered"
+    kernel_manager = object()
+
+    def __init__(self):
+        self.list_calls = []
+
+    def resolve_intent(self, user_text: str) -> str:
+        _ = user_text
+        return "code_task"
+
+    def select_tool_names_for_intent(self, intent: str, user_text: str = ""):
+        _ = (intent, user_text)
+        return ["notebook_execute", "notebook_variables", "notebook_cell"]
+
+    def get_tools_description(self, **kwargs) -> str:
+        return "- notebook_execute: 执行代码\n- notebook_variables: 查看变量\n- notebook_cell: 查看单元格"
+
+    def list_tools(self, **kwargs):
+        self.list_calls.append(kwargs)
+        names = kwargs.get("include_tool_names") or {"notebook_execute", "notebook_variables", "notebook_cell", "web_search"}
+        return _tool_defs(*sorted(names))
+
+    async def execute(self, tool_name: str, **kwargs):
+        _ = kwargs
+        return ToolResult(success=True, output=f"ok:{tool_name}", data={})
 
 
 class _RouterAwareCodelabTools:
@@ -239,6 +269,66 @@ def test_codelab_system_prompt_contains_dedicated_route_policy(monkeypatch):
     assert "CodeLab 场景规则" in prompt
     assert "默认先使用 `notebook_cell`、`notebook_variables`、`notebook_execute`" in prompt
     assert "不要调用 `knowledge_search`、`web_search`、`web_scrape` 或任何 `mcp.*` 工具" in prompt
+
+
+def test_chat_profile_includes_chat_preferences_and_rag_sections():
+    agent = ReActAgent(
+        _DummyLLM(),
+        _DummyTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat"),
+    )
+    agent._active_chat_preferences = {
+        "response_language": "zh-CN",
+        "response_verbosity": "concise",
+    }
+    agent._active_rag_overrides = {
+        "enabled": True,
+        "scope_mode": "knowledge_base",
+        "knowledge_base_ids": [7],
+        "use_reranker": True,
+    }
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "帮我总结这个主题"}], function_calling=True)
+
+    assert "用户已确认的聊天偏好" in prompt
+    assert "本轮临时 RAG 注入" in prompt
+    assert "检索范围: 仅限指定知识库 [7]" in prompt
+
+
+def test_codelab_profile_excludes_chat_preference_and_rag_sections():
+    agent = ReActAgent(
+        _DummyLLM(),
+        _CodelabTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="codelab_agent", notebook_id="nb-1"),
+    )
+    agent._active_chat_preferences = {
+        "response_language": "en-US",
+        "response_verbosity": "detailed",
+    }
+    agent._active_rag_overrides = {
+        "enabled": True,
+        "scope_mode": "document",
+        "document_ids": [11],
+    }
+    agent._active_channel_system_context = "Notebook snapshot: demo"
+
+    prompt = agent._build_system_prompt(messages=[{"role": "user", "content": "继续调试当前 notebook"}], function_calling=True)
+
+    assert "CodeLab / Notebook Runtime Context" in prompt
+    assert "Notebook snapshot: demo" in prompt
+    assert "用户已确认的聊天偏好" not in prompt
+    assert "本轮临时 RAG 注入" not in prompt
+    assert "知识检索引用规范" not in prompt
+
+
+def test_profile_resolution_matches_route_boundaries():
+    assert resolve_agent_profile("chat").key == "chat"
+    assert resolve_agent_profile("codelab_agent").key == "codelab"
+    assert resolve_agent_profile("notebook_agent").key == "codelab"
+    assert resolve_agent_profile("literature").key == "literature"
+    assert resolve_agent_profile("reader_compose").key == "default"
 
 
 def test_system_prompt_uses_available_tools_without_intent_filtering(monkeypatch):
@@ -525,6 +615,62 @@ def test_collect_llm_tool_schemas_uses_available_tools(monkeypatch):
     assert agent._last_tool_selection["schema_scope"] == "available"
     assert names == {"datetime", "calculator", "knowledge_search"}
     assert tools.list_calls and tools.list_calls[-1] == {"include_tool_names": {"datetime", "calculator", "knowledge_search"}}
+
+
+def test_codelab_system_prompt_uses_filtered_tool_selection(monkeypatch):
+    monkeypatch.setattr(settings, "tool_selection_enabled", True)
+    tools = _IntentFilteredCodelabTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="codelab_agent", notebook_id="nb-filtered"),
+    )
+
+    agent._build_system_prompt(messages=[{"role": "user", "content": "根据上传的 csv 在 notebook 里训练一个模型"}], function_calling=True)
+
+    assert agent._last_tool_selection["intent"] == "code_task"
+    assert agent._last_tool_selection["schema_scope"] == "selected"
+    assert agent._last_tool_selection["selected_tools"] == [
+        "notebook_cell",
+        "notebook_execute",
+        "notebook_variables",
+    ]
+    assert tools.list_calls and tools.list_calls[-1] == {
+        "include_tool_names": {"notebook_execute", "notebook_variables", "notebook_cell"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_single_tool_call_blocks_tools_outside_selected_allowlist():
+    tools = _IntentFilteredCodelabTools()
+    agent = ReActAgent(
+        _DummyLLM(),
+        tools,
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="codelab_agent", notebook_id="nb-filtered"),
+    )
+    agent._last_tool_selection = {
+        "selected_tools": ["notebook_execute", "notebook_variables", "notebook_cell"],
+    }
+    context = AgentContext(messages=[])
+
+    executed = await agent._execute_single_tool_call(
+        context,
+        ParsedToolCall(
+            call_id="call-web-search",
+            name="web_search",
+            arguments={"query": "latest news"},
+            arguments_raw='{"query":"latest news"}',
+        ),
+        parallel_group="test",
+    )
+
+    assert executed.tool_name == "web_search"
+    assert executed.success is False
+    assert executed.error == "tool_not_allowed"
+    assert "web_search" in executed.observation_output
+    assert "notebook_execute" in executed.observation_output
 
 
 def test_chat_prompt_uses_default_routing_without_router(monkeypatch):

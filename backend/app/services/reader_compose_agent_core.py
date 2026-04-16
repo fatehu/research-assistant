@@ -56,8 +56,11 @@ class ReaderComposeAgentCore(AgentCore):
             "schema_scope": "selected",
             "tool_selection_enabled": True,
         }
-        return f"{self.SYSTEM_PROMPT}\n\nTools:\n{tools_desc}"
+        return self._compose_profile_prompt_sections(
+            f"{self.SYSTEM_PROMPT}\n\nTools:\n{tools_desc}",
+            available_tools=sorted(list(self.allowed_tool_names)),
+            include_generic_citation_policy=False,
+        )
 
     def _collect_llm_tool_schemas(self, user_text: str) -> List[Dict[str, Any]]:
         return self.tools.list_tools(include_tool_names=self.allowed_tool_names, user_text=user_text)
-

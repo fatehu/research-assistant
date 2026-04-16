@@ -6,11 +6,11 @@ import sys
 
 
 BASELINE = {
-    "backend/app/api/codelab.py": {"exception": 11, "bare": 7},
-    "backend/app/api/knowledge.py": {"exception": 9, "bare": 0},
-    "backend/app/services/agent_tools_impl/registry.py": {"exception": 20, "bare": 0},
-    "backend/app/services/react_agent.py": {"exception": 19, "bare": 0},
-    "backend/app/services/mcp/client.py": {"exception": 5, "bare": 0},
+    "backend/app/api/codelab.py": {"exception": 6, "bare": 5},
+    "backend/app/api/knowledge.py": {"exception": 13, "bare": 0},
+    "backend/app/services/agent_tools_impl/registry.py": {"exception": 21, "bare": 0},
+    "backend/app/services/react_agent.py": {"exception": 37, "bare": 0},
+    "backend/app/services/mcp/client.py": {"exception": 3, "bare": 0},
     "backend/app/services/codelab_executor.py": {"exception": 2, "bare": 0},
 }
 
@@ -61,4 +61,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

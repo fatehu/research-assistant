@@ -42,6 +42,24 @@ class MessageResponse(BaseModel):
     created_at: datetime
 
 
+class MessageSpanRewriteRequest(BaseModel):
+    instruction: str = Field(..., min_length=1, max_length=500)
+    selected_text: str = Field(..., min_length=1, max_length=4000)
+    before_context: str = Field(default="", max_length=2000)
+    after_context: str = Field(default="", max_length=2000)
+    occurrence_index: Optional[int] = Field(default=None, ge=0)
+
+
+class MessageSpanRewriteResponse(BaseModel):
+    message: MessageResponse
+    old_content: str
+    new_content: str
+    selected_text: str
+    replacement_text: str
+    start_offset: int
+    end_offset: int
+
+
 class ConversationEvidenceLedgerEntryResponse(BaseModel):
     entry_id: str
     origin_kind: Literal["tool_result", "assistant_summary", "llm_inferred"] = "llm_inferred"

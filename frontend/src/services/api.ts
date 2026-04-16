@@ -111,6 +111,62 @@ export const normalizeTaskStatus = (
   return 'failed'
 }
 
+const readJsonSseResponse = async (
+  response: Response,
+  onEvent?: (event: string, data: any) => void,
+): Promise<void> => {
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('无法读取响应')
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const processStreamChunk = (
+    chunk: string,
+    options?: { flush?: boolean },
+  ): string => {
+    const flush = Boolean(options?.flush)
+    if (!chunk) return ''
+    const lines = chunk.split('\n')
+    const remainder = flush ? '' : (lines.pop() || '')
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line.startsWith('data:')) continue
+      try {
+        const data = JSON.parse(line.slice(5).trim())
+        onEvent?.(data.event, data.data)
+      } catch {
+        // ignore malformed stream chunk
+      }
+    }
+
+    if (flush) {
+      const trailing = remainder.trim()
+      if (trailing.startsWith('data:')) {
+        try {
+          const data = JSON.parse(trailing.slice(5).trim())
+          onEvent?.(data.event, data.data)
+        } catch {
+          // ignore malformed trailing chunk
+        }
+      }
+      return ''
+    }
+    return remainder
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) {
+      processStreamChunk(buffer, { flush: true })
+      break
+    }
+
+    buffer += decoder.decode(value, { stream: true })
+    buffer = processStreamChunk(buffer)
+  }
+}
+
 // Response interceptor - normalize errors
 api.interceptors.response.use(
   (response) => response,
@@ -252,6 +308,20 @@ export interface ChatRagOverrides {
   use_query_rewrite?: boolean
   query_rewrite_profile?: ChatRagRewriteProfile
   use_contextual_compression?: boolean
+}
+
+export interface ChatRunResponse {
+  run_id: string
+  user_id?: number
+  status: string
+  conversation_id?: number | null
+  channel?: string
+  created_at?: string | null
+  updated_at?: string | null
+  completed_at?: string | null
+  error?: string | null
+  result?: Record<string, any>
+  event_count?: number
 }
 
 export interface ChatPreferenceCandidate {
@@ -553,6 +623,24 @@ export interface Message {
   completion_tokens?: number
   total_tokens?: number
   created_at: string
+}
+
+export interface MessageSpanRewriteRequest {
+  instruction: string
+  selected_text: string
+  before_context?: string
+  after_context?: string
+  occurrence_index?: number
+}
+
+export interface MessageSpanRewriteResponse {
+  message: Message
+  old_content: string
+  new_content: string
+  selected_text: string
+  replacement_text: string
+  start_offset: number
+  end_offset: number
 }
 
 export interface LLMProvider {
@@ -988,6 +1076,60 @@ export const chatApi = {
     return response.data
   },
 
+  createChatRun: async (
+    message: string,
+    conversationId?: number,
+    sendPlanId?: string,
+    chatPreferenceOverrides?: Partial<ChatUserPreferences>,
+    ragOverrides?: ChatRagOverrides | null,
+  ): Promise<ChatRunResponse> => {
+    const response = await api.post('/api/v1/chat/runs', {
+      message,
+      conversation_id: conversationId,
+      stream: true,
+      send_plan_id: sendPlanId,
+      ...(chatPreferenceOverrides && Object.keys(chatPreferenceOverrides).length
+        ? { chat_preference_overrides: chatPreferenceOverrides }
+        : {}),
+      ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+    })
+    return response.data
+  },
+
+  streamChatRun: async (
+    runId: string,
+    onEvent?: (event: string, data: any) => void,
+    abortController?: AbortController,
+  ): Promise<void> => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/chat/runs/${encodeURIComponent(runId)}/stream`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${getToken()}`,
+        },
+        signal: abortController?.signal,
+      })
+
+      if (!response.ok) {
+        const error = (await response.json()) as { detail?: ApiErrorDetail }
+        throw new Error(extractApiErrorMessage(error.detail, '请求失败'))
+      }
+
+      await readJsonSseResponse(response, onEvent)
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        onEvent?.('stopped', { aborted: true })
+        return
+      }
+      throw error
+    }
+  },
+
+  cancelChatRun: async (runId: string): Promise<ChatRunResponse> => {
+    const response = await api.post(`/api/v1/chat/runs/${encodeURIComponent(runId)}/cancel`)
+    return response.data
+  },
+
   sendMessageStream: async (
     message: string,
     conversationId?: number,
@@ -1022,58 +1164,7 @@ export const chatApi = {
         throw new Error(extractApiErrorMessage(error.detail, '请求失败'))
       }
 
-      const reader = response.body?.getReader()
-      if (!reader) throw new Error('无法读取响应')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-      const processStreamChunk = (
-        chunk: string,
-        options?: { flush?: boolean },
-      ): string => {
-        const flush = Boolean(options?.flush)
-        if (!chunk) {
-          return ''
-        }
-        const lines = chunk.split('\n')
-        const remainder = flush ? '' : (lines.pop() || '')
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim()
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data = JSON.parse(line.slice(6))
-            onEvent?.(data.event, data.data)
-          } catch {
-            // ignore malformed stream chunk
-          }
-        }
-
-        if (flush) {
-          const trailing = remainder.trim()
-          if (trailing.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trailing.slice(6))
-              onEvent?.(data.event, data.data)
-            } catch {
-              // ignore malformed trailing chunk
-            }
-          }
-          return ''
-        }
-        return remainder
-      }
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) {
-          processStreamChunk(buffer, { flush: true })
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        buffer = processStreamChunk(buffer)
-      }
+      await readJsonSseResponse(response, onEvent)
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         onEvent?.('stopped', { aborted: true })
@@ -1108,6 +1199,14 @@ export const chatApi = {
     metadata?: MessageMetadata
   }): Promise<Message> => {
     const response = await api.post('/api/v1/chat/messages/stopped', data)
+    return response.data
+  },
+
+  rewriteMessageSpan: async (
+    messageId: number,
+    data: MessageSpanRewriteRequest,
+  ): Promise<MessageSpanRewriteResponse> => {
+    const response = await api.post(`/api/v1/chat/messages/${messageId}/rewrite-span`, data)
     return response.data
   },
 }
@@ -3747,6 +3846,24 @@ export interface ExecuteResponse {
   policy_violation_code?: string | null
 }
 
+export interface NotebookBackgroundExecution {
+  execution_id: string
+  notebook_id: string
+  user_id: number
+  cell_id: string
+  description?: string
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string
+  created_at: string
+  started_at?: string | null
+  completed_at?: string | null
+  cancel_requested?: boolean
+  success?: boolean | null
+  terminated_reason?: string | null
+  policy_violation_code?: string | null
+  execution_count?: number | null
+  error?: string | null
+}
+
 
 export const codelabApi = {
   listNotebooks: async (): Promise<Notebook[]> => {
@@ -3777,12 +3894,16 @@ export const codelabApi = {
   },
 
   executeCell: async (notebookId: string, data: ExecuteRequest): Promise<ExecuteResponse> => {
-    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/execute`, data)
+    const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/execute`, data, {
+      timeout: 0,
+    })
     return response.data
   },
 
   executeCode: async (data: ExecuteRequest): Promise<ExecuteResponse> => {
-    const response = await api.post('/api/v1/codelab/execute', data)
+    const response = await api.post('/api/v1/codelab/execute', data, {
+      timeout: 0,
+    })
     return response.data
   },
 
@@ -3820,6 +3941,21 @@ export const codelabApi = {
 
   interruptKernel: async (notebookId: string): Promise<{ message: string }> => {
     const response = await api.post(`/api/v1/codelab/notebooks/${notebookId}/interrupt`)
+    return response.data
+  },
+
+  listBackgroundExecutions: async (notebookId: string): Promise<NotebookBackgroundExecution[]> => {
+    const response = await api.get(`/api/v1/codelab/notebooks/${notebookId}/background-executions`)
+    return response.data
+  },
+
+  cancelBackgroundExecution: async (
+    notebookId: string,
+    executionId: string
+  ): Promise<NotebookBackgroundExecution> => {
+    const response = await api.post(
+      `/api/v1/codelab/notebooks/${notebookId}/background-executions/${executionId}/cancel`
+    )
     return response.data
   },
 
@@ -3884,6 +4020,40 @@ export interface AgentContextResponse {
   code_summary: string
   stage_summary?: string
   history_summary?: string
+  history_health?: {
+    user_message_count?: number
+    assistant_message_count?: number
+    trailing_user_messages?: number
+    assistant_code_responses?: number
+  }
+  task_memory?: {
+    summary?: string
+    current_goal?: string
+    constraints?: string[]
+    open_request?: string
+    recent_turns?: Array<{
+      role: 'user' | 'assistant'
+      content: string
+    }>
+  }
+  action_ledger?: Array<{
+    kind: string
+    label: string
+    detail: string
+  }>
+  notebook_state_digest?: {
+    notebook_id: string
+    notebook_title: string
+    cell_count: number
+    code_cell_count: number
+    execution_count: number
+    stage_summary?: string
+    focus_line?: string
+    workspace_file_count?: number
+    variable_count?: number
+    risky_cell_count?: number
+    summary?: string
+  }
   recent_cells?: Array<{
     cell_id: string
     cell_index: number
@@ -4007,24 +4177,33 @@ export const agentApi = {
 
     const decoder = new TextDecoder()
     let buffer = ''
+    const dispatchLine = (line: string) => {
+      if (!line.startsWith('data: ')) return
+      try {
+        const data = JSON.parse(line.slice(6))
+        onEvent(data as AgentChatEvent)
+      } catch (e) {
+        console.error('解析事件失败:', e)
+      }
+    }
 
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        buffer += decoder.decode()
+        const tailLines = buffer.split('\n')
+        for (const line of tailLines) {
+          if (line.trim()) dispatchLine(line)
+        }
+        break
+      }
 
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() || ''
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            onEvent(data as AgentChatEvent)
-          } catch (e) {
-            console.error('解析事件失败:', e)
-          }
-        }
+        dispatchLine(line)
       }
     }
   },

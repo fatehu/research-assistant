@@ -16,6 +16,7 @@ from app.core.database import async_session_factory, get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.services.agent_runtime_service import get_agent_runtime_service
+from app.services.codelab_sandbox_policy import SANDBOX_FORBIDDEN_IMPORT_ROOTS
 from app.services.notebook_agent_history_service import (
     append_history_message,
     build_history_summary,
@@ -39,27 +40,7 @@ _notebooks_cache = codelab_base._notebooks
 # Agent 对话历史存储 (内存中)
 _agent_histories: Dict[str, Dict[str, Any]] = {}
 AGENT_HISTORY_CHANNEL = "codelab"
-_SANDBOX_FORBIDDEN_IMPORT_ROOTS = {
-    "os",
-    "subprocess",
-    "socket",
-    "pathlib",
-    "shutil",
-    "tempfile",
-    "requests",
-    "httpx",
-    "urllib",
-    "aiohttp",
-    "ftplib",
-    "telnetlib",
-    "paramiko",
-    "multiprocessing",
-    "threading",
-    "ctypes",
-    "importlib",
-    "pickle",
-    "marshal",
-}
+_SANDBOX_FORBIDDEN_IMPORT_ROOTS = set(SANDBOX_FORBIDDEN_IMPORT_ROOTS)
 
 
 class AgentChatRequest(BaseModel):
@@ -123,22 +104,27 @@ def _summarize_code_kind(source: str, cell_type: str) -> str:
     normalized = str(source or "").lower()
     if not normalized.strip():
         return "empty_code"
-    if any(line.strip().startswith(("import ", "from ")) for line in normalized.splitlines()):
-        if not normalized.replace("import ", "").replace("from ", "").strip():
-            return "imports"
-    if any(token in normalized for token in ("read_csv(", "read_excel(", "read_parquet(", "read_json(", "load_iris(", "fetch_", "dataframe(")):
+    lines = normalized.splitlines()
+    has_imports = any(line.strip().startswith(("import ", "from ")) for line in lines)
+    semantic_source = "\n".join(
+        line for line in lines
+        if not line.strip().startswith(("import ", "from ", "#"))
+    )
+    if has_imports and not semantic_source.strip():
+        return "imports"
+    if any(token in semantic_source for token in ("read_csv(", "read_excel(", "read_parquet(", "read_json(", "load_iris(", "fetch_", "dataframe(")):
         return "data_loading"
-    if any(token in normalized for token in ("train_test_split", "fillna(", "dropna(", "astype(", "get_dummies(", "standardscaler", "labelencoder", "merge(", "concat(", "groupby(")):
+    if any(token in semantic_source for token in ("train_test_split", "fillna(", "dropna(", "astype(", "get_dummies(", "standardscaler", "labelencoder", "merge(", "concat(", "groupby(")):
         return "feature_processing"
-    if any(token in normalized for token in (".fit(", "randomforest", "logisticregression", "svc(", "xgb", "lgbm", "linearregression", "kmeans(")):
+    if any(token in semantic_source for token in (".fit(", "randomforest", "logisticregression", "svc(", "xgb", "lgbm", "linearregression", "kmeans(")):
         return "model_training"
-    if any(token in normalized for token in ("predict(", "score(", "accuracy_score", "classification_report", "confusion_matrix", "mean_squared_error", "roc_auc_score")):
+    if any(token in semantic_source for token in ("predict(", "score(", "accuracy_score", "classification_report", "confusion_matrix", "mean_squared_error", "roc_auc_score")):
         return "evaluation"
-    if any(token in normalized for token in ("plt.", "sns.", ".plot(", "scatter(", "hist(", "bar(", "imshow(", "heatmap(")):
+    if any(token in semantic_source for token in ("plt.", "sns.", ".plot(", "scatter(", "hist(", "bar(", "imshow(", "heatmap(")):
         return "visualization"
-    if any(token in normalized for token in ("def ", "class ")):
+    if any(token in semantic_source for token in ("def ", "class ")):
         return "helper_definition"
-    if any(line.strip().startswith(("import ", "from ")) for line in normalized.splitlines()):
+    if has_imports:
         return "imports"
     return "general_python"
 
@@ -168,9 +154,16 @@ def _summarize_cell(cell: Dict[str, Any], index: int, max_source_length: int) ->
     outputs = list(cell.get("outputs") or [])
     output_summaries = _summarize_outputs(outputs)
     error_summary = next((item for item in output_summaries if ":" in item and ("error" in item.lower() or "warning" in item.lower())), None)
+    metadata = dict(cell.get("metadata") or {})
+    background_execution = dict(metadata.get("background_execution") or {})
+    background_status = str(background_execution.get("status") or "").strip().lower()
     status = "idle"
     if error_summary:
         status = "error"
+    elif background_status in {"pending", "running"}:
+        status = f"background_{background_status}"
+    elif background_status in {"completed", "failed", "cancelled"}:
+        status = f"background_{background_status}"
     elif outputs:
         status = "has_output"
     elif cell.get("execution_count") is not None:
@@ -189,6 +182,7 @@ def _summarize_cell(cell: Dict[str, Any], index: int, max_source_length: int) ->
         "status": status,
         "output_summary": output_summaries[0] if output_summaries else "",
         "error_summary": error_summary or "",
+        "background_execution": background_execution,
     }
 
 
@@ -360,6 +354,7 @@ def _build_history_context(history: Optional[Dict[str, Any]], recent_limit: int 
         trailing_user_messages += 1
     return {
         "summary": summary,
+        "messages": [{"role": item["role"], "content": item["content"]} for item in normalized],
         "recent_messages": recent_messages,
         "health": {
             "user_message_count": user_message_count,
@@ -367,6 +362,214 @@ def _build_history_context(history: Optional[Dict[str, Any]], recent_limit: int 
             "trailing_user_messages": trailing_user_messages,
             "assistant_code_responses": assistant_code_responses,
         },
+    }
+
+
+def _extract_task_constraints(messages: List[Dict[str, str]], limit: int = 4) -> List[str]:
+    constraints: List[str] = []
+    for item in reversed(messages):
+        if item.get("role") != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        lowered = content.lower()
+        if any(token in lowered for token in ("不要", "别", "只", "先", "不要联网", "不要修改", "不要执行", "只回答", "只基于")):
+            normalized = _truncate_text(content, limit=120)
+            if normalized and normalized not in constraints:
+                constraints.append(normalized)
+        if len(constraints) >= limit:
+            break
+    constraints.reverse()
+    return constraints
+
+
+def _build_task_memory(
+    history_context: Dict[str, Any],
+    *,
+    recent_turn_limit: int = 2,
+) -> Dict[str, Any]:
+    all_messages = list(history_context.get("messages") or [])
+    recent_messages = list(history_context.get("recent_messages") or [])
+    recent_turns = recent_messages[-recent_turn_limit:] if len(recent_messages) > recent_turn_limit else recent_messages
+    task_source_messages = all_messages or recent_messages
+    constraints = _extract_task_constraints(task_source_messages)
+
+    current_goal = ""
+    last_user_message = next(
+        (str(item.get("content") or "").strip() for item in reversed(task_source_messages) if item.get("role") == "user"),
+        "",
+    )
+    if last_user_message:
+        current_goal = _truncate_text(last_user_message, limit=140)
+
+    open_request = ""
+    trailing_user_messages = int((history_context.get("health") or {}).get("trailing_user_messages") or 0)
+    if trailing_user_messages > 0 and last_user_message:
+        open_request = current_goal
+
+    summary_parts: List[str] = []
+    if current_goal:
+        summary_parts.append(f"当前目标: {current_goal}")
+    history_summary = str(history_context.get("summary") or "").strip()
+    if history_summary:
+        summary_parts.append(history_summary.replace("\n", "；"))
+    if constraints:
+        summary_parts.append("限制条件: " + " | ".join(constraints[:3]))
+    if open_request:
+        summary_parts.append(f"未闭合请求: {open_request}")
+
+    return {
+        "summary": "；".join([part for part in summary_parts if part]).strip(),
+        "current_goal": current_goal,
+        "constraints": constraints,
+        "open_request": open_request,
+        "recent_turns": [{"role": item["role"], "content": item["content"]} for item in recent_turns],
+    }
+
+
+def _build_action_ledger(
+    *,
+    focus: Dict[str, Optional[Dict[str, Any]]],
+    recent_outputs: List[Dict[str, Any]],
+    variables: Dict[str, str],
+    workspace: Optional[Dict[str, Any]],
+    sandbox_risky_cells: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+
+    recent_executed = focus.get("recent_executed")
+    if isinstance(recent_executed, dict):
+        entries.append(
+            {
+                "kind": "recent_execution",
+                "label": f"{recent_executed.get('label')}#{int(recent_executed.get('cell_index', 0)) + 1}",
+                "detail": str(recent_executed.get("source_excerpt") or recent_executed.get("output_summary") or "").strip(),
+            }
+        )
+
+    recent_error = focus.get("recent_error")
+    if isinstance(recent_error, dict):
+        entries.append(
+            {
+                "kind": "recent_error",
+                "label": f"{recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}",
+                "detail": str(recent_error.get("error_summary") or recent_error.get("source_excerpt") or "").strip(),
+            }
+        )
+
+    for output in recent_outputs[:2]:
+        entries.append(
+            {
+                "kind": "recent_output",
+                "label": f"Cell {int(output.get('cell_index', 0)) + 1}",
+                "detail": _truncate_text(output.get("summary") or output.get("outputs"), limit=120),
+            }
+        )
+
+    if variables:
+        entries.append(
+            {
+                "kind": "variables",
+                "label": "变量快照",
+                "detail": " | ".join(f"{key}={value}" for key, value in list(variables.items())[:3]),
+            }
+        )
+
+    workspace_files = list((workspace or {}).get("files") or [])
+    if workspace_files:
+        file_names = ", ".join(
+            str(item.get("name") or "").strip()
+            for item in workspace_files[:3]
+            if str(item.get("name") or "").strip()
+        )
+        entries.append(
+            {
+                "kind": "workspace",
+                "label": "工作区",
+                "detail": f"{int((workspace or {}).get('file_count') or len(workspace_files))} 个文件"
+                + (f"（{file_names}）" if file_names else ""),
+            }
+        )
+
+    risky_cells = list(sandbox_risky_cells or [])
+    if risky_cells:
+        first_risky = risky_cells[0]
+        imports = ", ".join(list(first_risky.get("blocked_imports") or [])[:3])
+        entries.append(
+            {
+                "kind": "sandbox_risk",
+                "label": f"{first_risky.get('label')}#{int(first_risky.get('cell_index', 0)) + 1}",
+                "detail": f"包含沙箱禁用导入 {imports}",
+            }
+        )
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for item in entries:
+        key = (item.get("kind"), item.get("label"), item.get("detail"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:6]
+
+
+def _build_notebook_state_digest(
+    *,
+    notebook_title: str,
+    notebook_id: str,
+    cell_count: int,
+    code_cell_count: int,
+    execution_count: int,
+    stage_summary: str,
+    focus: Dict[str, Optional[Dict[str, Any]]],
+    sandbox_risky_cells: Optional[List[Dict[str, Any]]],
+    workspace: Optional[Dict[str, Any]],
+    variables: Dict[str, str],
+) -> Dict[str, Any]:
+    active_cell = focus.get("active_cell") if isinstance(focus, dict) else None
+    recent_error = focus.get("recent_error") if isinstance(focus, dict) else None
+    recent_output = focus.get("recent_output") if isinstance(focus, dict) else None
+    workspace_files = list((workspace or {}).get("files") or [])
+    risky_count = len(list(sandbox_risky_cells or []))
+
+    focus_line_parts: List[str] = []
+    if isinstance(active_cell, dict):
+        focus_line_parts.append(
+            f"当前焦点={active_cell.get('label')}#{int(active_cell.get('cell_index', 0)) + 1}[{active_cell.get('kind')}]"
+        )
+    if isinstance(recent_error, dict):
+        focus_line_parts.append(
+            f"最近错误={recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}: {recent_error.get('error_summary') or recent_error.get('source_excerpt')}"
+        )
+    elif isinstance(recent_output, dict):
+        focus_line_parts.append(
+            f"最近输出={recent_output.get('label')}#{int(recent_output.get('cell_index', 0)) + 1}: {recent_output.get('output_summary') or recent_output.get('source_excerpt')}"
+        )
+
+    digest_lines = [
+        f"{notebook_title} (ID={notebook_id}, cells={cell_count}, code={code_cell_count}, exec={execution_count})",
+        stage_summary,
+    ]
+    if focus_line_parts:
+        digest_lines.append("；".join(focus_line_parts[:2]))
+    digest_lines.append(
+        f"工作区文件={int((workspace or {}).get('file_count') or len(workspace_files))}, 变量数={len(variables)}, 风险单元格={risky_count}"
+    )
+
+    return {
+        "notebook_id": notebook_id,
+        "notebook_title": notebook_title,
+        "cell_count": cell_count,
+        "code_cell_count": code_cell_count,
+        "execution_count": execution_count,
+        "stage_summary": stage_summary,
+        "focus_line": "；".join(focus_line_parts[:2]),
+        "workspace_file_count": int((workspace or {}).get("file_count") or len(workspace_files)),
+        "variable_count": len(variables),
+        "risky_cell_count": risky_count,
+        "summary": " | ".join([part for part in digest_lines if part]).strip(),
     }
 
 
@@ -379,8 +582,9 @@ def _build_tool_hints(
     workspace: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     hints = [
-        "需要核对单元格源码、输出或报错细节时，先用 notebook_cell(get_one/get)。",
-        "在 observation 返回前，不要假设代码已经执行过或变量一定存在。",
+        "If you need cell source, outputs, or error details, call notebook_cell(action='get_one' or action='get') before assuming them.",
+        "Do not assume code has executed or variables exist until a tool observation confirms it.",
+        "Do not create a code cell with notebook_cell(add) and then run the same code with notebook_execute without cell_id. Prefer notebook_execute directly; if a draft cell already exists, update/execute that exact cell.",
     ]
     risky_cells = list(sandbox_risky_cells or [])
     if risky_cells:
@@ -388,40 +592,64 @@ def _build_tool_hints(
         imports = ", ".join(list(first_risky.get("blocked_imports") or [])[:2])
         hints.insert(
             0,
-            f"如果现有单元格包含沙箱禁用导入（如 {imports}），不要建议直接执行 {first_risky.get('label')}#{int(first_risky.get('cell_index', 0)) + 1}；先指出需要去掉这些导入。",
+            f"A current cell imports sandbox-blocked modules ({imports}). Do not execute {first_risky.get('label')}#{int(first_risky.get('cell_index', 0)) + 1} as-is; first remove the blocked imports and use the injected file helpers.",
         )
     recent_error = focus.get("recent_error")
     if isinstance(recent_error, dict):
         hints.insert(
             0,
-            f"修复最近报错时，优先直接覆盖 {recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}"
-            + (f"（cell_id={recent_error.get('cell_id')}）" if str(recent_error.get('cell_id') or '').strip() else "")
-            + "，并优先传 cell_id，不要再创建一个重复的修复版 cell。",
+            f"When fixing the latest error, update {recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}"
+            + (f" directly with cell_id={recent_error.get('cell_id')}" if str(recent_error.get('cell_id') or '').strip() else "")
+            + "; do not create a duplicate fix cell unless the user explicitly asks for a new cell.",
         )
     active_cell = focus.get("active_cell")
     if isinstance(active_cell, dict):
         hints.insert(
             1 if isinstance(recent_error, dict) else 0,
-            f"当前焦点可先查 notebook_cell(action='get_one', cell_id='{active_cell.get('cell_id')}')。"
+            f"If the active cell matters, inspect it with notebook_cell(action='get_one', cell_id='{active_cell.get('cell_id')}')."
             if str(active_cell.get("cell_id") or "").strip()
-            else f"当前焦点可先查 notebook_cell(action='get_one', cell_index={int(active_cell.get('cell_index', 0)) + 1})。",
+            else f"If the active cell matters, inspect it with notebook_cell(action='get_one', cell_index={int(active_cell.get('cell_index', 0)) + 1}).",
         )
     if include_variables:
-        hints.append("需要确认 DataFrame、模型或数组状态时，再用 notebook_variables。")
-    workspace_files = list((workspace or {}).get("file_names") or [])
-    if workspace_files:
-        hints.append(
-            f"当前工作区已有 {len(workspace_files)} 个上传文件；先用 list_uploaded_files() 或直接用相对路径确认文件名，再用 uploaded_file_path('{workspace_files[0]}') / read_uploaded_text(...)。不要导入 os 去枚举目录。"
-        )
-        hints.append(
-            f"处理上传文件时先写最小可验证代码，例如 `df = pd.read_csv('{workspace_files[0]}')`、`print(df.shape)`、`print(df.head())`；不要一开始就写多层 try/except 或备用文件名猜测。"
-        )
-        hints.append(
-            f"`uploaded_file_path('{workspace_files[0]}')` 必须作为函数调用使用，不要把它写成字符串 `'uploaded_file_path({workspace_files[0]})'`。"
-        )
+        hints.append("Use notebook_variables only when you need existing runtime variables; do not call it repeatedly if a fresh notebook_execute validation is enough.")
     if user_authorized:
-        hints.append("只有在确实需要验证结果或修改 Notebook 时，再调用 notebook_execute；修复已有单元格时优先传 cell_id，cell_index 仅兼容旧调用。")
+        hints.append("When the user asks to build, run, analyze, or modify the notebook and authorization is granted, take one small executable notebook action instead of only describing a plan. Prefer cell_id when updating an existing cell; cell_index is compatibility-only.")
+    else:
+        hints.append("Authorization is not granted: do not execute or mutate the notebook; provide code and instructions only.")
     return hints
+
+
+def _build_workspace_guidance_lines(workspace: Optional[Dict[str, Any]]) -> List[str]:
+    workspace_payload = dict(workspace or {}) if isinstance(workspace, dict) else {}
+    workspace_files = [
+        item for item in list(workspace_payload.get("files") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    if not workspace_files:
+        return [
+            "Workspace files: no uploaded files were detected in the context. If file state matters, call list_uploaded_files() before assuming absence."
+        ]
+
+    file_names = ", ".join(
+        str(item.get("name") or "").strip()
+        for item in workspace_files[:5]
+        if str(item.get("name") or "").strip()
+    )
+    first_file = str((workspace_files[0] or {}).get("name") or "").strip()
+    lines = [
+        f"Workspace files: {int(workspace_payload.get('file_count') or len(workspace_files))} uploaded file(s)"
+        + (f" ({file_names})" if file_names else ""),
+        "File access contract: use list_uploaded_files(), uploaded_file_path(name), or read_uploaded_text(name); do not import os/pathlib/glob to discover uploaded files.",
+    ]
+    if first_file:
+        lines.append(
+            f"Preferred first validation: files = list_uploaded_files(); df = pd.read_csv(uploaded_file_path('{first_file}')); "
+            "then inspect shape, columns, and a small sample before broader analysis."
+        )
+        lines.append(
+            f"Literal rule: uploaded_file_path('{first_file}') is a Python function call, not a quoted path string."
+        )
+    return lines
 
 
 def _build_notebook_agent_context(
@@ -484,11 +712,31 @@ def _build_notebook_agent_context(
         sandbox_risky_cells,
         history_health=history_context["health"],
     )
+    task_memory = _build_task_memory(history_context)
     imports = _extract_import_roots(code_cells)
     code_summary_parts = [f"{len(code_cells)} 个代码单元格"]
     if imports:
         code_summary_parts.append(f"主要库: {', '.join(imports[:5])}")
     code_summary_parts.append(stage_summary)
+    action_ledger = _build_action_ledger(
+        focus=focus,
+        recent_outputs=recent_outputs,
+        variables=variables,
+        workspace=workspace,
+        sandbox_risky_cells=sandbox_risky_cells,
+    )
+    notebook_state_digest = _build_notebook_state_digest(
+        notebook_title=notebook.get("title", "未命名"),
+        notebook_id=notebook_id,
+        cell_count=len(cells),
+        code_cell_count=len(code_cells),
+        execution_count=int(notebook.get("execution_count", 0) or 0),
+        stage_summary=stage_summary,
+        focus=focus,
+        sandbox_risky_cells=sandbox_risky_cells,
+        workspace=workspace,
+        variables=variables,
+    )
 
     return {
         "notebook_id": notebook_id,
@@ -502,8 +750,11 @@ def _build_notebook_agent_context(
         "focus": focus,
         "sandbox_risky_cells": sandbox_risky_cells,
         "history_summary": history_context["summary"],
-        "recent_history_messages": history_context["recent_messages"],
+        "recent_history_messages": task_memory["recent_turns"],
         "history_health": history_context["health"],
+        "task_memory": task_memory,
+        "action_ledger": action_ledger,
+        "notebook_state_digest": notebook_state_digest,
         "stage_summary": stage_summary,
         "code_summary": "；".join([part for part in code_summary_parts if part]),
         "workspace": {
@@ -536,65 +787,94 @@ def _render_notebook_system_context(
         if isinstance(item, dict)
     ]
     lines = [
-        "你是 CodeLab 的专业数据科学助手。",
-        "默认先围绕当前焦点回答；信息不够时先调用 Notebook 工具核实，再下结论。",
+        "You are the CodeLab notebook agent, a practical data-science assistant operating inside the user's current notebook.",
+        "Final answer language: Chinese. Tool calls and Python code may use English identifiers, but user-facing explanations must be Chinese.",
+        "Default behavior: work from the current notebook state. If information is missing, use the notebook tools to verify it before making claims.",
+        "Execution posture: when the user asks you to build, run, analyze, debug, or modify the notebook and authorization is granted, prefer one small verifiable notebook action over a high-level plan.",
+        "Long-running posture: for model training, hyperparameter search, or multi-model evaluation that may exceed a short tool wait, prefer notebook_execute with run_mode=background. If the observation returns real outputs from a completed background execution, continue the notebook task instead of treating background execution itself as the final answer.",
+        "Hard constraints:",
+        "1. Uploaded files are already mounted in the notebook workspace. Do not discover upload paths with import os, pathlib, glob, shutil, subprocess, or sys.",
+        "2. Use the injected helpers for uploaded files: list_uploaded_files(), uploaded_file_path(name), read_uploaded_text(name). Available variables: NOTEBOOK_FILES, NOTEBOOK_FILE_PATHS, NOTEBOOK_FILES_DIR.",
+        "3. Never call os.listdir, os.path, pathlib.Path, glob.glob, subprocess, or shell commands to locate uploaded files.",
+        "4. Do not fake execution results, file names, columns, metrics, or plots. Wait for tool observations.",
+        "5. Do not wrap the first file-loading attempt in broad try/except or guess alternate filenames. Validate the mounted file list and schema first.",
+        "6. If an existing cell contains blocked imports, do not execute it as-is. Rewrite it to use the injected helpers.",
+        "7. Do not duplicate notebook cells. For executable code, prefer notebook_execute directly. If you already created or need to revise a code cell, inspect it with notebook_cell and pass its cell_id to notebook_execute/update instead of appending another copy.",
         (
-            f"Notebook: {context_payload.get('notebook_title')} "
+            f"Notebook snapshot: {context_payload.get('notebook_title')} "
             f"(ID={context_payload.get('notebook_id')}, cells={context_payload.get('cell_count', 0)}, "
             f"code={context_payload.get('code_cell_count', 0)}, exec={context_payload.get('execution_count', 0)})"
         ),
     ]
 
     if include_context:
-        lines.append(f"阶段: {context_payload.get('stage_summary') or context_payload.get('code_summary')}")
+        lines.append(f"Stage: {context_payload.get('stage_summary') or context_payload.get('code_summary')}")
+        notebook_state_digest = context_payload.get("notebook_state_digest") or {}
+        digest_summary = str(notebook_state_digest.get("summary") or "").strip()
+        if digest_summary:
+            lines.append("Notebook state digest: " + digest_summary)
 
         focus = context_payload.get("focus") or {}
         focus_parts: List[str] = []
         recent_error = focus.get("recent_error")
         if isinstance(recent_error, dict):
             focus_parts.append(
-                f"最近报错={recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}: "
+                f"latest_error={recent_error.get('label')}#{int(recent_error.get('cell_index', 0)) + 1}: "
                 f"{recent_error.get('error_summary') or recent_error.get('source_excerpt')}"
             )
         active_cell = focus.get("active_cell")
         if isinstance(active_cell, dict):
             focus_parts.append(
-                f"当前单元格={active_cell.get('label')}#{int(active_cell.get('cell_index', 0)) + 1}"
+                f"active_cell={active_cell.get('label')}#{int(active_cell.get('cell_index', 0)) + 1}"
                 f"[{active_cell.get('kind')}]: {active_cell.get('source_excerpt')}"
             )
         recent_output = focus.get("recent_output")
         if isinstance(recent_output, dict):
             focus_parts.append(
-                f"最近输出={recent_output.get('label')}#{int(recent_output.get('cell_index', 0)) + 1}: "
+                f"latest_output={recent_output.get('label')}#{int(recent_output.get('cell_index', 0)) + 1}: "
                 f"{recent_output.get('output_summary') or recent_output.get('source_excerpt')}"
             )
         if focus_parts:
-            lines.append("焦点: " + "；".join(focus_parts[:3]))
+            lines.append("Focus: " + " | ".join(focus_parts[:3]))
         if sandbox_risky_cells:
             first_risky = sandbox_risky_cells[0]
             risky_imports = ", ".join(list(first_risky.get("blocked_imports") or [])[:3])
             lines.append(
-                "风险: "
-                + f"{first_risky.get('label')}#{int(first_risky.get('cell_index', 0)) + 1} 包含沙箱禁用导入 {risky_imports}，"
-                + "这是硬规则：不要建议直接执行该单元格。"
+                "Risk: "
+                + f"{first_risky.get('label')}#{int(first_risky.get('cell_index', 0)) + 1} imports sandbox-blocked module(s): {risky_imports}. "
+                + "Hard rule: do not execute this cell as-is."
             )
 
-        history_summary = str(context_payload.get("history_summary") or "").strip()
-        if history_summary:
-            lines.append("更早任务: " + history_summary)
+        task_memory = context_payload.get("task_memory") or {}
+        task_memory_summary = str(task_memory.get("summary") or "").strip()
+        if task_memory_summary:
+            lines.append("Task memory: " + task_memory_summary)
+        else:
+            history_summary = str(context_payload.get("history_summary") or "").strip()
+            if history_summary:
+                lines.append("Earlier task summary: " + history_summary)
 
-        workspace = context_payload.get("workspace") or {}
-        workspace_files = list(workspace.get("files") or [])
-        if workspace_files:
-            file_names = ", ".join(str(item.get("name") or "") for item in workspace_files[:5] if str(item.get("name") or "").strip())
-            lines.append(
-                f"工作区: {int(workspace.get('file_count') or len(workspace_files))} 个上传文件"
-                + (f"（{file_names}）" if file_names else "")
-                + "；Notebook 内可直接用相对路径、uploaded_file_path(name) 或 read_uploaded_text(name)。"
-            )
+        action_ledger = [
+            item
+            for item in list(context_payload.get("action_ledger") or [])
+            if isinstance(item, dict)
+        ]
+        if action_ledger:
+            ledger_parts = []
+            for item in action_ledger[:4]:
+                label = str(item.get("label") or item.get("kind") or "").strip()
+                detail = str(item.get("detail") or "").strip()
+                if label and detail:
+                    ledger_parts.append(f"{label}: {detail}")
+                elif label:
+                    ledger_parts.append(label)
+            if ledger_parts:
+                lines.append("Recent notebook evidence: " + " | ".join(ledger_parts))
+
+        lines.extend(_build_workspace_guidance_lines(context_payload.get("workspace")))
 
     if tool_hints:
-        lines.append("工具策略: " + " ".join(tool_hints))
+        lines.append("Tool strategy: " + " ".join(tool_hints))
 
     if include_variables and context_payload.get("variables"):
         variable_parts = [
@@ -602,147 +882,16 @@ def _render_notebook_system_context(
             for key, value in list((context_payload.get("variables") or {}).items())[:8]
         ]
         if variable_parts:
-            lines.append("变量快照: " + " | ".join(variable_parts))
+            lines.append("Variable snapshot: " + " | ".join(variable_parts))
 
     lines.append(
-        "授权状态: " + (
-            "已授权，可直接操作 Notebook"
+        "Authorization: " + (
+            "granted. You may execute code and mutate the notebook when needed."
             if user_authorized
-            else "未授权，只能给建议，不能直接执行或改写 Notebook"
+            else "not granted. Do not execute code or mutate the notebook; provide code and instructions only."
         )
     )
     return "\n".join(lines).strip()
-
-
-def _looks_like_next_run_cell_question(message: str) -> bool:
-    text = str(message or "").strip().lower()
-    if not text:
-        return False
-    patterns = [
-        r"下一步.*运行.*cell",
-        r"下一步.*运行.*单元格",
-        r"运行哪个\s*cell",
-        r"运行哪个单元格",
-        r"先跑哪个",
-        r"接下来.*运行.*cell",
-        r"接下来.*运行.*单元格",
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _looks_like_fix_priority_question(message: str) -> bool:
-    text = str(message or "").strip().lower()
-    if not text:
-        return False
-    patterns = [
-        r"哪个\s*cell.*优先修复",
-        r"哪个单元格.*优先修复",
-        r"优先修复.*cell",
-        r"优先修复.*单元格",
-        r"先修哪个",
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _looks_like_issue_audit_question(message: str) -> bool:
-    text = str(message or "").strip().lower()
-    if not text:
-        return False
-    patterns = [
-        r"暴露.*问题",
-        r"系统问题",
-        r"哪里.*有问题",
-        r"当前.*问题",
-        r"当前状态.*问题",
-        r"有什么问题",
-        r"问题在哪里",
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _build_codelab_shortcut_answer(message: str, context_payload: Dict[str, Any]) -> Optional[str]:
-    if _looks_like_issue_audit_question(message):
-        issues: List[str] = []
-        cell_count = int(context_payload.get("cell_count") or 0)
-        code_cell_count = int(context_payload.get("code_cell_count") or 0)
-        execution_count = int(context_payload.get("execution_count") or 0)
-        workspace = context_payload.get("workspace") or {}
-        workspace_files = list(workspace.get("files") or [])
-        recent_outputs = list(context_payload.get("recent_outputs") or [])
-        history_health = context_payload.get("history_health") or {}
-        trailing_user_messages = int(history_health.get("trailing_user_messages") or 0)
-        assistant_code_responses = int(history_health.get("assistant_code_responses") or 0)
-        variables = context_payload.get("variables") or {}
-
-        if execution_count <= 0 and not recent_outputs:
-            issues.append(
-                f"Notebook 实体几乎没有推进：当前只有 {cell_count} 个单元格、其中 {code_cell_count} 个代码单元格，execution_count={execution_count}，没有任何已保存输出。"
-            )
-        if workspace_files and execution_count <= 0:
-            file_names = ", ".join(
-                str(item.get("name") or "")
-                for item in workspace_files[:3]
-                if str(item.get("name") or "").strip()
-            )
-            issues.append(
-                "上传文件已经在工作区里"
-                + (f"（{file_names}）" if file_names else "")
-                + "，但还没有进入任何已执行的数据链路。"
-            )
-        if assistant_code_responses > 0 and cell_count <= 1 and execution_count <= 0:
-            issues.append("聊天历史里已经出现了代码/方案回答，但 Notebook 本体没有新增对应单元格或执行痕迹，聊天结论和 Notebook 状态是脱节的。")
-        if trailing_user_messages > 0:
-            issues.append("历史里存在上一轮未闭合的用户请求，说明之前有一次响应中断、重载或未完整落库。")
-        if not variables:
-            issues.append("当前没有可复用的变量快照；这通常意味着代码还没真正执行，或者运行时状态已经丢失。")
-
-        if issues:
-            return "基于当前 notebook 状态，我看到的主要系统问题是：\n\n" + "\n".join(
-                f"{idx}. {issue}" for idx, issue in enumerate(issues, 1)
-            )
-
-    risky_cells = [
-        item
-        for item in list(context_payload.get("sandbox_risky_cells") or [])
-        if isinstance(item, dict)
-    ]
-    if not risky_cells:
-        return None
-
-    first_risky = risky_cells[0]
-    label = str(first_risky.get("label") or f"Cell {int(first_risky.get('cell_index', 0)) + 1}")
-    blocked_imports = ", ".join(list(first_risky.get("blocked_imports") or [])[:3]) or "禁用导入"
-    workspace = context_payload.get("workspace") or {}
-    workspace_files = list(workspace.get("files") or [])
-    file_names = ", ".join(str(item.get("name") or "") for item in workspace_files[:3] if str(item.get("name") or "").strip())
-    recent_error = (context_payload.get("focus") or {}).get("recent_error") or {}
-    recent_error_label = str(recent_error.get("label") or "").strip()
-    recent_error_summary = str(recent_error.get("error_summary") or "").strip()
-
-    if _looks_like_fix_priority_question(message):
-        answer = (
-            f"结论：优先修复 {label}。\n\n"
-            f"原因：它包含沙箱禁用导入 `{blocked_imports}`，而且它是后续数据链路的入口。"
-        )
-        if file_names:
-            answer += f" 当前上传文件已经存在：{file_names}。"
-        if recent_error_label and recent_error_summary:
-            answer += f" {recent_error_label} 的 `{recent_error_summary}` 更像是它未先修好导致的连锁报错。"
-        return answer
-
-    if _looks_like_next_run_cell_question(message):
-        answer = (
-            f"结论：当前不建议直接运行任何现有 cell。\n\n"
-            f"应先修复 {label}，因为它包含沙箱禁用导入 `{blocked_imports}`，直接运行大概率再次失败。"
-        )
-        if file_names:
-            answer += f" 上传文件 {file_names} 已经在工作区里，问题不在文件缺失，而在这个读取单元格的实现。"
-        answer += " 修复后，再从该单元格开始执行，后续单元格才能拿到所需变量。"
-        if recent_error_label and recent_error_summary:
-            answer += f" 当前最近报错 {recent_error_label} 的 `{recent_error_summary}` 属于后续连锁问题。"
-        return answer
-
-    return None
 
 
 _AGENT_MEMORY_PREF_KEY = "agent_memory"
@@ -1018,41 +1167,12 @@ async def notebook_agent_chat(
                 user_authorized=request.user_authorized,
                 workspace=workspace,
             )
-            shortcut_answer = _build_codelab_shortcut_answer(request.message, context_payload)
-            if shortcut_answer:
-                logger.info(
-                    "[CodeLabShortcut] notebook_id={} hit for message={}",
-                    notebook_id,
-                    _truncate_text(request.message, limit=120),
-                )
-                react_steps = [
-                    {
-                        "type": "thought",
-                        "iteration": 1,
-                        "content": "命中 CodeLab 决策型短路规则，直接根据 Notebook 状态给出结论。",
-                    }
-                ]
-                assistant_message = AgentMessage(
-                    id=str(uuid.uuid4()),
-                    role="assistant",
-                    content=shortcut_answer,
-                    code_blocks=[],
-                    timestamp=datetime.now().isoformat(),
-                    metadata={"react_steps": react_steps},
-                )
-                await save_agent_message(notebook_id, current_user.id, assistant_message)
-                response_state["assistant_message"] = assistant_message.model_dump()
-                response_state["react_steps"] = react_steps
-                yield f"data: {json.dumps({'type': 'answer', 'content': shortcut_answer})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'code_blocks': [], 'react_steps': react_steps})}\n\n"
-                return
-
             from app.services.agent_tools import ToolRegistry
             from app.services.react_agent import AgentRuntimeContext, create_react_agent
             from app.services.llm_service import get_llm_service
 
             logger.info(
-                "[CodeLabShortcut] notebook_id={} miss for message={}",
+                "[CodeLabAgent] notebook_id={} using notebook-state-first context for message={}",
                 notebook_id,
                 _truncate_text(request.message, limit=120),
             )
@@ -1081,6 +1201,8 @@ async def notebook_agent_chat(
                     user_id=current_user.id,
                     channel="codelab_agent",
                     notebook_id=notebook_id,
+                    scope_type="notebook",
+                    scope_id=str(notebook_id),
                 ),
             )
 
@@ -1090,13 +1212,19 @@ async def notebook_agent_chat(
                 include_variables=request.include_variables,
                 user_authorized=request.user_authorized,
             )
+            set_channel_system_context = getattr(agent, "set_channel_system_context", None)
+            if callable(set_channel_system_context):
+                set_channel_system_context(system_context)
             
-            # 调用 Agent - 注意: messages 构建已包含 system context
-            messages = [
-                {"role": "system", "content": system_context}
-            ]
-            
-            for msg in context_payload.get("recent_history_messages", []):
+            # 调用 Agent。CodeLab runtime context is promoted into the top-level
+            # system prompt so the generic context trimmer cannot drop it.
+            messages: List[Dict[str, str]] = []
+
+            recent_turns = (
+                ((context_payload.get("task_memory") or {}).get("recent_turns"))
+                or context_payload.get("recent_history_messages", [])
+            )
+            for msg in recent_turns:
                 messages.append({
                     "role": msg["role"],
                     "content": msg["content"]
@@ -1120,8 +1248,8 @@ async def notebook_agent_chat(
                     yield f"data: {json.dumps({'type': 'thought', 'content': event_data, 'iteration': current_iteration})}\n\n"
                 
                 elif event_type == "thinking":
-                    # 流式思考内容
-                    yield f"data: {json.dumps({'type': 'content', 'content': event_data})}\n\n"
+                    # Generic planning heartbeat. Keep it out of assistant answer text to avoid noisy repeated UI.
+                    continue
                 
                 elif event_type == "action":
                     # data 是字典 {"tool": "...", "input": {...}}
@@ -1200,6 +1328,12 @@ async def notebook_agent_chat(
                                                     position=len(notebook_model.cells),
                                                 )
                                                 notebook_model.cells.append(new_db_cell)
+                                                new_execution_count = new_cell.get('execution_count')
+                                                if new_execution_count is not None:
+                                                    notebook_model.execution_count = max(
+                                                        int(notebook_model.execution_count or 0),
+                                                        int(new_execution_count),
+                                                    )
                                                 await db_session.commit()
                                                 logger.info(f"[Agent] 新 Cell 已同步到数据库: {new_cell.get('id')}")
                                 
@@ -1211,7 +1345,8 @@ async def notebook_agent_chat(
                                         source=updated_cell.get('source'),
                                         cell_type=updated_cell.get('cell_type'),
                                         outputs=updated_cell.get('outputs'),
-                                        execution_count=updated_cell.get('execution_count')
+                                        execution_count=updated_cell.get('execution_count'),
+                                        metadata=updated_cell.get('metadata')
                                     )
                                     logger.info(f"[Agent] Cell 更新已同步到数据库: {updated_cell.get('id')}")
                                 

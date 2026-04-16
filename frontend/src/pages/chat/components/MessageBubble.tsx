@@ -1,4 +1,4 @@
-import { useMemo, useState, forwardRef, isValidElement, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, forwardRef, isValidElement, type ReactNode } from 'react'
 import { Button, Tooltip, Avatar, message } from 'antd'
 import {
   RobotOutlined,
@@ -10,6 +10,7 @@ import {
   ThunderboltOutlined,
   DownOutlined,
   UpOutlined,
+  EditOutlined,
 } from '@ant-design/icons'
 import { AnimatePresence, motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
@@ -22,6 +23,7 @@ import {
   type ConversationItemStream,
   type ConversationToolLedger,
   type ConversationTurnStore,
+  type MessageSpanRewriteResponse,
 } from '@/services/api'
 import CodeBlock from './CodeBlock'
 import ThinkingPanel from './ThinkingPanel'
@@ -38,6 +40,16 @@ interface MessageBubbleProps {
   streamingThought?: string
   isThinking?: boolean
   isHighlighted?: boolean
+  onRewriteSpan?: (
+    messageId: number,
+    payload: {
+      instruction: string
+      selected_text: string
+      before_context?: string
+      after_context?: string
+      occurrence_index?: number
+    },
+  ) => Promise<MessageSpanRewriteResponse>
 }
 
 interface CitationExplanationItem {
@@ -71,6 +83,265 @@ interface RagMetricCardItem {
 interface EnhancedTermParts {
   primary: string
   secondary: string
+}
+
+interface RewriteSelectionState {
+  selectedText: string
+  displayText: string
+  beforeContext: string
+  afterContext: string
+  occurrenceIndex: number
+  x: number
+  y: number
+}
+
+interface RewriteAnimationState {
+  oldContent: string
+  newContent: string
+  startOffset: number
+  endOffset: number
+  selectedText: string
+  replacementText: string
+}
+
+const SPAN_REWRITE_OPTIONS = [
+  {
+    label: '更简洁',
+    instruction: 'Make this selected span more concise while preserving facts and citation labels.',
+  },
+  {
+    label: '更清楚',
+    instruction: 'Make this selected span clearer and easier to read while preserving facts and citation labels.',
+  },
+  {
+    label: '更正式',
+    instruction: 'Make this selected span more formal while preserving facts and citation labels.',
+  },
+]
+
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+const findAllOccurrences = (content: string, selected: string): number[] => {
+  const positions: number[] = []
+  if (!selected) return positions
+  let index = content.indexOf(selected)
+  while (index >= 0) {
+    positions.push(index)
+    index = content.indexOf(selected, index + Math.max(selected.length, 1))
+  }
+  return positions
+}
+
+const countOccurrences = (content: string, selected: string): number => {
+  return findAllOccurrences(content, selected).length
+}
+
+const expandMarkdownSelectionScaffold = (
+  source: string,
+  startOffset: number,
+  endOffset: number,
+): { startOffset: number; endOffset: number } => {
+  let nextStart = startOffset
+  let nextEnd = endOffset
+  const lineStart = source.lastIndexOf('\n', Math.max(0, startOffset - 1)) + 1
+  const leading = source.slice(lineStart, startOffset)
+  const isLeadingScaffold = /^\s{0,3}(?:(?:#{1,6}\s+)|(?:[-*+]\s+)|(?:\d+[.)]\s+)|(?:>\s+))*[*_`~\s]*$/.test(leading)
+
+  if (leading && isLeadingScaffold) {
+    nextStart = lineStart
+  }
+
+  for (const token of ['***', '___', '**', '__', '~~', '`', '*', '_']) {
+    if (source.startsWith(token, nextEnd)) {
+      nextEnd += token.length
+      break
+    }
+  }
+
+  return { startOffset: nextStart, endOffset: nextEnd }
+}
+
+const shouldUseCharacterRewriteAnimation = (selectedText: string, replacementText: string): boolean => {
+  const combined = `${selectedText}\n${replacementText}`
+  if (combined.length > 360) return false
+  if (/[\n\r]/.test(combined)) return false
+  if (/(?:^|\n)\s{0,3}(?:#{1,6}|[-*+]|\d+[.)]|>)\s/.test(combined)) return false
+  if (/[*_`[\]]/.test(combined)) return false
+  return true
+}
+
+interface MarkdownVisibleTextIndex {
+  text: string
+  sourceOffsets: number[]
+}
+
+interface ResolvedRewriteSelection {
+  selectedText: string
+  displayText: string
+  beforeContext: string
+  afterContext: string
+  occurrenceIndex: number
+}
+
+const normalizeVisibleText = (value: string): string => {
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+const appendVisibleIndexChar = (
+  chars: string[],
+  offsets: number[],
+  char: string,
+  sourceOffset: number,
+) => {
+  if (/\s/.test(char)) {
+    if (chars.length > 0 && chars[chars.length - 1] !== ' ') {
+      chars.push(' ')
+      offsets.push(sourceOffset)
+    }
+    return
+  }
+  chars.push(char)
+  offsets.push(sourceOffset)
+}
+
+const findLineSyntaxEnd = (source: string, offset: number): number => {
+  const lineEnd = source.indexOf('\n', offset)
+  const end = lineEnd >= 0 ? lineEnd : source.length
+  const prefix = source.slice(offset, end)
+  const match = prefix.match(/^\s{0,3}(?:(?:#{1,6}|[-*+]|\d+[.)]|>)\s+|\[[ xX]\]\s+)/)
+  return match ? offset + match[0].length : offset
+}
+
+const buildMarkdownVisibleTextIndex = (source: string): MarkdownVisibleTextIndex => {
+  const chars: string[] = []
+  const sourceOffsets: number[] = []
+  let index = 0
+  let lineStart = true
+
+  while (index < source.length) {
+    if (lineStart) {
+      const nextIndex = findLineSyntaxEnd(source, index)
+      if (nextIndex > index) {
+        index = nextIndex
+      }
+      lineStart = false
+      if (index >= source.length) break
+    }
+
+    const char = source[index]
+    if (char === '\n') {
+      appendVisibleIndexChar(chars, sourceOffsets, ' ', index)
+      index += 1
+      lineStart = true
+      continue
+    }
+
+    if (source.startsWith('![', index)) {
+      index += 2
+      continue
+    }
+
+    if (char === '[') {
+      const closeBracket = source.indexOf(']', index + 1)
+      if (closeBracket >= 0 && source[closeBracket + 1] === '(') {
+        index += 1
+        continue
+      }
+    }
+
+    if (char === ']' && source[index + 1] === '(') {
+        const closeIndex = source.indexOf(')', index + 2)
+        index = closeIndex >= 0 ? closeIndex + 1 : index + 1
+        continue
+    }
+
+    if (
+      source.startsWith('***', index) ||
+      source.startsWith('___', index)
+    ) {
+      index += 3
+      continue
+    }
+    if (
+      source.startsWith('**', index) ||
+      source.startsWith('__', index) ||
+      source.startsWith('~~', index)
+    ) {
+      index += 2
+      continue
+    }
+    if (char === '*' || char === '_' || char === '`') {
+      index += 1
+      continue
+    }
+
+    appendVisibleIndexChar(chars, sourceOffsets, char, index)
+    index += 1
+  }
+
+  while (chars.length > 0 && chars[chars.length - 1] === ' ') {
+    chars.pop()
+    sourceOffsets.pop()
+  }
+
+  return {
+    text: chars.join(''),
+    sourceOffsets,
+  }
+}
+
+const resolveRewriteSelectionFromMarkdown = (
+  source: string,
+  renderedSelectedText: string,
+  renderedBeforeText: string,
+): ResolvedRewriteSelection | null => {
+  const exactOccurrences = findAllOccurrences(source, renderedSelectedText)
+  if (exactOccurrences.length > 0) {
+    const renderedOccurrenceIndex = countOccurrences(renderedBeforeText, renderedSelectedText)
+    const occurrenceIndex = Math.min(renderedOccurrenceIndex, exactOccurrences.length - 1)
+    const sourceStart = exactOccurrences[occurrenceIndex]
+    const sourceEnd = sourceStart + renderedSelectedText.length
+    return {
+      selectedText: renderedSelectedText,
+      displayText: renderedSelectedText,
+      beforeContext: source.slice(Math.max(0, sourceStart - 600), sourceStart),
+      afterContext: source.slice(sourceEnd, sourceEnd + 600),
+      occurrenceIndex,
+    }
+  }
+
+  const normalizedSelected = normalizeVisibleText(renderedSelectedText)
+  if (!normalizedSelected) return null
+
+  const visibleIndex = buildMarkdownVisibleTextIndex(source)
+  const matchPositions = findAllOccurrences(visibleIndex.text, normalizedSelected)
+  if (matchPositions.length === 0) {
+    return null
+  }
+
+  const normalizedBeforeLength = normalizeVisibleText(renderedBeforeText).length
+  const visibleStart = matchPositions.reduce((best, current) =>
+    Math.abs(current - normalizedBeforeLength) < Math.abs(best - normalizedBeforeLength)
+      ? current
+      : best,
+  )
+  const visibleEnd = visibleStart + normalizedSelected.length
+  const sourceStart = visibleIndex.sourceOffsets[visibleStart]
+  const sourceEnd = (visibleIndex.sourceOffsets[visibleEnd - 1] ?? sourceStart) + 1
+  if (sourceStart == null || sourceEnd <= sourceStart) {
+    return null
+  }
+
+  const expanded = expandMarkdownSelectionScaffold(source, sourceStart, sourceEnd)
+  const selectedText = source.slice(expanded.startOffset, expanded.endOffset)
+  const occurrenceIndex = Math.max(0, countOccurrences(source.slice(0, expanded.startOffset), selectedText))
+  return {
+    selectedText,
+    displayText: renderedSelectedText,
+    beforeContext: source.slice(Math.max(0, expanded.startOffset - 600), expanded.startOffset),
+    afterContext: source.slice(expanded.endOffset, expanded.endOffset + 600),
+    occurrenceIndex,
+  }
 }
 
 const parseRagMetrics = (value: unknown): RagMetrics | null => {
@@ -275,10 +546,10 @@ const renderCitationScope = (scope: Record<string, unknown> | undefined): string
     ? scope.document_ids.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0)
     : []
   if (documentIds.length > 0) {
-    return `直达文档 ${documentIds.join(', ')}`
+    return `直达文档 ${documentIds.length} 个`
   }
   if (knowledgeBaseIds.length > 0) {
-    return `知识库 ${knowledgeBaseIds.join(', ')}`
+    return `指定知识库 ${knowledgeBaseIds.length} 个`
   }
   if (scopeMode === 'knowledge_base') {
     return '指定知识库'
@@ -416,11 +687,19 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       streamingContent = '',
       isThinking = false,
       isHighlighted = false,
+      onRewriteSpan,
     },
     ref
   ) => {
     const isUser = msg.role === 'user'
-    const content = isStreaming ? streamingContent : msg.content
+    const baseContent = isStreaming ? streamingContent : msg.content
+    const contentRef = useRef<HTMLDivElement | null>(null)
+    const [rewriteSelection, setRewriteSelection] = useState<RewriteSelectionState | null>(null)
+    const [customRewriteInstruction, setCustomRewriteInstruction] = useState('')
+    const [rewriteLoading, setRewriteLoading] = useState(false)
+    const [rewriteAnimation, setRewriteAnimation] = useState<RewriteAnimationState | null>(null)
+    const [animatedContent, setAnimatedContent] = useState<string | null>(null)
+    const content = animatedContent ?? baseContent
     const turnId = useMemo(() => deriveMessageTurnId(msg, turnStore), [msg, turnStore])
     const historySteps = useMemo(
       () => (isStreaming ? [] : deriveHistorySteps(itemStream, turnId)),
@@ -473,9 +752,137 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       [ragMetrics]
     )
 
+    useEffect(() => {
+      if (!rewriteAnimation) return
+      let cancelled = false
+
+      const runAnimation = async () => {
+        const {
+          oldContent,
+          newContent,
+          startOffset,
+          endOffset,
+          selectedText,
+          replacementText,
+        } = rewriteAnimation
+        const prefix = oldContent.slice(0, startOffset)
+        const suffix = oldContent.slice(endOffset)
+        if (!shouldUseCharacterRewriteAnimation(selectedText, replacementText)) {
+          setAnimatedContent(oldContent)
+          await sleep(90)
+          if (cancelled) return
+          setAnimatedContent(newContent)
+          await sleep(180)
+          if (cancelled) return
+          setAnimatedContent(null)
+          setRewriteAnimation(null)
+          return
+        }
+
+        const deleteStep = Math.max(1, Math.ceil(selectedText.length / 18))
+        const typeStep = Math.max(1, Math.ceil(replacementText.length / 30))
+
+        for (let length = selectedText.length; length > 0; length -= deleteStep) {
+          if (cancelled) return
+          const nextSpan = selectedText.slice(0, Math.max(0, length - deleteStep))
+          setAnimatedContent(prefix + nextSpan + suffix)
+          await sleep(16)
+        }
+
+        await sleep(90)
+
+        for (let length = 0; length < replacementText.length; length += typeStep) {
+          if (cancelled) return
+          const nextSpan = replacementText.slice(0, Math.min(replacementText.length, length + typeStep))
+          setAnimatedContent(prefix + nextSpan + suffix)
+          await sleep(18)
+        }
+
+        if (cancelled) return
+        setAnimatedContent(null)
+        setRewriteAnimation(null)
+      }
+
+      void runAnimation()
+      return () => {
+        cancelled = true
+      }
+    }, [rewriteAnimation])
+
     const handleCopy = () => {
       navigator.clipboard.writeText(content)
       message.success('已复制到剪贴板')
+    }
+
+    const handleCaptureRewriteSelection = () => {
+      if (isUser || isStreaming || rewriteLoading || rewriteAnimation || !onRewriteSpan) return
+      const selection = window.getSelection()
+      if (!selection || selection.rangeCount <= 0 || selection.isCollapsed) return
+      const range = selection.getRangeAt(0)
+      const container = contentRef.current
+      if (!container || !container.contains(range.commonAncestorContainer)) return
+
+      const selectedText = selection.toString()
+      if (selectedText.trim().length < 2) return
+      if (selectedText.length > 4000) {
+        message.warning('选区太长，请缩小后再改写')
+        return
+      }
+
+      const preRange = range.cloneRange()
+      preRange.selectNodeContents(container)
+      preRange.setEnd(range.startContainer, range.startOffset)
+      const renderedBefore = preRange.toString()
+      const currentContent = String(baseContent || '')
+      const resolvedSelection = resolveRewriteSelectionFromMarkdown(
+        currentContent,
+        selectedText,
+        renderedBefore,
+      )
+      if (!resolvedSelection) {
+        message.warning('这个选区暂时无法映射到原始 Markdown，请缩小选区后重试')
+        return
+      }
+
+      const rect = range.getBoundingClientRect()
+
+      setRewriteSelection({
+        ...resolvedSelection,
+        x: Math.min(Math.max(rect.left + rect.width / 2, 180), window.innerWidth - 180),
+        y: Math.max(rect.top - 12, 72),
+      })
+    }
+
+    const runRewrite = async (instruction: string) => {
+      if (!rewriteSelection || !onRewriteSpan) return
+      const normalizedInstruction = instruction.trim()
+      if (!normalizedInstruction) {
+        message.warning('请输入改写要求')
+        return
+      }
+      setRewriteLoading(true)
+      try {
+        const response = await onRewriteSpan(msg.id, {
+          instruction: normalizedInstruction,
+          selected_text: rewriteSelection.selectedText,
+          before_context: rewriteSelection.beforeContext,
+          after_context: rewriteSelection.afterContext,
+          occurrence_index: rewriteSelection.occurrenceIndex,
+        })
+        setRewriteSelection(null)
+        setCustomRewriteInstruction('')
+        setAnimatedContent(response.old_content)
+        setRewriteAnimation({
+          oldContent: response.old_content,
+          newContent: response.new_content,
+          startOffset: response.start_offset,
+          endOffset: response.end_offset,
+          selectedText: response.selected_text,
+          replacementText: response.replacement_text,
+        })
+      } finally {
+        setRewriteLoading(false)
+      }
     }
     const timeLabel = new Date(msg.created_at).toLocaleTimeString('zh-CN', {
       hour: '2-digit',
@@ -486,7 +893,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       ? 'flex min-w-0 flex-1 flex-col items-end'
       : 'flex min-w-0 flex-1 flex-col'
     const userBubbleShellClass = 'inline-flex max-w-[min(76%,720px)] flex-col items-end'
-    const assistantBubbleWidthClass = 'w-full max-w-[min(100%,860px)]'
+    const assistantBubbleWidthClass = 'w-full max-w-[min(100%,920px)]'
     const hasAssistantPrelude =
       showHistoryPrelude && !isUser && !isStreaming && (historySteps.length > 0 || String(thought || '').trim().length > 0)
     const normalizedContent = String(content || '').trim()
@@ -617,7 +1024,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
             </div>
           ) : (
             <div className={assistantBubbleWidthClass}>
-              <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-6 pt-5 pb-6 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_30px_rgba(2,6,23,0.18)]">
+              <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-8 pt-7 pb-8 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_40px_rgba(2,6,23,0.22)]">
                   {hasAssistantPrelude && (
                     <div className="mb-3 space-y-3 border-b border-white/[0.04] pb-3">
                       {historySteps.length > 0 && (
@@ -639,20 +1046,21 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                   {content ? (
                     <>
                       <div
+                        ref={contentRef}
+                        onMouseUp={handleCaptureRewriteSelection}
                         className="prose prose-invert prose-slate max-w-none
-                        [&>*:first-child]:mt-0 [&>*:last-child]:mb-0
-                        prose-p:my-3 prose-p:text-base prose-p:leading-8 prose-p:text-slate-100
-                        prose-headings:mt-6 prose-headings:mb-3 prose-headings:text-white prose-headings:font-semibold
-                        prose-h1:text-xl prose-h2:text-lg prose-h3:text-base
-                        prose-pre:my-4 prose-pre:bg-slate-950/90 prose-pre:border prose-pre:border-slate-700/60 prose-pre:rounded-xl
+                        [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_li>p]:my-1
+                        prose-p:my-6 prose-p:text-[16px] prose-p:leading-[1.95] prose-p:tracking-[0.004em] prose-p:text-slate-200/90
+                        prose-headings:text-white prose-headings:font-semibold prose-headings:tracking-[-0.03em]
+                        prose-pre:my-6 prose-pre:bg-slate-950/90 prose-pre:border prose-pre:border-slate-700/60 prose-pre:rounded-xl
                         prose-code:text-emerald-200 prose-code:bg-white/[0.06] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:text-sm prose-code:font-mono
-                        prose-strong:text-white prose-strong:font-semibold
+                        prose-strong:text-white prose-strong:font-bold
                         prose-em:text-slate-200 prose-em:italic
                         prose-a:text-emerald-300 prose-a:no-underline hover:prose-a:text-emerald-200 hover:prose-a:underline
-                        prose-blockquote:border-l-4 prose-blockquote:border-slate-600 prose-blockquote:bg-slate-950/60 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:not-italic prose-blockquote:rounded-r-lg
-                        prose-hr:border-slate-700 prose-hr:my-6
-                        prose-table:border prose-table:border-slate-700 prose-th:bg-slate-800 prose-th:px-3 prose-th:py-2 prose-td:px-3 prose-td:py-2 prose-td:border-t prose-td:border-slate-700
-                        text-base leading-7"
+                        prose-blockquote:border-l-4 prose-blockquote:border-emerald-500/30 prose-blockquote:bg-emerald-500/5 prose-blockquote:py-3 prose-blockquote:px-5 prose-blockquote:not-italic prose-blockquote:rounded-r-lg
+                        prose-hr:border-white/[0.06] prose-hr:my-8
+                        prose-table:border prose-table:border-white/[0.06] prose-th:bg-slate-800/50 prose-th:px-4 prose-th:py-3 prose-td:px-4 prose-td:py-3 prose-td:border-t prose-td:border-white/[0.06]
+                        text-base leading-8"
                       >
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
@@ -660,10 +1068,42 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                             code: ({ className, children }) => (
                               <CodeBlock className={className}>{children}</CodeBlock>
                             ),
+                            h1: ({ children, ...props }) => (
+                              <h1
+                                {...props}
+                                className="mt-12 mb-7 text-[30px] font-semibold leading-[1.14] tracking-[-0.045em] text-white"
+                              >
+                                {children}
+                              </h1>
+                            ),
+                            h2: ({ children, ...props }) => (
+                              <h2
+                                {...props}
+                                className="relative mt-12 mb-7 pl-4 text-[25px] font-semibold leading-[1.22] tracking-[-0.04em] text-white before:absolute before:left-0 before:top-1 before:h-[calc(100%-0.35rem)] before:w-1 before:rounded-full before:bg-emerald-300/70 before:shadow-[0_0_18px_rgba(110,231,183,0.45)] before:content-['']"
+                              >
+                                {children}
+                              </h2>
+                            ),
+                            h3: ({ children, ...props }) => (
+                              <h3
+                                {...props}
+                                className="mt-10 mb-5 text-[20px] font-semibold leading-[1.32] tracking-[-0.025em] text-slate-50"
+                              >
+                                {children}
+                              </h3>
+                            ),
+                            p: ({ children, ...props }) => (
+                              <p
+                                {...props}
+                                className="my-6 text-[16px] leading-[1.95] tracking-[0.004em] text-slate-200/90"
+                              >
+                                {children}
+                              </p>
+                            ),
                             ul: ({ children, ...props }) => (
                               <ul
                                 {...props}
-                                className="my-3 list-outside list-disc pl-6 text-slate-100 [padding-inline-start:1.5rem]"
+                                className="my-6 list-outside list-disc space-y-3 pl-7 text-slate-100 [padding-inline-start:1.75rem]"
                               >
                                 {children}
                               </ul>
@@ -671,13 +1111,16 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                             ol: ({ children, ...props }) => (
                               <ol
                                 {...props}
-                                className="my-3 list-outside list-decimal pl-6 text-slate-100 [padding-inline-start:1.5rem]"
+                                className="my-6 list-outside list-decimal space-y-3 pl-7 text-slate-100 [padding-inline-start:1.75rem]"
                               >
                                 {children}
                               </ol>
                             ),
                             li: ({ children, ...props }) => (
-                              <li {...props} className="my-1 pl-1 text-slate-100 marker:text-slate-400">
+                              <li
+                                {...props}
+                                className="my-2.5 pl-2 text-[16px] leading-[1.9] text-slate-100 marker:font-semibold marker:text-emerald-300/70"
+                              >
                                 {children}
                               </li>
                             ),
@@ -820,6 +1263,19 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
                   {/* 操作栏 */}
                       {!isStreaming && content && (
                     <div className="mt-5 flex items-center gap-3 border-t border-white/[0.04] pt-4">
+                      {!isUser && onRewriteSpan && (
+                        <Tooltip title="选中回复中的一段文字后改写">
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<EditOutlined />}
+                            onClick={() => message.info('请先在这条回复里选中需要改写的一段文字')}
+                            className="rounded-lg text-slate-400 transition-all hover:bg-white/[0.04] hover:text-cyan-300"
+                          >
+                            局部改写
+                          </Button>
+                        </Tooltip>
+                      )}
                       <Tooltip title="复制内容">
                         <Button
                           type="text"
@@ -840,6 +1296,76 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
             </div>
           )}
         </div>
+
+        <AnimatePresence>
+          {rewriteSelection && !isUser && !isStreaming && (
+            <motion.div
+              initial={{ opacity: 0, y: 8, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 6, scale: 0.96 }}
+              transition={{ duration: 0.16, ease: 'easeOut' }}
+              className="fixed z-[80] w-[360px] rounded-2xl border border-cyan-300/20 bg-slate-950/95 p-3 shadow-[0_22px_70px_rgba(2,6,23,0.58)] backdrop-blur-xl"
+              style={{
+                left: Math.min(Math.max(rewriteSelection.x - 180, 16), window.innerWidth - 376),
+                top: Math.max(rewriteSelection.y - 178, 16),
+              }}
+            >
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-xs font-medium text-cyan-100">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-cyan-400/10 text-cyan-200">
+                    <EditOutlined />
+                  </span>
+                  局部改写选区
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setRewriteSelection(null)}
+                  className="rounded-full px-2 py-1 text-xs text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200"
+                >
+                  取消
+                </button>
+              </div>
+              <div className="mb-2 max-h-16 overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.04] px-3 py-2 text-xs leading-5 text-slate-300">
+                {rewriteSelection.displayText}
+              </div>
+              <div className="mb-2 flex flex-wrap gap-2">
+                {SPAN_REWRITE_OPTIONS.map((option) => (
+                  <button
+                    key={option.label}
+                    type="button"
+                    disabled={rewriteLoading}
+                    onClick={() => void runRewrite(option.instruction)}
+                    className="rounded-full border border-cyan-300/15 bg-cyan-400/10 px-3 py-1.5 text-xs text-cyan-100 transition-all hover:border-cyan-300/35 hover:bg-cyan-300/16 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  value={customRewriteInstruction}
+                  onChange={(event) => setCustomRewriteInstruction(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault()
+                      void runRewrite(customRewriteInstruction)
+                    }
+                  }}
+                  placeholder="自定义要求，例如：更像论文摘要"
+                  className="min-w-0 flex-1 rounded-xl border border-white/[0.08] bg-slate-900/90 px-3 py-2 text-xs text-slate-100 outline-none transition-colors placeholder:text-slate-600 focus:border-cyan-300/40"
+                />
+                <button
+                  type="button"
+                  disabled={rewriteLoading}
+                  onClick={() => void runRewrite(customRewriteInstruction)}
+                  className="rounded-xl bg-cyan-300 px-3 py-2 text-xs font-semibold text-slate-950 transition-all hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {rewriteLoading ? '改写中' : '应用'}
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </motion.div>
     )
   }

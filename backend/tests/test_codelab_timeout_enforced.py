@@ -23,3 +23,22 @@ def test_codelab_executor_enforces_hard_timeout():
     finally:
         executor.close()
 
+
+def test_codelab_executor_preserves_last_line_inside_except_block():
+    executor = CodeLabExecutor(notebook_id="test-control-flow", hard_timeout_seconds=3)
+    try:
+        result = executor.execute(
+            "try:\n"
+            "    missing_helper()\n"
+            "except NameError as e:\n"
+            "    print('fallback reached')",
+            timeout_seconds=2,
+        )
+        assert result["success"] is True
+        assert result["terminated_reason"] == "none"
+        assert any(
+            output.get("output_type") == "stream" and "fallback reached" in str(output.get("content") or "")
+            for output in list(result.get("outputs") or [])
+        )
+    finally:
+        executor.close()

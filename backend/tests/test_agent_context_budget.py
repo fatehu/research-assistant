@@ -99,12 +99,89 @@ async def test_context_budget_trims_observation_after_first_user_turn(monkeypatc
 
     trimmed = await agent._prepare_llm_messages(context, system_prompt="system")
     roles = [str(item.get("role", "")).lower() for item in trimmed]
+    tool_contents = [
+        str(item.get("content", ""))
+        for item in trimmed
+        if str(item.get("role", "")).lower() == "tool"
+    ]
 
     assert "user" in roles
-    assert "tool" not in roles
+    assert "tool" in roles
+    assert any("system-compression-truncated" in content for content in tool_contents)
     assert context.context_truncated is True
     assert context.context_debug["context_truncated"] is True
     assert context.context_debug["message_count_sent"] == len(trimmed)
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_messages_compresses_older_history_instead_of_silent_drop(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_budget_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_max_input_tokens", 4096)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 2)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_summary_trigger_tokens", 999999)
+
+    agent = ReActAgent(_BudgetLLM(), _BudgetTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[
+            {"role": "user", "content": "第1轮问题：定义 agentic search。"},
+            {"role": "assistant", "content": "第1轮回答。"},
+            {"role": "user", "content": "第2轮问题：和 RAG 的区别。"},
+            {"role": "assistant", "content": "第2轮回答。"},
+            {"role": "user", "content": "第3轮问题：为什么最近又火了？"},
+            {"role": "assistant", "content": "第3轮回答。"},
+            {"role": "user", "content": "第4轮问题：给我一个直观解释。"},
+        ]
+    )
+
+    prepared = await agent._prepare_llm_messages(context, system_prompt="system")
+    system_texts = [
+        str(item.get("content", ""))
+        for item in prepared
+        if str(item.get("role", "")).lower() == "system"
+    ]
+
+    assert any(text.startswith("更早历史系统压缩：") for text in system_texts)
+    assert context.context_truncated is True
+    assert context.context_debug["system_compression_message_count"] >= 1
+    assert "第1轮问题" in str(context.context_debug.get("older_history_summary", ""))
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_messages_compresses_recent_history_before_dropping_assistant_user(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_budget_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_max_input_tokens", 520)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 8)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
+    monkeypatch.setattr(settings, "agent_context_preserve_recent_turns", 2)
+
+    agent = ReActAgent(_BudgetLLM(), _BudgetTools(), max_iterations=1)
+    long_tail = "A" * 900
+    context = AgentContext(
+        messages=[
+            {"role": "user", "content": f"第1轮问题：{long_tail}"},
+            {"role": "assistant", "content": f"第1轮回答：{long_tail}"},
+            {"role": "user", "content": f"第2轮问题：{long_tail}"},
+            {"role": "assistant", "content": f"第2轮回答：{long_tail}"},
+            {"role": "user", "content": f"第3轮问题：{long_tail}"},
+            {"role": "assistant", "content": f"第3轮回答：{long_tail}"},
+            {"role": "user", "content": "当前问题：最后给一个结论。"},
+        ]
+    )
+
+    prepared = await agent._prepare_llm_messages(context, system_prompt="system")
+    prepared_text = "\n".join(str(item.get("content", "")) for item in prepared)
+    current_messages = [
+        item for item in prepared if str(item.get("role", "")).lower() in {"user", "assistant"}
+    ]
+
+    assert "近期历史系统压缩：" in prepared_text or "临近上下文历史系统压缩：" in prepared_text
+    assert any("当前问题：最后给一个结论。" in str(item.get("content", "")) for item in prepared)
+    assert not any(
+        str(item.get("role", "")).lower() == "assistant" and "第1轮回答" in str(item.get("content", ""))
+        for item in current_messages
+    )
+    assert context.context_debug["system_compression_message_count"] >= 1
 
 
 @pytest.mark.asyncio

@@ -3481,7 +3481,7 @@ class ToolRegistry:
     def classify_codelab_intent(cls, user_text: str) -> str:
         text = str(user_text or "").lower()
         if not text.strip():
-            return "general_chat"
+            return "code_task"
 
         if any(token in text for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
             return "literature_task"
@@ -3557,7 +3557,40 @@ class ToolRegistry:
             return "code_task"
         if explicit_knowledge:
             return "knowledge_query"
-        return "general_chat"
+        return "code_task"
+
+    def _select_codelab_tool_names(self, user_text: str = "") -> List[str]:
+        text = str(user_text or "")
+        selected: Set[str] = set(self._CODELAB_NOTEBOOK_BASE_TOOLS)
+        selected.update(name for name in self._fallback_tools() if name in self._CODELAB_FALLBACK_ALLOWLIST)
+
+        if self._has_codelab_explicit_knowledge_request(text):
+            selected.add("knowledge_search")
+
+        if self._has_codelab_explicit_web_request(text):
+            selected.update({"web_search", "web_scrape"})
+
+        lowered = text.lower()
+        if any(token in lowered for token in ["论文", "文献", "paper", "arxiv", "pubmed", "citation"]):
+            selected.add("literature_search")
+
+        if not self.user_authorized:
+            selected.difference_update(self._CODELAB_NOTEBOOK_MUTATION_TOOLS)
+
+        for tool in self._iter_all_tools():
+            if not tool.name.startswith("mcp."):
+                continue
+            if "web_search" in selected or "web_scrape" in selected:
+                if self._mcp_tool_matches_intent(tool, "web_query"):
+                    selected.add(tool.name)
+            if "knowledge_search" in selected:
+                if self._mcp_tool_matches_intent(tool, "knowledge_query"):
+                    selected.add(tool.name)
+            if "literature_search" in selected:
+                if self._mcp_tool_matches_intent(tool, "literature_task"):
+                    selected.add(tool.name)
+
+        return [tool.name for tool in self._iter_all_tools() if tool.name in selected]
 
     @staticmethod
     def _parse_csv_names(value: str) -> Set[str]:
@@ -3682,9 +3715,19 @@ class ToolRegistry:
             return "code_task"
         return self.classify_intent(user_text)
 
+    def select_tool_names_for_user_text(self, user_text: str = "") -> List[str]:
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB:
+            return self._select_codelab_tool_names(user_text)
+        if not self._uses_intent_tool_filtering():
+            return [tool.name for tool in self._iter_all_tools()]
+        return self.select_tool_names_for_intent(self.resolve_intent(user_text), user_text=user_text)
+
     def select_tool_names_for_intent(self, intent: str, user_text: str = "") -> List[str]:
         if not self._uses_intent_tool_filtering():
             return [tool.name for tool in self._iter_all_tools()]
+
+        if self.route_profile == self._ROUTE_PROFILE_CODELAB:
+            return self._select_codelab_tool_names(user_text)
 
         intent_tool_map = self._intent_tool_map_for_profile()
         notebook_local_file_task = bool(

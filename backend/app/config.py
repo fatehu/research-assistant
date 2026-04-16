@@ -258,6 +258,8 @@ class Settings(BaseSettings):
     agent_context_model_window_overrides: str = "{}"
     agent_context_window_turns: int = 8
     agent_context_recently_slid_turns: int = 2
+    agent_context_preserve_recent_turns: int = 2
+    agent_pre_turn_compaction_enabled: bool = True
     agent_context_anchor_enabled: bool = True
     agent_context_anchor_max_items: int = 3
     agent_context_summary_trigger_tokens: int = 7000
@@ -309,6 +311,7 @@ class Settings(BaseSettings):
     kernel_idle_timeout: int = 7200
     codelab_sandbox_enabled: bool = True
     codelab_exec_timeout_hard_seconds: int = 20
+    codelab_background_inline_wait_seconds: float = 8.0
     codelab_max_concurrency_per_user: int = 2
     codelab_direct_execute_enabled: bool = False
     cors_allow_origins: str = "http://localhost:3000,http://127.0.0.1:3000"

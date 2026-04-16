@@ -28,9 +28,9 @@ const CodeLabPage = () => {
     currentNotebook, setCurrentNotebook,
     selectedCellIndex, setSelectedCellIndex,
     runningCells, isLoading, isSaving,
-    loadNotebook, saveNotebook, setTitle,
+    loadNotebook, refreshNotebook, saveNotebook, setTitle,
     // Cell 操作
-    runCell, runAllCells, restartKernel,
+    runCell, runAllCells, restartKernel, interruptRunningExecution, cancelBackgroundExecution,
     updateCell, addCell, deleteCell, toggleCellType, moveCell,
     // Agent 回调
     handleAgentInsertCode, handleAgentRunCode, handleAgentFocusCell,
@@ -102,6 +102,8 @@ const CodeLabPage = () => {
       onSelectCell={setSelectedCellIndex}
       onRunCell={runCell}
       onRunAllCells={runAllCells}
+      onInterruptRunningExecution={interruptRunningExecution}
+      onCancelBackgroundExecution={cancelBackgroundExecution}
       onRestartKernel={restartKernel}
       onSave={saveNotebook}
       onDeleteCell={deleteCell}
@@ -117,7 +119,7 @@ const CodeLabPage = () => {
       onAgentClearOutputs={handleAgentClearOutputs}
       onAgentAddCell={handleAgentAddCell}
       onAgentUpdateCell={handleAgentUpdateCell}
-      onRefreshNotebook={() => loadNotebook(currentNotebook.id)}
+      onRefreshNotebook={() => refreshNotebook(currentNotebook.id)}
     />
   )
 }

@@ -55,6 +55,7 @@ const ChatPage = () => {
     currentTurnId,
     selectConversation,
     sendMessage,
+    rewriteMessageSpan,
     compactConversationContext,
     stopGeneration,
     clearCurrentConversation,
@@ -342,6 +343,7 @@ const ChatPage = () => {
         currentToolCall={currentToolCall}
         currentTurnId={currentTurnId}
         highlightedMessageId={highlightedMessageId}
+        onRewriteSpan={rewriteMessageSpan}
         onQuickPrompt={handleQuickPrompt}
         onReload={handleReload}
       />

@@ -555,7 +555,50 @@ def test_codelab_followup_only_message_stays_in_code_task(monkeypatch):
     assert "web_search" not in selected
 
 
-def test_codelab_general_chat_without_authorization_does_not_auto_mount_notebook_tools(monkeypatch):
+def test_codelab_explicit_web_request_adds_web_tools_without_dropping_notebook_tools(monkeypatch):
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
+    monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
+
+    class _Provider:
+        def build_default_tools(self, ctx):
+            return [
+                _fake_tool("calculator"),
+                _fake_tool("datetime"),
+                _fake_tool("text_analysis"),
+                _fake_tool("unit_converter"),
+                _fake_tool("web_search"),
+                _fake_tool("web_scrape"),
+            ]
+
+        def build_notebook_tools(self, ctx):
+            return [
+                _fake_tool("notebook_execute"),
+                _fake_tool("notebook_variables"),
+                _fake_tool("notebook_cell"),
+                _fake_tool("notebook_cleanup"),
+                _fake_tool("pip_install"),
+                _fake_tool("code_analysis"),
+            ]
+
+    registry = agent_tools.ToolRegistry(
+        db=object(),
+        user_id=1,
+        notebook_id="nb-explicit-web",
+        kernel_manager=object(),
+        notebooks_store={},
+        user_authorized=True,
+        tool_provider=_Provider(),
+        route_profile="codelab",
+    )
+
+    selected = set(registry.select_tool_names_for_user_text("先查看当前 notebook，再联网搜一下这个报错"))
+    assert "notebook_cell" in selected
+    assert "notebook_variables" in selected
+    assert "web_search" in selected
+    assert "web_scrape" in selected
+
+
+def test_codelab_default_selection_without_authorization_keeps_read_only_notebook_tools(monkeypatch):
     monkeypatch.setattr(agent_tools.settings, "tool_selection_enabled", True)
     monkeypatch.setattr(agent_tools.settings, "tool_selection_fallback_tools", "datetime,calculator")
 
@@ -589,12 +632,13 @@ def test_codelab_general_chat_without_authorization_does_not_auto_mount_notebook
         route_profile="codelab",
     )
 
-    selected = set(registry.select_tool_names_for_intent("general_chat", user_text="你好"))
+    selected = set(registry.select_tool_names_for_user_text("你好"))
     assert "datetime" in selected
     assert "calculator" in selected
     assert "notebook_execute" not in selected
-    assert "notebook_variables" not in selected
-    assert "notebook_cell" not in selected
+    assert "notebook_variables" in selected
+    assert "notebook_cell" in selected
+    assert "code_analysis" in selected
 
 
 def test_codelab_code_task_without_authorization_strips_mutation_tools(monkeypatch):

@@ -20,6 +20,7 @@ import threading
 import queue
 import traceback
 import time
+import ast
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
@@ -41,6 +42,7 @@ from app.services.notebook_agent_history_service import (
 )
 from app.services.agent_runtime_service import get_agent_runtime_service
 from app.services.codelab_executor import CodeLabExecutor, RunnerUnavailableError
+from app.services.notebook_background_execution_service import get_notebook_background_execution_manager
 from app.services.notebook_workspace_service import (
     build_notebook_workspace_context,
     delete_notebook_workspace,
@@ -52,6 +54,60 @@ from app.services.notebook_workspace_service import (
 from app.config import settings
 
 router = APIRouter()
+
+
+def _split_top_level_last_expression(code: str) -> tuple[str, Optional[str]]:
+    source = str(code or "")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, None
+
+    body = list(getattr(tree, "body", []) or [])
+    if not body or not isinstance(body[-1], ast.Expr):
+        return source, None
+
+    last_stmt = body[-1]
+    start_line = getattr(last_stmt, "lineno", None)
+    end_line = getattr(last_stmt, "end_lineno", None)
+    start_col = getattr(last_stmt, "col_offset", None)
+    end_col = getattr(last_stmt, "end_col_offset", None)
+    if None in {start_line, end_line, start_col, end_col}:
+        return source, None
+
+    lines = source.splitlines(keepends=True)
+    if not (
+        isinstance(start_line, int)
+        and isinstance(end_line, int)
+        and 1 <= start_line <= len(lines)
+        and 1 <= end_line <= len(lines)
+    ):
+        return source, None
+
+    expr_parts: List[str] = []
+    if start_line == end_line:
+        expr_parts.append(lines[start_line - 1][start_col:end_col])
+    else:
+        expr_parts.append(lines[start_line - 1][start_col:])
+        for idx in range(start_line, end_line - 1):
+            expr_parts.append(lines[idx])
+        expr_parts.append(lines[end_line - 1][:end_col])
+    expr_code = "".join(expr_parts)
+    if not expr_code.strip():
+        return source, None
+
+    rewritten_lines = list(lines)
+    if start_line == end_line:
+        rewritten_lines[start_line - 1] = (
+            lines[start_line - 1][:start_col] + lines[start_line - 1][end_col:]
+        )
+    else:
+        rewritten_lines[start_line - 1] = lines[start_line - 1][:start_col]
+        for idx in range(start_line, end_line - 1):
+            rewritten_lines[idx] = ""
+        rewritten_lines[end_line - 1] = lines[end_line - 1][end_col:]
+
+    return "".join(rewritten_lines), expr_code
 
 # ========== Pydantic Models ==========
 
@@ -127,6 +183,24 @@ class NotebookWorkspaceResponse(BaseModel):
     display_path: str
     file_count: int
     files: List[NotebookWorkspaceFileResponse]
+
+
+class NotebookBackgroundExecutionResponse(BaseModel):
+    execution_id: str
+    notebook_id: str
+    user_id: int
+    cell_id: str
+    description: str = ""
+    status: str
+    created_at: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    cancel_requested: bool = False
+    success: Optional[bool] = None
+    terminated_reason: Optional[str] = None
+    policy_violation_code: Optional[str] = None
+    execution_count: Optional[int] = None
+    error: Optional[str] = None
 
 
 # ========== 持久化执行内核 ==========
@@ -288,6 +362,13 @@ except:
         self.namespace["list_uploaded_files"] = list_uploaded_files
         self.namespace["uploaded_file_path"] = uploaded_file_path
         self.namespace["read_uploaded_text"] = read_uploaded_text
+
+    def interrupt(self) -> bool:
+        if self._sandbox_executor is None:
+            return False
+        self.last_used_at = datetime.utcnow()
+        self._sandbox_executor.interrupt()
+        return True
         
     def execute(
         self,
@@ -301,8 +382,16 @@ except:
         """
         if self._sandbox_executor is not None:
             self.last_used_at = datetime.utcnow()
-            hard_timeout = max(1, int(settings.codelab_exec_timeout_hard_seconds))
-            safe_timeout = max(1, min(int(timeout or 1), hard_timeout))
+            timeout_value = int(timeout or 0)
+            if timeout_value <= 0:
+                safe_timeout = 0
+            else:
+                hard_timeout = max(0, int(settings.codelab_exec_timeout_hard_seconds))
+                safe_timeout = (
+                    max(1, min(timeout_value, hard_timeout))
+                    if hard_timeout > 0
+                    else max(1, timeout_value)
+                )
             result = self._sandbox_executor.execute(
                 code=code,
                 timeout_seconds=safe_timeout,
@@ -329,32 +418,8 @@ except:
         stderr_capture = io.StringIO()
         
         try:
-            # 使用 compile 来检测是否是表达式
-            # 如果最后一行是表达式，我们需要特殊处理以显示其值
-            lines = code.strip().split('\n')
-            last_line = lines[-1].strip() if lines else ''
-            
-            # 尝试将最后一行作为表达式编译
             last_expr_value = None
-            main_code = code
-            
-            # 检查最后一行是否是表达式（不是赋值、import等语句）
-            try:
-                if last_line and not any(last_line.startswith(kw) for kw in 
-                    ['import ', 'from ', 'def ', 'class ', 'if ', 'for ', 'while ', 
-                     'try:', 'with ', 'return ', 'raise ', 'pass', 'break', 'continue',
-                     '#', '@']):
-                    # 检查是否是赋值语句
-                    if '=' in last_line and not any(op in last_line for op in ['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=']):
-                        # 这是赋值语句，不需要特殊处理
-                        pass
-                    else:
-                        # 尝试作为表达式编译
-                        compile(last_line, '<string>', 'eval')
-                        # 成功，说明最后一行是表达式
-                        main_code = '\n'.join(lines[:-1]) if len(lines) > 1 else ''
-            except SyntaxError:
-                pass
+            main_code, last_expr_code = _split_top_level_last_expression(code)
             
             # 执行主代码
             with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
@@ -362,18 +427,11 @@ except:
                     exec(main_code, self.namespace)
                 
                 # 如果最后一行是表达式，评估它
-                if main_code != code and last_line:
+                if last_expr_code:
                     try:
-                        last_expr_value = eval(last_line, self.namespace)
-                    except:
-                        # 如果 eval 失败，尝试 exec
-                        exec(last_line, self.namespace)
-                elif not main_code.strip() and last_line:
-                    # 整个代码就是一个表达式
-                    try:
-                        last_expr_value = eval(code, self.namespace)
-                    except:
-                        exec(code, self.namespace)
+                        last_expr_value = eval(last_expr_code, self.namespace)
+                    except Exception:
+                        exec(last_expr_code, self.namespace)
             
             # 捕获任何未关闭的图表
             try:
@@ -1360,20 +1418,113 @@ async def get_kernel_status(
         }
 
 
+@router.get(
+    "/notebooks/{notebook_id}/background-executions",
+    response_model=List[NotebookBackgroundExecutionResponse],
+)
+async def list_background_executions(
+    notebook_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+    manager = get_notebook_background_execution_manager()
+    return await manager.list_notebook(notebook_id=notebook_id, user_id=current_user.id)
+
+
+@router.post(
+    "/notebooks/{notebook_id}/background-executions/{execution_id}/cancel",
+    response_model=NotebookBackgroundExecutionResponse,
+)
+async def cancel_background_execution(
+    notebook_id: str,
+    execution_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    notebook = await get_notebook_cached(db, notebook_id, current_user.id)
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook 不存在")
+
+    manager = get_notebook_background_execution_manager()
+    snapshot = await manager.cancel(
+        execution_id=execution_id,
+        user_id=current_user.id,
+        notebook_id=notebook_id,
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="后台执行任务不存在")
+
+    target_cell_id = str(snapshot.get("cell_id") or "").strip()
+    if target_cell_id:
+        updated_metadata: Optional[Dict[str, Any]] = None
+        for cell in notebook.get("cells", []):
+            if cell.get("id") != target_cell_id:
+                continue
+            metadata = dict(cell.get("metadata") or {})
+            execution_meta = dict(metadata.get("background_execution") or {})
+            execution_meta.update(
+                {
+                    "execution_id": snapshot.get("execution_id"),
+                    "status": snapshot.get("status"),
+                    "cancel_requested": True,
+                    "description": snapshot.get("description"),
+                    "created_at": snapshot.get("created_at"),
+                    "started_at": snapshot.get("started_at"),
+                }
+            )
+            metadata["background_execution"] = execution_meta
+            cell["metadata"] = metadata
+            updated_metadata = metadata
+            break
+        notebook["updated_at"] = datetime.utcnow()
+        await _sync_to_cache(notebook)
+        if updated_metadata is not None:
+            service = NotebookService(db)
+            await service.update_cell(
+                notebook_id,
+                current_user.id,
+                target_cell_id,
+                metadata=updated_metadata,
+            )
+
+    return snapshot
+
+
 @router.post("/notebooks/{notebook_id}/interrupt")
 async def interrupt_kernel(
     notebook_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """中断内核执行（当前实现中，由于使用同步执行，此功能有限）"""
+    """中断内核执行，并尝试取消当前 notebook 的后台任务。"""
     notebook = await get_notebook_cached(db, notebook_id, current_user.id)
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook 不存在")
-    
-    # 注意：当前实现使用同步执行，无法真正中断
-    # 未来可以考虑使用多进程来实现真正的中断功能
-    return {"message": "中断请求已发送"}
+
+    manager = get_notebook_background_execution_manager()
+    executions = await manager.list_notebook(notebook_id=notebook_id, user_id=current_user.id)
+    cancelled = 0
+    for item in executions:
+        if str(item.get("status") or "") not in {"pending", "running"}:
+            continue
+        snapshot = await manager.cancel(
+            execution_id=str(item.get("execution_id") or ""),
+            user_id=current_user.id,
+            notebook_id=notebook_id,
+        )
+        if snapshot is not None:
+            cancelled += 1
+
+    kernel = kernel_manager.get_kernel(notebook_id)
+    interrupted = bool(kernel and kernel.interrupt())
+    if cancelled:
+        return {"message": f"已请求停止 {cancelled} 个后台任务"}
+    if interrupted:
+        return {"message": "中断请求已发送"}
+    return {"message": "当前没有可中断的后台执行任务"}
 
 
 

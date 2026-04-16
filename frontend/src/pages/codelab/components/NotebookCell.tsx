@@ -4,7 +4,7 @@ import {
   CaretRightOutlined, DeleteOutlined, CodeOutlined,
   FileMarkdownOutlined, PlusOutlined, MoreOutlined,
   UpOutlined, DownOutlined, CopyOutlined, ClearOutlined,
-  LoadingOutlined,
+  LoadingOutlined, StopOutlined,
 } from '@ant-design/icons'
 import { motion } from 'framer-motion'
 import Editor from '@monaco-editor/react'
@@ -20,6 +20,8 @@ export interface NotebookCellProps {
   index: number
   isSelected: boolean
   isRunning: boolean
+  onInterruptRunningExecution: () => void
+  onCancelBackgroundExecution: (executionId: string) => void
   onSelect: () => void
   onRun: () => void
   onDelete: () => void
@@ -38,6 +40,8 @@ const NotebookCell = ({
   index,
   isSelected,
   isRunning,
+  onInterruptRunningExecution,
+  onCancelBackgroundExecution,
   onSelect,
   onRun,
   onDelete,
@@ -52,6 +56,10 @@ const NotebookCell = ({
   const [isEditing, setIsEditing] = useState(cell.cell_type === 'code' || !cell.source)
   const editorRef = useRef<any>(null)
   const [isPending, startTransition] = useTransition()
+  const backgroundExecution = cell.metadata?.background_execution as Record<string, any> | undefined
+  const backgroundStatus = String(backgroundExecution?.status || '').trim().toLowerCase()
+  const backgroundExecutionId = String(backgroundExecution?.execution_id || '').trim()
+  const isBackgroundRunning = backgroundStatus === 'pending' || backgroundStatus === 'running'
 
   const handleEditorMount = useCallback((editor: any) => {
     editorRef.current = editor
@@ -103,7 +111,7 @@ const NotebookCell = ({
             size="small"
             icon={isRunning ? <LoadingOutlined spin /> : <CaretRightOutlined />}
             onClick={(e) => { e.stopPropagation(); onRun() }}
-            disabled={cell.cell_type !== 'code' || isRunning}
+            disabled={cell.cell_type !== 'code' || isRunning || isBackgroundRunning}
             className="text-slate-500 hover:text-emerald-400"
           />
         </Tooltip>
@@ -139,15 +147,49 @@ const NotebookCell = ({
                 [{cell.execution_count}]
               </span>
             )}
-            {isRunning && (
+            {(isRunning || isBackgroundRunning) && (
               <span className="flex items-center gap-1 text-amber-400 text-xs">
                 <LoadingOutlined spin />
-                运行中...
+                {isBackgroundRunning ? '后台运行中…' : '运行中...'}
               </span>
+            )}
+            {backgroundStatus === 'failed' && (
+              <span className="text-rose-400 text-xs">后台任务失败</span>
+            )}
+            {backgroundStatus === 'cancelled' && (
+              <span className="text-slate-400 text-xs">后台任务已停止</span>
             )}
           </div>
 
           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {isRunning && !isBackgroundRunning && (
+              <Tooltip title="中断当前执行">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<StopOutlined />}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onInterruptRunningExecution()
+                  }}
+                  className="text-amber-400 hover:text-amber-300"
+                />
+              </Tooltip>
+            )}
+            {isBackgroundRunning && backgroundExecutionId && (
+              <Tooltip title="停止后台任务">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<StopOutlined />}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onCancelBackgroundExecution(backgroundExecutionId)
+                  }}
+                  className="text-rose-400 hover:text-rose-300"
+                />
+              </Tooltip>
+            )}
             <Tooltip title="添加单元格">
               <Button
                 type="text"

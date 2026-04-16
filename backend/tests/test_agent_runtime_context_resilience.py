@@ -194,6 +194,18 @@ class _MidRunRuntime(_RuntimeRecorder):
         )
         self.item_stream_payload = store.to_payload()
 
+    async def get_user_memory_control(self, *, user_id: int, channel: str | None = None):
+        return {"effective_enabled": False}
+
+    async def get_conversation_context_state(self, conversation_id: int):
+        return None
+
+    async def get_conversation_compacted_history(self, conversation_id: int):
+        return None
+
+    async def get_user_chat_preferences(self, *, user_id: int):
+        return {}
+
 
 class _HistoryRuntime(_RuntimeRecorder):
     def __init__(self):
@@ -240,6 +252,23 @@ class _HistoryRuntime(_RuntimeRecorder):
         return {}
 
 
+class _NoConversationArtifactsRuntime(_RuntimeRecorder):
+    async def get_user_memory_control(self, *, user_id: int, channel: str | None = None):
+        return {"effective_enabled": False}
+
+    async def get_conversation_context_state(self, conversation_id: int):
+        raise AssertionError("literature profile should not load chat conversation context state")
+
+    async def get_conversation_compacted_history(self, conversation_id: int):
+        raise AssertionError("literature profile should not load chat compacted history")
+
+    async def get_conversation_item_stream(self, conversation_id: int):
+        raise AssertionError("literature profile should not load chat item stream")
+
+    async def get_user_chat_preferences(self, *, user_id: int):
+        return {}
+
+
 @pytest.mark.asyncio
 async def test_prepare_runtime_context_intent_failures_do_not_abort_run(monkeypatch):
     monkeypatch.setattr(settings, "agent_persist_steps_enabled", True)
@@ -260,6 +289,31 @@ async def test_prepare_runtime_context_intent_failures_do_not_abort_run(monkeypa
     assert runtime.created
     assert runtime.created[0]["intent"] == "general_chat"
     assert runtime.created[0]["selected_tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_literature_profile_skips_chat_conversation_artifact_loading():
+    runtime = _NoConversationArtifactsRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(
+            user_id=1,
+            channel="literature",
+            conversation_id=99,
+            scope_type="literature_session",
+            scope_id="99",
+        ),
+        runtime_service=runtime,
+    )
+    context = AgentContext(messages=[{"role": "user", "content": "解释这篇论文"}], max_iterations=1)
+
+    await agent._prepare_runtime_context(context)
+
+    assert context.history_messages == []
+    assert context.conversation_state == {}
+    assert context.compacted_history == {}
 
 
 @pytest.mark.asyncio
@@ -642,3 +696,67 @@ async def test_mid_run_compaction_can_trigger_on_message_pressure_without_trim(m
     assert compacted is True
     assert run_context.mid_run_compactions == 1
     assert runtime.compacted_histories
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_compaction_persists_boundary_and_refreshes_context(monkeypatch):
+    monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
+    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+
+    runtime = _MidRunRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=42, turn_id="turn:200"),
+        runtime_service=runtime,
+    )
+    context = AgentContext(
+        messages=[{"role": "user", "content": "当前问题"}],
+        turn_id="turn:200",
+        iteration=0,
+        run_id="run-1",
+    )
+
+    compacted = await agent._maybe_pre_turn_compact(context)
+
+    assert compacted is True
+    assert runtime.context_states
+    assert runtime.compacted_histories
+    assert runtime.history_events[-1][1] == "pre_turn_compact"
+    boundary_entry = runtime.item_stream_payload["entries"][-1]
+    assert boundary_entry["kind"] == "compact_boundary"
+    assert boundary_entry["status"] == "pre_turn"
+    assert boundary_entry["metadata"]["keep_turn_id"] == "turn:200"
+    assert context.compacted_history["mode"] == "pre_turn"
+    assert [item["role"] for item in context.history_messages] == ["user"]
+    assert [item["content"] for item in context.history_messages] == ["当前问题"]
+    assert context.context_debug["formal_compaction_applied"] is True
+    assert context.context_debug["formal_compaction_mode"] == "pre_turn"
+
+
+@pytest.mark.asyncio
+async def test_run_emits_pre_turn_compaction_thought(monkeypatch):
+    monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
+    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+
+    runtime = _MidRunRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=42, turn_id="turn:200"),
+        runtime_service=runtime,
+    )
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "当前问题"}], stream=False):
+        events.append(event)
+
+    thought_messages = [str(event.get("data") or "") for event in events if event.get("type") == "thought"]
+    assert any("发送前已压缩较早上下文" in message for message in thought_messages)
+    assert any(event.get("type") == "done" for event in events)

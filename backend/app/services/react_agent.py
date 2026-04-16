@@ -19,6 +19,11 @@ from app.services.agent_runtime_service import (
     MemoryContext,
     get_agent_runtime_service,
 )
+from app.services.agent_profiles import (
+    AgentProfile,
+    build_agent_channel_tool_policy_prompt,
+    resolve_agent_profile,
+)
 from app.services.chat_context_store import ConversationItemStreamStore, build_context_snapshot_payload
 from app.services.agent_tools import ToolRegistry, ToolResult
 from app.services.contextual_compression_service import (
@@ -30,7 +35,7 @@ from app.services.agent_tool_error_contract import (
     merge_error_contract,
 )
 from app.services.llm_service import LLMService
-from app.services.smart_chunking.token_utils import estimate_tokens
+from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
 
 
 class AgentState(Enum):
@@ -60,6 +65,8 @@ class AgentRuntimeContext:
     channel: str = "chat"
     conversation_id: Optional[int] = None
     notebook_id: Optional[str] = None
+    scope_type: Optional[str] = None
+    scope_id: Optional[str] = None
     turn_id: Optional[str] = None
     chat_preferences_override: Dict[str, Any] = field(default_factory=dict)
     rag_overrides: Dict[str, Any] = field(default_factory=dict)
@@ -243,6 +250,48 @@ class AgentCore:
         self._routing_decision: Optional[RoutingDecision] = None
         self._active_chat_preferences: Dict[str, Any] = {}
         self._active_rag_overrides: Dict[str, Any] = {}
+        self._active_channel_system_context: str = ""
+
+    def set_channel_system_context(self, context: str) -> None:
+        """Attach route-specific runtime context to the top-level model system prompt."""
+        self._active_channel_system_context = str(context or "").strip()
+
+    def _agent_profile(self) -> AgentProfile:
+        return resolve_agent_profile(str(getattr(self.runtime_context, "channel", "") or "").strip())
+
+    def _conversation_artifact_conversation_id(self) -> Optional[int]:
+        profile = self._agent_profile()
+        if not profile.load_conversation_artifacts:
+            return None
+        try:
+            return int(self.runtime_context.conversation_id) if self.runtime_context.conversation_id is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _run_binding_conversation_id(self) -> Optional[int]:
+        profile = self._agent_profile()
+        if not profile.bind_runs_to_conversation:
+            return None
+        try:
+            return int(self.runtime_context.conversation_id) if self.runtime_context.conversation_id is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _memory_scope(self) -> tuple[str, str]:
+        explicit_scope_type = str(getattr(self.runtime_context, "scope_type", "") or "").strip()
+        explicit_scope_id = str(getattr(self.runtime_context, "scope_id", "") or "").strip()
+        if explicit_scope_type and explicit_scope_id:
+            return explicit_scope_type, explicit_scope_id
+
+        profile = self._agent_profile()
+        preferred_scope = str(getattr(profile, "default_memory_scope_type", "user") or "user").strip().lower()
+        if preferred_scope == "conversation":
+            conversation_id = self._conversation_artifact_conversation_id()
+            if conversation_id is not None:
+                return "conversation", str(conversation_id)
+        if preferred_scope == "notebook" and self.runtime_context.notebook_id is not None:
+            return "notebook", str(self.runtime_context.notebook_id)
+        return "user", str(self.runtime_context.user_id)
 
     @staticmethod
     def _latest_user_text(messages: Optional[Sequence[Dict[str, Any]]]) -> str:
@@ -471,9 +520,19 @@ class AgentCore:
 
     def _build_direct_response_system_prompt(self) -> str:
         prompt = self.DIRECT_RESPONSE_SYSTEM_PROMPT
-        user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
-        if user_pref_prompt:
-            prompt = f"{prompt}\n\n## 用户已确认的聊天偏好\n{user_pref_prompt}"
+        profile = self._agent_profile()
+        if profile.include_channel_system_context:
+            channel_system_context = str(getattr(self, "_active_channel_system_context", "") or "").strip()
+            if channel_system_context:
+                prompt = f"{prompt}\n\n## CodeLab / Notebook Runtime Context\n{channel_system_context}"
+        if profile.include_rag_overrides:
+            rag_prompt = self._render_rag_overrides_prompt(self._active_rag_overrides)
+            if rag_prompt:
+                prompt = f"{prompt}\n\n## 本轮临时 RAG 注入\n{rag_prompt}"
+        if profile.include_user_chat_preferences:
+            user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
+            if user_pref_prompt:
+                prompt = f"{prompt}\n\n## 用户已确认的聊天偏好\n{user_pref_prompt}"
         return prompt
 
     def _supports_function_calling(self) -> bool:
@@ -559,22 +618,7 @@ class AgentCore:
         self,
         available_tools: Sequence[str],
     ) -> str:
-        channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
-        if channel not in {"codelab_agent", "notebook_agent"}:
-            return ""
-
-        selected = {str(name or "").strip() for name in available_tools if str(name or "").strip()}
-        if not selected.intersection({"notebook_execute", "notebook_variables", "notebook_cell", "code_analysis"}):
-            return ""
-
-        lines = [
-            "## CodeLab 场景规则（必须遵守）",
-            "1. 你当前在 CodeLab Notebook 中工作，默认先使用 `notebook_cell`、`notebook_variables`、`notebook_execute` 和当前工作区文件解决问题。",
-            "2. 只要问题涉及当前 notebook、当前 cell、变量、上传文件、csv/xlsx/数据集、建模、画图或调试，就先按本地 Notebook 任务处理。",
-            "3. 除非用户明确要求“查知识库”“联网”“搜索网页”，否则不要调用 `knowledge_search`、`web_search`、`web_scrape` 或任何 `mcp.*` 工具。",
-            "4. 修复已有单元格时优先围绕当前/最近相关 cell 操作，不要脱离当前 notebook 另起一套无关方案。",
-        ]
-        return "\n".join(lines) + "\n"
+        return build_agent_channel_tool_policy_prompt(self._agent_profile(), available_tools)
 
     @staticmethod
     def _normalize_think_tag_aliases(text: str) -> str:
@@ -1461,7 +1505,7 @@ class AgentCore:
 
     def _apply_tool_call_overrides(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         effective_arguments = dict(arguments or {})
-        if tool_name != "knowledge_search":
+        if tool_name != "knowledge_search" or not self._agent_profile().include_rag_overrides:
             return effective_arguments
 
         overrides = dict(self._active_rag_overrides or {})
@@ -1510,6 +1554,8 @@ class AgentCore:
         return effective_arguments
 
     def _should_force_initial_rag_retrieval(self, context: AgentContext) -> bool:
+        if not self._agent_profile().include_rag_overrides:
+            return False
         overrides = dict(context.active_rag_overrides or self._active_rag_overrides or {})
         if not overrides or not bool(overrides.get("enabled", False)):
             return False
@@ -1738,24 +1784,194 @@ class AgentCore:
                 break
         return "\n".join(lines)
 
+    @classmethod
+    def _build_system_compression_message(
+        cls,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        title: str,
+        max_lines: int = 8,
+    ) -> Optional[Dict[str, str]]:
+        summary = cls._summarize_messages(messages, max_lines=max_lines).strip()
+        if not summary:
+            return None
+        return {"role": "system", "content": f"{title}：\n{summary}"}
+
+    @staticmethod
+    def _split_messages_preserving_recent_turns(
+        messages: Sequence[Dict[str, Any]],
+        *,
+        preserve_recent_turns: int,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        rows = [dict(item) for item in list(messages or []) if isinstance(item, dict)]
+        if not rows:
+            return [], []
+
+        preserve_recent_turns = max(int(preserve_recent_turns or 0), 1)
+        user_indices = [idx for idx, msg in enumerate(rows) if str(msg.get("role", "")).strip().lower() == "user"]
+        if len(user_indices) <= preserve_recent_turns:
+            return [], rows
+
+        keep_start = user_indices[-preserve_recent_turns]
+        return rows[:keep_start], rows[keep_start:]
+
+    @staticmethod
+    def _truncate_message_content_to_token_budget(content: str, token_budget: int) -> str:
+        text = str(content or "")
+        if not text:
+            return text
+        current_tokens = estimate_tokens(text)
+        if current_tokens <= max(int(token_budget or 0), 0):
+            return text
+
+        token_budget = max(int(token_budget or 0), 24)
+        char_budget = max(tokens_to_chars(token_budget, text), 96)
+        marker = "\n...[system-compression-truncated]...\n"
+        head_chars = max(48, int(char_budget * 0.7))
+        tail_budget = max(0, char_budget - head_chars - len(marker))
+        if tail_budget > 0 and len(text) > head_chars:
+            return f"{text[:head_chars]}{marker}{text[-tail_budget:]}"
+        return f"{text[: max(48, char_budget - len(marker))]}{marker}"
+
+    @classmethod
+    def _apply_content_truncation_until_budget(
+        cls,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        budget: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        candidate = [dict(item) for item in list(messages or []) if isinstance(item, dict)]
+        if not candidate:
+            return candidate, False
+
+        changed = False
+
+        def _is_observation(msg: Dict[str, Any]) -> bool:
+            role = str(msg.get("role", "")).strip().lower()
+            return role == "tool" or "<observation>" in str(msg.get("content", "") or "")
+
+        while cls._estimate_messages_tokens(candidate) > budget:
+            last_user = max(
+                [idx for idx, item in enumerate(candidate) if str(item.get("role", "")).strip().lower() == "user"] or [len(candidate) - 1]
+            )
+            truncatable: List[tuple[int, int]] = []
+            for idx, item in enumerate(candidate):
+                if idx == last_user:
+                    continue
+                role = str(item.get("role", "")).strip().lower()
+                kind = cls._context_prefix_kind(item)
+                if role not in {"assistant", "system", "tool"} and not _is_observation(item):
+                    continue
+                if role == "system" and kind not in {
+                    "older_summary",
+                    "persisted_summary",
+                    "memory",
+                    "rag_prefetch",
+                    "system_compression",
+                }:
+                    continue
+                content_tokens = estimate_tokens(str(item.get("content", "") or ""))
+                if content_tokens <= 24:
+                    continue
+                truncatable.append((content_tokens, idx))
+
+            if not truncatable:
+                break
+
+            truncatable.sort(reverse=True)
+            _tokens, idx = truncatable[0]
+            current_content = str(candidate[idx].get("content", "") or "")
+            current_tokens = estimate_tokens(current_content)
+            overshoot = max(cls._estimate_messages_tokens(candidate) - budget, 1)
+            shrink_by = max(overshoot + 16, current_tokens // 3)
+            target_budget = max(24, current_tokens - shrink_by)
+            truncated = cls._truncate_message_content_to_token_budget(current_content, target_budget)
+            if truncated == current_content:
+                break
+            candidate[idx]["content"] = truncated
+            changed = True
+
+        return candidate, changed
+
     def _build_system_prompt(
         self,
         messages: Optional[List[Dict[str, Any]]] = None,
         *,
         function_calling: bool = False,
     ) -> str:
+        profile = self._agent_profile()
         routing_decision = self._routing_decision_for_messages(messages)
         latest_user_text = self._latest_user_text(messages)
         tool_choice = "auto"
+        tool_selection_enabled = False
+        resolved_intent = "general_chat"
+        selected_tool_names: List[str] = []
+
+        select_tool_names_for_user_text = getattr(self.tools, "select_tool_names_for_user_text", None)
+        resolve_intent = getattr(self.tools, "resolve_intent", None)
+        select_tool_names_for_intent = getattr(self.tools, "select_tool_names_for_intent", None)
+        if bool(getattr(settings, "tool_selection_enabled", True)):
+            if callable(select_tool_names_for_user_text):
+                try:
+                    raw_selected = select_tool_names_for_user_text(latest_user_text)
+                except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                    logger.warning(f"[AgentCore] select_tool_names_for_user_text failed, fallback to available tools: {exc}")
+                else:
+                    selected_tool_names = [
+                        str(item).strip()
+                        for item in list(raw_selected or [])
+                        if str(item or "").strip()
+                    ]
+                    tool_selection_enabled = True
+                    if callable(resolve_intent):
+                        try:
+                            maybe_intent = str(resolve_intent(latest_user_text) or "").strip()
+                        except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                            logger.warning(f"[AgentCore] resolve_intent failed after user-text selection: {exc}")
+                        else:
+                            if maybe_intent:
+                                resolved_intent = maybe_intent
+            elif callable(resolve_intent) and callable(select_tool_names_for_intent):
+                try:
+                    maybe_intent = str(resolve_intent(latest_user_text) or "").strip()
+                except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                    logger.warning(f"[AgentCore] resolve_intent failed, fallback to available tools: {exc}")
+                else:
+                    if maybe_intent:
+                        resolved_intent = maybe_intent
+                    try:
+                        raw_selected = select_tool_names_for_intent(resolved_intent, user_text=latest_user_text)
+                    except TypeError:
+                        raw_selected = select_tool_names_for_intent(resolved_intent)
+                    except (RuntimeError, ValueError, AttributeError) as exc:
+                        logger.warning(f"[AgentCore] select_tool_names_for_intent failed, fallback to available tools: {exc}")
+                    else:
+                        selected_tool_names = [
+                            str(item).strip()
+                            for item in list(raw_selected or [])
+                            if str(item or "").strip()
+                        ]
+                        tool_selection_enabled = True
+
         tools_desc = ""
         if not function_calling:
             get_tools_description = getattr(self.tools, "get_tools_description", None)
-            tools_desc = get_tools_description() if callable(get_tools_description) else ""
+            if callable(get_tools_description):
+                try:
+                    if selected_tool_names:
+                        tools_desc = get_tools_description(include_tool_names=set(selected_tool_names))
+                    else:
+                        tools_desc = get_tools_description()
+                except TypeError:
+                    tools_desc = get_tools_description()
         available_tools: List[str] = []
         list_tools = getattr(self.tools, "list_tools", None)
         if callable(list_tools):
             try:
-                raw_tools = list_tools()
+                if selected_tool_names:
+                    raw_tools = list_tools(include_tool_names=set(selected_tool_names))
+                else:
+                    raw_tools = list_tools()
             except TypeError:
                 raw_tools = []
             else:
@@ -1769,15 +1985,19 @@ class AgentCore:
                         name = str(tool.get("name") or "").strip()
                     if name:
                         available_tools.append(name)
-        channel_policy_prompt = self._channel_tool_policy_prompt(available_tools)
+        channel_policy_prompt = (
+            self._channel_tool_policy_prompt(available_tools)
+            if profile.include_channel_tool_policy
+            else ""
+        )
         desc_tokens = estimate_tokens(tools_desc)
         self._last_tool_selection = {
-            "intent": "general_chat",
+            "intent": resolved_intent,
             "intent_user_text": latest_user_text,
-            "selected_tools": available_tools,
+            "selected_tools": available_tools if available_tools else selected_tool_names,
             "prompt_desc_tokens": desc_tokens,
-            "schema_scope": "available",
-            "tool_selection_enabled": False,
+            "schema_scope": "selected" if selected_tool_names else "available",
+            "tool_selection_enabled": tool_selection_enabled,
             "tool_choice": tool_choice,
             "routing_source": routing_decision.source if routing_decision else "default_agent",
             "routing_reason": routing_decision.reason if routing_decision else "",
@@ -1786,23 +2006,52 @@ class AgentCore:
             "router_needs_tools": routing_decision.needs_tools if routing_decision else None,
         }
         logger.info(
-            f"[AgentCore] selected_tools={available_tools or 'ALL'} "
-            f"schema_scope=available tool_choice={tool_choice} prompt_desc_tokens={desc_tokens} "
+            f"[AgentCore] selected_tools={self._last_tool_selection.get('selected_tools') or 'ALL'} "
+            f"schema_scope={self._last_tool_selection.get('schema_scope')} "
+            f"tool_choice={tool_choice} prompt_desc_tokens={desc_tokens} "
             f"routing_source={self._last_tool_selection.get('routing_source')}"
         )
         if function_calling:
-            prompt = f"{self.FUNCTION_CALLING_SYSTEM_PROMPT.strip()}\n\n{self.CITATION_POLICY_PROMPT}"
+            prompt = self.FUNCTION_CALLING_SYSTEM_PROMPT.strip()
         else:
-            prompt = f"{self.SYSTEM_PROMPT.format(tools_description=tools_desc)}\n\n{self.CITATION_POLICY_PROMPT}"
-        user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
-        if user_pref_prompt:
-            prompt = f"{prompt}\n\n## 用户已确认的聊天偏好\n{user_pref_prompt}"
-        rag_prompt = self._render_rag_overrides_prompt(self._active_rag_overrides)
-        if rag_prompt:
-            prompt = f"{prompt}\n\n## 本轮临时 RAG 注入\n{rag_prompt}"
-        if channel_policy_prompt:
-            prompt = f"{prompt}\n\n{channel_policy_prompt}"
-        return prompt
+            prompt = self.SYSTEM_PROMPT.format(tools_description=tools_desc)
+        return self._compose_profile_prompt_sections(
+            prompt,
+            available_tools=available_tools,
+            include_generic_citation_policy=profile.include_generic_citation_policy,
+            channel_policy_prompt=channel_policy_prompt,
+        )
+
+    def _compose_profile_prompt_sections(
+        self,
+        prompt: str,
+        *,
+        available_tools: Optional[Sequence[str]] = None,
+        include_generic_citation_policy: bool = True,
+        channel_policy_prompt: Optional[str] = None,
+    ) -> str:
+        profile = self._agent_profile()
+        composed = str(prompt or "").strip()
+        if include_generic_citation_policy:
+            composed = f"{composed}\n\n{self.CITATION_POLICY_PROMPT}"
+        if profile.include_channel_system_context:
+            channel_system_context = str(getattr(self, "_active_channel_system_context", "") or "").strip()
+            if channel_system_context:
+                composed = f"{composed}\n\n## CodeLab / Notebook Runtime Context\n{channel_system_context}"
+        if profile.include_user_chat_preferences:
+            user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
+            if user_pref_prompt:
+                composed = f"{composed}\n\n## 用户已确认的聊天偏好\n{user_pref_prompt}"
+        if profile.include_rag_overrides:
+            rag_prompt = self._render_rag_overrides_prompt(self._active_rag_overrides)
+            if rag_prompt:
+                composed = f"{composed}\n\n## 本轮临时 RAG 注入\n{rag_prompt}"
+        policy_prompt = channel_policy_prompt
+        if policy_prompt is None and profile.include_channel_tool_policy:
+            policy_prompt = self._channel_tool_policy_prompt(list(available_tools or []))
+        if policy_prompt:
+            composed = f"{composed}\n\n{policy_prompt}"
+        return composed
 
     @staticmethod
     def _build_observation_message(tool_name: str, observation_output: str) -> str:
@@ -2315,6 +2564,7 @@ class AgentCore:
         return f"Public web contexts: {len(parts)}\n" + "".join(parts)
 
     async def _prepare_runtime_context(self, context: AgentContext) -> None:
+        profile = self._agent_profile()
         refresh_mcp_tools = getattr(self.tools, "refresh_mcp_tools", None)
         if callable(refresh_mcp_tools):
             try:
@@ -2337,15 +2587,16 @@ class AgentCore:
                 context.memory_enabled = False
                 logger.warning(f"[AgentCore] load memory control failed: {exc}")
 
-            if self.runtime_context.conversation_id is not None:
+            conversation_artifact_id = self._conversation_artifact_conversation_id()
+            if conversation_artifact_id is not None:
                 try:
                     latest_state = await self.runtime_service.get_conversation_context_state(
-                        int(self.runtime_context.conversation_id)
+                        conversation_artifact_id
                     )
                     if isinstance(latest_state, dict):
                         context.conversation_state = latest_state
                     latest_compacted_history = await self.runtime_service.get_conversation_compacted_history(
-                        int(self.runtime_context.conversation_id)
+                        conversation_artifact_id
                     )
                     if isinstance(latest_compacted_history, dict):
                         context.compacted_history = latest_compacted_history
@@ -2353,7 +2604,7 @@ class AgentCore:
                         if persisted_summary:
                             context.context_summary = persisted_summary
                     item_stream = await self.runtime_service.get_conversation_item_stream(
-                        int(self.runtime_context.conversation_id)
+                        conversation_artifact_id
                     )
                     if isinstance(item_stream, dict):
                         context.item_stream = item_stream
@@ -2376,7 +2627,7 @@ class AgentCore:
         context.messages = self._merge_history_messages(context.history_messages, context.messages)
         self._seed_allowed_citations_from_messages(context)
 
-        if self.runtime_context.user_id:
+        if profile.include_user_chat_preferences and self.runtime_context.user_id:
             try:
                 context.user_chat_preferences = await self.runtime_service.get_user_chat_preferences(
                     user_id=self.runtime_context.user_id
@@ -2384,32 +2635,35 @@ class AgentCore:
             except Exception as exc:
                 logger.warning(f"[AgentCore] load user chat preferences failed: {exc}")
                 context.user_chat_preferences = {}
+        else:
+            context.user_chat_preferences = {}
         overrides = dict(self.runtime_context.chat_preferences_override or {})
-        if overrides:
+        if profile.include_user_chat_preferences and overrides:
             context.user_chat_preferences = self.runtime_service.merge_chat_preferences(
                 context.user_chat_preferences,
                 overrides,
             )
         self._active_chat_preferences = dict(context.user_chat_preferences or {})
         normalize_rag_overrides = getattr(self.runtime_service, "normalize_chat_rag_overrides", None)
-        if callable(normalize_rag_overrides):
+        if profile.include_rag_overrides and callable(normalize_rag_overrides):
             context.active_rag_overrides = normalize_rag_overrides(self.runtime_context.rag_overrides)
-        else:
+        elif profile.include_rag_overrides:
             context.active_rag_overrides = dict(self.runtime_context.rag_overrides or {})
-        self._active_rag_overrides = dict(context.active_rag_overrides or {})
-        if list(context.prefetched_rag_messages or []):
-            self._hydrate_prefetched_rag_context(context)
         else:
+            context.active_rag_overrides = {}
+        self._active_rag_overrides = dict(context.active_rag_overrides or {})
+        if profile.include_rag_overrides and list(context.prefetched_rag_messages or []):
+            self._hydrate_prefetched_rag_context(context)
+        elif profile.include_rag_overrides:
             await self._maybe_prefetch_rag_context(context)
+        else:
+            context.prefetched_rag_messages = []
+            context.prefetched_rag_metadata = {}
+            context.prefetched_rag_search_count = 0
 
         if context.memory_enabled and self.runtime_context.user_id:
             try:
-                if self.runtime_context.conversation_id is not None:
-                    scope_type, scope_id = "conversation", str(self.runtime_context.conversation_id)
-                elif self.runtime_context.notebook_id is not None:
-                    scope_type, scope_id = "notebook", str(self.runtime_context.notebook_id)
-                else:
-                    scope_type, scope_id = "user", str(self.runtime_context.user_id)
+                scope_type, scope_id = self._memory_scope()
                 context.memory_contexts = await self.runtime_service.recall(
                     user_id=self.runtime_context.user_id,
                     channel=self.runtime_context.channel,
@@ -2428,11 +2682,12 @@ class AgentCore:
             return
 
         selection = dict(self._last_tool_selection or {})
+        scope_type, scope_id = self._memory_scope()
         try:
             context.run_id = await self.runtime_service.create_run(
                 user_id=self.runtime_context.user_id,
                 channel=self.runtime_context.channel,
-                conversation_id=self.runtime_context.conversation_id,
+                conversation_id=self._run_binding_conversation_id(),
                 notebook_id=self.runtime_context.notebook_id,
                 intent=str(selection.get("intent") or "general_chat"),
                 selected_tools=[
@@ -2446,6 +2701,8 @@ class AgentCore:
                     "path": "agent_core",
                     "routing_source": str(selection.get("routing_source") or "default"),
                     "turn_id": context.turn_id,
+                    "scope_type": scope_type,
+                    "scope_id": scope_id,
                 },
             )
         except Exception as exc:
@@ -2672,6 +2929,9 @@ class AgentCore:
             "older_history_summary": self._compact_debug_text(older_summary, 600),
             "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
             "replacement_history_count": int(len(replacement_history)),
+            "system_compression_message_count": int(
+                sum(1 for item in llm_messages if self._context_prefix_kind(item) == "system_compression")
+            ),
             "mid_run_compactions": int(max(0, context.mid_run_compactions)),
             "stable_prefix_cache_hits": int(max(0, context.stable_prefix_cache_hits)),
             "stable_prefix_cache_misses": int(max(0, context.stable_prefix_cache_misses)),
@@ -2743,6 +3003,8 @@ class AgentCore:
             return "older_summary"
         if content.startswith("历史摘要："):
             return "persisted_summary"
+        if content.startswith("更早历史系统压缩：") or content.startswith("滑出窗口历史系统压缩：") or content.startswith("近期历史系统压缩：") or content.startswith("临近上下文历史系统压缩："):
+            return "system_compression"
         if content.startswith("以下是可参考的跨会话记忆"):
             return "memory"
         return ""
@@ -2921,77 +3183,123 @@ class AgentCore:
             memory_prompt=memory_prompt,
         )
         summary_trigger_tokens = max(int(getattr(settings, "agent_context_summary_trigger_tokens", 7000) or 7000), 0)
-        history_summary_source = older if older else recently_slid
-        if (
-            history_summary_source
-            and not replacement_history_entries
-            and self._estimate_messages_tokens(history_source + ephemeral_messages) >= summary_trigger_tokens
-        ):
-            older_summary = self._summarize_messages(history_summary_source, max_lines=10)
-            prefixes.append({"role": "system", "content": f"更早历史摘要：\n{older_summary}"})
-            context.context_summary = older_summary
+        preserve_recent_turns = max(int(getattr(settings, "agent_context_preserve_recent_turns", 2) or 2), 1)
+        overflow_compression_messages: List[Dict[str, Any]] = []
+        older_summary_parts: List[str] = []
+        raw_recently_slid = [dict(item) for item in list(recently_slid or []) if isinstance(item, dict)]
+        raw_recent = [dict(item) for item in list(recent or []) if isinstance(item, dict)]
+        prefetched_rag_messages = [
+            dict(item) for item in list(context.prefetched_rag_messages or []) if isinstance(item, dict)
+        ]
 
-        candidate = (
-            prefixes
-            + replacement_history_entries
-            + [dict(item) for item in list(context.prefetched_rag_messages or []) if isinstance(item, dict)]
-            + recently_slid
-            + recent
-            + ephemeral_messages
-        )
+        if older:
+            compressed_older = self._build_system_compression_message(
+                older,
+                title="更早历史系统压缩",
+                max_lines=10,
+            )
+            if compressed_older:
+                overflow_compression_messages.append(compressed_older)
+                older_summary = self._summarize_messages(older, max_lines=10)
+                if older_summary:
+                    older_summary_parts.append(older_summary)
+                    context.context_summary = older_summary
+                context.context_truncated = True
+
+        def build_candidate(*, opportunistic_summary: str = "") -> List[Dict[str, Any]]:
+            dynamic_prefixes = [dict(item) for item in prefixes]
+            if opportunistic_summary:
+                dynamic_prefixes.append({"role": "system", "content": f"更早历史摘要：\n{opportunistic_summary}"})
+            return (
+                dynamic_prefixes
+                + replacement_history_entries
+                + overflow_compression_messages
+                + prefetched_rag_messages
+                + raw_recently_slid
+                + raw_recent
+                + ephemeral_messages
+            )
+
+        candidate = build_candidate()
         context.message_tokens_before_trim = self._estimate_messages_tokens(candidate)
         budget = max(int(budget_state.get("effective_budget") or 0), 256)
 
-        def is_observation(msg: Dict[str, Any]) -> bool:
-            role = str(msg.get("role", "")).lower()
-            return role == "tool" or "<observation>" in str(msg.get("content", ""))
-
-        while self._estimate_messages_tokens(candidate) > budget and len(candidate) > 1:
-            drop = None
-            last_user = max(
-                [idx for idx, item in enumerate(candidate) if str(item.get("role", "")).lower() == "user"] or [len(candidate) - 1]
+        if self._estimate_messages_tokens(candidate) > budget and raw_recently_slid:
+            compressed_slid = self._build_system_compression_message(
+                raw_recently_slid,
+                title="滑出窗口历史系统压缩",
+                max_lines=8,
             )
-            for idx, item in enumerate(candidate):
-                if idx < last_user and is_observation(item):
-                    drop = idx
-                    break
-            if drop is None:
-                for idx, item in enumerate(candidate):
-                    if idx != last_user and is_observation(item):
-                        drop = idx
-                        break
-            if drop is None:
-                for kind in ("older_summary", "memory", "persisted_summary"):
-                    for idx, item in enumerate(candidate):
-                        if idx == last_user:
-                            continue
-                        if self._context_prefix_kind(item) == kind:
-                            drop = idx
-                            break
-                    if drop is not None:
-                        break
-            if drop is None:
-                for idx in range(last_user):
-                    if self._context_prefix_kind(candidate[idx]) in {"anchor", "persisted_anchor", "rag_prefetch"}:
-                        continue
-                    drop = idx
-                    break
-            if drop is None:
-                for idx in range(len(candidate)):
-                    if idx != last_user and self._context_prefix_kind(candidate[idx]) not in {"anchor", "persisted_anchor", "rag_prefetch"}:
-                        drop = idx
-                        break
-            if drop is None:
-                for idx in range(len(candidate)):
-                    if idx != last_user:
-                        drop = idx
-                        break
-            if drop is None:
-                break
-            candidate.pop(drop)
+            if compressed_slid:
+                overflow_compression_messages.append(compressed_slid)
+                slid_summary = self._summarize_messages(raw_recently_slid, max_lines=8)
+                if slid_summary:
+                    older_summary_parts.append(slid_summary)
+                raw_recently_slid = []
+                context.context_truncated = True
+                candidate = build_candidate()
+
+        if self._estimate_messages_tokens(candidate) > budget and raw_recent:
+            compactable_recent, preserved_recent = self._split_messages_preserving_recent_turns(
+                raw_recent,
+                preserve_recent_turns=preserve_recent_turns,
+            )
+            if compactable_recent:
+                compressed_recent = self._build_system_compression_message(
+                    compactable_recent,
+                    title="近期历史系统压缩",
+                    max_lines=8,
+                )
+                if compressed_recent:
+                    overflow_compression_messages.append(compressed_recent)
+                    recent_summary = self._summarize_messages(compactable_recent, max_lines=8)
+                    if recent_summary:
+                        older_summary_parts.append(recent_summary)
+                    raw_recent = preserved_recent
+                    context.context_truncated = True
+                    candidate = build_candidate()
+
+        if self._estimate_messages_tokens(candidate) > budget and raw_recent:
+            compactable_recent, preserved_recent = self._split_messages_preserving_recent_turns(
+                raw_recent,
+                preserve_recent_turns=1,
+            )
+            if compactable_recent:
+                compressed_recent = self._build_system_compression_message(
+                    compactable_recent,
+                    title="临近上下文历史系统压缩",
+                    max_lines=6,
+                )
+                if compressed_recent:
+                    overflow_compression_messages.append(compressed_recent)
+                    recent_summary = self._summarize_messages(compactable_recent, max_lines=6)
+                    if recent_summary:
+                        older_summary_parts.append(recent_summary)
+                    raw_recent = preserved_recent
+                    context.context_truncated = True
+                    candidate = build_candidate()
+
+        opportunistic_summary = ""
+        if (
+            not older
+            and raw_recently_slid
+            and not replacement_history_entries
+            and self._estimate_messages_tokens(history_source + ephemeral_messages) >= summary_trigger_tokens
+        ):
+            opportunistic_summary = self._summarize_messages(raw_recently_slid, max_lines=10)
+            if opportunistic_summary:
+                older_summary_parts.append(opportunistic_summary)
+
+        candidate = build_candidate(opportunistic_summary=opportunistic_summary)
+        candidate, content_truncated = self._apply_content_truncation_until_budget(candidate, budget=budget)
+        if content_truncated:
             context.context_truncated = True
 
+        older_summary = "\n".join(part for part in older_summary_parts if str(part or "").strip())
+
         estimated_tokens = self._estimate_messages_tokens(candidate)
+        if estimated_tokens > budget:
+            context.context_truncated = True
         context.message_tokens_after_trim = estimated_tokens
         context.context_debug = self._build_context_debug_payload(
             context=context,
@@ -3020,9 +3328,264 @@ class AgentCore:
             try:
                 if raw_message_id is not None:
                     return int(raw_message_id)
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 continue
         return None
+
+    def _current_compaction_boundary_message_id(self, context: AgentContext) -> Optional[int]:
+        if not isinstance(context.compacted_history, dict):
+            return None
+        raw_boundary = context.compacted_history.get("compact_boundary_message_id")
+        try:
+            return int(raw_boundary) if raw_boundary is not None else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    async def _gather_runtime_compaction_inputs(self, context: AgentContext) -> Dict[str, Any]:
+        conversation_id = getattr(self.runtime_context, "conversation_id", None)
+        if conversation_id is None:
+            raise RuntimeError("conversation_id is required for runtime compaction")
+
+        from app.services.conversation_context_compaction_service import (
+            ConversationContextCompactionService,
+            ConversationItemStreamUnavailableError,
+        )
+
+        item_stream_payload = ConversationContextCompactionService._require_item_stream_payload(
+            int(conversation_id),
+            await self.runtime_service.get_conversation_item_stream(int(conversation_id)),
+        )
+        store = ConversationItemStreamStore.from_payload(item_stream_payload)
+        fallback_boundary_message_id = self._current_compaction_boundary_message_id(context)
+        canonical = store.canonical_history(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        active_entries = [entry.__dict__ for entry in canonical.active_entries]
+        payload_rows = [
+            self._sanitize_message_for_context(item)
+            for item in list(context.messages or [])
+            if isinstance(item, dict)
+        ]
+        canonical_rows = store.canonical_replay_rows(
+            fallback_boundary_message_id=fallback_boundary_message_id,
+        )
+        if not payload_rows:
+            payload_rows = canonical_rows
+
+        tool_rows: List[Dict[str, Any]] = []
+        tool_ledger_payload = await self.runtime_service.get_conversation_tool_ledger(int(conversation_id))
+        if isinstance(tool_ledger_payload, dict):
+            active_turn_ids = {
+                str(entry.turn_id or "").strip()
+                for entry in canonical.active_entries
+                if str(entry.turn_id or "").strip()
+            }
+            for row in list(tool_ledger_payload.get("entries") or []):
+                if not isinstance(row, dict):
+                    continue
+                row_turn_id = str(row.get("turn_id") or "").strip()
+                if active_turn_ids and row_turn_id and row_turn_id not in active_turn_ids:
+                    continue
+                tool_rows.append(dict(row))
+        if not tool_rows:
+            tool_rows = ConversationContextCompactionService._item_stream_to_tool_rows(active_entries)
+
+        latest_message_id = self._latest_item_stream_message_id(active_entries)
+        return {
+            "conversation_id": int(conversation_id),
+            "item_stream_payload": item_stream_payload,
+            "store": store,
+            "canonical": canonical,
+            "active_entries": active_entries,
+            "payload_rows": payload_rows,
+            "canonical_rows": canonical_rows,
+            "tool_rows": tool_rows,
+            "latest_message_id": latest_message_id,
+            "conversation_item_stream_unavailable_error": ConversationItemStreamUnavailableError,
+        }
+
+    async def _resolve_runtime_compaction_artifacts(
+        self,
+        *,
+        payload_rows: Sequence[Dict[str, Any]],
+        canonical_rows: Sequence[Dict[str, Any]],
+        tool_rows: Sequence[Dict[str, Any]],
+        latest_message_id: Optional[int],
+    ) -> tuple[Dict[str, Any], Any]:
+        from app.services.conversation_context_compaction_service import ConversationContextCompactionService
+
+        artifacts = await ConversationContextCompactionService.build_artifacts(
+            payload_rows,
+            tool_ledger_entries=tool_rows,
+            up_to_message_id=latest_message_id,
+        )
+        if not dict(artifacts.compacted_history or {}) and payload_rows is not canonical_rows:
+            artifacts = await ConversationContextCompactionService.build_artifacts(
+                canonical_rows,
+                tool_ledger_entries=tool_rows,
+                up_to_message_id=latest_message_id,
+            )
+
+        compacted_history = dict(artifacts.compacted_history or {})
+        if not compacted_history:
+            sanitized_rows = [
+                self._sanitize_message_for_context(item)
+                for item in list(payload_rows or canonical_rows)
+                if isinstance(item, dict)
+            ]
+            older_rows, recently_slid_rows, _recent_rows = self._split_context_windows(
+                sanitized_rows,
+                recent_turns=max(int(getattr(settings, "agent_context_window_turns", 8) or 8), 1),
+                recently_slid_turns=max(int(getattr(settings, "agent_context_recently_slid_turns", 2) or 2), 0),
+            )
+            compact_source = older_rows + recently_slid_rows
+            if not compact_source:
+                return {}, artifacts
+            fallback_summary = self._summarize_messages(compact_source, max_lines=10)
+            fallback_anchors = self._summarize_messages(compact_source, max_lines=6)
+            compacted_history = ConversationContextCompactionService._normalize_compacted_history_payload(
+                {
+                    "history_anchors": fallback_anchors,
+                    "history_summary": fallback_summary,
+                    "replacement_history": [
+                        {
+                            "role": "system",
+                            "content": fallback_summary or fallback_anchors,
+                        }
+                    ],
+                },
+                compacted_message_count=len(compact_source),
+                up_to_message_id=latest_message_id,
+            )
+            artifacts.summary_text = fallback_summary
+            artifacts.compacted_message_count = len(compact_source)
+        return compacted_history, artifacts
+
+    async def _persist_runtime_compaction(
+        self,
+        *,
+        context: AgentContext,
+        conversation_id: int,
+        compacted_history: Dict[str, Any],
+        artifacts: Any,
+        latest_message_id: Optional[int],
+        mode: str,
+        history_event_title: str,
+    ) -> None:
+        from app.services.conversation_context_compaction_service import ConversationItemStreamUnavailableError
+
+        compacted_history = dict(compacted_history or {})
+        compacted_history["mid_run"] = mode == "mid_run"
+        compacted_history["mode"] = mode
+        await self.runtime_service.upsert_conversation_context_state(
+            int(conversation_id),
+            dict(artifacts.context_state or {}),
+        )
+        await self.runtime_service.upsert_conversation_compacted_history(
+            int(conversation_id),
+            compacted_history,
+        )
+        await self.runtime_service.append_conversation_history_event(
+            int(conversation_id),
+            title=history_event_title,
+            detail=(
+                f"mode={mode}, "
+                f"iteration={int(context.iteration)}, "
+                f"compacted_messages={artifacts.compacted_message_count}, "
+                f"summary_chars={len(artifacts.summary_text or '')}, "
+                f"up_to_message_id={latest_message_id or 0}"
+            ),
+        )
+        await self.runtime_service.append_conversation_context_snapshot(
+            int(conversation_id),
+            build_context_snapshot_payload(
+                mode=mode,
+                context_state=artifacts.context_state,
+                compacted_history=compacted_history,
+                summary_text=artifacts.summary_text,
+                compacted_message_count=artifacts.compacted_message_count,
+                up_to_message_id=latest_message_id,
+            ),
+        )
+        await self.runtime_service.append_conversation_item_entries(
+            int(conversation_id),
+            [
+                {
+                    "kind": "compact_boundary",
+                    "turn_id": context.turn_id,
+                    "role": "system",
+                    "run_id": context.run_id,
+                    "iteration": context.iteration,
+                    "content": artifacts.summary_text,
+                    "summary": str(compacted_history.get("history_anchors") or "").strip() or None,
+                    "status": mode,
+                    "message_id": latest_message_id,
+                    "metadata": {
+                        "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
+                        "replacement_history": list(compacted_history.get("replacement_history") or []),
+                        "compacted_message_count": artifacts.compacted_message_count,
+                        "keep_turn_id": context.turn_id,
+                        "mode": mode,
+                    },
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            ],
+        )
+
+        refreshed_item_stream = await self.runtime_service.get_conversation_item_stream(int(conversation_id))
+        if not isinstance(refreshed_item_stream, dict):
+            raise ConversationItemStreamUnavailableError(int(conversation_id))
+
+        context.context_summary = artifacts.summary_text or context.context_summary
+        context.conversation_state = dict(artifacts.context_state or {})
+        context.compacted_history = compacted_history
+        context.item_stream = refreshed_item_stream
+        context.history_messages = self._active_history_messages_from_item_stream(
+            list(refreshed_item_stream.get("entries") or []),
+            fallback_boundary_message_id=latest_message_id,
+        )
+        context.messages = [
+            self._sanitize_message_for_context(item)
+            for item in list(context.history_messages or [])
+            if isinstance(item, dict)
+        ]
+        context.context_truncated = True
+        context.context_debug = {
+            **dict(context.context_debug or {}),
+            "formal_compaction_mode": mode,
+            "formal_compaction_applied": True,
+        }
+
+    async def _maybe_pre_turn_compact(self, context: AgentContext) -> bool:
+        if not bool(getattr(settings, "agent_context_budget_enabled", True)):
+            return False
+        if not bool(getattr(settings, "agent_pre_turn_compaction_enabled", True)):
+            return False
+
+        conversation_id = getattr(self.runtime_context, "conversation_id", None)
+        if conversation_id is None:
+            return False
+
+        inputs = await self._gather_runtime_compaction_inputs(context)
+        compacted_history, artifacts = await self._resolve_runtime_compaction_artifacts(
+            payload_rows=inputs["payload_rows"],
+            canonical_rows=inputs["canonical_rows"],
+            tool_rows=inputs["tool_rows"],
+            latest_message_id=inputs["latest_message_id"],
+        )
+        if not compacted_history:
+            return False
+
+        await self._persist_runtime_compaction(
+            context=context,
+            conversation_id=int(conversation_id),
+            compacted_history=compacted_history,
+            artifacts=artifacts,
+            latest_message_id=inputs["latest_message_id"],
+            mode="pre_turn",
+            history_event_title="pre_turn_compact",
+        )
+        return True
 
     async def _maybe_mid_run_compact(self, context: AgentContext, system_prompt: str) -> bool:
         if not bool(getattr(settings, "agent_mid_run_compaction_enabled", True)):
@@ -3054,175 +3617,26 @@ class AgentCore:
         if conversation_id is None:
             return False
 
-        from app.services.conversation_context_compaction_service import (
-            ConversationContextCompactionService,
-            ConversationItemStreamUnavailableError,
+        inputs = await self._gather_runtime_compaction_inputs(context)
+        compacted_history, artifacts = await self._resolve_runtime_compaction_artifacts(
+            payload_rows=inputs["payload_rows"],
+            canonical_rows=inputs["canonical_rows"],
+            tool_rows=inputs["tool_rows"],
+            latest_message_id=inputs["latest_message_id"],
         )
-
-        item_stream_payload = ConversationContextCompactionService._require_item_stream_payload(
-            int(conversation_id),
-            await self.runtime_service.get_conversation_item_stream(int(conversation_id)),
-        )
-        store = ConversationItemStreamStore.from_payload(item_stream_payload)
-        canonical = store.canonical_history(
-            fallback_boundary_message_id=(
-                context.compacted_history.get("compact_boundary_message_id")
-                if isinstance(context.compacted_history, dict)
-                else None
-            ),
-        )
-        active_entries = [entry.__dict__ for entry in canonical.active_entries]
-        payload_rows = [
-            self._sanitize_message_for_context(item)
-            for item in list(context.messages or [])
-            if isinstance(item, dict)
-        ]
-        canonical_rows = store.canonical_replay_rows(
-            fallback_boundary_message_id=(
-                context.compacted_history.get("compact_boundary_message_id")
-                if isinstance(context.compacted_history, dict)
-                else None
-            ),
-        )
-        if not payload_rows:
-            payload_rows = canonical_rows
-        tool_rows: List[Dict[str, Any]] = []
-        tool_ledger_payload = await self.runtime_service.get_conversation_tool_ledger(int(conversation_id))
-        if isinstance(tool_ledger_payload, dict):
-            active_turn_ids = {
-                str(entry.turn_id or "").strip()
-                for entry in canonical.active_entries
-                if str(entry.turn_id or "").strip()
-            }
-            for row in list(tool_ledger_payload.get("entries") or []):
-                if not isinstance(row, dict):
-                    continue
-                row_turn_id = str(row.get("turn_id") or "").strip()
-                if active_turn_ids and row_turn_id and row_turn_id not in active_turn_ids:
-                    continue
-                tool_rows.append(dict(row))
-        if not tool_rows:
-            tool_rows = ConversationContextCompactionService._item_stream_to_tool_rows(active_entries)
-        latest_message_id = self._latest_item_stream_message_id(active_entries)
-        artifacts = await ConversationContextCompactionService.build_artifacts(
-            payload_rows,
-            tool_ledger_entries=tool_rows,
-            up_to_message_id=latest_message_id,
-        )
-        if not dict(artifacts.compacted_history or {}) and payload_rows is not canonical_rows:
-            artifacts = await ConversationContextCompactionService.build_artifacts(
-                canonical_rows,
-                tool_ledger_entries=tool_rows,
-                up_to_message_id=latest_message_id,
-            )
-        compacted_history = dict(artifacts.compacted_history or {})
-        if not compacted_history:
-            sanitized_rows = [
-                self._sanitize_message_for_context(item)
-                for item in list(payload_rows or canonical_rows)
-                if isinstance(item, dict)
-            ]
-            older_rows, recently_slid_rows, _recent_rows = self._split_context_windows(
-                sanitized_rows,
-                recent_turns=max(int(getattr(settings, "agent_context_window_turns", 8) or 8), 1),
-                recently_slid_turns=max(int(getattr(settings, "agent_context_recently_slid_turns", 2) or 2), 0),
-            )
-            compact_source = older_rows + recently_slid_rows
-            if not compact_source:
-                return False
-            fallback_summary = self._summarize_messages(compact_source, max_lines=10)
-            fallback_anchors = self._summarize_messages(compact_source, max_lines=6)
-            compacted_history = ConversationContextCompactionService._normalize_compacted_history_payload(
-                {
-                    "history_anchors": fallback_anchors,
-                    "history_summary": fallback_summary,
-                    "replacement_history": [
-                        {
-                            "role": "system",
-                            "content": fallback_summary or fallback_anchors,
-                        }
-                    ],
-                },
-                compacted_message_count=len(compact_source),
-                up_to_message_id=latest_message_id,
-            )
-            artifacts.summary_text = fallback_summary
-            artifacts.compacted_message_count = len(compact_source)
         if not compacted_history:
             return False
 
-        compacted_history["mid_run"] = True
-        await self.runtime_service.upsert_conversation_context_state(
-            int(conversation_id),
-            dict(artifacts.context_state or {}),
+        await self._persist_runtime_compaction(
+            context=context,
+            conversation_id=int(conversation_id),
+            compacted_history=compacted_history,
+            artifacts=artifacts,
+            latest_message_id=inputs["latest_message_id"],
+            mode="mid_run",
+            history_event_title="mid_run_compact",
         )
-        await self.runtime_service.upsert_conversation_compacted_history(
-            int(conversation_id),
-            compacted_history,
-        )
-        await self.runtime_service.append_conversation_history_event(
-            int(conversation_id),
-            title="mid_run_compact",
-            detail=(
-                f"iteration={int(context.iteration)}, "
-                f"compacted_messages={artifacts.compacted_message_count}, "
-                f"summary_chars={len(artifacts.summary_text or '')}, "
-                f"up_to_message_id={latest_message_id or 0}"
-            ),
-        )
-        await self.runtime_service.append_conversation_context_snapshot(
-            int(conversation_id),
-            build_context_snapshot_payload(
-                mode="mid_run",
-                context_state=artifacts.context_state,
-                compacted_history=compacted_history,
-                summary_text=artifacts.summary_text,
-                compacted_message_count=artifacts.compacted_message_count,
-                up_to_message_id=latest_message_id,
-            ),
-        )
-        await self.runtime_service.append_conversation_item_entries(
-            int(conversation_id),
-            [
-                {
-                    "kind": "compact_boundary",
-                    "turn_id": context.turn_id,
-                    "role": "system",
-                    "run_id": context.run_id,
-                    "iteration": context.iteration,
-                    "content": artifacts.summary_text,
-                    "summary": str(compacted_history.get("history_anchors") or "").strip() or None,
-                    "status": "mid_run",
-                    "message_id": latest_message_id,
-                    "metadata": {
-                        "compact_boundary_message_id": compacted_history.get("compact_boundary_message_id"),
-                        "replacement_history": list(compacted_history.get("replacement_history") or []),
-                        "compacted_message_count": artifacts.compacted_message_count,
-                        "keep_turn_id": context.turn_id,
-                    },
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-            ],
-        )
-
-        refreshed_item_stream = await self.runtime_service.get_conversation_item_stream(int(conversation_id))
-        if not isinstance(refreshed_item_stream, dict):
-            raise ConversationItemStreamUnavailableError(int(conversation_id))
-
         context.mid_run_compactions += 1
-        context.context_summary = artifacts.summary_text or context.context_summary
-        context.conversation_state = dict(artifacts.context_state or {})
-        context.compacted_history = compacted_history
-        context.item_stream = refreshed_item_stream
-        context.history_messages = self._active_history_messages_from_item_stream(
-            list(refreshed_item_stream.get("entries") or []),
-            fallback_boundary_message_id=latest_message_id,
-        )
-        context.messages = [
-            self._sanitize_message_for_context(item)
-            for item in list(context.history_messages or [])
-            if isinstance(item, dict)
-        ]
         return True
 
     def _collect_llm_tool_schemas(self, user_text: str) -> List[Dict[str, Any]]:
@@ -3456,6 +3870,59 @@ class AgentCore:
         context.state = AgentState.DONE
         return f"检测到 `{tool_name}` 需要用户授权，已停止后续自动写操作并改为直接说明原因。"
 
+    def _maybe_stop_after_background_execution_started(
+        self,
+        context: AgentContext,
+        events: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
+        if channel not in {"codelab_agent", "notebook_agent"}:
+            return None
+
+        observations = [
+            event.get("data")
+            for event in events
+            if event.get("type") == "observation" and isinstance(event.get("data"), dict)
+        ]
+        if not observations:
+            return None
+
+        latest_background_observation: Optional[Dict[str, Any]] = None
+        for item in observations:
+            tool_data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            execution = dict(tool_data.get("background_execution") or {})
+            status = str(execution.get("status") or "").strip().lower()
+            if (
+                bool(tool_data.get("background_execution_started"))
+                and not bool(tool_data.get("background_execution_completed"))
+                and status in {"", "pending", "running"}
+            ):
+                latest_background_observation = item
+
+        if latest_background_observation is None:
+            return None
+
+        tool_data = latest_background_observation.get("data") if isinstance(latest_background_observation.get("data"), dict) else {}
+        execution = dict(tool_data.get("background_execution") or {})
+        execution_id = str(execution.get("execution_id") or "").strip()
+        cell_id = str(tool_data.get("cell_id") or execution.get("cell_id") or "").strip()
+        detail = self._truncate_failure_text(
+            str(latest_background_observation.get("output") or "长任务已转入后台执行。"),
+            limit=220,
+        )
+        suffix_parts = []
+        if cell_id:
+            suffix_parts.append(f"cell_id={cell_id}")
+        if execution_id:
+            suffix_parts.append(f"execution_id={execution_id}")
+        suffix = f"（{'，'.join(suffix_parts)}）" if suffix_parts else ""
+        context.final_answer = (
+            f"{detail} 当前任务已转入后台执行{suffix}。"
+            "你可以稍后刷新 notebook 查看结果；如果不需要继续执行，可以手动停止。"
+        )
+        context.state = AgentState.DONE
+        return "检测到长任务已切换到后台执行，本轮停止继续调用工具，改为向用户回报任务状态。"
+
     @staticmethod
     def _tool_repeat_signature(tool_name: str, tool_input: Optional[Dict[str, Any]]) -> str:
         try:
@@ -3552,8 +4019,33 @@ class AgentCore:
                 "iteration": context.iteration,
             },
         }
+        selected_tools = {
+            str(item).strip()
+            for item in list(self._last_tool_selection.get("selected_tools") or [])
+            if str(item or "").strip()
+        }
         try:
-            result = await self.tools.execute(call.name, **effective_arguments)
+            if selected_tools and call.name not in selected_tools:
+                contract = build_tool_error_contract(
+                    code="tool_not_allowed",
+                    message="当前回合不允许调用该工具",
+                    tool_name=call.name,
+                    stage="agent_execute",
+                    detail=f"selected_tools={sorted(selected_tools)}",
+                    retryable=False,
+                    metadata={"selected_tools": sorted(selected_tools)},
+                )
+                result = ToolResult(
+                    success=False,
+                    output=(
+                        f"{contract['message']}: `{call.name}` 不在当前允许集合内。"
+                        f"允许工具: {', '.join(sorted(selected_tools))}"
+                    ),
+                    error=str(contract["code"]),
+                    data=merge_error_contract(None, contract),
+                )
+            else:
+                result = await self.tools.execute(call.name, **effective_arguments)
         except Exception as exc:
             contract = build_tool_error_contract(
                 code="tool_dispatch_failed",
@@ -3577,7 +4069,7 @@ class AgentCore:
             call.name,
             result.data if isinstance(result.data, dict) else {},
         )
-        if citation_tool_name == "knowledge_search":
+        if result.success and citation_tool_name == "knowledge_search":
             context.knowledge_search_calls += 1
             observation_output = await self._compress_knowledge_observation(
                 str(effective_arguments.get("query", "")),
@@ -3585,7 +4077,7 @@ class AgentCore:
                 context=context,
             )
             context.allowed_source_labels.update(self._extract_source_labels(observation_output))
-        elif citation_tool_name == "web_search":
+        elif result.success and citation_tool_name == "web_search":
             context.web_search_calls += 1
             observation_output = await self._compress_web_search_observation(
                 str(call.arguments.get("query", "")),
@@ -3929,26 +4421,14 @@ class AgentCore:
         context.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
         context.total_tokens += int(usage.get("total_tokens", 0) or 0)
 
-    async def _run_iteration_function_calling(
+    async def _finalize_function_calling_iteration(
         self,
         context: AgentContext,
-        llm_messages: List[Dict[str, Any]],
-        system_prompt: str,
+        *,
+        content: str,
+        reasoning: str,
+        parsed_calls: Sequence[ParsedToolCall],
     ) -> tuple[List[Dict[str, Any]], bool]:
-        user_text = self._current_user_text(context)
-        llm_messages = self._normalize_messages_for_function_calling(llm_messages)
-        response = await self.llm.chat_with_tools(
-            messages=llm_messages,
-            tools=self._collect_llm_tool_schemas(user_text),
-            system_prompt=system_prompt,
-            temperature=settings.react_temperature,
-            max_tokens=settings.llm_max_tokens,
-            tool_choice=str(self._last_tool_selection.get("tool_choice") or "auto"),
-        )
-        self._accumulate_usage(context, response)
-        content = str(response.get("content") or "")
-        reasoning = str(response.get("reasoning") or "").strip()
-        parsed_calls = self._normalize_tool_calls(response.get("tool_calls") or [])
         events: List[Dict[str, Any]] = []
         answer_hint = self._extract_answer_text(content)
         raw_thought_text = ""
@@ -4020,6 +4500,109 @@ class AgentCore:
             events.append({"type": "answer", "data": answer})
             return events, True
         return events, False
+
+    async def _run_iteration_function_calling_once(
+        self,
+        context: AgentContext,
+        llm_messages: List[Dict[str, Any]],
+        system_prompt: str,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        user_text = self._current_user_text(context)
+        llm_messages = self._normalize_messages_for_function_calling(llm_messages)
+        response = await self.llm.chat_with_tools(
+            messages=llm_messages,
+            tools=self._collect_llm_tool_schemas(user_text),
+            system_prompt=system_prompt,
+            temperature=settings.react_temperature,
+            max_tokens=settings.llm_max_tokens,
+            tool_choice=str(self._last_tool_selection.get("tool_choice") or "auto"),
+        )
+        self._accumulate_usage(context, response)
+        return await self._finalize_function_calling_iteration(
+            context,
+            content=str(response.get("content") or ""),
+            reasoning=str(response.get("reasoning") or "").strip(),
+            parsed_calls=self._normalize_tool_calls(response.get("tool_calls") or []),
+        )
+
+    async def _run_iteration_function_calling(
+        self,
+        context: AgentContext,
+        llm_messages: List[Dict[str, Any]],
+        system_prompt: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        user_text = self._current_user_text(context)
+        llm_messages = self._normalize_messages_for_function_calling(llm_messages)
+        stream_method = getattr(self.llm, "chat_with_tools_stream", None)
+        if not callable(stream_method):
+            events, done = await self._run_iteration_function_calling_once(context, llm_messages, system_prompt)
+            for event in events:
+                yield event
+            yield {"type": "_iteration_done", "data": {"done": done}}
+            return
+
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        saw_tool_call_delta = False
+        streamed_answer = False
+        final_payload: Dict[str, Any] = {}
+
+        async for stream_event in stream_method(
+            messages=llm_messages,
+            tools=self._collect_llm_tool_schemas(user_text),
+            system_prompt=system_prompt,
+            temperature=settings.react_temperature,
+            max_tokens=settings.llm_max_tokens,
+            tool_choice=str(self._last_tool_selection.get("tool_choice") or "auto"),
+        ):
+            event_type = str(stream_event.get("type") or "")
+            event_data = stream_event.get("data")
+            if event_type == "content":
+                chunk = str(event_data or "")
+                if not chunk:
+                    continue
+                content_parts.append(chunk)
+                if not saw_tool_call_delta:
+                    streamed_answer = True
+                    yield {"type": "content", "data": chunk}
+                continue
+            if event_type == "reasoning":
+                reasoning_parts.append(str(event_data or ""))
+                continue
+            if event_type in {"tool_call", "tool_call_delta"}:
+                saw_tool_call_delta = True
+                continue
+            if event_type == "done" and isinstance(event_data, dict):
+                final_payload = dict(event_data)
+
+        if final_payload:
+            self._accumulate_usage(context, final_payload)
+        content = str(final_payload.get("content") or "".join(content_parts))
+        reasoning = str(final_payload.get("reasoning") or "".join(reasoning_parts)).strip()
+        parsed_calls = self._normalize_tool_calls(final_payload.get("tool_calls") or [])
+        if parsed_calls and streamed_answer:
+            # Function-calling providers should not mix user-visible answer text with tool-call deltas.
+            # If they do, keep the tool path correct and avoid treating the streamed draft as final.
+            streamed_answer = False
+
+        events, done = await self._finalize_function_calling_iteration(
+            context,
+            content=content,
+            reasoning=reasoning,
+            parsed_calls=parsed_calls,
+        )
+        if streamed_answer and done and context.final_answer:
+            for event in events:
+                if event.get("type") == "answer":
+                    self._append_step_from_event(context, event)
+                    context.persist_events.append(event)
+                    yield {"type": "_answer_streamed", "data": {"answer": context.final_answer}}
+                    continue
+                yield event
+        else:
+            for event in events:
+                yield event
+        yield {"type": "_iteration_done", "data": {"done": done}}
 
     async def _run_iteration_xml(
         self,
@@ -4137,12 +4720,7 @@ class AgentCore:
         if not self.runtime_context.user_id or not context.final_answer:
             return
 
-        if self.runtime_context.conversation_id is not None:
-            scope_type, scope_id = "conversation", str(self.runtime_context.conversation_id)
-        elif self.runtime_context.notebook_id is not None:
-            scope_type, scope_id = "notebook", str(self.runtime_context.notebook_id)
-        else:
-            scope_type, scope_id = "user", str(self.runtime_context.user_id)
+        scope_type, scope_id = self._memory_scope()
 
         try:
             await self.runtime_service.remember(
@@ -4207,7 +4785,7 @@ class AgentCore:
                         source=str(routing_payload.get("source") or "llm"),
                         latest_user_text=str(routing_payload.get("latest_user_text") or ""),
                     )
-                except Exception:
+                except (TypeError, ValueError):
                     self._routing_decision = None
             tool_selection = prepared_plan.get("tool_selection")
             if isinstance(tool_selection, dict):
@@ -4221,6 +4799,16 @@ class AgentCore:
         if not self._routing_decision:
             await self._prepare_routing_decision(context.messages)
 
+        pre_turn_compacted = False
+        try:
+            pre_turn_compacted = await self._maybe_pre_turn_compact(context)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(f"[AgentCore] pre-turn compact skipped: {exc}")
+            pre_turn_compacted = False
+        if pre_turn_compacted:
+            prepared_system_prompt = ""
+            prepared_llm_messages = []
+
         yield {
             "type": "start",
             "data": {
@@ -4233,6 +4821,14 @@ class AgentCore:
         try:
             for i in range(1, context.max_iterations + 1):
                 context.iteration = i
+                if i == 1 and pre_turn_compacted:
+                    thought_event = {
+                        "type": "thought",
+                        "data": "发送前已压缩较早上下文，并基于替代历史继续当前任务。",
+                    }
+                    self._append_step_from_event(context, thought_event)
+                    context.persist_events.append(thought_event)
+                    yield thought_event
                 context.state = AgentState.THINKING
                 yield {"type": "thinking_start", "data": ""}
                 yield {"type": "thinking", "data": "正在分析问题并规划下一步..."}
@@ -4303,28 +4899,58 @@ class AgentCore:
                     )
                     yield {"type": "context_debug", "data": dict(context.context_debug)}
 
+                emit_events_after_call = not use_fc
                 if use_fc:
                     try:
-                        events, done = await self._run_iteration_function_calling(context, llm_messages, system_prompt)
+                        events: List[Dict[str, Any]] = []
+                        done = False
+                        async for event in self._run_iteration_function_calling(context, llm_messages, system_prompt):
+                            event_type = str(event.get("type") or "")
+                            if event_type == "_iteration_done":
+                                event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                                done = bool(event_data.get("done"))
+                                continue
+                            if event_type == "_answer_streamed":
+                                event_data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                                answer = str(event_data.get("answer") or context.final_answer or "").strip()
+                                if answer:
+                                    answer_emitted = True
+                                continue
+                            events.append(event)
+                            self._append_step_from_event(context, event)
+                            if event_type in {"thought", "action", "observation", "answer", "content", "error"}:
+                                context.persist_events.append(event)
+                            if event_type == "answer":
+                                answer_emitted = True
+                            yield event
                     except Exception as exc:
                         logger.warning(f"[AgentCore] function-calling failed, fallback={exc}")
                         if bool(getattr(settings, "agent_function_calling_fallback_xml", True)):
                             events, done = await self._run_iteration_xml(context, llm_messages, system_prompt)
+                            emit_events_after_call = True
                         else:
                             raise
                 else:
                     events, done = await self._run_iteration_xml(context, llm_messages, system_prompt)
 
-                for event in events:
-                    self._append_step_from_event(context, event)
-                    if event.get("type") in {"thought", "action", "observation", "answer", "content", "error"}:
-                        context.persist_events.append(event)
-                    if event.get("type") == "answer":
-                        answer_emitted = True
-                    yield event
+                if emit_events_after_call:
+                    for event in events:
+                        self._append_step_from_event(context, event)
+                        if event.get("type") in {"thought", "action", "observation", "answer", "content", "error"}:
+                            context.persist_events.append(event)
+                        if event.get("type") == "answer":
+                            answer_emitted = True
+                        yield event
                 authorization_stop_thought = self._maybe_stop_after_authorization_required(context, events)
                 if authorization_stop_thought:
                     thought_event = {"type": "thought", "data": authorization_stop_thought}
+                    self._append_step_from_event(context, thought_event)
+                    context.persist_events.append(thought_event)
+                    yield thought_event
+                    break
+                background_stop_thought = self._maybe_stop_after_background_execution_started(context, events)
+                if background_stop_thought:
+                    thought_event = {"type": "thought", "data": background_stop_thought}
                     self._append_step_from_event(context, thought_event)
                     context.persist_events.append(thought_event)
                     yield thought_event

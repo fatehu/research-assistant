@@ -49,14 +49,14 @@ def _require_internal_token(authorization: Optional[str] = Header(default=None))
 class ExecutePayload(BaseModel):
     notebook_id: str = Field(min_length=1, max_length=200)
     code: str
-    timeout_seconds: int = Field(default=20, ge=1, le=120)
-    hard_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    timeout_seconds: int = Field(default=20, ge=0, le=86400)
+    hard_timeout_seconds: int = Field(default=20, ge=0, le=86400)
     workspace: Optional[Dict[str, Any]] = None
 
 
 class NotebookPayload(BaseModel):
     notebook_id: str = Field(min_length=1, max_length=200)
-    hard_timeout_seconds: int = Field(default=20, ge=1, le=120)
+    hard_timeout_seconds: int = Field(default=20, ge=0, le=86400)
     workspace: Optional[Dict[str, Any]] = None
 
 
@@ -91,7 +91,7 @@ def reset(payload: NotebookPayload):
 @app.get("/internal/codelab/variables", dependencies=[Depends(_require_internal_token)])
 def variables(
     notebook_id: str = Query(..., min_length=1, max_length=200),
-    hard_timeout_seconds: int = Query(default=20, ge=1, le=120),
+    hard_timeout_seconds: int = Query(default=20, ge=0, le=86400),
 ):
     executor = _get_or_create_executor(notebook_id, hard_timeout_seconds)
     return {
@@ -104,6 +104,13 @@ def close(payload: NotebookPayload):
     executor = _executors.pop(payload.notebook_id, None)
     if executor is not None:
         executor.close()
+    return {"success": True}
+
+
+@app.post("/internal/codelab/interrupt", dependencies=[Depends(_require_internal_token)])
+def interrupt(payload: NotebookPayload):
+    executor = _get_or_create_executor(payload.notebook_id, payload.hard_timeout_seconds)
+    executor.interrupt()
     return {"success": True}
 
 

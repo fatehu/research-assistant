@@ -101,6 +101,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingHistory, setIsLoadingHistory] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const [streamingStatus, setStreamingStatus] = useState('')
   const [streamingReActSteps, setStreamingReActSteps] = useState<ReactStep[]>([])
   const [isAuthorized, setIsAuthorized] = useState(false)  // 授权状态
   const [, setPendingAuthAction] = useState<string | null>(null)
@@ -118,10 +119,10 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   }, [messages, scrollToBottom])
 
   useEffect(() => {
-    if (!streamingContent && streamingReActSteps.length === 0) return
+    if (!streamingContent && !streamingStatus && streamingReActSteps.length === 0) return
     // 流式阶段避免每个 token 执行 smooth 动画，减少卡顿。
     scrollToBottom('auto')
-  }, [streamingContent, streamingReActSteps.length, scrollToBottom])
+  }, [streamingContent, streamingStatus, streamingReActSteps.length, scrollToBottom])
 
   const activeCell = useMemo(() => {
     if (currentCellIndex < 0 || currentCellIndex >= cells.length) return null
@@ -147,8 +148,14 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
 
   const clearHistory = async () => {
     try {
+      abortControllerRef.current?.abort()
+      abortControllerRef.current = null
+      setIsLoading(false)
       await agentApi.clearHistory(notebookId)
       setMessages([])
+      setStreamingContent('')
+      setStreamingStatus('')
+      setStreamingReActSteps([])
       message.success('对话已清空')
     } catch (error) {
       message.error('清空失败')
@@ -171,6 +178,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
     setInputValue('')
     setIsLoading(true)
     setStreamingContent('')
+    setStreamingStatus('正在读取 Notebook 状态…')
     setStreamingReActSteps([])
     abortControllerRef.current = new AbortController()
 
@@ -199,6 +207,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             fullContent += event.content
             setStreamingContent(fullContent)
           } else if (event.type === 'thought') {
+            setStreamingStatus('正在分析 Notebook 状态…')
             const iteration = Number(event.iteration || 0)
             pushReactStep({
               type: 'thought',
@@ -209,6 +218,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             })
           } else if (event.type === 'action') {
             const iteration = Number(event.iteration || 0)
+            setStreamingStatus(event.tool ? `正在调用 ${event.tool}…` : '正在调用 Notebook 工具…')
             pushReactStep({
               type: 'action',
               iteration: Number.isFinite(iteration) && iteration > 0 ? iteration : 1,
@@ -217,6 +227,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             })
           } else if (event.type === 'observation') {
             const iteration = Number(event.iteration || 0)
+            setStreamingStatus(event.success === false ? '工具返回失败，正在调整…' : '已收到工具结果，正在整理回答…')
             pushReactStep({
               type: 'observation',
               iteration: Number.isFinite(iteration) && iteration > 0 ? iteration : 1,
@@ -237,6 +248,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
           } else if (event.type === 'answer') {
             fullContent = event.content || fullContent
             setStreamingContent(fullContent)
+            setStreamingStatus('')
           } else if (event.type === 'authorization_required') {
             // 需要授权
             setPendingAuthAction(event.action || 'unknown')
@@ -260,6 +272,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
             }
             setMessages(prev => [...prev, assistantMessage])
             setStreamingContent('')
+            setStreamingStatus('')
             setStreamingReActSteps([])
           } else if (event.type === 'error') {
             message.error(event.error || '请求失败')
@@ -274,6 +287,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
       }
     } finally {
       setIsLoading(false)
+      setStreamingStatus('')
       setStreamingReActSteps([])
       abortControllerRef.current = null
     }
@@ -284,6 +298,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
       abortControllerRef.current.abort()
       setIsLoading(false)
       setStreamingContent('')
+      setStreamingStatus('')
       setStreamingReActSteps([])
     }
   }
@@ -384,11 +399,17 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
   }, [copyCode, insertCode, onInsertCode, onRunCode, runCode])
 
   const renderStreamingContent = () => {
-    if (!streamingContent && streamingReActSteps.length === 0) return null
+    if (!streamingContent && !streamingStatus && streamingReActSteps.length === 0) return null
     return (
       <div className="space-y-3">
         {streamingReActSteps.length > 0 ? <HistoryReActPanel steps={streamingReActSteps} defaultExpanded /> : null}
-        <div className="flex gap-3">
+        {streamingStatus ? (
+          <div className="ml-11 inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200">
+            <Spin size="small" />
+            <span>{streamingStatus}</span>
+          </div>
+        ) : null}
+        {streamingContent ? <div className="flex gap-3">
           <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
             <RobotOutlined className="text-white text-sm" />
           </div>
@@ -400,7 +421,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
               <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse ml-1" />
             </div>
           </div>
-        </div>
+        </div> : null}
       </div>
     )
   }
@@ -424,7 +445,9 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
           <div className="flex items-center gap-1">
             <Tooltip title="刷新上下文"><Button type="text" size="small" icon={<ReloadOutlined />} onClick={loadHistory} className="text-slate-400 hover:text-white" /></Tooltip>
             <Popconfirm title="确定要清空对话历史吗？" onConfirm={clearHistory} okText="确定" cancelText="取消">
-              <Tooltip title="清空对话"><Button type="text" size="small" icon={<DeleteOutlined />} className="text-slate-400 hover:text-red-400" /></Tooltip>
+              <Button type="text" size="small" icon={<DeleteOutlined />} className="text-slate-400 hover:text-red-400 px-2">
+                清空历史
+              </Button>
             </Popconfirm>
             {onToggleExpand && <Tooltip title={isExpanded ? '收起' : '展开'}><Button type="text" size="small" icon={isExpanded ? <CompressOutlined /> : <ExpandOutlined />} onClick={onToggleExpand} className="text-slate-400 hover:text-white" /></Tooltip>}
             <Tooltip title="关闭"><Button type="text" size="small" icon={<CloseOutlined />} onClick={onClose} className="text-slate-400 hover:text-white" /></Tooltip>
@@ -503,7 +526,7 @@ const NotebookAgentPanel: React.FC<NotebookAgentPanelProps> = ({
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {isLoadingHistory ? (
             <div className="flex items-center justify-center h-full"><Spin /></div>
-          ) : messages.length === 0 && !streamingContent && streamingReActSteps.length === 0 ? (
+          ) : messages.length === 0 && !streamingContent && !streamingStatus && streamingReActSteps.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/20 to-teal-500/20 flex items-center justify-center mb-4"><RobotOutlined className="text-3xl text-emerald-400" /></div>
               <h4 className="text-white font-medium mb-2">AI 编程助手</h4>

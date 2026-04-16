@@ -34,75 +34,28 @@ except ImportError:
     BS4_AVAILABLE = False
 
 from app.config import settings
+from app.core.database import async_session_factory
 from app.services.agent_tools import Tool, ToolResult
+from app.services.codelab_sandbox_policy import (
+    ALLOWED_PACKAGES,
+    SANDBOX_FORBIDDEN_IMPORT_ROOTS,
+    extract_sandbox_blocked_imports,
+)
+from app.services.notebook_background_execution_service import (
+    NotebookBackgroundExecutionBusyError,
+    get_notebook_background_execution_manager,
+)
+from app.services.notebook_service import NotebookService
 from app.services.notebook_workspace_service import build_notebook_workspace_context
 
 
 # ========== 安全配置 ==========
-
-# pip install 白名单 - 只允许安装这些包
-ALLOWED_PACKAGES = {
-    # 数据科学基础
-    'numpy', 'pandas', 'scipy', 'statsmodels',
-    # 可视化
-    'matplotlib', 'seaborn', 'plotly', 'bokeh', 'altair', 'pygal',
-    # 机器学习
-    'scikit-learn', 'sklearn', 'xgboost', 'lightgbm', 'catboost',
-    # 深度学习
-    'torch', 'torchvision', 'torchaudio', 'tensorflow', 'keras',
-    'transformers', 'datasets', 'accelerate',
-    # NLP
-    'nltk', 'spacy', 'gensim', 'jieba', 'snownlp',
-    # 图像处理
-    'pillow', 'opencv-python', 'opencv-python-headless', 'imageio',
-    # 网络请求
-    'requests', 'httpx', 'aiohttp', 'urllib3',
-    # 数据解析
-    'beautifulsoup4', 'bs4', 'lxml', 'html5lib', 'cssselect',
-    'pyquery', 'parsel',
-    # 数据格式
-    'openpyxl', 'xlrd', 'xlwt', 'python-docx', 'PyPDF2', 'pdfplumber',
-    'python-pptx', 'csvkit',
-    # 数据库
-    'sqlalchemy', 'pymysql', 'psycopg2-binary', 'redis', 'pymongo',
-    # 工具库
-    'tqdm', 'loguru', 'rich', 'typer', 'click',
-    'pydantic', 'python-dotenv', 'python-dateutil', 'pytz',
-    # 科学计算
-    'sympy', 'networkx', 'igraph',
-    # 其他常用
-    'faker', 'arrow', 'pendulum', 'humanize',
-    'tabulate', 'prettytable', 'colorama',
-}
-
-SANDBOX_FORBIDDEN_IMPORT_ROOTS = {
-    "os", "subprocess", "socket", "pathlib", "shutil", "tempfile", "requests",
-    "httpx", "urllib", "aiohttp", "ftplib", "telnetlib", "paramiko",
-    "multiprocessing", "threading", "ctypes", "importlib", "pickle", "marshal",
-}
 
 # 网页爬取黑名单域名
 BLOCKED_DOMAINS = {
     'localhost', '127.0.0.1', '0.0.0.0',
     'internal', 'intranet', 'corp', 'private',
 }
-
-
-def _extract_sandbox_blocked_imports(source: str) -> List[str]:
-    blocked: List[str] = []
-    for line in str(source or "").splitlines():
-        stripped = line.strip()
-        module_name = ""
-        if stripped.startswith("import "):
-            module_name = stripped[len("import ") :].split(",")[0].strip().split()[0]
-        elif stripped.startswith("from "):
-            module_name = stripped[len("from ") :].split()[0].strip()
-        if not module_name:
-            continue
-        root = module_name.split(".")[0]
-        if root in SANDBOX_FORBIDDEN_IMPORT_ROOTS and root not in blocked:
-            blocked.append(root)
-    return blocked
 
 
 def _workspace_context_for_notebook_payload(notebook: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -123,14 +76,27 @@ class NotebookExecuteTool(Tool):
     执行后可追加新 Cell，或直接覆盖已有 Cell 并保存结果
     """
     name = "notebook_execute"
-    description = """在 Notebook 的 Python 内核中执行代码。
-代码会在持久化的命名空间中执行，变量在多次调用之间保持。
-执行后可以：
-1. 追加一个新的代码单元格；
-2. 覆盖已有单元格并把执行结果写回该单元格。
-适用于：运行数据分析代码、创建图表、测试代码片段，或修复已有报错单元格。
-如果是在修复当前/最近报错的单元格，优先使用 cell_id 覆盖原单元格；cell_index 仅作为兼容参数，而不是再新增一个修复版单元格。
-注意：此操作需要用户授权。"""
+    description = """Execute Python code in CodeLab's persistent notebook kernel.
+Variables persist across calls.
+
+Injected uploaded-file helpers:
+- list_uploaded_files(): returns uploaded file names for the current notebook.
+- uploaded_file_path(name): returns a readable path for an uploaded file.
+- read_uploaded_text(name, encoding='utf-8'): reads an uploaded text file.
+- NOTEBOOK_FILES / NOTEBOOK_FILE_PATHS / NOTEBOOK_FILES_DIR: uploaded names, path map, and workspace directory.
+
+Hard file-access rules:
+- Do not import os, pathlib, glob, shutil, subprocess, or sys to discover uploaded files.
+- Do not use os.listdir, os.path, pathlib.Path, glob.glob, subprocess, or shell commands for uploaded files.
+- For uploaded files, use relative file names or the injected helpers, for example:
+  files = list_uploaded_files(); df = pd.read_csv(uploaded_file_path(files[0])).
+- Do not fake file names, columns, execution results, metrics, or plots.
+
+Use this tool to run data analysis code, create charts, test code snippets, or fix an existing failing cell.
+For long ML training / hyperparameter search / multi-model evaluation, prefer run_mode=background. If the returned observation contains completed outputs, use those outputs and continue the notebook task; only treat a still-running background execution as a parked long task.
+If fixing the current/latest failing cell, prefer updating it with cell_id; cell_index is compatibility-only.
+Do not create duplicate code cells. If the code already exists in an unexecuted AI-created draft cell, execute/update that cell with cell_id or let write_mode=auto reuse the matching draft.
+This action requires user authorization."""
     parameters = {
         "type": "object",
         "properties": {
@@ -154,6 +120,11 @@ class NotebookExecuteTool(Tool):
                 "type": "string",
                 "enum": ["auto", "append", "replace"],
                 "description": "写回模式。append=总是新增，replace=优先覆盖目标/最近报错单元格，auto=自动判断，默认 auto。"
+            },
+            "run_mode": {
+                "type": "string",
+                "enum": ["auto", "foreground", "background"],
+                "description": "执行模式。background 会将长任务转为后台执行并稍后写回 cell；auto 会对训练/搜索类长任务自动走后台。"
             }
         },
         "required": ["code"]
@@ -223,6 +194,176 @@ class NotebookExecuteTool(Tool):
         overlap = cls._identifier_overlap(source, code)
         return similarity >= 0.55 or (similarity >= 0.35 and overlap >= 0.45) or overlap >= 0.75
 
+    @staticmethod
+    def _is_ai_draft_code_cell(cell: dict) -> bool:
+        if str(cell.get("cell_type") or "code") != "code":
+            return False
+        if cell.get("execution_count") is not None:
+            return False
+        if list(cell.get("outputs") or []):
+            return False
+        metadata = dict(cell.get("metadata") or {})
+        if str(metadata.get("created_by") or "") != "ai_agent":
+            return False
+        return bool(str(cell.get("source") or "").strip())
+
+    @classmethod
+    def _find_recent_ai_draft_cell(cls, notebook: dict, code: str):
+        cells = list(notebook.get("cells", []) or [])
+        for idx in range(len(cells) - 1, -1, -1):
+            cell = cells[idx]
+            if not cls._is_ai_draft_code_cell(cell):
+                continue
+            source = str(cell.get("source") or "")
+            similarity = cls._code_similarity(source, code)
+            overlap = cls._identifier_overlap(source, code)
+            if similarity >= 0.8 or (similarity >= 0.55 and overlap >= 0.55) or overlap >= 0.85:
+                return cell, idx
+        return None, None
+
+    @classmethod
+    def _select_write_target(
+        cls,
+        notebook: dict,
+        *,
+        code: str,
+        description: Optional[str],
+        cell_id: Optional[str],
+        cell_index: Optional[int],
+        write_mode: str,
+    ) -> tuple[Optional[dict], Optional[int], Optional[str], Optional[str]]:
+        target_cell = None
+        target_index = None
+        target_cell_id = None
+        explicit_target = bool(cell_id) or cell_index is not None
+        if explicit_target:
+            target_cell, target_index, target_cell_id = cls._resolve_target_cell(
+                notebook,
+                cell_id=cell_id,
+                cell_index=cell_index,
+            )
+            if target_cell is None:
+                return None, None, None, "cell_not_found"
+            return target_cell, target_index, target_cell_id, None
+
+        normalized_write_mode = str(write_mode or "auto").strip().lower()
+        recent_error_cell, recent_error_index = cls._find_recent_error_cell(notebook)
+        if normalized_write_mode == "replace" and recent_error_cell is not None:
+            return recent_error_cell, recent_error_index, recent_error_cell.get("id"), None
+        if (
+            normalized_write_mode == "auto"
+            and recent_error_cell is not None
+            and cls._looks_like_fix(code, recent_error_cell.get("source", ""), description=description)
+        ):
+            return recent_error_cell, recent_error_index, recent_error_cell.get("id"), None
+        if normalized_write_mode in {"auto", "replace"}:
+            draft_cell, draft_index = cls._find_recent_ai_draft_cell(notebook, code)
+            if draft_cell is not None:
+                return draft_cell, draft_index, draft_cell.get("id"), None
+        return None, None, None, None
+
+    @staticmethod
+    def _serialize_outputs(raw_outputs: List[Any]) -> List[Dict[str, Any]]:
+        serialized_outputs: List[Dict[str, Any]] = []
+        for output in list(raw_outputs or []):
+            if hasattr(output, "model_dump"):
+                serialized_outputs.append(output.model_dump())
+            elif hasattr(output, "dict"):
+                serialized_outputs.append(output.dict())
+            elif isinstance(output, dict):
+                serialized_outputs.append(output)
+            else:
+                serialized_outputs.append({"output_type": "stream", "content": str(output), "mime_type": "text/plain"})
+        return serialized_outputs
+
+    @staticmethod
+    def _format_serialized_outputs(serialized_outputs: List[Dict[str, Any]], description: Optional[str] = None) -> str:
+        output_parts: List[str] = []
+        if description:
+            output_parts.append(f"📝 {description}\n")
+        for output in serialized_outputs:
+            output_type = output.get("output_type", "")
+            content = output.get("content", "")
+            mime_type = output.get("mime_type", "")
+            if output_type == "stream":
+                output_parts.append(f"📤 输出:\n{content}")
+            elif output_type == "execute_result":
+                output_parts.append(f"✅ 结果:\n{content}")
+            elif output_type == "error":
+                output_parts.append(f"❌ 错误:\n{content}")
+            elif output_type == "display_data":
+                if mime_type and "image" in mime_type:
+                    output_parts.append("📊 [图表已生成并显示在 Notebook 中]")
+                else:
+                    output_parts.append(f"📋 显示数据:\n{str(content)[:500]}")
+        if not output_parts:
+            output_parts.append("✅ 代码执行成功（无输出）")
+        return "\n".join(output_parts)
+
+    @staticmethod
+    def _should_run_in_background(code: str, description: Optional[str], run_mode: str) -> bool:
+        normalized_mode = str(run_mode or "auto").strip().lower()
+        if normalized_mode == "background":
+            return True
+        if normalized_mode != "auto":
+            return False
+        lowered = f"{description or ''}\n{code or ''}".lower()
+        fit_count = lowered.count(".fit(")
+        background_tokens = (
+            "gridsearchcv",
+            "randomizedsearchcv",
+            "cross_val",
+            "study.optimize",
+            "optuna",
+            "epochs",
+            "epoch",
+            "xgboost",
+            "lightgbm",
+            "catboost",
+            "tensorflow",
+            "torch",
+            "训练多个模型",
+            "模型优化",
+            "交叉验证",
+            "网格搜索",
+        )
+        if any(token in lowered for token in background_tokens):
+            return True
+        if fit_count >= 3:
+            return True
+        if fit_count >= 1 and len(str(code or "")) >= 1800:
+            return True
+        return False
+
+    @staticmethod
+    def _background_placeholder_outputs(description: Optional[str], execution_id: str) -> List[Dict[str, Any]]:
+        content = "后台执行已启动。"
+        if description:
+            content += f"\n任务: {description}"
+        content += f"\nexecution_id={execution_id}"
+        return [{"output_type": "stream", "content": content, "mime_type": "text/plain"}]
+
+    @staticmethod
+    def _background_metadata(
+        *,
+        execution: Dict[str, Any],
+        status: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "execution_id": str(execution.get("execution_id") or "").strip(),
+            "status": str(status or execution.get("status") or "").strip() or "running",
+            "description": str(execution.get("description") or "").strip(),
+            "created_at": execution.get("created_at"),
+            "started_at": execution.get("started_at"),
+            "completed_at": execution.get("completed_at"),
+            "cancel_requested": bool(execution.get("cancel_requested")),
+            "terminated_reason": execution.get("terminated_reason"),
+            "policy_violation_code": execution.get("policy_violation_code"),
+            "error": error if error is not None else execution.get("error"),
+        }
+        return {key: value for key, value in payload.items() if value not in (None, "", False)}
+
     async def execute(
         self,
         code: str,
@@ -230,6 +371,7 @@ class NotebookExecuteTool(Tool):
         cell_id: str = None,
         cell_index: int = None,
         write_mode: str = "auto",
+        run_mode: str = "auto",
         **kwargs,
     ) -> ToolResult:
         """执行代码并创建或更新 Cell"""
@@ -247,149 +389,382 @@ class NotebookExecuteTool(Tool):
                 error="authorization_required",
                 data={"requires_authorization": True, "action": "execute_code"}
             )
+
+        blocked_imports = extract_sandbox_blocked_imports(code)
+        if blocked_imports:
+            imports_text = ", ".join(blocked_imports)
+            return ToolResult(
+                success=False,
+                output=(
+                    f"代码未执行：检测到沙箱禁用导入 {imports_text}。\n"
+                    "不要使用 os/pathlib/glob/shutil/subprocess/sys 查找上传文件；"
+                    "请改用 list_uploaded_files() 和 uploaded_file_path(name)。\n"
+                    "最小示例：files = list_uploaded_files(); df = pd.read_csv(uploaded_file_path(files[0]))"
+                ),
+                error="sandbox_forbidden_import",
+                data={
+                    "blocked_imports": blocked_imports,
+                    "notebook_updated": False,
+                    "operation": "rejected",
+                },
+            )
+
+        try:
+            compile(str(code or ""), "<notebook_execute>", "exec")
+        except SyntaxError as exc:
+            return ToolResult(
+                success=False,
+                output=f"代码未执行：Python 语法错误，第 {exc.lineno or '?'} 行：{exc.msg}",
+                error="syntax_error",
+                data={
+                    "lineno": exc.lineno,
+                    "offset": exc.offset,
+                    "notebook_updated": False,
+                    "operation": "rejected",
+                },
+            )
         
         try:
-            # 获取内核
             kernel = self.kernel_manager.get_or_create_kernel(self.notebook_id)
-            
-            # 执行代码
+            notebook = None
             workspace_context = None
             if self.notebooks_store is not None and self.notebook_id in self.notebooks_store:
-                workspace_context = _workspace_context_for_notebook_payload(self.notebooks_store[self.notebook_id])
+                notebook = self.notebooks_store[self.notebook_id]
+                if "cells" not in notebook:
+                    notebook["cells"] = []
+                workspace_context = _workspace_context_for_notebook_payload(notebook)
+
+            target_cell = None
+            target_index = None
+            target_cell_id = None
+            if notebook is not None:
+                target_cell, target_index, target_cell_id, target_error = self._select_write_target(
+                    notebook,
+                    code=code,
+                    description=description,
+                    cell_id=cell_id,
+                    cell_index=cell_index,
+                    write_mode=write_mode,
+                )
+                if target_error == "cell_not_found":
+                    return ToolResult(
+                        success=False,
+                        output=f"未找到目标单元格 (cell_id={cell_id}, cell_index={cell_index})",
+                        error="cell_not_found",
+                    )
+
+            should_background = bool(
+                notebook is not None
+                and self._should_run_in_background(code, description, run_mode)
+            )
+            if should_background:
+                user_id = notebook.get("user_id") if isinstance(notebook, dict) else None
+                if user_id is not None:
+                    background_manager = get_notebook_background_execution_manager()
+                    if target_cell is None and not target_cell_id:
+                        target_cell_id = str(uuid.uuid4())
+
+                    async def _finalize_background(snapshot: Dict[str, Any], result_payload: Optional[Dict[str, Any]]) -> None:
+                        result_dict = dict(result_payload or {})
+                        serialized_outputs = self._serialize_outputs(list(result_dict.get("outputs") or []))
+                        if not serialized_outputs:
+                            status_name = str(snapshot.get("status") or "failed")
+                            message = str(snapshot.get("error") or "后台执行未返回结果")
+                            if status_name == "cancelled":
+                                message = "执行已被用户停止"
+                            serialized_outputs = [
+                                {
+                                    "output_type": "error",
+                                    "content": {"ename": "BackgroundExecution", "evalue": message, "traceback": []},
+                                }
+                            ]
+
+                        metadata_payload = self._background_metadata(
+                            execution=snapshot,
+                            status=str(snapshot.get("status") or ""),
+                            error=str(snapshot.get("error") or "") or None,
+                        )
+                        cell_metadata = {"background_execution": metadata_payload}
+                        execution_count_value = int(
+                            result_dict.get("execution_count")
+                            or (notebook.get("execution_count") if isinstance(notebook, dict) else 0)
+                            or 0
+                        )
+
+                        if self.notebooks_store is not None and self.notebook_id in self.notebooks_store:
+                            cached_notebook = self.notebooks_store[self.notebook_id]
+                            for cached_cell in list(cached_notebook.get("cells") or []):
+                                if cached_cell.get("id") != target_cell_id:
+                                    continue
+                                cached_cell["outputs"] = serialized_outputs
+                                cached_cell["execution_count"] = execution_count_value
+                                merged_metadata = dict(cached_cell.get("metadata") or {})
+                                merged_metadata["background_execution"] = metadata_payload
+                                cached_cell["metadata"] = merged_metadata
+                                break
+                            cached_notebook["execution_count"] = execution_count_value
+                            cached_notebook["updated_at"] = datetime.utcnow()
+
+                        async with async_session_factory() as db_session:
+                            service = NotebookService(db_session)
+                            await service.save_cell_execution(
+                                self.notebook_id,
+                                int(user_id),
+                                str(target_cell_id),
+                                serialized_outputs,
+                                execution_count_value,
+                                metadata=cell_metadata,
+                            )
+
+                    try:
+                        execution = await background_manager.start(
+                            notebook_id=self.notebook_id,
+                            user_id=int(user_id),
+                            cell_id=str(target_cell_id or ""),
+                            description=str(description or "").strip(),
+                            execute_fn=lambda: kernel.execute(code, timeout=0, workspace_context=workspace_context),
+                            cancel_fn=getattr(kernel, "interrupt", None),
+                            finalize_fn=_finalize_background,
+                        )
+                    except NotebookBackgroundExecutionBusyError as exc:
+                        return ToolResult(
+                            success=False,
+                            output=(
+                                "当前 notebook 已有后台任务在运行，请先等待它完成或手动停止后再启动新的长任务。"
+                                f"\n详情: {exc}"
+                            ),
+                            error="background_execution_busy",
+                            data={"notebook_updated": False, "operation": "rejected"},
+                        )
+
+                    placeholder_outputs = self._background_placeholder_outputs(description, str(execution.get("execution_id") or ""))
+                    placeholder_metadata = {
+                        "background_execution": self._background_metadata(execution=execution, status="running")
+                    }
+
+                    new_cell_id = None
+                    new_cell = None
+                    updated_cell = None
+                    operation = "append"
+                    if target_cell is not None:
+                        target_cell["cell_type"] = "code"
+                        target_cell["source"] = code
+                        target_cell["outputs"] = placeholder_outputs
+                        target_cell["metadata"] = {
+                            **dict(target_cell.get("metadata") or {}),
+                            **placeholder_metadata,
+                            "updated_by": "ai_agent",
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                        if description:
+                            target_cell["metadata"]["description"] = description
+                        updated_cell = target_cell
+                        operation = "update"
+                    else:
+                        new_cell_id = str(target_cell_id)
+                        new_cell = {
+                            "id": new_cell_id,
+                            "cell_type": "code",
+                            "source": code,
+                            "outputs": placeholder_outputs,
+                            "execution_count": notebook.get("execution_count"),
+                            "metadata": {
+                                "created_by": "ai_agent",
+                                "created_at": datetime.utcnow().isoformat(),
+                                "description": description,
+                                **placeholder_metadata,
+                            },
+                        }
+                        notebook["cells"].append(new_cell)
+
+                    execution["cell_id"] = target_cell_id
+                    if updated_cell is not None:
+                        updated_cell["metadata"]["background_execution"] = self._background_metadata(
+                            execution=execution,
+                            status="running",
+                        )
+                    if new_cell is not None:
+                        new_cell["metadata"]["background_execution"] = self._background_metadata(
+                            execution=execution,
+                            status="running",
+                        )
+                    notebook["updated_at"] = datetime.utcnow()
+
+                    wait_seconds = max(
+                        float(getattr(settings, "codelab_background_inline_wait_seconds", 8.0) or 0.0),
+                        0.0,
+                    )
+                    completed_execution = None
+                    if wait_seconds > 0:
+                        completed_execution = await background_manager.wait(
+                            execution_id=str(execution.get("execution_id") or ""),
+                            user_id=int(user_id),
+                            notebook_id=self.notebook_id,
+                            timeout_seconds=wait_seconds,
+                            include_result=True,
+                        )
+
+                    completed_status = str((completed_execution or {}).get("status") or "").strip().lower()
+                    if completed_execution and completed_status not in {"", "pending", "running"}:
+                        result_payload = dict(completed_execution.pop("result_payload") or {})
+                        completed_execution["cell_id"] = target_cell_id
+                        completion_outputs = self._serialize_outputs(list(result_payload.get("outputs") or []))
+                        if not completion_outputs:
+                            message = str(completed_execution.get("error") or "后台执行未返回结果")
+                            if completed_status == "cancelled":
+                                message = "执行已被用户停止"
+                            completion_outputs = [
+                                {
+                                    "output_type": "error",
+                                    "content": {
+                                        "ename": "BackgroundExecution",
+                                        "evalue": message,
+                                        "traceback": [],
+                                    },
+                                }
+                            ]
+
+                        execution_count_value = int(
+                            result_payload.get("execution_count")
+                            or notebook.get("execution_count")
+                            or 0
+                        )
+                        completion_metadata = {
+                            "background_execution": self._background_metadata(
+                                execution=completed_execution,
+                                status=completed_status,
+                                error=str(completed_execution.get("error") or "") or None,
+                            )
+                        }
+                        if target_cell is not None:
+                            target_cell["cell_type"] = "code"
+                            target_cell["source"] = code
+                            target_cell["outputs"] = completion_outputs
+                            target_cell["execution_count"] = execution_count_value
+                            target_cell["metadata"] = {
+                                **dict(target_cell.get("metadata") or {}),
+                                **completion_metadata,
+                                "updated_by": "ai_agent",
+                                "updated_at": datetime.utcnow().isoformat(),
+                            }
+                            if description:
+                                target_cell["metadata"]["description"] = description
+                            updated_cell = target_cell
+                        elif new_cell is not None:
+                            new_cell["outputs"] = completion_outputs
+                            new_cell["execution_count"] = execution_count_value
+                            new_cell["metadata"] = {
+                                **dict(new_cell.get("metadata") or {}),
+                                **completion_metadata,
+                            }
+                        notebook["execution_count"] = execution_count_value
+                        notebook["updated_at"] = datetime.utcnow()
+
+                        execution_success = (
+                            bool(result_payload.get("success"))
+                            if "success" in result_payload
+                            else completed_status == "completed"
+                        )
+                        return ToolResult(
+                            success=execution_success,
+                            output=self._format_serialized_outputs(completion_outputs, description=description),
+                            data={
+                                "cell_id": target_cell_id,
+                                "execution_count": execution_count_value,
+                                "execution_time_ms": result_payload.get("execution_time_ms"),
+                                "outputs": completion_outputs,
+                                "notebook_updated": True,
+                                "new_cell": new_cell if new_cell_id else None,
+                                "updated_cell": updated_cell if target_cell is not None else None,
+                                "operation": operation,
+                                "background_execution": completed_execution,
+                                "background_execution_completed": True,
+                            },
+                        )
+
+                    return ToolResult(
+                        success=True,
+                        output=(
+                            "长任务已转入后台执行。你可以继续对话或稍后回来看结果；如果不需要了，可以手动停止。"
+                            f"\nexecution_id={execution.get('execution_id')}"
+                        ),
+                        data={
+                            "cell_id": target_cell_id,
+                            "execution_count": notebook.get("execution_count"),
+                            "execution_time_ms": 0,
+                            "outputs": placeholder_outputs,
+                            "notebook_updated": True,
+                            "new_cell": new_cell if new_cell_id else None,
+                            "updated_cell": updated_cell if target_cell is not None else None,
+                            "operation": operation,
+                            "background_execution": execution,
+                            "background_execution_started": True,
+                        },
+                    )
 
             result = kernel.execute(code, timeout=60, workspace_context=workspace_context)
-            
-            # 将 outputs 转换为可序列化的格式
-            serialized_outputs = []
-            for output in result.get('outputs', []):
-                if hasattr(output, 'model_dump'):
-                    serialized_outputs.append(output.model_dump())
-                elif hasattr(output, 'dict'):
-                    serialized_outputs.append(output.dict())
-                else:
-                    serialized_outputs.append(output)
-            
-            # 更新已有 Cell，或创建新的 Cell 并添加到 Notebook
+            serialized_outputs = self._serialize_outputs(list(result.get("outputs") or []))
+            execution_success = bool(result.get("success", True))
+
             new_cell_id = None
             new_cell = None
             updated_cell = None
-            updated_cell_id = None
             operation = "append"
-            if self.notebooks_store is not None and self.notebook_id in self.notebooks_store:
-                notebook = self.notebooks_store[self.notebook_id]
-                if 'cells' not in notebook:
-                    notebook['cells'] = []
-
-                target_cell = None
-                target_index = None
-
-                explicit_target = bool(cell_id) or cell_index is not None
-                if explicit_target:
-                    target_cell, target_index, updated_cell_id = self._resolve_target_cell(
-                        notebook,
-                        cell_id=cell_id,
-                        cell_index=cell_index,
-                    )
-                    if target_cell is None:
-                        return ToolResult(
-                            success=False,
-                            output=f"未找到目标单元格 (cell_id={cell_id}, cell_index={cell_index})",
-                            error="cell_not_found",
-                        )
-                else:
-                    normalized_write_mode = str(write_mode or "auto").strip().lower()
-                    recent_error_cell, recent_error_index = self._find_recent_error_cell(notebook)
-                    if normalized_write_mode == "replace" and recent_error_cell is not None:
-                        target_cell = recent_error_cell
-                        target_index = recent_error_index
-                        updated_cell_id = recent_error_cell.get('id')
-                    elif (
-                        normalized_write_mode == "auto"
-                        and recent_error_cell is not None
-                        and self._looks_like_fix(code, recent_error_cell.get('source', ''), description=description)
-                    ):
-                        target_cell = recent_error_cell
-                        target_index = recent_error_index
-                        updated_cell_id = recent_error_cell.get('id')
-
+            if execution_success and notebook is not None:
                 if target_cell is not None:
-                    target_cell['cell_type'] = 'code'
-                    target_cell['source'] = code
-                    target_cell['outputs'] = serialized_outputs
-                    target_cell['execution_count'] = result.get('execution_count')
-                    target_cell['metadata'] = target_cell.get('metadata', {})
-                    target_cell['metadata']['updated_by'] = 'ai_agent'
-                    target_cell['metadata']['updated_at'] = datetime.utcnow().isoformat()
+                    target_cell["cell_type"] = "code"
+                    target_cell["source"] = code
+                    target_cell["outputs"] = serialized_outputs
+                    target_cell["execution_count"] = result.get("execution_count")
+                    target_cell["metadata"] = target_cell.get("metadata", {})
+                    target_cell["metadata"].pop("background_execution", None)
+                    target_cell["metadata"]["updated_by"] = "ai_agent"
+                    target_cell["metadata"]["updated_at"] = datetime.utcnow().isoformat()
                     if description:
-                        target_cell['metadata']['description'] = description
+                        target_cell["metadata"]["description"] = description
                     updated_cell = target_cell
                     operation = "update"
                     logger.info(
-                        f"[NotebookExecute] 更新现有 Cell: {updated_cell_id}, index={target_index + 1 if target_index is not None else 'unknown'}"
+                        f"[NotebookExecute] 更新现有 Cell: {target_cell_id}, index={target_index + 1 if target_index is not None else 'unknown'}"
                     )
                 else:
                     new_cell_id = str(uuid.uuid4())
+                    target_cell_id = new_cell_id
                     new_cell = {
-                        'id': new_cell_id,
-                        'cell_type': 'code',
-                        'source': code,
-                        'outputs': serialized_outputs,
-                        'execution_count': result.get('execution_count'),
-                        'metadata': {
-                            'created_by': 'ai_agent',
-                            'description': description,
-                            'created_at': datetime.utcnow().isoformat()
-                        }
+                        "id": new_cell_id,
+                        "cell_type": "code",
+                        "source": code,
+                        "outputs": serialized_outputs,
+                        "execution_count": result.get("execution_count"),
+                        "metadata": {
+                            "created_by": "ai_agent",
+                            "description": description,
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
                     }
-                    notebook['cells'].append(new_cell)
+                    notebook["cells"].append(new_cell)
                     logger.info(f"[NotebookExecute] 创建新 Cell: {new_cell_id}")
 
-                notebook['updated_at'] = datetime.utcnow()
-                notebook['execution_count'] = result.get('execution_count', notebook.get('execution_count', 0))
-            
-            # 格式化输出
-            output_parts = []
-            
-            if description:
-                output_parts.append(f"📝 {description}\n")
-            
-            for output in serialized_outputs:
-                output_type = output.get('output_type', '')
-                content = output.get('content', '')
-                mime_type = output.get('mime_type', '')
-                
-                if output_type == 'stream':
-                    output_parts.append(f"📤 输出:\n{content}")
-                elif output_type == 'execute_result':
-                    output_parts.append(f"✅ 结果:\n{content}")
-                elif output_type == 'error':
-                    output_parts.append(f"❌ 错误:\n{content}")
-                elif output_type == 'display_data':
-                    if mime_type and 'image' in mime_type:
-                        output_parts.append(f"📊 [图表已生成并显示在 Notebook 中]")
-                    else:
-                        output_parts.append(f"📋 显示数据:\n{str(content)[:500]}")
-            
-            if not output_parts:
-                output_parts.append("✅ 代码执行成功（无输出）")
-            
-            output_text = "\n".join(output_parts)
-            
+                notebook["updated_at"] = datetime.utcnow()
+                notebook["execution_count"] = result.get("execution_count", notebook.get("execution_count", 0))
+            elif not execution_success:
+                operation = "rejected"
+
             return ToolResult(
-                success=result.get('success', True),
-                output=output_text,
+                success=execution_success,
+                output=self._format_serialized_outputs(serialized_outputs, description=description),
                 data={
-                    "cell_id": updated_cell_id or new_cell_id,
-                    "execution_count": result.get('execution_count'),
-                    "execution_time_ms": result.get('execution_time_ms'),
+                    "cell_id": target_cell_id or new_cell_id,
+                    "execution_count": result.get("execution_count"),
+                    "execution_time_ms": result.get("execution_time_ms"),
                     "outputs": serialized_outputs,
-                    "notebook_updated": bool(updated_cell_id or new_cell_id),
+                    "notebook_updated": bool(target_cell_id or new_cell_id) and execution_success,
                     "new_cell": new_cell if new_cell_id else None,
-                    "updated_cell": updated_cell if updated_cell_id else None,
+                    "updated_cell": updated_cell if target_cell is not None else None,
                     "operation": operation,
-                }
+                },
             )
-            
+
         except Exception as e:
             logger.error(f"[NotebookExecute] 执行失败: {e}")
             return ToolResult(
@@ -525,6 +900,9 @@ class NotebookCellTool(Tool):
 【重要】删除/更新/移动时可以使用:
 1. cell_id: 单元格的唯一标识符（UUID格式，首选）
 2. cell_index: 单元格位置索引（从1开始，如第一个单元格是1，仅兼容）
+
+不要先用 add 创建代码单元格、再用 notebook_execute 无目标执行同一段代码；这会造成重复 cell。
+需要执行代码时优先直接调用 notebook_execute；如果已经 add 了代码草稿，后续执行必须带上该 cell_id 或先 update 该 cell。
 
 注意：修改操作需要用户授权。"""
     parameters = {
@@ -684,7 +1062,7 @@ class NotebookCellTool(Tool):
             has_output = bool(cell.get('outputs'))
             metadata = cell.get('metadata', {})
             created_by = metadata.get('created_by', 'user')
-            blocked_imports = _extract_sandbox_blocked_imports(source)
+            blocked_imports = extract_sandbox_blocked_imports(source)
 
             icon = "💻" if cell_type == "code" else "📝"
             status = f"[{exec_count}]" if exec_count else "[未执行]"
@@ -749,7 +1127,7 @@ class NotebookCellTool(Tool):
         exec_count = cell.get('execution_count')
         outputs = cell.get('outputs', [])
         metadata = cell.get('metadata', {})
-        blocked_imports = _extract_sandbox_blocked_imports(source)
+        blocked_imports = extract_sandbox_blocked_imports(source)
         
         icon = "💻" if cell_type == "code" else "📝"
         

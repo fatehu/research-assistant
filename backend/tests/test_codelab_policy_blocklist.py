@@ -51,6 +51,12 @@ def test_codelab_executor_allows_joblib_module():
     assert validate_code_policy("import joblib\nprint(joblib.__version__)") is None
 
 
+def test_codelab_executor_allows_common_ml_modules():
+    assert validate_code_policy("import scipy\nfrom scipy import stats\nprint(stats.norm.mean())") is None
+    assert validate_code_policy("import statsmodels\nprint(statsmodels.__version__)") is None
+    assert validate_code_policy("import xgboost\nprint(xgboost.__version__)") is None
+
+
 def test_codelab_executor_allows_common_python_builtins():
     assert '"format"' in _WORKER_CODE
     assert '"getattr"' in _WORKER_CODE

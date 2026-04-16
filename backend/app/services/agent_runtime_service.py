@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import uuid
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, func, select
 
 from app.config import settings
 from app.core.database import async_session_factory
@@ -487,6 +488,89 @@ class AgentRuntimeService:
                     )
                 )
             await db.commit()
+
+    @staticmethod
+    def _json_safe_payload(payload: Any) -> Any:
+        try:
+            return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        except Exception:
+            return str(payload)
+
+    async def append_chat_run_event(
+        self,
+        run_id: str,
+        *,
+        event: str,
+        data: Any,
+        created_at: Optional[str] = None,
+    ) -> None:
+        normalized_run_id = str(run_id or "").strip()
+        event_name = str(event or "").strip()
+        if not normalized_run_id or not event_name:
+            return
+
+        safe_data = self._json_safe_payload(data)
+        if isinstance(safe_data, str):
+            content = safe_data
+        elif isinstance(safe_data, dict):
+            content = str(safe_data.get("answer") or safe_data.get("content") or safe_data.get("message") or "")
+        else:
+            content = ""
+        metadata = {
+            "chat_background_event": True,
+            "event": event_name,
+            "payload": safe_data,
+            "created_at": str(created_at or datetime.utcnow().isoformat()),
+        }
+
+        async with async_session_factory() as db:
+            max_index_result = await db.execute(
+                select(func.max(AgentStepRecord.step_index)).where(AgentStepRecord.run_id == normalized_run_id)
+            )
+            next_index = int(max_index_result.scalar() or 0) + 1
+            db.add(
+                AgentStepRecord(
+                    run_id=normalized_run_id,
+                    step_index=next_index,
+                    step_type="chat_event",
+                    content=content,
+                    metadata_=metadata,
+                )
+            )
+            await db.commit()
+
+    async def list_chat_run_events(self, run_id: str, *, limit: int = 1000) -> List[Dict[str, Any]]:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return []
+        bounded_limit = min(max(int(limit or 1000), 1), 5000)
+
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(AgentStepRecord)
+                .where(
+                    AgentStepRecord.run_id == normalized_run_id,
+                    AgentStepRecord.step_type == "chat_event",
+                )
+                .order_by(AgentStepRecord.step_index.asc(), AgentStepRecord.id.asc())
+                .limit(bounded_limit)
+            )
+            rows = list(result.scalars().all())
+
+        events: List[Dict[str, Any]] = []
+        for row in rows:
+            metadata = dict(row.metadata_ or {}) if isinstance(row.metadata_, dict) else {}
+            event_name = str(metadata.get("event") or "").strip()
+            if not event_name:
+                continue
+            events.append(
+                {
+                    "event": event_name,
+                    "data": metadata.get("payload"),
+                    "created_at": str(metadata.get("created_at") or (row.created_at.isoformat() if row.created_at else "")),
+                }
+            )
+        return events
 
     async def get_conversation_context_state(self, conversation_id: int) -> Optional[Dict[str, Any]]:
         async with async_session_factory() as db:

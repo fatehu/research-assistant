@@ -18,6 +18,15 @@ class NotebookService:
     
     def __init__(self, db: AsyncSession):
         self.db = db
+
+    @staticmethod
+    def _max_execution_count(current: Any, candidate: Any) -> Any:
+        if candidate is None:
+            return current
+        try:
+            return max(int(current or 0), int(candidate))
+        except (TypeError, ValueError):
+            return candidate
     
     async def get_user_notebooks(self, user_id: int) -> List[Dict]:
         """获取用户的所有 Notebook"""
@@ -239,7 +248,8 @@ class NotebookService:
     
     async def update_cell(self, notebook_id: str, user_id: int, cell_id: str,
                          source: str = None, cell_type: str = None,
-                         outputs: List = None, execution_count: int = None) -> Optional[Dict]:
+                         outputs: List = None, execution_count: int = None,
+                         metadata: Dict[str, Any] = None) -> Optional[Dict]:
         """更新单元格"""
         notebook = await self.get_notebook_model(notebook_id, user_id)
         if not notebook:
@@ -255,6 +265,9 @@ class NotebookService:
                     cell.outputs = outputs
                 if execution_count is not None:
                     cell.execution_count = execution_count
+                    notebook.execution_count = self._max_execution_count(notebook.execution_count, execution_count)
+                if metadata is not None:
+                    cell.cell_metadata = metadata
                 cell.updated_at = datetime.utcnow()
                 break
         
@@ -331,7 +344,7 @@ class NotebookService:
         if not notebook:
             return None
         
-        notebook.execution_count = execution_count
+        notebook.execution_count = self._max_execution_count(notebook.execution_count, execution_count)
         notebook.updated_at = datetime.utcnow()
         
         await self.db.commit()
@@ -340,7 +353,8 @@ class NotebookService:
         return await self.get_notebook(notebook_id, user_id)
     
     async def save_cell_execution(self, notebook_id: str, user_id: int, cell_id: str,
-                                 outputs: List, execution_count: int) -> Optional[Dict]:
+                                 outputs: List, execution_count: int,
+                                 metadata: Dict[str, Any] = None) -> Optional[Dict]:
         """保存单元格执行结果"""
         notebook = await self.get_notebook_model(notebook_id, user_id)
         if not notebook:
@@ -366,6 +380,8 @@ class NotebookService:
             if cell.id == cell_id:
                 cell.outputs = serialized_outputs
                 cell.execution_count = execution_count
+                if metadata is not None:
+                    cell.cell_metadata = metadata
                 cell.updated_at = datetime.utcnow()
                 break
         
