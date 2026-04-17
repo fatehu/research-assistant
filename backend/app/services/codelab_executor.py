@@ -51,15 +51,35 @@ class CodeLabExecutor:
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self._runner_token}"}
 
-    def _request(self, method: str, path: str, *, json_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _build_http_timeout(self, request_timeout_seconds: Optional[float] = None) -> httpx.Timeout:
+        if request_timeout_seconds is None:
+            effective_timeout: Optional[float] = float(self._runner_timeout_seconds)
+        elif float(request_timeout_seconds) <= 0:
+            # Background notebook jobs use timeout_seconds=0 to mean "let the
+            # runner execute until completion/cancel". Do not let the transport
+            # read timeout masquerade as a notebook execution timeout.
+            effective_timeout = None
+        else:
+            effective_timeout = max(1.0, float(request_timeout_seconds))
+
+        return httpx.Timeout(
+            effective_timeout,
+            connect=self._runner_connect_timeout_seconds,
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_payload: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
         if not self._runner_token:
             raise RunnerUnavailableError("CODELAB_RUNNER_TOKEN is missing")
 
         url = f"{self._runner_url}{path}"
-        timeout = httpx.Timeout(
-            self._runner_timeout_seconds,
-            connect=self._runner_connect_timeout_seconds,
-        )
+        timeout = self._build_http_timeout(request_timeout_seconds=request_timeout_seconds)
         try:
             with httpx.Client(timeout=timeout) as client:
                 response = client.request(method=method, url=url, headers=self._headers(), json=json_payload)
@@ -193,6 +213,15 @@ class CodeLabExecutor:
             self._last_workspace_context = dict(workspace_context)
         effective_workspace = workspace_context if workspace_context is not None else self._last_workspace_context
         started = time.time()
+        request_timeout_seconds: Optional[float]
+        if no_timeout:
+            request_timeout_seconds = 0
+        else:
+            request_timeout_seconds = max(
+                float(self._runner_timeout_seconds),
+                float(timeout_value) + 5.0,
+            )
+
         payload = self._request(
             "POST",
             "/internal/codelab/execute",
@@ -203,6 +232,7 @@ class CodeLabExecutor:
                 "hard_timeout_seconds": hard_timeout_value,
                 "workspace": effective_workspace,
             },
+            request_timeout_seconds=request_timeout_seconds,
         )
         self._last_variables = dict(payload.get("variables", {}) or {})
         self._last_variable_previews = dict(payload.get("variable_previews", {}) or {})
