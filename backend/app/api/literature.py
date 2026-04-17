@@ -450,7 +450,12 @@ PAGE_COUNT_CACHE_TTL_SECONDS = 3600
 _pdf_page_count_cache: Dict[str, tuple[float, int]] = {}
 
 
-async def _plan_cache_db_get(cache_key: str, plan_kind: str) -> tuple[Optional[Dict[str, Any]], Optional[datetime]]:
+async def _plan_cache_db_get(
+    cache_key: str,
+    plan_kind: str,
+    *,
+    allow_expired: bool = False,
+) -> tuple[Optional[Dict[str, Any]], Optional[datetime]]:
     try:
         async with async_session_factory() as session:
             stmt = (
@@ -469,7 +474,7 @@ async def _plan_cache_db_get(cache_key: str, plan_kind: str) -> tuple[Optional[D
             if not record:
                 return None, None
             expires_at = record.expires_at
-            if expires_at and expires_at <= datetime.utcnow():
+            if expires_at and expires_at <= datetime.utcnow() and not allow_expired:
                 await session.delete(record)
                 await session.commit()
                 return None, None
@@ -487,6 +492,7 @@ async def _plan_cache_db_get_latest_by_compose_signature(
     page: int,
     compose_source_signature: str,
     cache_key_like: str,
+    allow_expired: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[datetime], Optional[str]]:
     compose_source_signature = str(compose_source_signature or "").strip()
     cache_key_like = str(cache_key_like or "").strip()
@@ -516,7 +522,7 @@ async def _plan_cache_db_get_latest_by_compose_signature(
             now = datetime.utcnow()
             for record in records:
                 expires_at = record.expires_at
-                if expires_at and expires_at <= now:
+                if expires_at and expires_at <= now and not allow_expired:
                     await session.delete(record)
                     expired_found = True
                     continue
@@ -541,6 +547,7 @@ async def _plan_cache_db_get_latest_by_cache_key_like(
     paper_id: int,
     page: int,
     cache_key_like: str,
+    allow_expired: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[datetime], Optional[str]]:
     cache_key_like = str(cache_key_like or "").strip()
     if not cache_key_like:
@@ -568,7 +575,7 @@ async def _plan_cache_db_get_latest_by_cache_key_like(
             now = datetime.utcnow()
             for record in records:
                 expires_at = record.expires_at
-                if expires_at and expires_at <= now:
+                if expires_at and expires_at <= now and not allow_expired:
                     await session.delete(record)
                     expired_found = True
                     continue
@@ -4113,6 +4120,23 @@ def _experience_v2_cache_key_like_pattern(
     )
 
 
+def _experience_v2_cache_key_like_pattern_any_kb(
+    *,
+    namespace: str,
+    user_id: int,
+    paper_id: int,
+    focus_page: int,
+    user_intent: str,
+    reader_profile: str,
+) -> str:
+    intent_hash = hashlib.sha256(str(user_intent or "").strip().encode("utf-8")).hexdigest()[:12]
+    profile_hash = hashlib.sha256(str(reader_profile or "").strip().encode("utf-8")).hexdigest()[:12]
+    return (
+        f"{str(namespace or '').strip()}:{_READER_PLAN_CACHE_NAMESPACE_VERSION}:{int(user_id)}:{int(paper_id)}:"
+        f"{int(focus_page)}:%:{_EXPERIENCE_V2_RUNTIME_VERSION}:%:{intent_hash}:{profile_hash}"
+    )
+
+
 def _experience_v2_fast_cache_key(
     *,
     namespace: str,
@@ -4140,7 +4164,7 @@ def _plan_cache_ttl_seconds_from_expires_at(
     if isinstance(expires_at, datetime):
         now_dt = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
         delta = (expires_at - now_dt).total_seconds()
-        ttl_seconds = max(1, int(delta)) if delta > 0 else 1
+        ttl_seconds = max(1, int(delta)) if delta > 0 else int(default_ttl_seconds)
     return ttl_seconds
 
 
@@ -4155,6 +4179,7 @@ async def _experience_v2_cache_db_get_by_compose_signature(
     compose_source_signature: str,
     user_intent: str,
     reader_profile: str,
+    allow_expired: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[datetime], Optional[str]]:
     cache_key_like = _experience_v2_cache_key_like_pattern(
         namespace=namespace,
@@ -4172,6 +4197,7 @@ async def _experience_v2_cache_db_get_by_compose_signature(
         page=focus_page,
         compose_source_signature=compose_source_signature,
         cache_key_like=cache_key_like,
+        allow_expired=allow_expired,
     )
 
 
@@ -4185,22 +4211,35 @@ async def _experience_v2_cache_db_get_latest_stable(
     selected_kb_id: int,
     user_intent: str,
     reader_profile: str,
+    allow_expired: bool = False,
+    match_selected_kb: bool = True,
 ) -> tuple[Optional[Dict[str, Any]], Optional[datetime], Optional[str]]:
-    cache_key_like = _experience_v2_cache_key_like_pattern(
-        namespace=namespace,
-        user_id=user_id,
-        paper_id=paper_id,
-        focus_page=focus_page,
-        selected_kb_id=selected_kb_id,
-        user_intent=user_intent,
-        reader_profile=reader_profile,
-    )
+    if match_selected_kb:
+        cache_key_like = _experience_v2_cache_key_like_pattern(
+            namespace=namespace,
+            user_id=user_id,
+            paper_id=paper_id,
+            focus_page=focus_page,
+            selected_kb_id=selected_kb_id,
+            user_intent=user_intent,
+            reader_profile=reader_profile,
+        )
+    else:
+        cache_key_like = _experience_v2_cache_key_like_pattern_any_kb(
+            namespace=namespace,
+            user_id=user_id,
+            paper_id=paper_id,
+            focus_page=focus_page,
+            user_intent=user_intent,
+            reader_profile=reader_profile,
+        )
     return await _plan_cache_db_get_latest_by_cache_key_like(
         plan_kind=plan_kind,
         user_id=user_id,
         paper_id=paper_id,
         page=focus_page,
         cache_key_like=cache_key_like,
+        allow_expired=allow_expired,
     )
 
 
@@ -8501,7 +8540,7 @@ async def _page_artifact_v2_cache_get(cache_key: str) -> tuple[Optional[Dict[str
     now_ts = time.time()
     item = _page_artifact_v2_cache_memory.get(cache_key)
     if not item:
-        db_payload, expires_at = await _plan_cache_db_get(cache_key, PAGE_ARTIFACT_V2_CACHE_KIND)
+        db_payload, expires_at = await _plan_cache_db_get(cache_key, PAGE_ARTIFACT_V2_CACHE_KIND, allow_expired=True)
         if isinstance(db_payload, dict):
             ttl_seconds = PAGE_ARTIFACT_V2_CACHE_TTL_SECONDS
             if isinstance(expires_at, datetime):
@@ -12659,6 +12698,7 @@ async def _prepare_reader_experience_v2_runtime(
             compose_source_signature=compose_source_signature,
             user_intent=user_intent,
             reader_profile=reader_profile,
+            allow_expired=True,
         )
         if isinstance(legacy_artifact, Mapping):
             await _page_artifact_v2_cache_set(
@@ -12689,7 +12729,23 @@ async def _prepare_reader_experience_v2_runtime(
             selected_kb_id=selected_kb_id,
             user_intent=user_intent,
             reader_profile=reader_profile,
+            allow_expired=True,
         )
+        stable_layer_prefix = "db_stable"
+        if not isinstance(stable_artifact, Mapping) and selected_kb_id > 0:
+            stable_artifact, stable_expires_at, stable_artifact_key = await _experience_v2_cache_db_get_latest_stable(
+                plan_kind=PAGE_ARTIFACT_V2_CACHE_KIND,
+                namespace=PAGE_ARTIFACT_V2_CACHE_NAMESPACE,
+                user_id=int(current_user.id),
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                selected_kb_id=selected_kb_id,
+                user_intent=user_intent,
+                reader_profile=reader_profile,
+                allow_expired=True,
+                match_selected_kb=False,
+            )
+            stable_layer_prefix = "db_stable_any_kb"
         if isinstance(stable_artifact, Mapping):
             await _page_artifact_v2_cache_set(
                 artifact_cache_key,
@@ -12705,9 +12761,9 @@ async def _prepare_reader_experience_v2_runtime(
             )
             cached_artifact = _jsonable_dict(stable_artifact)
             artifact_cache_layer = (
-                f"db_stable:{stable_artifact_key}"
+                f"{stable_layer_prefix}:{stable_artifact_key}"
                 if str(stable_artifact_key or "").strip()
-                else "db_stable"
+                else stable_layer_prefix
             )
     artifact_validation = {}
     if isinstance(cached_artifact, Mapping):
@@ -13158,10 +13214,30 @@ async def _build_reader_experience_v2_cached_fast_payload(
             selected_kb_id=selected_kb_id,
             user_intent=user_intent,
             reader_profile=reader_profile,
+            allow_expired=True,
         )
+        stable_artifact_layer = "db"
+        if not isinstance(stable_artifact, Mapping) and selected_kb_id > 0:
+            stable_artifact, artifact_expires_at, stable_artifact_key = await _experience_v2_cache_db_get_latest_stable(
+                plan_kind=PAGE_ARTIFACT_V2_CACHE_KIND,
+                namespace=PAGE_ARTIFACT_V2_CACHE_NAMESPACE,
+                user_id=int(current_user.id),
+                paper_id=int(paper.id),
+                focus_page=focus_page,
+                selected_kb_id=selected_kb_id,
+                user_intent=user_intent,
+                reader_profile=reader_profile,
+                allow_expired=True,
+                match_selected_kb=False,
+            )
+            stable_artifact_layer = (
+                f"db_stable_any_kb:{stable_artifact_key}"
+                if str(stable_artifact_key or "").strip()
+                else "db_stable_any_kb"
+            )
         if isinstance(stable_artifact, Mapping):
             cached_artifact = _jsonable_dict(stable_artifact)
-            artifact_layer = "db"
+            artifact_layer = stable_artifact_layer
             await _page_artifact_v2_fast_cache_set(
                 artifact_fast_key,
                 cached_artifact,

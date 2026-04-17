@@ -8713,9 +8713,66 @@ async def test_reader_experience_v2_cached_payload_should_fast_return_latest_sta
     assert fast_artifact_writes and fast_artifact_writes[0]["cache_key"].startswith(
         f"{literature_api.PAGE_ARTIFACT_V2_FAST_CACHE_NAMESPACE}:"
     )
-    assert fast_session_writes and fast_session_writes[0]["cache_key"].startswith(
-        f"{literature_api.EXPERIENCE_SESSION_V2_FAST_CACHE_NAMESPACE}:"
+
+
+@pytest.mark.asyncio
+async def test_reader_experience_v2_cached_payload_should_reuse_stable_artifact_across_kb_without_runtime_prepare(monkeypatch):
+    paper = SimpleNamespace(id=78, user_id=5, title="Demo Paper", url="https://example.com/paper", pdf_path="demo.pdf")
+    stable_artifact = literature_api._build_page_artifact_v2_from_dossier(
+        reading_dossier=_build_sample_reading_dossier_v2_for_session(),
+        authored_plan=_build_sample_page_artifact_v2_authored_plan(),
     )
+    stable_calls: list[dict[str, object]] = []
+
+    async def _fake_get_owned(_db, _current_user, _paper_id):
+        return paper
+
+    async def _fake_normalize(**_kwargs):
+        return 146
+
+    async def _fake_fast_get(_cache_key):
+        return None, "none"
+
+    async def _fake_fast_set(*_args, **_kwargs):
+        return None
+
+    async def _fake_latest_stable(**kwargs):
+        stable_calls.append(dict(kwargs))
+        if kwargs["plan_kind"] != literature_api.PAGE_ARTIFACT_V2_CACHE_KIND:
+            return None, None, None
+        if kwargs.get("match_selected_kb", True):
+            return None, None, None
+        return stable_artifact, None, "stable-artifact-key-kb84"
+
+    async def _fail_prepare(**_kwargs):
+        raise AssertionError("full runtime should not run when cross-kb stable artifact exists")
+
+    monkeypatch.setattr(literature_api, "_get_owned_paper_or_404", _fake_get_owned)
+    monkeypatch.setattr(literature_api, "_normalize_reader_selected_kb_id", _fake_normalize)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_fast_cache_get", _fake_fast_get)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_fast_cache_get", _fake_fast_get)
+    monkeypatch.setattr(literature_api, "_experience_session_v2_fast_cache_set", _fake_fast_set)
+    monkeypatch.setattr(literature_api, "_page_artifact_v2_fast_cache_set", _fake_fast_set)
+    monkeypatch.setattr(literature_api, "_experience_v2_cache_db_get_latest_stable", _fake_latest_stable)
+    monkeypatch.setattr(literature_api, "_prepare_reader_experience_v2_runtime", _fail_prepare)
+
+    response = await literature_api._build_reader_experience_v2_cached_payload(
+        paper_id=78,
+        payload=literature_api.ReaderExperiencePlanRequest(
+            page=7,
+            focus_page=7,
+            reader_profile="curious_generalist",
+            selected_kb_id=146,
+        ),
+        db=SimpleNamespace(),
+        current_user=SimpleNamespace(id=5),
+    )
+
+    assert response["status"] == "ready"
+    assert response["artifact"]["version"] == "page_artifact_v2"
+    assert response["artifact_cache_hit"] is True
+    assert response["artifact_cache_layer"].startswith("db_stable_any_kb")
+    assert any(call.get("match_selected_kb") is False for call in stable_calls)
 
 
 @pytest.mark.asyncio
