@@ -162,11 +162,17 @@ export function useNotebook() {
           if (!prev) return prev
           return {
             ...prev,
-            cells: prev.cells.map(cell =>
-              cell.id === cellId
-                ? { ...cell, outputs: result.outputs, execution_count: result.execution_count }
-                : cell
-            ),
+            cells: prev.cells.map(cell => {
+              if (cell.id !== cellId) return cell
+              const metadata = { ...(cell.metadata || {}) }
+              delete metadata.background_execution
+              return {
+                ...cell,
+                outputs: result.outputs,
+                execution_count: result.execution_count,
+                metadata,
+              }
+            }),
           }
         })
       })

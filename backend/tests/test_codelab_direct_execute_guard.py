@@ -7,7 +7,12 @@ from fastapi import HTTPException
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.api.codelab import ExecuteRequest, PythonKernel, execute_code_directly
+from app.api.codelab import (
+    ExecuteRequest,
+    PythonKernel,
+    _metadata_without_background_execution,
+    execute_code_directly,
+)
 from app.config import settings
 
 
@@ -71,3 +76,19 @@ def test_python_kernel_non_sandbox_preserves_last_line_inside_else(monkeypatch):
         )
     finally:
         kernel.close()
+
+
+def test_metadata_without_background_execution_preserves_other_fields():
+    original = {
+        "description": "train model",
+        "background_execution": {"status": "failed", "execution_id": "old"},
+        "created_by": "ai_agent",
+    }
+
+    cleaned = _metadata_without_background_execution(original)
+
+    assert cleaned == {
+        "description": "train model",
+        "created_by": "ai_agent",
+    }
+    assert "background_execution" in original

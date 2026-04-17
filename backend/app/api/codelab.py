@@ -203,6 +203,12 @@ class NotebookBackgroundExecutionResponse(BaseModel):
     error: Optional[str] = None
 
 
+def _metadata_without_background_execution(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    next_metadata = dict(metadata or {})
+    next_metadata.pop("background_execution", None)
+    return next_metadata
+
+
 # ========== 持久化执行内核 ==========
 
 class PythonKernel:
@@ -1043,10 +1049,17 @@ async def execute_cell(
     
     # 更新数据库中的单元格输出
     if request.cell_id:
+        next_metadata: Optional[Dict[str, Any]] = None
+        for cell in notebook['cells']:
+            if cell['id'] == request.cell_id:
+                next_metadata = _metadata_without_background_execution(cell.get("metadata"))
+                break
+
         service = NotebookService(db)
         await service.save_cell_execution(
             notebook_id, current_user.id, request.cell_id,
-            serialized_outputs, result['execution_count']
+            serialized_outputs, result['execution_count'],
+            metadata=next_metadata,
         )
         
         # 更新缓存
@@ -1054,6 +1067,7 @@ async def execute_cell(
             if cell['id'] == request.cell_id:
                 cell['outputs'] = serialized_outputs
                 cell['execution_count'] = result['execution_count']
+                cell['metadata'] = dict(next_metadata or {})
                 break
     
     notebook['updated_at'] = datetime.utcnow()
