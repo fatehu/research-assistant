@@ -44,6 +44,8 @@ from app.models.literature import (
     PaperCollection,
     PaperComment,
     PaperEntity,
+    PaperExperimentRun,
+    PaperExperimentWorkspace,
     PaperKnowledgeLink,
     PaperReaderPageCache,
     PaperReaderPlanCache,
@@ -75,6 +77,10 @@ from app.schemas.literature import (
     PaperCommentCreate,
     PaperCommentResponse,
     PaperCommentUpdate,
+    PaperExperimentRunCreateRequest,
+    PaperExperimentRunResponse,
+    PaperExperimentRunUpdateRequest,
+    PaperExperimentWorkspaceResponse,
     PaperCreate,
     ReaderGenerativePlanRequest,
     ReaderGenerativePlanResponse,
@@ -141,7 +147,14 @@ from app.services.generative_reader_agent_runtime import get_generative_reader_a
 from app.services.literature_service import PaperResult, get_literature_service
 from app.services.literature_reader_compose_service import GROUNDED_FIGURE_ASSET_VERSION, get_literature_reader_compose_service
 from app.services.literature_reader_service import get_literature_reader_service
-from app.services.llm_service import get_llm_service
+from app.services.llm_service import (
+    build_llm_source_headers,
+    get_llm_service,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
+from app.services.paper_experiment_service import PaperExperimentService
 from app.services.render_pipeline_contract import RenderPipelineContractError
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
@@ -418,6 +431,50 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
         "created_at": paper.created_at,
         "updated_at": paper.updated_at,
         "collection_ids": collection_ids,
+    }
+
+
+def _paper_experiment_run_to_response(run: PaperExperimentRun) -> dict:
+    return {
+        "id": run.id,
+        "workspace_id": run.workspace_id,
+        "user_id": run.user_id,
+        "notebook_id": run.notebook_id,
+        "notebook_cell_id": run.notebook_cell_id,
+        "base_run_id": run.base_run_id,
+        "run_kind": run.run_kind,
+        "status": run.status,
+        "label": run.label,
+        "model_name": run.model_name,
+        "hypothesis": run.hypothesis,
+        "variant_spec": run.variant_spec_json or {},
+        "params": run.params_json or {},
+        "metrics": run.metrics_json or {},
+        "artifacts": run.artifacts_json or {},
+        "summary": run.summary_json or {},
+        "notes": run.notes,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+    }
+
+
+def _paper_experiment_workspace_to_response(workspace: PaperExperimentWorkspace) -> dict:
+    runs = list(workspace.runs or [])
+    return {
+        "id": workspace.id,
+        "user_id": workspace.user_id,
+        "paper_id": workspace.paper_id,
+        "notebook_id": workspace.notebook_id,
+        "status": workspace.status,
+        "title": workspace.title,
+        "summary": workspace.summary_json or {},
+        "experiment_spec": workspace.experiment_spec_json or {},
+        "compare_report": workspace.compare_report_json or {},
+        "runs": [_paper_experiment_run_to_response(item) for item in runs],
+        "created_at": workspace.created_at,
+        "updated_at": workspace.updated_at,
     }
 
 
@@ -5397,7 +5454,14 @@ async def _call_experience_session_v2_narrative_brief_model(
     max_tokens: int,
 ) -> Dict[str, Any]:
     del provider
+    source = "literature.experience_v2.narrative_brief"
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    log_tagged_llm_request_start(
+        source=source,
+        provider="aliyun",
+        model=model,
+        operation="chat",
+    )
     response = await asyncio.wait_for(
         client.chat.completions.create(
             model=model,
@@ -5417,8 +5481,22 @@ async def _call_experience_session_v2_narrative_brief_model(
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             timeout=timeout_seconds,
+            extra_headers=build_llm_source_headers(source) or None,
         ),
         timeout=timeout_seconds + 1.0,
+    )
+    usage_obj = getattr(response, "usage", None)
+    log_tagged_llm_request_done(
+        source=source,
+        provider="aliyun",
+        model=str(getattr(response, "model", "") or model),
+        operation="chat",
+        finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+        usage={
+            "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+        },
     )
     try:
         content = str((response.choices[0].message.content or "")).strip()
@@ -5557,8 +5635,17 @@ async def _create_reader_experience_block_explain_stream(
     *,
     client: AsyncOpenAI,
     request_kwargs: Dict[str, Any],
+    source: str,
 ):
     try:
+        request_kwargs = dict(request_kwargs)
+        request_kwargs["extra_headers"] = build_llm_source_headers(source) or None
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=str(request_kwargs.get("model") or ""),
+            operation="chat_stream",
+        )
         return await client.chat.completions.create(
             **request_kwargs,
             extra_body={"enable_thinking": False},
@@ -5571,6 +5658,13 @@ async def _create_reader_experience_block_explain_stream(
             or "invalid_request_error" in message
         )
         if not disable_thinking_unsupported:
+            log_tagged_llm_request_error(
+                source=source,
+                provider="aliyun",
+                model=str(request_kwargs.get("model") or ""),
+                operation="chat_stream",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             raise
         return await client.chat.completions.create(**request_kwargs)
 
@@ -6592,7 +6686,14 @@ async def _call_experience_session_v2_artifact_draft_model(
     max_tokens: int,
 ) -> Dict[str, Any]:
     del provider
+    source = "literature.experience_v2.artifact_draft"
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    log_tagged_llm_request_start(
+        source=source,
+        provider="aliyun",
+        model=model,
+        operation="chat",
+    )
     response = await asyncio.wait_for(
         client.chat.completions.create(
             model=model,
@@ -6612,8 +6713,22 @@ async def _call_experience_session_v2_artifact_draft_model(
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             timeout=timeout_seconds,
+            extra_headers=build_llm_source_headers(source) or None,
         ),
         timeout=timeout_seconds + 1.0,
+    )
+    usage_obj = getattr(response, "usage", None)
+    log_tagged_llm_request_done(
+        source=source,
+        provider="aliyun",
+        model=str(getattr(response, "model", "") or model),
+        operation="chat",
+        finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+        usage={
+            "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+        },
     )
     try:
         content = str((response.choices[0].message.content or "")).strip()
@@ -10166,6 +10281,110 @@ async def get_paper(
     collection_ids = [row[0] for row in coll_result.fetchall()]
     
     return PaperResponse(**paper_to_response(paper, collection_ids))
+
+
+@router.get("/papers/{paper_id}/experiment-workspace", response_model=PaperExperimentWorkspaceResponse)
+async def get_paper_experiment_workspace(
+    paper_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = PaperExperimentService(db)
+    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="实验工作台不存在")
+    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
+
+
+@router.post("/papers/{paper_id}/experiment-workspace/bootstrap", response_model=PaperExperimentWorkspaceResponse)
+async def bootstrap_paper_experiment_workspace(
+    paper_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = PaperExperimentService(db)
+    workspace = await service.bootstrap_workspace(paper=paper, user_id=current_user.id)
+    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
+
+
+@router.post("/papers/{paper_id}/experiment-workspace/refresh-intake", response_model=PaperExperimentWorkspaceResponse)
+async def refresh_paper_experiment_workspace_intake(
+    paper_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = PaperExperimentService(db)
+    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
+    if workspace is None:
+        workspace = await service.bootstrap_workspace(paper=paper, user_id=current_user.id)
+    else:
+        workspace = await service.refresh_workspace_intake(paper=paper, workspace=workspace)
+    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
+
+
+@router.post("/papers/{paper_id}/experiment-workspace/runs", response_model=PaperExperimentRunResponse)
+async def create_paper_experiment_run(
+    paper_id: int,
+    request: PaperExperimentRunCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = PaperExperimentService(db)
+    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="请先创建实验工作台")
+
+    base_run_id = request.base_run_id
+    if request.run_kind == "variant" and base_run_id is None:
+        baseline = next((item for item in list(workspace.runs or []) if str(item.run_kind or "") == "baseline"), None)
+        if baseline is not None:
+            base_run_id = int(baseline.id)
+
+    run = await service.create_run(
+        workspace=workspace,
+        label=request.label,
+        run_kind=request.run_kind,
+        model_name=request.model_name,
+        hypothesis=request.hypothesis,
+        params=request.params,
+        variant_spec=request.variant_spec,
+        base_run_id=base_run_id,
+    )
+    return PaperExperimentRunResponse(**_paper_experiment_run_to_response(run))
+
+
+@router.patch("/papers/{paper_id}/experiment-workspace/runs/{run_id}", response_model=PaperExperimentRunResponse)
+async def update_paper_experiment_run(
+    paper_id: int,
+    run_id: int,
+    request: PaperExperimentRunUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _get_owned_paper_or_404(db, current_user, paper_id)
+    service = PaperExperimentService(db)
+    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="实验工作台不存在")
+
+    run = await service.get_run(workspace_id=int(workspace.id), run_id=run_id, user_id=current_user.id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="实验运行记录不存在")
+
+    updated = await service.update_run(
+        workspace=workspace,
+        run=run,
+        status=request.status,
+        metrics=request.metrics,
+        artifacts=request.artifacts,
+        summary=request.summary,
+        notes=request.notes,
+    )
+    return PaperExperimentRunResponse(**_paper_experiment_run_to_response(updated))
 
 
 @router.post("/papers", response_model=PaperResponse)
@@ -14693,6 +14912,7 @@ async def stream_reader_experience_v2_block_explain(
                 _create_reader_experience_block_explain_stream(
                     client=client,
                     request_kwargs=request_kwargs,
+                    source="literature.experience_v2.block_explain",
                 ),
                 timeout=float(config["timeout_seconds"]),
             )
@@ -14709,6 +14929,14 @@ async def stream_reader_experience_v2_block_explain(
                 yield _sse_payload("token", {"text": token})
 
             answer = "".join(chunks).strip()
+            log_tagged_llm_request_done(
+                source="literature.experience_v2.block_explain",
+                provider="aliyun",
+                model=str(config["model"]),
+                operation="chat_stream",
+                finish_reason="stream_completed",
+                usage=None,
+            )
             if not answer:
                 if str(request_payload.explain_kind or "").strip().lower() == "figure":
                     answer = "仅根据当前图块材料，可以先把它理解为这张图在用图注和标签提示读者先看重点证据，再看它支持的结论。你可以继续追问想看哪一部分。"
@@ -14726,6 +14954,13 @@ async def stream_reader_experience_v2_block_explain(
                 },
             )
         except Exception as exc:
+            log_tagged_llm_request_error(
+                source="literature.experience_v2.block_explain",
+                provider="aliyun",
+                model=str(config.get("model") or ""),
+                operation="chat_stream",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             logger.exception(f"[Literature API] experience-v2 block explain failed paper={paper_id}: {exc}")
             yield _sse_payload("error", {"message": _friendly_reader_experience_block_explain_error_message(exc)})
 

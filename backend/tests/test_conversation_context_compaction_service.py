@@ -38,6 +38,7 @@ class _FakeStateLLM:
                 "messages": list(messages),
                 "system_prompt": system_prompt,
                 "payload": payload,
+                "kwargs": dict(kwargs),
             }
         )
         if "会话历史压缩器" in str(system_prompt or ""):
@@ -168,6 +169,8 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert "检索到 attention mechanism 定义" in _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["summary"]
     assert _FakeStateLLM.calls[0]["payload"]["evidence_candidates"][0]["source_kind"] == "knowledge_base_search"
     assert _FakeStateLLM.calls[1]["payload"]["tool_ledger_preview"][0]["tool_name"] == "knowledge_search"
+    assert _FakeStateLLM.calls[0]["kwargs"]["source"] == "chat_compaction.context_state"
+    assert _FakeStateLLM.calls[1]["kwargs"]["source"] == "chat_compaction.compacted_history"
 
 def test_require_item_stream_payload_raises_on_missing_entries():
     with pytest.raises(compaction_module.ConversationItemStreamUnavailableError) as exc_info:

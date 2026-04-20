@@ -358,14 +358,15 @@ async def test_prepare_llm_messages_supports_nested_model_window_overrides(monke
 
 
 @pytest.mark.asyncio
-async def test_run_prefers_reasoning_summary_as_done_thought(monkeypatch):
+async def test_run_does_not_block_done_on_reasoning_summary(monkeypatch):
     monkeypatch.setattr(settings, "agent_reasoning_summary_enabled", True)
+    monkeypatch.setattr(settings, "agent_reasoning_summary_min_iterations", 1)
 
     llm = _BudgetLLM()
     agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
 
     async def _fake_reasoning_summary(context):
-        return "先基于已有上下文确认问题，再直接收束为最终结论。"
+        raise AssertionError("reasoning summary must not run before done")
 
     monkeypatch.setattr(agent, "_generate_reasoning_summary", _fake_reasoning_summary)
 
@@ -374,5 +375,6 @@ async def test_run_prefers_reasoning_summary_as_done_thought(monkeypatch):
         events.append(event)
 
     done_event = next(event for event in events if event.get("type") == "done")
-    assert done_event["data"]["thought"] == "先基于已有上下文确认问题，再直接收束为最终结论。"
-    assert done_event["data"]["reasoning_summary"] == "先基于已有上下文确认问题，再直接收束为最终结论。"
+    assert done_event["data"]["reasoning_summary"] is None
+    assert done_event["data"]["reasoning_summary_pending"] is True
+    assert done_event["data"]["_reasoning_trace"]

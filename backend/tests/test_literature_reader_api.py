@@ -3614,6 +3614,36 @@ def test_mcp_client_normalize_call_result_should_shape_web_scrape_payload():
     assert result.data["provenance"]["tool_kind"] == "web_scrape"
 
 
+def test_mcp_client_normalize_call_result_should_preserve_full_web_content():
+    schema = MCPToolSchema(
+        server_name="firecrawl",
+        tool_name="firecrawl_scrape",
+        qualified_name="mcp.firecrawl.firecrawl_scrape",
+        description="scrape a page",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}},
+    )
+    markdown = "# Title\n" + "\n".join(f"line {index}" for index in range(60))
+    call_result = SimpleNamespace(
+        content=[],
+        isError=False,
+        structuredContent={
+            "metadata": {"title": "Long Page"},
+            "markdown": markdown,
+            "links": [{"href": "https://example.com/data.zip", "label": "data"}],
+        },
+    )
+
+    result = MCPClientManager._normalize_call_result(
+        call_result,
+        schema=schema,
+        arguments={"url": "https://example.com/page", "formats": ["markdown"]},
+    )
+
+    assert result.success is True
+    assert result.data["reader_summary"] == markdown
+    assert result.data["public_links"][0]["snippet"] == markdown
+
+
 @pytest.mark.asyncio
 async def test_tool_registry_should_translate_routed_web_search_arguments_and_preserve_provenance(monkeypatch):
     local_search = _CountingTool("web_search", output="local-web")

@@ -22,6 +22,12 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.llm_service import (
+    build_llm_source_headers,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 from app.services.render_pipeline_contract import (
     CanonicalAtomBundle,
     RenderPipelineContractError,
@@ -3450,11 +3456,19 @@ class ReaderMultimodalLayoutService:
             return None
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        source = f"reader.multimodal_layout.{prompt_kind}"
         if str(prompt_kind) in {"line_parse_advice_v1", "stage1_structural_v1", "stage1_semantic_v2"}:
             max_tokens = max(1200, int(getattr(settings, "reader_mm_parser_max_tokens", 4200) or 4200))
         else:
             max_tokens = max(900, int(getattr(settings, "reader_mm_max_tokens", 2200) or 2200))
         request_timeout = max(2.0, float(timeout_ms) / 1000.0)
+        extra_headers = build_llm_source_headers(source)
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=model,
+            operation="chat",
+        )
         try:
             resp = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -3476,14 +3490,35 @@ class ReaderMultimodalLayoutService:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     timeout=request_timeout,
+                    extra_headers=extra_headers or None,
                 ),
                 timeout=request_timeout + 1.0,
             )
         except Exception as exc:  # pragma: no cover - network failures are acceptable
+            log_tagged_llm_request_error(
+                source=source,
+                provider="aliyun",
+                model=model,
+                operation="chat",
+                error=f"{type(exc).__name__}: {exc!r}",
+            )
             logger.warning(
                 f"[ReaderMM] model call failed model={model}, prompt_kind={prompt_kind}: {type(exc).__name__}: {exc!r}"
             )
             return None
+        usage_obj = getattr(resp, "usage", None)
+        log_tagged_llm_request_done(
+            source=source,
+            provider="aliyun",
+            model=str(getattr(resp, "model", "") or model),
+            operation="chat",
+            finish_reason=str(getattr((getattr(resp, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage={
+                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+            },
+        )
 
         content = ""
         finish_reason = ""
@@ -4387,4 +4422,3 @@ class ReaderMultimodalLayoutService:
             if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"):
                 cleaned.append(ch)
         return "".join(cleaned)[:180]
-

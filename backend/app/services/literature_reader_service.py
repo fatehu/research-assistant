@@ -1305,6 +1305,7 @@ class LiteratureReaderService:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=max(0.0, min(0.8, float(temperature))),
                 max_tokens=2000,
+                source="reader.page_repair",
             )
             content = str(result.get("content") or "").strip()
             parsed_json = self._extract_json_object(content)

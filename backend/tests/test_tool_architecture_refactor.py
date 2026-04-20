@@ -254,6 +254,62 @@ async def test_web_search_serper_payload_is_guided_reading_ready(monkeypatch):
     assert result.data["structured_content"]["domains"][0]["domain"] == "usmle.org"
 
 
+@pytest.mark.asyncio
+async def test_web_search_extracts_direct_candidate_urls_from_snippet(monkeypatch):
+    tool = agent_tools.WebSearchTool()
+    tool.serper_api_key = "x"
+    payload = {
+        "organic": [
+            {
+                "title": "automl/nanoTabPFN",
+                "link": "https://github.com/automl/nanoTabPFN",
+                "snippet": (
+                    "curl http://ml.informatik.uni-freiburg.de/research-artifacts/"
+                    "nanoTabPFN/300k_150x5_2.h5 --output 300k_150x5_2.h5"
+                ),
+            }
+        ],
+    }
+    monkeypatch.setattr(agent_tools.httpx, "AsyncClient", lambda **kwargs: _FakeSearchClient(payload))
+
+    result = await tool._serper_search('"300k_150x5_2.h5" nanoTabPFN', max_results=3)
+
+    assert result.success is True
+    row = result.data["structured_content"]["results"][0]
+    assert row["embedded_urls"] == [
+        "http://ml.informatik.uni-freiburg.de/research-artifacts/nanoTabPFN/300k_150x5_2.h5"
+    ]
+    assert row["candidate_download_urls"] == [
+        "http://ml.informatik.uni-freiburg.de/research-artifacts/nanoTabPFN/300k_150x5_2.h5"
+    ]
+    assert result.data["candidate_download_urls"][0]["matched_filename"] == "300k_150x5_2.h5"
+
+
+@pytest.mark.asyncio
+async def test_web_search_preserves_full_snippet_in_payload(monkeypatch):
+    tool = agent_tools.WebSearchTool()
+    tool.serper_api_key = "x"
+    long_snippet = " ".join(f"segment-{index}" for index in range(80))
+    payload = {
+        "organic": [
+            {
+                "title": "Long Snippet Result",
+                "link": "https://example.com/long",
+                "snippet": long_snippet,
+            }
+        ],
+    }
+    monkeypatch.setattr(agent_tools.httpx, "AsyncClient", lambda **kwargs: _FakeSearchClient(payload))
+
+    result = await tool._serper_search("long snippet", max_results=3)
+
+    assert result.success is True
+    row = result.data["structured_content"]["results"][0]
+    assert row["reader_excerpt"] == long_snippet
+    assert result.data["public_links"][0]["snippet"] == long_snippet
+    assert result.data["reader_summary"] == f"Long Snippet Result: {long_snippet}"
+
+
 class _FakeEvalError:
     def __init__(self, message: str):
         self._message = message

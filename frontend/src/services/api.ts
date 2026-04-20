@@ -510,6 +510,59 @@ export interface ChatContextDebugMessage {
   content: string
 }
 
+export interface ChatContextDebugSkill {
+  name: string
+  description?: string
+  path?: string
+  config_path?: string
+  interface_path?: string
+  score?: number
+  activation_reason?: string
+  display_name?: string
+  short_description?: string
+  default_prompt?: string
+  when_to_use?: string
+  user_invocable?: boolean
+  execution_context?: string
+  agent?: string
+  effort?: string
+  allow_implicit_invocation?: boolean
+  scripts?: string[]
+  stage_names?: string[]
+  stage_policies?: string[]
+  artifact_paths?: string[]
+  continue_policies?: string[]
+  default_continue_policy?: string
+}
+
+export interface ChatSkillLaunchRequest {
+  skill_name: string
+  stage?: string
+  paper_id?: number
+  project_id?: number | null
+  goal?: string | null
+  preferred_draft_id?: string | null
+}
+
+export interface ChatWorkflowAction {
+  label: string
+  message: string
+  skill_launch?: ChatSkillLaunchRequest | null
+}
+
+export interface ChatWorkflowControl {
+  skill_name: string
+  display_name?: string
+  stage: string
+  stage_label?: string
+  stage_status: 'completed' | 'blocked' | 'running'
+  continue_policy?: string
+  next_stage?: string
+  next_stage_label?: string
+  suggested_action?: string
+  action?: ChatWorkflowAction | null
+}
+
 export interface ChatModelRequestMessageRaw extends Record<string, unknown> {
   role?: string
   content?: unknown
@@ -548,6 +601,9 @@ export interface ChatContextDebug {
   carry_over_previous_goal?: boolean
   selected_tools: string[]
   tool_choice: string
+  available_skills?: ChatContextDebugSkill[]
+  active_skills?: ChatContextDebugSkill[]
+  skill_prompt_tokens_estimate?: number
   conversation_state?: ConversationContextState
   conversation_state_summary?: string
   anchor_summary?: string
@@ -609,6 +665,7 @@ export interface MessageMetadata extends Record<string, unknown> {
   rag_metrics?: RagMetrics
   reasoning_summary?: ReasoningSummary
   citation_index?: Record<string, MessageCitationSourceItem>
+  workflow_control?: ChatWorkflowControl
 }
 
 export interface Message {
@@ -1082,6 +1139,7 @@ export const chatApi = {
     sendPlanId?: string,
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
+    skillLaunch?: ChatSkillLaunchRequest | null,
   ): Promise<ChatRunResponse> => {
     const response = await api.post('/api/v1/chat/runs', {
       message,
@@ -1092,6 +1150,7 @@ export const chatApi = {
         ? { chat_preference_overrides: chatPreferenceOverrides }
         : {}),
       ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+      ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
     })
     return response.data
   },
@@ -1138,6 +1197,7 @@ export const chatApi = {
     sendPlanId?: string,
     chatPreferenceOverrides?: Partial<ChatUserPreferences>,
     ragOverrides?: ChatRagOverrides | null,
+    skillLaunch?: ChatSkillLaunchRequest | null,
   ): Promise<void> => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/v1/chat/send`, {
@@ -1155,6 +1215,7 @@ export const chatApi = {
             ? { chat_preference_overrides: chatPreferenceOverrides }
             : {}),
           ...(ragOverrides && ragOverrides.enabled ? { rag_overrides: ragOverrides } : {}),
+          ...(skillLaunch ? { skill_launch: skillLaunch } : {}),
         }),
         signal: abortController?.signal,
       })
@@ -1425,6 +1486,238 @@ export interface Paper {
   created_at: string
   updated_at: string
   collection_ids: number[]
+}
+
+export interface PaperExperimentRun {
+  id: number
+  workspace_id: number
+  user_id: number
+  notebook_id?: string
+  notebook_cell_id?: string
+  base_run_id?: number
+  run_kind: 'baseline' | 'variant' | string
+  status: 'draft' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string
+  label: string
+  model_name?: string
+  hypothesis?: string
+  variant_spec: Record<string, unknown>
+  params: Record<string, unknown>
+  metrics: Record<string, unknown>
+  artifacts: Record<string, unknown>
+  summary: Record<string, unknown>
+  notes?: string
+  created_at: string
+  updated_at: string
+  started_at?: string
+  completed_at?: string
+}
+
+export interface PaperExperimentWorkspace {
+  id: number
+  user_id: number
+  paper_id: number
+  notebook_id?: string
+  status: string
+  title: string
+  summary: Record<string, unknown>
+  experiment_spec: Record<string, unknown>
+  compare_report: Record<string, unknown>
+  runs: PaperExperimentRun[]
+  created_at: string
+  updated_at: string
+}
+
+export interface PaperExperimentRunCreateRequest {
+  run_kind: 'baseline' | 'variant'
+  label: string
+  model_name?: string
+  hypothesis?: string
+  params?: Record<string, unknown>
+  variant_spec?: Record<string, unknown>
+  base_run_id?: number
+}
+
+export interface PaperExperimentRunUpdateRequest {
+  status?: 'draft' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+  metrics?: Record<string, unknown>
+  artifacts?: Record<string, unknown>
+  summary?: Record<string, unknown>
+  notes?: string
+}
+
+export interface ResearchProjectPaperSummary {
+  id: number
+  title: string
+  year?: number
+  venue?: string
+  arxiv_id?: string
+  role: string
+  notes?: string
+}
+
+export interface ResearchProjectWorkspaceSummary {
+  id: number
+  paper_id?: number
+  paper_title?: string
+  notebook_id?: string
+  title: string
+  status: string
+  role: string
+  run_count: number
+  latest_run_status?: string
+  latest_run_at?: string
+}
+
+export interface ResearchProjectExecutionSummary {
+  execution_id: string
+  label?: string
+  draft_id?: string
+  runtime_type?: string
+  status: string
+  success?: boolean
+  error?: string
+  message?: string
+  created_at?: string
+  started_at?: string
+  completed_at?: string
+  spec_relative_path?: string
+  result_relative_path?: string
+  log_relative_path?: string
+  result_exists: boolean
+  log_exists: boolean
+  log_total_chars: number
+  log_truncated: boolean
+  log_tail?: string
+  last_log_line?: string
+  latest_elapsed_sec?: number
+  latest_loss?: number
+  command_preview?: string
+}
+
+export interface ResearchProjectArtifactSummary {
+  label: string
+  relative_path: string
+  kind: string
+  present: boolean
+  updated_at?: string
+}
+
+export interface ResearchProjectStageSummary {
+  stage: string
+  label: string
+  status: string
+  summary?: string
+  blockers: string[]
+  artifacts: ResearchProjectArtifactSummary[]
+  updated_at?: string
+}
+
+export interface ResearchProjectRuntimeToolSummary {
+  tool_key: string
+  available: boolean
+  command?: string
+}
+
+export interface ResearchProjectRuntimeCandidateSummary {
+  runtime_type: string
+  status: string
+  priority: number
+  reason?: string
+  entrypoints: string[]
+  evidence_files: string[]
+  blockers: string[]
+  requires_runtime_worker: boolean
+  requires_explicit_user_confirm: boolean
+}
+
+export interface ResearchProjectRuntimeContextSummary {
+  execution_mode?: string
+  notebook_id?: string
+  notebook_asset_relative_path?: string
+  repo_available: boolean
+  repo_root_relative_path?: string
+  repo_file_count: number
+  repo_reference_url?: string
+  repo_history_candidate_count: number
+  entrypoint_hints: string[]
+  runtime_candidates: ResearchProjectRuntimeCandidateSummary[]
+  tools: ResearchProjectRuntimeToolSummary[]
+  runtime_worker_enabled: boolean
+  runtime_worker_available: boolean
+}
+
+export interface ResearchProjectResultSummary {
+  baseline_status: string
+  baseline_execution_id?: string
+  baseline_completed_at?: string
+  baseline_metrics: Record<string, unknown>
+  tuning_status: string
+  tuning_execution_id?: string
+  tuning_completed_at?: string
+  tuning_metrics: Record<string, unknown>
+  compare_status: string
+  compare_summary?: string
+  highlights: string[]
+}
+
+export interface ResearchProjectWorkspaceRuntimeOverview {
+  workspace_id: number
+  paper_id?: number
+  paper_title?: string
+  notebook_id?: string
+  title: string
+  status: string
+  role: string
+  run_count: number
+  latest_run_status?: string
+  latest_run_at?: string
+  current_stage: string
+  current_status: string
+  stage_ledger: ResearchProjectStageSummary[]
+  runtime_context: ResearchProjectRuntimeContextSummary
+  results: ResearchProjectResultSummary
+  execution_count: number
+  running_execution_count: number
+  recent_executions: ResearchProjectExecutionSummary[]
+}
+
+export interface ResearchProjectRuntimeOverview {
+  project_id: number
+  current_stage: string
+  current_status: string
+  recommended_chat_stage?: string
+  continue_reason?: string
+  primary_workspace_id?: number
+  workspace_count: number
+  execution_count: number
+  running_execution_count: number
+  workspaces: ResearchProjectWorkspaceRuntimeOverview[]
+}
+
+export interface ResearchProject {
+  id: number
+  user_id: number
+  primary_paper_id?: number
+  primary_workspace_id?: number
+  title: string
+  goal?: string
+  status: 'draft' | 'active' | 'archived' | string
+  summary: Record<string, unknown>
+  paper_count: number
+  workspace_count: number
+  primary_paper?: ResearchProjectPaperSummary
+  primary_workspace?: ResearchProjectWorkspaceSummary
+  papers: ResearchProjectPaperSummary[]
+  workspaces: ResearchProjectWorkspaceSummary[]
+  created_at: string
+  updated_at: string
+}
+
+export interface ResearchProjectCreateRequest {
+  title?: string
+  goal?: string
+  status?: 'draft' | 'active' | 'archived'
+  paper_ids?: number[]
 }
 
 export interface PaperSearchResult {
@@ -3045,6 +3338,42 @@ export const literatureApi = {
     return response.data
   },
 
+  getPaperExperimentWorkspace: async (paperId: number): Promise<PaperExperimentWorkspace> => {
+    const response = await api.get(`/api/v1/literature/papers/${paperId}/experiment-workspace`)
+    return response.data
+  },
+
+  bootstrapPaperExperimentWorkspace: async (paperId: number): Promise<PaperExperimentWorkspace> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/bootstrap`, undefined, {
+      timeout: 180000,
+    })
+    return response.data
+  },
+
+  refreshPaperExperimentWorkspaceIntake: async (paperId: number): Promise<PaperExperimentWorkspace> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/refresh-intake`, undefined, {
+      timeout: 180000,
+    })
+    return response.data
+  },
+
+  createPaperExperimentRun: async (
+    paperId: number,
+    data: PaperExperimentRunCreateRequest,
+  ): Promise<PaperExperimentRun> => {
+    const response = await api.post(`/api/v1/literature/papers/${paperId}/experiment-workspace/runs`, data)
+    return response.data
+  },
+
+  updatePaperExperimentRun: async (
+    paperId: number,
+    runId: number,
+    data: PaperExperimentRunUpdateRequest,
+  ): Promise<PaperExperimentRun> => {
+    const response = await api.patch(`/api/v1/literature/papers/${paperId}/experiment-workspace/runs/${runId}`, data)
+    return response.data
+  },
+
   getPaperPdfBlob: async (paperId: number, timeoutMs = 180000): Promise<Blob> => {
     const response = await api.get(`/api/v1/literature/papers/${paperId}/pdf`, {
       responseType: 'blob',
@@ -3783,6 +4112,42 @@ export const literatureApi = {
         }
       }
     }
+  },
+}
+
+export const projectApi = {
+  listProjects: async (params?: { paper_id?: number }): Promise<ResearchProject[]> => {
+    const response = await api.get('/api/v1/projects', { params })
+    return response.data
+  },
+
+  getProject: async (projectId: number): Promise<ResearchProject> => {
+    const response = await api.get(`/api/v1/projects/${projectId}`)
+    return response.data
+  },
+
+  getProjectRuntimeOverview: async (
+    projectId: number,
+    params?: { recent_execution_limit?: number; max_log_chars?: number },
+  ): Promise<ResearchProjectRuntimeOverview> => {
+    const response = await api.get(`/api/v1/projects/${projectId}/runtime-overview`, { params })
+    return response.data
+  },
+
+  cancelProjectExecution: async (
+    projectId: number,
+    workspaceId: number,
+    executionId: string,
+  ): Promise<Record<string, unknown>> => {
+    const response = await api.post(
+      `/api/v1/projects/${projectId}/workspaces/${workspaceId}/executions/${encodeURIComponent(executionId)}/cancel`,
+    )
+    return response.data
+  },
+
+  createProject: async (data: ResearchProjectCreateRequest): Promise<ResearchProject> => {
+    const response = await api.post('/api/v1/projects', data)
+    return response.data
   },
 }
 

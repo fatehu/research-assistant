@@ -372,6 +372,36 @@ def test_sanitized_persisted_chat_metadata_drops_context_debug():
     }
 
 
+def test_align_chat_citation_payload_filters_metadata_to_answer_labels():
+    rag_metrics, citation_index = chat_api._align_chat_citation_payload(
+        answer_text="本轮没有实际引用标签。",
+        rag_metrics={
+            "knowledge_search_calls": 0,
+            "web_search_calls": 0,
+            "source_labels_count": 3,
+            "source_labels": ["网页8", "网页16", "网页56"],
+            "answer_citation_count": 3,
+            "citation_required": True,
+            "citation_valid": True,
+        },
+        citation_index={
+            "网页8": {"label": "网页8", "source_kind": "public_web_search"},
+            "网页16": {"label": "网页16", "source_kind": "public_web_search"},
+            "网页56": {"label": "网页56", "source_kind": "public_web_search"},
+        },
+    )
+
+    assert citation_index is None
+    assert rag_metrics is not None
+    assert rag_metrics["source_labels"] == []
+    assert rag_metrics["source_labels_count"] == 0
+    assert rag_metrics["answer_citation_count"] == 0
+    assert rag_metrics["available_source_labels"] == ["网页8", "网页16", "网页56"]
+    assert rag_metrics["available_source_labels_count"] == 3
+    assert rag_metrics["citation_required"] is True
+    assert rag_metrics["citation_valid"] is False
+
+
 @pytest.mark.asyncio
 async def test_preview_chat_context_returns_agent_prepared_preview(monkeypatch):
     conversation = Conversation(

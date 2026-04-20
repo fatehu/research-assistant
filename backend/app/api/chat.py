@@ -27,11 +27,13 @@ from app.schemas.chat import (
     MessageResponse, ChatRequest, SaveStoppedMessageRequest, ConversationCompactResponse,
     ChatContextPreviewRequest, ChatContextPreviewResponse,
     MessageSpanRewriteRequest, MessageSpanRewriteResponse,
+    ChatWorkflowActionResponse, ChatWorkflowControlResponse,
 )
 from app.services.llm_service import LLMService
 from app.services.agent_tools import get_tool_registry
 from app.services.agent_runtime_service import get_agent_runtime_service
 from app.services.chat_context_store import ConversationItemStreamStore
+from app.services.agent_skill_service import get_agent_skill_service
 from app.services.conversation_context_compaction_service import (
     ConversationItemStreamUnavailableError,
     get_conversation_context_compaction_service,
@@ -53,6 +55,116 @@ _PERSISTED_CHAT_BACKGROUND_EVENTS = {
     "error",
     "cancelled",
 }
+
+
+def _safe_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _sse_event(event: str, data: Any) -> str:
+    return f"data: {_safe_json_dumps({'event': event, 'data': data})}\n\n"
+
+
+async def _persist_reasoning_summary_later(
+    *,
+    conversation_id: int,
+    turn_id: str,
+    message_id: int,
+    run_id: Optional[str],
+    iteration_count: Optional[int],
+    trace: str,
+    created_at: Optional[datetime],
+    runtime_service: Any,
+    session_factory: Any,
+) -> None:
+    trace_text = str(trace or "").strip()
+    if not trace_text:
+        return
+    try:
+        from app.services.react_agent import AgentCore
+
+        summary_text = await AgentCore.generate_reasoning_summary_from_trace(trace_text)
+        compacted = _assistant_summary_text(summary_text or "", limit=240)
+        if not compacted:
+            return
+
+        async with session_factory() as save_db:
+            message = await save_db.get(Message, int(message_id))
+            if message and int(message.conversation_id) == int(conversation_id):
+                message.thought = compacted
+                await save_db.commit()
+
+        await runtime_service.append_conversation_item_entries(
+            int(conversation_id),
+            [
+                {
+                    "kind": "reasoning_summary",
+                    "turn_id": turn_id,
+                    "role": "assistant",
+                    "message_id": int(message_id),
+                    "run_id": str(run_id or "").strip() or None,
+                    "iteration": max(int(iteration_count or 0), 0),
+                    "summary": compacted,
+                    "content": compacted,
+                    "created_at": created_at.isoformat() if created_at else datetime.utcnow().isoformat(),
+                }
+            ],
+        )
+        if str(run_id or "").strip():
+            await runtime_service.append_chat_run_event(
+                str(run_id).strip(),
+                event="reasoning_summary",
+                data={
+                    "summary": compacted,
+                    "conversation_id": int(conversation_id),
+                    "turn_id": turn_id,
+                    "message_id": int(message_id),
+                },
+            )
+        logger.info(
+            "[Chat] reasoning summary persisted asynchronously: conv={}, turn={}, msg={}",
+            conversation_id,
+            turn_id,
+            message_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Chat] async reasoning summary failed: conv={}, turn={}, msg={}, error={}",
+            conversation_id,
+            turn_id,
+            message_id,
+            exc,
+        )
+
+
+def _schedule_reasoning_summary_persist(
+    *,
+    conversation_id: int,
+    turn_id: str,
+    message_id: int,
+    run_id: Optional[str],
+    iteration_count: Optional[int],
+    trace: Optional[str],
+    created_at: Optional[datetime],
+    runtime_service: Any,
+    session_factory: Any,
+) -> None:
+    trace_text = str(trace or "").strip()
+    if not trace_text:
+        return
+    asyncio.create_task(
+        _persist_reasoning_summary_later(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            message_id=message_id,
+            run_id=run_id,
+            iteration_count=iteration_count,
+            trace=trace_text,
+            created_at=created_at,
+            runtime_service=runtime_service,
+            session_factory=session_factory,
+        )
+    )
 
 
 def _normalized_optional_text(value: object) -> Optional[str]:
@@ -82,6 +194,144 @@ def _normalized_context_snapshot_payload(payload: object) -> Optional[dict]:
     normalized["context_state"] = _normalized_context_state_payload(normalized.get("context_state"))
     normalized["compacted_history"] = _normalized_compacted_history_payload(normalized.get("compacted_history"))
     return normalized
+
+
+_PAPER_STAGE_LABELS = {
+    "planning": "规划阶段",
+    "implementation_prep": "实施准备阶段",
+    "run_drafts": "运行草案阶段",
+    "execution": "执行阶段",
+}
+
+
+def _build_visible_skill_launch_message(skill_launch: object) -> str:
+    stage = str(getattr(skill_launch, "stage", "") or "").strip()
+    skill_name = str(getattr(skill_launch, "skill_name", "") or "").strip() or "skill"
+    label = _PAPER_STAGE_LABELS.get(stage, stage or "启动")
+    paper_id = getattr(skill_launch, "paper_id", None)
+    if paper_id:
+        return f"继续论文 {label}（paper_id={paper_id}）"
+    return f"继续 {skill_name} · {label}"
+
+
+def _build_visible_chat_message(request: ChatRequest) -> str:
+    message = _normalized_optional_text(request.message)
+    if message:
+        return message
+    if request.skill_launch is not None:
+        return _build_visible_skill_launch_message(request.skill_launch)
+    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="消息内容不能为空")
+
+
+def _build_user_message_metadata(request: ChatRequest) -> Optional[dict]:
+    if request.skill_launch is None:
+        return None
+    payload = request.skill_launch.model_dump(exclude_none=True)
+    return {"skill_launch": payload}
+
+
+def _resolve_effective_agent_message(request: ChatRequest) -> tuple[str, str]:
+    visible_message = _build_visible_chat_message(request)
+    if request.skill_launch is None:
+        return visible_message, visible_message
+    service = get_agent_skill_service()
+    launch_payload = request.skill_launch.model_dump(exclude_none=True)
+    try:
+        expanded_message = service.render_launch_prompt(
+            str(request.skill_launch.skill_name or "").strip(),
+            launch_payload,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not str(expanded_message or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="skill_launch 未生成有效启动消息")
+    return visible_message, str(expanded_message).strip()
+
+
+def _parse_stage_policy_map(raw_policies: object) -> dict[str, str]:
+    policies: dict[str, str] = {}
+    for item in raw_policies if isinstance(raw_policies, (list, tuple)) else []:
+        text = str(item or "").strip()
+        if not text or "=" not in text:
+            continue
+        stage_name, policy = text.split("=", 1)
+        stage_name = str(stage_name or "").strip()
+        policy = str(policy or "").strip()
+        if stage_name and policy:
+            policies[stage_name] = policy
+    return policies
+
+
+def _build_workflow_control_payload(request: ChatRequest) -> Optional[dict]:
+    skill_launch = request.skill_launch
+    if skill_launch is None:
+        return None
+    skill_name = str(skill_launch.skill_name or "").strip()
+    stage = str(skill_launch.stage or "").strip()
+    if not skill_name or not stage:
+        return None
+
+    skill = get_agent_skill_service().get_skill(skill_name)
+    if skill is None:
+        return None
+
+    stage_names = [str(item).strip() for item in skill.stage_names if str(item).strip()]
+    stage_policy_map = _parse_stage_policy_map(skill.stage_policies)
+    continue_policy = stage_policy_map.get(stage) or str(skill.default_continue_policy or "").strip() or None
+
+    next_stage: Optional[str] = None
+    if stage_names:
+        try:
+            current_index = stage_names.index(stage)
+        except ValueError:
+            current_index = -1
+        if current_index >= 0 and current_index + 1 < len(stage_names):
+            next_stage = stage_names[current_index + 1]
+
+    action: Optional[ChatWorkflowActionResponse] = None
+    suggested_action: Optional[str] = None
+    if next_stage:
+        next_skill_launch = skill_launch.model_copy(update={"stage": next_stage})
+        next_stage_label = _PAPER_STAGE_LABELS.get(next_stage, next_stage)
+        action_label = f"继续 {next_stage_label}"
+        suggested_action = action_label
+        action = ChatWorkflowActionResponse(
+            label=action_label,
+            message=_build_visible_skill_launch_message(next_skill_launch),
+            skill_launch=next_skill_launch,
+        )
+
+    workflow_control = ChatWorkflowControlResponse(
+        skill_name=skill.name,
+        display_name=str(skill.display_name or "").strip() or None,
+        stage=stage,
+        stage_label=_PAPER_STAGE_LABELS.get(stage, stage),
+        stage_status="completed",
+        continue_policy=continue_policy,
+        next_stage=next_stage,
+        next_stage_label=_PAPER_STAGE_LABELS.get(next_stage, next_stage) if next_stage else None,
+        suggested_action=suggested_action,
+        action=action,
+    )
+    return workflow_control.model_dump(exclude_none=True)
+
+
+def _attach_workflow_control(done_payload: dict[str, Any], request: ChatRequest) -> dict[str, Any]:
+    workflow_control = _build_workflow_control_payload(request)
+    if workflow_control:
+        done_payload["workflow_control"] = workflow_control
+    return done_payload
+
+
+def _normalized_workflow_control_payload(payload: object) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return ChatWorkflowControlResponse.model_validate(payload).model_dump(exclude_none=True)
+    except Exception:
+        return None
 
 
 def _normalized_evidence_entry(payload: object) -> Optional[dict]:
@@ -731,6 +981,9 @@ def _sanitized_persisted_chat_metadata(payload: object) -> Optional[dict]:
     citation_index = _normalized_message_citation_index(payload.get("citation_index"))
     if citation_index:
         metadata["citation_index"] = citation_index
+    workflow_control = _normalized_workflow_control_payload(payload.get("workflow_control"))
+    if workflow_control:
+        metadata["workflow_control"] = workflow_control
     rewrites = [
         {
             "rewritten_at": str(item.get("rewritten_at") or "").strip(),
@@ -757,6 +1010,63 @@ _CHAT_MARKDOWN_BOLD_LEADING_LABEL_RE = re.compile(r"^(\*\*)([^*\n]{1,120}?)(\*\*
 
 def _extract_chat_citation_labels(text: str) -> set[str]:
     return {str(match.group(1) or "").strip() for match in _CHAT_CITATION_LABEL_RE.finditer(str(text or ""))}
+
+
+def _extract_chat_citation_labels_in_order(text: str) -> List[str]:
+    seen: set[str] = set()
+    labels: List[str] = []
+    for match in _CHAT_CITATION_LABEL_RE.finditer(str(text or "")):
+        label = str(match.group(1) or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def _align_chat_citation_payload(
+    *,
+    answer_text: str,
+    rag_metrics: object,
+    citation_index: object,
+) -> tuple[Optional[dict], Optional[dict]]:
+    used_labels = _extract_chat_citation_labels_in_order(answer_text)
+    used_label_set = set(used_labels)
+
+    normalized_index = _normalized_message_citation_index(citation_index)
+    if normalized_index:
+        normalized_index = {
+            label: item
+            for label, item in normalized_index.items()
+            if label in used_label_set
+        } or None
+
+    normalized_metrics: Optional[dict] = None
+    if isinstance(rag_metrics, dict):
+        normalized_metrics = dict(rag_metrics)
+        available_labels = [
+            str(item).strip()
+            for item in list(normalized_metrics.get("available_source_labels") or normalized_metrics.get("source_labels") or [])
+            if str(item).strip()
+        ]
+        available_label_set = set(available_labels)
+        if not available_labels and normalized_index:
+            available_labels = list(normalized_index.keys())
+            available_label_set = set(available_labels)
+
+        normalized_metrics["available_source_labels"] = available_labels
+        normalized_metrics["available_source_labels_count"] = len(available_labels)
+        normalized_metrics["source_labels"] = used_labels
+        normalized_metrics["source_labels_count"] = len(used_labels)
+        normalized_metrics["answer_citation_count"] = len(used_labels)
+        normalized_metrics["citation_required"] = bool(available_label_set)
+        normalized_metrics["citation_valid"] = (
+            bool(used_labels) and used_label_set.issubset(available_label_set)
+            if available_label_set
+            else True
+        )
+
+    return normalized_metrics, normalized_index
 
 
 def _chat_span_has_markdown_heading(text: str) -> bool:
@@ -1472,10 +1782,18 @@ async def preview_chat_context(
     from app.core.database import async_session_factory
     from app.services.react_agent import AgentRuntimeContext, create_chat_preview_planner
 
+    conversation_state = await runtime_service.get_conversation_context_state(conversation_id) if conversation_id else {}
+    active_skill_names = [
+        str(item or "").strip()
+        for item in list((conversation_state or {}).get("active_skill_names") or [])
+        if str(item or "").strip()
+    ]
+
     tool_registry = get_tool_registry(
         db=None,
         user_id=current_user.id,
         db_session_factory=async_session_factory,
+        conversation_id=conversation_id,
         route_profile="chat",
         initialize_mcp=False,
     )
@@ -1486,6 +1804,7 @@ async def preview_chat_context(
             user_id=current_user.id,
             channel="chat",
             conversation_id=conversation_id,
+            active_skill_names=active_skill_names,
             chat_preferences_override=runtime_service.normalize_chat_preference_overrides(
                 request.chat_preference_overrides
             ),
@@ -1633,6 +1952,34 @@ async def create_chat_background_run(
     )
     background_request = request.model_copy(update={"stream": True})
 
+    async def _finalize_background_turn(
+        *,
+        status_value: str,
+        error_message: Optional[str] = None,
+    ) -> None:
+        conversation_id = start_payload.get("conversation_id") or request.conversation_id
+        turn_id = str(start_payload.get("turn_id") or "").strip()
+        if not conversation_id or not turn_id:
+            return
+        try:
+            await runtime_service.upsert_conversation_turn_entry(
+                int(conversation_id),
+                {
+                    "turn_id": turn_id,
+                    "status": status_value,
+                    "run_id": str(run_id),
+                    "error_message": error_message,
+                    "completed_at": datetime.utcnow().isoformat(),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[ChatBackgroundRun] finalize turn failed: run_id={}, conversation_id={}, turn_id={}",
+                run_id,
+                conversation_id,
+                turn_id,
+            )
+
     async def _persist_event(payload: dict) -> None:
         event = str(payload.get("event") or "").strip()
         if event not in _PERSISTED_CHAT_BACKGROUND_EVENTS:
@@ -1694,6 +2041,10 @@ async def create_chat_background_run(
             )
             return {"start": start_payload, "done": done_payload}
         except asyncio.CancelledError:
+            await _finalize_background_turn(
+                status_value="stopped",
+                error_message="background_run_cancelled",
+            )
             await runtime_service.complete_run(
                 run_id,
                 status="cancelled",
@@ -1701,6 +2052,10 @@ async def create_chat_background_run(
             )
             raise
         except Exception as exc:
+            await _finalize_background_turn(
+                status_value="failed",
+                error_message=str(exc),
+            )
             await runtime_service.complete_run(
                 run_id,
                 status="error",
@@ -1786,21 +2141,21 @@ async def stream_chat_background_run(
         persisted_events = await runtime_service.list_chat_run_events(str(run_id), limit=1000)
 
     async def _generate():
-        yield f"data: {json.dumps({'event': 'run_status', 'data': snapshot}, ensure_ascii=False)}\n\n"
+        yield _sse_event("run_status", snapshot)
         if not has_memory_record:
             for payload in persisted_events:
                 event = str(payload.get("event") or "").strip()
                 if not event or event == "run_status":
                     continue
-                yield f"data: {json.dumps({'event': event, 'data': payload.get('data')}, ensure_ascii=False)}\n\n"
+                yield _sse_event(event, payload.get("data"))
             if snapshot.get("status") == "error" and snapshot.get("error") == "background_run_interrupted":
-                yield f"data: {json.dumps({'event': 'error', 'data': '后台对话任务已中断，可能是服务重启或进程切换导致。'}, ensure_ascii=False)}\n\n"
+                yield _sse_event("error", "后台对话任务已中断，可能是服务重启或进程切换导致。")
             return
         async for payload in manager.subscribe(run_id, user_id=current_user.id, replay=True):
             event = str(payload.get("event") or "").strip()
             if not event:
                 continue
-            yield f"data: {json.dumps({'event': event, 'data': payload.get('data')}, ensure_ascii=False)}\n\n"
+            yield _sse_event(event, payload.get("data"))
 
     return StreamingResponse(
         _generate(),
@@ -1820,6 +2175,8 @@ async def send_message(
     db: AsyncSession = Depends(get_db)
 ):
     """发送消息（支持流式响应和工具调用）"""
+    visible_message, effective_agent_message = _resolve_effective_agent_message(request)
+
     # 获取或创建对话
     if request.conversation_id:
         result = await db.execute(
@@ -1840,7 +2197,7 @@ async def send_message(
         # 创建新对话
         conversation = Conversation(
             user_id=current_user.id,
-            title=request.message[:50] + "..." if len(request.message) > 50 else request.message,
+            title=visible_message[:50] + "..." if len(visible_message) > 50 else visible_message,
             llm_provider=request.llm_provider or current_user.preferred_llm_provider,
         )
         db.add(conversation)
@@ -1855,7 +2212,7 @@ async def send_message(
         plan_id=request.send_plan_id,
         user_id=current_user.id,
         conversation_id=request.conversation_id,
-        draft_message=request.message,
+        draft_message=visible_message,
         llm_provider=request.llm_provider or conversation.llm_provider,
         conversation_revision=pre_send_conversation_revision,
     )
@@ -1872,8 +2229,9 @@ async def send_message(
     user_message = Message(
         conversation_id=conversation.id,
         role=MessageRole.USER,
-        content=request.message,
+        content=visible_message,
         message_type=MessageType.TEXT,
+        metadata_=_build_user_message_metadata(request),
     )
     db.add(user_message)
     await db.commit()
@@ -1887,6 +2245,10 @@ async def send_message(
         message_id=user_message.id,
         created_at=user_message.created_at,
         kind="user_message",
+    )
+    await runtime_service.cleanup_stale_conversation_turns(
+        conversation_id=conversation.id,
+        older_than_seconds=300,
     )
     await runtime_service.upsert_conversation_turn_entry(
         conversation.id,
@@ -1905,7 +2267,7 @@ async def send_message(
     llm_provider = request.llm_provider or conversation.llm_provider
     llm_service = LLMService(llm_provider)
     
-    agent_messages = [{"role": "user", "content": request.message}]
+    agent_messages = [{"role": "user", "content": effective_agent_message}]
     
     # 保存对话ID用于流式响应
     conversation_id = conversation.id
@@ -1924,6 +2286,13 @@ async def send_message(
         create_react_agent,
     )
 
+    conversation_state = await runtime_service.get_conversation_context_state(conversation_id) if conversation_id else {}
+    persisted_active_skill_names = [
+        str(item or "").strip()
+        for item in list((conversation_state or {}).get("active_skill_names") or [])
+        if str(item or "").strip()
+    ]
+
     def _build_runtime_context() -> AgentRuntimeContext:
         effective_chat_preferences = (
             prepared_send_plan.get("chat_preferences")
@@ -1940,6 +2309,11 @@ async def send_message(
             channel="chat",
             conversation_id=conversation_id,
             turn_id=turn_id,
+            active_skill_names=(
+                [str(request.skill_launch.skill_name).strip()]
+                if request.skill_launch is not None and str(request.skill_launch.skill_name or "").strip()
+                else list(persisted_active_skill_names)
+            ),
             chat_preferences_override=runtime_service.normalize_chat_preference_overrides(effective_chat_preferences),
             rag_overrides=runtime_service.normalize_chat_rag_overrides(effective_rag_overrides),
         )
@@ -1949,6 +2323,7 @@ async def send_message(
             db=None,
             user_id=current_user.id,
             db_session_factory=async_session_factory,
+            conversation_id=conversation_id,
             route_profile="chat",
         )
         return create_react_agent(
@@ -1963,6 +2338,7 @@ async def send_message(
             db=None,
             user_id=current_user.id,
             db_session_factory=async_session_factory,
+            conversation_id=conversation_id,
             route_profile="chat",
             initialize_mcp=False,
         )
@@ -1981,6 +2357,7 @@ async def send_message(
             citation_index = None
             context_debug = None
             reasoning_summary = None
+            reasoning_trace = None
             current_iteration = 0
 
             def _phase_payload(key: str, *, first_turn: bool) -> dict:
@@ -2075,7 +2452,7 @@ async def send_message(
             
             try:
                 # 发送开始事件
-                yield f"data: {json.dumps({'event': 'start', 'data': {'conversation_id': conversation_id, 'message_id': user_message.id, 'turn_id': turn_id}})}\n\n"
+                yield _sse_event("start", {"conversation_id": conversation_id, "message_id": user_message.id, "turn_id": turn_id})
                 
                 if use_tools:
                     # 先走轻量 planner 判断是否可以直答；只有真的需要工具时才初始化完整 agent。
@@ -2084,8 +2461,8 @@ async def send_message(
                     if prepared_send_plan and str(prepared_send_plan.get("preview_mode") or "") == "direct":
                         logger.info(f"[Chat] 复用完整预演 send_plan: conv={conversation_id}")
                     else:
-                        yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('loading_context', first_turn=is_first_turn)})}\n\n"
-                        yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('routing', first_turn=is_first_turn)})}\n\n"
+                        yield _sse_event("phase", _phase_payload("loading_context", first_turn=is_first_turn))
+                        yield _sse_event("phase", _phase_payload("routing", first_turn=is_first_turn))
                         planner = _create_direct_planner()
                         direct_response = await planner.prepare_direct_response(agent_messages)
                     if prepared_send_plan and str(prepared_send_plan.get("preview_mode") or "") == "direct":
@@ -2093,8 +2470,8 @@ async def send_message(
                             f"[Chat] 复用直连流式回答 send_plan: conv={conversation_id}, "
                             f"intent={((prepared_send_plan.get('routing_decision') or {}).get('intent') or 'unknown')}"
                         )
-                        yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('waiting_model', first_turn=is_first_turn)})}\n\n"
-                        yield f"data: {json.dumps({'event': 'model_info', 'data': {'provider': getattr(llm_service, 'provider', ''), 'model': (getattr(llm_service, 'config', {}) or {}).get('model')}})}\n\n"
+                        yield _sse_event("phase", _phase_payload("waiting_model", first_turn=is_first_turn))
+                        yield _sse_event("model_info", {"provider": getattr(llm_service, "provider", ""), "model": (getattr(llm_service, "config", {}) or {}).get("model")})
                         context_debug = None
 
                         async for chunk in llm_service.chat_stream(
@@ -2104,11 +2481,13 @@ async def send_message(
                             max_tokens=settings.llm_max_tokens,
                         ):
                             full_content += chunk
-                            yield f"data: {json.dumps({'event': 'content', 'data': chunk})}\n\n"
+                            yield _sse_event("content", chunk)
 
                         logger.info(f"[Chat] 复用直连 send_plan 完成: content_len={len(full_content)}")
                         async with async_session_factory() as save_db:
-                            message_metadata = _sanitized_persisted_chat_metadata({})
+                            message_metadata = _sanitized_persisted_chat_metadata(
+                                {"workflow_control": _build_workflow_control_payload(request)}
+                            )
                             assistant_message = Message(
                                 conversation_id=conversation_id,
                                 role=MessageRole.ASSISTANT,
@@ -2165,7 +2544,8 @@ async def send_message(
                             if conversation_item_stream:
                                 done_payload["item_stream"] = conversation_item_stream
 
-                            yield f"data: {json.dumps({'event': 'done', 'data': done_payload})}\n\n"
+                            done_payload = _attach_workflow_control(done_payload, request)
+                            yield _sse_event("done", done_payload)
                         return
                     if direct_response is not None:
                         routing_intent = "unknown"
@@ -2177,11 +2557,11 @@ async def send_message(
                             f"[Chat] 直连流式回答: conv={conversation_id}, "
                             f"intent={routing_intent}"
                         )
-                        yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('waiting_model', first_turn=is_first_turn)})}\n\n"
-                        yield f"data: {json.dumps({'event': 'model_info', 'data': {'provider': getattr(llm_service, 'provider', ''), 'model': (getattr(llm_service, 'config', {}) or {}).get('model')}})}\n\n"
+                        yield _sse_event("phase", _phase_payload("waiting_model", first_turn=is_first_turn))
+                        yield _sse_event("model_info", {"provider": getattr(llm_service, "provider", ""), "model": (getattr(llm_service, "config", {}) or {}).get("model")})
                         if isinstance(direct_response.context.context_debug, dict) and direct_response.context.context_debug:
                             context_debug = direct_response.context.context_debug
-                            yield f"data: {json.dumps({'event': 'context_debug', 'data': context_debug})}\n\n"
+                            yield _sse_event("context_debug", context_debug)
 
                         async for chunk in llm_service.chat_stream(
                             messages=direct_response.llm_messages,
@@ -2190,11 +2570,13 @@ async def send_message(
                             max_tokens=settings.llm_max_tokens,
                         ):
                             full_content += chunk
-                            yield f"data: {json.dumps({'event': 'content', 'data': chunk})}\n\n"
+                            yield _sse_event("content", chunk)
 
                         logger.info(f"[Chat] 直连流式完成: content_len={len(full_content)}")
                         async with async_session_factory() as save_db:
-                            message_metadata = _sanitized_persisted_chat_metadata({})
+                            message_metadata = _sanitized_persisted_chat_metadata(
+                                {"workflow_control": _build_workflow_control_payload(request)}
+                            )
                             assistant_message = Message(
                                 conversation_id=conversation_id,
                                 role=MessageRole.ASSISTANT,
@@ -2251,11 +2633,12 @@ async def send_message(
                             if conversation_item_stream:
                                 done_payload["item_stream"] = conversation_item_stream
 
-                            yield f"data: {json.dumps({'event': 'done', 'data': done_payload})}\n\n"
+                            done_payload = _attach_workflow_control(done_payload, request)
+                            yield _sse_event("done", done_payload)
                         return
 
                     # 使用 ReAct Agent（带工具）
-                    yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('waiting_model', first_turn=is_first_turn)})}\n\n"
+                    yield _sse_event("phase", _phase_payload("waiting_model", first_turn=is_first_turn))
                     agent = _create_chat_agent()
                     
                     async for event in agent.run(agent_messages, stream=True, prepared_plan=prepared_send_plan):
@@ -2263,32 +2646,32 @@ async def send_message(
                         event_data = event["data"]
                         
                         if event_type == "start":
-                            yield f"data: {json.dumps({'event': 'model_info', 'data': event_data})}\n\n"
+                            yield _sse_event("model_info", event_data)
                         elif event_type == "thinking_start":
                             current_iteration += 1
-                            yield f"data: {json.dumps({'event': 'thinking_start', 'data': {'iteration': current_iteration}})}\n\n"
+                            yield _sse_event("thinking_start", {"iteration": current_iteration})
                         elif event_type == "thinking":
-                            yield f"data: {json.dumps({'event': 'thinking', 'data': event_data})}\n\n"
+                            yield _sse_event("thinking", event_data)
                         elif event_type == "thought":
                             thought = event_data
-                            yield f"data: {json.dumps({'event': 'thought', 'data': event_data})}\n\n"
+                            yield _sse_event("thought", event_data)
                         elif event_type == "action":
-                            yield f"data: {json.dumps({'event': 'action', 'data': event_data})}\n\n"
+                            yield _sse_event("action", event_data)
                         elif event_type == "observation":
-                            yield f"data: {json.dumps({'event': 'observation', 'data': event_data})}\n\n"
+                            yield _sse_event("observation", event_data)
                         elif event_type == "context_debug":
                             if isinstance(event_data, dict):
                                 context_debug = event_data
-                            yield f"data: {json.dumps({'event': 'context_debug', 'data': event_data})}\n\n"
+                            yield _sse_event("context_debug", event_data)
                         elif event_type == "content":
                             full_content += event_data
-                            yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
+                            yield _sse_event("content", event_data)
                         elif event_type == "answer":
                             full_content = event_data
-                            yield f"data: {json.dumps({'event': 'content', 'data': event_data})}\n\n"
+                            yield _sse_event("content", event_data)
                         elif event_type == "error":
                             logger.error(f"[Chat] ReAct Agent 错误: {event_data}")
-                            yield f"data: {json.dumps({'event': 'error', 'data': event_data})}\n\n"
+                            yield _sse_event("error", event_data)
                         elif event_type == "done":
                             if isinstance(event_data, dict):
                                 if event_data.get("thought"):
@@ -2299,8 +2682,16 @@ async def send_message(
                                     rag_metrics = event_data["rag_metrics"]
                                 if isinstance(event_data.get("reasoning_summary"), str):
                                     reasoning_summary = event_data["reasoning_summary"]
+                                if isinstance(event_data.get("_reasoning_trace"), str):
+                                    reasoning_trace = event_data["_reasoning_trace"]
                                 if isinstance(event_data.get("citation_index"), dict):
                                     citation_index = dict(event_data.get("citation_index") or {})
+
+                            rag_metrics, citation_index = _align_chat_citation_payload(
+                                answer_text=full_content,
+                                rag_metrics=rag_metrics,
+                                citation_index=citation_index,
+                            )
                             
                             logger.info(f"[Chat] 对话完成: iterations={current_iteration}, content_len={len(full_content)}")
                             
@@ -2311,6 +2702,9 @@ async def send_message(
                                     message_metadata["rag_metrics"] = rag_metrics
                                 if isinstance(citation_index, dict):
                                     message_metadata["citation_index"] = citation_index
+                                workflow_control = _build_workflow_control_payload(request)
+                                if workflow_control:
+                                    message_metadata["workflow_control"] = workflow_control
                                 persisted_message_metadata = _sanitized_persisted_chat_metadata(message_metadata) or {}
                                 assistant_message = Message(
                                     conversation_id=conversation_id,
@@ -2335,11 +2729,22 @@ async def send_message(
                                     kind="assistant_message",
                                 )
                                 await _append_reasoning_item(
-                                    summary_text=(reasoning_summary or thought),
+                                    summary_text=reasoning_summary,
                                     message_id=assistant_message.id,
                                     run_id=str(event_data.get("run_id") or "").strip() or None,
                                     iteration_count=current_iteration,
                                     created_at=assistant_message.created_at,
+                                )
+                                _schedule_reasoning_summary_persist(
+                                    conversation_id=conversation_id,
+                                    turn_id=turn_id,
+                                    message_id=assistant_message.id,
+                                    run_id=str(event_data.get("run_id") or "").strip() or None,
+                                    iteration_count=current_iteration,
+                                    trace=reasoning_trace,
+                                    created_at=assistant_message.created_at,
+                                    runtime_service=agent.runtime_service,
+                                    session_factory=async_session_factory,
                                 )
                                 turn_store = await _finalize_turn(
                                     status_value="completed",
@@ -2381,10 +2786,11 @@ async def send_message(
                                 if isinstance(reasoning_summary, str) and reasoning_summary.strip():
                                     done_payload["reasoning_summary"] = reasoning_summary.strip()
 
-                                yield f"data: {json.dumps({'event': 'done', 'data': done_payload})}\n\n"
+                                done_payload = _attach_workflow_control(done_payload, request)
+                                yield _sse_event("done", done_payload)
                 else:
-                    yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('loading_context', first_turn=is_first_turn)})}\n\n"
-                    yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('routing', first_turn=is_first_turn)})}\n\n"
+                    yield _sse_event("phase", _phase_payload("loading_context", first_turn=is_first_turn))
+                    yield _sse_event("phase", _phase_payload("routing", first_turn=is_first_turn))
                     planner = _create_direct_planner()
                     direct_response = None
                     if prepared_send_plan and str(prepared_send_plan.get("preview_mode") or "") == "direct":
@@ -2409,10 +2815,10 @@ async def send_message(
                         llm_messages = [dict(item) for item in list(direct_response.llm_messages or []) if isinstance(item, dict)]
                         system_prompt = direct_response.system_prompt
 
-                    yield f"data: {json.dumps({'event': 'phase', 'data': _phase_payload('waiting_model', first_turn=is_first_turn)})}\n\n"
-                    yield f"data: {json.dumps({'event': 'model_info', 'data': {'provider': getattr(llm_service, 'provider', ''), 'model': (getattr(llm_service, 'config', {}) or {}).get('model')}})}\n\n"
+                    yield _sse_event("phase", _phase_payload("waiting_model", first_turn=is_first_turn))
+                    yield _sse_event("model_info", {"provider": getattr(llm_service, "provider", ""), "model": (getattr(llm_service, "config", {}) or {}).get("model")})
                     if isinstance(context_debug, dict) and context_debug:
-                        yield f"data: {json.dumps({'event': 'context_debug', 'data': context_debug})}\n\n"
+                        yield _sse_event("context_debug", context_debug)
 
                     async for chunk in llm_service.chat_stream(
                         messages=llm_messages,
@@ -2421,7 +2827,7 @@ async def send_message(
                         max_tokens=settings.llm_max_tokens,
                     ):
                         full_content += chunk
-                        yield f"data: {json.dumps({'event': 'content', 'data': chunk})}\n\n"
+                        yield _sse_event("content", chunk)
 
                     async with async_session_factory() as save_db:
                         assistant_message = Message(
@@ -2473,7 +2879,8 @@ async def send_message(
                             done_payload["tool_ledger"] = conversation_tool_ledger
                         if conversation_item_stream:
                             done_payload["item_stream"] = conversation_item_stream
-                        yield f"data: {json.dumps({'event': 'done', 'data': done_payload})}\n\n"
+                        done_payload = _attach_workflow_control(done_payload, request)
+                        yield _sse_event("done", done_payload)
                 
             except asyncio.CancelledError:
                 logger.warning(
@@ -2512,7 +2919,7 @@ async def send_message(
                     assistant_thought=thought,
                     error_message=str(e),
                 )
-                yield f"data: {json.dumps({'event': 'error', 'data': str(e)})}\n\n"
+                yield _sse_event("error", str(e))
         
         return StreamingResponse(
             generate(),
@@ -2526,6 +2933,8 @@ async def send_message(
     else:
         # 非流式响应
         try:
+            reasoning_trace = ""
+            run_id = None
             if use_tools:
                 direct_response = None
                 if prepared_send_plan and str(prepared_send_plan.get("preview_mode") or "") == "direct":
@@ -2562,8 +2971,12 @@ async def send_message(
                                     answer = str(event_data.get("answer") or "")
                                 if event_data.get("thought"):
                                     thought = str(event_data.get("thought") or "")
+                                if event_data.get("run_id"):
+                                    run_id = str(event_data.get("run_id") or "")
                                 if isinstance(event_data.get("reasoning_summary"), str):
                                     reasoning_summary = str(event_data.get("reasoning_summary") or "")
+                                if isinstance(event_data.get("_reasoning_trace"), str):
+                                    reasoning_trace = str(event_data.get("_reasoning_trace") or "")
                                 if isinstance(event_data.get("rag_metrics"), dict):
                                     rag_metrics = dict(event_data.get("rag_metrics") or {})
                                 if isinstance(event_data.get("citation_index"), dict):
@@ -2577,6 +2990,13 @@ async def send_message(
                             "rag_metrics": rag_metrics,
                             "citation_index": citation_index,
                         }
+                        aligned_rag_metrics, aligned_citation_index = _align_chat_citation_payload(
+                            answer_text=response["content"],
+                            rag_metrics=response.get("rag_metrics"),
+                            citation_index=response.get("citation_index"),
+                        )
+                        response["rag_metrics"] = aligned_rag_metrics
+                        response["citation_index"] = aligned_citation_index
                         llm_messages = []
                         system_prompt = ""
                 if llm_messages:
@@ -2624,6 +3044,7 @@ async def send_message(
                 {
                     "rag_metrics": response.get("rag_metrics"),
                     "citation_index": response.get("citation_index"),
+                    "workflow_control": _build_workflow_control_payload(request),
                 }
             ) or {}
             assistant_message = Message(
@@ -2668,6 +3089,18 @@ async def send_message(
                 if _assistant_summary_text(response["content"], limit=240)
                 else [],
             )
+            if reasoning_trace:
+                _schedule_reasoning_summary_persist(
+                    conversation_id=conversation.id,
+                    turn_id=turn_id,
+                    message_id=assistant_message.id,
+                    run_id=run_id,
+                    iteration_count=1,
+                    trace=reasoning_trace,
+                    created_at=assistant_message.created_at,
+                    runtime_service=runtime_service,
+                    session_factory=async_session_factory,
+                )
             await runtime_service.upsert_conversation_turn_entry(
                 conversation.id,
                 {
@@ -2693,6 +3126,7 @@ async def send_message(
                 "turn_store": conversation_turn_store if conversation_turn_store else None,
                 "tool_ledger": conversation_tool_ledger if conversation_tool_ledger else None,
                 "item_stream": conversation_item_stream if conversation_item_stream else None,
+                "workflow_control": _build_workflow_control_payload(request),
             }
             
         except Exception as e:
@@ -2807,6 +3241,7 @@ async def rewrite_message_span(
             system_prompt="You are a precise text rewriting engine. Return only the requested replacement span.",
             temperature=0.2,
             max_tokens=min(max(len(selected_text) * 2, 256), 2048),
+            source="chat.message_span_rewrite",
         )
     except Exception as exc:
         logger.warning(f"[ChatRewrite] LLM rewrite failed message_id={message_id}: {exc}")

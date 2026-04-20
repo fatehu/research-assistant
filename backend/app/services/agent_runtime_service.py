@@ -83,6 +83,23 @@ class AgentRuntimeService:
         return text
 
     @staticmethod
+    def _parse_optional_iso_datetime(value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+        if parsed.tzinfo is not None:
+            try:
+                return parsed.astimezone(tz=None).replace(tzinfo=None)
+            except Exception:
+                return parsed.replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
     def _normalize_chat_preferences(raw: Any) -> Dict[str, Any]:
         payload = dict(raw or {}) if isinstance(raw, dict) else {}
         language = str(payload.get("response_language") or "auto").strip()
@@ -447,6 +464,119 @@ class AgentRuntimeService:
                 merged.update(metadata)
                 record.metadata_ = merged
             await db.commit()
+
+    async def cleanup_stale_runs(
+        self,
+        *,
+        older_than_seconds: Optional[int] = None,
+        only_channels: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        timeout_seconds = max(int(older_than_seconds or getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900), 60)
+        threshold = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+        channels = [str(item or "").strip() for item in list(only_channels or []) if str(item or "").strip()]
+
+        async with async_session_factory() as db:
+            stmt = select(AgentRun).where(
+                AgentRun.status == "running",
+                AgentRun.started_at <= threshold,
+            )
+            if channels:
+                stmt = stmt.where(AgentRun.channel.in_(channels))
+            result = await db.execute(stmt)
+            rows = list(result.scalars().all())
+            cleaned: List[Dict[str, Any]] = []
+            for record in rows:
+                record.status = "error"
+                record.finished_at = datetime.utcnow()
+                merged = dict(record.metadata_ or {})
+                merged.update(
+                    {
+                        "error": "stale_run_cleanup",
+                        "cleanup_reason": "stale_running_run",
+                        "cleanup_threshold_seconds": timeout_seconds,
+                        "cleanup_at": datetime.utcnow().isoformat(),
+                    }
+                )
+                record.metadata_ = merged
+                cleaned.append(
+                    {
+                        "id": str(record.id),
+                        "channel": str(record.channel or ""),
+                        "conversation_id": int(record.conversation_id) if record.conversation_id is not None else None,
+                        "started_at": str(record.started_at),
+                    }
+                )
+            await db.commit()
+        return {
+            "timeout_seconds": timeout_seconds,
+            "cleaned_count": len(cleaned),
+            "cleaned_runs": cleaned,
+        }
+
+    async def cleanup_stale_conversation_turns(
+        self,
+        *,
+        older_than_seconds: Optional[int] = None,
+        conversation_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        timeout_seconds = max(int(older_than_seconds or getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900), 60)
+        threshold = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+
+        async with async_session_factory() as db:
+            stmt = select(Conversation)
+            if conversation_id is not None:
+                stmt = stmt.where(Conversation.id == int(conversation_id))
+            result = await db.execute(stmt)
+            conversations = list(result.scalars().all())
+            cleaned: List[Dict[str, Any]] = []
+            for row in conversations:
+                metadata = dict(row.metadata_ or {})
+                turn_payload = metadata.get("turn_store")
+                if not isinstance(turn_payload, dict):
+                    continue
+                turn_store = ConversationTurnStore.from_payload(turn_payload)
+                changed = False
+                for index, entry in enumerate(list(turn_store.entries or [])):
+                    if str(entry.status or "").strip().lower() != "running":
+                        continue
+                    started_at = self._parse_optional_iso_datetime(entry.started_at)
+                    if started_at is not None and started_at > threshold:
+                        continue
+                    turn_store.entries[index] = ConversationTurnEntry(
+                        turn_id=entry.turn_id,
+                        status="error",
+                        user_message_id=entry.user_message_id,
+                        assistant_message_id=entry.assistant_message_id,
+                        run_id=entry.run_id,
+                        user_content=entry.user_content,
+                        assistant_summary=entry.assistant_summary,
+                        iteration_count=entry.iteration_count,
+                        tool_call_count=entry.tool_call_count,
+                        tool_result_count=entry.tool_result_count,
+                        error_message=entry.error_message or "stale_turn_cleanup",
+                        started_at=entry.started_at,
+                        completed_at=datetime.utcnow().isoformat(),
+                    )
+                    changed = True
+                    cleaned.append(
+                        {
+                            "conversation_id": int(row.id),
+                            "turn_id": str(entry.turn_id),
+                            "run_id": str(entry.run_id or ""),
+                            "started_at": str(entry.started_at or ""),
+                        }
+                    )
+                if not changed:
+                    continue
+                turn_store.updated_at = datetime.utcnow().isoformat()
+                metadata["turn_store"] = turn_store.to_payload()
+                row.metadata_ = metadata
+            await db.commit()
+        return {
+            "timeout_seconds": timeout_seconds,
+            "cleaned_count": len(cleaned),
+            "cleaned_turns": cleaned,
+        }
 
     async def append_steps(self, run_id: str, steps: Iterable[Dict[str, Any]]) -> None:
         payload = list(steps)

@@ -391,6 +391,7 @@ class QueryRewriteService:
                 system_prompt=system_prompt,
                 temperature=settings.query_rewrite_temperature,
                 max_tokens=min(settings.llm_max_tokens, 800),
+                source="retrieval.query_rewrite",
             ),
             timeout=max(1, settings.query_rewrite_timeout_seconds),
         )

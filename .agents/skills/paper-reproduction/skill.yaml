@@ -1,0 +1,165 @@
+name: paper-reproduction
+description: >-
+  Complete saved-paper reproduction skill. Continue a Project from PDF/intake
+  through repo/data discovery, implementation planning, run drafts, baseline
+  execution, first tuning, metric comparison, and result reporting.
+when_to_use: >-
+  Use when the user wants to reproduce a saved paper, run or debug its code,
+  prepare implementation plans, start baseline experiments, tune parameters or
+  models, compare results, or continue an existing paper Project.
+category: paper
+family: paper-reproduction
+allowed_channels:
+  - chat
+interface_metadata_path: agents/openai.yaml
+user_invocable: true
+execution_context: inline
+agent: primary
+effort: high
+aliases:
+  - paper reproduction
+  - paper repro
+  - paper research
+  - reproduce paper
+  - reproduce this paper
+  - run paper code
+  - paper execution plan
+  - paper intake
+  - 论文复现
+  - 复现论文
+  - 论文代码复现
+  - 论文调优
+  - 论文研究
+  - 论文执行规划
+trigger_keywords:
+  - paper-reproduction
+  - paper reproduction
+  - paper repro
+  - paper research
+  - reproduce paper
+  - run draft
+  - run 草案
+  - pdf2markdown
+  - pdf to markdown
+  - intake
+  - refresh intake
+  - paper_research_prepare
+  - paper_research_status
+  - execution plan
+  - full_paper_markdown
+  - local_pdf_markdown
+  - abstract_fallback
+enforced_tool_names:
+  - paper_research_status
+  - paper_research_prepare
+  - paper_research_clone_repo
+  - paper_research_get_artifact_manifest
+  - paper_research_read_artifact
+  - paper_research_read_repo_file
+  - paper_research_search_repo
+  - paper_research_write_implementation_spec
+  - paper_research_read_implementation_spec
+  - paper_research_write_run_drafts
+  - paper_research_read_run_drafts
+  - paper_research_inspect_runtime
+  - paper_research_write_execution_spec
+  - paper_research_read_execution_spec
+  - paper_research_start_execution
+  - paper_research_read_execution
+  - paper_research_cancel_execution
+  - web_search
+  - web_scrape
+blocked_tool_names:
+  - knowledge_search
+  - literature_search
+  - paper_research_create_run_draft
+continue_policies:
+  - manual
+  - ask_to_continue
+  - auto_continue
+default_continue_policy: ask_to_continue
+scripts:
+  - path: scripts/render_stage_prompt.py
+    purpose: Render a concise launch prompt for the requested paper reproduction stage.
+  - path: scripts/check_artifact_contract.py
+    purpose: Validate archived skill artifacts against the declared top-level contract.
+  - path: scripts/check_runtime_environment.py
+    purpose: Check runtime-worker ML package and command availability without importing heavy modules.
+  - path: scripts/render_execution_spec.py
+    purpose: Render a deterministic execution_spec JSON skeleton from explicit draft/runtime inputs.
+stages:
+  - id: planning
+    title: Planning / Intake
+    continue_policy: manual
+    reads: []
+    writes:
+      - planning/paper_intake_result.json
+      - planning/experiment_spec.json
+  - id: implementation_prep
+    title: Implementation Prep
+    continue_policy: ask_to_continue
+    reads:
+      - planning/paper_intake_result.json
+      - planning/experiment_spec.json
+      - repo/repo_reference.json
+      - repo/repo_file_index.json
+    writes:
+      - specs/implementation_spec.json
+  - id: run_drafts
+    title: Run Drafts
+    continue_policy: ask_to_continue
+    reads:
+      - specs/implementation_spec.json
+    writes:
+      - drafts/run_drafts.json
+  - id: execution
+    title: Baseline Execution
+    continue_policy: auto_continue
+    reads:
+      - drafts/run_drafts.json
+      - runtime_worker.environment
+      - executions/{execution_id}/execution_spec.json
+      - executions/{execution_id}/execution_result.json
+    writes:
+      - executions/{execution_id}/execution_spec.json
+      - executions/{execution_id}/execution_result.json
+  - id: tuning
+    title: First Tuning / Compare
+    continue_policy: ask_to_continue
+    reads:
+      - specs/implementation_spec.json
+      - executions/{execution_id}/execution_result.json
+    writes:
+      - executions/{execution_id}/execution_spec.json
+      - executions/{execution_id}/execution_result.json
+      - reports/compare_report.json
+artifacts:
+  - name: intake_result
+    path: planning/paper_intake_result.json
+  - name: experiment_spec
+    path: planning/experiment_spec.json
+  - name: implementation_spec
+    path: specs/implementation_spec.json
+  - name: run_drafts
+    path: drafts/run_drafts.json
+  - name: execution_spec
+    path: executions/{execution_id}/execution_spec.json
+  - name: execution_result
+    path: executions/{execution_id}/execution_result.json
+  - name: compare_report
+    path: reports/compare_report.json
+references:
+  - path: references/intake-contract.md
+    when: Prepare or explain PDF/markdown/intake JSON.
+  - path: references/implementation-planning.md
+    when: Generate or revise implementation_spec and run_drafts.
+  - path: references/execution-and-tuning.md
+    when: Run baseline, recover failed official sources, tune, compare, or inspect long tasks.
+  - path: references/pipeline.md
+    when: Explain PDF/markdown/intake fallback behavior.
+  - path: references/output-fields.md
+    when: Explain archived workspace/result fields.
+  - path: references/run-draft-heuristics.md
+    when: Generate or revise run_drafts from repo evidence.
+  - path: references/runtime-environment.md
+    when: Run, reproduce, tune, debug runtime, or configure runtime-worker.

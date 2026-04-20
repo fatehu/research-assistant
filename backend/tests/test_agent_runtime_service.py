@@ -1,5 +1,7 @@
 import os
 import sys
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,3 +153,59 @@ async def test_list_chat_run_events_loads_persisted_payloads(monkeypatch):
     assert [item["event"] for item in events] == ["start", "done"]
     assert events[0]["data"]["conversation_id"] == 42
     assert events[1]["data"]["answer"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_runs_marks_old_running_runs_as_error(monkeypatch):
+    old_running = SimpleNamespace(
+        id="run-old",
+        channel="chat",
+        conversation_id=107,
+        status="running",
+        started_at=datetime.utcnow() - timedelta(hours=2),
+        finished_at=None,
+        metadata_={},
+    )
+    recent_running = SimpleNamespace(
+        id="run-new",
+        channel="chat",
+        conversation_id=107,
+        status="running",
+        started_at=datetime.utcnow(),
+        finished_at=None,
+        metadata_={},
+    )
+
+    class _ScalarsResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return list(self._rows)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, stmt):
+            return _ScalarsResult([old_running])
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "async_session_factory", lambda: _FakeSession())
+
+    report = await AgentRuntimeService().cleanup_stale_runs(older_than_seconds=300, only_channels=["chat"])
+
+    assert report["cleaned_count"] == 1
+    assert report["cleaned_runs"][0]["id"] == "run-old"
+    assert old_running.status == "error"
+    assert old_running.finished_at is not None
+    assert old_running.metadata_["error"] == "stale_run_cleanup"
+    assert recent_running.status == "running"

@@ -13,6 +13,7 @@ import {
 import { useNavigate } from 'react-router-dom'
 import { Paper } from '@/services/api'
 import { useLiteratureStore } from '@/stores/literatureStore'
+import PaperProjectLauncherCard from './PaperProjectLauncherCard'
 
 const { TextArea } = Input
 
@@ -330,6 +331,11 @@ export default function PaperDetailPanel({ paper }: PaperDetailPanelProps) {
           )}
         </div>
       </div>
+
+      {/* 分割线 */}
+      <div className="h-px bg-slate-700/50" />
+
+      <PaperProjectLauncherCard paper={paper} />
 
       {/* 分割线 */}
       <div className="h-px bg-slate-700/50" />

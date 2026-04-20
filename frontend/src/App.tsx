@@ -18,6 +18,7 @@ const PaperReaderWorkbenchPage = lazy(() => import('@/pages/literature').then((m
 const PaperReaderExperiencePage = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderExperiencePage })))
 const PaperReaderWorkbenchV2Page = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderWorkbenchV2Page })))
 const PaperReaderExperienceV2Page = lazy(() => import('@/pages/literature').then((m) => ({ default: m.PaperReaderExperienceV2Page })))
+const ProjectsPage = lazy(() => import('@/pages/projects').then((m) => ({ default: m.ProjectsPage })))
 const CodeLabPage = lazy(() => import('@/pages/codelab').then((m) => ({ default: m.CodeLabPage })))
 const AdminUsersPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.UsersPage })))
 const AdminStatisticsPage = lazy(() => import('@/pages/admin').then((m) => ({ default: m.StatisticsPage })))
@@ -215,6 +216,8 @@ function App() {
           <Route path="knowledge/chunking" element={withSuspense(<SmartChunkingPage />)} />
           <Route path="literature" element={withSuspense(<LiteraturePage />)} />
           <Route path="literature/:paperId/read" element={withSuspense(<PaperReaderPage />)} />
+          <Route path="projects" element={withSuspense(<ProjectsPage />)} />
+          <Route path="projects/:projectId" element={withSuspense(<ProjectsPage />)} />
           <Route path="code" element={withSuspense(<CodeLabPage />)} />
           <Route path="code/:notebookId" element={withSuspense(<CodeLabPage />)} />
 

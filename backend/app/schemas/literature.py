@@ -84,6 +84,67 @@ class PaperResponse(PaperBase):
         from_attributes = True
 
 
+class PaperExperimentRunBase(BaseModel):
+    run_kind: Literal["baseline", "variant"] = "variant"
+    label: str = Field(..., min_length=1, max_length=200)
+    model_name: Optional[str] = Field(default=None, max_length=255)
+    hypothesis: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    variant_spec: Dict[str, Any] = Field(default_factory=dict)
+    base_run_id: Optional[int] = None
+
+
+class PaperExperimentRunCreateRequest(PaperExperimentRunBase):
+    pass
+
+
+class PaperExperimentRunUpdateRequest(BaseModel):
+    status: Optional[Literal["draft", "pending", "running", "completed", "failed", "cancelled"]] = None
+    metrics: Optional[Dict[str, Any]] = None
+    artifacts: Optional[Dict[str, Any]] = None
+    summary: Optional[Dict[str, Any]] = None
+    notes: Optional[str] = None
+
+
+class PaperExperimentRunResponse(BaseModel):
+    id: int
+    workspace_id: int
+    user_id: int
+    notebook_id: Optional[str] = None
+    notebook_cell_id: Optional[str] = None
+    base_run_id: Optional[int] = None
+    run_kind: str
+    status: str
+    label: str
+    model_name: Optional[str] = None
+    hypothesis: Optional[str] = None
+    variant_spec: Dict[str, Any] = Field(default_factory=dict)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    artifacts: Dict[str, Any] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class PaperExperimentWorkspaceResponse(BaseModel):
+    id: int
+    user_id: int
+    paper_id: int
+    notebook_id: Optional[str] = None
+    status: str
+    title: str
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    experiment_spec: Dict[str, Any] = Field(default_factory=dict)
+    compare_report: Dict[str, Any] = Field(default_factory=dict)
+    runs: List[PaperExperimentRunResponse] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
 class PaperSearchResult(BaseModel):
     """搜索结果"""
     source: str

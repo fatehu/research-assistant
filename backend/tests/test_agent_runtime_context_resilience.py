@@ -207,6 +207,25 @@ class _MidRunRuntime(_RuntimeRecorder):
         return {}
 
 
+class _CurrentTurnOnlyRuntime(_MidRunRuntime):
+    def __init__(self):
+        super().__init__()
+        self.item_stream_payload = {
+            "version": "conversation_item_stream.v1",
+            "updated_at": "2026-04-02T00:00:00",
+            "entries": [
+                {
+                    "item_id": "item-current",
+                    "kind": "user_message",
+                    "turn_id": "turn:200",
+                    "role": "user",
+                    "content": "当前问题",
+                    "message_id": 200,
+                },
+            ],
+        }
+
+
 class _HistoryRuntime(_RuntimeRecorder):
     def __init__(self):
         super().__init__()
@@ -699,6 +718,52 @@ async def test_mid_run_compaction_can_trigger_on_message_pressure_without_trim(m
 
 
 @pytest.mark.asyncio
+async def test_mid_run_compaction_skips_paper_reproduction_skill(monkeypatch):
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_enabled", True)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_min_iteration", 2)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_max_per_run", 2)
+    monkeypatch.setattr(settings, "agent_mid_run_compaction_message_tokens_trigger", 256)
+    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+
+    runtime = _MidRunRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=2,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=42, turn_id="turn:200"),
+        runtime_service=runtime,
+    )
+    agent._last_skill_resolution = {
+        "active_skills": [
+            {
+                "name": "paper-reproduction",
+            }
+        ]
+    }
+
+    run_context = AgentContext(
+        messages=[
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "继续 implementation-prep"},
+        ],
+        turn_id="turn:200",
+        iteration=2,
+        run_id="run-1",
+        context_truncated=False,
+        message_tokens_before_trim=1024,
+    )
+
+    compacted = await agent._maybe_mid_run_compact(run_context, "system")
+
+    assert compacted is False
+    assert run_context.mid_run_compactions == 0
+    assert not runtime.compacted_histories
+    assert run_context.context_debug["mid_run_compaction_skipped"] == "skill_exempt"
+    assert "paper-reproduction" in run_context.context_debug["mid_run_compaction_active_skills"]
+
+
+@pytest.mark.asyncio
 async def test_pre_turn_compaction_persists_boundary_and_refreshes_context(monkeypatch):
     monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
     monkeypatch.setattr(settings, "agent_context_window_turns", 1)
@@ -735,6 +800,36 @@ async def test_pre_turn_compaction_persists_boundary_and_refreshes_context(monke
     assert [item["content"] for item in context.history_messages] == ["当前问题"]
     assert context.context_debug["formal_compaction_applied"] is True
     assert context.context_debug["formal_compaction_mode"] == "pre_turn"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_compaction_skips_new_conversation_first_turn(monkeypatch):
+    monkeypatch.setattr(settings, "agent_pre_turn_compaction_enabled", True)
+    monkeypatch.setattr(settings, "agent_context_window_turns", 8)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 2)
+    monkeypatch.setattr(compaction_module, "LLMService", _CompactionLLM)
+
+    runtime = _CurrentTurnOnlyRuntime()
+    agent = ReActAgent(
+        _SimpleLLM(),
+        _BrokenIntentTools(),
+        max_iterations=1,
+        runtime_context=AgentRuntimeContext(user_id=1, channel="chat", conversation_id=42, turn_id="turn:200"),
+        runtime_service=runtime,
+    )
+    context = AgentContext(
+        messages=[{"role": "user", "content": "当前问题"}],
+        turn_id="turn:200",
+        iteration=0,
+        run_id="run-1",
+    )
+
+    compacted = await agent._maybe_pre_turn_compact(context)
+
+    assert compacted is False
+    assert not runtime.context_states
+    assert not runtime.compacted_histories
+    assert context.context_debug["pre_turn_compaction_skipped"] == "no_compactable_history"
 
 
 @pytest.mark.asyncio

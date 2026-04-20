@@ -34,7 +34,13 @@ from app.models.knowledge import Document, KnowledgeBase
 from app.models.literature import Paper, PaperReaderComponentOverlay, PaperReaderPageCache
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_reader_service import get_literature_reader_service
-from app.services.llm_service import get_llm_service
+from app.services.llm_service import (
+    build_llm_source_headers,
+    get_llm_service,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 from app.services.reader_component_contract_service import get_reader_component_contract_service
 from app.services.reader_compose_agent_state import ReaderComposeAgentState
 from app.services.reader_compose_agent_runtime import get_reader_compose_agent_runtime
@@ -9961,6 +9967,14 @@ class LiteratureReaderComposeService:
         ]
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        source = f"reader.compose.single_agent_v2.{step}.{phase}"
+        extra_headers = build_llm_source_headers(source)
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=model_name,
+            operation="chat",
+        )
         try:
             response = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -9973,10 +9987,18 @@ class LiteratureReaderComposeService:
                     max_tokens=max_tokens,
                     response_format={"type": "json_object"},
                     timeout=request_timeout,
+                    extra_headers=extra_headers or None,
                 ),
                 timeout=request_timeout + 1.0,
             )
         except Exception as exc:  # pragma: no cover - network/provider failures expected at runtime
+            log_tagged_llm_request_error(
+                source=source,
+                provider="aliyun",
+                model=model_name,
+                operation="chat",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             logger.warning(
                 f"[ReaderComposeService] single_agent_v2 model call failed "
                 f"step={step} phase={phase} model={model_name}: {type(exc).__name__}: {exc}"
@@ -9997,6 +10019,14 @@ class LiteratureReaderComposeService:
             "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
             "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
         }
+        log_tagged_llm_request_done(
+            source=source,
+            provider="aliyun",
+            model=str(getattr(response, "model", "") or model_name),
+            operation="chat",
+            finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage=usage,
+        )
         return {
             "status": str(parsed.get("status") or ""),
             "step_result": dict(parsed.get("step_result") or {}),

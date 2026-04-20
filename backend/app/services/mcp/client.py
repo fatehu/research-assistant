@@ -524,7 +524,31 @@ class MCPClientManager:
     @staticmethod
     def _clean_excerpt(value: Any, *, limit: int = 180) -> str:
         text = " ".join(str(value or "").split()).strip()
-        return text[:limit]
+        if limit and limit > 0:
+            return text[:limit]
+        return text
+
+    @classmethod
+    def _combine_reader_results(
+        cls,
+        rows: List[Dict[str, Any]],
+        *,
+        empty_summary: str,
+    ) -> str:
+        excerpts: List[str] = []
+        for row in rows:
+            excerpt = str(
+                row.get("reader_excerpt") or row.get("snippet") or row.get("summary") or ""
+            ).strip()
+            if not excerpt:
+                continue
+            title = str(row.get("title") or "").strip()
+            candidate = excerpt
+            if title and title.lower() not in excerpt.lower():
+                candidate = f"{title}: {excerpt}"
+            if candidate and candidate not in excerpts:
+                excerpts.append(candidate)
+        return "\n\n".join(excerpts) if excerpts else empty_summary
 
     @staticmethod
     def _extract_hostname(value: Any) -> str:
@@ -576,32 +600,6 @@ class MCPClientManager:
         ]
 
     @classmethod
-    def _summarize_reader_results(
-        cls,
-        rows: List[Dict[str, Any]],
-        *,
-        empty_summary: str,
-        limit: int = 2,
-    ) -> str:
-        excerpts: List[str] = []
-        for row in rows:
-            excerpt = cls._clean_excerpt(
-                row.get("reader_excerpt") or row.get("snippet") or row.get("summary") or "",
-                limit=140,
-            )
-            if not excerpt:
-                continue
-            title = cls._clean_excerpt(row.get("title") or "", limit=80)
-            candidate = excerpt
-            if title and title.lower() not in excerpt.lower():
-                candidate = cls._clean_excerpt(f"{title}: {excerpt}", limit=160)
-            if candidate and candidate not in excerpts:
-                excerpts.append(candidate)
-            if len(excerpts) >= limit:
-                break
-        return " | ".join(excerpts) if excerpts else empty_summary
-
-    @classmethod
     def _normalize_search_result_item(
         cls,
         item: Any,
@@ -628,7 +626,7 @@ class MCPClientManager:
             "title": title,
             "url": url,
             "snippet": snippet,
-            "reader_excerpt": cls._clean_excerpt(snippet or title, limit=220),
+            "reader_excerpt": cls._clean_excerpt(snippet or title, limit=0),
             "type": str(item.get("type") or ("organic" if url else "result")).strip() or "result",
             "display_url": domain or url,
             "domain": domain,
@@ -651,10 +649,10 @@ class MCPClientManager:
                 continue
             seen.add(href)
             link = {
-                "label": str(row.get("title") or row.get("label") or href).strip()[:120],
+                "label": str(row.get("title") or row.get("label") or href).strip(),
                 "href": href,
             }
-            snippet = cls._clean_excerpt(row.get("snippet") or row.get("summary") or "")
+            snippet = cls._clean_excerpt(row.get("snippet") or row.get("summary") or "", limit=0)
             if snippet:
                 link["snippet"] = snippet
             links.append(link)
@@ -724,7 +722,7 @@ class MCPClientManager:
             for item in normalized_results
             if str(item.get("type") or "").strip()
         ]
-        reader_summary = cls._summarize_reader_results(
+        reader_summary = cls._combine_reader_results(
             normalized_results,
             empty_summary=f"No public web results found for '{query}'.",
         )
@@ -767,10 +765,10 @@ class MCPClientManager:
         if not href:
             return {}
         normalized = {
-            "label": str(item.get("label") or item.get("title") or href).strip()[:120],
+            "label": str(item.get("label") or item.get("title") or href).strip(),
             "href": href,
         }
-        snippet = MCPClientManager._clean_excerpt(item.get("snippet") or item.get("summary") or "")
+        snippet = MCPClientManager._clean_excerpt(item.get("snippet") or item.get("summary") or "", limit=0)
         if snippet:
             normalized["snippet"] = snippet
         return normalized
@@ -855,17 +853,14 @@ class MCPClientManager:
 
         title = str(metadata.get("title") or metadata.get("page_title") or "").strip()
         source_domain = cls._extract_hostname(url)
-        reader_summary = cls._clean_excerpt(
-            markdown or text or content or fallback_output or title,
-            limit=260,
-        )
+        reader_summary = str(markdown or text or content or fallback_output or title).strip()
         public_links = normalized_links
         if url:
             source_link = {
                 "label": title or str(urlparse(url).netloc or url).strip(),
                 "href": url,
             }
-            source_snippet = cls._clean_excerpt(markdown or text or content or fallback_output)
+            source_snippet = str(markdown or text or content or fallback_output or "").strip()
             if source_snippet:
                 source_link["snippet"] = source_snippet
             public_links = [source_link] + [row for row in normalized_links if row.get("href") != url]

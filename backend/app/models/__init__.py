@@ -7,6 +7,9 @@ from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
 from app.models.literature import (
     Paper,
     PaperCollection,
+    PaperExperimentRun,
+    PaperExperimentWorkspace,
+    ResearchProject,
     PaperSearchHistory,
     PaperEntity,
     PaperReadSession,
@@ -51,6 +54,9 @@ __all__ = [
     # 文献
     "Paper",
     "PaperCollection",
+    "PaperExperimentWorkspace",
+    "PaperExperimentRun",
+    "ResearchProject",
     "PaperSearchHistory",
     "PaperEntity",
     "PaperReadSession",

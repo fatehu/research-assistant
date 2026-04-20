@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from typing import Optional, List, Literal, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class ReActStep(BaseModel):
@@ -270,9 +270,39 @@ class ConversationListResponse(BaseModel):
     message_count: int = 0
 
 
+class ChatSkillLaunch(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    skill_name: str = Field(..., min_length=1)
+    stage: Optional[str] = None
+    paper_id: Optional[int] = Field(default=None, ge=1)
+    project_id: Optional[int] = Field(default=None, ge=1)
+    goal: Optional[str] = Field(default=None, max_length=4000)
+    preferred_draft_id: Optional[str] = Field(default=None, max_length=256)
+
+
+class ChatWorkflowActionResponse(BaseModel):
+    label: str
+    message: str
+    skill_launch: Optional[ChatSkillLaunch] = None
+
+
+class ChatWorkflowControlResponse(BaseModel):
+    skill_name: str
+    display_name: Optional[str] = None
+    stage: str
+    stage_label: Optional[str] = None
+    stage_status: Literal["completed", "blocked", "running"] = "completed"
+    continue_policy: Optional[str] = None
+    next_stage: Optional[str] = None
+    next_stage_label: Optional[str] = None
+    suggested_action: Optional[str] = None
+    action: Optional[ChatWorkflowActionResponse] = None
+
+
 class ChatRequest(BaseModel):
     """聊天请求模式"""
-    message: str = Field(..., min_length=1)
+    message: Optional[str] = Field(default=None, min_length=1)
     conversation_id: Optional[int] = None
     llm_provider: Optional[str] = None  # 临时指定 LLM
     stream: bool = True  # 是否流式返回
@@ -280,6 +310,15 @@ class ChatRequest(BaseModel):
     send_plan_id: Optional[str] = None
     chat_preference_overrides: Optional[dict] = None
     rag_overrides: Optional[dict] = None
+    skill_launch: Optional[ChatSkillLaunch] = None
+
+    @model_validator(mode="after")
+    def _validate_message_or_skill_launch(self) -> "ChatRequest":
+        message = str(self.message or "").strip()
+        if not message and self.skill_launch is None:
+            raise ValueError("message or skill_launch is required")
+        self.message = message or None
+        return self
 
 
 class ChatContextPreviewRequest(BaseModel):

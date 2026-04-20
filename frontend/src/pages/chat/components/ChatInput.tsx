@@ -10,6 +10,8 @@ import type {
   ChatRagOverrides,
   ChatRagRewriteProfile,
   ChatRagScopeMode,
+  ChatWorkflowAction,
+  ChatWorkflowControl,
   ChatUserPreferences,
   ConversationCompactedHistory,
   ConversationContextState,
@@ -40,10 +42,12 @@ interface ChatInputProps {
   ragOverrides?: ChatRagOverrides | null
   effectiveRagOverrides?: ChatRagOverrides | null
   ragResetToken?: number
+  workflowControl?: ChatWorkflowControl | null
   llmProvider?: string
   onInputChange: (value: string) => void
   onSend: () => void
   onStop: () => void
+  onWorkflowAction?: (action: ChatWorkflowAction) => void
   onRequestPreview?: () => void
   onChatPreferenceOverrideChange?: (
     key: ChatPreferenceKey,
@@ -210,10 +214,12 @@ const ChatInput = ({
   ragOverrides = null,
   effectiveRagOverrides = null,
   ragResetToken = 0,
+  workflowControl = null,
   llmProvider,
   onInputChange,
   onSend,
   onStop,
+  onWorkflowAction,
   onRequestPreview,
   onChatPreferenceOverrideChange,
   onChatPreferenceOverrideClear,
@@ -664,6 +670,7 @@ const ChatInput = ({
   const previewRagEnabled = Boolean(contextPreview?.effective_rag_overrides?.enabled || effectiveRagOverrides?.enabled)
   const previewRagForceInitialSearch = Boolean(previewDebug?.rag_force_initial_knowledge_search)
   const previewRagForceInitialQuery = normalizePreviewScalar(previewDebug?.rag_force_initial_query)
+  const workflowAction = workflowControl?.action || null
 
   return (
     <div className="border-t border-white/[0.06] bg-slate-950/88 backdrop-blur-2xl">
@@ -706,6 +713,39 @@ const ChatInput = ({
             </Button>
           )}
         </div>
+
+        {workflowControl ? (
+          <div className="mt-3 rounded-[20px] border border-cyan-400/12 bg-[linear-gradient(135deg,rgba(8,47,73,0.28),rgba(15,23,42,0.7))] px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-200/90">
+                  Skill Workflow
+                </div>
+                <div className="text-sm text-slate-100">
+                  {workflowControl.display_name || workflowControl.skill_name}
+                  {' · '}
+                  {workflowControl.stage_label || workflowControl.stage}
+                  {' 已完成'}
+                </div>
+                <div className="text-xs text-slate-400">
+                  继续策略：{workflowControl.continue_policy || '未指定'}
+                  {workflowControl.next_stage_label ? ` · 下一阶段：${workflowControl.next_stage_label}` : ''}
+                </div>
+              </div>
+              {workflowAction && onWorkflowAction ? (
+                <Button
+                  size="small"
+                  type="primary"
+                  disabled={isSending}
+                  onClick={() => onWorkflowAction(workflowAction)}
+                  className="rounded-xl border-none bg-cyan-500 text-slate-950 shadow-none hover:!bg-cyan-400 disabled:opacity-50"
+                >
+                  {workflowAction.label}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
 
         <div className="mt-3 overflow-hidden rounded-[22px] border border-emerald-400/12 bg-[linear-gradient(135deg,rgba(6,78,59,0.18),rgba(15,23,42,0.72))] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">

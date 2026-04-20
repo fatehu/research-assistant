@@ -4,6 +4,7 @@ Supports plain chat, streaming chat, and native function-calling.
 """
 
 import hashlib
+import inspect
 import json
 import re
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -12,6 +13,82 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from app.config import settings
+
+
+def _normalize_llm_source(source: Optional[str]) -> str:
+    value = re.sub(r"\s+", "_", str(source or "").strip())
+    value = re.sub(r"[^a-zA-Z0-9._:-]+", "_", value)
+    return value.strip("._:-")
+
+
+def build_llm_source_headers(source: Optional[str]) -> Dict[str, str]:
+    normalized = _normalize_llm_source(source)
+    if not normalized:
+        return {}
+    return {"X-Agent-LLM-Source": normalized}
+
+
+def _usage_log_suffix(usage: Optional[Dict[str, int]]) -> str:
+    payload = dict(usage or {})
+    prompt_tokens = int(payload.get("prompt_tokens") or 0)
+    completion_tokens = int(payload.get("completion_tokens") or 0)
+    total_tokens = int(payload.get("total_tokens") or 0)
+    return (
+        f"prompt_tokens={prompt_tokens} "
+        f"completion_tokens={completion_tokens} "
+        f"total_tokens={total_tokens}"
+    )
+
+
+def log_tagged_llm_request_start(
+    *,
+    source: Optional[str],
+    provider: str,
+    model: str,
+    operation: str,
+) -> None:
+    normalized = _normalize_llm_source(source)
+    if not normalized:
+        return
+    logger.info(
+        f"[LLMTagged] start source={normalized} provider={provider} model={model} op={operation}"
+    )
+
+
+def log_tagged_llm_request_done(
+    *,
+    source: Optional[str],
+    provider: str,
+    model: str,
+    operation: str,
+    finish_reason: Optional[str] = None,
+    usage: Optional[Dict[str, int]] = None,
+) -> None:
+    normalized = _normalize_llm_source(source)
+    if not normalized:
+        return
+    finish = str(finish_reason or "").strip() or "-"
+    logger.info(
+        f"[LLMTagged] done source={normalized} provider={provider} model={model} "
+        f"op={operation} finish_reason={finish} {_usage_log_suffix(usage)}"
+    )
+
+
+def log_tagged_llm_request_error(
+    *,
+    source: Optional[str],
+    provider: str,
+    model: str,
+    operation: str,
+    error: str,
+) -> None:
+    normalized = _normalize_llm_source(source)
+    if not normalized:
+        return
+    logger.warning(
+        f"[LLMTagged] error source={normalized} provider={provider} model={model} "
+        f"op={operation} error={error}"
+    )
 
 
 class LLMService:
@@ -126,6 +203,37 @@ class LLMService:
             parts.append(f"context={type(context).__name__}: {context!r}")
         return " | ".join(parts)
 
+    def _infer_source_from_stack(self) -> str:
+        frame = inspect.currentframe()
+        try:
+            current = frame.f_back if frame is not None else None
+            while current is not None:
+                module_name = str(current.f_globals.get("__name__") or "")
+                if module_name.startswith("app.") and module_name != __name__:
+                    qualname = str(current.f_code.co_name or "").strip()
+                    self_obj = current.f_locals.get("self")
+                    if self_obj is not None:
+                        class_name = getattr(type(self_obj), "__name__", "")
+                        if class_name:
+                            qualname = f"{class_name}.{qualname}"
+                    elif "cls" in current.f_locals:
+                        cls_obj = current.f_locals.get("cls")
+                        class_name = getattr(cls_obj, "__name__", "")
+                        if class_name:
+                            qualname = f"{class_name}.{qualname}"
+                    module_name = module_name.removeprefix("app.")
+                    return _normalize_llm_source(f"{module_name}.{qualname}")
+                current = current.f_back
+        finally:
+            del frame
+        return ""
+
+    def _resolve_source(self, source: Optional[str]) -> str:
+        normalized = _normalize_llm_source(source)
+        if normalized:
+            return normalized
+        return self._infer_source_from_stack()
+
     @classmethod
     def _sanitize_tool_name(cls, name: str) -> str:
         raw = str(name or "").strip()
@@ -177,6 +285,8 @@ class LLMService:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        source: Optional[str] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if temperature is None:
             temperature = settings.llm_temperature
@@ -184,22 +294,52 @@ class LLMService:
             max_tokens = settings.llm_max_tokens
 
         full_messages = self._build_messages(messages, system_prompt)
+        resolved_source = self._resolve_source(source)
+        request_kwargs: Dict[str, Any] = {
+            "model": self.config["model"],
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        extra_headers = build_llm_source_headers(resolved_source)
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
+        if extra_body:
+            request_kwargs["extra_body"] = dict(extra_body)
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=full_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            log_tagged_llm_request_start(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat",
             )
-            return {
+            response = await self.client.chat.completions.create(**request_kwargs)
+            payload = {
                 "content": response.choices[0].message.content or "",
                 "usage": self._normalize_usage(response.usage),
                 "model": response.model,
                 "finish_reason": response.choices[0].finish_reason,
             }
+            log_tagged_llm_request_done(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(payload.get("model") or self.config.get("model") or ""),
+                operation="chat",
+                finish_reason=str(payload.get("finish_reason") or ""),
+                usage=dict(payload.get("usage") or {}),
+            )
+            return payload
         except Exception as exc:
-            logger.error(f"LLM chat failed [{self.provider}]: {self._format_exception(exc)}")
+            formatted = self._format_exception(exc)
+            log_tagged_llm_request_error(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat",
+                error=formatted,
+            )
+            logger.error(f"LLM chat failed [{self.provider}]: {formatted}")
             raise
 
     async def chat_stream(
@@ -208,6 +348,7 @@ class LLMService:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        source: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         if temperature is None:
             temperature = settings.llm_temperature
@@ -215,21 +356,59 @@ class LLMService:
             max_tokens = settings.llm_max_tokens
 
         full_messages = self._build_messages(messages, system_prompt)
+        resolved_source = self._resolve_source(source)
+        request_kwargs: Dict[str, Any] = {
+            "model": self.config["model"],
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        extra_headers = build_llm_source_headers(resolved_source)
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
 
         try:
-            stream = await self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=full_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
+            log_tagged_llm_request_start(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_stream",
             )
+            stream = await self.client.chat.completions.create(**request_kwargs)
+            usage_payload: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            finish_reason = ""
+            model_name = str(self.config.get("model") or "")
             async for chunk in stream:
-                delta = chunk.choices[0].delta
+                model_name = str(getattr(chunk, "model", "") or model_name)
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    usage_payload = self._normalize_usage(usage)
+                choices = list(getattr(chunk, "choices", []) or [])
+                if not choices:
+                    continue
+                finish_reason = str(getattr(choices[0], "finish_reason", "") or finish_reason)
+                delta = choices[0].delta
                 if delta and delta.content:
                     yield delta.content
+            log_tagged_llm_request_done(
+                source=resolved_source,
+                provider=self.provider,
+                model=model_name,
+                operation="chat_stream",
+                finish_reason=finish_reason,
+                usage=usage_payload,
+            )
         except Exception as exc:
-            logger.error(f"LLM stream failed [{self.provider}]: {self._format_exception(exc)}")
+            formatted = self._format_exception(exc)
+            log_tagged_llm_request_error(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_stream",
+                error=formatted,
+            )
+            logger.error(f"LLM stream failed [{self.provider}]: {formatted}")
             raise
 
     async def chat_with_tools(
@@ -240,6 +419,7 @@ class LLMService:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tool_choice: str = "auto",
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
         if temperature is None:
             temperature = settings.llm_temperature
@@ -248,16 +428,27 @@ class LLMService:
 
         full_messages = self._build_messages(messages, system_prompt)
         safe_tools, alias_to_actual = self._build_provider_safe_tools(tools)
+        resolved_source = self._resolve_source(source)
+        request_kwargs: Dict[str, Any] = {
+            "model": self.config["model"],
+            "messages": full_messages,
+            "tools": safe_tools or None,
+            "tool_choice": tool_choice if safe_tools else None,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        extra_headers = build_llm_source_headers(resolved_source)
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=full_messages,
-                tools=safe_tools or None,
-                tool_choice=tool_choice if safe_tools else None,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            log_tagged_llm_request_start(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_with_tools",
             )
+            response = await self.client.chat.completions.create(**request_kwargs)
             message = response.choices[0].message
             raw_tool_calls = getattr(message, "tool_calls", None) or []
             reasoning_payload = getattr(message, "reasoning_content", None)
@@ -292,7 +483,7 @@ class LLMService:
                     }
                 )
 
-            return {
+            payload = {
                 "content": message.content or "",
                 "reasoning": reasoning_text,
                 "tool_calls": tool_calls,
@@ -300,8 +491,25 @@ class LLMService:
                 "model": response.model,
                 "finish_reason": response.choices[0].finish_reason,
             }
+            log_tagged_llm_request_done(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(payload.get("model") or self.config.get("model") or ""),
+                operation="chat_with_tools",
+                finish_reason=str(payload.get("finish_reason") or ""),
+                usage=dict(payload.get("usage") or {}),
+            )
+            return payload
         except Exception as exc:
-            logger.error(f"LLM function calling failed [{self.provider}]: {self._format_exception(exc)}")
+            formatted = self._format_exception(exc)
+            log_tagged_llm_request_error(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_with_tools",
+                error=formatted,
+            )
+            logger.error(f"LLM function calling failed [{self.provider}]: {formatted}")
             raise
 
     async def chat_with_tools_stream(
@@ -312,6 +520,7 @@ class LLMService:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tool_choice: str = "auto",
+        source: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream native function-calling deltas and return a final normalized payload.
 
@@ -326,6 +535,7 @@ class LLMService:
 
         full_messages = self._build_messages(messages, system_prompt)
         safe_tools, alias_to_actual = self._build_provider_safe_tools(tools)
+        resolved_source = self._resolve_source(source)
 
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
@@ -335,15 +545,25 @@ class LLMService:
         finish_reason = ""
 
         try:
-            stream = await self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=full_messages,
-                tools=safe_tools or None,
-                tool_choice=tool_choice if safe_tools else None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
+            request_kwargs: Dict[str, Any] = {
+                "model": self.config["model"],
+                "messages": full_messages,
+                "tools": safe_tools or None,
+                "tool_choice": tool_choice if safe_tools else None,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            extra_headers = build_llm_source_headers(resolved_source)
+            if extra_headers:
+                request_kwargs["extra_headers"] = extra_headers
+            log_tagged_llm_request_start(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_with_tools_stream",
             )
+            stream = await self.client.chat.completions.create(**request_kwargs)
 
             async for chunk in stream:
                 model_name = str(getattr(chunk, "model", "") or model_name)
@@ -426,6 +646,14 @@ class LLMService:
                     }
                 )
 
+            log_tagged_llm_request_done(
+                source=resolved_source,
+                provider=self.provider,
+                model=model_name,
+                operation="chat_with_tools_stream",
+                finish_reason=finish_reason,
+                usage=usage_payload,
+            )
             yield {
                 "type": "done",
                 "data": {
@@ -439,9 +667,17 @@ class LLMService:
                 },
             }
         except Exception as exc:
+            formatted = self._format_exception(exc)
+            log_tagged_llm_request_error(
+                source=resolved_source,
+                provider=self.provider,
+                model=str(self.config.get("model") or ""),
+                operation="chat_with_tools_stream",
+                error=formatted,
+            )
             logger.warning(
                 f"LLM function-calling stream failed [{self.provider}], fallback to non-stream: "
-                f"{self._format_exception(exc)}"
+                f"{formatted}"
             )
             result = await self.chat_with_tools(
                 messages=messages,
@@ -450,6 +686,7 @@ class LLMService:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tool_choice=tool_choice,
+                source=resolved_source,
             )
             if result.get("content") and not list(result.get("tool_calls") or []):
                 yield {"type": "content", "data": result["content"]}

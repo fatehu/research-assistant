@@ -433,6 +433,7 @@ class ContextualCompressionService:
                         settings.llm_max_tokens,
                         settings.contextual_compression_max_output_tokens,
                     ),
+                    source="retrieval.contextual_compression.single",
                 ),
                 timeout=max(1, settings.contextual_compression_timeout_seconds),
             )
@@ -511,6 +512,7 @@ class ContextualCompressionService:
                     settings.llm_max_tokens,
                     settings.contextual_compression_max_output_tokens * max(1, len(chunks)),
                 ),
+                source="retrieval.contextual_compression.batch",
             ),
             timeout=max(1, settings.contextual_compression_timeout_seconds),
         )

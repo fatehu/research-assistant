@@ -35,10 +35,67 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     with_db = agent_tools.ToolRegistry(db=object(), user_id=1)
     without_db = agent_tools.ToolRegistry(db=None, user_id=1)
     with_factory = agent_tools.ToolRegistry(db=None, db_session_factory=lambda: object(), user_id=1)
+    codelab = agent_tools.ToolRegistry(db=object(), user_id=1, route_profile="codelab")
+
+    paper_tool_names = {
+        "paper_research_get_artifact_manifest",
+        "paper_research_prepare",
+        "paper_research_read_artifact",
+        "paper_research_read_implementation_spec",
+        "paper_research_read_run_drafts",
+        "paper_research_read_repo_file",
+        "paper_research_search_repo",
+        "paper_research_status",
+        "paper_research_write_implementation_spec",
+        "paper_research_write_run_drafts",
+        "paper_research_create_run_draft",
+    }
 
     assert "knowledge_search" in with_db._tools
+    assert paper_tool_names.issubset(set(with_db._tools))
     assert "knowledge_search" not in without_db._tools
+    assert paper_tool_names.isdisjoint(set(without_db._tools))
     assert "knowledge_search" in with_factory._tools
+    assert paper_tool_names.issubset(set(with_factory._tools))
+    assert "knowledge_search" in codelab._tools
+    assert paper_tool_names.isdisjoint(set(codelab._tools))
+
+
+def test_paper_research_workspace_missing_required_archives(tmp_path):
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir(parents=True)
+    assert tool._workspace_missing_required_archives(workspace_dir) is True
+    (workspace_dir / "paper_intake_result.json").write_text("{}", encoding="utf-8")
+    (workspace_dir / "experiment_spec.json").write_text("{}", encoding="utf-8")
+    (workspace_dir / "workspace_adapter_manifest.json").write_text("{}", encoding="utf-8")
+    assert tool._workspace_missing_required_archives(workspace_dir) is False
+
+
+def test_paper_research_search_repo_python_fallback_finds_matches(tmp_path):
+    repo_dir = tmp_path / "paper_repo"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "train.py").write_text(
+        "parser.add_argument('--lr', type=float, default=1e-3)\n"
+        "parser.add_argument('--epochs', type=int, default=5)\n",
+        encoding="utf-8",
+    )
+    (repo_dir / "README.md").write_text("learning rate is configured in train.py\n", encoding="utf-8")
+
+    payload = agent_tools.PaperResearchSearchRepoTool._search_with_python_fallback(
+        repo_dir=repo_dir,
+        repo_files=["README.md", "train.py"],
+        query="lr",
+        max_results=10,
+        case_sensitive=False,
+        is_regex=False,
+        glob="*.py",
+    )
+
+    assert payload["engine"] == "python_fallback"
+    assert payload["returned_matches"] == 1
+    assert payload["matches"][0]["relative_path"] == "repo/source/train.py"
+    assert payload["matches"][0]["line_number"] == 1
 
 
 def test_knowledge_search_runtime_uses_configurable_threshold(monkeypatch):
@@ -344,3 +401,48 @@ def test_api_search_filters_embedding_dimension():
     assert "dc.embedding_dimension = :vector_dimension" in knowledge_api
     assert "\"vector_dimension\": group_dimension" in knowledge_api
     assert "embedding::vector(" in knowledge_api
+
+
+def test_paper_research_probe_url_classifies_hdf5_payload():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=200,
+        content_length=1024,
+        detected_kind="hdf5",
+        expected_kind="hdf5",
+        head_bytes=b"\x89HDF\r\n\x1a\n",
+    )
+
+    assert ok is True
+    assert downloadable is True
+    assert diagnosis == "valid_hdf5"
+    assert next_action == "use_as_official_source"
+
+
+def test_paper_research_probe_url_flags_empty_202_response():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=202,
+        content_length=0,
+        detected_kind="unknown",
+        expected_kind="file",
+        head_bytes=b"",
+    )
+
+    assert ok is False
+    assert downloadable is False
+    assert diagnosis == "accepted_but_empty"
+    assert next_action == "diagnose_official_source_failure"
+
+
+def test_paper_research_parse_git_ls_remote_extracts_default_branch():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    parsed = tool._parse_git_ls_remote(
+        "ref: refs/heads/main\tHEAD\n0123456789abcdef0123456789abcdef01234567\tHEAD\n"
+    )
+
+    assert parsed["default_branch"] == "main"
+    assert parsed["head_sha"] == "0123456789abcdef0123456789abcdef01234567"

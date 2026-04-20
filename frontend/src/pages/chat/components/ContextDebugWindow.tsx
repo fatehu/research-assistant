@@ -181,6 +181,131 @@ const MessagePreviewList = ({
   )
 }
 
+const SkillMatchList = ({
+  items,
+  emptyText,
+  tone = 'neutral',
+}: {
+  items?: ChatContextDebug['active_skills']
+  emptyText: string
+  tone?: 'neutral' | 'active'
+}) => {
+  if (!items || items.length === 0) {
+    return <div className="text-sm text-slate-500">{emptyText}</div>
+  }
+
+  const accentClass =
+    tone === 'active'
+      ? 'border-emerald-400/18 bg-emerald-500/10 text-emerald-200'
+      : 'border-white/[0.08] bg-slate-950/70 text-slate-300'
+
+  return (
+    <div className="space-y-2">
+      {items.map((item) => (
+        <div
+          key={`${item.name}-${item.path || item.activation_reason || 'skill'}`}
+          className="rounded-xl border border-white/[0.06] bg-slate-900/72 px-3 py-2.5"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-2.5 py-1 text-[11px] ${accentClass}`}>
+              {item.display_name || item.name}
+            </span>
+            {typeof item.score === 'number' ? (
+              <span className="rounded-full border border-cyan-400/18 bg-cyan-500/10 px-2.5 py-1 text-[11px] text-cyan-200">
+                score {item.score}
+              </span>
+            ) : null}
+          </div>
+          {item.description ? (
+            <div className="mt-2 text-sm leading-6 text-slate-200">{item.description}</div>
+          ) : null}
+          {item.short_description ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">{item.short_description}</div>
+          ) : null}
+          {item.when_to_use ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">触发说明: {item.when_to_use}</div>
+          ) : null}
+          {item.stage_names && item.stage_names.length > 0 ? (
+            <div className="mt-2 text-xs leading-5 text-slate-400">
+              阶段: {item.stage_names.join(' -> ')}
+            </div>
+          ) : null}
+          {item.stage_policies && item.stage_policies.length > 0 ? (
+            <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-slate-400">
+              {item.stage_policies.map((policy) => (
+                <span
+                  key={`${item.name}-stage-${policy}`}
+                  className="rounded-full border border-cyan-400/18 bg-cyan-500/10 px-2 py-0.5 text-cyan-200"
+                >
+                  {policy}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {item.default_continue_policy ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">
+              默认继续策略: {item.default_continue_policy}
+            </div>
+          ) : null}
+          {item.scripts && item.scripts.length > 0 ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">
+              辅助脚本: {item.scripts.join(', ')}
+            </div>
+          ) : null}
+          {item.default_prompt ? (
+            <div className="mt-1 text-xs leading-5 text-slate-400">默认入口: {item.default_prompt}</div>
+          ) : null}
+          <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-slate-500">
+            {item.activation_reason ? (
+              <span className="rounded-full border border-fuchsia-400/18 bg-fuchsia-500/10 px-2 py-0.5 text-fuchsia-200">
+                {item.activation_reason}
+              </span>
+            ) : null}
+            {item.execution_context ? (
+              <span className="rounded-full border border-amber-400/18 bg-amber-500/10 px-2 py-0.5 text-amber-200">
+                context {item.execution_context}
+              </span>
+            ) : null}
+            {item.agent ? (
+              <span className="rounded-full border border-sky-400/18 bg-sky-500/10 px-2 py-0.5 text-sky-200">
+                agent {item.agent}
+              </span>
+            ) : null}
+            {item.effort ? (
+              <span className="rounded-full border border-lime-400/18 bg-lime-500/10 px-2 py-0.5 text-lime-200">
+                effort {item.effort}
+              </span>
+            ) : null}
+            {typeof item.user_invocable === 'boolean' ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.user_invocable ? '可显式调用' : '仅内部调用'}
+              </span>
+            ) : null}
+            {typeof item.allow_implicit_invocation === 'boolean' ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.allow_implicit_invocation ? '允许隐式触发' : '仅显式触发'}
+              </span>
+            ) : null}
+            {item.path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">{item.path}</span>
+            ) : null}
+            {item.config_path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.config_path}
+              </span>
+            ) : null}
+            {item.interface_path ? (
+              <span className="rounded-full border border-white/[0.08] bg-slate-950/70 px-2 py-0.5">
+                {item.interface_path}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 const ContextDebugWindow = ({
   contextDebug,
   conversationState = null,
@@ -555,6 +680,35 @@ const ContextDebugWindow = ({
                         ) : (
                           <span className="text-sm text-slate-500">这一轮没有限定工具集合。</span>
                         )}
+                      </div>
+                    </div>
+                  ) : null}
+                </Section>
+
+                <Section title="Skills" icon={<DatabaseOutlined />}>
+                  {contextDebug ? (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="mb-1.5 text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                          已激活
+                        </div>
+                        <SkillMatchList
+                          items={contextDebug.active_skills}
+                          emptyText="当前没有命中的 skill。"
+                          tone="active"
+                        />
+                      </div>
+                      <div>
+                        <div className="mb-1.5 text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
+                          候选清单
+                        </div>
+                        <SkillMatchList
+                          items={contextDebug.available_skills}
+                          emptyText="当前没有可用的 skill。"
+                        />
+                      </div>
+                      <div className="text-xs leading-5 text-slate-500">
+                        注入提示词预算约 {contextDebug.skill_prompt_tokens_estimate ?? 0} tokens
                       </div>
                     </div>
                   ) : null}

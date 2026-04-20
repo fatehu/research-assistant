@@ -11,6 +11,12 @@ from openai import AsyncOpenAI
 
 from app.config import settings
 from app.services.dashscope_multimodal_service import DashScopeMultimodalService
+from app.services.llm_service import (
+    build_llm_source_headers,
+    log_tagged_llm_request_done,
+    log_tagged_llm_request_error,
+    log_tagged_llm_request_start,
+)
 
 GENERIC_TITLES = {
     "panel design preview",
@@ -653,6 +659,7 @@ class ReaderPanelPlanAgentService:
         timeout_seconds: float,
     ) -> tuple[Dict[str, Any], Dict[str, int]]:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        source = f"reader.panel_plan.tool_call.{tool_name}"
         request = {
             "model": model,
             "messages": messages,
@@ -662,6 +669,15 @@ class ReaderPanelPlanAgentService:
             "max_tokens": max(512, int(max_tokens)),
             "timeout": float(timeout_seconds),
         }
+        extra_headers = build_llm_source_headers(source)
+        if extra_headers:
+            request["extra_headers"] = extra_headers
+        log_tagged_llm_request_start(
+            source=source,
+            provider="aliyun",
+            model=model,
+            operation="chat_with_tools",
+        )
         try:
             response = await client.chat.completions.create(
                 **request,
@@ -675,6 +691,13 @@ class ReaderPanelPlanAgentService:
                 or "invalid_request_error" in message
             )
             if not disable_thinking_unsupported:
+                log_tagged_llm_request_error(
+                    source=source,
+                    provider="aliyun",
+                    model=model,
+                    operation="chat_with_tools",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 raise
             response = await client.chat.completions.create(**request)
         usage_obj = getattr(response, "usage", None)
@@ -683,6 +706,14 @@ class ReaderPanelPlanAgentService:
             "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
             "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
         }
+        log_tagged_llm_request_done(
+            source=source,
+            provider="aliyun",
+            model=str(getattr(response, "model", "") or model),
+            operation="chat_with_tools",
+            finish_reason=str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or ""),
+            usage=usage,
+        )
         msg = response.choices[0].message
         for tool_call in list(getattr(msg, "tool_calls", None) or []):
             fn = getattr(tool_call, "function", None)

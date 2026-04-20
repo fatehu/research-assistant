@@ -8,9 +8,10 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.core import database as core_database
 from app.api import chat as chat_api
 from app.models.conversation import Conversation, Message
-from app.schemas.chat import ChatRequest
+from app.schemas.chat import ChatRequest, ChatSkillLaunch
 
 
 class _ScalarResult:
@@ -110,11 +111,55 @@ class _FakeRuntimeService:
         }
 
 
+class _NoopCompactionService:
+    def enqueue_conversation(self, conversation_id):
+        _ = conversation_id
+        return None
+
+
+class _FakeSaveSession:
+    def __init__(self):
+        self._next_message_id = 2000
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def add(self, obj):
+        if isinstance(obj, Message):
+            if getattr(obj, "id", None) is None:
+                obj.id = self._next_message_id
+                self._next_message_id += 1
+            if getattr(obj, "created_at", None) is None:
+                obj.created_at = datetime.utcnow()
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, obj):
+        if getattr(obj, "id", None) is None:
+            obj.id = self._next_message_id
+            self._next_message_id += 1
+        if getattr(obj, "created_at", None) is None:
+            obj.created_at = datetime.utcnow()
+        return obj
+
+
+@pytest.fixture(autouse=True)
+def _stub_compaction_service(monkeypatch):
+    monkeypatch.setattr(chat_api, "get_conversation_context_compaction_service", lambda: _NoopCompactionService())
+    monkeypatch.setattr(core_database, "async_session_factory", lambda: _FakeSaveSession())
+
+
 class _FakePlanner:
     def __init__(self, runtime_service):
         self.runtime_service = runtime_service
+        self.seen_messages = []
 
     async def prepare_direct_response(self, messages, *, force_no_tools=False):
+        self.seen_messages.append([dict(item) for item in messages])
         return SimpleNamespace(
             system_prompt="direct-system",
             llm_messages=[{"role": "user", "content": messages[-1]["content"]}],
@@ -178,6 +223,32 @@ class _User:
     id = 7
     username = "tester"
     preferred_llm_provider = "aliyun"
+
+
+class _FakeSkillService:
+    def __init__(self):
+        self.calls = []
+
+    def render_launch_prompt(self, skill_name, payload):
+        self.calls.append({"skill_name": skill_name, "payload": dict(payload or {})})
+        return f"expanded::{payload.get('stage')}::{payload.get('paper_id')}"
+
+    def get_skill(self, skill_name):
+        if skill_name != "paper-reproduction":
+            return None
+        return SimpleNamespace(
+            name="paper-reproduction",
+            display_name="Paper Reproduction",
+            stage_names=("planning", "implementation_prep", "run_drafts", "execution", "tuning"),
+            stage_policies=(
+                "planning=manual",
+                "implementation_prep=ask_to_continue",
+                "run_drafts=ask_to_continue",
+                "execution=auto_continue",
+                "tuning=ask_to_continue",
+            ),
+            default_continue_policy="ask_to_continue",
+        )
 
 
 @pytest.mark.asyncio
@@ -387,3 +458,129 @@ async def test_send_message_stream_emits_phase_events_before_direct_answer(monke
     assert '"key": "waiting_model"' in joined
     assert '"event": "content"' in joined
     assert '"event": "done"' in joined
+
+
+def test_chat_request_accepts_skill_launch_without_message():
+    request = ChatRequest(
+        skill_launch=ChatSkillLaunch(
+            skill_name="paper-reproduction",
+            stage="planning",
+            paper_id=111,
+        ),
+        stream=True,
+    )
+
+    assert request.message is None
+    assert request.skill_launch is not None
+    assert request.skill_launch.skill_name == "paper-reproduction"
+
+
+@pytest.mark.asyncio
+async def test_send_message_uses_skill_launch_renderer_but_persists_visible_message(monkeypatch):
+    conversation = Conversation(
+        id=57,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=57,
+            stream=False,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+                goal="run baseline",
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    assert response["message"].content == "direct answer"
+    assert skill_service.calls == [
+        {
+            "skill_name": "paper-reproduction",
+            "payload": {
+                "skill_name": "paper-reproduction",
+                "stage": "planning",
+                "paper_id": 111,
+                "project_id": 2,
+                "goal": "run baseline",
+            },
+        }
+    ]
+    assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
+    assert response["workflow_control"]["next_stage"] == "implementation_prep"
+    turn_store = await runtime_service.get_conversation_turn_store(57)
+    assert turn_store["entries"][0]["user_content"] == "继续论文规划阶段（paper_id=111）"
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_emits_workflow_control_for_skill_launch(monkeypatch):
+    conversation = Conversation(
+        id=58,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    planner = _FakePlanner(runtime_service)
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: planner)
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "done"' in joined
+    assert '"workflow_control"' in joined
+    assert '"next_stage": "implementation_prep"' in joined
+    assert '"label": "\\u7ee7\\u7eed \\u5b9e\\u65bd\\u51c6\\u5907\\u9636\\u6bb5"' in joined

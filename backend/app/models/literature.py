@@ -84,6 +84,28 @@ paper_citations = Table(
 )
 
 
+research_project_papers_association = Table(
+    "research_project_papers",
+    Base.metadata,
+    Column("project_id", Integer, ForeignKey("research_projects.id", ondelete="CASCADE"), primary_key=True),
+    Column("paper_id", Integer, ForeignKey("papers.id", ondelete="CASCADE"), primary_key=True),
+    Column("role", String(32), nullable=False, default="related", server_default="related"),
+    Column("notes", Text, nullable=True),
+    Column("added_at", DateTime, default=datetime.utcnow),
+)
+
+
+research_project_workspaces_association = Table(
+    "research_project_workspaces",
+    Base.metadata,
+    Column("project_id", Integer, ForeignKey("research_projects.id", ondelete="CASCADE"), primary_key=True),
+    Column("workspace_id", Integer, ForeignKey("paper_experiment_workspaces.id", ondelete="CASCADE"), primary_key=True),
+    Column("paper_id", Integer, ForeignKey("papers.id", ondelete="SET NULL"), nullable=True),
+    Column("role", String(40), nullable=False, default="related_reproduction", server_default="related_reproduction"),
+    Column("added_at", DateTime, default=datetime.utcnow),
+)
+
+
 class Paper(Base):
     """论文表"""
     __tablename__ = "papers"
@@ -169,6 +191,12 @@ class Paper(Base):
     knowledge_base = relationship("KnowledgeBase")
     document = relationship("Document")
     paper_entity = relationship("PaperEntity")
+    projects = relationship(
+        "ResearchProject",
+        secondary=research_project_papers_association,
+        back_populates="papers",
+        overlaps="primary_paper",
+    )
     
     # 引用关系
     citing = relationship(
@@ -253,6 +281,133 @@ class PaperSearchHistory(Base):
     
     # 关系
     user = relationship("User")
+
+
+class PaperExperimentWorkspace(Base):
+    """论文实验工作台（面向可运行的 ML/DL 实验流程）"""
+    __tablename__ = "paper_experiment_workspaces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True)
+    notebook_id = Column(String(36), ForeignKey("notebooks.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    status = Column(String(32), default="draft", nullable=False, index=True)
+    title = Column(String(300), nullable=False)
+    summary_json = Column(JSON, default=dict)
+    experiment_spec_json = Column(JSON, default=dict)
+    compare_report_json = Column(JSON, default=dict)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+    paper = relationship("Paper")
+    notebook = relationship("Notebook")
+    runs = relationship(
+        "PaperExperimentRun",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+        order_by="PaperExperimentRun.created_at.desc()",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "paper_id", name="uq_paper_experiment_workspace_user_paper"),
+        Index("idx_paper_experiment_workspace_user_paper", "user_id", "paper_id"),
+        Index("idx_paper_experiment_workspace_updated_at", "updated_at"),
+    )
+
+
+class PaperExperimentRun(Base):
+    """实验工作台中的一次运行记录"""
+    __tablename__ = "paper_experiment_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(
+        Integer,
+        ForeignKey("paper_experiment_workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    notebook_id = Column(String(36), ForeignKey("notebooks.id", ondelete="SET NULL"), nullable=True, index=True)
+    notebook_cell_id = Column(String(36), nullable=True, index=True)
+    base_run_id = Column(Integer, ForeignKey("paper_experiment_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    run_kind = Column(String(24), default="variant", nullable=False, index=True)
+    status = Column(String(24), default="draft", nullable=False, index=True)
+    label = Column(String(200), nullable=False)
+    model_name = Column(String(255), nullable=True)
+    hypothesis = Column(Text, nullable=True)
+    variant_spec_json = Column(JSON, default=dict)
+    params_json = Column(JSON, default=dict)
+    metrics_json = Column(JSON, default=dict)
+    artifacts_json = Column(JSON, default=dict)
+    summary_json = Column(JSON, default=dict)
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    workspace = relationship("PaperExperimentWorkspace", back_populates="runs")
+    user = relationship("User")
+    notebook = relationship("Notebook")
+    base_run = relationship("PaperExperimentRun", remote_side=[id], backref="derived_runs")
+
+    __table_args__ = (
+        Index("idx_paper_experiment_run_workspace_created", "workspace_id", "created_at"),
+        Index("idx_paper_experiment_run_workspace_status", "workspace_id", "status"),
+    )
+
+
+class ResearchProject(Base):
+    """研究项目入口对象，用于承接跨论文/跨 notebook 的长期研究目标"""
+    __tablename__ = "research_projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    primary_paper_id = Column(Integer, ForeignKey("papers.id", ondelete="SET NULL"), nullable=True, index=True)
+    primary_workspace_id = Column(
+        Integer,
+        ForeignKey("paper_experiment_workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    title = Column(String(300), nullable=False)
+    goal = Column(Text, nullable=True)
+    status = Column(String(32), default="draft", nullable=False, index=True)
+    summary_json = Column(JSON, default=dict)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+    primary_paper = relationship("Paper", foreign_keys=[primary_paper_id])
+    primary_workspace = relationship(
+        "PaperExperimentWorkspace",
+        foreign_keys=[primary_workspace_id],
+        overlaps="workspaces",
+    )
+    papers = relationship(
+        "Paper",
+        secondary=research_project_papers_association,
+        back_populates="projects",
+        overlaps="primary_paper",
+    )
+    workspaces = relationship(
+        "PaperExperimentWorkspace",
+        secondary=research_project_workspaces_association,
+        viewonly=True,
+        overlaps="primary_workspace",
+    )
+
+    __table_args__ = (
+        Index("idx_research_project_user_updated_at", "user_id", "updated_at"),
+        Index("idx_research_project_user_status", "user_id", "status"),
+    )
 
 
 class PaperEntity(Base):

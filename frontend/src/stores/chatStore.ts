@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import {
   chatApi,
   type ChatContextDebug,
+  type ChatWorkflowControl,
+  type ChatSkillLaunchRequest,
   type ChatRagOverrides,
   type ChatUserPreferences,
   Conversation,
@@ -53,6 +55,108 @@ const assistantSummaryText = (content: string, limit = 160): string => {
   const normalized = String(content || '').replace(/\s+/g, ' ').trim()
   if (normalized.length <= limit) return normalized
   return `${normalized.slice(0, Math.max(1, limit - 1)).trimEnd()}…`
+}
+
+const resolveAssistantTurnEntry = (
+  turnStore: ConversationTurnStore | undefined,
+  currentTurnId: string | null,
+) => {
+  const entries = Array.isArray(turnStore?.entries) ? turnStore.entries : []
+  if (!entries.length) return undefined
+  if (currentTurnId) {
+    const matched = entries.find((entry) => entry.turn_id === currentTurnId)
+    if (matched) return matched
+  }
+  return entries[entries.length - 1]
+}
+
+const resolveAssistantItemEntry = (
+  itemStream: ConversationItemStream | undefined,
+  currentTurnId: string | null,
+  assistantMessageId?: number,
+) => {
+  const entries = Array.isArray(itemStream?.entries) ? itemStream.entries : []
+  if (!entries.length) return undefined
+
+  if (assistantMessageId) {
+    const byMessageId = entries.find(
+      (entry) => entry.role === 'assistant' && entry.message_id === assistantMessageId,
+    )
+    if (byMessageId) return byMessageId
+  }
+
+  const assistantEntries = entries.filter((entry) => entry.role === 'assistant')
+  if (!assistantEntries.length) return undefined
+
+  if (currentTurnId) {
+    const sameTurnEntries = assistantEntries.filter((entry) => entry.turn_id === currentTurnId)
+    if (sameTurnEntries.length) return sameTurnEntries[sameTurnEntries.length - 1]
+  }
+
+  return assistantEntries[assistantEntries.length - 1]
+}
+
+const buildDoneAssistantMessage = ({
+  itemStream,
+  turnStore,
+  currentTurnId,
+  fallbackContent,
+  fallbackThought,
+  fallbackMetadata,
+  conversationId,
+}: {
+  itemStream?: ConversationItemStream
+  turnStore?: ConversationTurnStore
+  currentTurnId: string | null
+  fallbackContent: string
+  fallbackThought?: string
+  fallbackMetadata?: MessageMetadata
+  conversationId: number
+}): Message | null => {
+  const turnEntry = resolveAssistantTurnEntry(turnStore, currentTurnId)
+  const assistantMessageId =
+    typeof turnEntry?.assistant_message_id === 'number' && Number.isFinite(turnEntry.assistant_message_id)
+      ? turnEntry.assistant_message_id
+      : undefined
+  const itemEntry = resolveAssistantItemEntry(itemStream, currentTurnId, assistantMessageId)
+  const content = String(itemEntry?.content || fallbackContent || '')
+  const thought = String(itemEntry?.thought || fallbackThought || '').trim()
+  const resolvedMessageId =
+    typeof itemEntry?.message_id === 'number' && Number.isFinite(itemEntry.message_id)
+      ? itemEntry.message_id
+      : assistantMessageId
+
+  if (!content.trim() && !thought) return null
+
+  return {
+    id: resolvedMessageId || Date.now() + 1,
+    conversation_id: conversationId,
+    role: 'assistant',
+    content,
+    message_type: 'text',
+    thought: thought || undefined,
+    metadata:
+      itemEntry?.metadata && typeof itemEntry.metadata === 'object'
+        ? (itemEntry.metadata as MessageMetadata)
+        : fallbackMetadata,
+    created_at: itemEntry?.created_at || new Date().toISOString(),
+  }
+}
+
+const resolveConversationWorkflowControl = (messages: Message[] | undefined): ChatWorkflowControl | null => {
+  const candidates = Array.isArray(messages) ? messages : []
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const message = candidates[index]
+    const workflowControl =
+      message?.role === 'assistant' &&
+      message.metadata &&
+      typeof message.metadata === 'object' &&
+      (message.metadata.workflow_control as ChatWorkflowControl | undefined)
+    if (workflowControl && typeof workflowControl === 'object') {
+      return workflowControl
+    }
+  }
+  return null
 }
 
 const applySpanRewriteToConversation = (
@@ -116,6 +220,7 @@ interface ChatState {
   streamingThought: string
   streamingContextDebug: ChatContextDebug | null
   lastRunContextDebug: ChatContextDebug | null
+  workflowControl: ChatWorkflowControl | null
   isThinking: boolean  // 是否正在思考中
 
   // ReAct 迭代状态
@@ -152,6 +257,7 @@ interface ChatState {
       sendPlanId?: string
       chatPreferenceOverrides?: Partial<ChatUserPreferences>
       ragOverrides?: ChatRagOverrides | null
+      skillLaunch?: ChatSkillLaunchRequest | null
     },
   ) => Promise<number | undefined>  // 返回新对话ID（如果有）
   stopGeneration: () => void  // 停止生成
@@ -173,6 +279,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streamingThought: '',
   streamingContextDebug: null,
   lastRunContextDebug: null,
+  workflowControl: null,
   isThinking: false,
   iterationSteps: [],
   currentIteration: 0,
@@ -204,6 +311,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         currentConversation: conversation,
         messages: [],
         lastRunContextDebug: null,
+        workflowControl: null,
         sendPhase: 'idle',
         sendPhaseLabel: null,
         sendPhaseHint: null,
@@ -230,6 +338,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: sortedMessages,
         streamingContextDebug: null,
         lastRunContextDebug: null,
+        workflowControl: resolveConversationWorkflowControl(sortedMessages),
         sendPhase: 'idle',
         sendPhaseLabel: null,
         sendPhaseHint: null,
@@ -237,7 +346,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       })
     } catch (error) {
       console.error('加载对话失败:', error)
-      set({ isLoading: false, currentConversation: null, messages: [] })
+      set({ isLoading: false, currentConversation: null, messages: [], workflowControl: null })
       throw error
     }
   },
@@ -250,6 +359,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       currentConversation: currentConversation?.id === conversationId ? null : currentConversation,
       messages: currentConversation?.id === conversationId ? [] : state.messages,
       lastRunContextDebug: currentConversation?.id === conversationId ? null : state.lastRunContextDebug,
+      workflowControl: currentConversation?.id === conversationId ? null : state.workflowControl,
       sendPhase: currentConversation?.id === conversationId ? 'idle' : state.sendPhase,
       sendPhaseLabel: currentConversation?.id === conversationId ? null : state.sendPhaseLabel,
       sendPhaseHint: currentConversation?.id === conversationId ? null : state.sendPhaseHint,
@@ -353,6 +463,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sendPlanId?: string
       chatPreferenceOverrides?: Partial<ChatUserPreferences>
       ragOverrides?: ChatRagOverrides | null
+      skillLaunch?: ChatSkillLaunchRequest | null
     },
   ): Promise<number | undefined> => {
     const { currentConversation, fetchConversations, isSending } = get()
@@ -385,6 +496,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingContent: '',
       streamingThought: '',
       streamingContextDebug: null,
+      workflowControl: null,
       iterationSteps: [],  // 重置迭代步骤
       currentIteration: 0,  // 重置为0，thinking_start时会变为1（表示第1轮）
       toolCalls: [],
@@ -578,6 +690,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     streamingContent: '',
                     streamingThought: '',
                     streamingContextDebug: null,
+                    workflowControl: null,
                     iterationSteps: [],
                     currentIteration: 0,
                     toolCalls: [],
@@ -619,6 +732,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 doneData.item_stream && typeof doneData.item_stream === 'object'
                   ? (doneData.item_stream as ConversationItemStream)
                   : undefined
+              const workflowControl =
+                doneData.workflow_control && typeof doneData.workflow_control === 'object'
+                  ? (doneData.workflow_control as ChatWorkflowControl)
+                  : null
               const metadata: MessageMetadata | undefined =
                 ragMetrics || reasoningSummary || citationIndex
                   ? {
@@ -627,28 +744,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
                       ...(citationIndex ? { citation_index: citationIndex } : {}),
                     }
                   : undefined
+              const resolvedMetadata: MessageMetadata | undefined =
+                workflowControl
+                  ? {
+                      ...(metadata || {}),
+                      workflow_control: workflowControl,
+                    }
+                  : metadata
               const finalAssistantContent = String(fullContent || doneData.answer || '')
               const finalAssistantThought =
                 typeof doneData.thought === 'string' && doneData.thought.trim()
                   ? doneData.thought.trim()
                   : currentThought || undefined
-              const shouldAppendLocalAssistantMessage =
-                Boolean(finalAssistantContent.trim()) || Boolean(String(finalAssistantThought || '').trim())
+              const resolvedAssistantMessage = buildDoneAssistantMessage({
+                itemStream: conversationItemStream,
+                turnStore: conversationTurnStore,
+                currentTurnId: get().currentTurnId,
+                fallbackContent: finalAssistantContent,
+                fallbackThought: finalAssistantThought,
+                fallbackMetadata: resolvedMetadata,
+                conversationId: newConversationId || currentConversation?.id || 0,
+              })
+              const shouldAppendLocalAssistantMessage = Boolean(resolvedAssistantMessage)
 
               set((state) => ({
                 messages: shouldAppendLocalAssistantMessage
                   ? [
-                      ...state.messages,
-                      {
-                        id: Date.now() + 1,
-                        conversation_id: newConversationId || currentConversation?.id || 0,
-                        role: 'assistant',
-                        content: finalAssistantContent,
-                        message_type: 'text',
-                        thought: finalAssistantThought,
-                        metadata,
-                        created_at: new Date().toISOString(),
-                      },
+                      ...state.messages.filter((message) =>
+                        resolvedAssistantMessage?.id ? message.id !== resolvedAssistantMessage.id : true,
+                      ),
+                      resolvedAssistantMessage as Message,
                     ]
                   : state.messages,
                 currentConversation: state.currentConversation
@@ -669,6 +794,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 streamingThought: '',
                 streamingContextDebug: null,
                 lastRunContextDebug: contextDebug || state.streamingContextDebug,
+                workflowControl,
                 iterationSteps: [],  // 清空迭代步骤
                 currentIteration: 0,
                 toolCalls: [],  // 清空工具调用记录
@@ -690,6 +816,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 sendPhaseLabel: null,
                 sendPhaseHint: null,
                 streamingContextDebug: null,
+                workflowControl: null,
                 iterationSteps: [],
                 currentIteration: 0,
                 toolCalls: [],
@@ -709,6 +836,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         options?.sendPlanId,
         options?.chatPreferenceOverrides,
         options?.ragOverrides,
+        options?.skillLaunch,
       )
       set({ currentBackgroundRunId: run.run_id })
       if (abortController.signal.aborted) {
@@ -740,6 +868,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sendPhaseLabel: null,
         sendPhaseHint: null,
         streamingContextDebug: null,
+        workflowControl: null,
         iterationSteps: [],
         currentIteration: 0,
         toolCalls: [],
@@ -806,6 +935,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           streamingThought: '',
           streamingContextDebug: null,
           lastRunContextDebug: streamingContextDebug || currentState.lastRunContextDebug,
+          workflowControl: null,
           iterationSteps: [],
           currentIteration: 0,
           toolCalls: [],
@@ -838,6 +968,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           streamingThought: '',
           streamingContextDebug: null,
           lastRunContextDebug: streamingContextDebug || currentState.lastRunContextDebug,
+          workflowControl: null,
           iterationSteps: [],
           currentIteration: 0,
           toolCalls: [],
@@ -858,6 +989,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streamingThought: '',
         streamingContextDebug: null,
         lastRunContextDebug: streamingContextDebug || state.lastRunContextDebug,
+        workflowControl: null,
         iterationSteps: [],
         currentIteration: 0,
         toolCalls: [],
@@ -883,6 +1015,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingThought: '',
       streamingContextDebug: null,
       lastRunContextDebug: null,
+      workflowControl: null,
       iterationSteps: [],
       currentIteration: 0,
       toolCalls: [],

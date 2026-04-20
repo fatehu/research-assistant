@@ -163,22 +163,17 @@ Input JSON:
         user_prompt: str,
         timeout_seconds: int,
         max_tokens: int,
+        source: str,
     ) -> Any:
         llm = self._ensure_llm_service()
-        request = {
-            "model": llm.config["model"],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-        }
-        response = None
         try:
             response = await asyncio.wait_for(
-                llm.client.chat.completions.create(
-                    **request,
+                llm.chat(
+                    messages=[{"role": "user", "content": user_prompt}],
+                    system_prompt=system_prompt,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    source=source,
                     extra_body={"reasoning": {"effort": "none"}},
                 ),
                 timeout=max(1, int(timeout_seconds)),
@@ -193,15 +188,17 @@ Input JSON:
             if not disable_reasoning_unsupported:
                 raise
             response = await asyncio.wait_for(
-                llm.client.chat.completions.create(**request),
+                llm.chat(
+                    messages=[{"role": "user", "content": user_prompt}],
+                    system_prompt=system_prompt,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    source=source,
+                ),
                 timeout=max(1, int(timeout_seconds)),
             )
 
-        msg = response.choices[0].message
-        raw = str(getattr(msg, "content", "") or "")
-        if not raw:
-            # Some local models place all output in reasoning-only fields.
-            raw = str(getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "") or "")
+        raw = str(response.get("content", "") or "")
         return self._extract_json_value(raw)
 
     @staticmethod
@@ -244,6 +241,7 @@ Input JSON:
             user_prompt=self.SCORE_USER_PROMPT.format(payload=json.dumps(payload, ensure_ascii=False)),
             timeout_seconds=int(settings.chunk_quality_gate_timeout_seconds),
             max_tokens=280,
+            source="rag_ingest.chunk_quality_gate.score",
         )
         if not isinstance(data, Mapping):
             raise ValueError("score payload is not an object")
@@ -385,6 +383,7 @@ Input JSON:
                 ),
                 timeout_seconds=int(settings.chunk_quality_gate_timeout_seconds),
                 max_tokens=400,
+                source="rag_ingest.chunk_quality_gate.repair",
             )
             if not isinstance(data, Mapping):
                 continue

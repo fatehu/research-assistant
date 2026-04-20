@@ -125,6 +125,7 @@ backend/eval/retrieval_beir/.cache/**
 !backend/eval/retrieval_beir/.cache/.gitkeep
 
 # Reader runtime artifacts
+backend/data/
 backend/uploads/
 backend/.cache/
 backend/.triton/

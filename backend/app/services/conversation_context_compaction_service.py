@@ -646,6 +646,7 @@ class ConversationContextCompactionService:
             system_prompt=system_prompt,
             temperature=0.1,
             max_tokens=max_tokens,
+            source="chat_compaction.context_state",
         )
         parsed = ReActAgent._extract_json_object(response.get("content") or "")
         if not parsed:
@@ -722,6 +723,7 @@ class ConversationContextCompactionService:
             system_prompt=system_prompt,
             temperature=0.1,
             max_tokens=max_tokens,
+            source="chat_compaction.compacted_history",
         )
         parsed = ReActAgent._extract_json_object(response.get("content") or "")
         if not parsed:

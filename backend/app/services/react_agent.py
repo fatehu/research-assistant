@@ -24,6 +24,7 @@ from app.services.agent_profiles import (
     build_agent_channel_tool_policy_prompt,
     resolve_agent_profile,
 )
+from app.services.agent_skill_service import get_agent_skill_service
 from app.services.chat_context_store import ConversationItemStreamStore, build_context_snapshot_payload
 from app.services.agent_tools import ToolRegistry, ToolResult
 from app.services.contextual_compression_service import (
@@ -70,6 +71,7 @@ class AgentRuntimeContext:
     turn_id: Optional[str] = None
     chat_preferences_override: Dict[str, Any] = field(default_factory=dict)
     rag_overrides: Dict[str, Any] = field(default_factory=dict)
+    active_skill_names: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -231,6 +233,108 @@ class AgentCore:
         r"^(?:(?:再|继续|接着|顺便)\s*)*(补充|解释|说明|展开|详细说说|详细讲讲|概括|总结)",
         r"(它|这个|那|该机制|这种机制).*(解决了什么问题|有什么作用|有什么限制|为什么重要)",
     )
+    _PAPER_SKILL_NAME = "paper-reproduction"
+    _PAPER_RESEARCH_TOOL_PREFIX = "paper_research_"
+    _PAPER_RUN_DRAFT_MARKERS = (
+        "run_drafts",
+        "run draft",
+        "run-draft",
+        "drafts/run_drafts.json",
+        "run_drafts.json",
+        "运行草案",
+        "run 草案",
+    )
+    _PAPER_IMPLEMENTATION_SPEC_MARKERS = (
+        "implementation_spec",
+        "implementation spec",
+        "specs/implementation_spec.json",
+        "实施规格",
+        "实施方案",
+        "implementation-prep",
+    )
+    _PAPER_PREPARE_MARKERS = (
+        "paper_research_prepare",
+        "paper_research_status",
+        "paper_research_get_artifact_manifest",
+        "paper_research_read_artifact",
+        "pdf2markdown",
+        "pdf to markdown",
+        "intake",
+        "artifact",
+        "manifest",
+        "产物",
+        "状态",
+    )
+    _PAPER_ARTIFACT_ACTION_MARKERS = (
+        "生成",
+        "创建",
+        "写入",
+        "保存",
+        "归档",
+        "刷新",
+        "修订",
+        "重写",
+        "改写",
+        "跑通",
+        "验收",
+        "继续",
+        "generate",
+        "create",
+        "write",
+        "save",
+        "archive",
+        "refresh",
+        "revise",
+        "rewrite",
+        "rerun",
+        "continue",
+    )
+    _PAPER_ARTIFACT_MUTATION_MARKERS = (
+        "生成",
+        "创建",
+        "写入",
+        "保存",
+        "归档",
+        "刷新",
+        "修订",
+        "重写",
+        "改写",
+        "generate",
+        "create",
+        "write",
+        "save",
+        "archive",
+        "refresh",
+        "revise",
+        "rewrite",
+    )
+    _PAPER_EXECUTION_MARKERS = (
+        "execution",
+        "execution_spec",
+        "execution result",
+        "baseline_repro",
+        "data_prep",
+        "smoke_test",
+        "执行",
+        "运行",
+        "训练",
+        "复现",
+        "结果",
+        "日志",
+        "read_execution",
+        "start_execution",
+        "paper_research_read_execution",
+        "paper_research_start_execution",
+    )
+    _PAPER_READBACK_MARKERS = (
+        "读回",
+        "读取",
+        "read back",
+        "readback",
+        "确认",
+        "verify",
+        "校验",
+    )
 
     def __init__(
         self,
@@ -246,7 +350,9 @@ class AgentCore:
         self.contextual_compression_service = get_contextual_compression_service()
         self.runtime_context = runtime_context or AgentRuntimeContext()
         self.runtime_service = runtime_service or get_agent_runtime_service()
+        self.skill_service = get_agent_skill_service()
         self._last_tool_selection: Dict[str, Any] = {}
+        self._last_skill_resolution: Dict[str, Any] = {}
         self._routing_decision: Optional[RoutingDecision] = None
         self._active_chat_preferences: Dict[str, Any] = {}
         self._active_rag_overrides: Dict[str, Any] = {}
@@ -299,6 +405,127 @@ class AgentCore:
             if str(item.get("role", "")).lower() == "user":
                 return str(item.get("content", "") or "")
         return ""
+
+    def _resolve_skills_for_messages(self, messages: Optional[Sequence[Dict[str, Any]]]) -> Dict[str, Any]:
+        latest_user_text = self._intent_user_text(messages) or self._latest_user_text(messages)
+        channel = str(getattr(self.runtime_context, "channel", "") or "chat").strip().lower() or "chat"
+        active_skill_names = [
+            str(item or "").strip()
+            for item in list(getattr(self.runtime_context, "active_skill_names", []) or [])
+            if str(item or "").strip()
+        ]
+        try:
+            resolution = self.skill_service.resolve(
+                latest_user_text,
+                channel=channel,
+                active_skill_names=active_skill_names,
+            )
+        except Exception as exc:
+            logger.warning(f"[AgentCore] skill resolution failed, continuing without skills: {exc}")
+            payload: Dict[str, Any] = {
+                "channel": channel,
+                "latest_user_text": latest_user_text,
+                "available_skills": [],
+                "active_skills": [],
+                "active_prompt": "",
+                "active_prompt_tokens": 0,
+            }
+        else:
+            payload = {
+                "channel": resolution.channel,
+                "latest_user_text": resolution.latest_user_text,
+                "available_skills": [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "path": item.path,
+                        "config_path": item.config_path,
+                        "interface_path": item.interface_path,
+                        "score": int(item.score),
+                        "activation_reason": item.activation_reason,
+                        "display_name": item.display_name,
+                        "short_description": item.short_description,
+                        "default_prompt": item.default_prompt,
+                        "when_to_use": item.when_to_use,
+                        "user_invocable": bool(item.user_invocable),
+                        "execution_context": item.execution_context,
+                        "agent": item.agent,
+                        "effort": item.effort,
+                        "allow_implicit_invocation": bool(item.allow_implicit_invocation),
+                        "enforced_tool_names": [str(name) for name in list(item.enforced_tool_names or []) if str(name or "").strip()],
+                        "blocked_tool_names": [str(name) for name in list(item.blocked_tool_names or []) if str(name or "").strip()],
+                        "scripts": [str(name) for name in list(item.scripts or []) if str(name or "").strip()],
+                        "stage_names": [str(name) for name in list(item.stage_names or []) if str(name or "").strip()],
+                        "stage_policies": [str(name) for name in list(item.stage_policies or []) if str(name or "").strip()],
+                        "artifact_paths": [str(name) for name in list(item.artifact_paths or []) if str(name or "").strip()],
+                        "continue_policies": [str(name) for name in list(item.continue_policies or []) if str(name or "").strip()],
+                        "default_continue_policy": str(item.default_continue_policy or ""),
+                    }
+                    for item in resolution.available_skills
+                ],
+                "active_skills": [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "path": item.path,
+                        "config_path": item.config_path,
+                        "interface_path": item.interface_path,
+                        "score": int(item.score),
+                        "activation_reason": item.activation_reason,
+                        "display_name": item.display_name,
+                        "short_description": item.short_description,
+                        "default_prompt": item.default_prompt,
+                        "when_to_use": item.when_to_use,
+                        "user_invocable": bool(item.user_invocable),
+                        "execution_context": item.execution_context,
+                        "agent": item.agent,
+                        "effort": item.effort,
+                        "allow_implicit_invocation": bool(item.allow_implicit_invocation),
+                        "enforced_tool_names": [str(name) for name in list(item.enforced_tool_names or []) if str(name or "").strip()],
+                        "blocked_tool_names": [str(name) for name in list(item.blocked_tool_names or []) if str(name or "").strip()],
+                        "scripts": [str(name) for name in list(item.scripts or []) if str(name or "").strip()],
+                        "stage_names": [str(name) for name in list(item.stage_names or []) if str(name or "").strip()],
+                        "stage_policies": [str(name) for name in list(item.stage_policies or []) if str(name or "").strip()],
+                        "artifact_paths": [str(name) for name in list(item.artifact_paths or []) if str(name or "").strip()],
+                        "continue_policies": [str(name) for name in list(item.continue_policies or []) if str(name or "").strip()],
+                        "default_continue_policy": str(item.default_continue_policy or ""),
+                    }
+                    for item in resolution.active_skills
+                ],
+                "active_prompt": resolution.active_prompt,
+                "active_prompt_tokens": int(resolution.active_prompt_tokens),
+                "enforced_tool_names": [str(name) for name in list(resolution.enforced_tool_names or []) if str(name or "").strip()],
+                "blocked_tool_names": [str(name) for name in list(resolution.blocked_tool_names or []) if str(name or "").strip()],
+                "persisted_active_skill_names": active_skill_names,
+            }
+        self._last_skill_resolution = payload
+        return payload
+
+    @staticmethod
+    def _render_skill_catalog(skill_resolution: Dict[str, Any]) -> str:
+        available_skills = [
+            item for item in list(skill_resolution.get("available_skills") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        if not available_skills:
+            return ""
+        active_skill_names = [
+            str(item.get("name") or "").strip()
+            for item in list(skill_resolution.get("active_skills") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        lines = [
+            "## Available Skills",
+            "你可以直接回答，也可以先调用 `activate_skill` 激活一个技能，再按照该技能的约束继续调用工具。",
+            f"Current active skills: {', '.join(active_skill_names) if active_skill_names else 'none'}",
+        ]
+        for item in available_skills:
+            name = str(item.get("name") or "").strip()
+            description = str(item.get("short_description") or item.get("description") or item.get("when_to_use") or "").strip()
+            if len(description) > 160:
+                description = f"{description[:157].rstrip()}..."
+            lines.append(f"- {name}: {description}")
+        return "\n".join(lines).strip()
 
     @classmethod
     def _looks_like_followup_only(cls, text: str) -> bool:
@@ -364,6 +591,105 @@ class AgentCore:
         selection = dict(self._last_tool_selection or {})
         latest = str(selection.get("intent_user_text") or "").strip()
         return latest
+
+    def _active_skill_name_set(self) -> set[str]:
+        names = {
+            str(item or "").strip()
+            for item in list((self._last_tool_selection or {}).get("active_skill_names") or [])
+            if str(item or "").strip()
+        }
+        for item in list((self._last_skill_resolution or {}).get("active_skills") or []):
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    names.add(name)
+        return names
+
+    @staticmethod
+    def _contains_any_marker(text: str, markers: Sequence[str]) -> bool:
+        lowered = str(text or "").lower()
+        return any(str(marker or "").lower() in lowered for marker in markers if str(marker or "").strip())
+
+    @staticmethod
+    def _tool_action_names(context: AgentContext) -> set[str]:
+        return {
+            str(step.tool_name or "").strip()
+            for step in list(context.steps or [])
+            if step.step_type == "action" and str(step.tool_name or "").strip()
+        }
+
+    @staticmethod
+    def _successful_tool_names(context: AgentContext) -> set[str]:
+        return {
+            str(step.tool_name or "").strip()
+            for step in list(context.steps or [])
+            if step.step_type == "observation" and bool(step.success) and str(step.tool_name or "").strip()
+        }
+
+    def _missing_required_paper_skill_tool_calls(self, context: AgentContext) -> List[str]:
+        if self._PAPER_SKILL_NAME not in self._active_skill_name_set():
+            return []
+
+        user_text = self._current_user_text(context)
+        if not user_text:
+            return []
+
+        is_run_draft_request = self._contains_any_marker(user_text, self._PAPER_RUN_DRAFT_MARKERS)
+        is_implementation_spec_request = self._contains_any_marker(user_text, self._PAPER_IMPLEMENTATION_SPEC_MARKERS)
+        is_prepare_or_status_request = self._contains_any_marker(user_text, self._PAPER_PREPARE_MARKERS)
+        is_artifact_action = self._contains_any_marker(user_text, self._PAPER_ARTIFACT_ACTION_MARKERS)
+        is_mutation_action = self._contains_any_marker(user_text, self._PAPER_ARTIFACT_MUTATION_MARKERS)
+        is_execution_request = self._contains_any_marker(user_text, self._PAPER_EXECUTION_MARKERS)
+        if not (is_run_draft_request or is_implementation_spec_request or is_prepare_or_status_request or is_artifact_action):
+            return []
+
+        attempted_tools = self._tool_action_names(context)
+        successful_tools = self._successful_tool_names(context)
+        paper_attempted = {
+            name for name in attempted_tools
+            if name.startswith(self._PAPER_RESEARCH_TOOL_PREFIX)
+        }
+        missing: List[str] = []
+        if not paper_attempted:
+            missing.append("any paper_research_* tool call")
+
+        if is_run_draft_request and is_mutation_action and not is_execution_request:
+            if "paper_research_write_run_drafts" not in attempted_tools:
+                missing.append("paper_research_write_run_drafts")
+            elif (
+                "paper_research_write_run_drafts" in successful_tools
+                and self._contains_any_marker(user_text, self._PAPER_READBACK_MARKERS)
+                and "paper_research_read_run_drafts" not in attempted_tools
+            ):
+                missing.append("paper_research_read_run_drafts")
+
+        if is_implementation_spec_request and is_mutation_action and not is_run_draft_request:
+            if "paper_research_write_implementation_spec" not in attempted_tools:
+                missing.append("paper_research_write_implementation_spec")
+            elif (
+                "paper_research_write_implementation_spec" in successful_tools
+                and self._contains_any_marker(user_text, self._PAPER_READBACK_MARKERS)
+                and "paper_research_read_implementation_spec" not in attempted_tools
+            ):
+                missing.append("paper_research_read_implementation_spec")
+
+        deduped: List[str] = []
+        for item in missing:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    def _build_paper_skill_tool_guard_message(self, context: AgentContext, missing_tools: Sequence[str]) -> str:
+        missing = ", ".join(str(item) for item in missing_tools if str(item or "").strip())
+        if not missing:
+            missing = "required paper_research tool calls"
+        return (
+            "当前激活的是 paper-reproduction，并且用户请求涉及产物生成、刷新、写入或读回。"
+            "不能用自然语言声明已经完成；必须先调用真实工具。\n"
+            f"缺失工具调用: {missing}\n"
+            "下一步请调用对应 paper_research_* 工具完成读取、写入或读回。"
+            "如果写入工具返回失败，请基于真实失败结果解释原因；不要假装产物已经保存。"
+        )
 
     @staticmethod
     def _user_texts(messages: Optional[Sequence[Dict[str, Any]]]) -> List[str]:
@@ -503,11 +829,8 @@ class AgentCore:
             )
             self._routing_decision = decision
             return decision
-        decision = self._maybe_short_circuit_direct_routing(messages)
-        if decision is None:
-            decision = self._maybe_short_circuit_followup_direct_routing(messages)
-        self._routing_decision = decision
-        return decision
+        self._routing_decision = None
+        return None
 
     async def resolve_routing_decision(
         self,
@@ -518,13 +841,24 @@ class AgentCore:
         await self._prepare_routing_decision(sanitized)
         return self._routing_decision_for_messages(sanitized)
 
-    def _build_direct_response_system_prompt(self) -> str:
+    def _build_direct_response_system_prompt(
+        self,
+        messages: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> str:
         prompt = self.DIRECT_RESPONSE_SYSTEM_PROMPT
+        if messages is not None or not self._last_skill_resolution:
+            self._resolve_skills_for_messages(messages)
         profile = self._agent_profile()
         if profile.include_channel_system_context:
             channel_system_context = str(getattr(self, "_active_channel_system_context", "") or "").strip()
             if channel_system_context:
                 prompt = f"{prompt}\n\n## CodeLab / Notebook Runtime Context\n{channel_system_context}"
+        active_skill_prompt = str((self._last_skill_resolution or {}).get("active_prompt") or "").strip()
+        skill_catalog_prompt = self._render_skill_catalog(self._last_skill_resolution or {})
+        if skill_catalog_prompt:
+            prompt = f"{prompt}\n\n{skill_catalog_prompt}"
+        if active_skill_prompt:
+            prompt = f"{prompt}\n\n## 已激活 Skills\n{active_skill_prompt}"
         if profile.include_rag_overrides:
             rag_prompt = self._render_rag_overrides_prompt(self._active_rag_overrides)
             if rag_prompt:
@@ -561,7 +895,7 @@ class AgentCore:
         if not force_no_tools and (not decision or decision.needs_tools is not False):
             return None
         self._build_system_prompt(context.messages, function_calling=self._supports_function_calling())
-        system_prompt = self._build_direct_response_system_prompt()
+        system_prompt = self._build_direct_response_system_prompt(context.messages)
         llm_messages = await self._prepare_llm_messages(context, system_prompt)
         self._augment_context_debug_with_model_request(
             context=context,
@@ -593,7 +927,7 @@ class AgentCore:
         system_prompt = ""
         if decision and decision.needs_tools is False:
             preview_mode = "direct"
-            system_prompt = self._build_direct_response_system_prompt()
+            system_prompt = self._build_direct_response_system_prompt(context.messages)
         else:
             use_fc = self._supports_function_calling()
             system_prompt = self._build_system_prompt(context.messages, function_calling=use_fc)
@@ -1053,7 +1387,10 @@ class AgentCore:
                 or row.get("description")
             )
             if excerpt is not None:
-                compacted = cls._compact_debug_text(excerpt, 220)
+                if source_kind in {"public_web_search", "public_web_page"}:
+                    compacted = str(excerpt).strip()
+                else:
+                    compacted = cls._compact_debug_text(excerpt, 220)
                 if compacted:
                     item["content_preview"] = compacted
 
@@ -1144,11 +1481,22 @@ class AgentCore:
                         "title": str(item.get("label") or href).strip(),
                         "url": href,
                         "domain": cls._extract_hostname(href),
-                        "snippet": str(item.get("snippet") or data.get("reader_summary") or "").strip(),
-                        "reader_excerpt": cls._compact_debug_text(
-                            item.get("snippet") or data.get("reader_summary") or "",
-                            220,
-                        ),
+                        "snippet": str(
+                            item.get("snippet")
+                            or data.get("markdown")
+                            or data.get("text")
+                            or data.get("content")
+                            or data.get("reader_summary")
+                            or ""
+                        ).strip(),
+                        "reader_excerpt": str(
+                            item.get("snippet")
+                            or data.get("markdown")
+                            or data.get("text")
+                            or data.get("content")
+                            or data.get("reader_summary")
+                            or ""
+                        ).strip(),
                     }
                 )
             if normalized_rows:
@@ -1164,12 +1512,12 @@ class AgentCore:
             or "Public web result"
         ).strip()
         snippet = str(
-            data.get("reader_summary")
-            or data.get("summary")
-            or data.get("description")
+            data.get("markdown")
             or data.get("text")
             or data.get("content")
-            or data.get("markdown")
+            or data.get("reader_summary")
+            or data.get("summary")
+            or data.get("description")
             or ""
         ).strip()
         if not (url or title or snippet):
@@ -1181,7 +1529,7 @@ class AgentCore:
                 "url": url,
                 "domain": str(data.get("source_domain") or cls._extract_hostname(url)).strip(),
                 "snippet": snippet,
-                "reader_excerpt": cls._compact_debug_text(snippet or title, 220),
+                "reader_excerpt": snippet or title,
             }
         ]
 
@@ -1194,6 +1542,80 @@ class AgentCore:
             if not label:
                 continue
             context.source_items_by_label[label] = dict(item)
+
+    async def _set_active_skill_names(
+        self,
+        context: AgentContext,
+        active_skill_names: Sequence[str],
+        *,
+        update_timestamp: bool = True,
+    ) -> None:
+        normalized_active_skill_names: List[str] = []
+        for item in list(active_skill_names or []):
+            name = str(item or "").strip()
+            if not name or name in normalized_active_skill_names:
+                continue
+            normalized_active_skill_names.append(name)
+        if not normalized_active_skill_names:
+            return
+
+        self.runtime_context.active_skill_names = list(normalized_active_skill_names)
+        if isinstance(self._last_tool_selection, dict):
+            self._last_tool_selection["active_skill_names"] = list(normalized_active_skill_names)
+        if isinstance(context.conversation_state, dict):
+            next_state = dict(context.conversation_state or {})
+        else:
+            next_state = {}
+        next_state["active_skill_names"] = list(normalized_active_skill_names)
+        if update_timestamp:
+            next_state["active_skill_updated_at"] = datetime.utcnow().isoformat()
+        context.conversation_state = next_state
+
+        conversation_id = getattr(self.runtime_context, "conversation_id", None)
+        if conversation_id is None:
+            return
+        try:
+            await self.runtime_service.upsert_conversation_context_state(
+                int(conversation_id),
+                dict(next_state),
+            )
+        except Exception as exc:
+            logger.warning(f"[AgentCore] failed to persist active skills for conversation {conversation_id}: {exc}")
+
+    async def _maybe_pin_skill_from_tool_result(
+        self,
+        context: AgentContext,
+        call: ParsedToolCall,
+        result: ToolResult,
+    ) -> None:
+        if not bool(result.success):
+            return
+
+        if call.name == "activate_skill" and isinstance(result.data, dict):
+            active_skill_names = [
+                str(item or "").strip()
+                for item in list(result.data.get("active_skill_names") or [])
+                if str(item or "").strip()
+            ]
+            if active_skill_names:
+                await self._set_active_skill_names(context, active_skill_names)
+            return
+
+        if not str(call.name or "").startswith(self._PAPER_RESEARCH_TOOL_PREFIX):
+            return
+
+        current_active_skill_names = [
+            str(item or "").strip()
+            for item in list(getattr(self.runtime_context, "active_skill_names", []) or [])
+            if str(item or "").strip()
+        ]
+        if self._PAPER_SKILL_NAME in current_active_skill_names:
+            return
+
+        await self._set_active_skill_names(
+            context,
+            [*current_active_skill_names, self._PAPER_SKILL_NAME],
+        )
 
     @classmethod
     def _build_citation_index(cls, answer: str, context: AgentContext) -> Dict[str, Dict[str, Any]]:
@@ -1902,6 +2324,7 @@ class AgentCore:
         profile = self._agent_profile()
         routing_decision = self._routing_decision_for_messages(messages)
         latest_user_text = self._latest_user_text(messages)
+        skill_resolution = self._resolve_skills_for_messages(messages)
         tool_choice = "auto"
         tool_selection_enabled = False
         resolved_intent = "general_chat"
@@ -1910,7 +2333,9 @@ class AgentCore:
         select_tool_names_for_user_text = getattr(self.tools, "select_tool_names_for_user_text", None)
         resolve_intent = getattr(self.tools, "resolve_intent", None)
         select_tool_names_for_intent = getattr(self.tools, "select_tool_names_for_intent", None)
-        if bool(getattr(settings, "tool_selection_enabled", True)):
+        channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
+        disable_intent_filtering = bool(function_calling and channel == "chat")
+        if bool(getattr(settings, "tool_selection_enabled", True)) and not disable_intent_filtering:
             if callable(select_tool_names_for_user_text):
                 try:
                     raw_selected = select_tool_names_for_user_text(latest_user_text)
@@ -1952,6 +2377,31 @@ class AgentCore:
                             if str(item or "").strip()
                         ]
                         tool_selection_enabled = True
+
+        skill_enforced_tool_names = [
+            str(item).strip()
+            for item in list(skill_resolution.get("enforced_tool_names") or [])
+            if str(item or "").strip()
+        ]
+        skill_blocked_tool_names = {
+            str(item).strip()
+            for item in list(skill_resolution.get("blocked_tool_names") or [])
+            if str(item or "").strip()
+        }
+        if skill_enforced_tool_names:
+            selected_tool_names = [
+                name for name in skill_enforced_tool_names
+                if name not in skill_blocked_tool_names
+            ]
+            tool_selection_enabled = True
+        elif skill_blocked_tool_names and selected_tool_names:
+            selected_tool_names = [
+                name for name in selected_tool_names
+                if name not in skill_blocked_tool_names
+            ]
+            tool_selection_enabled = True
+        if channel == "chat" and selected_tool_names and "activate_skill" not in selected_tool_names:
+            selected_tool_names.append("activate_skill")
 
         tools_desc = ""
         if not function_calling:
@@ -2004,6 +2454,13 @@ class AgentCore:
             "routing_confidence": routing_decision.confidence if routing_decision else 0.0,
             "carry_over_previous_goal": routing_decision.carry_over_previous_goal if routing_decision else False,
             "router_needs_tools": routing_decision.needs_tools if routing_decision else None,
+            "skill_enforced_tools": selected_tool_names if skill_enforced_tool_names else [],
+            "skill_blocked_tools": sorted(skill_blocked_tool_names),
+            "active_skill_names": [
+                str(item.get("name") or "").strip()
+                for item in list(skill_resolution.get("active_skills") or [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ],
         }
         logger.info(
             f"[AgentCore] selected_tools={self._last_tool_selection.get('selected_tools') or 'ALL'} "
@@ -2020,6 +2477,8 @@ class AgentCore:
             available_tools=available_tools,
             include_generic_citation_policy=profile.include_generic_citation_policy,
             channel_policy_prompt=channel_policy_prompt,
+            active_skill_prompt=str(skill_resolution.get("active_prompt") or ""),
+            skill_catalog_prompt=self._render_skill_catalog(skill_resolution),
         )
 
     def _compose_profile_prompt_sections(
@@ -2029,6 +2488,8 @@ class AgentCore:
         available_tools: Optional[Sequence[str]] = None,
         include_generic_citation_policy: bool = True,
         channel_policy_prompt: Optional[str] = None,
+        active_skill_prompt: Optional[str] = None,
+        skill_catalog_prompt: Optional[str] = None,
     ) -> str:
         profile = self._agent_profile()
         composed = str(prompt or "").strip()
@@ -2038,6 +2499,10 @@ class AgentCore:
             channel_system_context = str(getattr(self, "_active_channel_system_context", "") or "").strip()
             if channel_system_context:
                 composed = f"{composed}\n\n## CodeLab / Notebook Runtime Context\n{channel_system_context}"
+        if skill_catalog_prompt:
+            composed = f"{composed}\n\n{str(skill_catalog_prompt).strip()}"
+        if active_skill_prompt:
+            composed = f"{composed}\n\n## 已激活 Skills\n{str(active_skill_prompt).strip()}"
         if profile.include_user_chat_preferences:
             user_pref_prompt = self._render_user_chat_preferences(self._active_chat_preferences)
             if user_pref_prompt:
@@ -2147,6 +2612,11 @@ class AgentCore:
             context.allowed_source_labels,
             context.allowed_web_source_labels,
         )
+        used_labels = cls._extract_citation_tokens_in_order(context.final_answer or "")
+        available_labels = (
+            [f"来源{idx}" for idx in sorted(context.allowed_source_labels, key=int)]
+            + [f"网页{idx}" for idx in sorted(context.allowed_web_source_labels, key=int)]
+        )
         citation_required = bool(allowed)
         citation_valid = (
             cls._citations_are_valid(
@@ -2160,11 +2630,10 @@ class AgentCore:
             "knowledge_search_calls": context.knowledge_search_calls,
             "prefetched_knowledge_search_count": int(max(0, context.prefetched_rag_search_count)),
             "web_search_calls": context.web_search_calls,
-            "source_labels_count": len(allowed),
-            "source_labels": (
-                [f"来源{idx}" for idx in sorted(context.allowed_source_labels, key=int)]
-                + [f"网页{idx}" for idx in sorted(context.allowed_web_source_labels, key=int)]
-            ),
+            "source_labels_count": len(used_labels),
+            "source_labels": used_labels,
+            "available_source_labels_count": len(available_labels),
+            "available_source_labels": available_labels,
             "answer_citation_count": len(cited),
             "citation_required": citation_required,
             "citation_valid": citation_valid,
@@ -2531,6 +3000,15 @@ class AgentCore:
         if not valid_rows:
             return result.output
 
+        source_kind = str(data.get("source_kind") or "").strip().lower()
+        page_url = str(data.get("url") or "").strip()
+        page_content = str(
+            data.get("markdown")
+            or data.get("text")
+            or data.get("content")
+            or data.get("reader_summary")
+            or ""
+        ).strip()
         base_source_id = max(int(getattr(context, "next_web_source_label", 1) or 1), 1) if context is not None else 1
         parts: List[str] = []
         for offset, row in enumerate(valid_rows):
@@ -2552,21 +3030,59 @@ class AgentCore:
                 or row.get("reader_excerpt")
                 or ""
             ).strip()
-
-            parts.append(
-                f"\n[{source_label}] {title or 'Public web result'}\n"
-                f"Domain: {domain or 'unknown'}\n"
-                f"URL: {url or 'N/A'}\n"
-                f"Summary: {snippet or 'No summary available.'}"
+            embedded_urls = [
+                str(item or "").strip()
+                for item in list(row.get("embedded_urls") or [])
+                if str(item or "").strip()
+            ]
+            candidate_download_urls = [
+                str(item or "").strip()
+                for item in list(row.get("candidate_download_urls") or [])
+                if str(item or "").strip()
+            ]
+            is_primary_page = bool(
+                source_kind == "public_web_page"
+                and page_url
+                and url
+                and url == page_url
             )
+            if source_kind == "public_web_page" and is_primary_page:
+                body = snippet or page_content or "No page content available."
+                section = (
+                    f"\n[{source_label}] {title or 'Public web page'}\n"
+                    f"Domain: {domain or 'unknown'}\n"
+                    f"URL: {url or 'N/A'}\n"
+                    f"Content:\n{body}"
+                )
+            else:
+                section = (
+                    f"\n[{source_label}] {title or 'Public web result'}\n"
+                    f"Domain: {domain or 'unknown'}\n"
+                    f"URL: {url or 'N/A'}\n"
+                    f"Snippet: {snippet or 'No content available.'}"
+                )
+            if candidate_download_urls:
+                section += f"\nDirect candidate URLs: {', '.join(candidate_download_urls[:3])}"
+            elif embedded_urls:
+                section += f"\nEmbedded URLs: {', '.join(embedded_urls[:3])}"
+            parts.append(section)
         if context is not None:
             context.next_web_source_label = base_source_id + len(valid_rows)
         return f"Public web contexts: {len(parts)}\n" + "".join(parts)
 
     async def _prepare_runtime_context(self, context: AgentContext) -> None:
         profile = self._agent_profile()
+        skill_resolution = self._resolve_skills_for_messages(context.messages)
+        skill_enforced_tool_names = [
+            str(item).strip()
+            for item in list(skill_resolution.get("enforced_tool_names") or [])
+            if str(item or "").strip()
+        ]
+        should_refresh_mcp_tools = True
+        if skill_enforced_tool_names:
+            should_refresh_mcp_tools = any(name.startswith("mcp.") for name in skill_enforced_tool_names)
         refresh_mcp_tools = getattr(self.tools, "refresh_mcp_tools", None)
-        if callable(refresh_mcp_tools):
+        if should_refresh_mcp_tools and callable(refresh_mcp_tools):
             try:
                 maybe_awaitable = refresh_mcp_tools()
                 if hasattr(maybe_awaitable, "__await__"):
@@ -2770,6 +3286,25 @@ class AgentCore:
         if not trace:
             return ""
 
+        summary_text = await self.generate_reasoning_summary_from_trace(trace)
+        if not summary_text:
+            return ""
+        context.context_debug["reasoning_summary"] = summary_text
+        context.context_debug["reasoning_summary_model"] = str(
+            getattr(settings, "agent_reasoning_summary_model", "qwen3.5-flash") or "qwen3.5-flash"
+        ).strip()
+        context.context_debug["reasoning_summary_provider"] = str(
+            getattr(settings, "agent_reasoning_summary_provider", "aliyun") or "aliyun"
+        ).strip()
+        context.reasoning_summary = summary_text
+        return summary_text
+
+    @staticmethod
+    async def generate_reasoning_summary_from_trace(trace: str) -> str:
+        trace_text = str(trace or "").strip()
+        if not trace_text:
+            return ""
+
         provider = str(getattr(settings, "agent_reasoning_summary_provider", "aliyun") or "aliyun").strip()
         model_name = str(getattr(settings, "agent_reasoning_summary_model", "qwen3.5-flash") or "qwen3.5-flash").strip()
         max_tokens = max(int(getattr(settings, "agent_reasoning_summary_max_tokens", 220) or 220), 64)
@@ -2779,7 +3314,7 @@ class AgentCore:
             summary_llm.config = dict(summary_llm.config)
             summary_llm.config["model"] = model_name
             response = await summary_llm.chat(
-                messages=[{"role": "user", "content": trace}],
+                messages=[{"role": "user", "content": trace_text}],
                 system_prompt=(
                     "你是一个推理过程压缩器。请把给定的多轮推理、工具使用与最终回答压缩成 1 到 3 句中文总结。"
                     "只保留回答策略、关键证据或工具、是否仍有未解问题。"
@@ -2788,14 +3323,9 @@ class AgentCore:
                 ),
                 temperature=0.2,
                 max_tokens=max_tokens,
+                source="chat.reasoning_summary",
             )
-            summary_text = self._compact_debug_text(response.get("content", ""), 160).strip()
-            if not summary_text:
-                return ""
-            context.context_debug["reasoning_summary"] = summary_text
-            context.context_debug["reasoning_summary_model"] = model_name
-            context.context_debug["reasoning_summary_provider"] = provider
-            context.reasoning_summary = summary_text
+            summary_text = AgentCore._compact_debug_text(response.get("content", ""), 160).strip()
             return summary_text
         except Exception as exc:
             logger.warning(f"[AgentCore] reasoning summary failed: {exc}")
@@ -2890,6 +3420,17 @@ class AgentCore:
         user_chat_preferences = dict(context.user_chat_preferences or {}) if isinstance(context.user_chat_preferences, dict) else {}
         active_rag_overrides = dict(context.active_rag_overrides or {}) if isinstance(context.active_rag_overrides, dict) else {}
         effective_budget_state = dict(budget_state or {})
+        skill_resolution = dict(self._last_skill_resolution or {})
+        available_skills = [
+            dict(item)
+            for item in list(skill_resolution.get("available_skills") or [])
+            if isinstance(item, dict)
+        ]
+        active_skills = [
+            dict(item)
+            for item in list(skill_resolution.get("active_skills") or [])
+            if isinstance(item, dict)
+        ]
 
         payload = {
             "version": "chat_context_debug.v1",
@@ -2920,7 +3461,13 @@ class AgentCore:
             "routing_confidence": float(selection.get("routing_confidence") or 0.0),
             "carry_over_previous_goal": bool(selection.get("carry_over_previous_goal")),
             "selected_tools": [str(item) for item in (selection.get("selected_tools") or []) if str(item or "").strip()],
+            "skill_enforced_tools": [str(item) for item in (selection.get("skill_enforced_tools") or []) if str(item or "").strip()],
+            "skill_blocked_tools": [str(item) for item in (selection.get("skill_blocked_tools") or []) if str(item or "").strip()],
+            "active_skill_names": [str(item) for item in (selection.get("active_skill_names") or []) if str(item or "").strip()],
             "tool_choice": str(selection.get("tool_choice") or "auto"),
+            "available_skills": available_skills,
+            "active_skills": active_skills,
+            "skill_prompt_tokens_estimate": int(max(0, skill_resolution.get("active_prompt_tokens") or 0)),
             "conversation_state": conversation_state,
             "conversation_state_summary": self._compact_debug_text(conversation_state_summary, 600),
             "anchor_summary": self._compact_debug_text(anchor_summary, 600),
@@ -3150,7 +3697,11 @@ class AgentCore:
             return sanitized
 
         window_turns = max(int(getattr(settings, "agent_context_window_turns", 8)), 1)
-        recently_slid_turns = max(int(getattr(settings, "agent_context_recently_slid_turns", 2) or 2), 0)
+        raw_recently_slid_turns = getattr(settings, "agent_context_recently_slid_turns", 2)
+        recently_slid_turns = max(
+            int(raw_recently_slid_turns if raw_recently_slid_turns is not None else 2),
+            0,
+        )
         older, recently_slid, recent = self._split_context_windows(
             history_source,
             recent_turns=window_turns,
@@ -3565,10 +4116,74 @@ class AgentCore:
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             return False
+        if not callable(getattr(self.runtime_service, "get_conversation_item_stream", None)):
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                "pre_turn_compaction_skipped": "runtime_item_stream_unavailable",
+            }
+            return False
 
         inputs = await self._gather_runtime_compaction_inputs(context)
+        candidate_rows = [
+            dict(item)
+            for item in list(inputs.get("canonical_rows") or inputs.get("payload_rows") or [])
+            if isinstance(item, dict)
+        ]
+        if not candidate_rows:
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                "pre_turn_compaction_skipped": "no_history_rows",
+            }
+            return False
+
+        window_turns = max(int(getattr(settings, "agent_context_window_turns", 8) or 8), 1)
+        raw_pre_turn_recently_slid_turns = getattr(settings, "agent_context_recently_slid_turns", 2)
+        recently_slid_turns = max(
+            int(raw_pre_turn_recently_slid_turns if raw_pre_turn_recently_slid_turns is not None else 2),
+            0,
+        )
+        older_rows, recently_slid_rows, _recent_rows = self._split_context_windows(
+            candidate_rows,
+            recent_turns=window_turns,
+            recently_slid_turns=recently_slid_turns,
+        )
+        compactable_rows = list(older_rows or []) + list(recently_slid_rows or [])
+        if not compactable_rows:
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                "pre_turn_compaction_skipped": "no_compactable_history",
+                "pre_turn_compaction_candidate_messages": len(candidate_rows),
+            }
+            return False
+
+        effective_budget = max(
+            int(
+                (context.context_debug or {}).get("effective_budget")
+                or getattr(settings, "agent_context_max_input_tokens", 10000)
+                or 0
+            ),
+            1024,
+        )
+        configured_trigger = int(getattr(settings, "agent_mid_run_compaction_message_tokens_trigger", 0) or 0)
+        summary_trigger = int(getattr(settings, "agent_context_summary_trigger_tokens", 7000) or 7000)
+        default_trigger = min(max(int(effective_budget * 0.6), 2048), max(summary_trigger, 2048))
+        trigger_tokens = max(configured_trigger or default_trigger, 256)
+        candidate_tokens = self._estimate_messages_tokens(candidate_rows)
+        old_history_exists = bool(older_rows)
+        pressure_triggered = candidate_tokens >= trigger_tokens
+        if not old_history_exists and not pressure_triggered:
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                "pre_turn_compaction_skipped": "below_pressure",
+                "pre_turn_compaction_candidate_tokens": candidate_tokens,
+                "pre_turn_compaction_trigger_tokens": trigger_tokens,
+                "pre_turn_compaction_compactable_messages": len(compactable_rows),
+            }
+            return False
+
+        pre_turn_payload_rows = inputs["canonical_rows"] or inputs["payload_rows"]
         compacted_history, artifacts = await self._resolve_runtime_compaction_artifacts(
-            payload_rows=inputs["payload_rows"],
+            payload_rows=pre_turn_payload_rows,
             canonical_rows=inputs["canonical_rows"],
             tool_rows=inputs["tool_rows"],
             latest_message_id=inputs["latest_message_id"],
@@ -3589,6 +4204,18 @@ class AgentCore:
 
     async def _maybe_mid_run_compact(self, context: AgentContext, system_prompt: str) -> bool:
         if not bool(getattr(settings, "agent_mid_run_compaction_enabled", True)):
+            return False
+        active_skill_names = [
+            str(item.get("name") or "").strip()
+            for item in list((self._last_skill_resolution or {}).get("active_skills") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        if self._PAPER_SKILL_NAME in active_skill_names:
+            context.context_debug = {
+                **dict(context.context_debug or {}),
+                "mid_run_compaction_skipped": "skill_exempt",
+                "mid_run_compaction_active_skills": active_skill_names,
+            }
             return False
         min_iteration = max(int(getattr(settings, "agent_mid_run_compaction_min_iteration", 2) or 2), 1)
         if int(context.iteration or 0) < min_iteration:
@@ -3839,7 +4466,7 @@ class AgentCore:
         events: List[Dict[str, Any]],
     ) -> Optional[str]:
         channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
-        if channel not in {"codelab_agent", "notebook_agent"}:
+        if channel not in {"chat", "codelab_agent", "notebook_agent"}:
             return None
 
         observations = [
@@ -3876,7 +4503,7 @@ class AgentCore:
         events: List[Dict[str, Any]],
     ) -> Optional[str]:
         channel = str(getattr(self.runtime_context, "channel", "") or "").strip().lower()
-        if channel not in {"codelab_agent", "notebook_agent"}:
+        if channel not in {"chat", "codelab_agent", "notebook_agent"}:
             return None
 
         observations = [
@@ -3890,11 +4517,12 @@ class AgentCore:
         latest_background_observation: Optional[Dict[str, Any]] = None
         for item in observations:
             tool_data = item.get("data") if isinstance(item.get("data"), dict) else {}
-            execution = dict(tool_data.get("background_execution") or {})
+            result_data = tool_data.get("data") if isinstance(tool_data.get("data"), dict) else {}
+            execution = dict(result_data.get("background_execution") or tool_data.get("background_execution") or {})
             status = str(execution.get("status") or "").strip().lower()
             if (
-                bool(tool_data.get("background_execution_started"))
-                and not bool(tool_data.get("background_execution_completed"))
+                bool(result_data.get("background_execution_started") or tool_data.get("background_execution_started"))
+                and not bool(result_data.get("background_execution_completed") or tool_data.get("background_execution_completed"))
                 and status in {"", "pending", "running"}
             ):
                 latest_background_observation = item
@@ -3903,23 +4531,28 @@ class AgentCore:
             return None
 
         tool_data = latest_background_observation.get("data") if isinstance(latest_background_observation.get("data"), dict) else {}
-        execution = dict(tool_data.get("background_execution") or {})
+        result_data = tool_data.get("data") if isinstance(tool_data.get("data"), dict) else {}
+        execution = dict(result_data.get("background_execution") or tool_data.get("background_execution") or {})
+        stage = str(execution.get("stage") or "").strip().lower()
         execution_id = str(execution.get("execution_id") or "").strip()
-        cell_id = str(tool_data.get("cell_id") or execution.get("cell_id") or "").strip()
-        detail = self._truncate_failure_text(
-            str(latest_background_observation.get("output") or "长任务已转入后台执行。"),
-            limit=220,
-        )
+        cell_id = str(result_data.get("cell_id") or tool_data.get("cell_id") or execution.get("cell_id") or "").strip()
+        if stage in {"env_setup", "data_prep"}:
+            return None
+        detail = str(
+            result_data.get("background_execution_user_summary")
+            or tool_data.get("background_execution_user_summary")
+            or latest_background_observation.get("output")
+            or "已启动后台 execution。"
+        ).strip()
+        detail = self._truncate_failure_text(detail, limit=420)
         suffix_parts = []
         if cell_id:
             suffix_parts.append(f"cell_id={cell_id}")
-        if execution_id:
+        if execution_id and f"Execution ID: {execution_id}" not in detail and f"execution_id={execution_id}" not in detail:
             suffix_parts.append(f"execution_id={execution_id}")
-        suffix = f"（{'，'.join(suffix_parts)}）" if suffix_parts else ""
-        context.final_answer = (
-            f"{detail} 当前任务已转入后台执行{suffix}。"
-            "你可以稍后刷新 notebook 查看结果；如果不需要继续执行，可以手动停止。"
-        )
+        if suffix_parts:
+            detail = f"{detail}\n- Context: {'，'.join(suffix_parts)}"
+        context.final_answer = detail
         context.state = AgentState.DONE
         return "检测到长任务已切换到后台执行，本轮停止继续调用工具，改为向用户回报任务状态。"
 
@@ -4090,6 +4723,7 @@ class AgentCore:
             observation_output=observation_output,
             result_data=result.data if isinstance(result.data, dict) else {},
         )
+        await self._maybe_pin_skill_from_tool_result(context, call, result)
         self._remember_source_items(
             context,
             list(result_metadata.get("source_items") or []) if isinstance(result_metadata.get("source_items"), list) else [],
@@ -4492,6 +5126,33 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
+            missing_paper_tools = self._missing_required_paper_skill_tool_calls(context)
+            if missing_paper_tools:
+                retries = int((context.context_debug or {}).get("paper_skill_tool_guard_retries") or 0)
+                context.context_debug = {
+                    **dict(context.context_debug or {}),
+                    "paper_skill_tool_guard_retries": retries + 1,
+                    "paper_skill_tool_guard_missing": list(missing_paper_tools),
+                }
+                if retries >= 2:
+                    safe_answer = (
+                        "本轮没有完成必要的 paper_research 工具调用，"
+                        "因此不能确认对应产物已经生成、写入或读回。"
+                        "请重试该步骤，或先查看当前 Project/workspace 状态。"
+                    )
+                    context.final_answer = safe_answer
+                    context.state = AgentState.DONE
+                    events.append({"type": "answer", "data": safe_answer})
+                    return events, True
+                guard_message = self._build_paper_skill_tool_guard_message(context, missing_paper_tools)
+                events.append(
+                    {
+                        "type": "thought",
+                        "data": "检测到当前阶段需要真实 paper_research 工具调用，已阻止直接回答并要求先执行工具。",
+                    }
+                )
+                context.messages.append({"role": "user", "content": guard_message})
+                return events, False
             if not thought_text:
                 events.append({"type": "thought", "data": "已完成问题分析，准备给出答案。"})
             answer = await self._ensure_citation_compliance(answer, context)
@@ -4546,6 +5207,7 @@ class AgentCore:
         saw_tool_call_delta = False
         streamed_answer = False
         final_payload: Dict[str, Any] = {}
+        buffer_direct_content = bool(self._missing_required_paper_skill_tool_calls(context))
 
         async for stream_event in stream_method(
             messages=llm_messages,
@@ -4562,7 +5224,7 @@ class AgentCore:
                 if not chunk:
                     continue
                 content_parts.append(chunk)
-                if not saw_tool_call_delta:
+                if not saw_tool_call_delta and not buffer_direct_content:
                     streamed_answer = True
                     yield {"type": "content", "data": chunk}
                 continue
@@ -4984,8 +5646,12 @@ class AgentCore:
                 yield answer_event
 
             context.state = AgentState.DONE
-            reasoning_summary = await self._generate_reasoning_summary(context)
-            final_thought = reasoning_summary or next(
+            reasoning_trace = (
+                self._build_reasoning_trace_for_summary(context)
+                if self._should_generate_reasoning_summary(context)
+                else ""
+            )
+            final_thought = next(
                 (s.content for s in reversed(context.steps) if s.step_type == "thought"),
                 "",
             )
@@ -5002,7 +5668,9 @@ class AgentCore:
                     "thought": final_thought,
                     "answer": context.final_answer,
                     "rag_metrics": rag_metrics,
-                    "reasoning_summary": reasoning_summary or None,
+                    "reasoning_summary": None,
+                    "reasoning_summary_pending": bool(reasoning_trace),
+                    "_reasoning_trace": reasoning_trace or None,
                     "citation_index": citation_index or None,
                 },
             }

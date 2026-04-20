@@ -8,6 +8,8 @@ import {
   type ChatPreferenceCandidate,
   type ChatPreferenceKey,
   type ChatRagOverrides,
+  type ChatWorkflowAction,
+  type ChatSkillLaunchRequest,
   type ChatUserPreferences,
 } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
@@ -49,6 +51,7 @@ const ChatPage = () => {
     streamingThought,
     streamingContextDebug,
     lastRunContextDebug,
+    workflowControl,
     iterationSteps,
     currentIteration,
     currentToolCall,
@@ -179,6 +182,7 @@ const ChatPage = () => {
   useEffect(() => {
     const state = location.state as {
       initialMessage?: string
+      initialSkillLaunch?: ChatSkillLaunchRequest
       highlightMessageId?: number
     } | null
 
@@ -191,7 +195,9 @@ const ChatPage = () => {
       !isSending
     ) {
       initialMessageSent.current = true
-      sendMessage(state.initialMessage).catch((err) => {
+      sendMessage(state.initialMessage, {
+        skillLaunch: state.initialSkillLaunch || null,
+      }).catch((err) => {
         console.error('发送初始消息失败:', err)
         // Error handled by store
         initialMessageSent.current = false
@@ -263,6 +269,31 @@ const ChatPage = () => {
 
   const handleQuickPrompt = (prompt: string) => {
     setInputValue(prompt)
+  }
+
+  const handleWorkflowAction = async (action: ChatWorkflowAction) => {
+    const messageContent = String(action.message || '').trim()
+    if (!messageContent || isSending) return
+
+    setInputValue('')
+    setContextPreview(null)
+    setPreviewError(null)
+    setIsPreviewLoading(false)
+
+    try {
+      const newConvId = await sendMessage(messageContent, {
+        skillLaunch: action.skill_launch || null,
+      })
+      setChatPreferenceOverrides({})
+      setRagOverrides(null)
+      setIgnoredCandidateIds([])
+      setRagResetToken((current) => current + 1)
+      if (newConvId && !conversationId) {
+        navigate(`/chat/${newConvId}`, { replace: true })
+      }
+    } catch {
+      // Error handled by store
+    }
   }
 
   const handleRequestPreview = async () => {
@@ -367,10 +398,12 @@ const ChatPage = () => {
         ragOverrides={ragOverrides}
         effectiveRagOverrides={contextPreview?.effective_rag_overrides || ragOverrides}
         ragResetToken={ragResetToken}
+        workflowControl={workflowControl}
         llmProvider={currentConversation?.llm_provider}
         onInputChange={setInputValue}
         onSend={() => handleSend()}
         onStop={stopGeneration}
+        onWorkflowAction={handleWorkflowAction}
         onRequestPreview={handleRequestPreview}
         onChatPreferenceOverrideChange={handleChatPreferenceOverrideChange}
         onChatPreferenceOverrideClear={handleChatPreferenceOverrideClear}
