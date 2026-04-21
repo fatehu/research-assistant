@@ -1507,6 +1507,12 @@ class _PaperResearchToolBase(ToolBase):
             "content_type": "json",
             "actual_rel_path": "paper_intake_result.json",
         },
+        "planning/paper_summary.json": {
+            "kind": "planning",
+            "name": "paper_summary",
+            "content_type": "json",
+            "actual_rel_path": "paper_summary.json",
+        },
         "planning/experiment_spec.json": {
             "kind": "planning",
             "name": "experiment_spec",
@@ -1756,6 +1762,7 @@ class _PaperResearchToolBase(ToolBase):
     def _workspace_missing_required_archives(cls, workspace_dir: Path) -> bool:
         required_paths = (
             "paper_intake_result.json",
+            "paper_summary.json",
             "experiment_spec.json",
             "workspace_adapter_manifest.json",
         )
@@ -2633,6 +2640,7 @@ class _PaperResearchToolBase(ToolBase):
         spec = dict(getattr(workspace, "experiment_spec_json", {}) or {})
         summary = dict(getattr(workspace, "summary_json", {}) or {})
         brief = dict(spec.get("optimization_brief") or {})
+        paper_summary = dict(summary.get("paper_summary") or {})
         return {
             "id": int(workspace.id),
             "status": str(workspace.status or ""),
@@ -2642,6 +2650,14 @@ class _PaperResearchToolBase(ToolBase):
             "execution_mode": spec.get("execution_mode") or summary.get("execution_mode"),
             "intake_status": dict(spec.get("intake_status") or {}),
             "intake_summary": _PaperResearchToolBase._intake_summary_from_workspace(workspace),
+            "paper_summary": {
+                "available": bool(paper_summary),
+                "problem_definition": paper_summary.get("problem_definition"),
+                "core_method": paper_summary.get("core_method"),
+                "reproduction_risk_count": len(list(paper_summary.get("reproduction_risks") or [])),
+                "verification_question_count": len(list(paper_summary.get("verification_questions") or [])),
+                "teaching_outline_count": len(list(paper_summary.get("teaching_outline") or [])),
+            },
             "task": dict(spec.get("task") or {}),
             "baseline": dict(spec.get("baseline") or {}),
             "datasets": [dict(item) for item in list(spec.get("datasets") or []) if isinstance(item, dict)][:8],
@@ -2846,6 +2862,15 @@ class _PaperResearchToolBase(ToolBase):
                 lines.append("- Structured intake JSON: available，可作为完成规划复用")
             else:
                 lines.append("- Structured intake JSON: missing，当前不是完成品，不能当作已完成规划复用")
+            paper_summary = dict(workspace_payload.get("paper_summary") or {})
+            if paper_summary.get("available"):
+                lines.append(
+                    "- Paper summary: available，可用于讲解/资料搜集/调优与验证设计"
+                    + (
+                        f"（复现风险 {int(paper_summary.get('reproduction_risk_count') or 0)} 条，"
+                        f"验证问题 {int(paper_summary.get('verification_question_count') or 0)} 条）"
+                    )
+                )
             if intake_summary.get("error"):
                 lines.append(f"- Intake error: {intake_summary.get('error')}")
             if payload.get("intake_refreshed"):

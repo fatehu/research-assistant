@@ -613,6 +613,7 @@ class ProjectService:
         results: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         experiment_spec = dict(workspace.get("experiment_spec") or {})
+        summary = dict(workspace.get("summary") or {})
         implementation_spec = self._safe_read_json_file(workspace_dir / "specs" / "implementation_spec.json" if workspace_dir else None)
         run_drafts = self._safe_read_json_file(workspace_dir / "drafts" / "run_drafts.json" if workspace_dir else None)
         compare_report = dict(workspace.get("compare_report") or {})
@@ -623,6 +624,7 @@ class ProjectService:
                 ("论文 Markdown", "paper_intake_markdown.md", "markdown"),
                 ("Intake payload", "paper_intake_payload.json", "json"),
                 ("Intake result", "paper_intake_result.json", "json"),
+                ("Paper summary", "paper_summary.json", "json"),
                 ("Experiment spec", "experiment_spec.json", "json"),
                 ("Repo reference", "repo_reference.json", "json"),
                 ("Repo index", "repo_file_index.json", "json"),
@@ -630,12 +632,19 @@ class ProjectService:
             ],
         )
         planning_present = [item for item in planning_artifacts if bool(item.get("present"))]
-        planning_complete = self._artifact_present(workspace_dir, "paper_intake_result.json") and self._artifact_present(workspace_dir, "experiment_spec.json")
+        planning_complete = (
+            self._artifact_present(workspace_dir, "paper_intake_result.json")
+            and self._artifact_present(workspace_dir, "paper_summary.json")
+            and self._artifact_present(workspace_dir, "experiment_spec.json")
+        )
         task = dict(experiment_spec.get("task") or {})
+        paper_summary = dict(summary.get("paper_summary") or self._safe_read_json_file(workspace_dir / "paper_summary.json" if workspace_dir else None))
         planning_summary = (
-            str(task.get("task_type") or "").strip()
+            str(paper_summary.get("problem_definition") or "").strip()
+            or str(paper_summary.get("core_method") or "").strip()
+            or str(task.get("task_type") or "").strip()
             or str(task.get("domain") or "").strip()
-            or ("已生成 intake 与 experiment spec" if planning_complete else None)
+            or ("已生成 intake、paper summary 与 experiment spec" if planning_complete else None)
         )
 
         implementation_artifacts = self._artifact_group(

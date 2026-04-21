@@ -6027,11 +6027,7 @@ class AgentCore:
 
         if not raw_thought_text and content.strip() and parsed_calls:
             raw_thought_text = self._strip_think_content(content)
-        thought_text = self._coerce_thought_for_display(
-            raw_thought_text,
-            tool_names=[call.name for call in parsed_calls],
-            answer_hint=answer_hint,
-        )
+        thought_text = str(raw_thought_text or "").strip()
         if thought_text:
             events.append({"type": "thought", "data": thought_text})
 
@@ -6230,11 +6226,7 @@ class AgentCore:
                 )
                 for idx, action in enumerate(actions, start=1)
             ]
-            display_thought = self._coerce_thought_for_display(
-                str(parsed["thought"] or ""),
-                tool_names=[call.name for call in parsed_calls],
-                answer_hint=answer_hint,
-            )
+            display_thought = str(parsed["thought"] or "").strip()
             if display_thought:
                 events.append({"type": "thought", "data": display_thought})
 

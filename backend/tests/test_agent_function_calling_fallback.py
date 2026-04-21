@@ -666,7 +666,7 @@ async def test_function_calling_direct_answer_extracts_thinking_alias_into_thoug
 
 
 @pytest.mark.asyncio
-async def test_function_calling_tool_plan_redacts_answer_like_reasoning_into_process_summary():
+async def test_function_calling_tool_plan_keeps_original_reasoning_text_in_process_lane():
     agent = ReActAgent(_AnswerDraftToolCallFCLLM(), _DateTimeOnlyTools(), max_iterations=2)
 
     events = []
@@ -677,8 +677,8 @@ async def test_function_calling_tool_plan_redacts_answer_like_reasoning_into_pro
     answer_event = next(event for event in events if event.get("type") == "answer")
 
     assert thought_events
-    assert "调用 `datetime`" in str(thought_events[0]["data"])
-    assert "关键里程碑" not in str(thought_events[0]["data"])
+    assert "让我先给出关键里程碑" in str(thought_events[0]["data"])
+    assert "2014年：注意力机制进入机器翻译" in str(thought_events[0]["data"])
     assert "2014" in str(answer_event["data"])
 
 
@@ -838,7 +838,8 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
     assert runtime_service.entries[1]["kind"] == "tool_result"
     assert runtime_service.entries[1]["status"] == "succeeded"
     assert runtime_service.entries[1]["success"] is True
-    assert "tool=datetime" in str(runtime_service.entries[1]["summary"])
+    assert str(runtime_service.entries[1]["summary"]).strip()
+    assert "2014" in str(runtime_service.entries[1]["summary"])
     assert "成功" in str(runtime_service.entries[1]["summary"])
     assert runtime_service.item_entries
     assert runtime_service.item_entries[0]["kind"] == "tool_use_summary"

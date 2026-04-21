@@ -1,7 +1,7 @@
 interface:
   display_name: "Paper Reproduction"
-  short_description: "Reproduce, run, tune, and compare saved paper projects"
-  default_prompt: "Use $paper-reproduction to continue the saved paper reproduction Project from current artifacts and status."
+  short_description: "Extract facts, ground the reproduction path, surface blockers, and execute only after qualification"
+  default_prompt: "Use $paper-reproduction to read the saved paper state, preserve a reusable summary, ground the current reproduction path, identify blockers, qualify what can actually run, and execute only when preflight conditions are satisfied."
 
 policy:
   allow_implicit_invocation: true

@@ -133,3 +133,38 @@ def test_paper_research_status_summary_handles_missing_runtime_overview():
     assert summary["baseline_status"] == "missing"
     assert summary["tuning_status"] == "missing"
     assert "paper_research_prepare" in summary["recommended_next_action"]
+
+
+def test_stage_ledger_planning_requires_paper_summary(tmp_path):
+    service = ProjectService(db=None)
+    workspace = {
+        "experiment_spec": {"task": {"task_type": "classification"}},
+        "summary": {},
+        "compare_report": {},
+    }
+
+    (tmp_path / "paper_intake_result.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "experiment_spec.json").write_text("{}", encoding="utf-8")
+
+    ledger_without_summary = service._build_stage_ledger(
+        workspace=workspace,
+        workspace_dir=tmp_path,
+        recent_executions=[],
+        results={},
+    )
+
+    planning_stage = next(item for item in ledger_without_summary if item["stage"] == "planning")
+    assert planning_stage["status"] == "ready"
+
+    (tmp_path / "paper_summary.json").write_text('{"problem_definition":"classify tabular data"}', encoding="utf-8")
+
+    ledger_with_summary = service._build_stage_ledger(
+        workspace=workspace,
+        workspace_dir=tmp_path,
+        recent_executions=[],
+        results={},
+    )
+
+    planning_stage_with_summary = next(item for item in ledger_with_summary if item["stage"] == "planning")
+    assert planning_stage_with_summary["status"] == "completed"
+    assert planning_stage_with_summary["summary"] == "classify tabular data"

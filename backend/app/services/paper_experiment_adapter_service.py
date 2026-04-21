@@ -46,10 +46,12 @@ class PaperExperimentAdapterService:
         intake_payload = dict(materials.get("intake_payload") or {})
         intake_json = dict(materials.get("paper_intake") or {})
         paper_markdown = str(materials.get("paper_markdown") or "")
+        paper_summary = self.build_paper_summary(paper=paper, summary=summary, experiment_spec=experiment_spec)
 
         self._write_json(workspace_dir / "paper_metadata.json", self._paper_metadata_payload(paper))
         self._write_json(workspace_dir / "paper_intake_payload.json", self._safe_intake_payload(intake_payload))
         self._write_json(workspace_dir / "paper_intake_result.json", intake_json)
+        self._write_json(workspace_dir / "paper_summary.json", paper_summary)
         self._write_json(workspace_dir / "experiment_spec.json", dict(experiment_spec or {}))
         self._write_text(workspace_dir / "paper_intake_markdown.md", paper_markdown)
         self._write_text(
@@ -88,6 +90,7 @@ class PaperExperimentAdapterService:
             "paper_markdown_file": "paper_intake_markdown.md",
             "intake_payload_file": "paper_intake_payload.json",
             "intake_json_file": "paper_intake_result.json",
+            "paper_summary_file": "paper_summary.json",
             "experiment_spec_file": "experiment_spec.json",
             "readme_file": "WORKSPACE_README.md",
             "template_files": template_files,
@@ -202,12 +205,14 @@ class PaperExperimentAdapterService:
         workspace_dir = Path(workspace_dir)
         intake_payload = dict(summary.get("paper_llm_input") or {})
         intake_json = dict(summary.get("paper_intake") or {})
+        paper_summary = self.build_paper_summary(paper=paper, summary=summary, experiment_spec=experiment_spec)
 
         self._write_json(workspace_dir / "paper_metadata.json", self._paper_metadata_payload(paper))
         if intake_payload:
             self._write_json(workspace_dir / "paper_intake_payload.json", self._safe_intake_payload(intake_payload))
         if intake_json:
             self._write_json(workspace_dir / "paper_intake_result.json", intake_json)
+        self._write_json(workspace_dir / "paper_summary.json", paper_summary)
         self._write_json(workspace_dir / "experiment_spec.json", dict(experiment_spec or {}))
         self._write_text(
             workspace_dir / "WORKSPACE_README.md",
@@ -252,6 +257,7 @@ class PaperExperimentAdapterService:
             "paper_markdown_file": existing_manifest.get("paper_markdown_file"),
             "intake_payload_file": "paper_intake_payload.json" if intake_payload else existing_manifest.get("intake_payload_file"),
             "intake_json_file": "paper_intake_result.json" if intake_json else existing_manifest.get("intake_json_file"),
+            "paper_summary_file": "paper_summary.json",
             "experiment_spec_file": "experiment_spec.json",
             "readme_file": "WORKSPACE_README.md",
             "template_files": list(existing_manifest.get("template_files") or []),
@@ -965,6 +971,7 @@ class PaperExperimentAdapterService:
             "- `paper_intake_markdown.md`: local PDF -> markdown output used for the intake LLM.",
             "- `paper_intake_payload.json`: metadata and context summary sent into the intake pipeline.",
             "- `paper_intake_result.json`: structured JSON returned by the intake LLM.",
+            "- `paper_summary.json`: reusable paper summary for explanation, grounding, tuning, and verification design.",
             "- `experiment_spec.json`: execution-oriented spec consumed by CodeLab runs.",
             "- `workspace_adapter_manifest.json`: repo/materialization status for this workspace.",
             "- `repo_reference.json`: resolved repo acquisition result.",
@@ -985,6 +992,263 @@ class PaperExperimentAdapterService:
             "- Repo acquisition is best-effort and is treated as reference material, not as a hard dependency for the baseline run.",
         ]
         return "\n".join(lines).strip() + "\n"
+
+    @classmethod
+    def build_paper_summary(
+        cls,
+        *,
+        paper: Paper,
+        summary: Dict[str, Any],
+        experiment_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        intake = cls._as_dict(summary.get("paper_intake"))
+        paper_profile = cls._as_dict(intake.get("paper_profile"))
+        training_setup = cls._as_dict(intake.get("training_setup"))
+        evaluation_setup = cls._as_dict(intake.get("evaluation_setup"))
+        models = cls._named_items(intake.get("models"))
+        metrics = cls._named_items(intake.get("metrics"))
+        datasets = cls._dataset_items(intake.get("dataset_candidates"))
+        optimization_candidates = [
+            cls._as_dict(item)
+            for item in cls._as_list(intake.get("optimization_candidates"))
+            if isinstance(item, dict)
+        ]
+        discovery_tasks = [
+            cls._as_dict(item)
+            for item in cls._as_list(intake.get("discovery_tasks"))
+            if isinstance(item, dict)
+        ]
+        limitations = [str(item).strip() for item in cls._as_list(intake.get("limitations")) if str(item).strip()]
+        sources = cls._as_dict(experiment_spec.get("sources"))
+        entrypoint_hints = [
+            cls._as_dict(item)
+            for item in cls._as_list(intake.get("entrypoint_hints"))
+            if isinstance(item, dict)
+        ]
+
+        problem_definition = cls._first_text(
+            [
+                paper_profile.get("problem_statement"),
+                paper.abstract,
+            ]
+        )
+        core_method = cls._first_text(
+            [
+                paper_profile.get("contribution_summary"),
+                paper_profile.get("experiment_goal"),
+                paper.abstract,
+            ]
+        )
+        task_type = cls._first_text([paper_profile.get("task_type"), cls._as_dict(experiment_spec.get("task")).get("task_type")])
+        domain = cls._first_text([paper_profile.get("domain"), cls._as_dict(experiment_spec.get("task")).get("domain")])
+        dataset_names = [item["name"] for item in datasets[:6]]
+        metric_names = [item["name"] for item in metrics[:6]]
+        model_names = [item["name"] for item in models[:6]]
+        entrypoint_values = [
+            cls._first_text([item.get("value"), item.get("evidence_text")])
+            for item in entrypoint_hints[:6]
+            if cls._first_text([item.get("value"), item.get("evidence_text")])
+        ]
+
+        claimed_contributions = []
+        contribution_summary = cls._first_text([paper_profile.get("contribution_summary")])
+        if contribution_summary:
+            claimed_contributions.append(contribution_summary)
+        claimed_contributions.extend(
+            [
+                str(item.get("name") or "").strip()
+                for item in optimization_candidates[:3]
+                if str(item.get("name") or "").strip()
+            ]
+        )
+
+        reproduction_risks: List[str] = []
+        for item in discovery_tasks:
+            if item.get("required_before_execution"):
+                target = str(item.get("target") or "unknown").strip() or "unknown"
+                reason = cls._first_text([item.get("reason"), item.get("query_or_hint")]) or "需要进一步确认"
+                reproduction_risks.append(f"{target}: {reason}")
+        if not list(sources.get("repo_urls") or []):
+            reproduction_risks.append("官方代码仓库尚未在当前 intake 中确认，grounding 阶段需要先完成 repo 证据闭环。")
+        if any(item.get("requires_download") and not item.get("url") for item in datasets):
+            reproduction_risks.append("部分数据集只确认了名称，没有确认可下载来源，后续需要补足官方数据证据。")
+        for item in limitations[:4]:
+            reproduction_risks.append(item)
+
+        tuning_hypotheses = [
+            {
+                "id": str(item.get("id") or "").strip() or None,
+                "name": str(item.get("name") or "").strip() or None,
+                "category": str(item.get("category") or "").strip() or None,
+                "rationale": cls._first_text([item.get("rationale"), item.get("expected_effect")]),
+                "expected_effect": cls._first_text([item.get("expected_effect")]),
+                "risk": str(item.get("risk") or "").strip() or None,
+            }
+            for item in optimization_candidates[:4]
+            if str(item.get("name") or item.get("id") or "").strip()
+        ]
+
+        verification_questions = [
+            cls._first_text([item.get("reason"), item.get("query_or_hint")])
+            for item in discovery_tasks[:8]
+            if cls._first_text([item.get("reason"), item.get("query_or_hint")])
+        ]
+        if not verification_questions and reproduction_risks:
+            verification_questions = reproduction_risks[:4]
+
+        glossary = cls._build_glossary(
+            dataset_names=dataset_names,
+            model_names=model_names,
+            metric_names=metric_names,
+        )
+
+        teaching_outline = [
+            {"section": "论文问题", "focus": problem_definition or task_type or "说明论文试图解决的问题"},
+            {"section": "核心方法", "focus": core_method or "概括论文的核心方法与方法直觉"},
+            {
+                "section": "实验设置",
+                "focus": cls._first_text(
+                    [
+                        paper_profile.get("experiment_goal"),
+                        f"重点关注数据集 {', '.join(dataset_names[:3])}" if dataset_names else None,
+                    ]
+                )
+                or "说明实验目标、数据与评价方式",
+            },
+            {
+                "section": "复现风险",
+                "focus": reproduction_risks[0] if reproduction_risks else "指出当前最影响复现的 blocker 或未知项",
+            },
+            {
+                "section": "后续验证",
+                "focus": verification_questions[0] if verification_questions else "定义下一步需要验证的关键问题",
+            },
+        ]
+
+        return {
+            "schema_version": "paper_summary_v1",
+            "paper_id": int(getattr(paper, "id", 0) or 0),
+            "title": str(getattr(paper, "title", "") or ""),
+            "task_type": task_type,
+            "domain": domain,
+            "source_mode": cls._as_dict(summary.get("paper_llm_input")).get("source_mode"),
+            "problem_definition": problem_definition,
+            "core_method": core_method,
+            "method_flow_or_architecture": {
+                "summary": core_method,
+                "models": model_names,
+                "entrypoint_hints": entrypoint_values,
+            },
+            "key_experiments": {
+                "goal": cls._first_text([paper_profile.get("experiment_goal")]),
+                "datasets": dataset_names,
+                "metrics": metric_names,
+            },
+            "main_results": {
+                "summary": cls._first_text([paper_profile.get("contribution_summary"), paper_profile.get("experiment_goal")]),
+                "reported_metrics": metric_names,
+                "reported_datasets": dataset_names,
+                "numeric_results_available": False,
+            },
+            "claimed_contributions": claimed_contributions[:6],
+            "limitations": limitations[:8],
+            "glossary": glossary,
+            "reproduction_risks": reproduction_risks[:8],
+            "tuning_hypotheses": tuning_hypotheses,
+            "verification_questions": verification_questions[:8],
+            "teaching_outline": teaching_outline,
+            "repo_urls": list(sources.get("repo_urls") or [])[:4],
+            "dataset_urls": list(sources.get("dataset_urls") or [])[:6],
+            "dependencies_mentioned": [
+                str(item).strip()
+                for item in cls._as_list(training_setup.get("dependencies_mentioned"))
+                if str(item).strip()
+            ][:12],
+            "evaluation_artifacts": [
+                str(item).strip()
+                for item in cls._as_list(evaluation_setup.get("artifacts"))
+                if str(item).strip()
+            ][:12],
+        }
+
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        return dict(value or {}) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        return list(value or []) if isinstance(value, list) else []
+
+    @staticmethod
+    def _first_text(values: List[Any]) -> Optional[str]:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+
+    @classmethod
+    def _named_items(cls, value: Any) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
+        for raw in cls._as_list(value):
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            items.append(
+                {
+                    "name": name,
+                    "evidence_text": str(raw.get("evidence_text") or "").strip() or None,
+                }
+            )
+        return items
+
+    @classmethod
+    def _dataset_items(cls, value: Any) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for raw in cls._as_list(value):
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            items.append(
+                {
+                    "name": name,
+                    "url": str(raw.get("url") or "").strip() or None,
+                    "requires_download": bool(raw.get("requires_download")),
+                    "evidence_text": str(raw.get("evidence_text") or "").strip() or None,
+                }
+            )
+        return items
+
+    @staticmethod
+    def _build_glossary(
+        *,
+        dataset_names: List[str],
+        model_names: List[str],
+        metric_names: List[str],
+    ) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for category, names in (
+            ("dataset", dataset_names),
+            ("model", model_names),
+            ("metric", metric_names),
+        ):
+            for name in names:
+                normalized = str(name or "").strip()
+                if not normalized:
+                    continue
+                key = normalized.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"term": normalized, "category": category})
+                if len(rows) >= 12:
+                    return rows
+        return rows
 
     @staticmethod
     def _write_text(path: Path, content: str) -> None:

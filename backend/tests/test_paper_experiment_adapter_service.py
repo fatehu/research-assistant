@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -58,11 +59,16 @@ def test_ensure_workspace_archive_from_existing_state_backfills_core_files(tmp_p
     )
 
     assert (workspace_dir / "paper_intake_result.json").is_file()
+    assert (workspace_dir / "paper_summary.json").is_file()
     assert (workspace_dir / "experiment_spec.json").is_file()
     assert (workspace_dir / "workspace_adapter_manifest.json").is_file()
     assert (workspace_dir / "repo_file_index.json").is_file()
     assert manifest["experiment_spec_file"] == "experiment_spec.json"
+    assert manifest["paper_summary_file"] == "paper_summary.json"
     assert manifest["repo"]["repo_url"] == "https://github.com/example/demo"
+    paper_summary = json.loads((workspace_dir / "paper_summary.json").read_text(encoding="utf-8"))
+    assert paper_summary["schema_version"] == "paper_summary_v1"
+    assert paper_summary["task_type"] == "classification"
 
 
 def test_build_repo_index_extracts_repo_history_url_candidates(tmp_path):

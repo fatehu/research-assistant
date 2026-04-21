@@ -243,6 +243,11 @@ class PaperExperimentService:
         bundle = await self._build_workspace_bundle(paper, user_id=user_id)
         summary = dict(bundle.get("summary") or {})
         experiment_spec = self._build_experiment_spec(paper, summary)
+        summary["paper_summary"] = self.adapter_service.build_paper_summary(
+            paper=paper,
+            summary=summary,
+            experiment_spec=experiment_spec,
+        )
         notebook = await self.notebook_service.create_notebook(
             user_id=int(user_id),
             title=f"{paper.title[:72]} - Experiment Workspace",
@@ -315,6 +320,11 @@ class PaperExperimentService:
         bundle = await self._build_workspace_bundle(paper, user_id=int(workspace.user_id))
         summary = dict(bundle.get("summary") or {})
         experiment_spec = self._build_experiment_spec(paper, summary)
+        summary["paper_summary"] = self.adapter_service.build_paper_summary(
+            paper=paper,
+            summary=summary,
+            experiment_spec=experiment_spec,
+        )
 
         adapter_manifest = await self._materialize_workspace_assets(
             paper=paper,

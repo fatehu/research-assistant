@@ -68,6 +68,7 @@ def test_paper_research_workspace_missing_required_archives(tmp_path):
     workspace_dir.mkdir(parents=True)
     assert tool._workspace_missing_required_archives(workspace_dir) is True
     (workspace_dir / "paper_intake_result.json").write_text("{}", encoding="utf-8")
+    (workspace_dir / "paper_summary.json").write_text("{}", encoding="utf-8")
     (workspace_dir / "experiment_spec.json").write_text("{}", encoding="utf-8")
     (workspace_dir / "workspace_adapter_manifest.json").write_text("{}", encoding="utf-8")
     assert tool._workspace_missing_required_archives(workspace_dir) is False

@@ -1,13 +1,31 @@
 ---
 name: paper-reproduction
-description: Reproduce and tune saved machine-learning or deep-learning papers from archived Project artifacts. Use when the user asks to reproduce a paper, run its code, prepare implementation plans, launch baseline experiments, tune parameters/models, compare results, or continue a saved paper Project.
+description: Turn archived machine-learning or deep-learning papers into a gated workflow that first extracts structured facts and a reusable paper summary, then grounds repo/data/runtime evidence, defines a concrete reproduction path, surfaces blockers, and executes only when qualification and preflight conditions pass. Use when the user asks to understand or explain a saved paper, gather supporting material, prepare or validate a reproduction plan, qualify run drafts, run or debug grounded experiments, tune parameters/models, compare results, design verification steps, or continue a saved paper Project.
 ---
 
 # Paper Reproduction
 
-Use this skill as the complete business workflow for reproducing and tuning a saved paper.
+Use this skill as the control-plane workflow for a saved paper Project.
+
+The goal is not to push execution at any cost. First read the saved Project state, produce reusable paper understanding artifacts, and ground repo/data/runtime facts. Then make the current reproduction path explicit, qualify which drafts are actually runnable, and enter execution only when preflight says the run is ready to start. When the required conditions are not satisfied, stop clearly, report the blocker, and leave behind artifacts that still support explanation, source gathering, tuning, and validation design.
+
+Think in seven workflow stages even if the user does not name them:
+
+1. `intake_summary`
+2. `grounding`
+3. `implementation_plan`
+4. `run_qualification`
+5. `execution_preflight`
+6. `execution_run`
+7. `analysis_tuning_report`
 
 The user should not need to know internal phases. Always begin from the saved Project state, then continue from the first missing, blocked, or requested step.
+
+During `intake_summary`, preserve three planning artifacts together:
+
+- `planning/paper_intake_result.json`
+- `planning/paper_summary.json`
+- `planning/experiment_spec.json`
 
 ## Truth Files
 
@@ -30,20 +48,31 @@ Do not keep rediscovering the same facts by repeatedly rereading broad repo cont
 
 ## Core Rule
 
-Call `paper_research_status` first when `paper_id` or `project_id` is available.
+If the user explicitly asks only for `intake_summary`, paper explanation, or planning-only work, keep the turn inside `intake_summary`.
+
+- In that case, do not let old `execution` / `tuning` state change the scope of the answer.
+- You may use `paper_research_status` only to resolve `project_id` / `workspace_id` or confirm whether planning artifacts already exist.
+- If any planning artifact is missing or stale, refresh planning with `paper_research_prepare` before synthesizing:
+  - `planning/paper_intake_result.json`
+  - `planning/paper_summary.json`
+  - `planning/experiment_spec.json`
+- Do not recommend repo grounding, runtime inspection, execution, or tuning when the user explicitly forbids them.
+
+Outside that exception, call `paper_research_status` first when `paper_id` or `project_id` is available.
 
 Then decide the next action from state:
 
 1. If no workspace or structured intake exists, run intake with `paper_research_prepare`.
-2. If intake exists but repo/data evidence is missing, materialize or inspect repo evidence.
-3. If `specs/implementation_spec.json` is missing or stale, create or revise it from intake plus repo/data evidence and the current runtime/environment snapshot.
-4. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
-5. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
-6. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
-7. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
-8. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
-9. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
-10. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
+2. If any planning artifact is missing or stale, refresh planning with `paper_research_prepare` before moving to later stages.
+3. If intake exists but repo/data evidence is missing, materialize or inspect repo evidence.
+4. If `specs/implementation_spec.json` is missing or stale, create or revise it from intake plus repo/data evidence and the current runtime/environment snapshot.
+5. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
+6. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
+7. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
+8. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
+9. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
+10. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
+11. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
 
 Do not stop after intake when the user asked for full reproduction. Continue until a long execution starts, a required user confirmation is needed, or a real blocker is reached.
 
@@ -205,6 +234,12 @@ For planning/prep responses, include:
 - Existing artifacts read this turn.
 - What was written or why it was not written.
 - Current blockers and next action.
+
+For `intake_summary`-only responses, also enforce:
+
+- Focus on paper facts, reusable summary, reproduction risks, and next verification questions.
+- Do not report old baseline/tuning/runtime state unless the user explicitly asks for Project status.
+- If `paper_summary.json` is missing, say that planning artifacts need refresh instead of pretending later stages are the current task.
 
 For tuning-analysis responses before execution, include:
 

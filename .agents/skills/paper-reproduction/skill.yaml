@@ -1,12 +1,16 @@
 name: paper-reproduction
 description: >-
-  Complete saved-paper reproduction skill. Continue a Project from PDF/intake
-  through repo/data discovery, implementation planning, run drafts, baseline
-  execution, first tuning, metric comparison, and result reporting.
+  Saved-paper control-plane skill. Continue a Project from PDF/intake through
+  structured fact extraction, reusable paper summary, grounding of
+  repo/data/runtime evidence, run qualification, explicit blocker reporting,
+  and execution only when qualification and preflight conditions are
+  satisfied.
 when_to_use: >-
-  Use when the user wants to reproduce a saved paper, run or debug its code,
-  prepare implementation plans, start baseline experiments, tune parameters or
-  models, compare results, or continue an existing paper Project.
+  Use when the user wants to understand or explain a saved paper, extract
+  structured facts, summarize it for reuse, gather supporting material,
+  prepare or validate a reproduction path, qualify run drafts, run or debug
+  grounded experiments, tune parameters or models, compare results, design
+  verification steps, or continue an existing paper Project.
 category: paper
 family: paper-reproduction
 allowed_channels:
@@ -95,6 +99,7 @@ stages:
     reads: []
     writes:
       - planning/paper_intake_result.json
+      - planning/paper_summary.json
       - planning/experiment_spec.json
   - id: implementation_prep
     title: Implementation Prep
@@ -138,6 +143,8 @@ stages:
 artifacts:
   - name: intake_result
     path: planning/paper_intake_result.json
+  - name: paper_summary
+    path: planning/paper_summary.json
   - name: experiment_spec
     path: planning/experiment_spec.json
   - name: implementation_spec
