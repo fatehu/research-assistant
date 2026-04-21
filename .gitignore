@@ -72,6 +72,8 @@ __pycache__/
 backend/debug_scripts/
 backend/scripts/
 scripts/
+!.agents/skills/*/scripts/
+!.agents/skills/*/scripts/*.py
 
 # Build artifacts
 *.tsbuildinfo
