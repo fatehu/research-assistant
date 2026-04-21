@@ -2,7 +2,17 @@
 
 Use this reference when creating or revising `specs/implementation_spec.json` and `drafts/run_drafts.json`.
 
+This reference starts after stage-2 grounding is complete.
+
+Before `implementation_spec.json` is written, `specs/grounding_report.json` should already exist and classify repo, entrypoint, dataset, runtime, and external dependencies as `grounded`, `absent`, or `blocked`.
+
 ## Truth Maintenance
+
+Do not let `implementation_spec.json` replace `grounding_report.json`.
+
+- `grounding_report.json` owns fact closure for repo/data/runtime/dependencies.
+- `implementation_spec.json` owns the reproduction path built on top of those facts.
+- `run_drafts.json` owns execution-ready candidate runs built on top of implementation.
 
 `implementation_spec.json` and `run_drafts.json` are editable truth files, not write-once snapshots.
 
@@ -20,7 +30,9 @@ Do not leave stale blockers in place after local repo or execution evidence disp
 
 The implementation stage must not assume an abstract machine.
 
-Before finalizing `implementation_spec.json`, call `paper_research_inspect_runtime` and fold the current runtime facts into the plan:
+Before finalizing `implementation_spec.json`, first read the grounded runtime section in `grounding_report.json`. If the report is missing or still incomplete, go back to grounding instead of writing implementation.
+
+The implementation stage may still read `paper_research_inspect_runtime` results when they already exist, but runtime discovery itself belongs to `grounding`.
 
 - available runtime candidates
 - runtime-worker availability
@@ -72,6 +84,7 @@ Rules:
 
 - Use `files_read` and `evidence_log` with the same relative-path convention returned by the manifest.
 - Prefer official repo URLs and official dataset/artifact URLs recorded in the paper or README.
+- Trust a `grounding_report.json` external-url claim only when the required official links were individually probed or the report explicitly grounded local file presence; one successful sample URL does not close a whole sibling list.
 - `paper_research_clone_repo` and explicit repo evidence are the primary checks for repository viability.
 - If the repo is already materialized, verify expected dataset files against the current repo before emitting `dataset_missing`, `needs download`, or equivalent blockers.
 - `web_search` / `web_scrape` are only for diagnosing official-source failures or confirming an updated official location.

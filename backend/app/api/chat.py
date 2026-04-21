@@ -214,6 +214,7 @@ def _normalized_context_snapshot_payload(payload: object) -> Optional[dict]:
 
 _PAPER_STAGE_LABELS = {
     "planning": "规划阶段",
+    "grounding": "证据落地阶段",
     "implementation_prep": "实施准备阶段",
     "run_drafts": "运行草案阶段",
     "execution": "执行阶段",
@@ -222,6 +223,7 @@ _PAPER_STAGE_LABELS = {
 
 _PAPER_DEFAULT_STAGE_ORDER = (
     "planning",
+    "grounding",
     "implementation_prep",
     "run_drafts",
     "execution",
@@ -231,13 +233,16 @@ _PAPER_DEFAULT_STAGE_ORDER = (
 _PAPER_TOOL_STAGE_HINTS = {
     "paper_research_status": "planning",
     "paper_research_prepare": "planning",
-    "paper_research_clone_repo": "implementation_prep",
-    "paper_research_probe_repo": "implementation_prep",
-    "paper_research_get_artifact_manifest": "implementation_prep",
-    "paper_research_read_artifact": "implementation_prep",
-    "paper_research_read_repo_file": "implementation_prep",
-    "paper_research_search_repo": "implementation_prep",
-    "paper_research_inspect_runtime": "implementation_prep",
+    "paper_research_clone_repo": "grounding",
+    "paper_research_probe_repo": "grounding",
+    "paper_research_probe_url": "grounding",
+    "paper_research_get_artifact_manifest": "grounding",
+    "paper_research_read_artifact": "grounding",
+    "paper_research_read_grounding_report": "grounding",
+    "paper_research_write_grounding_report": "grounding",
+    "paper_research_read_repo_file": "grounding",
+    "paper_research_search_repo": "grounding",
+    "paper_research_inspect_runtime": "grounding",
     "paper_research_read_implementation_spec": "implementation_prep",
     "paper_research_write_implementation_spec": "implementation_prep",
     "paper_research_read_run_drafts": "run_drafts",
@@ -251,6 +256,7 @@ _PAPER_TOOL_STAGE_HINTS = {
 
 _PAPER_STAGE_COMPLETION_TOOLS = {
     "planning": {"paper_research_prepare"},
+    "grounding": {"paper_research_write_grounding_report"},
     "implementation_prep": {"paper_research_write_implementation_spec"},
     "run_drafts": {"paper_research_write_run_drafts"},
 }
@@ -341,6 +347,23 @@ def _normalize_paper_runtime_stage(stage: object) -> Optional[str]:
     return None
 
 
+def _infer_paper_stage_from_artifact_path(relative_path: object) -> Optional[str]:
+    normalized = str(relative_path or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized.startswith("planning/"):
+        return "planning"
+    if normalized == "specs/grounding_report.json":
+        return "grounding"
+    if normalized == "specs/implementation_spec.json":
+        return "implementation_prep"
+    if normalized == "drafts/run_drafts.json":
+        return "run_drafts"
+    if normalized.startswith("executions/"):
+        return "execution"
+    return None
+
+
 def _extract_workflow_status_from_tool_payload(payload: object) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -385,6 +408,7 @@ def _infer_paper_workflow_stage_from_tool_event(
             _normalize_paper_runtime_stage(background_execution.get("stage"))
             or _normalize_paper_runtime_stage(status_summary.get("current_stage"))
             or _normalize_paper_runtime_stage(tool_payload.get("current_stage"))
+            or _infer_paper_stage_from_artifact_path(tool_payload.get("relative_path"))
         )
     if inferred_stage is None:
         inferred_stage = _PAPER_TOOL_STAGE_HINTS.get(normalized_tool_name)

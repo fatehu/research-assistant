@@ -968,7 +968,7 @@ class PaperExperimentAdapterService:
             "",
             "## Workspace Assets",
             "",
-            "- `paper_intake_markdown.md`: local PDF -> markdown output used for the intake LLM.",
+            "- `paper_intake_markdown.md`: local PDF -> markdown auxiliary text kept for reference/fallback; stage-1 intake may use page images as the primary LLM input.",
             "- `paper_intake_payload.json`: metadata and context summary sent into the intake pipeline.",
             "- `paper_intake_result.json`: structured JSON returned by the intake LLM.",
             "- `paper_summary.json`: reusable paper summary for explanation, grounding, tuning, and verification design.",

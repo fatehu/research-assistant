@@ -1,10 +1,17 @@
 # Intake Contract
 
-Use this reference when preparing or explaining `planning/paper_intake_result.json` and `planning/experiment_spec.json`.
+Use this reference when preparing or explaining the stage-1 planning bundle:
+
+- `planning/paper_intake_result.json`
+- `planning/paper_summary.json`
+- `planning/experiment_spec.json`
+
+Current runtime stage id is still `planning`; semantically, that stage now corresponds to the new workflow stage `intake_summary`.
 
 ## Source Boundaries
 
 - The intake stage uses the saved paper and the local PDF-to-markdown pipeline when available.
+- The intake stage must produce both structured extraction facts and a reusable paper summary, not only experiment-oriented planning hints.
 - If the tool reports `source_mode=metadata_abstract_fallback`, explicitly say the result came from metadata/abstract fallback, not full PDF parsing.
 - The structured intake artifact is JSON facts and discovery hints. It is not runnable code.
 - Do not ask the intake model to generate Python code, shell commands, package installs, or fake repo paths from the paper alone.

@@ -9,6 +9,18 @@ from pathlib import Path
 
 
 REQUIRED_FIELDS = {
+    "grounding_report": [
+        "schema_version",
+        "paper_id",
+        "project_id",
+        "workspace_id",
+        "repo",
+        "entrypoint",
+        "dataset",
+        "runtime",
+        "external_dependencies",
+        "summary",
+    ],
     "implementation_spec": [
         "schema_version",
         "paper_id",

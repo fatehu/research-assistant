@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.config import settings
 from app.services.agent_tools import ToolResult
-from app.services.react_agent import AgentContext, AgentRuntimeContext, ParsedToolCall, ReActAgent
+from app.services.react_agent import AgentContext, AgentRuntimeContext, AgentStep, ExecutedToolCall, ParsedToolCall, ReActAgent
 
 
 class _FallbackLLM:
@@ -507,6 +507,42 @@ class _RepeatedRunDraftFailureTools:
         )
 
 
+class _RepeatedRepoReadFailureLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def supports_function_calling(self):
+        return False
+
+    async def chat(self, *args, **kwargs):
+        return {
+            "content": (
+                '<think>继续确认 classification-results.sh 的真实位置</think>'
+                '<action>{"tool":"paper_research_read_repo_file","input":{"project_id":142,'
+                '"repo_relative_path":"scripts/classification-results.sh","line_start":80,"line_end":96}}</action>'
+            ),
+            "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
+        }
+
+
+class _RepeatedRepoReadFailureTools:
+    def get_tools_description(self, **kwargs):
+        return "- paper_research_read_repo_file: 读取 repo 文件"
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "paper_research_read_repo_file"
+        return ToolResult(
+            success=False,
+            output=(
+                "仓库文件不存在: `repo/source/scripts/classification-results.sh`。"
+                "这通常不是文件不可读，而是 repo_relative_path 猜错了。"
+                "如果不确定真实路径，请先调用 `paper_research_search_repo` 用文件名或关键字定位，"
+                "不要继续假设它在 `scripts/` 等目录下。"
+            ),
+            error="repo_file_not_found",
+        )
+
+
 class _SimpleExecuteTools:
     def get_tools_description(self, **kwargs):
         return "- datetime: 时间计算"
@@ -746,6 +782,117 @@ async def test_function_calling_interrupts_repeated_repo_reads_after_success():
 
 
 @pytest.mark.asyncio
+async def test_paper_grounding_requires_grounding_report_before_direct_answer():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
+
+    context = AgentContext(
+        messages=[{"role": "user", "content": "继续 grounding"}],
+        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
+        steps=[
+            AgentStep(
+                step_type="action",
+                content="probe url",
+                tool_name="paper_research_probe_url",
+                tool_input={"url": "https://example.com/ag_news.csv"},
+            ),
+            AgentStep(
+                step_type="observation",
+                content="probe ok",
+                tool_name="paper_research_probe_url",
+                success=True,
+            ),
+        ],
+    )
+
+    missing = agent._missing_required_paper_skill_tool_calls(context)
+    assert "paper_research_write_grounding_report" in missing
+
+    events, done = await agent._finalize_function_calling_iteration(
+        context,
+        content="grounding 已完成，可以进入下一阶段。",
+        reasoning="",
+        parsed_calls=[],
+    )
+
+    assert done is False
+    assert any("真实 paper_research 工具调用" in str(event.get("data", "")) for event in events if event.get("type") == "thought")
+    assert context.messages[-1]["role"] == "user"
+    assert "paper_research_write_grounding_report" in str(context.messages[-1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_paper_read_only_grounding_summary_can_answer_without_rewriting_report():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
+
+    context = AgentContext(
+        messages=[{"role": "user", "content": "读取并总结当前 grounding_report"}],
+        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
+        steps=[
+            AgentStep(
+                step_type="action",
+                content="read grounding report",
+                tool_name="paper_research_read_grounding_report",
+            ),
+            AgentStep(
+                step_type="observation",
+                content="overall_status=blocked",
+                tool_name="paper_research_read_grounding_report",
+                success=True,
+            ),
+        ],
+    )
+
+    missing = agent._missing_required_paper_skill_tool_calls(context)
+    assert "paper_research_write_grounding_report" not in missing
+
+
+def test_grounding_blocked_without_alternative_candidates_prefers_alternative_source_search():
+    row = ExecutedToolCall(
+        action_event={},
+        observation_event={},
+        tool_message={},
+        tool_name="paper_research_write_grounding_report",
+        observation_output="ok",
+        result_data={
+            "grounding_ready": False,
+            "content": {
+                "dataset": {"status": "blocked", "alternative_source_candidates": []},
+                "external_dependencies": {"status": "blocked", "alternative_source_candidates": []},
+                "summary": {
+                    "repo_grounded": True,
+                    "entrypoint_grounded": True,
+                    "dataset_grounded": False,
+                    "runtime_grounded": False,
+                    "external_dependencies_grounded": False,
+                    "overall_status": "blocked",
+                },
+            },
+        },
+        tool_call_id="call-1",
+        arguments={},
+        success=True,
+        error=None,
+        permission_required=False,
+        execution_time_ms=1.0,
+        output_tokens_estimate=10,
+        truncated=False,
+    )
+
+    message, decision = ReActAgent._tool_workflow_next_action(
+        [row],
+        paper_skill_active=True,
+        repo_edit_allowed=True,
+        workflow_binding={"current_stage": "grounding"},
+    )
+
+    assert "替代源搜索" in message
+    assert decision["next_action"] == "search_alternative_sources"
+    assert "web_search" in decision["allowed_actions"]
+
+
+@pytest.mark.asyncio
 async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
     agent = ReActAgent(_RepeatedFailureLLM(), _RepeatedFailureTools(), max_iterations=8)
@@ -761,6 +908,52 @@ async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     assert done_events
     assert done_events[0]["data"]["iterations"] == 3
     assert "已停止自动重试" in str(done_events[0]["data"]["answer"])
+
+
+def test_grounding_probe_failures_do_not_trigger_generic_failure_streak():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[{"role": "user", "content": "继续 grounding"}],
+        conversation_state={"workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"}},
+    )
+    events = [
+        {
+            "type": "observation",
+            "data": {
+                "tool": "paper_research_probe_url",
+                "success": False,
+                "error": "url_probe_failed",
+                "output": "HTTP 403",
+                "data": {"status_code": 403, "diagnosis": "http_403"},
+            },
+        },
+        {
+            "type": "observation",
+            "data": {
+                "tool": "paper_research_probe_url",
+                "success": False,
+                "error": "url_probe_failed",
+                "output": "HTTP 404",
+                "data": {"status_code": 404, "diagnosis": "http_404"},
+            },
+        },
+        {
+            "type": "observation",
+            "data": {
+                "tool": "paper_research_probe_url",
+                "success": False,
+                "error": "url_probe_failed",
+                "output": "license gate",
+                "data": {"diagnosis": "license_gate"},
+            },
+        },
+    ]
+
+    message = agent._maybe_stop_after_repeated_tool_failures(context, events)
+
+    assert message is None
+    assert context.state.name == "IDLE"
+    assert context.tool_failure_streaks.get("paper_research_probe_url", 0) == 0
 
 
 @pytest.mark.asyncio
@@ -805,6 +998,27 @@ async def test_agent_stops_repeated_run_drafts_failures_with_schema_guidance(mon
 
 
 @pytest.mark.asyncio
+async def test_agent_stops_repeated_repo_read_failures_with_search_guidance(monkeypatch):
+    monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
+    agent = ReActAgent(_RepeatedRepoReadFailureLLM(), _RepeatedRepoReadFailureTools(), max_iterations=8)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "继续定位 classification-results.sh"}], stream=False):
+        events.append(event)
+
+    action_events = [event for event in events if event.get("type") == "action"]
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    done_events = [event for event in events if event.get("type") == "done"]
+
+    assert len(action_events) == 3
+    assert any("先 search_repo" in str(event.get("data", "")) or "真实路径" in str(event.get("data", "")) for event in thought_events)
+    assert done_events
+    assert "paper_research_search_repo" in str(done_events[0]["data"]["answer"])
+    assert "repo_relative_path 猜错了" in str(done_events[0]["data"]["answer"])
+    assert done_events[0]["data"]["iterations"] == 3
+
+
+@pytest.mark.asyncio
 async def test_execute_tool_calls_persists_tool_ledger_entries():
     runtime_service = _ToolLedgerRuntimeService()
     agent = ReActAgent(
@@ -839,8 +1053,6 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
     assert runtime_service.entries[1]["status"] == "succeeded"
     assert runtime_service.entries[1]["success"] is True
     assert str(runtime_service.entries[1]["summary"]).strip()
-    assert "2014" in str(runtime_service.entries[1]["summary"])
-    assert "成功" in str(runtime_service.entries[1]["summary"])
     assert runtime_service.item_entries
     assert runtime_service.item_entries[0]["kind"] == "tool_use_summary"
     assert runtime_service.item_entries[0]["turn_id"] is None

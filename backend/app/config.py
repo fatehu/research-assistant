@@ -225,6 +225,9 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     paper_intake_timeout_seconds: int = 600
+    paper_intake_multimodal_enabled: bool = True
+    paper_intake_multimodal_model: str = "qwen3-vl-flash"
+    paper_intake_multimodal_max_pages: int = 24
 
     # Generic tool runtime
     tool_default_timeout_seconds: int = 20

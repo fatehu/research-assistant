@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,12 +41,16 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     paper_tool_names = {
         "paper_research_get_artifact_manifest",
         "paper_research_prepare",
+        "paper_research_probe_repo",
+        "paper_research_probe_url",
         "paper_research_read_artifact",
+        "paper_research_read_grounding_report",
         "paper_research_read_implementation_spec",
         "paper_research_read_run_drafts",
         "paper_research_read_repo_file",
         "paper_research_search_repo",
         "paper_research_status",
+        "paper_research_write_grounding_report",
         "paper_research_write_execution_script",
         "paper_research_write_implementation_spec",
         "paper_research_write_run_drafts",
@@ -72,6 +77,19 @@ def test_paper_research_workspace_missing_required_archives(tmp_path):
     (workspace_dir / "experiment_spec.json").write_text("{}", encoding="utf-8")
     (workspace_dir / "workspace_adapter_manifest.json").write_text("{}", encoding="utf-8")
     assert tool._workspace_missing_required_archives(workspace_dir) is False
+    assert tool._workspace_missing_required_archives(workspace_dir, include_grounding=True) is True
+    (workspace_dir / "specs").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "specs" / "grounding_report.json").write_text("{}", encoding="utf-8")
+    assert tool._workspace_missing_required_archives(workspace_dir, include_grounding=True) is False
+
+
+def test_paper_research_grounding_report_is_canonical_artifact():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+    spec = tool._artifact_spec_for_path("specs/grounding_report.json")
+
+    assert spec is not None
+    assert spec["name"] == "grounding_report"
+    assert spec["content_type"] == "json"
 
 
 def test_paper_research_search_repo_python_fallback_finds_matches(tmp_path):
@@ -98,6 +116,57 @@ def test_paper_research_search_repo_python_fallback_finds_matches(tmp_path):
     assert payload["returned_matches"] == 1
     assert payload["matches"][0]["relative_path"] == "repo/source/train.py"
     assert payload["matches"][0]["line_number"] == 1
+
+
+def test_paper_research_search_repo_schema_exposes_context_line_bounds():
+    schema = agent_tools.PaperResearchSearchRepoTool.parameters["properties"]["context_lines"]
+
+    assert schema["minimum"] == 0
+    assert schema["maximum"] == 20
+    assert "0-20" in schema["description"]
+
+
+@pytest.mark.asyncio
+async def test_paper_research_search_repo_validation_error_mentions_context_line_limit():
+    tool = agent_tools.PaperResearchSearchRepoTool(db=None, user_id=1)
+
+    result = await tool.execute(project_id=1, query="classification-results.sh", context_lines=30)
+
+    assert result.success is False
+    assert result.error == "validation_error"
+    assert "context_lines" in result.output
+    assert "20" in result.output
+
+
+def test_paper_research_read_repo_file_schema_mentions_search_first_when_path_uncertain():
+    schema = agent_tools.PaperResearchReadRepoFileTool.parameters["properties"]["repo_relative_path"]
+
+    assert "paper_research_search_repo" in schema["description"]
+    assert "不要臆测 `scripts/`" in schema["description"]
+
+
+def test_paper_research_tool_parameters_expose_input_model_constraints():
+    issues = []
+    for name, tool_cls in vars(agent_tools).items():
+        if not inspect.isclass(tool_cls):
+            continue
+        if not name.startswith("PaperResearch") or not name.endswith("Tool"):
+            continue
+        if not getattr(tool_cls, "parameters", None) or not getattr(tool_cls, "input_model", None):
+            continue
+
+        model_schema = tool_cls.input_model.model_json_schema()
+        model_props = model_schema.get("properties", {}) or {}
+        manual_props = tool_cls.parameters.get("properties", {}) or {}
+        for field_name, model_meta in model_props.items():
+            manual_meta = manual_props.get(field_name)
+            if not isinstance(manual_meta, dict):
+                continue
+            for key in ("minimum", "maximum", "minLength", "maxLength", "enum"):
+                if key in model_meta and manual_meta.get(key) != model_meta.get(key):
+                    issues.append(f"{name}.{field_name}.{key}")
+
+    assert not issues, "paper tool schema drift: " + "; ".join(sorted(issues))
 
 
 def test_knowledge_search_runtime_uses_configurable_threshold(monkeypatch):

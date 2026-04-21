@@ -27,7 +27,8 @@ from app.services.project_runtime_service import ProjectRuntimeService
 _TRAIN_PROGRESS_RE = re.compile(r"time\s+([0-9.]+)s\s+\|\s+loss\s+([0-9.]+)", flags=re.IGNORECASE)
 _METRIC_DICT_RE = re.compile(r"\{[^{}]+\}")
 _RESULT_STAGE_LABELS = {
-    "planning": "Planning / Intake",
+    "planning": "Planning / Intake Summary",
+    "grounding": "Grounding",
     "implementation_prep": "Implementation Prep",
     "run_drafts": "Run Drafts",
     "execution": "Execution",
@@ -604,6 +605,73 @@ class ProjectService:
             "runtime_worker_available": bool(runtime_worker.get("available")),
         }
 
+    @staticmethod
+    def _grounding_status_text(report: Dict[str, Any], key: str) -> str:
+        return str(dict(report.get(key) or {}).get("status") or "unknown").strip().lower() or "unknown"
+
+    def _grounding_completion_state(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        summary = dict(report.get("summary") or {})
+        statuses = {
+            "repo": self._grounding_status_text(report, "repo"),
+            "entrypoint": self._grounding_status_text(report, "entrypoint"),
+            "dataset": self._grounding_status_text(report, "dataset"),
+            "runtime": self._grounding_status_text(report, "runtime"),
+            "external_dependencies": self._grounding_status_text(report, "external_dependencies"),
+        }
+        blockers: List[str] = []
+        for key in ("repo", "entrypoint", "dataset", "runtime", "external_dependencies"):
+            section = dict(report.get(key) or {})
+            blockers.extend(
+                str(item).strip()
+                for item in list(section.get("blockers") or [])
+                if str(item).strip()
+            )
+            blockers.extend(
+                str(dict(item).get("reason") or "").strip()
+                for item in list(section.get("blocker_details") or [])
+                if isinstance(item, dict) and str(dict(item).get("reason") or "").strip()
+            )
+        blockers.extend(
+            str(item).strip()
+            for item in list(summary.get("blockers") or [])
+            if str(item).strip()
+        )
+        repo_grounded = bool(summary.get("repo_grounded")) or statuses["repo"] == "grounded"
+        entrypoint_grounded = bool(summary.get("entrypoint_grounded")) or statuses["entrypoint"] == "grounded"
+        dataset_grounded = bool(summary.get("dataset_grounded")) or statuses["dataset"] == "grounded"
+        runtime_grounded = bool(summary.get("runtime_grounded")) or statuses["runtime"] == "grounded"
+        external_dependencies_grounded = bool(summary.get("external_dependencies_grounded")) or statuses["external_dependencies"] == "grounded"
+        complete = all(
+            (
+                repo_grounded,
+                entrypoint_grounded,
+                dataset_grounded,
+                runtime_grounded,
+                external_dependencies_grounded,
+            )
+        )
+        overall_status = str(summary.get("overall_status") or "").strip().lower()
+        if not overall_status:
+            if complete:
+                overall_status = "grounded"
+            elif blockers or any(value == "blocked" for value in statuses.values()):
+                overall_status = "blocked"
+            elif any(value == "absent" for value in statuses.values()):
+                overall_status = "absent"
+            else:
+                overall_status = "unknown"
+        return {
+            "complete": complete and overall_status == "grounded",
+            "overall_status": overall_status,
+            "blockers": list(dict.fromkeys(blockers)),
+            "statuses": statuses,
+            "next_actions": [
+                str(item).strip()
+                for item in list(summary.get("next_actions") or [])
+                if str(item).strip()
+            ],
+        }
+
     def _build_stage_ledger(
         self,
         *,
@@ -614,6 +682,7 @@ class ProjectService:
     ) -> List[Dict[str, Any]]:
         experiment_spec = dict(workspace.get("experiment_spec") or {})
         summary = dict(workspace.get("summary") or {})
+        grounding_report = self._safe_read_json_file(workspace_dir / "specs" / "grounding_report.json" if workspace_dir else None)
         implementation_spec = self._safe_read_json_file(workspace_dir / "specs" / "implementation_spec.json" if workspace_dir else None)
         run_drafts = self._safe_read_json_file(workspace_dir / "drafts" / "run_drafts.json" if workspace_dir else None)
         compare_report = dict(workspace.get("compare_report") or {})
@@ -626,9 +695,6 @@ class ProjectService:
                 ("Intake result", "paper_intake_result.json", "json"),
                 ("Paper summary", "paper_summary.json", "json"),
                 ("Experiment spec", "experiment_spec.json", "json"),
-                ("Repo reference", "repo_reference.json", "json"),
-                ("Repo index", "repo_file_index.json", "json"),
-                ("历史候选", "repo_history_url_candidates.json", "json"),
             ],
         )
         planning_present = [item for item in planning_artifacts if bool(item.get("present"))]
@@ -647,13 +713,57 @@ class ProjectService:
             or ("已生成 intake、paper summary 与 experiment spec" if planning_complete else None)
         )
 
+        grounding_artifacts = self._artifact_group(
+            workspace_dir,
+            [
+                ("Grounding report", "specs/grounding_report.json", "json"),
+                ("Repo reference", "repo_reference.json", "json"),
+                ("Repo index", "repo_file_index.json", "json"),
+                ("Repo history candidates", "repo_history_url_candidates.json", "json"),
+            ],
+        )
+        grounding_state = self._grounding_completion_state(grounding_report) if grounding_report else {
+            "complete": False,
+            "overall_status": "missing",
+            "blockers": [],
+            "statuses": {
+                "repo": "unknown",
+                "entrypoint": "unknown",
+                "dataset": "unknown",
+                "runtime": "unknown",
+                "external_dependencies": "unknown",
+            },
+            "next_actions": [],
+        }
+        if not planning_complete:
+            grounding_status = "missing"
+        elif bool(grounding_state.get("complete")):
+            grounding_status = "completed"
+        elif grounding_report and str(grounding_state.get("overall_status") or "") == "blocked":
+            grounding_status = "blocked"
+        else:
+            grounding_status = "ready"
+        grounding_statuses = dict(grounding_state.get("statuses") or {})
+        grounding_summary = (
+            str(dict(grounding_report.get("summary") or {}).get("overall_status") or "").strip()
+            or ", ".join(
+                f"{key}={grounding_statuses.get(key) or 'unknown'}"
+                for key in ("repo", "entrypoint", "dataset", "runtime", "external_dependencies")
+            )
+            if grounding_report
+            else ("等待写入 grounding_report" if planning_complete else None)
+        )
+
         implementation_artifacts = self._artifact_group(
             workspace_dir,
             [("Implementation spec", "specs/implementation_spec.json", "json")],
         )
         implementation_blockers = self._extract_blockers(implementation_spec)
         readiness = dict(implementation_spec.get("readiness") or {})
-        if not implementation_artifacts[0]["present"]:
+        grounding_complete = bool(grounding_state.get("complete"))
+        if not grounding_complete:
+            implementation_status = "missing"
+        elif not implementation_artifacts[0]["present"]:
             implementation_status = "missing"
         elif bool(readiness.get("can_execute")):
             implementation_status = "completed"
@@ -672,7 +782,9 @@ class ProjectService:
             workspace_dir,
             [("Run drafts", "drafts/run_drafts.json", "json")],
         )
-        if run_drafts_artifacts[0]["present"] and draft_items:
+        if not grounding_complete:
+            run_drafts_status = "missing"
+        elif run_drafts_artifacts[0]["present"] and draft_items:
             run_drafts_status = "completed"
         elif implementation_artifacts[0]["present"]:
             run_drafts_status = "ready"
@@ -774,6 +886,15 @@ class ProjectService:
                 "updated_at": self._latest_artifact_timestamp(planning_artifacts),
             },
             {
+                "stage": "grounding",
+                "label": _RESULT_STAGE_LABELS["grounding"],
+                "status": grounding_status,
+                "summary": grounding_summary,
+                "blockers": list(grounding_state.get("blockers") or []),
+                "artifacts": grounding_artifacts,
+                "updated_at": self._latest_artifact_timestamp(grounding_artifacts),
+            },
+            {
                 "stage": "implementation_prep",
                 "label": _RESULT_STAGE_LABELS["implementation_prep"],
                 "status": implementation_status,
@@ -853,8 +974,12 @@ class ProjectService:
                 return "results", "completed"
             return "tuning", "active"
         stage_map = {str(item.get("stage") or ""): item for item in stage_ledger}
-        if str(stage_map.get("planning", {}).get("status") or "") == "missing":
-            return "planning", "draft"
+        planning_status = str(stage_map.get("planning", {}).get("status") or "")
+        if planning_status in {"missing", "ready"}:
+            return "planning", "draft" if planning_status == "missing" else "active"
+        grounding_status = str(stage_map.get("grounding", {}).get("status") or "")
+        if grounding_status in {"missing", "ready", "blocked"}:
+            return "grounding", "blocked" if grounding_status == "blocked" else "active"
         if str(stage_map.get("implementation_prep", {}).get("status") or "") in {"missing", "blocked"}:
             return "implementation_prep", "blocked" if stage_map.get("implementation_prep", {}).get("status") == "blocked" else "active"
         if str(stage_map.get("run_drafts", {}).get("status") or "") == "missing":
@@ -929,7 +1054,7 @@ class ProjectService:
         stage = str(current_stage or "planning").strip().lower() or "planning"
         if stage == "results":
             return "tuning" if str(current_status or "").strip().lower() == "active" else "execution"
-        if stage not in {"planning", "implementation_prep", "run_drafts", "execution", "tuning"}:
+        if stage not in {"planning", "grounding", "implementation_prep", "run_drafts", "execution", "tuning"}:
             stage = "execution"
         if str(current_status or "").strip().lower() == "running":
             return "execution"

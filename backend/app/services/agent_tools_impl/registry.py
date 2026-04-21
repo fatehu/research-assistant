@@ -100,6 +100,45 @@ def _normalize_relative_path(value: Any) -> str:
     return "/".join(parts)
 
 
+def _collect_schema_constraints(schema: Mapping[str, Any]) -> Dict[str, Any]:
+    constraints: Dict[str, Any] = {}
+    for key in ("minimum", "maximum", "minLength", "maxLength", "enum", "default"):
+        if key in schema:
+            constraints[key] = schema[key]
+    for branch in list(schema.get("anyOf") or []):
+        if isinstance(branch, Mapping):
+            for key, value in _collect_schema_constraints(branch).items():
+                constraints.setdefault(key, value)
+    return constraints
+
+
+def _sync_tool_parameter_constraints(tool_cls: type) -> None:
+    input_model = getattr(tool_cls, "input_model", None)
+    parameters = getattr(tool_cls, "parameters", None)
+    if input_model is None or not isinstance(parameters, dict):
+        return
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return
+
+    schema = input_model.model_json_schema()
+    model_properties = schema.get("properties")
+    if not isinstance(model_properties, dict):
+        return
+
+    merged_properties: Dict[str, Any] = dict(properties)
+    for field_name, model_meta in model_properties.items():
+        manual_meta = merged_properties.get(field_name)
+        if not isinstance(manual_meta, dict):
+            continue
+        merged_meta = dict(manual_meta)
+        for key, value in _collect_schema_constraints(model_meta).items():
+            merged_meta.setdefault(key, value)
+        merged_properties[field_name] = merged_meta
+
+    tool_cls.parameters = {**parameters, "properties": merged_properties}
+
+
 class Tool:
     """工具协议（兼容旧实现）。"""
 
@@ -144,6 +183,17 @@ class ToolBase(Tool, ABC):
 
     @staticmethod
     def _validation_error_result(exc: ValidationError) -> ToolResult:
+        issues: List[str] = []
+        for item in list(exc.errors() or [])[:3]:
+            loc = ".".join(str(part) for part in list(item.get("loc") or []) if str(part).strip())
+            msg = str(item.get("msg") or "").strip()
+            if loc and msg:
+                issues.append(f"{loc}: {msg}")
+            elif msg:
+                issues.append(msg)
+        output = "工具参数校验失败，请检查输入格式。"
+        if issues:
+            output = f"{output} " + "；".join(issues)
         contract = build_tool_error_contract(
             code="validation_error",
             message="工具参数校验失败，请检查输入格式。",
@@ -153,7 +203,7 @@ class ToolBase(Tool, ABC):
         )
         return ToolResult(
             success=False,
-            output=str(contract["message"]),
+            output=output,
             error=str(contract["code"]),
             data=merge_error_contract({"validation_errors": exc.errors()}, contract),
         )
@@ -1330,6 +1380,11 @@ class PaperResearchReadRepoFileInput(BaseModel):
     repo_relative_path: str = Field(
         min_length=1,
         max_length=400,
+        description=(
+            "repo/source 下的 repo-relative 路径。"
+            "如果不确定文件具体在哪个子目录，先用 `paper_research_search_repo`"
+            " 按文件名或关键字定位真实路径，不要臆测 `scripts/` 等前缀。"
+        ),
         validation_alias=AliasChoices("repo_relative_path", "relative_path", "path", "file_path", "file"),
     )
     mode: str = Field(default="auto")
@@ -1392,6 +1447,23 @@ class PaperResearchWriteImplementationSpecInput(BaseModel):
 
 
 class PaperResearchReadImplementationSpecInput(BaseModel):
+    project_id: int = Field(ge=1)
+    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
+    max_chars: int = Field(default=20000, ge=200, le=200000)
+    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
+    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
+    page: Optional[int] = Field(default=None, ge=1, le=1000000)
+    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
+    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
+
+
+class PaperResearchWriteGroundingReportInput(BaseModel):
+    project_id: int = Field(ge=1)
+    grounding_report: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PaperResearchReadGroundingReportInput(BaseModel):
     project_id: int = Field(ge=1)
     mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
     max_chars: int = Field(default=20000, ge=200, le=200000)
@@ -1500,6 +1572,7 @@ class _PaperResearchToolBase(ToolBase):
         "manual_step",
         "unknown",
     }
+    _GROUNDING_STATUSES = {"grounded", "absent", "blocked", "unknown"}
     _CANONICAL_FILE_SPECS: Dict[str, Dict[str, str]] = {
         "planning/paper_intake_result.json": {
             "kind": "planning",
@@ -1566,6 +1639,12 @@ class _PaperResearchToolBase(ToolBase):
             "name": "workspace_readme",
             "content_type": "text",
             "actual_rel_path": "WORKSPACE_README.md",
+        },
+        "specs/grounding_report.json": {
+            "kind": "spec",
+            "name": "grounding_report",
+            "content_type": "json",
+            "actual_rel_path": "specs/grounding_report.json",
         },
         "specs/implementation_spec.json": {
             "kind": "spec",
@@ -1759,13 +1838,15 @@ class _PaperResearchToolBase(ToolBase):
         return bool(cls._intake_summary_from_workspace(workspace).get("needs_refresh"))
 
     @classmethod
-    def _workspace_missing_required_archives(cls, workspace_dir: Path) -> bool:
-        required_paths = (
+    def _workspace_missing_required_archives(cls, workspace_dir: Path, *, include_grounding: bool = False) -> bool:
+        required_paths = [
             "paper_intake_result.json",
             "paper_summary.json",
             "experiment_spec.json",
             "workspace_adapter_manifest.json",
-        )
+        ]
+        if include_grounding:
+            required_paths.append("specs/grounding_report.json")
         root = Path(workspace_dir)
         return any(not (root / rel_path).is_file() for rel_path in required_paths)
 
@@ -2258,6 +2339,812 @@ class _PaperResearchToolBase(ToolBase):
         return files
 
     @classmethod
+    def _grounding_section_defaults(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "repo": {
+                "status": "unknown",
+                "url": None,
+                "resolved_ref": None,
+                "default_branch": None,
+                "commit_sha": None,
+                "blockers": [],
+                "blocker_details": [],
+            },
+            "entrypoint": {
+                "status": "unknown",
+                "candidates": [],
+                "selected_candidate": None,
+                "evidence_files": [],
+                "blockers": [],
+                "blocker_details": [],
+            },
+            "dataset": {
+                "status": "unknown",
+                "sources": [],
+                "access_mode": None,
+                "local_presence": {},
+                "blockers": [],
+                "blocker_details": [],
+                "alternative_source_candidates": [],
+            },
+            "runtime": {
+                "status": "unknown",
+                "inspection_summary": None,
+                "candidate_runtimes": [],
+                "tool_availability": {},
+                "blockers": [],
+                "blocker_details": [],
+            },
+            "external_dependencies": {
+                "status": "unknown",
+                "urls": [],
+                "probe_results": [],
+                "blockers": [],
+                "blocker_details": [],
+                "alternative_source_candidates": [],
+            },
+        }
+
+    @classmethod
+    def _grounding_completion_summary(cls, report: Dict[str, Any]) -> Dict[str, Any]:
+        summary = dict(report.get("summary") or {})
+        repo = dict(report.get("repo") or {})
+        entrypoint = dict(report.get("entrypoint") or {})
+        dataset = dict(report.get("dataset") or {})
+        runtime = dict(report.get("runtime") or {})
+        external_dependencies = dict(report.get("external_dependencies") or {})
+        repo_grounded = bool(summary.get("repo_grounded")) or str(repo.get("status") or "") == "grounded"
+        entrypoint_grounded = bool(summary.get("entrypoint_grounded")) or str(entrypoint.get("status") or "") == "grounded"
+        dataset_grounded = bool(summary.get("dataset_grounded")) or str(dataset.get("status") or "") == "grounded"
+        runtime_grounded = bool(summary.get("runtime_grounded")) or str(runtime.get("status") or "") == "grounded"
+        external_dependencies_grounded = bool(summary.get("external_dependencies_grounded")) or str(external_dependencies.get("status") or "") == "grounded"
+        section_blockers: List[str] = []
+        for section in (repo, entrypoint, dataset, runtime, external_dependencies):
+            for blocker in list(section.get("blockers") or []):
+                text = str(blocker or "").strip()
+                if text:
+                    section_blockers.append(text)
+            for detail in list(section.get("blocker_details") or []):
+                if not isinstance(detail, dict):
+                    continue
+                text = (
+                    str(detail.get("reason") or "").strip()
+                    or str(detail.get("message") or "").strip()
+                    or str(detail.get("summary") or "").strip()
+                )
+                if text:
+                    section_blockers.append(text)
+        for blocker in list(summary.get("blockers") or []):
+            text = str(blocker or "").strip()
+            if text:
+                section_blockers.append(text)
+        explicit_next_actions = [str(item).strip() for item in list(summary.get("next_actions") or []) if str(item).strip()]
+        explicit_status = str(summary.get("overall_status") or "").strip().lower()
+        if explicit_status not in cls._GROUNDING_STATUSES:
+            explicit_status = ""
+        any_blocked = any(
+            str(section.get("status") or "").strip().lower() == "blocked"
+            for section in (repo, entrypoint, dataset, runtime, external_dependencies)
+        ) or bool(section_blockers)
+        all_grounded = all(
+            (
+                repo_grounded,
+                entrypoint_grounded,
+                dataset_grounded,
+                runtime_grounded,
+                external_dependencies_grounded,
+            )
+        )
+        if explicit_status:
+            overall_status = explicit_status
+        elif all_grounded:
+            overall_status = "grounded"
+        elif any_blocked:
+            overall_status = "blocked"
+        elif any(
+            str(section.get("status") or "").strip().lower() == "absent"
+            for section in (repo, entrypoint, dataset, runtime, external_dependencies)
+        ):
+            overall_status = "absent"
+        else:
+            overall_status = "unknown"
+        return {
+            "repo_grounded": repo_grounded,
+            "entrypoint_grounded": entrypoint_grounded,
+            "dataset_grounded": dataset_grounded,
+            "runtime_grounded": runtime_grounded,
+            "external_dependencies_grounded": external_dependencies_grounded,
+            "overall_status": overall_status,
+            "blockers": list(dict.fromkeys(section_blockers)),
+            "next_actions": explicit_next_actions,
+            "complete": all_grounded and overall_status == "grounded",
+        }
+
+    @classmethod
+    def _normalize_grounding_report_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> Dict[str, Any]:
+        normalized = dict(payload or {})
+        repo_files = cls._repo_file_set(workspace_dir)
+        defaults = cls._grounding_section_defaults()
+        for section_name, section_defaults in defaults.items():
+            merged_section = dict(section_defaults)
+            merged_section.update(dict(normalized.get(section_name) or {}))
+            status = str(merged_section.get("status") or "unknown").strip().lower() or "unknown"
+            if status not in cls._GROUNDING_STATUSES:
+                status = "unknown"
+            merged_section["status"] = status
+            for list_field in (
+                "blockers",
+                "blocker_details",
+                "alternative_source_candidates",
+                "candidates",
+                "evidence_files",
+                "sources",
+                "candidate_runtimes",
+                "urls",
+                "probe_results",
+            ):
+                if list_field in merged_section and not isinstance(merged_section.get(list_field), list):
+                    merged_section[list_field] = []
+            normalized[section_name] = merged_section
+
+        summary = dict(normalized.get("summary") or {})
+        if not isinstance(summary.get("blockers") or [], list):
+            summary["blockers"] = []
+        if not isinstance(summary.get("next_actions") or [], list):
+            summary["next_actions"] = []
+        normalized["summary"] = summary
+
+        entrypoint = dict(normalized.get("entrypoint") or {})
+        selected_candidate = entrypoint.get("selected_candidate")
+        if selected_candidate is None and list(entrypoint.get("candidates") or []):
+            first_candidate = next(
+                (
+                    item
+                    for item in list(entrypoint.get("candidates") or [])
+                    if isinstance(item, dict) and cls._normalize_relative_path(item.get("path") or item.get("repo_relative_path") or item.get("path_or_hint") or "")
+                ),
+                None,
+            )
+            if first_candidate is not None:
+                entrypoint["selected_candidate"] = first_candidate
+        entrypoint_evidence: List[str] = []
+        for item in list(entrypoint.get("evidence_files") or []):
+            normalized_path = cls._normalize_relative_path(item)
+            if normalized_path:
+                entrypoint_evidence.append(normalized_path)
+        for candidate in list(entrypoint.get("candidates") or []):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_path = cls._normalize_relative_path(
+                candidate.get("path")
+                or candidate.get("repo_relative_path")
+                or candidate.get("path_or_hint")
+                or ""
+            )
+            if candidate_path and not candidate_path.startswith("repo/source/") and candidate_path in repo_files:
+                candidate_path = f"repo/source/{candidate_path}"
+            if candidate_path:
+                entrypoint_evidence.append(candidate_path)
+        entrypoint["evidence_files"] = list(dict.fromkeys(entrypoint_evidence))
+        normalized["entrypoint"] = entrypoint
+
+        dataset = dict(normalized.get("dataset") or {})
+        if not list(dataset.get("sources") or []):
+            for alias in ("datasets", "items"):
+                if isinstance(dataset.get(alias), list):
+                    dataset["sources"] = list(dataset.get(alias) or [])
+                    break
+        local_presence = dataset.get("local_presence")
+        if isinstance(local_presence, bool):
+            dataset["local_presence"] = {"available": bool(local_presence)}
+        elif not isinstance(local_presence, dict):
+            dataset["local_presence"] = {}
+        dataset["blocker_details"] = cls._normalize_grounding_detail_items(dataset.get("blocker_details"))
+        dataset["alternative_source_candidates"] = cls._normalize_grounding_candidate_items(
+            dataset.get("alternative_source_candidates")
+        )
+        normalized["dataset"] = dataset
+
+        runtime = dict(normalized.get("runtime") or {})
+        tool_availability = runtime.get("tool_availability")
+        if not isinstance(tool_availability, dict):
+            runtime["tool_availability"] = {}
+        runtime["blocker_details"] = cls._normalize_grounding_detail_items(runtime.get("blocker_details"))
+        normalized["runtime"] = runtime
+
+        external_dependencies = dict(normalized.get("external_dependencies") or {})
+        raw_urls = list(external_dependencies.get("urls") or [])
+        existing_probe_results = list(external_dependencies.get("probe_results") or [])
+        normalized_urls: List[str] = []
+        flattened_probe_results: List[Dict[str, Any]] = []
+        for item in raw_urls:
+            if isinstance(item, str):
+                url = str(item or "").strip()
+                if url:
+                    normalized_urls.append(url)
+                continue
+            if not isinstance(item, dict):
+                continue
+            url = str(
+                item.get("url")
+                or item.get("source_url")
+                or item.get("download_url")
+                or item.get("href")
+                or item.get("link")
+                or ""
+            ).strip()
+            if url:
+                normalized_urls.append(url)
+            nested_probe_results = list(item.get("probe_results") or [])
+            singular_probe_result = item.get("probe_result")
+            if isinstance(singular_probe_result, dict):
+                nested_probe_results.append(singular_probe_result)
+            for probe in nested_probe_results:
+                if not isinstance(probe, dict):
+                    continue
+                probe_payload = dict(probe)
+                probe_payload.setdefault("url", url)
+                flattened_probe_results.append(probe_payload)
+        merged_probe_results: List[Dict[str, Any]] = []
+        for item in [*existing_probe_results, *flattened_probe_results]:
+            if isinstance(item, dict):
+                probe_payload = dict(item)
+                inferred_ok = cls._infer_probe_result_ok(probe_payload)
+                if inferred_ok is not None and "ok" not in probe_payload:
+                    probe_payload["ok"] = inferred_ok
+                merged_probe_results.append(probe_payload)
+        external_dependencies["urls"] = list(dict.fromkeys(url for url in normalized_urls if url))
+        external_dependencies["probe_results"] = merged_probe_results
+        external_dependencies["blocker_details"] = cls._normalize_grounding_detail_items(
+            external_dependencies.get("blocker_details")
+        )
+        external_dependencies["alternative_source_candidates"] = cls._normalize_grounding_candidate_items(
+            external_dependencies.get("alternative_source_candidates")
+        )
+        normalized["external_dependencies"] = external_dependencies
+
+        repo = dict(normalized.get("repo") or {})
+        repo["blocker_details"] = cls._normalize_grounding_detail_items(repo.get("blocker_details"))
+        repo_verification = str(repo.get("verification_status") or "").strip().lower()
+        if (
+            str(repo.get("status") or "").strip().lower() == "unknown"
+            and not list(repo.get("blockers") or [])
+            and not list(repo.get("blocker_details") or [])
+        ):
+            if repo_verification in {"verified", "cloneable", "ready"} or (
+                str(repo.get("url") or "").strip()
+                and (
+                    str(repo.get("resolved_ref") or "").strip()
+                    or str(repo.get("default_branch") or "").strip()
+                    or str(repo.get("commit_sha") or "").strip()
+                )
+            ):
+                repo["status"] = "grounded"
+        normalized["repo"] = repo
+
+        entrypoint = dict(normalized.get("entrypoint") or {})
+        entrypoint_verification = str(entrypoint.get("verification_status") or "").strip().lower()
+        if (
+            str(entrypoint.get("status") or "").strip().lower() == "unknown"
+            and not list(entrypoint.get("blockers") or [])
+            and not list(entrypoint.get("blocker_details") or [])
+        ):
+            has_selected_candidate = isinstance(entrypoint.get("selected_candidate"), dict)
+            has_evidence = bool(list(entrypoint.get("evidence_files") or []))
+            if entrypoint_verification == "verified" or (has_selected_candidate and has_evidence):
+                entrypoint["status"] = "grounded"
+        normalized["entrypoint"] = entrypoint
+
+        summary = dict(normalized.get("summary") or {})
+        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
+        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
+        successful_probe_urls, failed_probe_urls = cls._probe_result_url_sets(external_dependencies.get("probe_results"))
+        failed_probe_map = cls._failed_probe_result_map(external_dependencies.get("probe_results"))
+
+        if str(dataset.get("status") or "").strip().lower() == "unknown":
+            if any(url in failed_probe_urls for url in dataset_source_urls):
+                dataset["status"] = "blocked"
+            elif bool(dict(dataset.get("local_presence") or {}).get("available")):
+                dataset["status"] = "grounded"
+            elif dataset_source_urls and all(url in successful_probe_urls for url in dataset_source_urls):
+                dataset["status"] = "grounded"
+        if str(external_dependencies.get("status") or "").strip().lower() == "unknown":
+            if any(url in failed_probe_urls for url in external_urls):
+                external_dependencies["status"] = "blocked"
+            elif external_urls and all(url in successful_probe_urls for url in external_urls):
+                external_dependencies["status"] = "grounded"
+
+        cls._merge_probe_failures_into_grounding_section(
+            dataset,
+            urls=dataset_source_urls,
+            failed_probe_map=failed_probe_map,
+            label_resolver=cls._dataset_source_label_map(dataset.get("sources")),
+            code="official_dataset_source_blocked",
+            blocker_prefix="Official dataset source blocked",
+        )
+        cls._merge_probe_failures_into_grounding_section(
+            external_dependencies,
+            urls=external_urls,
+            failed_probe_map=failed_probe_map,
+            label_resolver={},
+            code="official_external_dependency_blocked",
+            blocker_prefix="Official external dependency blocked",
+        )
+        normalized["dataset"] = dataset
+        normalized["external_dependencies"] = external_dependencies
+
+        completion = cls._grounding_completion_summary(normalized)
+        section_blockers = list(completion.get("blockers") or [])
+        if not list(summary.get("blockers") or []):
+            summary["blockers"] = section_blockers
+        else:
+            summary["blockers"] = list(
+                dict.fromkeys(str(item).strip() for item in list(summary.get("blockers") or []) if str(item).strip())
+            )
+        for field in (
+            "repo_grounded",
+            "entrypoint_grounded",
+            "dataset_grounded",
+            "runtime_grounded",
+            "external_dependencies_grounded",
+            "overall_status",
+        ):
+            summary[field] = completion[field]
+        existing_next_actions = [
+            str(item).strip()
+            for item in list(summary.get("next_actions") or [])
+            if str(item).strip()
+        ]
+        if existing_next_actions:
+            summary["next_actions"] = existing_next_actions
+        else:
+            next_actions: List[str] = []
+            blocked_source_search_needed = (
+                (
+                    str(dataset.get("status") or "").strip().lower() == "blocked"
+                    and not list(dataset.get("alternative_source_candidates") or [])
+                )
+                or (
+                    str(external_dependencies.get("status") or "").strip().lower() == "blocked"
+                    and not list(external_dependencies.get("alternative_source_candidates") or [])
+                )
+            )
+            if blocked_source_search_needed:
+                next_actions.append(
+                    "对 blocked 官方链接做一次 focused web_search/web_scrape，记录 `alternative_source_candidates`；不要覆盖 official blocker。"
+                )
+            if str(runtime.get("status") or "").strip().lower() == "unknown":
+                next_actions.append("调用 `paper_research_inspect_runtime`，把 runtime 收敛成 grounded/absent/blocked。")
+            if str(repo.get("status") or "").strip().lower() == "unknown":
+                next_actions.append("继续 probe/clone repo，补齐 repo commit/ref 与 blocker 归因。")
+            if str(entrypoint.get("status") or "").strip().lower() == "unknown":
+                next_actions.append("继续 read/search repo，确认 entrypoint candidate、selected_candidate 与 evidence_files。")
+            summary["next_actions"] = list(dict.fromkeys(next_actions))
+        normalized["summary"] = summary
+        return normalized
+
+    @staticmethod
+    def _extract_grounding_urls(items: Any) -> List[str]:
+        urls: List[str] = []
+        for item in list(items or []):
+            candidate = ""
+            if isinstance(item, str):
+                candidate = item
+            elif isinstance(item, dict):
+                for key in ("url", "source_url", "download_url", "href", "link"):
+                    raw_value = str(item.get(key) or "").strip()
+                    if raw_value:
+                        candidate = raw_value
+                        break
+            normalized = str(candidate or "").strip()
+            if normalized.startswith(("http://", "https://")):
+                urls.append(normalized)
+        return list(dict.fromkeys(urls))
+
+    @classmethod
+    def _probe_result_url_sets(cls, probe_results: Any) -> tuple[set[str], set[str]]:
+        successful: set[str] = set()
+        failed: set[str] = set()
+        for item in list(probe_results or []):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("final_url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            inferred_ok = cls._infer_probe_result_ok(item)
+            if inferred_ok is True:
+                successful.add(url)
+            elif inferred_ok is False:
+                failed.add(url)
+        return successful, failed
+
+    @staticmethod
+    def _infer_probe_result_ok(item: Dict[str, Any]) -> Optional[bool]:
+        if "ok" in item:
+            raw_ok = item.get("ok")
+            if isinstance(raw_ok, bool):
+                return raw_ok
+            return None
+        raw_valid = item.get("valid")
+        if isinstance(raw_valid, bool):
+            return raw_valid
+        diagnosis = str(item.get("diagnosis") or "").strip().lower()
+        if diagnosis.startswith("valid_") or diagnosis in {"ready", "ok", "downloadable"}:
+            return True
+        if diagnosis in {
+            "auth_required",
+            "forbidden",
+            "not_found",
+            "accepted_but_empty",
+            "redirect_broken",
+            "checksum_mismatch",
+            "license_gate",
+            "manual_download_required",
+            "repo_unreachable",
+            "repo_page_reachable_but_not_cloneable",
+        }:
+            return False
+        raw_status = item.get("status_code", item.get("status"))
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            status_code = None
+        if status_code is not None:
+            if status_code in {200, 206}:
+                return True
+            if status_code >= 400:
+                return False
+        downloadable = item.get("downloadable")
+        if isinstance(downloadable, bool):
+            return downloadable
+        return None
+
+    @staticmethod
+    def _normalize_grounding_detail_items(items: Any) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in list(items or []):
+            if isinstance(item, str):
+                text = str(item or "").strip()
+                if text:
+                    normalized.append({"reason": text})
+                continue
+            if not isinstance(item, dict):
+                continue
+            payload = {str(key): value for key, value in dict(item).items() if str(key).strip()}
+            if payload:
+                normalized.append(payload)
+        return normalized
+
+    @staticmethod
+    def _normalize_grounding_candidate_items(items: Any) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in list(items or []):
+            if isinstance(item, str):
+                text = str(item or "").strip()
+                if text:
+                    normalized.append({"label": text})
+                continue
+            if not isinstance(item, dict):
+                continue
+            payload = {str(key): value for key, value in dict(item).items() if str(key).strip()}
+            if payload:
+                normalized.append(payload)
+        return normalized
+
+    @classmethod
+    def _failed_probe_result_map(cls, probe_results: Any) -> Dict[str, Dict[str, Any]]:
+        failed: Dict[str, Dict[str, Any]] = {}
+        for item in list(probe_results or []):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("final_url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            if cls._infer_probe_result_ok(item) is False and url not in failed:
+                failed[url] = dict(item)
+        return failed
+
+    @staticmethod
+    def _dataset_source_label_map(items: Any) -> Dict[str, str]:
+        labels: Dict[str, str] = {}
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            url = str(
+                item.get("url")
+                or item.get("source_url")
+                or item.get("download_url")
+                or item.get("href")
+                or item.get("link")
+                or ""
+            ).strip()
+            label = str(item.get("name") or item.get("label") or item.get("title") or "").strip()
+            if url and label:
+                labels[url] = label
+        return labels
+
+    @classmethod
+    def _merge_probe_failures_into_grounding_section(
+        cls,
+        section: Dict[str, Any],
+        *,
+        urls: Sequence[str],
+        failed_probe_map: Dict[str, Dict[str, Any]],
+        label_resolver: Dict[str, str],
+        code: str,
+        blocker_prefix: str,
+    ) -> None:
+        if str(section.get("status") or "").strip().lower() != "blocked":
+            return
+        blockers = [str(item).strip() for item in list(section.get("blockers") or []) if str(item).strip()]
+        blocker_details = cls._normalize_grounding_detail_items(section.get("blocker_details"))
+        existing_targets = {
+            str(detail.get("target_url") or detail.get("url") or detail.get("target") or "").strip()
+            for detail in blocker_details
+            if isinstance(detail, dict)
+        }
+        for url in list(urls or []):
+            failure = failed_probe_map.get(url)
+            if not failure or url in existing_targets:
+                continue
+            diagnosis = str(failure.get("diagnosis") or "").strip().lower()
+            raw_status = failure.get("status_code", failure.get("status"))
+            try:
+                status_code = int(raw_status)
+            except (TypeError, ValueError):
+                status_code = None
+            label = str(label_resolver.get(url) or "").strip()
+            target_text = label or url
+            suffix_parts: List[str] = []
+            if status_code is not None:
+                suffix_parts.append(f"HTTP {status_code}")
+            if diagnosis:
+                suffix_parts.append(diagnosis)
+            suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+            reason = f"{blocker_prefix}: {target_text}{suffix}"
+            blockers.append(reason)
+            blocker_details.append(
+                {
+                    "code": code,
+                    "target": label or None,
+                    "target_url": url,
+                    "reason": reason,
+                    "diagnosis": diagnosis or None,
+                    "status_code": status_code,
+                }
+            )
+        section["blockers"] = list(dict.fromkeys(item for item in blockers if item))
+        section["blocker_details"] = blocker_details
+
+    @classmethod
+    def _validate_grounding_report_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
+        from app.services.project_runtime_service import ProjectRuntimeService
+
+        errors: List[str] = []
+        required_sections = ("repo", "entrypoint", "dataset", "runtime", "external_dependencies", "summary")
+        for section in required_sections:
+            if not isinstance(payload.get(section), dict):
+                errors.append(f"`{section}` must be an object.")
+
+        repo = dict(payload.get("repo") or {})
+        entrypoint = dict(payload.get("entrypoint") or {})
+        dataset = dict(payload.get("dataset") or {})
+        runtime = dict(payload.get("runtime") or {})
+        external_dependencies = dict(payload.get("external_dependencies") or {})
+        summary = dict(payload.get("summary") or {})
+
+        for section_name, section in (
+            ("repo", repo),
+            ("entrypoint", entrypoint),
+            ("dataset", dataset),
+            ("runtime", runtime),
+            ("external_dependencies", external_dependencies),
+        ):
+            status = str(section.get("status") or "").strip().lower()
+            if status not in cls._GROUNDING_STATUSES:
+                errors.append(
+                    f"`{section_name}.status` must be one of {sorted(cls._GROUNDING_STATUSES)}, got `{status}`."
+                )
+            blockers = section.get("blockers")
+            if blockers is not None and not isinstance(blockers, list):
+                errors.append(f"`{section_name}.blockers` must be a list when provided.")
+            blocker_details = section.get("blocker_details")
+            if blocker_details is not None and not isinstance(blocker_details, list):
+                errors.append(f"`{section_name}.blocker_details` must be a list when provided.")
+            elif isinstance(blocker_details, list):
+                for index, item in enumerate(blocker_details):
+                    if not isinstance(item, dict):
+                        errors.append(f"`{section_name}.blocker_details[{index}]` must be an object.")
+
+        repo_url = str(repo.get("url") or "").strip()
+        if repo_url and not repo_url.startswith(("http://", "https://", "git@")):
+            errors.append("`repo.url` must be http(s) or git@ when provided.")
+        entrypoint_evidence = entrypoint.get("evidence_files")
+        if entrypoint_evidence is not None and not isinstance(entrypoint_evidence, list):
+            errors.append("`entrypoint.evidence_files` must be a list when provided.")
+        else:
+            for item in list(entrypoint_evidence or []):
+                relative_path = cls._normalize_relative_path(item)
+                if not relative_path:
+                    errors.append(f"`entrypoint.evidence_files` contains invalid path `{item}`.")
+                    continue
+                resolved = ProjectRuntimeService.resolve_workspace_path(workspace_dir, relative_path, require_exists=False)
+                if resolved is None:
+                    errors.append(f"`entrypoint.evidence_files` contains out-of-scope path `{relative_path}`.")
+
+        if dataset.get("sources") is not None and not isinstance(dataset.get("sources"), list):
+            errors.append("`dataset.sources` must be a list when provided.")
+        if not isinstance(dataset.get("local_presence") or {}, dict):
+            errors.append("`dataset.local_presence` must be an object.")
+        if dataset.get("alternative_source_candidates") is not None and not isinstance(dataset.get("alternative_source_candidates"), list):
+            errors.append("`dataset.alternative_source_candidates` must be a list when provided.")
+        elif isinstance(dataset.get("alternative_source_candidates"), list):
+            for index, item in enumerate(list(dataset.get("alternative_source_candidates") or [])):
+                if not isinstance(item, dict):
+                    errors.append(f"`dataset.alternative_source_candidates[{index}]` must be an object.")
+        if runtime.get("candidate_runtimes") is not None and not isinstance(runtime.get("candidate_runtimes"), list):
+            errors.append("`runtime.candidate_runtimes` must be a list when provided.")
+        if runtime.get("tool_availability") is not None and not isinstance(runtime.get("tool_availability"), dict):
+            errors.append("`runtime.tool_availability` must be an object when provided.")
+        if external_dependencies.get("urls") is not None and not isinstance(external_dependencies.get("urls"), list):
+            errors.append("`external_dependencies.urls` must be a list when provided.")
+        if external_dependencies.get("probe_results") is not None and not isinstance(external_dependencies.get("probe_results"), list):
+            errors.append("`external_dependencies.probe_results` must be a list when provided.")
+        else:
+            for index, item in enumerate(list(external_dependencies.get("probe_results") or [])):
+                if not isinstance(item, dict):
+                    errors.append(f"`external_dependencies.probe_results[{index}]` must be an object.")
+                    continue
+                url = str(item.get("url") or item.get("final_url") or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    errors.append(
+                        f"`external_dependencies.probe_results[{index}]` must include a valid `url` or `final_url`."
+                    )
+                inferred_ok = cls._infer_probe_result_ok(item)
+                if "ok" in item and not isinstance(item.get("ok"), bool):
+                    errors.append(f"`external_dependencies.probe_results[{index}].ok` must be a boolean.")
+                elif inferred_ok is None:
+                    errors.append(
+                        f"`external_dependencies.probe_results[{index}]` must include a boolean `ok`, "
+                        "or enough status/diagnosis fields to infer success."
+                    )
+        if external_dependencies.get("alternative_source_candidates") is not None and not isinstance(external_dependencies.get("alternative_source_candidates"), list):
+            errors.append("`external_dependencies.alternative_source_candidates` must be a list when provided.")
+        elif isinstance(external_dependencies.get("alternative_source_candidates"), list):
+            for index, item in enumerate(list(external_dependencies.get("alternative_source_candidates") or [])):
+                if not isinstance(item, dict):
+                    errors.append(f"`external_dependencies.alternative_source_candidates[{index}]` must be an object.")
+
+        dataset_status = str(dataset.get("status") or "").strip().lower()
+        external_status = str(external_dependencies.get("status") or "").strip().lower()
+        local_presence = dict(dataset.get("local_presence") or {})
+        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
+        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
+        successful_probe_urls, failed_probe_urls = cls._probe_result_url_sets(external_dependencies.get("probe_results"))
+
+        if external_status == "grounded":
+            if not external_urls:
+                errors.append(
+                    "`external_dependencies.status` is `grounded` but `external_dependencies.urls` is empty."
+                )
+            missing_external_probes = [url for url in external_urls if url not in successful_probe_urls]
+            if missing_external_probes:
+                preview = ", ".join(missing_external_probes[:4])
+                errors.append(
+                    "`external_dependencies.status` is `grounded` but these urls do not have successful "
+                    f"`probe_results`: {preview}."
+                )
+            failed_external_urls = [url for url in external_urls if url in failed_probe_urls]
+            if failed_external_urls:
+                preview = ", ".join(failed_external_urls[:4])
+                errors.append(
+                    "`external_dependencies.status` is `grounded` but these urls have failed probe results: "
+                    f"{preview}."
+                )
+
+        if dataset_status == "grounded" and dataset_source_urls and not bool(local_presence.get("available")):
+            missing_dataset_probes = [url for url in dataset_source_urls if url not in successful_probe_urls]
+            if missing_dataset_probes:
+                preview = ", ".join(missing_dataset_probes[:4])
+                errors.append(
+                    "`dataset.status` is `grounded`, but these remote dataset sources do not have successful "
+                    f"probe results and `dataset.local_presence.available` is not true: {preview}."
+                )
+
+        for field in (
+            "repo_grounded",
+            "entrypoint_grounded",
+            "dataset_grounded",
+            "runtime_grounded",
+            "external_dependencies_grounded",
+        ):
+            if field in summary and not isinstance(summary.get(field), bool):
+                errors.append(f"`summary.{field}` must be a boolean.")
+        overall_status = str(summary.get("overall_status") or "").strip().lower()
+        if overall_status and overall_status not in cls._GROUNDING_STATUSES:
+            errors.append(
+                f"`summary.overall_status` must be one of {sorted(cls._GROUNDING_STATUSES)}, got `{overall_status}`."
+            )
+        if summary.get("next_actions") is not None and not isinstance(summary.get("next_actions"), list):
+            errors.append("`summary.next_actions` must be a list when provided.")
+        if summary.get("blockers") is not None and not isinstance(summary.get("blockers"), list):
+            errors.append("`summary.blockers` must be a list when provided.")
+        return errors
+
+    @classmethod
+    def _read_grounding_report_payload(cls, workspace_dir: Path) -> Dict[str, Any]:
+        return cls._read_json_file(workspace_dir / "specs" / "grounding_report.json")
+
+    @classmethod
+    def _grounding_gate_state(cls, workspace_dir: Path) -> Dict[str, Any]:
+        report = cls._read_grounding_report_payload(workspace_dir)
+        if not report:
+            return {
+                "ready": False,
+                "status": "missing",
+                "relative_path": "specs/grounding_report.json",
+                "blockers": [],
+                "next_actions": ["先完成 grounding，并写入 `specs/grounding_report.json`。"],
+                "report": {},
+            }
+        completion = cls._grounding_completion_summary(report)
+        return {
+            "ready": bool(completion.get("complete")),
+            "status": str(completion.get("overall_status") or "unknown"),
+            "relative_path": "specs/grounding_report.json",
+            "blockers": list(completion.get("blockers") or []),
+            "next_actions": list(completion.get("next_actions") or []),
+            "report": report,
+        }
+
+    @classmethod
+    def _grounding_gate_result(
+        cls,
+        *,
+        project_payload: Dict[str, Any],
+        workspace: Any,
+        stage_name: str,
+        action_label: str,
+        gate_state: Dict[str, Any],
+    ) -> ToolResult:
+        blockers = [str(item).strip() for item in list(gate_state.get("blockers") or []) if str(item).strip()]
+        next_actions = [str(item).strip() for item in list(gate_state.get("next_actions") or []) if str(item).strip()]
+        status = str(gate_state.get("status") or "missing")
+        lines = [
+            f"{action_label} 前，必须先完成 grounding 阶段。",
+            f"- Project: /projects/{int(project_payload.get('id') or 0)}",
+            f"- Grounding report: {gate_state.get('relative_path')}",
+            f"- Grounding status: {status}",
+        ]
+        if blockers:
+            lines.append("- Grounding blockers:")
+            lines.extend(f"  - {item}" for item in blockers[:8])
+        if next_actions:
+            lines.append("- Recommended next actions:")
+            lines.extend(f"  - {item}" for item in next_actions[:6])
+        else:
+            if status == "blocked":
+                lines.append("- Recommended next action: 对 blocked 官方链接做一次 focused web_search/web_scrape，记录 alternative_source_candidates；若仍无可信候选，再报告 blocker。")
+            else:
+                lines.append("- Recommended next action: 先 probe repo/url、inspect runtime，并写入 grounding_report。")
+        return ToolResult(
+            success=False,
+            output="\n".join(lines),
+            error="grounding_incomplete",
+            data={
+                **cls._root_descriptor(project_payload=project_payload, workspace=workspace),
+                "project_id": int(project_payload.get("id") or 0),
+                "current_stage": "grounding",
+                "blocked_stage": stage_name,
+                "grounding_report_relative_path": gate_state.get("relative_path"),
+                "grounding_status": status,
+                "grounding_ready": False,
+                "grounding_blockers": blockers,
+                "next_actions": next_actions,
+            },
+        )
+
+    @classmethod
     def _normalize_implementation_spec_payload(
         cls,
         payload: Dict[str, Any],
@@ -2412,6 +3299,8 @@ class _PaperResearchToolBase(ToolBase):
 
     @classmethod
     def _validate_implementation_spec_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
+        from app.services.project_runtime_service import ProjectRuntimeService
+
         errors: List[str] = []
         required_object_fields = (
             "source_summary",
@@ -2429,7 +3318,7 @@ class _PaperResearchToolBase(ToolBase):
         repo_root_relative_path = cls._normalize_relative_path(payload.get("repo_root_relative_path") or "")
         if not repo_root_relative_path:
             errors.append("`repo_root_relative_path` must be a workspace-relative path.")
-        elif cls.resolve_workspace_path(workspace_dir, repo_root_relative_path, require_exists=False) is None:
+        elif ProjectRuntimeService.resolve_workspace_path(workspace_dir, repo_root_relative_path, require_exists=False) is None:
             errors.append(f"`repo_root_relative_path` is outside workspace or invalid: {repo_root_relative_path}")
 
         for field in ("blockers", "next_actions", "evidence_log", "notes"):
@@ -2476,7 +3365,7 @@ class _PaperResearchToolBase(ToolBase):
                 repo_relative_path = repo_relative_path.removeprefix("repo/source/")
             if not repo_relative_path:
                 errors.append("`baseline.entrypoint_path_or_hint` must be a repo-relative path.")
-            elif cls.resolve_workspace_path(workspace_dir, f"repo/source/{repo_relative_path}") is None:
+            elif ProjectRuntimeService.resolve_workspace_path(workspace_dir, f"repo/source/{repo_relative_path}") is None:
                 errors.append(
                     f"`baseline.entrypoint_path_or_hint` references missing repo file `{repo_relative_path}`."
                 )
@@ -2766,6 +3655,11 @@ class _PaperResearchToolBase(ToolBase):
                 )
         elif current_stage == "planning":
             recommended_next_action = "先调用 paper_research_prepare，准备/刷新论文 intake 与 workspace。"
+        elif current_stage == "grounding":
+            recommended_next_action = (
+                "优先 probe repo/url、读取 repo/runtime 证据，并写入 grounding_report；"
+                "在 grounding 完成前不要进入 implementation 或 execution。"
+            )
         elif current_stage in {"implementation_prep", "run_drafts"}:
             recommended_next_action = "优先读取 implementation_spec / run_drafts，确认 repo、数据和 baseline 草案后再启动 execution。"
         elif current_stage == "execution":
@@ -3319,7 +4213,10 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "relative_path": {"type": "string", "description": "manifest 中返回的 artifact 相对路径。"},
+            "relative_path": {
+                "type": "string",
+                "description": "manifest 中返回的 artifact 相对路径，例如 `planning/paper_summary.json` 或 `specs/grounding_report.json`。不要传绝对路径。",
+            },
             "mode": {
                 "type": "string",
                 "enum": ["auto", "full", "chunk", "page", "line_range"],
@@ -3447,12 +4344,20 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
     input_model = PaperResearchReadRepoFileInput
     parallel_safe = True
     output_max_tokens = 9000
-    description = "按 repo/source 下的相对路径读取单个仓库文件。"
+    description = "按 repo/source 下的相对路径读取单个仓库文件；路径不确定时先用 `paper_research_search_repo` 定位。"
     parameters = {
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "repo_relative_path": {"type": "string", "description": "repo/source 下的相对路径，例如 README.md 或 train.py。"},
+            "repo_relative_path": {
+                "type": "string",
+                "description": (
+                    "repo/source 下的相对路径，例如 `README.md`、`train.py` 或 `configs/train.yaml`。"
+                    "优先传 repo-relative 路径，不需要带 `repo/source/` 前缀。"
+                    "如果不确定具体位于哪个子目录，先用 `paper_research_search_repo` 按文件名或关键字定位，"
+                    "不要臆测 `scripts/` 等目录前缀。"
+                ),
+            },
             "mode": {
                 "type": "string",
                 "enum": ["auto", "full", "chunk", "page", "line_range"],
@@ -3526,9 +4431,19 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
             if not target_path.is_file():
                 return ToolResult(
                     success=False,
-                    output=f"仓库文件不存在: `repo/source/{repo_relative_path}`。",
+                    output=(
+                        f"仓库文件不存在: `repo/source/{repo_relative_path}`。"
+                        "这通常不是文件不可读，而是 repo_relative_path 猜错了。"
+                        "如果不确定真实路径，请先调用 `paper_research_search_repo` 用文件名或关键字定位，"
+                        "不要继续假设它在 `scripts/` 等目录下。"
+                    ),
                     error="repo_file_not_found",
-                    data={"project_id": project_id, "repo_relative_path": repo_relative_path},
+                    data={
+                        "project_id": project_id,
+                        "repo_relative_path": repo_relative_path,
+                        "next_action": "paper_research_search_repo",
+                        "path_hint_invalid": True,
+                    },
                 )
 
             text_payload = self._read_text_payload(
@@ -3587,12 +4502,18 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "query": {"type": "string", "description": "搜索词或正则表达式。"},
-            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条匹配。"},
+            "query": {"type": "string", "description": "搜索词或正则表达式。默认按固定字符串搜索；只有在 `is_regex=true` 时才按正则处理。"},
+            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条匹配。范围 1-100。"},
             "case_sensitive": {"type": "boolean", "default": False, "description": "是否大小写敏感。"},
             "is_regex": {"type": "boolean", "default": False, "description": "是否将 query 按正则表达式处理。"},
-            "glob": {"type": "string", "description": "可选文件 glob，例如 `*.py` 或 `**/*.ipynb`。"},
-            "context_lines": {"type": "integer", "default": 0, "description": "可选，返回每个命中点上下各多少行上下文。适合先 search 再按行读局部。"},
+            "glob": {"type": "string", "description": "可选文件 glob，例如 `*.py`、`*.sh` 或 `**/*.ipynb`；只用于缩小文件范围。"},
+            "context_lines": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 20,
+                "description": "可选，返回每个命中点上下各多少行上下文。范围 0-20，适合先 search 再按行读局部。",
+            },
         },
         "required": ["project_id", "query"],
     }
@@ -3915,6 +4836,149 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
+class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
+    name = "paper_research_write_grounding_report"
+    input_model = PaperResearchWriteGroundingReportInput
+    description = "将 grounding 阶段的结构化证据闭环报告归档到当前 Project 工作区。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID（>=1）。"},
+            "grounding_report": {
+                "type": "object",
+                "description": (
+                    "要保存的 grounding_report JSON。必须覆盖 repo、entrypoint、dataset、runtime、"
+                    "external_dependencies、summary 六个顶层对象，并将事实收敛为 grounded/absent/blocked/unknown。"
+                    "如果把一组 dataset/external URLs 声明为 grounded，必须为每个必要官方链接提供成功的 probe 结果，"
+                    "或明确证明本地已存在。canonical 结构中 `dataset.sources` 保存数据源，"
+                    "`external_dependencies.urls` 只放 URL 字符串，`external_dependencies.probe_results` 单独保存逐条 probe 结果。"
+                    "blocked 场景应把失败原因写进各 section 的 `blockers`/`blocker_details`，并把替代源候选写进 "
+                    "`dataset.alternative_source_candidates` 或 `external_dependencies.alternative_source_candidates`。"
+                ),
+            },
+        },
+        "required": ["project_id", "grounding_report"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            relative_path = "specs/grounding_report.json"
+            actual_path = workspace_dir / "specs" / "grounding_report.json"
+            payload = dict(kwargs.get("grounding_report") or {})
+            payload.setdefault("schema_version", "grounding_report_v1")
+            payload.setdefault("paper_id", project_payload.get("paper_id"))
+            payload.setdefault("project_id", int(project_id))
+            payload.setdefault("workspace_id", int(workspace.id))
+            payload.setdefault("notebook_id", str(workspace.notebook_id or ""))
+            payload.setdefault("root_alias", self._PROJECT_ROOT_ALIAS)
+            payload.setdefault("repo_root_relative_path", "repo/source")
+            payload = self._normalize_grounding_report_payload(payload, workspace_dir=workspace_dir)
+            validation_errors = self._validate_grounding_report_payload(payload, workspace_dir=workspace_dir)
+            if validation_errors:
+                return ToolResult(
+                    success=False,
+                    output=(
+                        "grounding_report JSON 未通过归档校验，未写入文件。\n"
+                        + "\n".join(f"- {item}" for item in validation_errors[:12])
+                    ),
+                    error="grounding_report_invalid",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "relative_path": relative_path,
+                        "saved": False,
+                        "validation_errors": validation_errors,
+                    },
+                )
+
+            actual_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+            completion = self._grounding_completion_summary(payload)
+            lines = [
+                "已写入 grounding report。",
+                f"- Project: /projects/{project_id}",
+                f"- Relative path: {relative_path}",
+                f"- Overall status: {completion.get('overall_status')}",
+            ]
+            blockers = [str(item).strip() for item in list(completion.get("blockers") or []) if str(item).strip()]
+            next_actions = [str(item).strip() for item in list(completion.get("next_actions") or []) if str(item).strip()]
+            if blockers:
+                lines.append("- Blockers:")
+                lines.extend(f"  - {item}" for item in blockers[:6])
+            if next_actions:
+                lines.append("- Next actions:")
+                lines.extend(f"  - {item}" for item in next_actions[:4])
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "relative_path": relative_path,
+                    "saved": True,
+                    "current_stage": "grounding",
+                    "grounding_status": completion.get("overall_status"),
+                    "grounding_ready": bool(completion.get("complete")),
+                    "content": payload,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchReadGroundingReportTool(_PaperResearchToolBase):
+    name = "paper_research_read_grounding_report"
+    input_model = PaperResearchReadGroundingReportInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取当前 Project 已归档的 grounding_report。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "chunk", "page", "line_range"],
+                "default": "auto",
+                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
+            },
+            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
+            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
+            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
+            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
+            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
+            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
+            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        return await PaperResearchReadArtifactTool(
+            self.db,
+            self.user_id,
+            db_session_factory=self.db_session_factory,
+        ).execute(
+            project_id=int(kwargs["project_id"]),
+            relative_path="specs/grounding_report.json",
+            mode=str(kwargs.get("mode") or "auto"),
+            max_chars=int(kwargs.get("max_chars") or 20000),
+            chunk_index=kwargs.get("chunk_index"),
+            chunk_chars=kwargs.get("chunk_chars"),
+            page=kwargs.get("page"),
+            page_size_lines=kwargs.get("page_size_lines"),
+            line_start=kwargs.get("line_start"),
+            line_end=kwargs.get("line_end"),
+        )
+
+
 class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
     name = "paper_research_write_implementation_spec"
     input_model = PaperResearchWriteImplementationSpecInput
@@ -3938,6 +5002,15 @@ class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
+            grounding_gate = self._grounding_gate_state(workspace_dir)
+            if not bool(grounding_gate.get("ready")):
+                return self._grounding_gate_result(
+                    project_payload=project_payload,
+                    workspace=workspace,
+                    stage_name="implementation_prep",
+                    action_label="写入 implementation_spec",
+                    gate_state=grounding_gate,
+                )
             relative_path = "specs/implementation_spec.json"
             actual_path = workspace_dir / "specs" / "implementation_spec.json"
             payload = dict(kwargs.get("implementation_spec") or {})
@@ -4078,6 +5151,15 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
+            grounding_gate = self._grounding_gate_state(workspace_dir)
+            if not bool(grounding_gate.get("ready")):
+                return self._grounding_gate_result(
+                    project_payload=project_payload,
+                    workspace=workspace,
+                    stage_name="run_drafts",
+                    action_label="写入 run_drafts",
+                    gate_state=grounding_gate,
+                )
             relative_path = "drafts/run_drafts.json"
             actual_path = workspace_dir / "drafts" / "run_drafts.json"
             payload = dict(kwargs.get("run_drafts") or {})
@@ -4266,7 +5348,7 @@ class PaperResearchProbeRepoTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "repo_url": {"type": "string", "description": "可选，显式指定要探测的仓库 URL；缺省时优先使用当前 Project 的 repo_reference。"},
+            "repo_url": {"type": "string", "description": "可选，显式指定要探测的官方仓库 URL；缺省时优先使用当前 Project 的 repo_reference。"},
         },
         "required": ["project_id"],
     }
@@ -4428,7 +5510,7 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "default": "auto",
                 "description": "期望拿到的内容类型，用于判断官方链接是否已失效或落到错误页面。",
             },
-            "read_bytes": {"type": "integer", "default": 64, "description": "最多读取的响应头字节数，用于 magic-bytes 判断。"},
+            "read_bytes": {"type": "integer", "default": 64, "description": "最多读取多少字节用于 magic-bytes 判断。范围 8-512；不会下载整个文件。"},
         },
         "required": ["project_id", "url"],
     }
@@ -4593,6 +5675,15 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
+            grounding_gate = self._grounding_gate_state(workspace_dir)
+            if not bool(grounding_gate.get("ready")):
+                return self._grounding_gate_result(
+                    project_payload=project_payload,
+                    workspace=workspace,
+                    stage_name="execution",
+                    action_label="写入 execution_spec",
+                    gate_state=grounding_gate,
+                )
             try:
                 saved = ProjectRuntimeService().write_execution_spec(
                     workspace_dir=workspace_dir,
@@ -4641,7 +5732,7 @@ class PaperResearchWriteExecutionScriptTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "execution_id": {"type": "string", "description": "目标 execution_id；脚本会被约束在 executions/{execution_id}/ 下。"},
+            "execution_id": {"type": "string", "description": "目标 execution_id；不是 draft_id。脚本会被约束在 executions/{execution_id}/ 下。"},
             "relative_path": {
                 "type": "string",
                 "description": (
@@ -4651,7 +5742,7 @@ class PaperResearchWriteExecutionScriptTool(_PaperResearchToolBase):
             },
             "content": {
                 "type": "string",
-                "description": "脚本内容。推荐用于 Python variant 脚本或轻量辅助文件。",
+                "description": "脚本内容。推荐用于 Python variant 脚本或轻量辅助文件；不能为空。",
             },
         },
         "required": ["project_id", "execution_id", "content"],
@@ -4670,6 +5761,15 @@ class PaperResearchWriteExecutionScriptTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
+            grounding_gate = self._grounding_gate_state(workspace_dir)
+            if not bool(grounding_gate.get("ready")):
+                return self._grounding_gate_result(
+                    project_payload=project_payload,
+                    workspace=workspace,
+                    stage_name="execution",
+                    action_label="写入 execution 脚本",
+                    gate_state=grounding_gate,
+                )
             try:
                 saved = ProjectRuntimeService().write_execution_generated_file(
                     workspace_dir=workspace_dir,
@@ -4717,7 +5817,7 @@ class PaperResearchReadExecutionSpecTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "execution_id": {"type": "string", "description": "execution spec ID。"},
+            "execution_id": {"type": "string", "description": "execution spec ID；不是 draft_id。"},
         },
         "required": ["project_id", "execution_id"],
     }
@@ -4783,7 +5883,7 @@ class PaperResearchStartExecutionTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "execution_id": {"type": "string", "description": "execution spec ID。"},
+            "execution_id": {"type": "string", "description": "execution spec ID；不是 draft_id。只有已归档 execution_spec 才能启动。"},
         },
         "required": ["project_id", "execution_id"],
     }
@@ -4851,11 +5951,22 @@ class PaperResearchStartExecutionTool(_PaperResearchToolBase):
             if workspace is None:
                 return self._workspace_not_ready(project_payload, project_id)
 
+            workspace_dir = self._workspace_dir_for(workspace)
+            grounding_gate = self._grounding_gate_state(workspace_dir)
+            if not bool(grounding_gate.get("ready")):
+                return self._grounding_gate_result(
+                    project_payload=project_payload,
+                    workspace=workspace,
+                    stage_name="execution",
+                    action_label="启动 execution",
+                    gate_state=grounding_gate,
+                )
+
             service = ProjectRuntimeService()
             spec_content: Dict[str, Any] = {}
             try:
                 spec_content = service.read_execution_spec(
-                    workspace_dir=self._workspace_dir_for(workspace),
+                    workspace_dir=workspace_dir,
                     execution_id=execution_id,
                 )
             except FileNotFoundError:
@@ -4864,7 +5975,7 @@ class PaperResearchStartExecutionTool(_PaperResearchToolBase):
                 payload = await service.start_execution(
                     project_id=project_id,
                     workspace_id=int(workspace.id),
-                    workspace_dir=self._workspace_dir_for(workspace),
+                    workspace_dir=workspace_dir,
                     execution_id=execution_id,
                 )
             except FileNotFoundError:
@@ -4964,9 +6075,9 @@ class PaperResearchReadExecutionTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "execution_id": {"type": "string", "description": "execution ID。"},
+            "execution_id": {"type": "string", "description": "execution ID；不是 draft_id。"},
             "include_logs": {"type": "boolean", "default": True},
-            "max_log_chars": {"type": "integer", "default": 20000},
+            "max_log_chars": {"type": "integer", "default": 20000, "description": "日志最多返回多少字符。范围 0-200000。"},
         },
         "required": ["project_id", "execution_id"],
     }
@@ -5025,7 +6136,7 @@ class PaperResearchCancelExecutionTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "execution_id": {"type": "string", "description": "execution ID。"},
+            "execution_id": {"type": "string", "description": "execution ID；不是 draft_id。"},
         },
         "required": ["project_id", "execution_id"],
     }
@@ -5067,6 +6178,15 @@ class PaperResearchCancelExecutionTool(_PaperResearchToolBase):
             )
 
         return await self._with_db(_handler)
+
+
+for _paper_tool_cls in list(globals().values()):
+    if (
+        isinstance(_paper_tool_cls, type)
+        and issubclass(_paper_tool_cls, _PaperResearchToolBase)
+        and _paper_tool_cls is not _PaperResearchToolBase
+    ):
+        _sync_tool_parameter_constraints(_paper_tool_cls)
 
 
 @dataclass
@@ -6892,6 +8012,16 @@ class DefaultToolProvider:
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
                         ),
+                        PaperResearchWriteGroundingReportTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchReadGroundingReportTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
                         PaperResearchWriteImplementationSpecTool(
                             ctx.db,
                             int(ctx.user_id),
@@ -6913,6 +8043,16 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                         ),
                         PaperResearchInspectRuntimeTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchProbeRepoTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchProbeUrlTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,

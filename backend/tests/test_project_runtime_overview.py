@@ -168,3 +168,149 @@ def test_stage_ledger_planning_requires_paper_summary(tmp_path):
     planning_stage_with_summary = next(item for item in ledger_with_summary if item["stage"] == "planning")
     assert planning_stage_with_summary["status"] == "completed"
     assert planning_stage_with_summary["summary"] == "classify tabular data"
+
+
+def test_stage_ledger_inserts_grounding_between_planning_and_implementation(tmp_path):
+    service = ProjectService(db=None)
+    workspace = {
+        "experiment_spec": {"task": {"task_type": "classification"}},
+        "summary": {},
+        "compare_report": {},
+    }
+
+    (tmp_path / "paper_intake_result.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "paper_summary.json").write_text('{"problem_definition":"classify news"}', encoding="utf-8")
+    (tmp_path / "experiment_spec.json").write_text("{}", encoding="utf-8")
+
+    ledger = service._build_stage_ledger(
+        workspace=workspace,
+        workspace_dir=tmp_path,
+        recent_executions=[],
+        results={},
+    )
+
+    assert [item["stage"] for item in ledger[:3]] == ["planning", "grounding", "implementation_prep"]
+    grounding_stage = next(item for item in ledger if item["stage"] == "grounding")
+    implementation_stage = next(item for item in ledger if item["stage"] == "implementation_prep")
+    assert grounding_stage["status"] == "ready"
+    assert implementation_stage["status"] == "missing"
+
+
+def test_stage_ledger_grounding_requires_grounding_report_completion(tmp_path):
+    service = ProjectService(db=None)
+    workspace = {
+        "experiment_spec": {"task": {"task_type": "classification"}},
+        "summary": {},
+        "compare_report": {},
+    }
+
+    (tmp_path / "paper_intake_result.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "paper_summary.json").write_text('{"problem_definition":"classify news"}', encoding="utf-8")
+    (tmp_path / "experiment_spec.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "specs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "specs" / "grounding_report.json").write_text(
+        """
+        {
+          "summary": {
+            "repo_grounded": false,
+            "entrypoint_grounded": false,
+            "dataset_grounded": true,
+            "runtime_grounded": true,
+            "external_dependencies_grounded": false,
+            "overall_status": "blocked"
+          },
+          "repo": {"status": "blocked", "blockers": ["repo missing"]},
+          "entrypoint": {"status": "absent", "blockers": []},
+          "dataset": {"status": "grounded", "blockers": []},
+          "runtime": {"status": "grounded", "blockers": []},
+          "external_dependencies": {"status": "blocked", "blockers": ["url dead"]}
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    blocked_ledger = service._build_stage_ledger(
+        workspace=workspace,
+        workspace_dir=tmp_path,
+        recent_executions=[],
+        results={},
+    )
+    blocked_grounding = next(item for item in blocked_ledger if item["stage"] == "grounding")
+    assert blocked_grounding["status"] == "blocked"
+
+    (tmp_path / "specs" / "grounding_report.json").write_text(
+        """
+        {
+          "summary": {
+            "repo_grounded": true,
+            "entrypoint_grounded": true,
+            "dataset_grounded": true,
+            "runtime_grounded": true,
+            "external_dependencies_grounded": true,
+            "overall_status": "grounded"
+          },
+          "repo": {"status": "grounded", "blockers": []},
+          "entrypoint": {"status": "grounded", "blockers": []},
+          "dataset": {"status": "grounded", "blockers": []},
+          "runtime": {"status": "grounded", "blockers": []},
+          "external_dependencies": {"status": "grounded", "blockers": []}
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    completed_ledger = service._build_stage_ledger(
+        workspace=workspace,
+        workspace_dir=tmp_path,
+        recent_executions=[],
+        results={},
+    )
+    completed_grounding = next(item for item in completed_ledger if item["stage"] == "grounding")
+    assert completed_grounding["status"] == "completed"
+
+
+def test_workspace_state_stays_in_grounding_until_grounding_complete(tmp_path):
+    service = ProjectService(db=None)
+    stage_ledger = [
+        {"stage": "planning", "status": "completed"},
+        {"stage": "grounding", "status": "ready"},
+        {"stage": "implementation_prep", "status": "missing"},
+        {"stage": "run_drafts", "status": "missing"},
+        {"stage": "execution", "status": "missing"},
+        {"stage": "results", "status": "missing"},
+    ]
+
+    current_stage, current_status = service._derive_workspace_state(
+        stage_ledger=stage_ledger,
+        results={},
+        executions=[],
+    )
+
+    assert current_stage == "grounding"
+    assert current_status == "active"
+
+
+def test_grounding_completion_state_reads_summary_and_blocker_details():
+    service = ProjectService(db=None)
+
+    state = service._grounding_completion_state(
+        {
+            "summary": {
+                "overall_status": "blocked",
+                "blockers": ["Official source unavailable"],
+            },
+            "repo": {"status": "grounded", "blockers": []},
+            "entrypoint": {"status": "grounded", "blockers": []},
+            "dataset": {
+                "status": "blocked",
+                "blockers": [],
+                "blocker_details": [{"reason": "IMDB source blocked (HTTP 403)"}],
+            },
+            "runtime": {"status": "unknown", "blockers": []},
+            "external_dependencies": {"status": "blocked", "blockers": []},
+        }
+    )
+
+    assert state["overall_status"] == "blocked"
+    assert "Official source unavailable" in state["blockers"]
+    assert "IMDB source blocked (HTTP 403)" in state["blockers"]

@@ -266,6 +266,24 @@ class AgentCore:
         "产物",
         "状态",
     )
+    _PAPER_GROUNDING_MARKERS = (
+        "grounding",
+        "grounding_report",
+        "grounding report",
+        "specs/grounding_report.json",
+        "repo grounding",
+        "external dependencies",
+        "external dependency",
+        "probe repo",
+        "probe url",
+        "探活",
+        "测活",
+        "repo 探测",
+        "repo 探活",
+        "url 探测",
+        "url 探活",
+        "证据闭环",
+    )
     _DECISION_STATE_STATUSES = {"active", "ready", "blocked", "waiting"}
     _DECISION_EVIDENCE_STATUSES = {"insufficient", "sufficient"}
     _PAPER_ARTIFACT_ACTION_MARKERS = (
@@ -637,13 +655,23 @@ class AgentCore:
         if not user_text:
             return []
 
+        workflow_binding = dict((context.conversation_state or {}).get("workflow_binding") or {})
+        current_stage = str(workflow_binding.get("current_stage") or "").strip().lower()
         is_run_draft_request = self._contains_any_marker(user_text, self._PAPER_RUN_DRAFT_MARKERS)
         is_implementation_spec_request = self._contains_any_marker(user_text, self._PAPER_IMPLEMENTATION_SPEC_MARKERS)
         is_prepare_or_status_request = self._contains_any_marker(user_text, self._PAPER_PREPARE_MARKERS)
+        is_grounding_request = self._contains_any_marker(user_text, self._PAPER_GROUNDING_MARKERS)
         is_artifact_action = self._contains_any_marker(user_text, self._PAPER_ARTIFACT_ACTION_MARKERS)
         is_mutation_action = self._contains_any_marker(user_text, self._PAPER_ARTIFACT_MUTATION_MARKERS)
         is_execution_request = self._contains_any_marker(user_text, self._PAPER_EXECUTION_MARKERS)
-        if not (is_run_draft_request or is_implementation_spec_request or is_prepare_or_status_request or is_artifact_action):
+        if not (
+            is_run_draft_request
+            or is_implementation_spec_request
+            or is_prepare_or_status_request
+            or is_grounding_request
+            or is_artifact_action
+            or current_stage == "grounding"
+        ):
             return []
 
         attempted_tools = self._tool_action_names(context)
@@ -652,9 +680,29 @@ class AgentCore:
             name for name in attempted_tools
             if name.startswith(self._PAPER_RESEARCH_TOOL_PREFIX)
         }
+        grounding_evidence_tools = {
+            "paper_research_clone_repo",
+            "paper_research_probe_repo",
+            "paper_research_probe_url",
+            "paper_research_get_artifact_manifest",
+            "paper_research_read_artifact",
+            "paper_research_read_repo_file",
+            "paper_research_search_repo",
+            "paper_research_inspect_runtime",
+        }
+        grounding_evidence_attempted = bool(attempted_tools.intersection(grounding_evidence_tools))
         missing: List[str] = []
         if not paper_attempted:
             missing.append("any paper_research_* tool call")
+
+        if (
+            "paper_research_write_grounding_report" not in attempted_tools
+            and (
+                (current_stage == "grounding" and grounding_evidence_attempted)
+                or (is_grounding_request and is_mutation_action and not is_execution_request)
+            )
+        ):
+            missing.append("paper_research_write_grounding_report")
 
         if is_run_draft_request and is_mutation_action and not is_execution_request:
             if "paper_research_write_run_drafts" not in attempted_tools:
@@ -686,6 +734,15 @@ class AgentCore:
         missing = ", ".join(str(item) for item in missing_tools if str(item or "").strip())
         if not missing:
             missing = "required paper_research tool calls"
+        if "paper_research_write_grounding_report" in set(missing_tools):
+            return (
+                "当前仍在 paper-reproduction 的 grounding 阶段。"
+                "不能只根据 probe/read/search 的中间证据口头宣布 grounding 完成；"
+                "必须先调用 `paper_research_write_grounding_report`，把 repo、entrypoint、dataset、"
+                "runtime、external dependencies 的 grounded/absent/blocked 结论正式写入。"
+                f"\n缺失工具调用: {missing}\n"
+                "下一步请先写 grounding_report；如果证据不足或外链失败，就把 blocker 写进报告，不要直接结束。"
+            )
         return (
             "当前激活的是 paper-reproduction，并且用户请求涉及产物生成、刷新、写入或读回。"
             "不能用自然语言声明已经完成；必须先调用真实工具。\n"
@@ -693,6 +750,47 @@ class AgentCore:
             "下一步请调用对应 paper_research_* 工具完成读取、写入或读回。"
             "如果写入工具返回失败，请基于真实失败结果解释原因；不要假装产物已经保存。"
         )
+
+    def _maybe_guard_paper_skill_direct_answer(
+        self,
+        context: AgentContext,
+        *,
+        events: List[Dict[str, Any]],
+    ) -> Optional[tuple[List[Dict[str, Any]], bool]]:
+        missing_paper_tools = self._missing_required_paper_skill_tool_calls(context)
+        if not missing_paper_tools:
+            return None
+        retries = int((context.context_debug or {}).get("paper_skill_tool_guard_retries") or 0)
+        context.context_debug = {
+            **dict(context.context_debug or {}),
+            "paper_skill_tool_guard_retries": retries + 1,
+            "paper_skill_tool_guard_missing": list(missing_paper_tools),
+        }
+        if retries >= 2:
+            safe_answer = (
+                "本轮没有完成必要的 paper_research 工具调用，"
+                "因此不能确认对应产物已经生成、写入或读回。"
+                "请重试该步骤，或先查看当前 Project/workspace 状态。"
+            )
+            if "paper_research_write_grounding_report" in set(missing_paper_tools):
+                safe_answer = (
+                    "当前 grounding 还没有通过真实工具写入 `specs/grounding_report.json`，"
+                    "因此不能把口头总结当成阶段完成。请先写入 grounding_report，"
+                    "或明确报告 blocker。"
+                )
+            context.final_answer = safe_answer
+            context.state = AgentState.DONE
+            events.append({"type": "answer", "data": safe_answer})
+            return events, True
+        guard_message = self._build_paper_skill_tool_guard_message(context, missing_paper_tools)
+        events.append(
+            {
+                "type": "thought",
+                "data": "检测到当前阶段需要真实 paper_research 工具调用，已阻止直接回答并要求先执行工具。",
+            }
+        )
+        context.messages.append({"role": "user", "content": guard_message})
+        return events, False
 
     @staticmethod
     def _user_texts(messages: Optional[Sequence[Dict[str, Any]]]) -> List[str]:
@@ -4856,6 +4954,20 @@ class AgentCore:
         )
         return any(marker in normalized for marker in markers)
 
+    @staticmethod
+    def _repo_read_failure_requires_search(detail: str) -> bool:
+        normalized = str(detail or "").strip().lower()
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "repo_file_not_found",
+                "仓库文件不存在",
+                "missing repo file",
+            )
+        )
+
     def _maybe_stop_after_repeated_tool_failures(
         self,
         context: AgentContext,
@@ -4878,6 +4990,9 @@ class AgentCore:
             if not tool_name:
                 continue
             if bool(item.get("success")):
+                context.tool_failure_streaks[tool_name] = 0
+                continue
+            if self._probe_failure_counts_as_grounding_evidence(context, item):
                 context.tool_failure_streaks[tool_name] = 0
                 continue
 
@@ -4922,6 +5037,19 @@ class AgentCore:
                 "检测到 run_drafts 连续失败且问题集中在 entrypoint schema，"
                 "已停止把生成脚本伪装成 repo_script 的重试。"
             )
+        if stop_tool == "paper_research_read_repo_file" and self._repo_read_failure_requires_search(stop_output):
+            context.final_answer = (
+                "`paper_research_read_repo_file` 已连续失败 "
+                f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
+                "这类失败通常不是文件不可读，而是 repo_relative_path 猜错了。"
+                "下一步应先调用 `paper_research_search_repo` 用文件名或关键字定位真实 repo-relative 路径，"
+                "再按命中结果读取；不要继续假设它在 `scripts/` 之类的目录下。"
+            )
+            context.state = AgentState.DONE
+            return (
+                "检测到 read_repo_file 连续失败且问题集中在 repo_relative_path 不存在，"
+                "已切换为“先 search_repo 定位真实路径”的收束路径。"
+            )
 
         context.final_answer = (
             f"`{stop_tool}` 已连续失败 {stop_count} 次，已停止自动重试。"
@@ -4932,6 +5060,57 @@ class AgentCore:
             f"检测到 `{stop_tool}` 连续失败 {stop_count} 次，继续自动尝试大概率只会重复犯错，"
             "本轮提前停止。"
         )
+
+    def _probe_failure_counts_as_grounding_evidence(
+        self,
+        context: AgentContext,
+        observation: Dict[str, Any],
+    ) -> bool:
+        tool_name = str(observation.get("tool") or "").strip()
+        if tool_name not in {"paper_research_probe_url", "paper_research_probe_repo"}:
+            return False
+        workflow_binding = (
+            dict((context.conversation_state or {}).get("workflow_binding") or {})
+            if isinstance(context.conversation_state, dict)
+            else {}
+        )
+        if str(workflow_binding.get("current_stage") or "").strip().lower() != "grounding":
+            return False
+
+        error_code = str(observation.get("error") or "").strip().lower()
+        result_data = dict(observation.get("data") or {}) if isinstance(observation.get("data"), dict) else {}
+        diagnosis = str(result_data.get("diagnosis") or "").strip().lower()
+        raw_status = result_data.get("status_code", result_data.get("status"))
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            status_code = None
+
+        if tool_name == "paper_research_probe_url":
+            if error_code != "url_probe_failed":
+                return False
+            if status_code is not None and status_code >= 400:
+                return True
+            return diagnosis in {
+                "auth_required",
+                "forbidden",
+                "not_found",
+                "accepted_but_empty",
+                "redirect_broken",
+                "checksum_mismatch",
+                "license_gate",
+                "manual_download_required",
+                "http_401",
+                "http_403",
+                "http_404",
+                "http_410",
+            }
+
+        if error_code != "repo_probe_failed":
+            return False
+        if status_code is not None and status_code >= 400:
+            return True
+        return diagnosis in {"repo_unreachable", "repo_page_reachable_but_not_cloneable"}
 
     def _maybe_stop_after_authorization_required(
         self,
@@ -5397,6 +5576,7 @@ class AgentCore:
                 suffix = f" · stage={stage}" if stage else ""
                 return f"{status} · 已启动 execution `{execution_id}`{suffix}"
         if tool_name in {
+            "paper_research_write_grounding_report",
             "paper_research_write_implementation_spec",
             "paper_research_write_run_drafts",
             "paper_research_write_execution_spec",
@@ -5417,11 +5597,23 @@ class AgentCore:
         *,
         paper_skill_active: bool,
         repo_edit_allowed: Optional[bool],
+        workflow_binding: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, Dict[str, Any]]:
         failed_rows = [item for item in rows if not item.success]
         permission_rows = [item for item in rows if item.permission_required]
         tool_names = [str(item.tool_name or "").strip() for item in rows if str(item.tool_name or "").strip()]
         last_tool = tool_names[-1] if tool_names else ""
+        current_stage = str(dict(workflow_binding or {}).get("current_stage") or "").strip().lower()
+        grounding_tool_names = {
+            "paper_research_clone_repo",
+            "paper_research_probe_repo",
+            "paper_research_probe_url",
+            "paper_research_get_artifact_manifest",
+            "paper_research_read_grounding_report",
+            "paper_research_write_grounding_report",
+            "paper_research_inspect_runtime",
+        }
+        grounding_context = current_stage == "grounding" or any(name in grounding_tool_names for name in tool_names)
 
         if permission_rows:
             return (
@@ -5441,6 +5633,17 @@ class AgentCore:
                 failure_detail = str(
                     last_failure.observation_output or last_failure.error or ""
                 )
+                if "grounding" in failure_detail.lower() and "grounding_report" in failure_detail.lower():
+                    return (
+                        "execution 仍被 grounding gate 拦住；先完成 grounding_report，不要继续尝试 execution。",
+                        {
+                            "status": "blocked",
+                            "evidence_status": "sufficient",
+                            "next_action": "write_grounding_report",
+                            "blocked_reason": "grounding_incomplete",
+                            "allowed_actions": ["write_grounding_report", "report_blocker"],
+                        },
+                    )
                 if cls._execution_spec_failure_requires_script(failure_detail):
                     return (
                         "execution_spec 连续卡在脚本/命令表达；请先写 execution 级脚本，再引用它生成 execution_spec。",
@@ -5471,8 +5674,39 @@ class AgentCore:
                         },
                     )
             elif last_tool == "paper_research_start_execution":
+                last_failure = failed_rows[-1]
+                failure_detail = str(
+                    last_failure.observation_output or last_failure.error or ""
+                )
+                if "grounding" in failure_detail.lower() and "grounding_report" in failure_detail.lower():
+                    return (
+                        "grounding 尚未完成，当前不能 start_execution；请先收束 grounding blockers 并写入 grounding_report。",
+                        {
+                            "status": "blocked",
+                            "evidence_status": "sufficient",
+                            "next_action": "write_grounding_report",
+                            "blocked_reason": "grounding_incomplete",
+                            "allowed_actions": ["write_grounding_report", "report_blocker"],
+                        },
+                    )
                 next_action = "inspect_execution_spec"
                 blocked_reason = "execution_contract_invalid"
+            elif last_tool == "paper_research_read_repo_file":
+                last_failure = failed_rows[-1]
+                failure_detail = str(
+                    last_failure.observation_output or last_failure.error or ""
+                )
+                if cls._repo_read_failure_requires_search(failure_detail):
+                    return (
+                        "repo_relative_path 当前不成立；先用 `paper_research_search_repo` 定位真实文件路径，不要继续猜目录。",
+                        {
+                            "status": "blocked",
+                            "evidence_status": "sufficient",
+                            "next_action": "search_repo",
+                            "blocked_reason": "repo_relative_path_invalid",
+                            "allowed_actions": ["search_repo", "report_blocker"],
+                        },
+                    )
             return (
                 "基于失败 observation 收束原因，不要继续重复同类读搜。",
                 {
@@ -5526,6 +5760,63 @@ class AgentCore:
                     "allowed_actions": ["start_execution"],
                 },
             )
+        if last_tool == "paper_research_write_grounding_report":
+            last_row = rows[-1] if rows else None
+            result_data = dict(last_row.result_data or {}) if isinstance(last_row, ExecutedToolCall) else {}
+            report = dict(result_data.get("content") or {})
+            summary = dict(report.get("summary") or {})
+            dataset = dict(report.get("dataset") or {})
+            external_dependencies = dict(report.get("external_dependencies") or {})
+            dataset_blocked = str(dataset.get("status") or "").strip().lower() == "blocked"
+            external_blocked = str(external_dependencies.get("status") or "").strip().lower() == "blocked"
+            has_alternative_candidates = bool(
+                list(dataset.get("alternative_source_candidates") or [])
+                or list(external_dependencies.get("alternative_source_candidates") or [])
+            )
+            grounding_ready = bool(result_data.get("grounding_ready")) or (
+                bool(summary.get("repo_grounded"))
+                and bool(summary.get("entrypoint_grounded"))
+                and bool(summary.get("dataset_grounded"))
+                and bool(summary.get("runtime_grounded"))
+                and bool(summary.get("external_dependencies_grounded"))
+                and str(summary.get("overall_status") or "").strip().lower() == "grounded"
+            )
+            if grounding_ready:
+                return (
+                    "grounding_report 已完成，下一步进入 implementation_spec。",
+                    {
+                        "status": "ready",
+                        "evidence_status": "sufficient",
+                        "next_action": "write_implementation_spec",
+                        "allowed_actions": ["write_implementation_spec", "report_blocker"],
+                    },
+                )
+            if (dataset_blocked or external_blocked) and not has_alternative_candidates:
+                return (
+                    "grounding_report 已写入且官方来源存在 blocker；先做一次 focused 替代源搜索并把候选写回 grounding_report，再决定是否直接报告 blocker。",
+                    {
+                        "status": "blocked",
+                        "evidence_status": "sufficient",
+                        "next_action": "search_alternative_sources",
+                        "blocked_reason": "grounding_blocked",
+                        "allowed_actions": [
+                            "web_search",
+                            "web_scrape",
+                            "write_grounding_report",
+                            "report_blocker",
+                        ],
+                    },
+                )
+            return (
+                "grounding_report 已写入但仍存在 absent/blocked 事实；请直接报告 blocker，不要跳到 implementation 或 execution。",
+                {
+                    "status": "blocked",
+                    "evidence_status": "sufficient",
+                    "next_action": "report_blocker",
+                    "blocked_reason": "grounding_blocked",
+                    "allowed_actions": ["report_blocker", "read_grounding_report"],
+                },
+            )
         if last_tool == "paper_research_write_run_drafts":
             return (
                 "run_drafts 已更新，继续写入 execution_spec 或选择要运行的 draft。",
@@ -5544,6 +5835,26 @@ class AgentCore:
                     "evidence_status": "sufficient",
                     "next_action": "write_run_drafts",
                     "allowed_actions": ["write_run_drafts", "report_blocker"],
+                },
+            )
+        if grounding_context and last_tool in {
+            "paper_research_clone_repo",
+            "paper_research_probe_repo",
+            "paper_research_probe_url",
+            "paper_research_get_artifact_manifest",
+            "paper_research_read_artifact",
+            "paper_research_read_repo_file",
+            "paper_research_search_repo",
+            "paper_research_inspect_runtime",
+            "paper_research_read_grounding_report",
+        }:
+            return (
+                "grounding 证据已更新；请收束 repo、entrypoint、dataset、runtime、external dependency 的事实状态，并写入 grounding_report。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "write_grounding_report",
+                    "allowed_actions": ["write_grounding_report", "report_blocker"],
                 },
             )
         if last_tool in {"paper_research_search_repo", "paper_research_read_repo_file"}:
@@ -5633,6 +5944,7 @@ class AgentCore:
             rows,
             paper_skill_active=paper_skill_active,
             repo_edit_allowed=bool(repo_edit_allowed) if repo_edit_allowed is not None else None,
+            workflow_binding=workflow_binding,
         )
         decision_state = self._merge_decision_state(
             existing_decision_state,
@@ -6074,33 +6386,9 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
-            missing_paper_tools = self._missing_required_paper_skill_tool_calls(context)
-            if missing_paper_tools:
-                retries = int((context.context_debug or {}).get("paper_skill_tool_guard_retries") or 0)
-                context.context_debug = {
-                    **dict(context.context_debug or {}),
-                    "paper_skill_tool_guard_retries": retries + 1,
-                    "paper_skill_tool_guard_missing": list(missing_paper_tools),
-                }
-                if retries >= 2:
-                    safe_answer = (
-                        "本轮没有完成必要的 paper_research 工具调用，"
-                        "因此不能确认对应产物已经生成、写入或读回。"
-                        "请重试该步骤，或先查看当前 Project/workspace 状态。"
-                    )
-                    context.final_answer = safe_answer
-                    context.state = AgentState.DONE
-                    events.append({"type": "answer", "data": safe_answer})
-                    return events, True
-                guard_message = self._build_paper_skill_tool_guard_message(context, missing_paper_tools)
-                events.append(
-                    {
-                        "type": "thought",
-                        "data": "检测到当前阶段需要真实 paper_research 工具调用，已阻止直接回答并要求先执行工具。",
-                    }
-                )
-                context.messages.append({"role": "user", "content": guard_message})
-                return events, False
+            guarded = self._maybe_guard_paper_skill_direct_answer(context, events=events)
+            if guarded is not None:
+                return guarded
             if not thought_text:
                 events.append({"type": "thought", "data": "已完成问题分析，准备给出答案。"})
             answer = await self._ensure_citation_compliance(answer, context)
@@ -6270,6 +6558,9 @@ class AgentCore:
 
         answer = answer_hint
         if answer:
+            guarded = self._maybe_guard_paper_skill_direct_answer(context, events=events)
+            if guarded is not None:
+                return guarded
             answer = await self._ensure_citation_compliance(str(answer), context)
             context.final_answer = answer
             context.state = AgentState.DONE

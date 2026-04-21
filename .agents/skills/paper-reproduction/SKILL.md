@@ -19,6 +19,11 @@ Think in seven workflow stages even if the user does not name them:
 6. `execution_run`
 7. `analysis_tuning_report`
 
+Current backend/runtime stage ids are not fully renamed yet.
+
+- Runtime stage `planning` currently maps to the new stage-1 semantics `intake_summary`.
+- Until the runtime ids are unified, read `planning` as “stage 1 / intake_summary”, not as a generic later-phase planning bucket.
+
 The user should not need to know internal phases. Always begin from the saved Project state, then continue from the first missing, blocked, or requested step.
 
 During `intake_summary`, preserve three planning artifacts together:
@@ -29,8 +34,9 @@ During `intake_summary`, preserve three planning artifacts together:
 
 ## Truth Files
 
-Treat these two archived files as the editable workflow truth:
+Treat these archived files as the workflow truth:
 
+- `specs/grounding_report.json`
 - `specs/implementation_spec.json`
 - `drafts/run_drafts.json`
 
@@ -64,15 +70,16 @@ Then decide the next action from state:
 
 1. If no workspace or structured intake exists, run intake with `paper_research_prepare`.
 2. If any planning artifact is missing or stale, refresh planning with `paper_research_prepare` before moving to later stages.
-3. If intake exists but repo/data evidence is missing, materialize or inspect repo evidence.
-4. If `specs/implementation_spec.json` is missing or stale, create or revise it from intake plus repo/data evidence and the current runtime/environment snapshot.
-5. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
-6. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
-7. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
-8. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
-9. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
-10. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
-11. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
+3. If `specs/grounding_report.json` is missing or stale, stay in `grounding`: probe repo/url first, then clone/read/search/inspect only as needed, and write a grounded evidence report before any implementation work.
+4. If `grounding_report.json` says repo, entrypoint, dataset, runtime, or external dependencies are `blocked`, stop clearly and report those blockers instead of moving on to implementation or execution.
+5. If `specs/implementation_spec.json` is missing or stale, create or revise it from planning plus `grounding_report`.
+6. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
+7. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
+8. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
+9. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
+10. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
+11. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
+12. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
 
 Do not stop after intake when the user asked for full reproduction. Continue until a long execution starts, a required user confirmation is needed, or a real blocker is reached.
 
@@ -86,6 +93,8 @@ Do not stop after intake when the user asked for full reproduction. Continue unt
 - Do not use `knowledge_search`, `literature_search`, or `mcp.*` tools for this workflow.
 - Treat Project workspace artifacts as the source of truth; keep web evidence separate from paper/PDF evidence.
 - Execution uses `runtime-worker`, not the chat backend process.
+- During `grounding`, do not write `implementation_spec`, `run_drafts`, `execution_spec`, `execution` scripts, or start execution until `grounding_report` is complete.
+- During `grounding`, missing evidence must stay `absent`/`blocked`; do not translate “not found” into an invented path, entrypoint, or workaround script.
 - Long-running ML/DL jobs are background tasks. Once a real training/comparison job starts, report the execution and stop instead of waiting.
 - Short prerequisite jobs such as `env_setup` or `data_prep` should be treated as workflow continuation steps, not as the final answer.
 - Do not let `execution_spec` become the only source of truth. If an execution reveals new facts, sync them back into `implementation_spec` or `run_drafts`.
@@ -97,10 +106,14 @@ Allowed paper workflow tools:
 - `paper_research_status`
 - `paper_research_prepare`
 - `paper_research_clone_repo`
+- `paper_research_probe_repo`
+- `paper_research_probe_url`
 - `paper_research_get_artifact_manifest`
 - `paper_research_read_artifact`
 - `paper_research_read_repo_file`
 - `paper_research_search_repo`
+- `paper_research_write_grounding_report`
+- `paper_research_read_grounding_report`
 - `paper_research_write_implementation_spec`
 - `paper_research_read_implementation_spec`
 - `paper_research_write_run_drafts`
@@ -122,6 +135,7 @@ Use web tools only for focused diagnosis or official-source recovery after local
 Read only the reference needed for the current state:
 
 - PDF/intake facts and JSON constraints: `references/intake-contract.md`
+- Grounding report contract and URL evidence shape: `references/grounding-contract.md`
 - Implementation spec and run drafts: `references/implementation-planning.md`
 - Runtime execution, source recovery, long tasks, and tuning/compare: `references/execution-and-tuning.md`
 - Backend artifact fields and UI-facing explanations: `references/output-fields.md`
@@ -129,8 +143,40 @@ Read only the reference needed for the current state:
 - Runtime environment and execution examples: `references/runtime-environment.md`
 - Run-draft repo heuristics: `references/run-draft-heuristics.md`
 
+`grounding` is a formal evidence-closure stage between `planning` and `implementation_prep`.
+
+Its job is to write `specs/grounding_report.json`, not to produce execution specs.
+
+Grounding must explicitly classify:
+
+- repo
+- entrypoint
+- dataset
+- runtime
+- external dependencies
+
+Each area should end in one of:
+
+- `grounded`
+- `absent`
+- `blocked`
+- only use `unknown` when the evidence truly has not been collected yet
+
+During `grounding`:
+
+- prefer `paper_research_probe_repo` / `paper_research_probe_url` before deeper clone/read/search
+- use `paper_research_clone_repo`, `paper_research_read_repo_file`, `paper_research_search_repo`, and `paper_research_inspect_runtime` only to close a specific missing fact
+- write `specs/grounding_report.json` as the stage-2 truth artifact
+- if you claim a list of datasets or external downloads is `grounded`, every required official link in that list must be individually probed or be explicitly covered by grounded local presence; one successful sample link cannot stand in for sibling links
+- if an official repo/data/dependency source is `blocked`, first write the blocker clearly, then do one focused recovery pass for alternative sources using `web_search` / `web_scrape`; record trustworthy candidates in `alternative_source_candidates`, but do not erase the official-source blocker
+- blocked sections should explain *why* they are blocked in `blockers` and, when possible, `blocker_details` with concrete URL / diagnosis / status-code context
+- do not start execution
+- do not generate execution scripts as a workaround
+- do not skip straight to `implementation_spec`
+
 Before writing structured artifacts, read the relevant schema:
 
+- `specs/grounding_report.json` uses the stage-2 grounding contract enforced by `paper_research_write_grounding_report`
 - `templates/implementation_spec.schema.json`
 - `templates/run_drafts.schema.json`
 
@@ -165,11 +211,15 @@ Use helper scripts when deterministic output is safer:
 ## Execution Rules
 
 - Environment constraints must enter the workflow before execution.
-  - During `implementation_prep`, call `paper_research_inspect_runtime` and treat `runtime_candidates` plus `runtime_worker.environment` as planning inputs, not only execution diagnostics.
+  - During `grounding`, call `paper_research_inspect_runtime` and treat `runtime_candidates` plus `runtime_worker.environment` as grounding inputs, not only execution diagnostics.
+  - `grounding_report.json` should already classify whether runtime is `grounded`, `absent`, or `blocked`, and should record explicit blocker text when the worker cannot support the paper's likely path.
   - The generated `implementation_spec.json` should reflect the current runtime snapshot, available commands, and any grounded missing packages that constrain later execution.
   - Do not postpone all environment reasoning until `execution`; the plan should already know whether the current machine supports `devcontainer`, `docker compose`, `repo2docker`, `papermill`, or only `plain-python`.
-- Always inspect runtime with `paper_research_inspect_runtime` before writing an execution spec.
+- Always inspect runtime during `grounding` before writing `implementation_spec` or any execution artifact.
+- Always read `grounding_report.json` before writing `implementation_spec` or any execution artifact.
+- If `grounding_report.json` is missing or not complete, stop and update/report grounding instead of continuing into implementation or execution.
 - Before writing a new execution spec, read the latest relevant truth file first:
+  - `grounding_report.json` for repo/data/runtime/external-dependency status
   - `implementation_spec.json` for baseline assumptions and blockers
   - `run_drafts.json` for the current execution-ready draft
 - If the latest execution result contradicts the truth files, revise the truth files first and only then create the next execution.

@@ -24,16 +24,27 @@ def _build_prompt(stage: str, paper_id: int, project_id: int | None, goal: str |
             "只有在 workspace 或 structured intake 缺失、损坏、或被明确要求刷新时，才调用 paper_research_prepare。",
             "本轮只输出 planning result，不要执行训练，不要创建 run draft。",
         ],
+        "grounding": [
+            "请使用 paper-reproduction skill，继续 grounding 阶段。",
+            "先读当前状态与 planning 产物，确认 `paper_intake_result`、`paper_summary`、`experiment_spec` 是否齐全；缺失时先回到 planning。",
+            "grounding 的目标是写出 `specs/grounding_report.json`，把 repo、entrypoint、dataset、runtime、external dependencies 统一收敛成 grounded/absent/blocked。",
+            "优先使用 `paper_research_probe_repo` 和 `paper_research_probe_url` 做轻量测活，再决定是否 clone repo、读文件、搜 entrypoint 或 inspect runtime。",
+            "如果要宣称一组数据集链接或 external URLs 已 grounded，必须对这组里每个必要官方链接逐个 probe，或明确说明本地已存在；不能用一个成功样本外推整组都可用。",
+            "如果官方 repo / dataset / dependency URL 被 probe 成 blocked，先把失败原因写清楚，再做一次 focused 的替代源探索；优先可信官方页面、项目页、镜像页，不要做宽泛搜索。",
+            "替代源探索只允许一轮：先 `web_search`，必要时 `web_scrape`，并把候选写入 `alternative_source_candidates`；不要因为找到了候选，就把官方 blocked 改写成 grounded。",
+            "可以 clone / read / search / inspect / probe，但不要写 implementation_spec，不要写 execution 脚本，不要写 execution_spec，不要 start_execution。",
+            "没找到就是 absent 或 blocked，不要把缺失事实翻译成应该存在的脚本、路径或 workaround。",
+            "grounding_report 必须明确 blocker、blocker_details 和 next_actions；如果事实层面卡住，就停在 grounding，不要继续推进。",
+        ],
         "implementation_prep": [
             "请使用 paper-reproduction skill，继续 implementation-prep 阶段。",
-            "先读当前状态，优先复用已归档 planning / repo 证据。",
-            "在生成或修订 implementation_spec 之前，先调用 paper_research_inspect_runtime，把 runtime candidates 和 runtime_worker.environment 当成方案输入条件，而不是等 execution 再看。",
+            "先读当前状态，优先复用已归档 planning 与 grounding 证据。",
+            "在生成或修订 implementation_spec 之前，必须先读 `specs/grounding_report.json`，确认 repo、entrypoint、dataset、runtime、external dependencies 已经 grounded 或被明确 blocked。",
             "implementation_spec 必须反映当前机器/worker 的真实环境约束，例如可用运行方式、已安装关键包、缺失包、可用命令、repo root/cwd 约束。",
             "如果 implementation_spec 已存在，优先读回再决定是复用还是局部修订。",
-            "如果 repo 已经 materialize，必须先按 repo 真实文件校验 dataset 和 entrypoint；不要把仓库里已存在的 Dataset/* 文件继续写成 missing/needs download。",
-            "如果 paper_research_inspect_runtime 已返回 runtime candidates，就不要再写 runtime_unknown 这一类 blocker。",
-            "不要让 intake 只基于论文内容生成抽象方案；implementation_spec 需要同时吸收论文事实、repo/data 事实、和 runtime/environment 事实。",
-            "如果证据不足以形成 grounded implementation_spec，就停止并列出 blockers。",
+            "如果 grounding_report 未完成，就不要写 implementation_spec；先返回 grounding blocker。",
+            "不要让 implementation_spec 重新承担 repo/data/runtime 发现工作；它要消费 grounding 结论，而不是重跑 grounding。",
+            "如果 grounding 已经给出 blocked 结论，implementation_spec 只允许引用这些 blocker，不要擅自把 blocked 说成 ready。",
         ],
         "run_drafts": [
             "请使用 paper-reproduction skill，继续 run-drafts 阶段。",
@@ -101,7 +112,7 @@ build_prompt = _build_prompt
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", required=True, choices=["planning", "implementation_prep", "run_drafts", "execution", "tuning"])
+    parser.add_argument("--stage", required=True, choices=["planning", "grounding", "implementation_prep", "run_drafts", "execution", "tuning"])
     parser.add_argument("--paper-id", type=int, required=True)
     parser.add_argument("--project-id", type=int)
     parser.add_argument("--goal")

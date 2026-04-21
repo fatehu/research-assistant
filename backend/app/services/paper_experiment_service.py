@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -17,10 +18,12 @@ from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.models.literature import Paper, PaperExperimentRun, PaperExperimentWorkspace
 from app.services.codelab_sandbox_policy import SANDBOX_FORBIDDEN_IMPORT_ROOTS
+from app.services.dashscope_multimodal_service import DashScopeMultimodalService
 from app.services.literature_service import get_literature_service
 from app.services.llm_service import LLMService
 from app.services.paper_experiment_adapter_service import PaperExperimentAdapterService
 from app.services.notebook_service import NotebookService
+from app.services.online_mm_ingest_service import OnlineMmIngestService
 from app.services.pdf_rag_ingest_service import PdfRagIngestService
 
 
@@ -47,7 +50,7 @@ _PAPER_INTAKE_SYSTEM_PROMPT = """You are a paper PDF-to-structured-intake engine
 Return STRICT JSON only. Do not include Markdown, comments, or explanatory prose.
 The first character of the response must be `{` and the last character must be `}`. Do not wrap the JSON in ``` fences.
 
-You will receive the paper metadata, raw import metadata, and the full markdown rendered from a local PDF parser.
+You will receive the paper metadata, raw import metadata, and either rendered PDF page images or markdown rendered from a local PDF parser.
 Use the full paper content to extract the structured facts and discovery hints needed for later repo/data inspection.
 This stage does not execute code, inspect external repositories, or generate runnable code.
 
@@ -59,6 +62,8 @@ Current task:
 
 Rules:
 - Do not invent URLs, repository names, dataset links, commands, or dependencies.
+- When the PDF contains multiple experiment groups, tables, or benchmark suites, keep their boundaries clear.
+- Do not merge datasets across different tables/experiments unless the paper explicitly says they belong to the same reproduction target.
 - If the paper mentions a dataset name but no URL, return the name with url=null.
 - Every extracted item must include short evidence_text copied or tightly paraphrased from the paper.
 - Keep evidence_text concise: no more than 120 characters per item.
@@ -642,7 +647,14 @@ class PaperExperimentService:
         }
 
         paper_intake: Dict[str, Any] = {}
-        if str(intake_payload.get("paper_markdown") or "").strip():
+        has_intake_input = bool(
+            str(intake_payload.get("paper_markdown") or "").strip()
+            or (
+                str(intake_payload.get("source_mode") or "").strip() == "local_pdf_page_images"
+                and str(intake_payload.get("pdf_path") or "").strip()
+            )
+        )
+        if has_intake_input:
             try:
                 paper_intake = await self._extract_paper_intake_json(intake_payload)
             except Exception as exc:  # noqa: BLE001 - intake must fail open; workspace scaffold should still be created
@@ -1032,7 +1044,12 @@ class PaperExperimentService:
         extractor_name = None
         report: Dict[str, Any] = {}
         markdown_spans: List[Dict[str, Any]] = []
+        page_count = 0
         if pdf_path:
+            try:
+                page_count = self._count_pdf_pages(pdf_path)
+            except Exception as exc:  # noqa: BLE001 - metadata only; intake can still continue
+                logger.warning(f"[PaperExperiment] count PDF pages failed paper_id={paper.id}: {exc}")
             try:
                 ingest = await self.pdf_ingest_service.ingest_pdf(
                     file_path=str(pdf_path),
@@ -1043,15 +1060,19 @@ class PaperExperimentService:
                 extractor_name = str(ingest.get("extractor") or "local_structured_pdf_fast").strip() or "local_structured_pdf_fast"
                 report = dict(ingest.get("report") or {})
                 markdown_spans = list(ingest.get("document_source_spans") or [])
-                if paper_markdown.strip():
+                if paper_markdown.strip() and not self._paper_intake_multimodal_ready():
                     source_mode = "local_pdf_markdown"
             except Exception as exc:  # noqa: BLE001 - intake can still use abstract/raw metadata
                 logger.warning(f"[PaperExperiment] local PDF markdown extraction failed paper_id={paper.id}: {exc}")
+            if self._paper_intake_multimodal_ready():
+                source_mode = "local_pdf_page_images"
+                extractor_name = "dashscope_multimodal_pages"
 
         if not paper_markdown.strip():
             paper_markdown = str(paper.abstract or "")
-            extractor_name = "abstract_fallback"
-            source_mode = "metadata_abstract_fallback"
+            if source_mode != "local_pdf_page_images":
+                extractor_name = "abstract_fallback"
+                source_mode = "metadata_abstract_fallback"
 
         provider = str(getattr(settings, "default_llm_provider", "deepseek") or "deepseek")
         model = str((settings.get_llm_config(provider) or {}).get("model") or "")
@@ -1085,6 +1106,7 @@ class PaperExperimentService:
             "pdf_path": str(pdf_path or ""),
             "extractor": extractor_name,
             "report": report,
+            "page_count": int(page_count),
             "provider": provider,
             "model": model,
             "total_chars": len(paper_markdown),
@@ -1094,12 +1116,22 @@ class PaperExperimentService:
         }
 
     async def _extract_paper_intake_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        source_mode = str(payload.get("source_mode") or "").strip()
+        if source_mode == "local_pdf_page_images" and str(payload.get("pdf_path") or "").strip():
+            try:
+                return await self._extract_paper_intake_json_from_pdf_images(payload)
+            except Exception as exc:  # noqa: BLE001 - fail open to markdown fallback when available
+                logger.warning(f"[PaperExperiment] multimodal intake failed, fallback to text path: {exc}")
+                if not str(payload.get("paper_markdown") or "").strip():
+                    raise
+
         user_payload = {
             "metadata": payload.get("metadata") or {},
             "raw_import_metadata_json": payload.get("raw_data_text") or "{}",
             "input_info": {
                 "source_mode": payload.get("source_mode"),
                 "extractor": payload.get("extractor"),
+                "page_count": payload.get("page_count"),
                 "total_chars": payload.get("total_chars"),
                 "sent_chars": payload.get("sent_chars"),
                 "truncated": payload.get("truncated"),
@@ -1139,6 +1171,82 @@ class PaperExperimentService:
         if not parsed:
             raise ValueError("paper intake response is empty")
         return parsed if isinstance(parsed, dict) else {}
+
+    async def _extract_paper_intake_json_from_pdf_images(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        pdf_path = Path(str(payload.get("pdf_path") or "").strip()).expanduser()
+        if not pdf_path.is_file():
+            raise ValueError("paper intake pdf missing for multimodal path")
+
+        page_limit = max(1, int(getattr(settings, "paper_intake_multimodal_max_pages", 24) or 24))
+        page_count = int(payload.get("page_count") or 0)
+        if page_count > page_limit:
+            raise ValueError(f"paper intake page_count_exceeds_limit:{page_count}>{page_limit}")
+
+        api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
+        base_url = str(getattr(settings, "aliyun_dashscope_api_base", "") or getattr(settings, "aliyun_base_url", "") or "").strip()
+        model = self._resolve_paper_intake_multimodal_model()
+        if not api_key or not base_url:
+            raise ValueError("paper intake multimodal credentials unavailable")
+
+        multimodal_payload = {
+            "metadata": payload.get("metadata") or {},
+            "raw_import_metadata_json": payload.get("raw_data_text") or "{}",
+            "input_info": {
+                "source_mode": payload.get("source_mode"),
+                "extractor": payload.get("extractor"),
+                "page_count": page_count,
+                "report": payload.get("report") or {},
+            },
+        }
+        user_prompt = (
+            "Extract the paper-to-experiment workspace JSON from the attached full-paper page images.\n"
+            "Use the page images as primary evidence, especially for tables, benchmark group boundaries, dataset lists, and experiment sections.\n"
+            "Do not flatten multiple experiment groups into one dataset list unless the paper explicitly says they are the same reproduction target.\n"
+            "Return JSON only.\n\n"
+            f"{json.dumps(multimodal_payload, ensure_ascii=False, default=str)}"
+        )
+
+        with tempfile.TemporaryDirectory(prefix="paper_intake_mm_") as temp_dir:
+            image_paths = OnlineMmIngestService._render_pdf_pages(pdf_path=pdf_path, out_dir=Path(temp_dir))
+            if not image_paths:
+                raise ValueError("paper intake multimodal render returned no pages")
+            response = await DashScopeMultimodalService.chat_json(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                system_prompt=_PAPER_INTAKE_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                image_paths=[str(path) for path in image_paths],
+                max_tokens=max(int(getattr(settings, "llm_max_tokens", 4096) or 4096), _PAPER_INTAKE_OUTPUT_TOKENS),
+                temperature=0.0,
+            )
+        parsed = dict(response.get("parsed") or {})
+        if not parsed:
+            parsed = self._parse_json_object(str(response.get("raw_text") or "")) or {}
+        if not parsed:
+            raise ValueError("paper intake multimodal response is empty")
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _count_pdf_pages(pdf_path: Path) -> int:
+        return int(OnlineMmIngestService._count_pages(pdf_path))
+
+    def _paper_intake_multimodal_ready(self) -> bool:
+        if not bool(getattr(settings, "paper_intake_multimodal_enabled", True)):
+            return False
+        if not DashScopeMultimodalService.is_available():
+            return False
+        api_key = str(getattr(settings, "aliyun_api_key", "") or "").strip()
+        base_url = str(getattr(settings, "aliyun_dashscope_api_base", "") or getattr(settings, "aliyun_base_url", "") or "").strip()
+        return bool(api_key and base_url)
+
+    @staticmethod
+    def _resolve_paper_intake_multimodal_model() -> str:
+        return str(
+            getattr(settings, "paper_intake_multimodal_model", "")
+            or getattr(settings, "kb_online_mm_primary_model", "")
+            or "qwen3-vl-flash"
+        ).strip()
 
     async def _ensure_pdf_available(self, paper: Paper, *, user_id: int) -> Optional[Path]:
         existing = self._resolve_local_pdf_path(paper=paper, user_id=user_id)

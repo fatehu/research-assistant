@@ -3,8 +3,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.config import settings
 from app.services.paper_experiment_adapter_service import PaperExperimentAdapterService
 from app.services.paper_experiment_service import PaperExperimentService
 
@@ -45,6 +48,78 @@ def test_paper_experiment_missing_template_uses_guard_not_fake_baseline():
     assert "requires_manual_implementation" in code
     assert "MLPClassifier" not in code
     assert "make_classification" not in code
+
+
+@pytest.mark.asyncio
+async def test_build_paper_intake_payload_prefers_page_images_when_multimodal_ready(monkeypatch, tmp_path: Path):
+    service = PaperExperimentService(db=None)
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    paper = SimpleNamespace(
+        id=113,
+        title="Bag of Tricks for Efficient Text Classification",
+        abstract="demo abstract",
+        authors=[],
+        year=2016,
+        venue="arXiv",
+        journal=None,
+        arxiv_id="1607.01759",
+        doi=None,
+        url="https://arxiv.org/abs/1607.01759",
+        pdf_url="https://arxiv.org/pdf/1607.01759",
+        arxiv_url="https://arxiv.org/abs/1607.01759",
+        fields_of_study=[],
+        raw_data={},
+    )
+
+    async def _fake_ingest_pdf(**kwargs):
+        return {
+            "document_text": "# Demo\n\nTable 1 data",
+            "extractor": "local_structured_pdf_fast",
+            "report": {"page_count": 8},
+            "document_source_spans": [],
+        }
+
+    async def _fake_ensure_pdf_available(*args, **kwargs):
+        return pdf_path
+
+    monkeypatch.setattr(service.pdf_ingest_service, "ingest_pdf", _fake_ingest_pdf)
+    monkeypatch.setattr(service, "_ensure_pdf_available", _fake_ensure_pdf_available)
+    monkeypatch.setattr(service, "_paper_intake_multimodal_ready", lambda: True)
+    monkeypatch.setattr(service, "_count_pdf_pages", lambda _path: 8)
+    monkeypatch.setattr(settings, "default_llm_provider", "aliyun_qwen35_flash", raising=False)
+
+    payload = await service._build_paper_intake_payload(paper, user_id=1)
+
+    assert payload["source_mode"] == "local_pdf_page_images"
+    assert payload["extractor"] == "dashscope_multimodal_pages"
+    assert payload["page_count"] == 8
+    assert "Table 1 data" in payload["paper_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_extract_paper_intake_json_uses_multimodal_path_for_page_images(monkeypatch):
+    service = PaperExperimentService(db=None)
+    expected = {"schema_version": "paper_intake_v1", "paper_profile": {"task_type": "classification"}}
+
+    async def _fake_mm(payload):
+        assert payload["source_mode"] == "local_pdf_page_images"
+        return expected
+
+    monkeypatch.setattr(service, "_extract_paper_intake_json_from_pdf_images", _fake_mm)
+
+    result = await service._extract_paper_intake_json(
+        {
+            "source_mode": "local_pdf_page_images",
+            "pdf_path": "/tmp/demo.pdf",
+            "paper_markdown": "# fallback text",
+            "metadata": {},
+            "raw_data_text": "{}",
+        }
+    )
+
+    assert result == expected
 
 
 def test_paper_experiment_repo_index_builds_workspace_assets(tmp_path: Path):

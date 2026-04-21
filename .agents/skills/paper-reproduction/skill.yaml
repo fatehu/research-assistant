@@ -57,10 +57,14 @@ enforced_tool_names:
   - paper_research_status
   - paper_research_prepare
   - paper_research_clone_repo
+  - paper_research_probe_repo
+  - paper_research_probe_url
   - paper_research_get_artifact_manifest
   - paper_research_read_artifact
   - paper_research_read_repo_file
   - paper_research_search_repo
+  - paper_research_write_grounding_report
+  - paper_research_read_grounding_report
   - paper_research_write_implementation_spec
   - paper_research_read_implementation_spec
   - paper_research_write_run_drafts
@@ -94,19 +98,33 @@ scripts:
     purpose: Render a deterministic execution_spec JSON skeleton from explicit draft/runtime inputs.
 stages:
   - id: planning
-    title: Planning / Intake
+    title: Planning / Intake Summary
     continue_policy: manual
     reads: []
     writes:
       - planning/paper_intake_result.json
       - planning/paper_summary.json
       - planning/experiment_spec.json
+  - id: grounding
+    title: Grounding
+    continue_policy: ask_to_continue
+    reads:
+      - planning/paper_intake_result.json
+      - planning/paper_summary.json
+      - planning/experiment_spec.json
+      - repo/repo_reference.json
+      - repo/repo_file_index.json
+      - runtime_worker.environment
+    writes:
+      - specs/grounding_report.json
   - id: implementation_prep
     title: Implementation Prep
     continue_policy: ask_to_continue
     reads:
       - planning/paper_intake_result.json
+      - planning/paper_summary.json
       - planning/experiment_spec.json
+      - specs/grounding_report.json
       - repo/repo_reference.json
       - repo/repo_file_index.json
       - runtime_worker.environment
@@ -147,6 +165,8 @@ artifacts:
     path: planning/paper_summary.json
   - name: experiment_spec
     path: planning/experiment_spec.json
+  - name: grounding_report
+    path: specs/grounding_report.json
   - name: implementation_spec
     path: specs/implementation_spec.json
   - name: run_drafts
@@ -160,6 +180,8 @@ artifacts:
 references:
   - path: references/intake-contract.md
     when: Prepare or explain PDF/markdown/intake JSON.
+  - path: references/grounding-contract.md
+    when: Write or revise grounding_report and close repo/dataset/runtime/external URL evidence.
   - path: references/implementation-planning.md
     when: Generate or revise implementation_spec and run_drafts.
   - path: references/execution-and-tuning.md

@@ -243,9 +243,10 @@ class _FakeSkillService:
         return SimpleNamespace(
             name="paper-reproduction",
             display_name="Paper Reproduction",
-            stage_names=("planning", "implementation_prep", "run_drafts", "execution", "tuning"),
+            stage_names=("planning", "grounding", "implementation_prep", "run_drafts", "execution", "tuning"),
             stage_policies=(
                 "planning=manual",
+                "grounding=ask_to_continue",
                 "implementation_prep=ask_to_continue",
                 "run_drafts=ask_to_continue",
                 "execution=auto_continue",
@@ -255,7 +256,15 @@ class _FakeSkillService:
         )
 
 
-def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool_name", "tool_payload"),
+    [
+        ("paper_research_inspect_runtime", {"project_id": 2}),
+        ("paper_research_probe_repo", {"project_id": 2, "repo_url": "https://github.com/example/repo"}),
+        ("paper_research_probe_url", {"project_id": 2, "url": "https://example.com/data.zip"}),
+    ],
+)
+def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypatch, tool_name, tool_payload):
     skill_service = _FakeSkillService()
     monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
 
@@ -272,14 +281,14 @@ def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypa
                 project_id=2,
             ),
         ),
-        tool_name="paper_research_inspect_runtime",
-        tool_payload={"project_id": 2},
+        tool_name=tool_name,
+        tool_payload=tool_payload,
         success=True,
         phase="action",
     )
 
     assert workflow_control is not None
-    assert workflow_control["stage"] == "implementation_prep"
+    assert workflow_control["stage"] == "grounding"
     assert workflow_control["stage_status"] == "running"
     assert workflow_control["continue_policy"] == "ask_to_continue"
     assert workflow_control.get("next_stage") is None
@@ -565,7 +574,7 @@ async def test_send_message_uses_skill_launch_renderer_but_persists_visible_mess
         }
     ]
     assert planner.seen_messages[-1][-1]["content"] == "expanded::planning::111"
-    assert response["workflow_control"]["next_stage"] == "implementation_prep"
+    assert response["workflow_control"]["next_stage"] == "grounding"
     turn_store = await runtime_service.get_conversation_turn_store(57)
     assert turn_store["entries"][0]["user_content"] == "继续论文规划阶段（paper_id=111）"
 
@@ -617,8 +626,8 @@ async def test_send_message_stream_emits_workflow_control_for_skill_launch(monke
     joined = "".join(chunks)
     assert '"event": "done"' in joined
     assert '"workflow_control"' in joined
-    assert '"next_stage": "implementation_prep"' in joined
-    assert '继续 实施准备阶段' in joined
+    assert '"next_stage": "grounding"' in joined
+    assert '继续 证据落地阶段' in joined
 
 
 @pytest.mark.asyncio
@@ -706,7 +715,7 @@ async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(
 
     joined = "".join(chunks)
     assert '"event": "action"' in joined
-    assert '"stage": "implementation_prep"' in joined
+    assert '"stage": "grounding"' in joined
     assert '"stage_status": "running"' in joined
     assert '"event": "done"' in joined
 
