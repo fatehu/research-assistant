@@ -88,6 +88,57 @@ class _StreamingDirectAnswerFCLLM:
         return {"content": "<answer>fallback</answer>"}
 
 
+class _StreamingDraftThenToolFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools_stream(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"type": "content", "data": "让我先查看脚本内容。"}
+            yield {
+                "type": "done",
+                "data": {
+                    "content": "让我先查看脚本内容。",
+                    "reasoning": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "name": "datetime",
+                            "arguments": "{\"query\":\"2014 到现在多少年\"}",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                    "function_calling_streaming": True,
+                },
+            }
+            return
+        yield {"type": "content", "data": "结果是 12 年。"}
+        yield {
+            "type": "done",
+            "data": {
+                "content": "结果是 12 年。",
+                "reasoning": "",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                "function_calling_streaming": True,
+            },
+        }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        raise AssertionError("streaming path should not call non-stream chat_with_tools")
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
 class _ThinkingAliasDirectAnswerFCLLM:
     provider = "test"
     config = {"model": "test-model"}
@@ -271,6 +322,43 @@ class _RedundantKnowledgeSearchFCLLM:
         return {"content": "<answer>fallback</answer>"}
 
 
+class _RepeatedPaperRepoReadFCLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_function_calling(self):
+        return True
+
+    async def chat_with_tools(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls in {1, 2}:
+            return {
+                "content": "",
+                "reasoning": "继续确认 classification-results.sh 的循环范围",
+                "tool_calls": [
+                    {
+                        "id": f"call_{self.calls}",
+                        "type": "function",
+                        "name": "paper_research_read_repo_file",
+                        "arguments": "{\"repo_relative_path\":\"scripts/classification-results.sh\",\"line_start\":80,\"line_end\":96}",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            }
+        return {
+            "content": "已确认脚本会遍历 8 个数据集；当前应直接报告 blocker，而不是继续读取同一脚本。",
+            "reasoning": "",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    async def chat(self, *args, **kwargs):
+        return {"content": "<answer>fallback</answer>"}
+
+
 class _NoopTools:
     def get_tools_description(self, **kwargs):
         return "- datetime: 时间"
@@ -355,6 +443,70 @@ class _RepeatedFailureTools:
         return ToolResult(success=False, output="PolicyViolationError: 不要导入 os", error="policy_violation")
 
 
+class _RepeatedExecutionSpecFailureLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def supports_function_calling(self):
+        return False
+
+    async def chat(self, *args, **kwargs):
+        return {
+            "content": (
+                '<think>继续尝试写 execution_spec</think>'
+                '<action>{"tool":"paper_research_write_execution_spec","input":{"project_id":135,"execution_spec":{"execution_id":"agnews-tuning","execution_intent":{"runtime_type":"plain-python","entrypoint_type":"generated_python","generated_program_name":"train_variant.py"}}}}</action>'
+            ),
+            "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
+        }
+
+
+class _RepeatedExecutionSpecFailureTools:
+    def get_tools_description(self, **kwargs):
+        return "- paper_research_write_execution_spec: 写入 execution 计划"
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "paper_research_write_execution_spec"
+        return ToolResult(
+            success=False,
+            output=(
+                "execution_spec 无效，未写入: generated_python entrypoint_path 缺失；"
+                "shell wrapper commands are not allowed"
+            ),
+            error="execution_spec_invalid",
+        )
+
+
+class _RepeatedRunDraftFailureLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    def supports_function_calling(self):
+        return False
+
+    async def chat(self, *args, **kwargs):
+        return {
+            "content": """<think>继续修正 run_drafts</think><action>{"tool":"paper_research_write_run_drafts","input":{"project_id":4,"run_drafts":{"drafts":[{"id":"baseline_ag_news_fixed","kind":"baseline_repro","objective":"baseline","entrypoint":{"type":"repo_script","path_or_hint":"bash -c './classification-results-ag-news-only.sh'"},"evidence_files":["repo/source/classification-results.sh"]}]}}}</action>""",
+            "usage": {"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
+        }
+
+
+class _RepeatedRunDraftFailureTools:
+    def get_tools_description(self, **kwargs):
+        return "- paper_research_write_run_drafts: 写入 run drafts"
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "paper_research_write_run_drafts"
+        return ToolResult(
+            success=False,
+            output=(
+                "run_drafts JSON 未通过归档校验，未写入文件。\n"
+                "- drafts[0].entrypoint.path_or_hint references missing repo file `classification-results-ag-news-only.sh`. "
+                "Use readme_command/dataset_step/manual_step for README-only actions."
+            ),
+            error="run_drafts_schema_invalid",
+        )
+
+
 class _SimpleExecuteTools:
     def get_tools_description(self, **kwargs):
         return "- datetime: 时间计算"
@@ -374,10 +526,48 @@ class _SimpleExecuteTools:
         )
 
 
+class _PaperRepoReadOnlyTools:
+    def get_tools_description(self, **kwargs):
+        return "- paper_research_read_repo_file: 读取 repo 文件"
+
+    def list_tools(self, **kwargs):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "paper_research_read_repo_file",
+                    "description": "read repo file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "repo_relative_path": {"type": "string"},
+                            "line_start": {"type": "integer"},
+                            "line_end": {"type": "integer"},
+                        },
+                        "required": ["repo_relative_path"],
+                    },
+                },
+            }
+        ]
+
+    def get(self, _name: str):
+        return None
+
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name == "paper_research_read_repo_file"
+        assert kwargs["repo_relative_path"] == "scripts/classification-results.sh"
+        return ToolResult(
+            success=True,
+            output="第 86 行是 for i in {0..7}，脚本会继续处理 8 个数据集。",
+            data={"relative_path": "scripts/classification-results.sh", "line_start": 86, "line_end": 86},
+        )
+
+
 class _ToolLedgerRuntimeService:
     def __init__(self):
         self.entries = []
         self.item_entries = []
+        self.context_states = []
 
     async def append_conversation_tool_ledger_entries(self, conversation_id: int, entries):
         assert conversation_id == 54
@@ -386,6 +576,10 @@ class _ToolLedgerRuntimeService:
     async def append_conversation_item_entries(self, conversation_id: int, entries):
         assert conversation_id == 54
         self.item_entries.extend(list(entries or []))
+
+    async def upsert_conversation_context_state(self, conversation_id: int, payload):
+        assert conversation_id == 54
+        self.context_states.append(dict(payload or {}))
 
 
 
@@ -434,11 +628,26 @@ async def test_function_calling_streams_direct_answer_before_done():
 
     content_events = [event for event in events if event.get("type") == "content"]
     done_index = next(index for index, event in enumerate(events) if event.get("type") == "done")
-    first_content_index = next(index for index, event in enumerate(events) if event.get("type") == "content")
-
-    assert first_content_index < done_index
-    assert "".join(str(event.get("data") or "") for event in content_events) == "第一段，第二段"
+    assert not content_events
     assert events[done_index]["data"]["answer"] == "第一段，第二段"
+
+
+@pytest.mark.asyncio
+async def test_function_calling_stream_does_not_emit_draft_content_before_tool_calls():
+    agent = ReActAgent(_StreamingDraftThenToolFCLLM(), _DateTimeOnlyTools(), max_iterations=3)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "先查一下再回答"}], stream=True):
+        events.append(event)
+
+    action_index = next(index for index, event in enumerate(events) if event.get("type") == "action")
+    done_index = next(index for index, event in enumerate(events) if event.get("type") == "done")
+    content_chunks = [str(event.get("data") or "") for event in events if event.get("type") == "content"]
+    done_event = next(event for event in events if event.get("type") == "done")
+
+    assert action_index < done_index
+    assert all("让我先查看脚本内容" not in chunk for chunk in content_chunks)
+    assert "结果是 12 年" in str(done_event["data"]["answer"])
 
 
 @pytest.mark.asyncio
@@ -520,6 +729,23 @@ async def test_function_calling_blocks_redundant_knowledge_search_after_success(
 
 
 @pytest.mark.asyncio
+async def test_function_calling_interrupts_repeated_repo_reads_after_success():
+    agent = ReActAgent(_RepeatedPaperRepoReadFCLLM(), _PaperRepoReadOnlyTools(), max_iterations=4)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "确认 classification-results.sh 的问题"}], stream=False):
+        events.append(event)
+
+    action_events = [event for event in events if event.get("type") == "action"]
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    done_event = next(event for event in events if event.get("type") == "done")
+
+    assert len(action_events) == 2
+    assert any("重复读取同一 repo 目标" in str(event.get("data", "")) for event in thought_events)
+    assert "直接报告 blocker" in str(done_event["data"]["answer"])
+
+
+@pytest.mark.asyncio
 async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
     agent = ReActAgent(_RepeatedFailureLLM(), _RepeatedFailureTools(), max_iterations=8)
@@ -535,6 +761,47 @@ async def test_agent_stops_after_repeated_same_tool_failures(monkeypatch):
     assert done_events
     assert done_events[0]["data"]["iterations"] == 3
     assert "已停止自动重试" in str(done_events[0]["data"]["answer"])
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance(monkeypatch):
+    monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
+    agent = ReActAgent(_RepeatedExecutionSpecFailureLLM(), _RepeatedExecutionSpecFailureTools(), max_iterations=8)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "继续为 AG News 写 execution_spec"}], stream=False):
+        events.append(event)
+
+    action_events = [event for event in events if event.get("type") == "action"]
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    done_events = [event for event in events if event.get("type") == "done"]
+
+    assert len(action_events) == 3
+    assert any("先写 execution 脚本" in str(event.get("data", "")) for event in thought_events)
+    assert done_events
+    assert "paper_research_write_execution_script" in str(done_events[0]["data"]["answer"])
+    assert done_events[0]["data"]["iterations"] == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_repeated_run_drafts_failures_with_schema_guidance(monkeypatch):
+    monkeypatch.setattr(settings, "agent_tool_failure_streak_limit", 3, raising=False)
+    agent = ReActAgent(_RepeatedRunDraftFailureLLM(), _RepeatedRunDraftFailureTools(), max_iterations=8)
+
+    events = []
+    async for event in agent.run([{"role": "user", "content": "继续修正 AG News run_drafts"}], stream=False):
+        events.append(event)
+
+    action_events = [event for event in events if event.get("type") == "action"]
+    thought_events = [event for event in events if event.get("type") == "thought"]
+    done_events = [event for event in events if event.get("type") == "done"]
+
+    assert len(action_events) == 3
+    assert any("entrypoint schema" in str(event.get("data", "")) for event in thought_events)
+    assert done_events
+    assert "不能写 shell wrapper" in str(done_events[0]["data"]["answer"])
+    assert "paper_research_write_execution_script" in str(done_events[0]["data"]["answer"])
+    assert done_events[0]["data"]["iterations"] == 3
 
 
 @pytest.mark.asyncio
@@ -571,11 +838,63 @@ async def test_execute_tool_calls_persists_tool_ledger_entries():
     assert runtime_service.entries[1]["kind"] == "tool_result"
     assert runtime_service.entries[1]["status"] == "succeeded"
     assert runtime_service.entries[1]["success"] is True
-    assert "Bahdanau 2014" in str(runtime_service.entries[1]["summary"])
+    assert "tool=datetime" in str(runtime_service.entries[1]["summary"])
+    assert "成功" in str(runtime_service.entries[1]["summary"])
     assert runtime_service.item_entries
     assert runtime_service.item_entries[0]["kind"] == "tool_use_summary"
     assert runtime_service.item_entries[0]["turn_id"] is None
     assert "datetime" in str(runtime_service.item_entries[0]["summary"])
+    assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "synthesize"
+    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "synthesize"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_marks_script_followup_after_execution_spec_failure():
+    runtime_service = _ToolLedgerRuntimeService()
+
+    class _FailureTools:
+        def get_tools_description(self, **kwargs):
+            return "- paper_research_write_execution_spec: 写入 execution 计划"
+
+        def get(self, _name: str):
+            return None
+
+        async def execute(self, tool_name: str, **kwargs):
+            assert tool_name == "paper_research_write_execution_spec"
+            return ToolResult(
+                success=False,
+                output="execution_spec 无效，未写入: generated_python entrypoint_path 缺失",
+                error="execution_spec_invalid",
+            )
+
+    agent = ReActAgent(
+        llm_service=_DirectAnswerFCLLM(),
+        tool_registry=_FailureTools(),
+        runtime_context=AgentRuntimeContext(user_id=7, channel="chat", conversation_id=54),
+        runtime_service=runtime_service,
+    )
+    context = AgentContext(
+        messages=[{"role": "user", "content": "继续写 execution 计划"}],
+        iteration=1,
+        run_id="run-1",
+    )
+
+    executed = await agent._execute_tool_calls(
+        context,
+        [
+            ParsedToolCall(
+                call_id="call_exec_spec",
+                name="paper_research_write_execution_spec",
+                arguments={"project_id": 135, "execution_spec": {"execution_id": "agnews-tuning"}},
+                arguments_raw='{"project_id":135,"execution_spec":{"execution_id":"agnews-tuning"}}',
+            )
+        ],
+    )
+
+    assert len(executed) == 1
+    assert runtime_service.item_entries
+    assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "write_execution_script"
+    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "write_execution_script"
 
 
 def test_plain_chat_normalization_strips_tool_protocol_messages():

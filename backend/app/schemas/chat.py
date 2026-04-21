@@ -75,6 +75,15 @@ class ConversationEvidenceLedgerEntryResponse(BaseModel):
     retrieval_scope: Optional[dict] = None
 
 
+class ConversationDecisionStateResponse(BaseModel):
+    status: Optional[Literal["active", "ready", "blocked", "waiting"]] = None
+    evidence_status: Optional[Literal["insufficient", "sufficient"]] = None
+    next_action: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    allowed_actions: List[str] = Field(default_factory=list)
+    repo_edit_allowed: Optional[bool] = None
+
+
 class ConversationContextStateResponse(BaseModel):
     version: str
     active_topic: Optional[str] = None
@@ -83,6 +92,7 @@ class ConversationContextStateResponse(BaseModel):
     open_questions: List[str] = Field(default_factory=list)
     resolved_facts: List[str] = Field(default_factory=list)
     evidence_ledger: List[ConversationEvidenceLedgerEntryResponse] = Field(default_factory=list)
+    decision_state: Optional[ConversationDecisionStateResponse] = None
     last_reasoning_summary: Optional[str] = None
     last_user_message: Optional[str] = None
     turn_count: int = 0

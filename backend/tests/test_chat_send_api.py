@@ -76,6 +76,10 @@ class _FakeRuntimeService:
             return {}
         return payload
 
+    async def cleanup_stale_conversation_turns(self, conversation_id, older_than_seconds):
+        _ = conversation_id, older_than_seconds
+        return 0
+
     async def append_conversation_item_entries(self, conversation_id, entries):
         for entry in entries:
             payload = dict(entry)
@@ -249,6 +253,37 @@ class _FakeSkillService:
             ),
             default_continue_policy="ask_to_continue",
         )
+
+
+def test_build_tool_event_workflow_control_payload_promotes_probe_stage(monkeypatch):
+    skill_service = _FakeSkillService()
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+
+    workflow_control = chat_api._build_tool_event_workflow_control_payload(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=58,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        tool_name="paper_research_inspect_runtime",
+        tool_payload={"project_id": 2},
+        success=True,
+        phase="action",
+    )
+
+    assert workflow_control is not None
+    assert workflow_control["stage"] == "implementation_prep"
+    assert workflow_control["stage_status"] == "running"
+    assert workflow_control["continue_policy"] == "ask_to_continue"
+    assert workflow_control.get("next_stage") is None
+    assert workflow_control.get("action") is None
 
 
 @pytest.mark.asyncio
@@ -583,4 +618,94 @@ async def test_send_message_stream_emits_workflow_control_for_skill_launch(monke
     assert '"event": "done"' in joined
     assert '"workflow_control"' in joined
     assert '"next_stage": "implementation_prep"' in joined
-    assert '"label": "\\u7ee7\\u7eed \\u5b9e\\u65bd\\u51c6\\u5907\\u9636\\u6bb5"' in joined
+    assert '继续 实施准备阶段' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _ToolAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            yield {
+                "type": "action",
+                "data": {
+                    "tool": "paper_research_inspect_runtime",
+                    "input": {"project_id": 2},
+                },
+            }
+            yield {
+                "type": "observation",
+                "data": {
+                    "tool": "paper_research_inspect_runtime",
+                    "success": True,
+                    "output": "runtime ok",
+                    "data": {"project_id": 2},
+                },
+            }
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "runtime inspected",
+                    "run_id": "run-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=59,
+        user_id=7,
+        title="测试对话",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+    skill_service = _FakeSkillService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_agent_skill_service", lambda: skill_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _ToolAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="继续论文规划阶段（paper_id=111）",
+            conversation_id=59,
+            stream=True,
+            use_tools=True,
+            skill_launch=ChatSkillLaunch(
+                skill_name="paper-reproduction",
+                stage="planning",
+                paper_id=111,
+                project_id=2,
+            ),
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    joined = "".join(chunks)
+    assert '"event": "action"' in joined
+    assert '"stage": "implementation_prep"' in joined
+    assert '"stage_status": "running"' in joined
+    assert '"event": "done"' in joined

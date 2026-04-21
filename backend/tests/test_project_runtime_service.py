@@ -73,6 +73,96 @@ def test_write_and_read_execution_spec(tmp_path, monkeypatch):
     assert content["validation"]["valid"] is True
 
 
+def test_write_execution_spec_renders_repo_script_from_execution_intent(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    (repo / "train.py").write_text("print('ok')\n", encoding="utf-8")
+
+    saved = ProjectRuntimeService().write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=1,
+        workspace_id=2,
+        notebook_id="nb",
+        execution_spec={
+            "execution_id": "intent-repo-script",
+            "execution_intent": {
+                "runtime_type": "plain-python",
+                "entrypoint_type": "repo_script",
+                "entrypoint_path": "train.py",
+                "args": ["--epochs", "1"],
+            },
+        },
+    )
+
+    content = saved["content"]
+    assert content["runtime_type"] == "plain-python"
+    assert content["cwd"] == "repo/source"
+    assert content["command"] == ["python", "train.py", "--epochs", "1"]
+    assert content["validation"]["valid"] is True
+
+
+def test_write_execution_spec_renders_generated_python_from_execution_intent(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
+    (tmp_path / "paper_repo").mkdir()
+
+    saved = ProjectRuntimeService().write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=1,
+        workspace_id=2,
+        notebook_id="nb",
+        execution_spec={
+            "execution_id": "intent-generated-script",
+            "execution_intent": {
+                "runtime_type": "plain-python",
+                "entrypoint_type": "generated_python",
+                "generated_program_name": "train_variant.py",
+            },
+            "generated_files": [
+                {
+                    "relative_path": "executions/intent-generated-script/train_variant.py",
+                    "content": "print('variant-ok')\n",
+                }
+            ],
+        },
+    )
+
+    content = saved["content"]
+    assert content["cwd"] == "repo/source"
+    assert content["command"] == ["python", "../../executions/intent-generated-script/train_variant.py"]
+    assert content["validation"]["valid"] is True
+
+
+def test_write_execution_generated_file_defaults_to_execution_workspace(tmp_path):
+    (tmp_path / "paper_repo").mkdir()
+
+    saved = ProjectRuntimeService().write_execution_generated_file(
+        workspace_dir=tmp_path,
+        execution_id="variant-script",
+        content="print('variant')\n",
+    )
+
+    target = tmp_path / "executions" / "variant-script" / "train_variant.py"
+    assert saved["relative_path"] == "executions/variant-script/train_variant.py"
+    assert saved["entrypoint_hint"]["entrypoint_type"] == "generated_python"
+    assert target.is_file()
+    assert "project-runtime: repo-import-shim" in target.read_text(encoding="utf-8")
+
+
+def test_write_execution_generated_file_rejects_paths_outside_execution_scope(tmp_path):
+    (tmp_path / "paper_repo").mkdir()
+
+    with pytest.raises(ValueError) as exc_info:
+        ProjectRuntimeService().write_execution_generated_file(
+            workspace_dir=tmp_path,
+            execution_id="variant-script",
+            relative_path="executions/other-run/train_variant.py",
+            content="print('variant')\n",
+        )
+
+    assert "relative_path must stay under `executions/variant-script/`" in str(exc_info.value)
+
+
 def test_derive_external_dependencies_from_download_command():
     deps = ProjectRuntimeService._derive_external_dependencies_from_spec(
         {
@@ -111,6 +201,50 @@ def test_invalid_execution_spec_is_not_saved(tmp_path):
         )
 
     assert not (tmp_path / "executions" / "bad" / "execution_spec.json").exists()
+
+
+def test_execution_intent_rejects_raw_command_and_cwd(tmp_path):
+    (tmp_path / "paper_repo").mkdir()
+
+    with pytest.raises(ValueError) as exc_info:
+        ProjectRuntimeService().write_execution_spec(
+            workspace_dir=tmp_path,
+            project_id=1,
+            workspace_id=2,
+            notebook_id="nb",
+            execution_spec={
+                "execution_id": "mixed-intent",
+                "cwd": "repo/source",
+                "command": ["python", "train.py"],
+                "execution_intent": {
+                    "runtime_type": "plain-python",
+                    "entrypoint_type": "repo_script",
+                    "entrypoint_path": "train.py",
+                },
+            },
+        )
+
+    assert "execution_intent cannot be combined with raw command" in str(exc_info.value)
+
+
+def test_execution_spec_rejects_shell_wrapper_command(tmp_path):
+    (tmp_path / "paper_repo").mkdir()
+
+    with pytest.raises(ValueError) as exc_info:
+        ProjectRuntimeService().write_execution_spec(
+            workspace_dir=tmp_path,
+            project_id=1,
+            workspace_id=2,
+            notebook_id="nb",
+            execution_spec={
+                "execution_id": "wrapped-command",
+                "runtime_type": "plain-python",
+                "cwd": "repo/source",
+                "command": ["bash", "-lc", "python train.py"],
+            },
+        )
+
+    assert "shell wrapper commands are not allowed" in str(exc_info.value)
 
 
 def test_execution_spec_rejects_failed_required_preflight(tmp_path):

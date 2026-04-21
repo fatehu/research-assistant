@@ -254,6 +254,15 @@ export interface ConversationEvidenceLedgerEntry {
   retrieval_scope?: Record<string, unknown>
 }
 
+export interface ConversationDecisionState {
+  status?: 'active' | 'ready' | 'blocked' | 'waiting'
+  evidence_status?: 'insufficient' | 'sufficient'
+  next_action?: string
+  blocked_reason?: string
+  allowed_actions: string[]
+  repo_edit_allowed?: boolean
+}
+
 export interface ConversationContextState {
   version: string
   active_topic?: string
@@ -262,6 +271,7 @@ export interface ConversationContextState {
   open_questions: string[]
   resolved_facts: string[]
   evidence_ledger: ConversationEvidenceLedgerEntry[]
+  decision_state?: ConversationDecisionState
   last_reasoning_summary?: string
   last_user_message?: string
   turn_count: number
@@ -417,8 +427,26 @@ export interface ConversationItemStreamEntry {
   output_tokens_estimate?: number
   truncated?: boolean
   parallel_group?: string
-  metadata?: Record<string, unknown>
+  metadata?: ConversationItemStreamEntryMetadata
   created_at?: string
+}
+
+export interface ToolWorkflowSummary {
+  version: string
+  headline?: string
+  status?: string
+  highlights?: string[]
+  next_action?: string
+  evidence_refs?: string[]
+  decision_state?: ConversationDecisionState
+  tool_names?: string[]
+  success_count?: number
+  failure_count?: number
+  permission_count?: number
+}
+
+export interface ConversationItemStreamEntryMetadata extends Record<string, unknown> {
+  workflow_summary?: ToolWorkflowSummary
 }
 
 export interface ConversationItemStream {

@@ -372,12 +372,7 @@ class ConversationItemStreamStore:
     @staticmethod
     def _is_message_like(entry: ConversationItemEntry) -> bool:
         kind = str(entry.kind or "").strip().lower()
-        role = str(entry.role or "").strip().lower()
-        return kind in {"message", "user_message", "assistant_message", "system_message"} or role in {
-            "user",
-            "assistant",
-            "system",
-        }
+        return kind in {"message", "user_message", "assistant_message", "stopped_assistant_message", "system_message"}
 
     def canonical_history(
         self,
@@ -467,23 +462,9 @@ class ConversationItemStreamStore:
         )
         rows: List[Dict[str, Any]] = list(canonical.replacement_history)
         for item in canonical.active_entries:
-            kind = str(item.kind or "").strip().lower()
+            if not self._is_message_like(item):
+                continue
             role = str(item.role or "").strip().lower()
-            if kind in {"reasoning_summary", "tool_use_summary", "permission_denial"}:
-                rows.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "thought": str(item.summary or item.content or "").strip() or None,
-                    }
-                )
-                continue
-            if kind not in {"message", "user_message", "assistant_message", "system_message"} and role not in {
-                "user",
-                "assistant",
-                "system",
-            }:
-                continue
             if role not in {"user", "assistant", "system"}:
                 continue
             rows.append(
@@ -506,23 +487,9 @@ class ConversationItemStreamStore:
         )
         rows: List[Dict[str, Any]] = []
         for item in canonical.active_entries:
-            kind = str(item.kind or "").strip().lower()
+            if not self._is_message_like(item):
+                continue
             role = str(item.role or "").strip().lower()
-            if kind in {"reasoning_summary", "tool_use_summary", "permission_denial"}:
-                rows.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "thought": str(item.summary or item.content or "").strip() or None,
-                    }
-                )
-                continue
-            if kind not in {"message", "user_message", "assistant_message", "system_message"} and role not in {
-                "user",
-                "assistant",
-                "system",
-            }:
-                continue
             if role not in {"user", "assistant", "system"}:
                 continue
             rows.append(

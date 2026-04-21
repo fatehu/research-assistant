@@ -93,6 +93,32 @@ const formatEvidenceLedgerSummary = (
     .join('；')
 }
 
+const formatDecisionStateSummary = (
+  decisionState: ConversationContextState['decision_state'] | undefined,
+): string => {
+  if (!decisionState) return ''
+  const parts: string[] = []
+  if (decisionState.status) {
+    parts.push(`状态: ${decisionState.status}`)
+  }
+  if (decisionState.evidence_status) {
+    parts.push(`证据: ${decisionState.evidence_status}`)
+  }
+  if (decisionState.next_action) {
+    parts.push(`下一步: ${decisionState.next_action}`)
+  }
+  if (decisionState.blocked_reason) {
+    parts.push(`阻塞: ${decisionState.blocked_reason}`)
+  }
+  if (decisionState.allowed_actions?.length) {
+    parts.push(`允许动作: ${decisionState.allowed_actions.join(' / ')}`)
+  }
+  if (typeof decisionState.repo_edit_allowed === 'boolean') {
+    parts.push(`可改 repo/source: ${decisionState.repo_edit_allowed ? '是' : '否'}`)
+  }
+  return parts.join('；')
+}
+
 const Section = ({ title, icon, children, emptyText }: SectionProps) => {
   const hasContent = Boolean(children)
   return (
@@ -742,6 +768,9 @@ const ContextDebugWindow = ({
                                   : '',
                                 activeConversationState.evidence_ledger?.length
                                   ? `证据账本: ${formatEvidenceLedgerSummary(activeConversationState.evidence_ledger)}`
+                                  : '',
+                                activeConversationState.decision_state
+                                  ? `决策态: ${formatDecisionStateSummary(activeConversationState.decision_state)}`
                                   : '',
                                 activeConversationState.last_reasoning_summary
                                   ? `最近推理摘要: ${activeConversationState.last_reasoning_summary}`

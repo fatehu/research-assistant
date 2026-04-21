@@ -62,6 +62,7 @@ enforced_tool_names:
   - paper_research_write_run_drafts
   - paper_research_read_run_drafts
   - paper_research_inspect_runtime
+  - paper_research_write_execution_script
   - paper_research_write_execution_spec
   - paper_research_read_execution_spec
   - paper_research_start_execution

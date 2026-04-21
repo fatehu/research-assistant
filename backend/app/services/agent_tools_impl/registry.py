@@ -1441,6 +1441,17 @@ class PaperResearchWriteExecutionSpecInput(BaseModel):
     execution_spec: Dict[str, Any] = Field(default_factory=dict)
 
 
+class PaperResearchWriteExecutionScriptInput(BaseModel):
+    project_id: int = Field(ge=1)
+    execution_id: str = Field(min_length=1, max_length=120)
+    relative_path: Optional[str] = Field(
+        default=None,
+        max_length=400,
+        validation_alias=AliasChoices("relative_path", "path", "file_path", "filename", "name"),
+    )
+    content: str = Field(min_length=1, max_length=300000)
+
+
 class PaperResearchReadExecutionSpecInput(BaseModel):
     project_id: int = Field(ge=1)
     execution_id: str = Field(min_length=1, max_length=120)
@@ -2391,6 +2402,94 @@ class _PaperResearchToolBase(ToolBase):
             normalized["next_actions"] = normalized_actions
 
         return normalized
+
+    @classmethod
+    def _validate_implementation_spec_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
+        errors: List[str] = []
+        required_object_fields = (
+            "source_summary",
+            "baseline",
+            "repo_plan",
+            "runtime_snapshot",
+            "data_plan",
+            "tuning_plan",
+            "readiness",
+        )
+        for field in required_object_fields:
+            if not isinstance(payload.get(field), dict):
+                errors.append(f"`{field}` must be an object.")
+
+        repo_root_relative_path = cls._normalize_relative_path(payload.get("repo_root_relative_path") or "")
+        if not repo_root_relative_path:
+            errors.append("`repo_root_relative_path` must be a workspace-relative path.")
+        elif cls.resolve_workspace_path(workspace_dir, repo_root_relative_path, require_exists=False) is None:
+            errors.append(f"`repo_root_relative_path` is outside workspace or invalid: {repo_root_relative_path}")
+
+        for field in ("blockers", "next_actions", "evidence_log", "notes"):
+            value = payload.get(field)
+            if value is not None and not isinstance(value, list):
+                errors.append(f"`{field}` must be a list when provided.")
+
+        baseline = dict(payload.get("baseline") or {})
+        readiness = dict(payload.get("readiness") or {})
+        runtime_snapshot = dict(payload.get("runtime_snapshot") or {})
+        repo_plan = dict(payload.get("repo_plan") or {})
+
+        entrypoint_type = str(baseline.get("entrypoint_type") or "").strip().lower()
+        entrypoint_aliases = {
+            "repo": "repo_script",
+            "repo_script": "repo_script",
+            "python_script": "repo_script",
+            "notebook": "notebook",
+            "unknown": "unknown",
+        }
+        normalized_entrypoint_type = entrypoint_aliases.get(entrypoint_type, entrypoint_type)
+        if normalized_entrypoint_type and normalized_entrypoint_type not in {"repo_script", "notebook", "unknown"}:
+            errors.append("`baseline.entrypoint_type` must be one of repo_script/notebook/unknown.")
+
+        readiness_bools = ("can_create_run_draft", "can_execute", "external_dependencies_grounded")
+        for field in readiness_bools:
+            if field in readiness and not isinstance(readiness.get(field), bool):
+                errors.append(f"`readiness.{field}` must be a boolean.")
+
+        entrypoint_path_or_hint = str(baseline.get("entrypoint_path_or_hint") or "").strip()
+        if bool(readiness.get("can_create_run_draft")) or bool(readiness.get("can_execute")):
+            if not normalized_entrypoint_type or normalized_entrypoint_type == "unknown":
+                errors.append(
+                    "`baseline.entrypoint_type` must be grounded before readiness.can_create_run_draft/can_execute is true."
+                )
+            if not entrypoint_path_or_hint:
+                errors.append(
+                    "`baseline.entrypoint_path_or_hint` is required before readiness.can_create_run_draft/can_execute is true."
+                )
+
+        if normalized_entrypoint_type in {"repo_script", "notebook"} and entrypoint_path_or_hint:
+            repo_relative_path = cls._normalize_relative_path(entrypoint_path_or_hint)
+            if repo_relative_path.startswith("repo/source/"):
+                repo_relative_path = repo_relative_path.removeprefix("repo/source/")
+            if not repo_relative_path:
+                errors.append("`baseline.entrypoint_path_or_hint` must be a repo-relative path.")
+            elif cls.resolve_workspace_path(workspace_dir, f"repo/source/{repo_relative_path}") is None:
+                errors.append(
+                    f"`baseline.entrypoint_path_or_hint` references missing repo file `{repo_relative_path}`."
+                )
+
+        repo_status = str(repo_plan.get("repo_status") or "").strip()
+        if str(payload.get("mode") or "").strip() == "repo_driven" and not repo_status:
+            errors.append("`repo_plan.repo_status` is required for repo_driven implementation specs.")
+        for field in ("dependency_files", "entrypoint_candidates", "files_read"):
+            if field in repo_plan and not isinstance(repo_plan.get(field), list):
+                errors.append(f"`repo_plan.{field}` must be a list when provided.")
+
+        captured_from = str(runtime_snapshot.get("captured_from") or "").strip()
+        if captured_from and captured_from != "paper_research_inspect_runtime":
+            errors.append("`runtime_snapshot.captured_from` must be `paper_research_inspect_runtime`.")
+        if not isinstance(runtime_snapshot.get("candidate_summaries") or [], list):
+            errors.append("`runtime_snapshot.candidate_summaries` must be a list.")
+        if not isinstance(runtime_snapshot.get("environment") or {}, dict):
+            errors.append("`runtime_snapshot.environment` must be an object.")
+
+        return errors
 
     @classmethod
     def _validate_run_drafts_payload(cls, payload: Dict[str, Any], *, workspace_dir: Path) -> List[str]:
@@ -3836,6 +3935,22 @@ class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
                 workspace_dir=workspace_dir,
                 runtime_inspection=runtime_inspection,
             )
+            validation_errors = self._validate_implementation_spec_payload(payload, workspace_dir=workspace_dir)
+            if validation_errors:
+                return ToolResult(
+                    success=False,
+                    output=(
+                        "implementation_spec JSON 未通过归档校验，未写入文件。\n"
+                        + "\n".join(f"- {item}" for item in validation_errors[:12])
+                    ),
+                    error="implementation_spec_invalid",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "relative_path": relative_path,
+                        "saved": False,
+                        "validation_errors": validation_errors,
+                    },
+                )
 
             actual_path.parent.mkdir(parents=True, exist_ok=True)
             actual_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -4425,13 +4540,16 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
             "execution_spec": {
                 "type": "object",
                 "description": (
-                    "单次执行计划。必须包含 runtime_type。可选 execution_id/draft_id/label/cwd/command/"
+                    "单次执行计划。优先提供 execution_intent，由 backend 确定性渲染最终 cwd/command；"
+                    "不要再自由拼 shell。execution_intent 建议包含 runtime_type/entrypoint_type/"
+                    "entrypoint_path/cwd_mode/args。兼容旧格式时也可直接传 runtime_type/cwd/command/"
                     "input_notebook/parameters/expected_outputs/evidence_files/external_dependencies/"
                     "preflight_checks/generated_files。preflight_checks 必须是对象数组，例如 "
                     "[{\"name\":\"check_python\",\"required\":true,\"status\":\"passed\"}]；不要传 "
                     "{\"check_python\": true} 这种 map。generated_files 每项至少需要 content，"
                     "并应显式给出 relative_path；如果误写成 path/file_path/filename/name，writer 会尝试吸收。"
                     "generated_files 只能写入 executions、generated 或 tmp 下的执行级文件，不能覆盖 repo/source。"
+                    "execution_intent 与原始 command/cwd/input_notebook 不能混用。"
                 ),
             },
         },
@@ -4482,6 +4600,83 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
             if warning_lines:
                 lines.append("- Runtime warnings:")
                 lines.extend(warning_lines)
+            return ToolResult(success=True, output="\n".join(lines), data=saved)
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchWriteExecutionScriptTool(_PaperResearchToolBase):
+    name = "paper_research_write_execution_script"
+    input_model = PaperResearchWriteExecutionScriptInput
+    description = (
+        "将执行级脚本写入 Project workspace 的 executions/{execution_id}/ 下。"
+        "适合生成 tuning variant 脚本或小型辅助程序，不会改动 repo/source。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "execution_id": {"type": "string", "description": "目标 execution_id；脚本会被约束在 executions/{execution_id}/ 下。"},
+            "relative_path": {
+                "type": "string",
+                "description": (
+                    "可选，执行级脚本相对路径。可以只传文件名如 train_variant.py，"
+                    "writer 会自动放到 executions/{execution_id}/ 下。禁止写 repo/source。"
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": "脚本内容。推荐用于 Python variant 脚本或轻量辅助文件。",
+            },
+        },
+        "required": ["project_id", "execution_id", "content"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_runtime_service import ProjectRuntimeService
+
+            project_id = int(kwargs["project_id"])
+            execution_id = str(kwargs.get("execution_id") or "").strip()
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            try:
+                saved = ProjectRuntimeService().write_execution_generated_file(
+                    workspace_dir=workspace_dir,
+                    execution_id=execution_id,
+                    relative_path=kwargs.get("relative_path"),
+                    content=str(kwargs.get("content") or ""),
+                )
+            except ValueError as exc:
+                return ToolResult(
+                    success=False,
+                    output=f"执行级脚本无效，未写入: {exc}",
+                    error="execution_script_invalid",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "project_id": project_id,
+                        "execution_id": execution_id,
+                        "saved": False,
+                    },
+                )
+
+            entrypoint_hint = dict(saved.get("entrypoint_hint") or {})
+            lines = [
+                "已写入 execution 脚本。",
+                f"- Project: /projects/{project_id}",
+                f"- Execution ID: {saved.get('execution_id')}",
+                f"- Relative path: {saved.get('relative_path')}",
+            ]
+            if entrypoint_hint:
+                lines.append(
+                    "- Execution intent hint: "
+                    + json.dumps(entrypoint_hint, ensure_ascii=False, sort_keys=True)
+                )
             return ToolResult(success=True, output="\n".join(lines), data=saved)
 
         return await self._with_db(_handler)
@@ -6698,6 +6893,11 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                         ),
                         PaperResearchWriteExecutionSpecTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchWriteExecutionScriptTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,

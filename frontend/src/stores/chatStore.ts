@@ -878,6 +878,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
             case 'action':
               // 工具调用开始
+              const actionWorkflowControl =
+                data && typeof data === 'object' && data.workflow_control && typeof data.workflow_control === 'object'
+                  ? (data.workflow_control as ChatWorkflowControl)
+                  : null
               const toolCall = {
                 tool: data.tool,
                 input: data.input,
@@ -890,6 +894,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 sendPhase: 'tool',
                 sendPhaseLabel: null,
                 sendPhaseHint: null,
+                workflowControl: actionWorkflowControl || state.workflowControl,
                 iterationSteps: [...state.iterationSteps, {
                   type: 'action',
                   content: `调用工具: ${data.tool}`,
@@ -902,6 +907,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
             case 'observation':
               // 工具调用结果
+              const observationWorkflowControl =
+                data && typeof data === 'object' && data.workflow_control && typeof data.workflow_control === 'object'
+                  ? (data.workflow_control as ChatWorkflowControl)
+                  : null
               set((state) => {
                 const updatedToolCalls = [...state.toolCalls]
                 const lastIndex = updatedToolCalls.length - 1
@@ -919,6 +928,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   sendPhase: 'thinking',
                   sendPhaseLabel: null,
                   sendPhaseHint: null,
+                  workflowControl: observationWorkflowControl || state.workflowControl,
                   iterationSteps: [...state.iterationSteps, {
                     type: 'observation',
                     content: data.output,

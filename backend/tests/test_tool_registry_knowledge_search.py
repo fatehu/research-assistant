@@ -46,6 +46,7 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
         "paper_research_read_repo_file",
         "paper_research_search_repo",
         "paper_research_status",
+        "paper_research_write_execution_script",
         "paper_research_write_implementation_spec",
         "paper_research_write_run_drafts",
         "paper_research_create_run_draft",

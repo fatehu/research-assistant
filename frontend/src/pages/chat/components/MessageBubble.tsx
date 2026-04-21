@@ -21,6 +21,7 @@ import {
   type MessageCitationSourceItem,
   type RagMetrics,
   type ConversationItemStream,
+  type ToolWorkflowSummary,
   type ConversationToolLedger,
   type ConversationTurnStore,
   type MessageSpanRewriteResponse,
@@ -585,6 +586,8 @@ const deriveHistorySteps = (
   input?: Record<string, unknown>
   output?: string
   success?: boolean
+  workflowSummary?: ToolWorkflowSummary
+  rawContent?: string
 }> => {
   if (!itemStream?.entries?.length || !turnId) return []
   const steps: Array<{
@@ -595,11 +598,42 @@ const deriveHistorySteps = (
     input?: Record<string, unknown>
     output?: string
     success?: boolean
+    workflowSummary?: ToolWorkflowSummary
+    rawContent?: string
   }> = []
   itemStream.entries
     .filter((entry) => entry.turn_id === turnId)
     .forEach((entry) => {
-      if (entry.kind === 'reasoning_summary' || entry.kind === 'tool_use_summary') {
+      if (entry.kind === 'tool_use_summary') {
+        steps.push({
+          type: 'workflow',
+          iteration: entry.iteration || 0,
+          content: entry.summary || entry.content || '',
+          rawContent: entry.content || entry.summary || '',
+          workflowSummary:
+            entry.metadata?.workflow_summary && typeof entry.metadata.workflow_summary === 'object'
+              ? (entry.metadata.workflow_summary as ToolWorkflowSummary)
+              : undefined,
+        })
+        return
+      }
+      if (entry.kind === 'permission_denial') {
+        steps.push({
+          type: 'workflow',
+          iteration: entry.iteration || 0,
+          content: entry.summary || entry.content || '',
+          rawContent: entry.content || entry.summary || '',
+          workflowSummary: {
+            version: 'tool_workflow_summary.v1',
+            headline: '权限受限，流程已等待',
+            status: 'waiting',
+            highlights: [entry.summary || entry.content || '当前步骤需要额外授权后才能继续。'],
+            next_action: '等待授权或调整执行路径',
+          },
+        })
+        return
+      }
+      if (entry.kind === 'reasoning_summary') {
         steps.push({
           type: 'thought',
           iteration: entry.iteration || 0,

@@ -5,6 +5,7 @@ import {
 import type {
   ConversationItemStream,
   ConversationItemStreamEntry,
+  ToolWorkflowSummary,
   ConversationToolLedger,
   ConversationTurnEntry,
   ConversationTurnStore,
@@ -137,6 +138,8 @@ const buildHistorySteps = (
   input?: Record<string, unknown>
   output?: string
   success?: boolean
+  workflowSummary?: ToolWorkflowSummary
+  rawContent?: string
 }> => {
   const steps: Array<{
     type: string
@@ -146,18 +149,46 @@ const buildHistorySteps = (
     input?: Record<string, unknown>
     output?: string
     success?: boolean
+    workflowSummary?: ToolWorkflowSummary
+    rawContent?: string
   }> = []
 
   for (const item of items) {
     const kind = String(item.kind || '').trim().toLowerCase()
-    if (kind === 'reasoning_summary' || kind === 'tool_use_summary' || kind === 'permission_denial') {
+    if (kind === 'tool_use_summary') {
+      steps.push({
+        type: 'workflow',
+        iteration: item.iteration || 0,
+        content: item.summary || item.content || '',
+        rawContent: item.content || item.summary || '',
+        workflowSummary:
+          item.metadata?.workflow_summary && typeof item.metadata.workflow_summary === 'object'
+            ? (item.metadata.workflow_summary as ToolWorkflowSummary)
+            : undefined,
+      })
+      continue
+    }
+    if (kind === 'permission_denial') {
+      steps.push({
+        type: 'workflow',
+        iteration: item.iteration || 0,
+        content: item.summary || item.content || '',
+        rawContent: item.content || item.summary || '',
+        workflowSummary: {
+          version: 'tool_workflow_summary.v1',
+          headline: '权限受限，流程已等待',
+          status: 'waiting',
+          highlights: [item.summary || item.content || '当前步骤需要额外授权后才能继续。'],
+          next_action: '等待授权或调整执行路径',
+        },
+      })
+      continue
+    }
+    if (kind === 'reasoning_summary') {
       steps.push({
         type: 'thought',
         iteration: item.iteration || 0,
-        content:
-          kind === 'permission_denial'
-            ? `权限限制：${item.summary || item.content || ''}`
-            : item.summary || item.content || '',
+        content: item.summary || item.content || '',
       })
       continue
     }

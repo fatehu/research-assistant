@@ -65,6 +65,22 @@ def _sse_event(event: str, data: Any) -> str:
     return f"data: {_safe_json_dumps({'event': event, 'data': data})}\n\n"
 
 
+def _sanitize_reasoning_summary_text(value: object, *, limit: int = 240) -> Optional[str]:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return None
+    patterns = (
+        r"(让我|我来|我先|我会|我将|我们将|接下来|下一步)",
+        r"(准备创建|准备修改|准备写入|将使用|会使用|将创建|将修改|将写入)",
+        r"(blocker 已移除|已经解决，因为我们将|fix-[a-z0-9_-]+\.sh)",
+    )
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
+        return None
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)].rstrip() + "…"
+
+
 async def _persist_reasoning_summary_later(
     *,
     conversation_id: int,
@@ -84,7 +100,7 @@ async def _persist_reasoning_summary_later(
         from app.services.react_agent import AgentCore
 
         summary_text = await AgentCore.generate_reasoning_summary_from_trace(trace_text)
-        compacted = _assistant_summary_text(summary_text or "", limit=240)
+        compacted = _sanitize_reasoning_summary_text(summary_text or "", limit=240)
         if not compacted:
             return
 
@@ -201,6 +217,42 @@ _PAPER_STAGE_LABELS = {
     "implementation_prep": "实施准备阶段",
     "run_drafts": "运行草案阶段",
     "execution": "执行阶段",
+    "tuning": "调参与对比阶段",
+}
+
+_PAPER_DEFAULT_STAGE_ORDER = (
+    "planning",
+    "implementation_prep",
+    "run_drafts",
+    "execution",
+    "tuning",
+)
+
+_PAPER_TOOL_STAGE_HINTS = {
+    "paper_research_status": "planning",
+    "paper_research_prepare": "planning",
+    "paper_research_clone_repo": "implementation_prep",
+    "paper_research_probe_repo": "implementation_prep",
+    "paper_research_get_artifact_manifest": "implementation_prep",
+    "paper_research_read_artifact": "implementation_prep",
+    "paper_research_read_repo_file": "implementation_prep",
+    "paper_research_search_repo": "implementation_prep",
+    "paper_research_inspect_runtime": "implementation_prep",
+    "paper_research_read_implementation_spec": "implementation_prep",
+    "paper_research_write_implementation_spec": "implementation_prep",
+    "paper_research_read_run_drafts": "run_drafts",
+    "paper_research_write_run_drafts": "run_drafts",
+    "paper_research_write_execution_spec": "execution",
+    "paper_research_read_execution_spec": "execution",
+    "paper_research_start_execution": "execution",
+    "paper_research_read_execution": "execution",
+    "paper_research_cancel_execution": "execution",
+}
+
+_PAPER_STAGE_COMPLETION_TOOLS = {
+    "planning": {"paper_research_prepare"},
+    "implementation_prep": {"paper_research_write_implementation_spec"},
+    "run_drafts": {"paper_research_write_run_drafts"},
 }
 
 
@@ -264,12 +316,102 @@ def _parse_stage_policy_map(raw_policies: object) -> dict[str, str]:
     return policies
 
 
-def _build_workflow_control_payload(request: ChatRequest) -> Optional[dict]:
+def _workflow_stage_index(stage_names: list[str], stage: Optional[str]) -> int:
+    normalized_stage = str(stage or "").strip()
+    if not normalized_stage:
+        return -1
+    try:
+        return stage_names.index(normalized_stage)
+    except ValueError:
+        return -1
+
+
+def _normalize_paper_runtime_stage(stage: object) -> Optional[str]:
+    normalized_stage = str(stage or "").strip().lower()
+    if not normalized_stage:
+        return None
+    if normalized_stage in {"env_setup", "data_prep", "implementation_prep"}:
+        return "implementation_prep"
+    if normalized_stage in {"baseline_repro", "execution"}:
+        return "execution"
+    if normalized_stage in {"tuning", "compare"}:
+        return "tuning"
+    if normalized_stage in _PAPER_DEFAULT_STAGE_ORDER:
+        return normalized_stage
+    return None
+
+
+def _extract_workflow_status_from_tool_payload(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    background_execution = (
+        dict(payload.get("background_execution") or {})
+        if isinstance(payload.get("background_execution"), dict)
+        else {}
+    )
+    for candidate in (background_execution.get("status"), payload.get("status")):
+        normalized = str(candidate or "").strip().lower()
+        if normalized:
+            return normalized
+    return None
+
+
+def _infer_paper_workflow_stage_from_tool_event(
+    *,
+    request_stage: str,
+    tool_name: object,
+    tool_payload: object = None,
+    stage_names: Optional[list[str]] = None,
+) -> Optional[str]:
+    normalized_tool_name = str(tool_name or "").strip()
+    normalized_request_stage = str(request_stage or "").strip()
+    resolved_stage_names = [str(item).strip() for item in list(stage_names or []) if str(item).strip()]
+    if not resolved_stage_names:
+        resolved_stage_names = list(_PAPER_DEFAULT_STAGE_ORDER)
+
+    inferred_stage: Optional[str] = None
+    if isinstance(tool_payload, dict):
+        background_execution = (
+            dict(tool_payload.get("background_execution") or {})
+            if isinstance(tool_payload.get("background_execution"), dict)
+            else {}
+        )
+        status_summary = (
+            dict(tool_payload.get("status_summary") or {})
+            if isinstance(tool_payload.get("status_summary"), dict)
+            else {}
+        )
+        inferred_stage = (
+            _normalize_paper_runtime_stage(background_execution.get("stage"))
+            or _normalize_paper_runtime_stage(status_summary.get("current_stage"))
+            or _normalize_paper_runtime_stage(tool_payload.get("current_stage"))
+        )
+    if inferred_stage is None:
+        inferred_stage = _PAPER_TOOL_STAGE_HINTS.get(normalized_tool_name)
+
+    if inferred_stage and _workflow_stage_index(resolved_stage_names, inferred_stage) >= 0:
+        if _workflow_stage_index(resolved_stage_names, inferred_stage) >= _workflow_stage_index(
+            resolved_stage_names,
+            normalized_request_stage,
+        ):
+            return inferred_stage
+    if _workflow_stage_index(resolved_stage_names, normalized_request_stage) >= 0:
+        return normalized_request_stage
+    return inferred_stage
+
+
+def _build_workflow_control_payload(
+    request: ChatRequest,
+    *,
+    stage_override: Optional[str] = None,
+    stage_status: str = "completed",
+) -> Optional[dict]:
     skill_launch = request.skill_launch
     if skill_launch is None:
         return None
     skill_name = str(skill_launch.skill_name or "").strip()
-    stage = str(skill_launch.stage or "").strip()
+    requested_stage = str(skill_launch.stage or "").strip()
+    stage = str(stage_override or requested_stage).strip()
     if not skill_name or not stage:
         return None
 
@@ -277,18 +419,19 @@ def _build_workflow_control_payload(request: ChatRequest) -> Optional[dict]:
     if skill is None:
         return None
 
-    stage_names = [str(item).strip() for item in skill.stage_names if str(item).strip()]
+    stage_names = [str(item).strip() for item in skill.stage_names if str(item).strip()] or list(_PAPER_DEFAULT_STAGE_ORDER)
+    if _workflow_stage_index(stage_names, stage) < 0:
+        stage = requested_stage
+    if _workflow_stage_index(stage_names, stage) < 0:
+        return None
+
     stage_policy_map = _parse_stage_policy_map(skill.stage_policies)
     continue_policy = stage_policy_map.get(stage) or str(skill.default_continue_policy or "").strip() or None
 
     next_stage: Optional[str] = None
-    if stage_names:
-        try:
-            current_index = stage_names.index(stage)
-        except ValueError:
-            current_index = -1
-        if current_index >= 0 and current_index + 1 < len(stage_names):
-            next_stage = stage_names[current_index + 1]
+    current_index = _workflow_stage_index(stage_names, stage)
+    if stage_status == "completed" and current_index >= 0 and current_index + 1 < len(stage_names):
+        next_stage = stage_names[current_index + 1]
 
     action: Optional[ChatWorkflowActionResponse] = None
     suggested_action: Optional[str] = None
@@ -308,7 +451,7 @@ def _build_workflow_control_payload(request: ChatRequest) -> Optional[dict]:
         display_name=str(skill.display_name or "").strip() or None,
         stage=stage,
         stage_label=_PAPER_STAGE_LABELS.get(stage, stage),
-        stage_status="completed",
+        stage_status=stage_status,
         continue_policy=continue_policy,
         next_stage=next_stage,
         next_stage_label=_PAPER_STAGE_LABELS.get(next_stage, next_stage) if next_stage else None,
@@ -318,8 +461,71 @@ def _build_workflow_control_payload(request: ChatRequest) -> Optional[dict]:
     return workflow_control.model_dump(exclude_none=True)
 
 
-def _attach_workflow_control(done_payload: dict[str, Any], request: ChatRequest) -> dict[str, Any]:
-    workflow_control = _build_workflow_control_payload(request)
+def _build_tool_event_workflow_control_payload(
+    request: ChatRequest,
+    *,
+    tool_name: object,
+    tool_payload: object = None,
+    success: Optional[bool] = None,
+    phase: str = "action",
+) -> Optional[dict]:
+    skill_launch = request.skill_launch
+    if skill_launch is None:
+        return None
+    skill_name = str(skill_launch.skill_name or "").strip()
+    if skill_name != "paper-reproduction":
+        return None
+
+    skill = get_agent_skill_service().get_skill(skill_name)
+    if skill is None:
+        return None
+
+    stage_names = [str(item).strip() for item in skill.stage_names if str(item).strip()] or list(_PAPER_DEFAULT_STAGE_ORDER)
+    stage = _infer_paper_workflow_stage_from_tool_event(
+        request_stage=str(skill_launch.stage or "").strip(),
+        tool_name=tool_name,
+        tool_payload=tool_payload,
+        stage_names=stage_names,
+    )
+    if not stage:
+        return None
+
+    normalized_tool_name = str(tool_name or "").strip()
+    normalized_phase = str(phase or "action").strip().lower()
+    tool_status = _extract_workflow_status_from_tool_payload(tool_payload)
+    stage_status = "running"
+
+    if normalized_phase == "observation":
+        if tool_status in {"failed", "error", "blocked", "cancelled", "canceled"}:
+            stage_status = "blocked"
+        elif success is False:
+            stage_status = "blocked"
+        elif (
+            stage in _PAPER_STAGE_COMPLETION_TOOLS
+            and normalized_tool_name in _PAPER_STAGE_COMPLETION_TOOLS[stage]
+            and bool(success)
+        ):
+            stage_status = "completed"
+        elif normalized_tool_name in {"paper_research_start_execution", "paper_research_read_execution", "paper_research_cancel_execution"}:
+            if tool_status in {"completed", "complete", "success", "done"}:
+                stage_status = "completed"
+            else:
+                stage_status = "running"
+
+    return _build_workflow_control_payload(
+        request,
+        stage_override=stage,
+        stage_status=stage_status,
+    )
+
+
+def _attach_workflow_control(
+    done_payload: dict[str, Any],
+    request: ChatRequest,
+    *,
+    workflow_control: Optional[dict] = None,
+) -> dict[str, Any]:
+    workflow_control = workflow_control or _build_workflow_control_payload(request)
     if workflow_control:
         done_payload["workflow_control"] = workflow_control
     return done_payload
@@ -412,11 +618,33 @@ def _normalized_context_state_payload(payload: object) -> Optional[dict]:
         for item in list(normalized.get("resolved_facts") or [])
         if str(item).strip()
     ]
+    compacted_reasoning = _sanitize_reasoning_summary_text(
+        normalized.get("last_reasoning_summary"),
+        limit=240,
+    )
+    if compacted_reasoning:
+        normalized["last_reasoning_summary"] = compacted_reasoning
+    else:
+        normalized.pop("last_reasoning_summary", None)
     normalized["evidence_ledger"] = [
         item
         for item in (_normalized_evidence_entry(raw) for raw in list(normalized.get("evidence_ledger") or []))
         if item is not None
     ]
+    workflow_binding = normalized.get("workflow_binding") or {}
+    try:
+        from app.services.react_agent import ReActAgent
+
+        decision_state = ReActAgent._normalize_decision_state(
+            normalized.get("decision_state") or {},
+            workflow_binding=workflow_binding,
+        )
+    except Exception:
+        decision_state = {}
+    if decision_state:
+        normalized["decision_state"] = decision_state
+    else:
+        normalized.pop("decision_state", None)
     return normalized
 
 
@@ -2606,7 +2834,7 @@ async def send_message(
                 iteration_count: Optional[int] = None,
                 created_at: Optional[datetime] = None,
             ) -> None:
-                compacted = _assistant_summary_text(summary_text or "", limit=240)
+                compacted = _sanitize_reasoning_summary_text(summary_text or "", limit=240)
                 if not compacted:
                     return
                 await runtime_service.append_conversation_item_entries(
@@ -2816,6 +3044,7 @@ async def send_message(
                     # 使用 ReAct Agent（带工具）
                     yield _sse_event("phase", _phase_payload("waiting_model", first_turn=is_first_turn))
                     agent = _create_chat_agent()
+                    active_workflow_control: Optional[dict] = None
                     
                     async for event in agent.run(agent_messages, stream=True, prepared_plan=prepared_send_plan):
                         event_type = event["type"]
@@ -2832,9 +3061,34 @@ async def send_message(
                             thought = event_data
                             yield _sse_event("thought", event_data)
                         elif event_type == "action":
-                            yield _sse_event("action", event_data)
+                            action_payload = dict(event_data or {}) if isinstance(event_data, dict) else {"value": event_data}
+                            workflow_control = _build_tool_event_workflow_control_payload(
+                                request,
+                                tool_name=action_payload.get("tool"),
+                                tool_payload=action_payload.get("data"),
+                                phase="action",
+                            )
+                            if workflow_control:
+                                action_payload["workflow_control"] = workflow_control
+                                active_workflow_control = workflow_control
+                            yield _sse_event("action", action_payload)
                         elif event_type == "observation":
-                            yield _sse_event("observation", event_data)
+                            observation_payload = dict(event_data or {}) if isinstance(event_data, dict) else {"value": event_data}
+                            workflow_control = _build_tool_event_workflow_control_payload(
+                                request,
+                                tool_name=observation_payload.get("tool"),
+                                tool_payload=observation_payload.get("data"),
+                                success=(
+                                    observation_payload.get("success")
+                                    if "success" in observation_payload
+                                    else None
+                                ),
+                                phase="observation",
+                            )
+                            if workflow_control:
+                                observation_payload["workflow_control"] = workflow_control
+                                active_workflow_control = workflow_control
+                            yield _sse_event("observation", observation_payload)
                         elif event_type == "context_debug":
                             if isinstance(event_data, dict):
                                 context_debug = event_data
@@ -2868,8 +3122,12 @@ async def send_message(
                                 rag_metrics=rag_metrics,
                                 citation_index=citation_index,
                             )
-                            
+
                             logger.info(f"[Chat] 对话完成: iterations={current_iteration}, content_len={len(full_content)}")
+                            persisted_thought = _sanitize_reasoning_summary_text(
+                                reasoning_summary or thought or "",
+                                limit=240,
+                            )
                             
                             # 保存助手消息（包含完整的ReAct步骤）
                             async with async_session_factory() as save_db:
@@ -2878,7 +3136,7 @@ async def send_message(
                                     message_metadata["rag_metrics"] = rag_metrics
                                 if isinstance(citation_index, dict):
                                     message_metadata["citation_index"] = citation_index
-                                workflow_control = _build_workflow_control_payload(request)
+                                workflow_control = active_workflow_control or _build_workflow_control_payload(request)
                                 if workflow_control:
                                     message_metadata["workflow_control"] = workflow_control
                                 persisted_message_metadata = _sanitized_persisted_chat_metadata(message_metadata) or {}
@@ -2887,7 +3145,7 @@ async def send_message(
                                     role=MessageRole.ASSISTANT,
                                     content=full_content,
                                     message_type=MessageType.TEXT,
-                                    thought=(reasoning_summary or thought) if (reasoning_summary or thought) else None,
+                                    thought=persisted_thought,
                                     metadata_=persisted_message_metadata or None,
                                 )
                                 save_db.add(assistant_message)
@@ -2900,7 +3158,7 @@ async def send_message(
                                     turn_id=turn_id,
                                     message_id=assistant_message.id,
                                     created_at=assistant_message.created_at,
-                                    thought=(reasoning_summary or thought) if (reasoning_summary or thought) else None,
+                                    thought=persisted_thought,
                                     metadata=persisted_message_metadata or None,
                                     kind="assistant_message",
                                 )
@@ -2926,7 +3184,7 @@ async def send_message(
                                     status_value="completed",
                                     assistant_message_id=assistant_message.id,
                                     assistant_content=full_content,
-                                    assistant_thought=(reasoning_summary or thought),
+                                    assistant_thought=persisted_thought,
                                     run_id=str(event_data.get("run_id") or "").strip() or None,
                                     iteration_count=current_iteration,
                                 )
@@ -2944,7 +3202,7 @@ async def send_message(
 
                                 done_payload = {
                                     "message_id": assistant_message.id,
-                                    "thought": (reasoning_summary or thought),
+                                    "thought": persisted_thought,
                                     "answer": full_content,
                                 }
                                 if isinstance(rag_metrics, dict):
@@ -2959,10 +3217,14 @@ async def send_message(
                                     done_payload["tool_ledger"] = conversation_tool_ledger
                                 if conversation_item_stream:
                                     done_payload["item_stream"] = conversation_item_stream
-                                if isinstance(reasoning_summary, str) and reasoning_summary.strip():
-                                    done_payload["reasoning_summary"] = reasoning_summary.strip()
+                                if persisted_thought:
+                                    done_payload["reasoning_summary"] = persisted_thought
 
-                                done_payload = _attach_workflow_control(done_payload, request)
+                                done_payload = _attach_workflow_control(
+                                    done_payload,
+                                    request,
+                                    workflow_control=active_workflow_control,
+                                )
                                 yield _sse_event("done", done_payload)
                 else:
                     yield _sse_event("phase", _phase_payload("loading_context", first_turn=is_first_turn))
@@ -3161,7 +3423,10 @@ async def send_message(
                                 raise RuntimeError(str(event_data or "agent run failed"))
                         response = {
                             "content": answer,
-                            "thought": reasoning_summary or thought or None,
+                            "thought": _sanitize_reasoning_summary_text(
+                                reasoning_summary or thought or "",
+                                limit=240,
+                            ),
                             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                             "rag_metrics": rag_metrics,
                             "citation_index": citation_index,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,6 +33,22 @@ def _assistant_summary_text(content: str, *, fallback: Optional[str] = None, lim
     if not text:
         text = " ".join(str(fallback or "").split()).strip()
     if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)].rstrip() + "…"
+
+
+def _sanitize_assistant_thought_text(value: object, *, limit: int = 240) -> Optional[str]:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return None
+    patterns = (
+        r"(让我|我来|我先|我会|我将|我们将|接下来|下一步)",
+        r"(准备创建|准备修改|准备写入|将使用|会使用|将创建|将修改|将写入)",
+        r"(blocker 已移除|已经解决，因为我们将|fix-[a-z0-9_-]+\.sh)",
+    )
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
         return None
     if len(text) <= limit:
         return text
@@ -305,12 +322,13 @@ class ExecutionContinuationManager:
                         "citation_index": citation_index,
                     }
                 )
+                persisted_thought = _sanitize_assistant_thought_text(reasoning_summary or thought or "")
                 assistant_message = Message(
                     conversation_id=int(record.conversation_id),
                     role=MessageRole.ASSISTANT,
                     content=full_content,
                     message_type=MessageType.TEXT,
-                    thought=(reasoning_summary or thought) if (reasoning_summary or thought) else None,
+                    thought=persisted_thought,
                     metadata_=message_metadata if isinstance(message_metadata, dict) else None,
                 )
                 db.add(assistant_message)
@@ -326,12 +344,12 @@ class ExecutionContinuationManager:
                             "content": full_content,
                             "message_id": int(assistant_message.id),
                             "created_at": assistant_message.created_at.isoformat() if assistant_message.created_at else _utcnow_iso(),
-                            "thought": (reasoning_summary or thought) if (reasoning_summary or thought) else None,
+                            "thought": persisted_thought,
                             "metadata": message_metadata if isinstance(message_metadata, dict) else {},
                         }
                     ],
                 )
-                summary_text = _assistant_summary_text(reasoning_summary or full_content, fallback=thought, limit=240)
+                summary_text = _assistant_summary_text(reasoning_summary or full_content, fallback=persisted_thought, limit=240)
                 if summary_text:
                     await runtime_service.append_conversation_item_entries(
                         int(record.conversation_id),
@@ -355,7 +373,7 @@ class ExecutionContinuationManager:
                         "turn_id": turn_id,
                         "status": "completed",
                         "assistant_message_id": int(assistant_message.id),
-                        "assistant_summary": _assistant_summary_text(full_content, fallback=(reasoning_summary or thought)),
+                        "assistant_summary": _assistant_summary_text(full_content, fallback=persisted_thought),
                         "run_id": run_id,
                         "iteration_count": current_iteration,
                         "completed_at": assistant_message.created_at.isoformat() if assistant_message.created_at else _utcnow_iso(),

@@ -312,6 +312,7 @@ class Settings(BaseSettings):
     agent_reasoning_summary_model: str = "qwen-turbo"
     agent_reasoning_summary_max_tokens: int = 220
     agent_reasoning_summary_min_iterations: int = 2
+    agent_citation_repair_timeout_seconds: float = 8.0
     agent_send_plan_ttl_seconds: int = 900
     agent_persist_steps_enabled: bool = True
     agent_longterm_memory_enabled: bool = False

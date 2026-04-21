@@ -347,6 +347,39 @@ class ConversationContextCompactionService:
                 break
         return items
 
+    @staticmethod
+    def _looks_like_unverified_reasoning(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        patterns = (
+            r"(让我|我来|我先|我会|我将|我们将|接下来|下一步)",
+            r"(准备创建|准备修改|准备写入|将使用|会使用|将创建|将修改|将写入)",
+            r"(blocker 已移除|已经解决，因为我们将|fix-[a-z0-9_-]+\.sh)",
+        )
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+    @classmethod
+    def _normalize_reasoning_like_text(cls, value: Any, *, max_chars: int = 180) -> str:
+        compacted = ReActAgent._compact_debug_text(value, max_chars)
+        if not compacted:
+            return ""
+        if cls._looks_like_unverified_reasoning(compacted):
+            return ""
+        return compacted
+
+    @classmethod
+    def _normalize_decision_state_payload(
+        cls,
+        payload: Any,
+        *,
+        workflow_binding: Any = None,
+    ) -> Dict[str, Any]:
+        return ReActAgent._normalize_decision_state(
+            dict(payload or {}) if isinstance(payload, dict) else {},
+            workflow_binding=workflow_binding,
+        )
+
     @classmethod
     def _normalize_evidence_ledger(cls, raw: Any, *, max_items: int) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
@@ -527,7 +560,14 @@ class ConversationContextCompactionService:
         open_questions = cls._normalize_string_list(
             payload.get("open_questions") or [], max_items=max_open_questions, max_chars=180
         )
-        resolved_facts = cls._normalize_string_list(payload.get("resolved_facts") or [], max_items=6, max_chars=180)
+        resolved_facts = [
+            item
+            for item in (
+                cls._normalize_reasoning_like_text(raw, max_chars=180)
+                for raw in list(payload.get("resolved_facts") or [])
+            )
+            if item
+        ][:6]
         candidate_evidence = cls._normalize_evidence_ledger(evidence_candidates or [], max_items=max_evidence)
         soft_evidence = cls._normalize_evidence_ledger(payload.get("evidence_ledger") or [], max_items=max_evidence)
         evidence_ledger = [dict(item) for item in candidate_evidence]
@@ -576,6 +616,10 @@ class ConversationContextCompactionService:
                 break
 
         workflow_binding = ReActAgent._normalize_workflow_binding(payload.get("workflow_binding") or {})
+        decision_state = cls._normalize_decision_state_payload(
+            payload.get("decision_state") or {},
+            workflow_binding=workflow_binding,
+        )
         normalized = {
             "version": "conversation_context_state.v3",
             "active_topic": ReActAgent._compact_debug_text(payload.get("active_topic", ""), 220),
@@ -584,12 +628,17 @@ class ConversationContextCompactionService:
             "open_questions": open_questions[:max_open_questions],
             "resolved_facts": resolved_facts[:6],
             "evidence_ledger": evidence_ledger[:max_evidence],
-            "last_reasoning_summary": ReActAgent._compact_debug_text(payload.get("last_reasoning_summary", ""), 180),
+            "last_reasoning_summary": cls._normalize_reasoning_like_text(
+                payload.get("last_reasoning_summary", ""),
+                max_chars=180,
+            ),
             "turn_count": int(max(0, turn_count)),
             "updated_at": datetime.utcnow().isoformat(),
         }
         if workflow_binding:
             normalized["workflow_binding"] = workflow_binding
+        if decision_state:
+            normalized["decision_state"] = decision_state
         return normalized
 
     @classmethod
@@ -650,7 +699,9 @@ class ConversationContextCompactionService:
             "6. evidence_ledger 只保留已获得且后续可复用的证据、来源或检索结论，优先根据 tool_ledger_preview 和 evidence_candidates 提炼。"
             "7. evidence_ledger 中 source_labels 只写类似 来源1 这样的标签，不要抄整段 observation。"
             "8. 如果 evidence_candidates 已提供 turn_ids 或 tool_call_ids，优先保留这些归属信息。"
-            "9. last_reasoning_summary 只保留最近一轮仍有后续价值的推理摘要，没有就输出空字符串。"
+            "9. last_reasoning_summary 只保留最近一轮仍有后续价值、且已经被 observation 支撑的推理摘要，没有就输出空字符串。"
+            "10. 不要把“让我修改/我将创建/准备使用某个脚本”这类计划、承诺或未经验证的结果写进 resolved_facts 或 last_reasoning_summary。"
+            "11. decision_state 需要表达当前是否已证据充分、下一步只能做什么，以及是否处于 blocker/waiting 状态。"
         )
         tools = [
             {
@@ -681,6 +732,17 @@ class ConversationContextCompactionService:
                                 },
                             },
                             "last_reasoning_summary": {"type": "string"},
+                            "decision_state": {
+                                "type": "object",
+                                "properties": {
+                                    "status": {"type": "string"},
+                                    "evidence_status": {"type": "string"},
+                                    "next_action": {"type": "string"},
+                                    "blocked_reason": {"type": "string"},
+                                    "allowed_actions": {"type": "array", "items": {"type": "string"}},
+                                    "repo_edit_allowed": {"type": "boolean"},
+                                },
+                            },
                         },
                         "required": [
                             "active_topic",
@@ -690,6 +752,7 @@ class ConversationContextCompactionService:
                             "resolved_facts",
                             "evidence_ledger",
                             "last_reasoning_summary",
+                            "decision_state",
                         ],
                     },
                 },

@@ -425,8 +425,7 @@ def test_item_stream_store_canonical_replay_rows_include_replacement_history_and
     assert replay_rows[1]["role"] == "user"
     assert replay_rows[1]["content"] == "解释当前问题"
     assert replay_rows[2]["role"] == "assistant"
-    assert replay_rows[2]["thought"] == "需要先解释核心概念，再补充背景。"
-    assert replay_rows[3]["content"] == "这是当前回答。"
+    assert replay_rows[2]["content"] == "这是当前回答。"
 
 
 def test_item_stream_store_canonical_active_message_rows_exclude_replacement_history():

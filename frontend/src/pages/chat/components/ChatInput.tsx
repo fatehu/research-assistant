@@ -671,6 +671,12 @@ const ChatInput = ({
   const previewRagForceInitialSearch = Boolean(previewDebug?.rag_force_initial_knowledge_search)
   const previewRagForceInitialQuery = normalizePreviewScalar(previewDebug?.rag_force_initial_query)
   const workflowAction = workflowControl?.action || null
+  const workflowStageStatusLabel =
+    workflowControl?.stage_status === 'running'
+      ? '进行中'
+      : workflowControl?.stage_status === 'blocked'
+        ? '已阻塞'
+        : '已完成'
 
   return (
     <div className="border-t border-white/[0.06] bg-slate-950/88 backdrop-blur-2xl">
@@ -725,7 +731,8 @@ const ChatInput = ({
                   {workflowControl.display_name || workflowControl.skill_name}
                   {' · '}
                   {workflowControl.stage_label || workflowControl.stage}
-                  {' 已完成'}
+                  {' '}
+                  {workflowStageStatusLabel}
                 </div>
                 <div className="text-xs text-slate-400">
                   继续策略：{workflowControl.continue_policy || '未指定'}

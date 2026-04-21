@@ -77,6 +77,7 @@ Allowed paper workflow tools:
 - `paper_research_write_run_drafts`
 - `paper_research_read_run_drafts`
 - `paper_research_inspect_runtime`
+- `paper_research_write_execution_script`
 - `paper_research_write_execution_spec`
 - `paper_research_read_execution_spec`
 - `paper_research_start_execution`
@@ -153,7 +154,12 @@ Use helper scripts when deterministic output is safer:
 - use the model to form the concrete dependency set for the selected draft from those files
 - Include locally imported helper-module dependencies in `env_requirements` when they are needed by the selected entrypoint.
 - Write an archived execution spec before starting execution.
+- Prefer `execution_spec.execution_intent` over free-form `command`/`cwd`.
+  - Use typed fields such as `runtime_type`, `entrypoint_type`, `entrypoint_path`, `cwd_mode`, and `args`.
+  - Let the backend render the final argv/cwd deterministically.
+- Do not mix `execution_intent` with raw `command`, `cwd`, or `input_notebook`.
 - `execution_spec.command` must be a JSON string array, never a shell string.
+- Do not use shell wrappers such as `bash -lc`, `sh -c`, or PowerShell wrappers.
 - `execution_spec.preflight_checks` must be a JSON object array, never a key/value map. Use forms like `[{"name":"check_python","required":true,"status":"passed"}]`, not `{"check_python": true}`.
 - Preserve official repo/data URLs in `command` or `external_dependencies`; runtime preflight will verify them.
 - Use workspace-relative paths only. Prefer `repo/source/...` for repository files.
@@ -179,6 +185,9 @@ Use helper scripts when deterministic output is safer:
 - First tuning should be one minimal, low-risk change: one parameter, one small algorithmic switch, or one lightweight model/config variant.
 - Do not change dataset or add heavyweight dependencies for the first tuning unless the user explicitly asks.
 - If params are hard-coded, create an execution-scoped generated script via `execution_spec.generated_files`; do not overwrite repo files.
+- Prefer `paper_research_write_execution_script` when you need to author a larger execution-scoped Python variant first.
+  - It writes only under `executions/{execution_id}/...`.
+  - Then reference that script from `paper_research_write_execution_spec` using `execution_intent.entrypoint_type="generated_python"`.
 - Each `generated_files` item should contain:
   - `relative_path`
   - `content`

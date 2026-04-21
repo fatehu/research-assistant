@@ -33,6 +33,17 @@ RUNTIME_TYPES = {
     "plain-python",
 }
 
+_EXECUTION_INTENT_ENTRYPOINT_TYPES = {
+    "repo_script",
+    "generated_python",
+    "notebook",
+}
+
+_EXECUTION_INTENT_CWD_MODES = {
+    "repo_root",
+    "execution_root",
+}
+
 
 _SKIPPED_DIRS = {
     ".git",
@@ -583,6 +594,70 @@ class ProjectRuntimeService:
         normalized = _safe_slug(execution_id)
         return Path(workspace_dir) / "executions" / normalized
 
+    def write_execution_generated_file(
+        self,
+        *,
+        workspace_dir: Path,
+        execution_id: str,
+        relative_path: Optional[str] = None,
+        content: str,
+    ) -> Dict[str, Any]:
+        execution_slug = _safe_slug(execution_id)
+        if not execution_slug:
+            raise ValueError("execution_id is required")
+        if not isinstance(content, str) or not str(content).strip():
+            raise ValueError("content is required")
+        if len(content.encode("utf-8")) > _MAX_GENERATED_FILE_BYTES:
+            raise ValueError("content is too large")
+
+        normalized_relative_path = _normalize_relative_path(relative_path or "")
+        if not normalized_relative_path:
+            normalized_relative_path = f"executions/{execution_slug}/train_variant.py"
+        elif "/" not in normalized_relative_path:
+            base_name = Path(normalized_relative_path).name or "train_variant.py"
+            if "." not in base_name:
+                base_name = f"{base_name}.py"
+            normalized_relative_path = f"executions/{execution_slug}/{base_name}"
+
+        required_prefix = f"executions/{execution_slug}/"
+        if not normalized_relative_path.startswith(required_prefix):
+            raise ValueError(
+                f"relative_path must stay under `{required_prefix}` for execution-scoped scripts"
+            )
+        if not _is_safe_generated_file_path(normalized_relative_path):
+            raise ValueError("relative_path must be under execution workspace")
+
+        target = self.resolve_workspace_path(
+            workspace_dir,
+            normalized_relative_path,
+            require_exists=False,
+        )
+        if target is None:
+            raise ValueError(f"relative_path is outside workspace or invalid: {normalized_relative_path}")
+
+        repo_root = self.resolve_workspace_path(workspace_dir, "repo/source", require_exists=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        materialized_content = self._prepare_generated_file_content(
+            workspace_dir=workspace_dir,
+            repo_root=repo_root,
+            relative_path=normalized_relative_path,
+            content=content,
+        )
+        target.write_text(materialized_content, encoding="utf-8")
+        return {
+            "execution_id": execution_slug,
+            "relative_path": normalized_relative_path,
+            "saved": True,
+            "content_bytes": len(materialized_content.encode("utf-8")),
+            "entrypoint_hint": {
+                "runtime_type": "plain-python",
+                "entrypoint_type": "generated_python",
+                "entrypoint_path": normalized_relative_path,
+                "generated_program_name": Path(normalized_relative_path).name,
+                "cwd_mode": "repo_root",
+            },
+        }
+
     def write_execution_spec(
         self,
         *,
@@ -593,10 +668,17 @@ class ProjectRuntimeService:
         execution_spec: Dict[str, Any],
     ) -> Dict[str, Any]:
         payload = dict(execution_spec or {})
+        if isinstance(payload.get("execution_intent"), dict):
+            if payload.get("command") is not None:
+                raise ValueError("execution_intent cannot be combined with raw command")
+            if str(payload.get("cwd") or "").strip():
+                raise ValueError("execution_intent cannot be combined with raw cwd")
+            if payload.get("input_notebook") is not None:
+                raise ValueError("execution_intent cannot be combined with raw input_notebook")
+        payload = self._normalize_execution_spec_payload(workspace_dir=workspace_dir, payload=payload)
         runtime_type = str(payload.get("runtime_type") or "").strip()
         if runtime_type not in RUNTIME_TYPES:
             raise ValueError(f"runtime_type must be one of {sorted(RUNTIME_TYPES)}, got `{runtime_type}`")
-        payload = self._normalize_execution_spec_payload(workspace_dir=workspace_dir, payload=payload)
 
         execution_id = _safe_slug(
             payload.get("execution_id")
@@ -638,6 +720,11 @@ class ProjectRuntimeService:
     def _normalize_execution_spec_payload(self, *, workspace_dir: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(payload or {})
         detected_repo_root = self._to_workspace_relative(workspace_dir, self.resolve_repo_root(workspace_dir)) or "repo/source"
+        normalized = self._render_execution_spec_from_intent(
+            workspace_dir=workspace_dir,
+            payload=normalized,
+            detected_repo_root=detected_repo_root,
+        )
         raw_repo_root = _normalize_relative_path(normalized.get("repo_root_relative_path") or "")
         raw_cwd = _normalize_relative_path(normalized.get("cwd") or "")
 
@@ -718,6 +805,187 @@ class ProjectRuntimeService:
             normalized["repo_root_relative_path"] = detected_repo_root
             normalized["cwd"] = detected_repo_root
             normalized["command"] = self._runtime_env_check_command()
+        return normalized
+
+    @staticmethod
+    def _normalize_string_array(value: Any) -> List[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [str(item).strip() for item in list(value) if str(item or "").strip()]
+
+    @classmethod
+    def _normalize_execution_intent(cls, value: Any) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        raw = dict(value or {})
+        entrypoint_type = str(
+            raw.get("entrypoint_type")
+            or raw.get("type")
+            or ""
+        ).strip().lower().replace("-", "_")
+        entrypoint_aliases = {
+            "repo": "repo_script",
+            "repo_script": "repo_script",
+            "python_script": "repo_script",
+            "script": "repo_script",
+            "generated": "generated_python",
+            "generated_python": "generated_python",
+            "generated_script": "generated_python",
+            "notebook": "notebook",
+        }
+        entrypoint_type = entrypoint_aliases.get(entrypoint_type, entrypoint_type)
+        cwd_mode = str(raw.get("cwd_mode") or "repo_root").strip().lower().replace("-", "_") or "repo_root"
+        return {
+            "runtime_type": str(raw.get("runtime_type") or "").strip(),
+            "entrypoint_type": entrypoint_type,
+            "entrypoint_path": str(
+                raw.get("entrypoint_path")
+                or raw.get("path_or_hint")
+                or raw.get("path")
+                or raw.get("file")
+                or ""
+            ).strip(),
+            "generated_program_name": str(
+                raw.get("generated_program_name")
+                or raw.get("program_name")
+                or raw.get("name")
+                or ""
+            ).strip(),
+            "cwd_mode": cwd_mode,
+            "args": cls._normalize_string_array(
+                raw.get("args")
+                or raw.get("argv")
+                or raw.get("command_args")
+            ),
+        }
+
+    @classmethod
+    def _derive_execution_intent_from_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        entrypoint = dict(payload.get("entrypoint") or {})
+        if not entrypoint:
+            return {}
+        if payload.get("command") is not None or payload.get("input_notebook") is not None:
+            return {}
+        derived = cls._normalize_execution_intent(
+            {
+                "runtime_type": payload.get("runtime_type"),
+                "entrypoint_type": entrypoint.get("type"),
+                "entrypoint_path": (
+                    entrypoint.get("path_or_hint")
+                    or entrypoint.get("path")
+                    or entrypoint.get("file")
+                ),
+                "generated_program_name": (
+                    entrypoint.get("generated_program_name")
+                    or entrypoint.get("name")
+                    or entrypoint.get("filename")
+                ),
+                "cwd_mode": payload.get("cwd_mode"),
+                "args": entrypoint.get("args"),
+            }
+        )
+        return derived
+
+    @classmethod
+    def _resolve_generated_entrypoint_path(
+        cls,
+        *,
+        execution_slug: str,
+        entrypoint_path: str,
+        generated_program_name: str,
+    ) -> str:
+        normalized_entrypoint = _normalize_relative_path(entrypoint_path)
+        if normalized_entrypoint and _is_safe_generated_file_path(normalized_entrypoint):
+            return normalized_entrypoint
+        if normalized_entrypoint and "/" in normalized_entrypoint:
+            return normalized_entrypoint
+        base_name = _safe_slug(
+            Path(normalized_entrypoint or generated_program_name or "train_variant.py").name,
+            fallback="train_variant.py",
+        )
+        if "." not in base_name:
+            base_name = f"{base_name}.py"
+        return f"executions/{execution_slug}/{base_name}"
+
+    def _render_execution_spec_from_intent(
+        self,
+        *,
+        workspace_dir: Path,
+        payload: Dict[str, Any],
+        detected_repo_root: str,
+    ) -> Dict[str, Any]:
+        normalized = dict(payload or {})
+        explicit_intent = self._normalize_execution_intent(normalized.get("execution_intent"))
+        derived_intent = {} if explicit_intent else self._derive_execution_intent_from_payload(normalized)
+        intent = explicit_intent or derived_intent
+        if not intent:
+            return normalized
+
+        runtime_type = str(intent.get("runtime_type") or normalized.get("runtime_type") or "").strip()
+        entrypoint_type = str(intent.get("entrypoint_type") or "").strip()
+        if not runtime_type:
+            runtime_type = "papermill" if entrypoint_type == "notebook" else "plain-python"
+
+        execution_slug = _safe_slug(
+            normalized.get("execution_id")
+            or normalized.get("draft_id")
+            or normalized.get("label")
+            or runtime_type
+            or "execution"
+        )
+        cwd_mode = str(intent.get("cwd_mode") or "repo_root").strip().lower().replace("-", "_") or "repo_root"
+        args = self._normalize_string_array(intent.get("args"))
+        entrypoint_path = str(intent.get("entrypoint_path") or "").strip()
+
+        normalized["runtime_type"] = runtime_type
+        normalized["repo_root_relative_path"] = detected_repo_root
+        if explicit_intent:
+            normalized["execution_intent"] = intent
+
+        if entrypoint_type == "notebook":
+            normalized["input_notebook"] = (
+                entrypoint_path
+                if entrypoint_path.startswith("repo/source/")
+                else f"{detected_repo_root}/{_normalize_relative_path(entrypoint_path)}"
+                if _normalize_relative_path(entrypoint_path)
+                else ""
+            )
+            normalized["cwd"] = detected_repo_root if cwd_mode != "execution_root" else f"executions/{execution_slug}"
+            normalized.pop("command", None)
+            return normalized
+
+        if entrypoint_type == "repo_script":
+            repo_relative_path = _normalize_relative_path(entrypoint_path)
+            if repo_relative_path.startswith("repo/source/"):
+                repo_relative_path = repo_relative_path.removeprefix("repo/source/")
+            normalized["cwd"] = detected_repo_root
+            normalized["command"] = ["python", repo_relative_path, *args]
+            return normalized
+
+        if entrypoint_type == "generated_python":
+            generated_path = self._resolve_generated_entrypoint_path(
+                execution_slug=execution_slug,
+                entrypoint_path=entrypoint_path,
+                generated_program_name=str(intent.get("generated_program_name") or "").strip(),
+            )
+            generated_target = generated_path
+            if cwd_mode == "execution_root":
+                generated_dir = str(Path(generated_path).parent).replace("\\", "/")
+                normalized["cwd"] = generated_dir
+                generated_target = Path(generated_path).name
+            else:
+                normalized["cwd"] = detected_repo_root
+                generated_target = _rewrite_generated_path_for_cwd(
+                    generated_path,
+                    cwd_relative_path=detected_repo_root,
+                )
+            normalized["command"] = ["python", generated_target, *args]
+            entrypoint = dict(normalized.get("entrypoint") or {})
+            entrypoint["type"] = "generated_python"
+            entrypoint["path_or_hint"] = generated_path
+            normalized["entrypoint"] = entrypoint
+            return normalized
+
         return normalized
 
     @staticmethod
@@ -1136,10 +1404,56 @@ class ProjectRuntimeService:
         if runtime_type not in RUNTIME_TYPES:
             errors.append(f"runtime_type must be one of {sorted(RUNTIME_TYPES)}")
 
+        execution_intent = self._normalize_execution_intent(spec.get("execution_intent"))
+        if execution_intent:
+            entrypoint_type = str(execution_intent.get("entrypoint_type") or "").strip()
+            if entrypoint_type not in _EXECUTION_INTENT_ENTRYPOINT_TYPES:
+                errors.append(
+                    f"execution_intent.entrypoint_type must be one of {sorted(_EXECUTION_INTENT_ENTRYPOINT_TYPES)}"
+                )
+            cwd_mode = str(execution_intent.get("cwd_mode") or "").strip()
+            if cwd_mode and cwd_mode not in _EXECUTION_INTENT_CWD_MODES:
+                errors.append(
+                    f"execution_intent.cwd_mode must be one of {sorted(_EXECUTION_INTENT_CWD_MODES)}"
+                )
+            if entrypoint_type in {"repo_script", "notebook"} and cwd_mode == "execution_root":
+                errors.append("execution_intent.cwd_mode=execution_root is only allowed for generated_python")
+            if entrypoint_type in {"repo_script", "notebook"}:
+                entrypoint_path = _normalize_relative_path(execution_intent.get("entrypoint_path"))
+                if entrypoint_path.startswith("repo/source/"):
+                    entrypoint_path = entrypoint_path.removeprefix("repo/source/")
+                if not entrypoint_path:
+                    errors.append("execution_intent.entrypoint_path is required")
+                elif self.resolve_workspace_path(
+                    workspace_dir,
+                    f"repo/source/{entrypoint_path}",
+                ) is None:
+                    errors.append(
+                        f"execution_intent.entrypoint_path references missing repo file: {entrypoint_path}"
+                    )
+            elif entrypoint_type == "generated_python":
+                target_path = self._resolve_generated_entrypoint_path(
+                    execution_slug=_safe_slug(
+                        spec.get("execution_id")
+                        or spec.get("draft_id")
+                        or spec.get("label")
+                        or runtime_type
+                        or "execution"
+                    ),
+                    entrypoint_path=str(execution_intent.get("entrypoint_path") or "").strip(),
+                    generated_program_name=str(execution_intent.get("generated_program_name") or "").strip(),
+                )
+                if not _is_safe_generated_file_path(target_path):
+                    errors.append("execution_intent for generated_python must resolve under execution workspace")
+
         if runtime_type in {"plain-python", "dockerfile", "docker_compose", "repo2docker", "devcontainer"}:
             command = spec.get("command")
             if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
                 errors.append("command must be a non-empty string array for this runtime_type")
+            else:
+                executable = str(command[0] or "").strip().lower()
+                if executable in {"bash", "sh", "zsh", "fish", "powershell", "pwsh", "cmd", "cmd.exe"}:
+                    errors.append("shell wrapper commands are not allowed; use direct argv or execution_intent")
 
         if runtime_type == "papermill":
             input_notebook = _normalize_relative_path(spec.get("input_notebook"))
@@ -1147,6 +1461,10 @@ class ProjectRuntimeService:
                 errors.append("input_notebook is required for papermill runtime")
             elif self.resolve_workspace_path(workspace_dir, input_notebook) is None:
                 errors.append(f"input_notebook is outside workspace or invalid: {input_notebook}")
+            if spec.get("command") not in (None, []):
+                errors.append("papermill runtime must not provide command; use input_notebook/parameters")
+        elif spec.get("input_notebook") not in (None, ""):
+            errors.append("input_notebook is only allowed for papermill runtime")
 
         cwd = _normalize_relative_path(spec.get("cwd") or "repo/source")
         if cwd and self.resolve_workspace_path(workspace_dir, cwd, require_exists=False) is None:
@@ -1232,7 +1550,7 @@ class ProjectRuntimeService:
                             or ("missing" if isinstance(exists_value, bool) and not exists_value else "")
                             or "failed"
                         ).strip()
-                        warnings.append(f"required preflight check flagged failed: {name} ({diagnosis})")
+                        errors.append(f"required preflight check failed: {name} ({diagnosis})")
 
         availability = self.tool_availability()
         tool_key = {

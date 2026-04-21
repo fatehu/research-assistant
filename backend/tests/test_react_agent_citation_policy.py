@@ -42,6 +42,17 @@ class _DummyLLM:
         return {"content": "修正后的回答 [来源1]"}
 
 
+class _HangingCitationLLM:
+    provider = "test"
+    config = {"model": "test-model"}
+
+    async def chat(self, *args, **kwargs):
+        import asyncio
+
+        await asyncio.sleep(1)
+        return {"content": "不会及时返回"}
+
+
 class _DummyTools:
     def get_tools_description(self) -> str:
         return "- knowledge_search: 搜索知识库"
@@ -958,15 +969,17 @@ async def test_execute_single_tool_call_pins_paper_skill_after_successful_paper_
     assert agent.runtime_context.active_skill_names == ["paper-reproduction"]
     assert context.conversation_state["active_skill_names"] == ["paper-reproduction"]
     assert agent._last_tool_selection["active_skill_names"] == ["paper-reproduction"]
-    assert runtime_service.upsert_calls == [
-        (
-            321,
-            {
-                "active_skill_names": ["paper-reproduction"],
-                "active_skill_updated_at": context.conversation_state["active_skill_updated_at"],
-            },
-        )
-    ]
+    assert len(runtime_service.upsert_calls) == 2
+    first_conversation_id, first_state = runtime_service.upsert_calls[0]
+    assert first_conversation_id == 321
+    assert first_state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert first_state["decision_state"]["repo_edit_allowed"] is False
+    second_conversation_id, second_state = runtime_service.upsert_calls[1]
+    assert second_conversation_id == 321
+    assert second_state["active_skill_names"] == ["paper-reproduction"]
+    assert second_state["active_skill_updated_at"] == context.conversation_state["active_skill_updated_at"]
+    assert second_state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert second_state["decision_state"]["repo_edit_allowed"] is False
 
 
 @pytest.mark.asyncio
@@ -1004,7 +1017,12 @@ async def test_execute_single_tool_call_does_not_duplicate_pinned_paper_skill():
     assert executed.success is True
     assert agent.runtime_context.active_skill_names == ["paper-reproduction"]
     assert context.conversation_state["active_skill_names"] == ["paper-reproduction"]
-    assert runtime_service.upsert_calls == []
+    assert len(runtime_service.upsert_calls) == 1
+    conversation_id, state = runtime_service.upsert_calls[0]
+    assert conversation_id == 321
+    assert state["active_skill_names"] == ["paper-reproduction"]
+    assert state["workflow_binding"]["skill"] == "paper-reproduction"
+    assert state["decision_state"]["repo_edit_allowed"] is False
 
 
 def test_chat_prompt_uses_default_routing_without_router(monkeypatch):
@@ -1080,11 +1098,12 @@ def test_observation_message_for_web_search_requires_web_citation():
     assert "只能使用 observation 中出现过的网页编号" in message
 
 
-def test_build_tool_result_ledger_entries_carries_structured_metadata():
+@pytest.mark.asyncio
+async def test_build_tool_result_ledger_entries_carries_structured_metadata():
     agent = ReActAgent(_DummyLLM(), _DummyTools(), max_iterations=1)
     context = AgentContext(messages=[], turn_id="turn:1", run_id="run-1", iteration=1)
 
-    rows = agent._build_tool_result_ledger_entries(
+    rows = await agent._build_tool_result_ledger_entries(
         context,
         [
             ExecutedToolCall(
@@ -1093,6 +1112,7 @@ def test_build_tool_result_ledger_entries_carries_structured_metadata():
                 tool_message={},
                 tool_name="knowledge_search",
                 observation_output="[来源1] 命中 Transformer / Attention Is All You Need.pdf",
+                result_data={},
                 tool_call_id="call-1",
                 arguments={"query": "attention"},
                 success=True,
@@ -1199,6 +1219,20 @@ async def test_ensure_citation_compliance_repairs_answer():
     assert "[来源1]" in fixed
     assert context.citation_repair_attempts == 1
     assert context.citation_repair_successes == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_citation_compliance_times_out_to_note(monkeypatch):
+    monkeypatch.setattr(settings, "agent_citation_repair_timeout_seconds", 0.01, raising=False)
+    agent = ReActAgent(_HangingCitationLLM(), _DummyTools(), max_iterations=1)
+    context = AgentContext(messages=[])
+    context.allowed_source_labels = {"1", "2"}
+
+    fixed = await agent._ensure_citation_compliance("这是没有引用的回答", context)
+
+    assert "当前可用来源仅为 [来源1], [来源2]" in fixed
+    assert context.citation_repair_attempts == 1
+    assert context.citation_repair_successes == 0
 
 
 @pytest.mark.asyncio

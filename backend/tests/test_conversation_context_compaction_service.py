@@ -71,11 +71,21 @@ class _FakeStateLLM:
                             "tool_names": ["knowledge_search"],
                         }
                     ],
+                    "decision_state": {
+                        "status": "active",
+                        "evidence_status": "insufficient",
+                        "next_action": "collect_more_evidence",
+                        "allowed_actions": ["collect_more_evidence", "answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "先解释定义，再回答历史条件限制。",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -151,6 +161,7 @@ async def test_build_artifacts_uses_llm_to_extract_context_state(monkeypatch):
     assert artifacts.context_state["evidence_ledger"][0]["result_count"] == 2
     assert artifacts.context_state["evidence_ledger"][0]["retrieval_scope"] == {"knowledge_base_ids": [12], "document_ids": [34]}
     assert artifacts.context_state["evidence_ledger"][0]["provenance_hints"] == ["Transformer / Attention Is All You Need.pdf"]
+    assert artifacts.context_state["decision_state"]["next_action"] == "collect_more_evidence"
     assert artifacts.compacted_history["version"] == "conversation_compacted_history.v2"
     assert "开场目标" in artifacts.compacted_history["history_anchors"]
     assert "注意力机制" in artifacts.compacted_history["history_summary"]
@@ -316,11 +327,21 @@ class _FakeNoCompactLLM:
                     "open_questions": [],
                     "resolved_facts": [],
                     "evidence_ledger": [],
+                    "decision_state": {
+                        "status": "active",
+                        "evidence_status": "insufficient",
+                        "next_action": "answer",
+                        "allowed_actions": ["answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "概念解释",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 class _FakeSparseEvidenceLLM:
@@ -359,11 +380,21 @@ class _FakeSparseEvidenceLLM:
                             "tool_names": [],
                         }
                     ],
+                    "decision_state": {
+                        "status": "ready",
+                        "evidence_status": "sufficient",
+                        "next_action": "answer",
+                        "allowed_actions": ["answer"],
+                        "repo_edit_allowed": False,
+                    },
                     "last_reasoning_summary": "已有外部证据。",
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs)
 
 
 class _ScalarResult:
@@ -560,3 +591,36 @@ async def test_compact_conversation_skips_when_boundary_already_covers_latest_me
     assert runtime_service.snapshots == []
     assert runtime_service.item_entries == []
     assert _FakeStateLLM.calls == []
+
+
+def test_normalize_context_state_payload_strips_unverified_reasoning_claims():
+    payload = ConversationContextCompactionService._normalize_context_state_payload(
+        {
+            "version": "conversation_context_state.v3",
+            "active_topic": "AG News tuning",
+            "user_goal": "确认为什么脚本反复处理 8 个数据集",
+            "constraints": ["只处理 AG News"],
+            "open_questions": [],
+            "resolved_facts": [
+                "classification-results.sh 第 86 行有 for i in {0..7}",
+                "我们将使用 fix-classification.sh 替代",
+            ],
+            "evidence_ledger": [],
+            "decision_state": {
+                "status": "blocked",
+                "evidence_status": "sufficient",
+                "next_action": "report_blocker",
+                "blocked_reason": "repo_patch_required",
+                "allowed_actions": ["report_blocker"],
+                "repo_edit_allowed": False,
+            },
+            "last_reasoning_summary": "blocker 已移除，因为我们将使用 fix-classification.sh 替代",
+        },
+        turn_count=1,
+        evidence_candidates=[],
+    )
+
+    assert payload is not None
+    assert payload["resolved_facts"] == ["classification-results.sh 第 86 行有 for i in {0..7}"]
+    assert not payload.get("last_reasoning_summary")
+    assert payload["decision_state"]["next_action"] == "report_blocker"

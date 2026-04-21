@@ -266,6 +266,8 @@ class AgentCore:
         "产物",
         "状态",
     )
+    _DECISION_STATE_STATUSES = {"active", "ready", "blocked", "waiting"}
+    _DECISION_EVIDENCE_STATUSES = {"insufficient", "sufficient"}
     _PAPER_ARTIFACT_ACTION_MARKERS = (
         "生成",
         "创建",
@@ -1638,6 +1640,83 @@ class AgentCore:
         return merged
 
     @classmethod
+    def _normalize_decision_state(
+        cls,
+        payload: Any,
+        *,
+        workflow_binding: Any = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            payload = {}
+
+        def _coerce_text(value: Any, limit: int = 160) -> Optional[str]:
+            compacted = cls._compact_debug_text(value or "", limit)
+            return compacted or None
+
+        normalized: Dict[str, Any] = {}
+        status = str(payload.get("status") or "").strip().lower()
+        if status in cls._DECISION_STATE_STATUSES:
+            normalized["status"] = status
+        evidence_status = str(payload.get("evidence_status") or "").strip().lower()
+        if evidence_status in cls._DECISION_EVIDENCE_STATUSES:
+            normalized["evidence_status"] = evidence_status
+        next_action = _coerce_text(payload.get("next_action"), 96)
+        if next_action:
+            normalized["next_action"] = next_action
+        blocked_reason = _coerce_text(payload.get("blocked_reason"), 120)
+        if blocked_reason:
+            normalized["blocked_reason"] = blocked_reason
+        allowed_actions = [
+            item
+            for item in (
+                _coerce_text(raw, 72)
+                for raw in list(payload.get("allowed_actions") or [])
+            )
+            if item
+        ]
+        if allowed_actions:
+            normalized["allowed_actions"] = allowed_actions[:6]
+        if payload.get("repo_edit_allowed") is not None:
+            normalized["repo_edit_allowed"] = bool(payload.get("repo_edit_allowed"))
+
+        binding = cls._normalize_workflow_binding(workflow_binding or {})
+        if binding.get("skill") == cls._PAPER_SKILL_NAME and "repo_edit_allowed" not in normalized:
+            normalized["repo_edit_allowed"] = False
+
+        if normalized.get("blocked_reason") and "status" not in normalized:
+            normalized["status"] = "blocked"
+        if normalized.get("next_action") and "allowed_actions" not in normalized:
+            normalized["allowed_actions"] = [str(normalized["next_action"])]
+        if normalized.get("status") == "blocked" and "evidence_status" not in normalized:
+            normalized["evidence_status"] = "sufficient"
+        return normalized
+
+    @classmethod
+    def _merge_decision_state(
+        cls,
+        existing: Any,
+        incoming: Any,
+        *,
+        workflow_binding: Any = None,
+    ) -> Dict[str, Any]:
+        existing_normalized = cls._normalize_decision_state(
+            existing,
+            workflow_binding=workflow_binding,
+        )
+        incoming_normalized = cls._normalize_decision_state(
+            incoming,
+            workflow_binding=workflow_binding,
+        )
+        if not existing_normalized and not incoming_normalized:
+            return {}
+
+        merged = dict(existing_normalized)
+        for key, value in incoming_normalized.items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        return cls._normalize_decision_state(merged, workflow_binding=workflow_binding)
+
+    @classmethod
     def _merge_conversation_state_with_workflow_binding(
         cls,
         existing_state: Any,
@@ -1651,6 +1730,25 @@ class AgentCore:
             merged_state["workflow_binding"] = merged_binding
         else:
             merged_state.pop("workflow_binding", None)
+        existing_decision_state = (
+            dict(existing_state.get("decision_state") or {})
+            if isinstance(existing_state, dict)
+            else {}
+        )
+        next_decision_state = (
+            dict(merged_state.get("decision_state") or {})
+            if isinstance(merged_state, dict)
+            else {}
+        )
+        merged_decision_state = cls._merge_decision_state(
+            existing_decision_state,
+            next_decision_state,
+            workflow_binding=merged_binding,
+        )
+        if merged_decision_state:
+            merged_state["decision_state"] = merged_decision_state
+        else:
+            merged_state.pop("decision_state", None)
         return merged_state
 
     @classmethod
@@ -2001,6 +2099,10 @@ class AgentCore:
             suffix = f"（{'；'.join(suffix_parts)}）" if suffix_parts else ""
             evidence_ledger.append(f"{summary}{suffix}")
         last_reasoning_summary = cls._compact_debug_text(state.get("last_reasoning_summary") or "", 180)
+        decision_state = cls._normalize_decision_state(
+            state.get("decision_state") or {},
+            workflow_binding=workflow_binding,
+        )
 
         if workflow_binding:
             skill_name = cls._compact_debug_text(workflow_binding.get("skill") or "", 64)
@@ -2050,6 +2152,27 @@ class AgentCore:
         if evidence_ledger:
             lines.append("- 证据账本:")
             lines.extend(f"  - {item}" for item in evidence_ledger[:4])
+        if decision_state:
+            lines.append("- 当前决策状态:")
+            if decision_state.get("status"):
+                lines.append(f"  - 状态: {decision_state.get('status')}")
+            if decision_state.get("evidence_status"):
+                lines.append(f"  - 证据充分度: {decision_state.get('evidence_status')}")
+            if decision_state.get("next_action"):
+                lines.append(f"  - 下一动作: {decision_state.get('next_action')}")
+            if decision_state.get("blocked_reason"):
+                lines.append(f"  - 阻塞原因: {decision_state.get('blocked_reason')}")
+            if decision_state.get("allowed_actions"):
+                lines.append(
+                    "  - 允许动作: " + "、".join(
+                        str(item)
+                        for item in list(decision_state.get("allowed_actions") or [])[:4]
+                    )
+                )
+            if decision_state.get("repo_edit_allowed") is not None:
+                lines.append(
+                    f"  - 允许直接修改 repo/source: {'是' if bool(decision_state.get('repo_edit_allowed')) else '否'}"
+                )
         if last_reasoning_summary:
             lines.append(f"- 最近推理摘要: {last_reasoning_summary}")
         return "\n".join(lines).strip()
@@ -2978,11 +3101,18 @@ class AgentCore:
         context.citation_repair_attempts += 1
         allowed_tokens = ", ".join(f"[{token}]" for token in sorted(allowed))
         try:
-            resp = await self.llm.chat(
-                messages=[{"role": "user", "content": f"只修正来源标注，只能使用：{allowed_tokens}\n\n{clean}"}],
-                system_prompt="你是引用修正助手。",
-                temperature=0.0,
-                max_tokens=min(settings.llm_max_tokens, 1000),
+            timeout_seconds = max(
+                float(getattr(settings, "agent_citation_repair_timeout_seconds", 8.0) or 8.0),
+                0.1,
+            )
+            resp = await asyncio.wait_for(
+                self.llm.chat(
+                    messages=[{"role": "user", "content": f"只修正来源标注，只能使用：{allowed_tokens}\n\n{clean}"}],
+                    system_prompt="你是引用修正助手。",
+                    temperature=0.0,
+                    max_tokens=min(settings.llm_max_tokens, 1000),
+                ),
+                timeout=timeout_seconds,
             )
             fixed = re.sub(r"</?answer>", "", str(resp.get("content") or "")).strip()
             if fixed and self._citations_are_valid(
@@ -2992,6 +3122,8 @@ class AgentCore:
             ):
                 context.citation_repair_successes += 1
                 return fixed
+        except asyncio.TimeoutError:
+            logger.warning("[AgentCore] citation repair timed out")
         except Exception as exc:
             logger.warning(f"[AgentCore] citation repair failed: {exc}")
         return f"{clean}\n\n注：当前可用来源仅为 {allowed_tokens}。"
@@ -4689,6 +4821,41 @@ class AgentCore:
             "只使用已经出现过的 [来源X] 引用，不要继续用同义改写重复搜索。"
         )
 
+    @staticmethod
+    def _execution_spec_failure_requires_script(detail: str) -> bool:
+        normalized = str(detail or "").strip().lower()
+        if not normalized:
+            return False
+        script_tokens = (
+            "generated_python",
+            "generated_files",
+            "generated file",
+            "entrypoint_path",
+            "generated_program_name",
+            "relative_path",
+            "shell wrapper",
+            "raw command",
+            "raw cwd",
+            "execution_intent",
+            "outside workspace",
+        )
+        return any(token in normalized for token in script_tokens)
+
+    @staticmethod
+    def _run_drafts_failure_is_entrypoint_schema_issue(detail: str) -> bool:
+        normalized = str(detail or "").strip().lower()
+        if not normalized:
+            return False
+        markers = (
+            "run_drafts_schema_invalid",
+            "entrypoint.path_or_hint",
+            "repo-relative path",
+            "references missing repo file",
+            "use readme_command/dataset_step/manual_step",
+            "missing repo file",
+        )
+        return any(marker in normalized for marker in markers)
+
     def _maybe_stop_after_repeated_tool_failures(
         self,
         context: AgentContext,
@@ -4726,6 +4893,36 @@ class AgentCore:
             return None
 
         recent_detail = self._truncate_failure_text(stop_output or "工具 observation 连续失败。")
+        if stop_tool == "paper_research_write_execution_spec" and self._execution_spec_failure_requires_script(stop_output):
+            context.final_answer = (
+                "`paper_research_write_execution_spec` 已连续失败 "
+                f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
+                "当前更合适的路径是先调用 `paper_research_write_execution_script`，"
+                "把 execution 级脚本写到 `executions/{execution_id}/...`，"
+                "再用 `paper_research_write_execution_spec` 的 `execution_intent` 引用该脚本。"
+            )
+            context.state = AgentState.DONE
+            return (
+                "检测到 execution_spec 连续失败且问题集中在脚本/命令表达，"
+                "已切换为“先写 execution 脚本，再引用 execution_intent”的收束路径。"
+            )
+        if stop_tool == "paper_research_write_run_drafts" and self._run_drafts_failure_is_entrypoint_schema_issue(stop_output):
+            context.final_answer = (
+                "`paper_research_write_run_drafts` 已连续失败 "
+                f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
+                "这类失败通常不是调参问题，而是 run_drafts 的 entrypoint 形态不合法："
+                "repo_script/notebook/config 只能引用真实存在的 repo-relative 文件，"
+                "不能写 shell wrapper，也不能写尚未存在的脚本路径。"
+                "如果需要 AG News 专用脚本，应在 execution 阶段用 "
+                "`paper_research_write_execution_script` 写到 `executions/{execution_id}/...`，"
+                "不要把它伪装成 run_drafts 里的 repo_script。"
+            )
+            context.state = AgentState.DONE
+            return (
+                "检测到 run_drafts 连续失败且问题集中在 entrypoint schema，"
+                "已停止把生成脚本伪装成 repo_script 的重试。"
+            )
+
         context.final_answer = (
             f"`{stop_tool}` 已连续失败 {stop_count} 次，已停止自动重试。"
             f"最近失败信息：{recent_detail}。建议先检查前置条件或调整指令后再继续。"
@@ -4845,7 +5042,18 @@ class AgentCore:
         context: AgentContext,
         events: List[Dict[str, Any]],
     ) -> Optional[str]:
-        read_only_tools = {"notebook_cell", "notebook_variables"}
+        read_only_tools = {
+            "notebook_cell",
+            "notebook_variables",
+            "paper_research_status",
+            "paper_research_search_repo",
+            "paper_research_read_repo_file",
+            "paper_research_read_artifact",
+            "paper_research_read_execution",
+            "paper_research_read_execution_spec",
+            "paper_research_read_run_drafts",
+            "paper_research_read_implementation_spec",
+        }
         threshold = 3
         observations = [
             event.get("data")
@@ -4869,6 +5077,7 @@ class AgentCore:
             return None
 
         tool_name = str(latest_matching.get("tool") or "").strip()
+        threshold = 2 if tool_name.startswith("paper_research_") else threshold
         signature = self._tool_repeat_signature(
             tool_name,
             latest_matching.get("input") if isinstance(latest_matching.get("input"), dict) else {},
@@ -4883,29 +5092,53 @@ class AgentCore:
             return None
 
         observation_summary = self._truncate_failure_text(str(latest_matching.get("output") or ""), limit=240)
+        target_label = ""
+        latest_input = latest_matching.get("input") if isinstance(latest_matching.get("input"), dict) else {}
+        if tool_name == "paper_research_read_repo_file":
+            target_label = str(latest_input.get("repo_relative_path") or "").strip()
+        elif tool_name == "paper_research_search_repo":
+            target_label = str(latest_input.get("query") or "").strip()
         interventions = int(context.context_debug.get("repeat_read_interventions") or 0)
+        repo_read_family = tool_name.startswith("paper_research_")
         if interventions < 1:
             context.context_debug["repeat_read_interventions"] = interventions + 1
+            guard_body = (
+                "不要继续重复读取；请直接基于现有 notebook 信息回答用户问题。"
+                "如果信息仍不足，请明确指出缺失的前置步骤，而不是再次调用同一读取工具。"
+            )
+            guard_summary = "检测到重复读取同一 Notebook 信息，已强制要求基于现有 observation 收束回答。"
+            if repo_read_family:
+                guard_body = (
+                    "不要继续重复读取/检索同一目标；请基于现有 repo observation 直接收束。"
+                    "如果当前 skill 不允许改 repo/source，就明确报告 blocker；"
+                    "如果还缺一步，请说明缺的是什么，而不是继续搜索同一脚本。"
+                )
+                guard_summary = "检测到重复读取同一 repo 目标，已强制要求基于现有 observation 收束。"
             context.messages.append(
                 {
                     "role": "user",
                     "content": (
                         "<observation>\n"
                         f"系统提示：你已经连续 {repeat_count} 次调用 `{tool_name}` 读取同一目标，且 observation 已成功返回。"
-                        "不要继续重复读取；请直接基于现有 notebook 信息回答用户问题。"
-                        "如果信息仍不足，请明确指出缺失的前置步骤，而不是再次调用同一读取工具。\n"
+                        + (f"目标={target_label}。" if target_label else "")
+                        + guard_body
+                        + "\n"
                         f"最近 observation 摘要：{observation_summary}\n"
                         "</observation>\n\n"
                         "请现在直接给出最终回答。"
                     ),
                 }
             )
-            return "检测到重复读取同一 Notebook 信息，已强制要求基于现有 observation 收束回答。"
+            return guard_summary
 
         context.final_answer = (
             f"`{tool_name}` 已连续重复读取同一目标 {repeat_count} 次，已停止自动重试。"
             f"最近 observation 摘要：{observation_summary}。"
-            "这通常说明当前更需要基于已有 observation 直接作答，而不是继续读取同一单元格或变量。"
+            + (
+                "这通常说明当前更需要基于已有 observation 直接报告 blocker 或给出下一步。"
+                if repo_read_family
+                else "这通常说明当前更需要基于已有 observation 直接作答，而不是继续读取同一单元格或变量。"
+            )
         )
         context.state = AgentState.DONE
         return f"检测到 `{tool_name}` 连续重复读取同一目标 {repeat_count} 次，本轮提前停止。"
@@ -5069,6 +5302,363 @@ class AgentCore:
             return text
         return cls._truncate_failure_text(fallback, limit=320)
 
+    def _paper_skill_active_for_context(
+        self,
+        context: AgentContext,
+        executed_calls: Sequence[ExecutedToolCall],
+    ) -> bool:
+        workflow_binding = (
+            dict((context.conversation_state or {}).get("workflow_binding") or {})
+            if isinstance(context.conversation_state, dict)
+            else {}
+        )
+        if str(workflow_binding.get("skill") or "").strip() == self._PAPER_SKILL_NAME:
+            return True
+        active_skill_names = [
+            str(item or "").strip()
+            for item in list(getattr(self.runtime_context, "active_skill_names", []) or [])
+            if str(item or "").strip()
+        ]
+        if self._PAPER_SKILL_NAME in active_skill_names:
+            return True
+        return any(
+            str(item.tool_name or "").strip().startswith(self._PAPER_RESEARCH_TOOL_PREFIX)
+            for item in list(executed_calls or [])
+            if isinstance(item, ExecutedToolCall)
+        )
+
+    @classmethod
+    def _tool_workflow_refs(cls, item: ExecutedToolCall) -> List[str]:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        refs: List[str] = []
+        relative_path = str(
+            result_data.get("relative_path")
+            or result_data.get("repo_relative_path")
+            or result_data.get("path")
+            or ""
+        ).strip()
+        if relative_path:
+            if result_data.get("line_start") is not None and result_data.get("line_end") is not None:
+                refs.append(f"{relative_path}:{result_data.get('line_start')}-{result_data.get('line_end')}")
+            elif result_data.get("line_number") is not None:
+                refs.append(f"{relative_path}:{result_data.get('line_number')}")
+            else:
+                refs.append(relative_path)
+        execution_id = str(result_data.get("execution_id") or "").strip()
+        if execution_id:
+            refs.append(f"execution:{execution_id}")
+        background_execution = (
+            dict(result_data.get("background_execution") or {})
+            if isinstance(result_data.get("background_execution"), dict)
+            else {}
+        )
+        background_execution_id = str(background_execution.get("execution_id") or "").strip()
+        if background_execution_id:
+            refs.append(f"background:{background_execution_id}")
+        return list(dict.fromkeys(refs))
+
+    @classmethod
+    def _tool_workflow_highlight(cls, item: ExecutedToolCall) -> Optional[str]:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        tool_name = str(item.tool_name or "").strip()
+        status = "需授权" if item.permission_required else ("成功" if item.success else "失败")
+        if tool_name == "paper_research_read_repo_file":
+            ref = next(iter(cls._tool_workflow_refs(item)), "")
+            content = cls._normalize_compacted_text(result_data.get("content") or "")
+            snippet = cls._truncate_failure_text(content, limit=140)
+            if ref and snippet:
+                return f"{status} · {ref} · {snippet}"
+            if ref:
+                return f"{status} · {ref}"
+        if tool_name == "paper_research_search_repo":
+            matched_files = int(result_data.get("matched_file_count") or 0)
+            returned_matches = int(result_data.get("returned_matches") or 0)
+            query = cls._compact_debug_text(result_data.get("query") or item.arguments.get("query") or "", 72)
+            if query:
+                return f"{status} · 搜索 `{query}` · 命中 {returned_matches} 处 / {matched_files} 个文件"
+        if tool_name == "paper_research_read_execution":
+            execution_id = str(result_data.get("execution_id") or "").strip()
+            execution_status = str(result_data.get("status") or "").strip()
+            if execution_id or execution_status:
+                return f"{status} · execution={execution_id or '-'} · status={execution_status or '-'}"
+        if tool_name == "paper_research_start_execution":
+            background_execution = (
+                dict(result_data.get("background_execution") or {})
+                if isinstance(result_data.get("background_execution"), dict)
+                else {}
+            )
+            execution_id = str(
+                background_execution.get("execution_id")
+                or result_data.get("execution_id")
+                or ""
+            ).strip()
+            stage = str(background_execution.get("stage") or "").strip()
+            if execution_id:
+                suffix = f" · stage={stage}" if stage else ""
+                return f"{status} · 已启动 execution `{execution_id}`{suffix}"
+        if tool_name in {
+            "paper_research_write_implementation_spec",
+            "paper_research_write_run_drafts",
+            "paper_research_write_execution_spec",
+            "paper_research_write_execution_script",
+        }:
+            ref = next(iter(cls._tool_workflow_refs(item)), "")
+            if ref:
+                return f"{status} · 已更新 `{ref}`"
+        detail = cls._truncate_failure_text(item.error or item.observation_output or "", limit=140)
+        if detail:
+            return f"{status} · {detail}"
+        return None
+
+    @classmethod
+    def _tool_workflow_next_action(
+        cls,
+        rows: Sequence[ExecutedToolCall],
+        *,
+        paper_skill_active: bool,
+        repo_edit_allowed: Optional[bool],
+    ) -> tuple[str, Dict[str, Any]]:
+        failed_rows = [item for item in rows if not item.success]
+        permission_rows = [item for item in rows if item.permission_required]
+        tool_names = [str(item.tool_name or "").strip() for item in rows if str(item.tool_name or "").strip()]
+        last_tool = tool_names[-1] if tool_names else ""
+
+        if permission_rows:
+            return (
+                "等待用户授权后继续。",
+                {
+                    "status": "waiting",
+                    "evidence_status": "sufficient",
+                    "next_action": "wait_user",
+                    "blocked_reason": "authorization_required",
+                },
+            )
+        if failed_rows:
+            next_action = "report_blocker" if paper_skill_active else "inspect_failure"
+            blocked_reason = "tool_failed"
+            if last_tool == "paper_research_write_execution_spec":
+                last_failure = failed_rows[-1]
+                failure_detail = str(
+                    last_failure.observation_output or last_failure.error or ""
+                )
+                if cls._execution_spec_failure_requires_script(failure_detail):
+                    return (
+                        "execution_spec 连续卡在脚本/命令表达；请先写 execution 级脚本，再引用它生成 execution_spec。",
+                        {
+                            "status": "blocked",
+                            "evidence_status": "sufficient",
+                            "next_action": "write_execution_script",
+                            "blocked_reason": "execution_script_required",
+                            "allowed_actions": ["write_execution_script", "inspect_execution_spec"],
+                        },
+                    )
+                next_action = "inspect_execution_spec"
+                blocked_reason = "execution_contract_invalid"
+            elif last_tool == "paper_research_write_run_drafts":
+                last_failure = failed_rows[-1]
+                failure_detail = str(
+                    last_failure.observation_output or last_failure.error or ""
+                )
+                if cls._run_drafts_failure_is_entrypoint_schema_issue(failure_detail):
+                    return (
+                        "run_drafts 当前卡在 entrypoint schema；请保持 run_drafts 只引用真实 repo 文件或 manual/readme 步骤，生成脚本应放到 execution 阶段。",
+                        {
+                            "status": "blocked",
+                            "evidence_status": "sufficient",
+                            "next_action": "report_blocker",
+                            "blocked_reason": "run_drafts_invalid",
+                            "allowed_actions": ["report_blocker", "read_run_drafts"],
+                        },
+                    )
+            elif last_tool == "paper_research_start_execution":
+                next_action = "inspect_execution_spec"
+                blocked_reason = "execution_contract_invalid"
+            return (
+                "基于失败 observation 收束原因，不要继续重复同类读搜。",
+                {
+                    "status": "blocked",
+                    "evidence_status": "sufficient",
+                    "next_action": next_action,
+                    "blocked_reason": blocked_reason,
+                },
+            )
+        if last_tool == "paper_research_start_execution":
+            return (
+                "等待 execution 运行，并调用 `paper_research_read_execution` 观察状态。",
+                {
+                    "status": "waiting",
+                    "evidence_status": "sufficient",
+                    "next_action": "observe_execution",
+                    "allowed_actions": ["observe_execution"],
+                },
+            )
+        if last_tool == "paper_research_read_execution":
+            last_row = rows[-1] if rows else None
+            result_data = dict(last_row.result_data or {}) if isinstance(last_row, ExecutedToolCall) else {}
+            execution_status = str(result_data.get("status") or "").strip().lower()
+            if execution_status in {"running", "pending"}:
+                return (
+                    "继续观察 execution 状态，等待下一次稳定结果。",
+                    {
+                        "status": "waiting",
+                        "evidence_status": "sufficient",
+                        "next_action": "observe_execution",
+                        "allowed_actions": ["observe_execution"],
+                    },
+                )
+            if execution_status in {"failed", "error"}:
+                return (
+                    "收束失败原因；若当前 skill 不允许改 repo/source，则直接报告 blocker。",
+                    {
+                        "status": "blocked",
+                        "evidence_status": "sufficient",
+                        "next_action": "report_blocker" if paper_skill_active else "inspect_failure",
+                        "blocked_reason": "execution_failed",
+                    },
+                )
+        if last_tool == "paper_research_write_execution_spec":
+            return (
+                "execution_spec 已准备，可启动 execution。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "start_execution",
+                    "allowed_actions": ["start_execution"],
+                },
+            )
+        if last_tool == "paper_research_write_run_drafts":
+            return (
+                "run_drafts 已更新，继续写入 execution_spec 或选择要运行的 draft。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "write_execution_spec",
+                    "allowed_actions": ["write_execution_spec", "read_run_drafts"],
+                },
+            )
+        if last_tool == "paper_research_write_implementation_spec":
+            return (
+                "implementation_spec 已更新，继续整理 run_drafts 或报告已确认 blocker。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "write_run_drafts",
+                    "allowed_actions": ["write_run_drafts", "report_blocker"],
+                },
+            )
+        if last_tool in {"paper_research_search_repo", "paper_research_read_repo_file"}:
+            next_action = (
+                "report_blocker"
+                if paper_skill_active and repo_edit_allowed is False
+                else "synthesize_or_read_target"
+            )
+            message = (
+                "repo 证据已更新；如果结论已经稳定，请直接收束，不要重复读取同一脚本。"
+                if next_action != "report_blocker"
+                else "已拿到 repo 证据，且当前 skill 不允许直接改 repo/source；请直接报告 blocker。"
+            )
+            decision_state = {
+                "status": "ready" if next_action != "report_blocker" else "blocked",
+                "evidence_status": "sufficient",
+                "next_action": next_action,
+                "allowed_actions": ["report_blocker", "write_implementation_spec"]
+                if next_action == "report_blocker"
+                else ["write_implementation_spec", "report_blocker"],
+            }
+            if next_action == "report_blocker":
+                decision_state["blocked_reason"] = "repo_patch_required"
+            return message, decision_state
+
+        return (
+            "基于当前 observation 收束下一步，不要重复调用同一成功工具。",
+            {
+                "status": "active",
+                "evidence_status": "sufficient",
+                "next_action": "synthesize",
+                "allowed_actions": ["synthesize"],
+            },
+        )
+
+    def _build_tool_workflow_summary(
+        self,
+        context: AgentContext,
+        executed_calls: Sequence[ExecutedToolCall],
+    ) -> Dict[str, Any]:
+        rows = [item for item in list(executed_calls or []) if isinstance(item, ExecutedToolCall)]
+        if not rows:
+            return {}
+
+        tool_names = [str(item.tool_name or "").strip() for item in rows if str(item.tool_name or "").strip()]
+        unique_tool_names = list(dict.fromkeys(tool_names))
+        success_rows = [item for item in rows if item.success]
+        failed_rows = [item for item in rows if not item.success]
+        permission_rows = [item for item in rows if item.permission_required]
+        paper_skill_active = self._paper_skill_active_for_context(context, rows)
+        existing_state = dict(context.conversation_state or {}) if isinstance(context.conversation_state, dict) else {}
+        workflow_binding = dict(existing_state.get("workflow_binding") or {})
+        existing_decision_state = self._normalize_decision_state(
+            existing_state.get("decision_state") or {},
+            workflow_binding=workflow_binding,
+        )
+        repo_edit_allowed = existing_decision_state.get("repo_edit_allowed")
+        if repo_edit_allowed is None and workflow_binding.get("skill") == self._PAPER_SKILL_NAME:
+            repo_edit_allowed = False
+
+        if len(unique_tool_names) == 1:
+            headline = f"{unique_tool_names[0]} 已执行"
+        elif unique_tool_names:
+            headline = "、".join(unique_tool_names[:3]) + " 已执行"
+        else:
+            headline = "工具批次已执行"
+
+        summary_status = "observed"
+        if permission_rows:
+            summary_status = "waiting"
+        elif failed_rows:
+            summary_status = "blocked"
+        elif any(name == "paper_research_start_execution" for name in unique_tool_names):
+            summary_status = "progressed"
+        elif any(name.startswith("paper_research_write_") for name in unique_tool_names):
+            summary_status = "ready"
+
+        highlights = [
+            item
+            for item in (
+                self._tool_workflow_highlight(call)
+                for call in rows[:6]
+            )
+            if item
+        ]
+        next_action_text, decision_state = self._tool_workflow_next_action(
+            rows,
+            paper_skill_active=paper_skill_active,
+            repo_edit_allowed=bool(repo_edit_allowed) if repo_edit_allowed is not None else None,
+        )
+        decision_state = self._merge_decision_state(
+            existing_decision_state,
+            {
+                **decision_state,
+                "repo_edit_allowed": repo_edit_allowed,
+            },
+            workflow_binding=workflow_binding,
+        )
+        evidence_refs: List[str] = []
+        for item in rows:
+            evidence_refs.extend(self._tool_workflow_refs(item))
+        return {
+            "version": "tool_workflow_summary.v1",
+            "headline": headline,
+            "status": summary_status,
+            "highlights": highlights[:4],
+            "next_action": self._compact_debug_text(next_action_text, 160),
+            "evidence_refs": list(dict.fromkeys(evidence_refs))[:6],
+            "decision_state": decision_state,
+            "tool_names": unique_tool_names[:6],
+            "success_count": len(success_rows),
+            "failure_count": len(failed_rows),
+            "permission_count": len(permission_rows),
+        }
+
     @classmethod
     async def _tool_result_ledger_summary_text(cls, item: ExecutedToolCall) -> str:
         result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
@@ -5132,70 +5722,40 @@ class AgentCore:
         return cls._normalize_compacted_text(" | ".join(parts))
 
     @classmethod
-    async def _tool_use_summary_text(cls, executed_calls: Sequence[ExecutedToolCall]) -> str:
+    async def _tool_use_summary_text(
+        cls,
+        executed_calls: Sequence[ExecutedToolCall],
+        *,
+        workflow_summary: Optional[Dict[str, Any]] = None,
+    ) -> str:
         rows = [item for item in list(executed_calls or []) if isinstance(item, ExecutedToolCall)]
         if not rows:
             return ""
+        summary = dict(workflow_summary or {}) if isinstance(workflow_summary, dict) else {}
+        headline = cls._compact_debug_text(summary.get("headline") or "", 120) or "工具批次已执行"
+        status = cls._compact_debug_text(summary.get("status") or "", 32)
+        highlights = [
+            cls._compact_debug_text(item, 160)
+            for item in list(summary.get("highlights") or [])
+            if cls._compact_debug_text(item, 160)
+        ]
+        next_action = cls._compact_debug_text(summary.get("next_action") or "", 180)
+        refs = [
+            cls._compact_debug_text(item, 96)
+            for item in list(summary.get("evidence_refs") or [])
+            if cls._compact_debug_text(item, 96)
+        ]
 
-        success_rows = [item for item in rows if item.success]
-        failed_rows = [item for item in rows if not item.success]
-        permission_rows = [item for item in rows if item.permission_required]
-        tool_names = [item.tool_name for item in rows if str(item.tool_name or "").strip()]
-        unique_tool_names = list(dict.fromkeys(tool_names))
-
-        if len(unique_tool_names) == 1:
-            headline = f"`{unique_tool_names[0]}` 已执行"
-        elif unique_tool_names:
-            headline = "、".join(f"`{name}`" for name in unique_tool_names[:3]) + " 已执行"
-        else:
-            headline = "工具批次已执行"
-
-        detail_parts: List[str] = []
-        if success_rows:
-            detail_parts.append(f"成功 {len(success_rows)}")
-        if failed_rows:
-            detail_parts.append(f"失败 {len(failed_rows)}")
-        if permission_rows:
-            detail_parts.append(f"需授权 {len(permission_rows)}")
-
-        suffix = f"（{'，'.join(detail_parts)}）" if detail_parts else ""
-        detail_lines: List[str] = []
-        for item in rows[:8]:
-            status = (
-                "需授权"
-                if item.permission_required
-                else "成功"
-                if item.success
-                else "失败"
-            )
-            detail = cls._normalize_compacted_text(item.error or item.observation_output or "")
-            if len(detail) > 360:
-                detail = detail[:360].rstrip()
-            line = f"- tool={item.tool_name or 'unknown'} status={status}"
-            if detail:
-                line += f" detail={detail}"
-            metadata = dict(item.metadata or {}) if isinstance(item.metadata, dict) else {}
-            execution_id = str(metadata.get("execution_id") or "").strip()
-            if execution_id:
-                line += f" execution_id={execution_id}"
-            detail_lines.append(line)
-
-        raw_summary = "\n".join(
-            [
-                f"headline={headline}{suffix}",
-                *detail_lines,
-            ]
-        ).strip()
-        compressed = await cls._compress_text_with_qwen_turbo(
-            raw_summary,
-            target_token_budget=180,
-            source="chat.tool_use_summary",
-            compression_kind="工具批次摘要",
-        )
-        compressed = cls._normalize_compacted_text(compressed)
-        if compressed:
-            return compressed
-        return f"{headline}{suffix}"
+        lines: List[str] = [f"headline={headline}"]
+        if status:
+            lines.append(f"status={status}")
+        for item in highlights[:3]:
+            lines.append(f"- {item}")
+        if next_action:
+            lines.append(f"next_action={next_action}")
+        if refs:
+            lines.append(f"evidence_refs={', '.join(refs[:4])}")
+        return "\n".join(lines).strip()
 
     async def _append_tool_use_summary_item(
         self,
@@ -5207,7 +5767,11 @@ class AgentCore:
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             return
-        summary_text = await self._tool_use_summary_text(executed_calls)
+        workflow_summary = self._build_tool_workflow_summary(context, executed_calls)
+        summary_text = await self._tool_use_summary_text(
+            executed_calls,
+            workflow_summary=workflow_summary,
+        )
         permission_rows = [
             item for item in executed_calls
             if isinstance(item, ExecutedToolCall) and item.permission_required
@@ -5239,6 +5803,7 @@ class AgentCore:
                                 for item in executed_calls
                                 if str(item.tool_call_id or "").strip()
                             ],
+                            "workflow_summary": workflow_summary or None,
                         },
                         "created_at": datetime.utcnow().isoformat(),
                     }
@@ -5281,6 +5846,24 @@ class AgentCore:
                 int(conversation_id),
                 items_to_append,
             )
+            decision_state = self._normalize_decision_state(
+                (workflow_summary or {}).get("decision_state") or {},
+                workflow_binding=(context.conversation_state or {}).get("workflow_binding") or {},
+            )
+            if decision_state:
+                current_state = dict(context.conversation_state or {}) if isinstance(context.conversation_state, dict) else {}
+                merged_state = self._merge_conversation_state_with_workflow_binding(
+                    current_state,
+                    {
+                        **current_state,
+                        "decision_state": decision_state,
+                    },
+                )
+                context.conversation_state = merged_state
+                await self.runtime_service.upsert_conversation_context_state(
+                    int(conversation_id),
+                    dict(merged_state),
+                )
         except Exception as exc:
             logger.warning(f"[AgentCore] append tool use summary item failed: {exc}")
 
@@ -5573,10 +6156,7 @@ class AgentCore:
 
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
-        saw_tool_call_delta = False
-        streamed_answer = False
         final_payload: Dict[str, Any] = {}
-        buffer_direct_content = bool(self._missing_required_paper_skill_tool_calls(context))
 
         async for stream_event in stream_method(
             messages=llm_messages,
@@ -5593,15 +6173,11 @@ class AgentCore:
                 if not chunk:
                     continue
                 content_parts.append(chunk)
-                if not saw_tool_call_delta and not buffer_direct_content:
-                    streamed_answer = True
-                    yield {"type": "content", "data": chunk}
                 continue
             if event_type == "reasoning":
                 reasoning_parts.append(str(event_data or ""))
                 continue
             if event_type in {"tool_call", "tool_call_delta"}:
-                saw_tool_call_delta = True
                 continue
             if event_type == "done" and isinstance(event_data, dict):
                 final_payload = dict(event_data)
@@ -5611,10 +6187,6 @@ class AgentCore:
         content = str(final_payload.get("content") or "".join(content_parts))
         reasoning = str(final_payload.get("reasoning") or "".join(reasoning_parts)).strip()
         parsed_calls = self._normalize_tool_calls(final_payload.get("tool_calls") or [])
-        if parsed_calls and streamed_answer:
-            # Function-calling providers should not mix user-visible answer text with tool-call deltas.
-            # If they do, keep the tool path correct and avoid treating the streamed draft as final.
-            streamed_answer = False
 
         events, done = await self._finalize_function_calling_iteration(
             context,
@@ -5622,17 +6194,8 @@ class AgentCore:
             reasoning=reasoning,
             parsed_calls=parsed_calls,
         )
-        if streamed_answer and done and context.final_answer:
-            for event in events:
-                if event.get("type") == "answer":
-                    self._append_step_from_event(context, event)
-                    context.persist_events.append(event)
-                    yield {"type": "_answer_streamed", "data": {"answer": context.final_answer}}
-                    continue
-                yield event
-        else:
-            for event in events:
-                yield event
+        for event in events:
+            yield event
         yield {"type": "_iteration_done", "data": {"done": done}}
 
     async def _run_iteration_xml(
