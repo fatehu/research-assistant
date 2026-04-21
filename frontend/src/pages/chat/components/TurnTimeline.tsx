@@ -124,7 +124,6 @@ const normalizeToolInput = (value: Record<string, any> | undefined | null): stri
 const hasRenderableAssistantMessage = (message: Message | undefined): boolean => {
   if (!message) return false
   if (String(message.content || '').trim()) return true
-  if (String(message.thought || '').trim()) return true
   return false
 }
 
@@ -135,6 +134,7 @@ const buildHistorySteps = (
   iteration: number
   content?: string
   tool?: string
+  toolCallId?: string
   input?: Record<string, unknown>
   output?: string
   success?: boolean
@@ -184,11 +184,11 @@ const buildHistorySteps = (
       })
       continue
     }
-    if (kind === 'reasoning_summary') {
+    if (kind === 'reasoning_summary' || kind === 'thought') {
       steps.push({
         type: 'thought',
         iteration: item.iteration || 0,
-        content: item.summary || item.content || '',
+        content: item.content || item.summary || item.thought || '',
       })
       continue
     }
@@ -197,6 +197,7 @@ const buildHistorySteps = (
         type: 'action',
         iteration: item.iteration || 0,
         tool: item.tool_name,
+        toolCallId: item.tool_call_id,
         input: item.arguments,
       })
       continue
@@ -206,6 +207,7 @@ const buildHistorySteps = (
         type: 'observation',
         iteration: item.iteration || 0,
         tool: item.tool_name,
+        toolCallId: item.tool_call_id,
         output: item.summary || item.error || '',
         success: item.success,
       })

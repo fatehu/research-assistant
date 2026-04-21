@@ -131,7 +131,7 @@ const buildDoneAssistantMessage = ({
       ? itemEntry.message_id
       : assistantMessageId
 
-  if (!content.trim() && !thought) return null
+  if (!content.trim()) return null
 
   return {
     id: resolvedMessageId || Date.now() + 1,

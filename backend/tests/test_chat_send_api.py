@@ -709,3 +709,75 @@ async def test_send_message_stream_emits_running_workflow_control_on_probe_tool(
     assert '"stage": "implementation_prep"' in joined
     assert '"stage_status": "running"' in joined
     assert '"event": "done"' in joined
+
+
+@pytest.mark.asyncio
+async def test_send_message_stream_persists_thought_items_into_item_stream(monkeypatch):
+    class _ToolPlanner:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+
+        async def prepare_direct_response(self, messages, *, force_no_tools=False):
+            _ = messages, force_no_tools
+            return None
+
+    class _ThoughtAgent:
+        def __init__(self, runtime_service):
+            self.runtime_service = runtime_service
+            self.runtime_context = SimpleNamespace(run_id="run-thought-1")
+
+        async def run(self, agent_messages, stream=True, prepared_plan=None):
+            _ = agent_messages, stream, prepared_plan
+            yield {"type": "start", "data": {"provider": "test", "model": "tool-model"}}
+            yield {"type": "thinking_start", "data": {"iteration": 1}}
+            yield {"type": "thought", "data": "让我先确认一下脚本入口。"}
+            yield {
+                "type": "done",
+                "data": {
+                    "answer": "已经确认入口脚本。",
+                    "run_id": "run-thought-1",
+                },
+            }
+
+    conversation = Conversation(
+        id=60,
+        user_id=7,
+        title="测试 thought 持久化",
+        llm_provider="aliyun",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    conversation.messages = []
+    runtime_service = _FakeRuntimeService()
+
+    import app.services.react_agent as react_agent_module
+
+    monkeypatch.setattr(chat_api, "get_agent_runtime_service", lambda: runtime_service)
+    monkeypatch.setattr(chat_api, "get_tool_registry", lambda *args, **kwargs: object())
+    monkeypatch.setattr(react_agent_module, "create_chat_preview_planner", lambda *args, **kwargs: _ToolPlanner(runtime_service))
+    monkeypatch.setattr(react_agent_module, "create_react_agent", lambda *args, **kwargs: _ThoughtAgent(runtime_service))
+    monkeypatch.setattr(chat_api, "LLMService", _FakeStreamingLLMService)
+
+    response = await chat_api.send_message(
+        ChatRequest(
+            message="帮我看下现在做到哪一步了",
+            conversation_id=60,
+            stream=True,
+            use_tools=True,
+        ),
+        current_user=_User(),
+        db=_FakeDB(conversation),
+    )
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk))
+
+    thought_entries = [entry for entry in runtime_service.item_entries if entry.get("kind") == "thought"]
+    assert thought_entries
+    assert thought_entries[0]["content"] == "让我先确认一下脚本入口。"
+    assert thought_entries[0]["iteration"] == 1
+
+    joined = "".join(chunks)
+    assert '"event": "done"' in joined
+    assert '"kind": "thought"' in joined

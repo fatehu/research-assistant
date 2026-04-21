@@ -21,14 +21,11 @@ import {
   type MessageCitationSourceItem,
   type RagMetrics,
   type ConversationItemStream,
-  type ToolWorkflowSummary,
   type ConversationToolLedger,
   type ConversationTurnStore,
   type MessageSpanRewriteResponse,
 } from '@/services/api'
 import CodeBlock from './CodeBlock'
-import ThinkingPanel from './ThinkingPanel'
-import HistoryReActPanel from './HistoryReActPanel'
 
 interface MessageBubbleProps {
   msg: Message
@@ -575,94 +572,6 @@ const deriveMessageTurnId = (
   return undefined
 }
 
-const deriveHistorySteps = (
-  itemStream: ConversationItemStream | undefined,
-  turnId: string | undefined,
-): Array<{
-  type: string
-  iteration: number
-  content?: string
-  tool?: string
-  input?: Record<string, unknown>
-  output?: string
-  success?: boolean
-  workflowSummary?: ToolWorkflowSummary
-  rawContent?: string
-}> => {
-  if (!itemStream?.entries?.length || !turnId) return []
-  const steps: Array<{
-    type: string
-    iteration: number
-    content?: string
-    tool?: string
-    input?: Record<string, unknown>
-    output?: string
-    success?: boolean
-    workflowSummary?: ToolWorkflowSummary
-    rawContent?: string
-  }> = []
-  itemStream.entries
-    .filter((entry) => entry.turn_id === turnId)
-    .forEach((entry) => {
-      if (entry.kind === 'tool_use_summary') {
-        steps.push({
-          type: 'workflow',
-          iteration: entry.iteration || 0,
-          content: entry.summary || entry.content || '',
-          rawContent: entry.content || entry.summary || '',
-          workflowSummary:
-            entry.metadata?.workflow_summary && typeof entry.metadata.workflow_summary === 'object'
-              ? (entry.metadata.workflow_summary as ToolWorkflowSummary)
-              : undefined,
-        })
-        return
-      }
-      if (entry.kind === 'permission_denial') {
-        steps.push({
-          type: 'workflow',
-          iteration: entry.iteration || 0,
-          content: entry.summary || entry.content || '',
-          rawContent: entry.content || entry.summary || '',
-          workflowSummary: {
-            version: 'tool_workflow_summary.v1',
-            headline: '权限受限，流程已等待',
-            status: 'waiting',
-            highlights: [entry.summary || entry.content || '当前步骤需要额外授权后才能继续。'],
-            next_action: '等待授权或调整执行路径',
-          },
-        })
-        return
-      }
-      if (entry.kind === 'reasoning_summary') {
-        steps.push({
-          type: 'thought',
-          iteration: entry.iteration || 0,
-          content: entry.summary || entry.content || '',
-        })
-        return
-      }
-      if (entry.kind === 'tool_call') {
-        steps.push({
-          type: 'action',
-          iteration: entry.iteration || 0,
-          tool: entry.tool_name,
-          input: entry.arguments,
-        })
-        return
-      }
-      if (entry.kind === 'tool_result') {
-        steps.push({
-          type: 'observation',
-          iteration: entry.iteration || 0,
-          tool: entry.tool_name,
-          output: entry.summary || entry.error || '',
-          success: entry.success,
-        })
-      }
-    })
-  return steps
-}
-
 const flattenMarkdownText = (value: ReactNode): string => {
   if (value == null || typeof value === 'boolean') {
     return ''
@@ -714,9 +623,7 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     {
       msg,
       turnStore,
-      itemStream,
       toolLedger,
-      showHistoryPrelude = true,
       isStreaming = false,
       streamingContent = '',
       isThinking = false,
@@ -735,17 +642,6 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
     const [animatedContent, setAnimatedContent] = useState<string | null>(null)
     const content = animatedContent ?? baseContent
     const turnId = useMemo(() => deriveMessageTurnId(msg, turnStore), [msg, turnStore])
-    const historySteps = useMemo(
-      () => (isStreaming ? [] : deriveHistorySteps(itemStream, turnId)),
-      [isStreaming, itemStream, turnId],
-    )
-    const derivedThought = useMemo(
-      () => historySteps.find((step) => step.type === 'thought')?.content || '',
-      [historySteps],
-    )
-    const thought = isStreaming ? '' : derivedThought || msg.thought || ''
-    const hasReasoningSummary = Boolean(derivedThought || msg.thought)
-    const [thoughtExpanded, setThoughtExpanded] = useState(false)
     const [ragExpanded, setRagExpanded] = useState(false)
     const [evidenceExpanded, setEvidenceExpanded] = useState(false)
     const ragMetrics = !isStreaming && !isUser ? parseRagMetrics(msg.metadata?.rag_metrics) : null
@@ -928,12 +824,8 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
       : 'flex min-w-0 flex-1 flex-col'
     const userBubbleShellClass = 'inline-flex max-w-[min(76%,720px)] flex-col items-end'
     const assistantBubbleWidthClass = 'w-full max-w-[min(100%,920px)]'
-    const hasAssistantPrelude =
-      showHistoryPrelude && !isUser && !isStreaming && (historySteps.length > 0 || String(thought || '').trim().length > 0)
     const normalizedContent = String(content || '').trim()
-    const normalizedThought = String(thought || '').trim()
-    const shouldHideEmptyAssistantBubble =
-      !isUser && !isStreaming && !normalizedContent && !normalizedThought && historySteps.length === 0
+    const shouldHideEmptyAssistantBubble = !isUser && !isStreaming && !normalizedContent
 
     if (shouldHideEmptyAssistantBubble) {
       return null
@@ -1059,24 +951,6 @@ const MessageBubble = forwardRef<HTMLDivElement, MessageBubbleProps>(
           ) : (
             <div className={assistantBubbleWidthClass}>
               <div className="overflow-hidden rounded-[24px] rounded-tl-md border border-white/[0.04] bg-[#13151A] px-8 pt-7 pb-8 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_14px_40px_rgba(2,6,23,0.22)]">
-                  {hasAssistantPrelude && (
-                    <div className="mb-3 space-y-3 border-b border-white/[0.04] pb-3">
-                      {historySteps.length > 0 && (
-                        <HistoryReActPanel steps={historySteps} embedded />
-                      )}
-                      {thought && (
-                        <ThinkingPanel
-                          thought={thought}
-                          isThinking={false}
-                          isExpanded={thoughtExpanded}
-                          onToggle={() => setThoughtExpanded(!thoughtExpanded)}
-                          embedded
-                          label={hasReasoningSummary ? '推理摘要' : '最终思考'}
-                        />
-                      )}
-                    </div>
-                  )}
-
                   {content ? (
                     <>
                       <div

@@ -3059,6 +3059,25 @@ async def send_message(
                             yield _sse_event("thinking", event_data)
                         elif event_type == "thought":
                             thought = event_data
+                            compacted_thought = " ".join(str(event_data or "").split()).strip()
+                            if len(compacted_thought) > 400:
+                                compacted_thought = compacted_thought[:399].rstrip() + "…"
+                            if compacted_thought:
+                                await runtime_service.append_conversation_item_entries(
+                                    conversation_id,
+                                    [
+                                        {
+                                            "kind": "thought",
+                                            "turn_id": turn_id,
+                                            "role": "assistant",
+                                            "run_id": str(getattr(agent.runtime_context, "run_id", "") or "").strip() or None,
+                                            "iteration": max(int(current_iteration or 0), 0),
+                                            "summary": compacted_thought,
+                                            "content": compacted_thought,
+                                            "created_at": datetime.utcnow().isoformat(),
+                                        }
+                                    ],
+                                )
                             yield _sse_event("thought", event_data)
                         elif event_type == "action":
                             action_payload = dict(event_data or {}) if isinstance(event_data, dict) else {"value": event_data}
