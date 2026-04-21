@@ -57,6 +57,11 @@ const assistantSummaryText = (content: string, limit = 160): string => {
   return `${normalized.slice(0, Math.max(1, limit - 1)).trimEnd()}…`
 }
 
+const sortMessagesByCreatedAt = (messages: Message[] | undefined): Message[] =>
+  [...(messages || [])].sort(
+    (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+  )
+
 const resolveAssistantTurnEntry = (
   turnStore: ConversationTurnStore | undefined,
   currentTurnId: string | null,
@@ -238,6 +243,7 @@ interface ChatState {
   fetchConversations: () => Promise<void>
   createConversation: (title?: string) => Promise<Conversation>
   selectConversation: (conversationId: number) => Promise<void>
+  resumeBackgroundRun: (runId: string, conversationId: number) => Promise<void>
   deleteConversation: (conversationId: number) => Promise<void>
   archiveConversation: (conversationId: number) => Promise<void>
   compactConversationContext: () => Promise<void>
@@ -324,14 +330,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectConversation: async (conversationId: number) => {
+    const existingAbortController = get().abortController
+    if (existingAbortController) {
+      existingAbortController.abort()
+    }
     set({ isLoading: true })
     try {
       const conversation = await chatApi.getConversation(conversationId)
-
-      // 确保消息按时间排序
-      const sortedMessages = (conversation.messages || []).sort(
-        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      )
+      const sortedMessages = sortMessagesByCreatedAt(conversation.messages)
 
       set({
         currentConversation: conversation,
@@ -344,10 +350,278 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sendPhaseHint: null,
         isLoading: false,
       })
+
+      try {
+        const activeRun = await chatApi.getActiveConversationRun(conversationId)
+        if (activeRun?.run_id && String(activeRun.status || '').toLowerCase() === 'running') {
+          void get().resumeBackgroundRun(activeRun.run_id, conversationId)
+        }
+      } catch (resumeError) {
+        console.error('[ChatStore] 恢复后台对话任务失败:', resumeError)
+      }
     } catch (error) {
       console.error('加载对话失败:', error)
       set({ isLoading: false, currentConversation: null, messages: [], workflowControl: null })
       throw error
+    }
+  },
+
+  resumeBackgroundRun: async (runId: string, conversationId: number) => {
+    const normalizedRunId = String(runId || '').trim()
+    if (!normalizedRunId) return
+
+    const existingState = get()
+    if (existingState.currentBackgroundRunId === normalizedRunId && existingState.isSending) {
+      return
+    }
+
+    if (existingState.abortController) {
+      existingState.abortController.abort()
+    }
+
+    const abortController = new AbortController()
+    let fullContent = ''
+    let currentThought = ''
+    let latestContextDebug: ChatContextDebug | null = null
+
+    set({
+      isSending: true,
+      isThinking: false,
+      sendPhase: 'planning',
+      sendPhaseLabel: '后台任务恢复中',
+      sendPhaseHint: null,
+      streamingContent: '',
+      streamingThought: '',
+      streamingContextDebug: null,
+      workflowControl: null,
+      iterationSteps: [],
+      currentIteration: 0,
+      toolCalls: [],
+      currentToolCall: null,
+      currentTurnId: null,
+      abortController,
+      currentBackgroundRunId: normalizedRunId,
+    })
+
+    const refreshConversationFromServer = async () => {
+      try {
+        const refreshedConversation = await chatApi.getConversation(conversationId)
+        const sortedMessages = sortMessagesByCreatedAt(refreshedConversation.messages)
+        set((state) =>
+          state.currentConversation?.id === conversationId
+            ? {
+                currentConversation: refreshedConversation,
+                messages: sortedMessages,
+                workflowControl: resolveConversationWorkflowControl(sortedMessages),
+              }
+            : state,
+        )
+      } catch (refreshError) {
+        console.error('[ChatStore] 刷新对话失败:', refreshError)
+      }
+    }
+
+    try {
+      await chatApi.streamChatRun(
+        normalizedRunId,
+        (event, data) => {
+          switch (event) {
+            case 'run_status': {
+              const status = String(data?.status || '').toLowerCase()
+              set({
+                currentBackgroundRunId:
+                  data && typeof data === 'object' && typeof data.run_id === 'string'
+                    ? data.run_id
+                    : normalizedRunId,
+                sendPhase:
+                  status === 'running'
+                    ? get().sendPhase === 'idle'
+                      ? 'planning'
+                      : get().sendPhase
+                    : get().sendPhase,
+                sendPhaseLabel:
+                  status === 'running'
+                    ? get().sendPhaseLabel || '后台执行中'
+                    : get().sendPhaseLabel,
+              })
+              break
+            }
+
+            case 'start':
+              set({
+                sendPhase: 'planning',
+                sendPhaseLabel: '后台执行中',
+                sendPhaseHint: null,
+                currentTurnId:
+                  data && typeof data === 'object' && typeof data.turn_id === 'string' && data.turn_id.trim()
+                    ? data.turn_id.trim()
+                    : null,
+              })
+              break
+
+            case 'phase':
+              if (data && typeof data === 'object') {
+                const phaseKey = typeof data.key === 'string' ? data.key : ''
+                const nextPhase: SendPhase =
+                  phaseKey === 'loading_context' ||
+                  phaseKey === 'routing' ||
+                  phaseKey === 'waiting_model' ||
+                  phaseKey === 'planning' ||
+                  phaseKey === 'thinking' ||
+                  phaseKey === 'tool' ||
+                  phaseKey === 'answering'
+                    ? phaseKey
+                    : 'planning'
+                set({
+                  sendPhase: nextPhase,
+                  sendPhaseLabel: typeof data.label === 'string' && data.label.trim() ? data.label.trim() : null,
+                  sendPhaseHint: typeof data.hint === 'string' && data.hint.trim() ? data.hint.trim() : null,
+                })
+              }
+              break
+
+            case 'thinking_start':
+              set((state) => ({
+                isThinking: true,
+                sendPhase: 'thinking',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
+                currentIteration: state.currentIteration + 1,
+              }))
+              currentThought = ''
+              break
+
+            case 'thinking':
+              currentThought += data
+              set({ streamingThought: currentThought })
+              break
+
+            case 'thought':
+              currentThought = data
+              set((state) => ({
+                streamingThought: currentThought,
+                isThinking: false,
+                sendPhase: 'thinking',
+                iterationSteps: [
+                  ...state.iterationSteps,
+                  {
+                    type: 'thought',
+                    content: data,
+                    timestamp: Date.now(),
+                  },
+                ],
+              }))
+              break
+
+            case 'action': {
+              const toolCall = {
+                tool: data.tool,
+                input: data.input,
+                timestamp: Date.now(),
+              }
+              set((state) => ({
+                currentToolCall: toolCall,
+                toolCalls: [...state.toolCalls, toolCall],
+                isThinking: false,
+                sendPhase: 'tool',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
+                iterationSteps: [
+                  ...state.iterationSteps,
+                  {
+                    type: 'action',
+                    content: `调用工具: ${data.tool}`,
+                    tool: data.tool,
+                    toolInput: data.input,
+                    timestamp: Date.now(),
+                  },
+                ],
+              }))
+              break
+            }
+
+            case 'observation':
+              set((state) => {
+                const updatedToolCalls = [...state.toolCalls]
+                const lastIndex = updatedToolCalls.length - 1
+                if (lastIndex >= 0) {
+                  updatedToolCalls[lastIndex] = {
+                    ...updatedToolCalls[lastIndex],
+                    output: data.output,
+                    success: data.success,
+                  }
+                }
+                return {
+                  toolCalls: updatedToolCalls,
+                  currentToolCall: null,
+                  isThinking: true,
+                  sendPhase: 'thinking',
+                  sendPhaseLabel: null,
+                  sendPhaseHint: null,
+                  iterationSteps: [
+                    ...state.iterationSteps,
+                    {
+                      type: 'observation',
+                      content: data.output,
+                      tool: data.tool,
+                      toolOutput: data.output,
+                      success: data.success,
+                      timestamp: Date.now(),
+                    },
+                  ],
+                }
+              })
+              break
+
+            case 'content':
+              fullContent += data
+              set({
+                streamingContent: fullContent,
+                sendPhase: 'answering',
+                sendPhaseLabel: null,
+                sendPhaseHint: null,
+                isThinking: false,
+              })
+              break
+
+            case 'context_debug':
+              latestContextDebug = data && typeof data === 'object' ? (data as ChatContextDebug) : null
+              set({ streamingContextDebug: latestContextDebug })
+              break
+
+            case 'done':
+            case 'error':
+            case 'cancelled':
+            case 'stopped':
+              break
+          }
+        },
+        abortController,
+      )
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AbortError')) {
+        console.error('[ChatStore] 恢复后台任务流失败:', error)
+      }
+    } finally {
+      await refreshConversationFromServer()
+      set((state) => ({
+        isSending: false,
+        isThinking: false,
+        sendPhase: 'idle',
+        sendPhaseLabel: null,
+        sendPhaseHint: null,
+        streamingContent: '',
+        streamingThought: '',
+        streamingContextDebug: null,
+        lastRunContextDebug: latestContextDebug || state.streamingContextDebug || state.lastRunContextDebug,
+        iterationSteps: [],
+        currentIteration: 0,
+        toolCalls: [],
+        currentToolCall: null,
+        currentTurnId: null,
+        abortController: null,
+        currentBackgroundRunId: null,
+      }))
     }
   },
 
@@ -539,7 +813,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     id: data.conversation_id,
                     user_id: 0,
                     title: message.slice(0, 30),
-                    llm_provider: 'deepseek',
+                    llm_provider: 'aliyun_qwen35_flash',
                     is_archived: 0,
                     created_at: new Date().toISOString(),
                     updated_at: new Date().toISOString(),

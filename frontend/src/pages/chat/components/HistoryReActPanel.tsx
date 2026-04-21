@@ -60,7 +60,9 @@ const HistoryReActPanel = ({
               <BulbOutlined className={`text-[11px] ${embedded ? '' : 'text-white'}`} />
             </div>
             <div className="flex items-center gap-2">
-              <span className={`font-medium ${embedded ? 'text-xs tracking-wide text-slate-400' : 'text-sm text-slate-100'}`}>推理过程</span>
+              <span className={`font-medium ${embedded ? 'text-xs tracking-wide text-slate-400' : 'text-sm text-slate-100'}`}>
+                推理过程
+              </span>
               <span className={`rounded-full border px-2 py-0.5 text-[11px] ${
                 embedded
                   ? 'border-white/[0.06] bg-transparent text-slate-500'

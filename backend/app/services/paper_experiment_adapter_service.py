@@ -350,15 +350,35 @@ class PaperExperimentAdapterService:
         }
 
         if repo_dir.exists() and any(repo_dir.iterdir()):
-            git_path = shutil.which("git")
-            history_refresh = await self._ensure_repo_history_available(
-                git_path=git_path,
+            integrity = self._validate_existing_repo_dir(
+                workspace_dir=workspace_dir,
                 repo_dir=repo_dir,
+                experiment_spec=experiment_spec,
             )
-            manifest["status"] = "reused"
-            manifest.update(history_refresh)
-            self._write_json(workspace_dir / "repo_reference.json", manifest)
-            return manifest
+            if bool(integrity.get("valid")):
+                git_path = shutil.which("git")
+                history_refresh = await self._ensure_repo_history_available(
+                    git_path=git_path,
+                    repo_dir=repo_dir,
+                )
+                manifest["status"] = "reused"
+                manifest.update(history_refresh)
+                manifest["integrity_status"] = "validated"
+                self._write_json(workspace_dir / "repo_reference.json", manifest)
+                return manifest
+
+            logger.warning(
+                "[PaperExperimentAdapter] existing repo_dir failed integrity check; re-materializing: repo_dir={}, missing={}",
+                repo_dir,
+                integrity.get("missing_paths"),
+            )
+            manifest["previous_repo_invalid"] = True
+            manifest["integrity_status"] = "failed"
+            manifest["integrity_reason"] = str(integrity.get("reason") or "repo_integrity_failed")
+            missing_paths = list(integrity.get("missing_paths") or [])
+            if missing_paths:
+                manifest["missing_paths"] = missing_paths[:24]
+            shutil.rmtree(repo_dir, ignore_errors=True)
 
         repo_dir.mkdir(parents=True, exist_ok=True)
         git_path = shutil.which("git")
@@ -378,6 +398,74 @@ class PaperExperimentAdapterService:
         manifest.update(archive_result)
         self._write_json(workspace_dir / "repo_reference.json", manifest)
         return manifest
+
+    def _validate_existing_repo_dir(
+        self,
+        *,
+        workspace_dir: Path,
+        repo_dir: Path,
+        experiment_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        repo_index = self._read_json(workspace_dir / "repo_file_index.json")
+        tracked_files = [str(item).strip() for item in list(repo_index.get("files") or []) if str(item or "").strip()]
+        readme_candidates = [
+            str(item).strip() for item in list(repo_index.get("readme_candidates") or []) if str(item or "").strip()
+        ]
+        dependency_files = [
+            str(item).strip() for item in list(repo_index.get("dependency_files") or []) if str(item or "").strip()
+        ]
+        entrypoint_candidates = [
+            str(dict(item or {}).get("path") or "").strip()
+            for item in list(repo_index.get("entrypoint_candidates") or [])
+            if isinstance(item, dict)
+        ]
+        hint_values = [
+            str(item.get("value") or item.get("evidence_text") or "").strip()
+            for item in list(experiment_spec.get("entrypoint_hints") or [])
+            if isinstance(item, dict)
+        ]
+
+        must_exist: List[str] = []
+        must_exist.extend(readme_candidates[:1])
+        must_exist.extend(dependency_files[:5])
+        must_exist.extend(entrypoint_candidates[:5])
+        if "Makefile" in tracked_files:
+            must_exist.append("Makefile")
+        src_files = [item for item in tracked_files if item.startswith("src/")]
+        if src_files:
+            must_exist.extend(src_files[:12])
+        for hint in hint_values:
+            normalized_hint = self._normalize_hint_token(hint)
+            if not normalized_hint:
+                continue
+            for relative in tracked_files:
+                if normalized_hint in relative.lower():
+                    must_exist.append(relative)
+                    break
+
+        ordered_required: List[str] = []
+        seen: set[str] = set()
+        for relative in must_exist:
+            normalized = str(relative or "").strip().strip("/")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered_required.append(normalized)
+
+        if not ordered_required:
+            if (repo_dir / ".git").exists():
+                return {"valid": True, "reason": "git_metadata_present"}
+            return {"valid": False, "reason": "no_integrity_reference", "missing_paths": []}
+
+        missing_paths = [relative for relative in ordered_required if not (repo_dir / relative).exists()]
+        if missing_paths:
+            return {
+                "valid": False,
+                "reason": "missing_indexed_files",
+                "missing_paths": missing_paths,
+                "required_paths": ordered_required,
+            }
+        return {"valid": True, "reason": "indexed_files_present", "required_paths": ordered_required}
 
     async def _clone_repo_via_git(self, *, git_path: str, repo_url: str, repo_dir: Path) -> Dict[str, Any]:
         try:

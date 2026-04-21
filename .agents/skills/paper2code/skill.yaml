@@ -1,0 +1,41 @@
+name: paper2code
+description: >-
+  Use the upstream Paper2Code/PaperCoder repository as an isolated paper-to-code
+  generator for demos or side-by-side workflow comparisons.
+when_to_use: >-
+  Use when the user explicitly asks for Paper2Code or PaperCoder, wants a
+  separate paper-to-code demo, or wants to generate a repository from a paper
+  with the external Paper2Code pipeline instead of the built-in
+  paper-reproduction workflow.
+category: paper
+family: paper2code
+allowed_channels:
+  - chat
+interface_metadata_path: agents/openai.yaml
+user_invocable: true
+execution_context: inline
+agent: primary
+effort: medium
+aliases:
+  - paper2code
+  - papercoder
+  - paper to code
+  - paper2code demo
+  - 论文转代码
+  - 论文代码生成
+trigger_keywords:
+  - paper2code
+  - papercoder
+  - paper to code
+  - paper2code demo
+scripts:
+  - path: scripts/bootstrap_paper2code_demo.py
+    purpose: Clone or update the upstream repo and create a deterministic demo run script.
+references:
+  - path: references/upstream-notes.md
+    when: Confirming upstream pipeline stages, required inputs, or demo limitations.
+interface:
+  display_name: "Paper2Code"
+  short_description: "Use the upstream Paper2Code pipeline in an isolated demo workspace"
+  default_prompt: "Use $paper2code to prepare or run an isolated Paper2Code demo."
+

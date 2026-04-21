@@ -16,6 +16,30 @@ Revise them whenever later grounded evidence changes the known state, for exampl
 
 Do not leave stale blockers in place after local repo or execution evidence disproved them.
 
+## Environment-Frontloaded Planning
+
+The implementation stage must not assume an abstract machine.
+
+Before finalizing `implementation_spec.json`, call `paper_research_inspect_runtime` and fold the current runtime facts into the plan:
+
+- available runtime candidates
+- runtime-worker availability
+- detected repo root / cwd basis
+- installed key packages
+- available commands such as `python`, `docker`, `papermill`, `repo2docker`, `devcontainer`
+- grounded missing packages required by the selected repo entrypoint
+
+The implementation plan should already reflect whether the current environment can realistically support:
+
+- `devcontainer`
+- `docker_compose`
+- `dockerfile`
+- `repo2docker`
+- `papermill`
+- `plain-python`
+
+Do not defer all environment reasoning to the execution stage. Execution should refine or enforce the plan, not discover the basic feasibility envelope from scratch.
+
 ## Implementation Spec
 
 `implementation_spec` must stay evidence-grounded and should follow `templates/implementation_spec.schema.json`.
@@ -54,6 +78,7 @@ Rules:
 - If `repo_reference.json` exposes `repo_history_candidates_file`, read that file before public web search for dead official URLs.
 - `readiness.can_create_run_draft` may be true only when evidence is enough to draft without guessing repo/data details.
 - `readiness.can_execute` may be true only when required repo/data evidence is grounded or the implementation is strictly local.
+- Preserve the runtime snapshot that shaped the plan. `implementation_spec` should carry a concise `runtime_snapshot` so later stages do not need to rediscover the same environment facts.
 - If `paper_research_inspect_runtime` already returns runtime candidates, do not keep a generic `runtime_unknown` blocker. Replace it with a specific package/runtime blocker only when local evidence supports it.
 - If evidence is insufficient, write explicit blockers and next actions instead of optimistic placeholders.
 - When repo data files are already present locally, rewrite dataset status to reflect that local truth instead of leaving `requires_download` or `dataset_missing` as the active blocker.

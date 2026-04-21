@@ -92,7 +92,7 @@ const SettingsPage: React.FC = () => {
     if (user) {
       const rawPreferences = (user.preferences || {}) as Record<string, unknown>
       llmForm.setFieldsValue({
-        preferred_llm_provider: user.preferred_llm_provider || 'openai',
+        preferred_llm_provider: user.preferred_llm_provider || 'aliyun_qwen35_flash',
         chat_preferences: {
           ...DEFAULT_CHAT_PREFERENCES,
           ...(rawPreferences.chat_preferences as Partial<ChatPreferences> | undefined),
@@ -293,10 +293,14 @@ const SettingsPage: React.FC = () => {
               style={{ width: '100%' }}
               styles={{ popup: { root: { backgroundColor: '#161B22', border: '1px solid #30363D' } } }}
             >
+              <Option value="aliyun_qwen35_flash">Aliyun (qwen3.5-flash)</Option>
+              <Option value="aliyun_qwen35_plus">Aliyun (qwen3.5-plus)</Option>
+              <Option value="aliyun_qwen_plus">Aliyun (qwen-plus)</Option>
+              <Option value="aliyun_qwen_max">Aliyun (qwen-max)</Option>
+              <Option value="aliyun">Aliyun (默认档)</Option>
               <Option value="deepseek">DeepSeek (deepseek-chat)</Option>
               <Option value="deepseek_test">DeepSeek 测试档 (deepseek-chat-test)</Option>
               <Option value="openai">OpenAI (GPT-4o)</Option>
-              <Option value="aliyun">Aliyun (qwen-plus)</Option>
               <Option value="ollama">本地 (Ollama)</Option>
             </Select>
           </Form.Item>

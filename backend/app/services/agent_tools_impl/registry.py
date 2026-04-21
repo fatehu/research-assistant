@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, or_, and_, tuple_
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.config import settings
 from app.models.knowledge import KnowledgeBase, Document, DocumentChunk
@@ -90,6 +90,16 @@ _REPO_SKIPPED_DIRS = {
 }
 
 
+def _normalize_relative_path(value: Any) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        return ""
+    parts = [part for part in raw.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
 class Tool:
     """工具协议（兼容旧实现）。"""
 
@@ -155,6 +165,8 @@ class ToolBase(Tool, ABC):
     def _truncate_output_if_needed(self, output: str) -> tuple[str, bool, int]:
         safe_output = str(output or "")
         est_tokens = estimate_tokens(safe_output)
+        if not bool(getattr(settings, "tool_output_truncation_enabled", False)):
+            return safe_output, False, est_tokens
         max_tokens = self._resolve_output_max_tokens()
         if est_tokens <= max_tokens:
             return safe_output, False, est_tokens
@@ -1303,13 +1315,65 @@ class PaperResearchArtifactManifestInput(BaseModel):
 class PaperResearchReadArtifactInput(BaseModel):
     project_id: int = Field(ge=1)
     relative_path: str = Field(min_length=1, max_length=260)
+    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
     max_chars: int = Field(default=20000, ge=200, le=200000)
+    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
+    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
+    page: Optional[int] = Field(default=None, ge=1, le=1000000)
+    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
+    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
 
 
 class PaperResearchReadRepoFileInput(BaseModel):
     project_id: int = Field(ge=1)
-    repo_relative_path: str = Field(min_length=1, max_length=400)
-    max_chars: int = Field(default=20000, ge=200, le=200000)
+    repo_relative_path: str = Field(
+        min_length=1,
+        max_length=400,
+        validation_alias=AliasChoices("repo_relative_path", "relative_path", "path", "file_path", "file"),
+    )
+    mode: str = Field(default="auto")
+    max_chars: int = Field(default=20000, ge=1, le=200000)
+    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
+    chunk_chars: Optional[int] = Field(default=None, ge=1, le=200000)
+    page: Optional[int] = Field(default=None, ge=1, le=1000000)
+    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
+    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
+
+    @field_validator("repo_relative_path")
+    @classmethod
+    def _normalize_repo_relative_path(cls, value: str) -> str:
+        normalized = _normalize_relative_path(value)
+        if normalized == "repo/source":
+            return ""
+        if normalized.startswith("repo/source/"):
+            return normalized.removeprefix("repo/source/")
+        if normalized.startswith("paper_repo/"):
+            return normalized.removeprefix("paper_repo/")
+        return normalized
+
+    @field_validator("mode")
+    @classmethod
+    def _normalize_mode(cls, value: str) -> str:
+        normalized = str(value or "auto").strip().lower().replace("-", "_")
+        alias_map = {
+            "auto": "auto",
+            "full": "full",
+            "all": "full",
+            "entire": "full",
+            "chunk": "chunk",
+            "chunks": "chunk",
+            "page": "page",
+            "pages": "page",
+            "line": "line_range",
+            "lines": "line_range",
+            "line_range": "line_range",
+        }
+        resolved = alias_map.get(normalized)
+        if not resolved:
+            raise ValueError("mode must be one of auto/full/chunk/page/line_range")
+        return resolved
 
 
 class PaperResearchSearchRepoInput(BaseModel):
@@ -1319,6 +1383,7 @@ class PaperResearchSearchRepoInput(BaseModel):
     case_sensitive: bool = False
     is_regex: bool = False
     glob: Optional[str] = Field(default=None, max_length=200)
+    context_lines: int = Field(default=0, ge=0, le=20)
 
 
 class PaperResearchWriteImplementationSpecInput(BaseModel):
@@ -1328,7 +1393,14 @@ class PaperResearchWriteImplementationSpecInput(BaseModel):
 
 class PaperResearchReadImplementationSpecInput(BaseModel):
     project_id: int = Field(ge=1)
+    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
     max_chars: int = Field(default=20000, ge=200, le=200000)
+    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
+    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
+    page: Optional[int] = Field(default=None, ge=1, le=1000000)
+    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
+    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
 
 
 class PaperResearchWriteRunDraftsInput(BaseModel):
@@ -1338,7 +1410,14 @@ class PaperResearchWriteRunDraftsInput(BaseModel):
 
 class PaperResearchReadRunDraftsInput(BaseModel):
     project_id: int = Field(ge=1)
+    mode: Literal["auto", "full", "chunk", "page", "line_range"] = "auto"
     max_chars: int = Field(default=20000, ge=200, le=200000)
+    chunk_index: Optional[int] = Field(default=None, ge=1, le=1000000)
+    chunk_chars: Optional[int] = Field(default=None, ge=200, le=200000)
+    page: Optional[int] = Field(default=None, ge=1, le=1000000)
+    page_size_lines: Optional[int] = Field(default=None, ge=1, le=5000)
+    line_start: Optional[int] = Field(default=None, ge=1, le=2000000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
 
 
 class PaperResearchInspectRuntimeInput(BaseModel):
@@ -1683,15 +1762,7 @@ class _PaperResearchToolBase(ToolBase):
 
     @classmethod
     def _normalize_relative_path(cls, value: Any) -> str:
-        raw = str(value or "").strip().replace("\\", "/")
-        if not raw:
-            return ""
-        if raw.startswith("/"):
-            return ""
-        parts = [part for part in raw.split("/") if part not in {"", "."}]
-        if not parts or any(part == ".." for part in parts):
-            return ""
-        return "/".join(parts)
+        return _normalize_relative_path(value)
 
     @classmethod
     def _artifact_spec_for_path(cls, relative_path: str) -> Optional[Dict[str, str]]:
@@ -1941,15 +2012,203 @@ class _PaperResearchToolBase(ToolBase):
             },
         }
 
-    @staticmethod
-    def _read_text_preview(path: Path, *, max_chars: int) -> Dict[str, Any]:
+    @classmethod
+    def _read_text_payload(
+        cls,
+        path: Path,
+        *,
+        mode: str,
+        max_chars: int,
+        chunk_index: Optional[int] = None,
+        chunk_chars: Optional[int] = None,
+        page: Optional[int] = None,
+        page_size_lines: Optional[int] = None,
+        line_start: Optional[int],
+        line_end: Optional[int],
+        default_window: int = 40,
+    ) -> Dict[str, Any]:
         content = path.read_text(encoding="utf-8", errors="ignore")
-        clipped = content[:max_chars]
+        all_lines = content.splitlines()
+        total_lines = len(all_lines)
+        total_chars = len(content)
+        effective_mode = str(mode or "auto").strip().lower() or "auto"
+
+        if effective_mode == "auto":
+            if line_start is not None or line_end is not None:
+                effective_mode = "line_range"
+            elif page is not None:
+                effective_mode = "page"
+            elif chunk_index is not None:
+                effective_mode = "chunk"
+            else:
+                effective_mode = "full"
+
+        if effective_mode == "full":
+            return {
+                "content": content,
+                "truncated": False,
+                "has_more": False,
+                "mode": "full",
+                "total_chars": total_chars,
+                "returned_chars": total_chars,
+                "total_lines": total_lines,
+                "returned_line_count": total_lines,
+                "line_start": 1 if total_lines > 0 else 0,
+                "line_end": total_lines,
+            }
+
+        if effective_mode == "chunk":
+            resolved_chunk_chars = max(int(chunk_chars or max_chars or 20000), 1)
+            resolved_chunk_index = max(int(chunk_index or 1), 1)
+            total_chunks = max(1, math.ceil(total_chars / resolved_chunk_chars))
+            resolved_chunk_index = min(resolved_chunk_index, total_chunks)
+            start_offset = (resolved_chunk_index - 1) * resolved_chunk_chars
+            end_offset = min(total_chars, start_offset + resolved_chunk_chars)
+            chunk_text = content[start_offset:end_offset]
+            return {
+                "content": chunk_text,
+                "truncated": end_offset < total_chars,
+                "has_more": end_offset < total_chars,
+                "next_chunk_index": resolved_chunk_index + 1 if end_offset < total_chars else None,
+                "mode": "chunk",
+                "total_chars": total_chars,
+                "returned_chars": len(chunk_text),
+                "chunk_index": resolved_chunk_index,
+                "chunk_chars": resolved_chunk_chars,
+                "total_chunks": total_chunks,
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "total_lines": total_lines,
+            }
+
+        if effective_mode == "page":
+            resolved_page = max(int(page or 1), 1)
+            resolved_page_size_lines = max(int(page_size_lines or default_window or 40), 1)
+            if total_lines <= 0:
+                return {
+                    "content": "",
+                    "truncated": False,
+                    "has_more": False,
+                    "mode": "page",
+                    "total_chars": total_chars,
+                    "returned_chars": 0,
+                    "page": resolved_page,
+                    "page_size_lines": resolved_page_size_lines,
+                    "total_pages": 0,
+                    "line_start": 0,
+                    "line_end": 0,
+                    "returned_line_count": 0,
+                    "total_lines": 0,
+                }
+            total_pages = max(1, math.ceil(total_lines / resolved_page_size_lines))
+            resolved_page = min(resolved_page, total_pages)
+            resolved_start = ((resolved_page - 1) * resolved_page_size_lines) + 1
+            resolved_end = min(total_lines, resolved_start + resolved_page_size_lines - 1)
+            selected_lines = all_lines[resolved_start - 1:resolved_end]
+            rendered = "\n".join(
+                f"{line_no}: {line}"
+                for line_no, line in enumerate(selected_lines, start=resolved_start)
+            )
+            return {
+                "content": rendered,
+                "truncated": resolved_page < total_pages,
+                "has_more": resolved_page < total_pages,
+                "next_page": resolved_page + 1 if resolved_page < total_pages else None,
+                "mode": "page",
+                "total_chars": total_chars,
+                "returned_chars": len(rendered),
+                "page": resolved_page,
+                "page_size_lines": resolved_page_size_lines,
+                "total_pages": total_pages,
+                "line_start": resolved_start,
+                "line_end": resolved_end,
+                "returned_line_count": len(selected_lines),
+                "total_lines": total_lines,
+            }
+
+        if total_lines <= 0:
+            return {
+                "content": "",
+                "truncated": False,
+                "has_more": False,
+                "total_chars": 0,
+                "returned_chars": 0,
+                "mode": "line_range",
+                "line_start": 0,
+                "line_end": 0,
+                "returned_line_count": 0,
+                "total_lines": 0,
+            }
+
+        resolved_start = int(line_start or 0) if line_start is not None else None
+        resolved_end = int(line_end or 0) if line_end is not None else None
+
+        if resolved_start is None and resolved_end is None:
+            resolved_start = 1
+            resolved_end = min(total_lines, max(int(default_window or 40), 1))
+
+        if resolved_start is None:
+            resolved_end = min(total_lines, max(1, resolved_end or total_lines))
+            resolved_start = max(1, resolved_end - default_window)
+        elif resolved_end is None:
+            resolved_start = max(1, resolved_start)
+            resolved_end = min(total_lines, resolved_start + default_window)
+        else:
+            resolved_start = max(1, resolved_start)
+            resolved_end = min(total_lines, max(resolved_start, resolved_end))
+
+        selected_lines = all_lines[resolved_start - 1:resolved_end]
+        numbered_lines = [
+            f"{line_no}: {line}"
+            for line_no, line in enumerate(selected_lines, start=resolved_start)
+        ]
+        rendered = "\n".join(numbered_lines)
         return {
-            "content": clipped,
-            "truncated": len(content) > len(clipped),
-            "total_chars": len(content),
-            "returned_chars": len(clipped),
+            "content": rendered,
+            "truncated": resolved_start > 1 or resolved_end < total_lines,
+            "has_more": resolved_end < total_lines,
+            "previous_line_start": max(1, resolved_start - max(default_window, 1)) if resolved_start > 1 else None,
+            "next_line_start": resolved_end + 1 if resolved_end < total_lines else None,
+            "total_chars": total_chars,
+            "returned_chars": len(rendered),
+            "mode": "line_range",
+            "line_start": resolved_start,
+            "line_end": resolved_end,
+            "returned_line_count": len(selected_lines),
+            "total_lines": total_lines,
+        }
+
+    @classmethod
+    def _build_repo_match_context(
+        cls,
+        *,
+        repo_dir: Path,
+        repo_relative_path: str,
+        line_number: int,
+        context_lines: int,
+        max_chars: int = 800,
+    ) -> Dict[str, Any]:
+        if context_lines <= 0:
+            return {}
+        file_path = repo_dir / repo_relative_path
+        if not file_path.is_file():
+            return {}
+        preview = cls._read_text_payload(
+            file_path,
+            mode="line_range",
+            max_chars=max_chars,
+            chunk_index=None,
+            chunk_chars=None,
+            page=None,
+            page_size_lines=None,
+            line_start=max(1, int(line_number or 1) - context_lines),
+            line_end=max(1, int(line_number or 1) + context_lines),
+        )
+        return {
+            "context_start_line": preview.get("line_start"),
+            "context_end_line": preview.get("line_end"),
+            "context_text": preview.get("content"),
+            "context_truncated": preview.get("truncated"),
         }
 
     @classmethod
@@ -2014,6 +2273,7 @@ class _PaperResearchToolBase(ToolBase):
         runtime_requirements = dict(normalized.get("runtime_requirements") or {})
         worker_environment = dict(dict(runtime_payload.get("runtime_worker") or {}).get("environment") or {})
         worker_packages = dict(worker_environment.get("packages") or {})
+        worker_commands = dict(worker_environment.get("commands") or {})
         package_aliases = {
             "sklearn": "scikit-learn",
             "scikit_learn": "scikit-learn",
@@ -2036,6 +2296,53 @@ class _PaperResearchToolBase(ToolBase):
             normalized["runtime_requirements"] = runtime_requirements
 
         runtime_candidates = [item for item in list(runtime_payload.get("runtime_candidates") or []) if isinstance(item, dict)]
+        preferred_runtime_type = (
+            str(
+                next(
+                    (
+                        item.get("runtime_type")
+                        for item in runtime_candidates
+                        if str(item.get("status") or "").strip().lower() in {"ready", "available", "supported"}
+                    ),
+                    "",
+                )
+            ).strip()
+            or str(runtime_candidates[0].get("runtime_type") or "").strip()
+            if runtime_candidates
+            else ""
+        )
+        installed_key_packages = [
+            name
+            for name, package_payload in worker_packages.items()
+            if isinstance(package_payload, dict) and bool(package_payload.get("installed"))
+        ][:12]
+        available_commands = [
+            name
+            for name, command_payload in worker_commands.items()
+            if isinstance(command_payload, dict) and bool(command_payload.get("available"))
+        ][:12]
+        normalized["runtime_snapshot"] = {
+            "captured_from": "paper_research_inspect_runtime",
+            "repo_root_relative_path": detected_repo_root,
+            "runtime_worker_available": bool(dict(runtime_payload.get("runtime_worker") or {}).get("available")),
+            "preferred_runtime_type": preferred_runtime_type,
+            "candidate_summaries": [
+                {
+                    "runtime_type": str(item.get("runtime_type") or "").strip(),
+                    "status": str(item.get("status") or "").strip(),
+                    "reason": str(item.get("reason") or "").strip(),
+                    "blockers": [str(blocker).strip() for blocker in list(item.get("blockers") or []) if str(blocker).strip()],
+                    "evidence_files": [str(path).strip() for path in list(item.get("evidence_files") or [])[:6] if str(path).strip()],
+                }
+                for item in runtime_candidates[:6]
+            ],
+            "environment": {
+                "python_version": str(dict(worker_environment.get("python") or {}).get("version") or "").strip(),
+                "available_commands": available_commands,
+                "installed_key_packages": installed_key_packages,
+                "missing_required_packages": missing_runtime_packages,
+            },
+        }
         blockers = normalized.get("blockers")
         if isinstance(blockers, list):
             normalized_blockers: List[Any] = []
@@ -2889,7 +3196,23 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
             "relative_path": {"type": "string", "description": "manifest 中返回的 artifact 相对路径。"},
-            "max_chars": {"type": "integer", "default": 20000, "description": "文本 artifact 最多返回字符数。"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "chunk", "page", "line_range"],
+                "default": "auto",
+                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
+            },
+            "max_chars": {
+                "type": "integer",
+                "default": 20000,
+                "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。",
+            },
+            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
+            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
+            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
+            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
+            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
+            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
         },
         "required": ["project_id", "relative_path"],
     }
@@ -2898,7 +3221,14 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
             relative_path = self._normalize_relative_path(kwargs.get("relative_path"))
+            mode = str(kwargs.get("mode") or "auto")
             max_chars = int(kwargs.get("max_chars") or 20000)
+            chunk_index = kwargs.get("chunk_index")
+            chunk_chars = kwargs.get("chunk_chars")
+            page = kwargs.get("page")
+            page_size_lines = kwargs.get("page_size_lines")
+            line_start = kwargs.get("line_start")
+            line_end = kwargs.get("line_end")
             project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
@@ -2933,41 +3263,54 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
                     },
                 )
 
+            text_payload = self._read_text_payload(
+                actual_path,
+                mode=mode,
+                max_chars=max_chars,
+                chunk_index=chunk_index,
+                chunk_chars=chunk_chars,
+                page=page,
+                page_size_lines=page_size_lines,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            parsed_content: Any = None
             if spec["content_type"] == "json":
-                content = json.loads(actual_path.read_text(encoding="utf-8"))
-                output_body = json.dumps(content, ensure_ascii=False, indent=2)
-                lines = [
-                    f"已读取 artifact: {relative_path}",
-                    f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
-                    "- Content type: json",
-                    "Content:",
-                    output_body,
-                ]
-                data = {
-                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
-                    "relative_path": relative_path,
-                    "exists": True,
-                    "content_type": "json",
-                    "content": content,
-                    "truncated": False,
-                }
-                return ToolResult(success=True, output="\n".join(lines), data=data)
-
-            text_payload = self._read_text_preview(actual_path, max_chars=max_chars)
+                try:
+                    parsed_content = json.loads(actual_path.read_text(encoding="utf-8"))
+                except Exception:
+                    parsed_content = None
             lines = [
                 f"已读取 artifact: {relative_path}",
                 f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
                 f"- Content type: {spec['content_type']}",
+                f"- Mode: {text_payload.get('mode')}",
                 f"- Truncated: {text_payload['truncated']}",
                 f"- Returned chars: {text_payload['returned_chars']}/{text_payload['total_chars']}",
+                f"- Has more: {text_payload.get('has_more')}",
+            ]
+            if text_payload.get("chunk_index") is not None:
+                lines.append(
+                    f"- Chunk: {text_payload.get('chunk_index')}/{text_payload.get('total_chunks')} (next={text_payload.get('next_chunk_index')})"
+                )
+            if text_payload.get("page") is not None:
+                lines.append(
+                    f"- Page: {text_payload.get('page')}/{text_payload.get('total_pages')} (next={text_payload.get('next_page')})"
+                )
+            if text_payload.get("line_start") is not None:
+                lines.append(
+                    f"- Lines: {text_payload.get('line_start')}-{text_payload.get('line_end')} / {text_payload.get('total_lines')}"
+                )
+            lines.extend([
                 "Content:",
                 str(text_payload["content"]),
-            ]
+            ])
             data = {
                 **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                 "relative_path": relative_path,
                 "exists": True,
                 "content_type": spec["content_type"],
+                "content": parsed_content,
                 **text_payload,
             }
             return ToolResult(success=True, output="\n".join(lines), data=data)
@@ -2986,7 +3329,19 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
             "repo_relative_path": {"type": "string", "description": "repo/source 下的相对路径，例如 README.md 或 train.py。"},
-            "max_chars": {"type": "integer", "default": 20000, "description": "最多返回字符数。"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "chunk", "page", "line_range"],
+                "default": "auto",
+                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
+            },
+            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
+            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
+            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
+            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
+            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
+            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
+            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
         },
         "required": ["project_id", "repo_relative_path"],
     }
@@ -2995,7 +3350,14 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
         async def _handler(db: AsyncSession) -> ToolResult:
             project_id = int(kwargs["project_id"])
             repo_relative_path = self._normalize_relative_path(kwargs.get("repo_relative_path"))
+            mode = str(kwargs.get("mode") or "auto")
             max_chars = int(kwargs.get("max_chars") or 20000)
+            chunk_index = kwargs.get("chunk_index")
+            chunk_chars = kwargs.get("chunk_chars")
+            page = kwargs.get("page")
+            page_size_lines = kwargs.get("page_size_lines")
+            line_start = kwargs.get("line_start")
+            line_end = kwargs.get("line_end")
             if not repo_relative_path:
                 return ToolResult(success=False, output="repo_relative_path 无效。", error="invalid_repo_relative_path")
             if any(part in _REPO_SKIPPED_DIRS for part in repo_relative_path.split("/")):
@@ -3045,7 +3407,17 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
                     data={"project_id": project_id, "repo_relative_path": repo_relative_path},
                 )
 
-            text_payload = self._read_text_preview(target_path, max_chars=max_chars)
+            text_payload = self._read_text_payload(
+                target_path,
+                mode=mode,
+                max_chars=max_chars,
+                chunk_index=chunk_index,
+                chunk_chars=chunk_chars,
+                page=page,
+                page_size_lines=page_size_lines,
+                line_start=line_start,
+                line_end=line_end,
+            )
             relative_path = f"repo/source/{repo_relative_path}"
             data = {
                 **self._root_descriptor(project_payload=project_payload, workspace=workspace),
@@ -3056,11 +3428,26 @@ class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
             lines = [
                 f"已读取 repo 文件: {relative_path}",
                 f"- Root alias: {self._PROJECT_ROOT_ALIAS}",
+                f"- Mode: {text_payload.get('mode')}",
                 f"- Truncated: {text_payload['truncated']}",
                 f"- Returned chars: {text_payload['returned_chars']}/{text_payload['total_chars']}",
+            ]
+            if text_payload.get("chunk_index") is not None:
+                lines.append(
+                    f"- Chunk: {text_payload.get('chunk_index')}/{text_payload.get('total_chunks')} (next={text_payload.get('next_chunk_index')})"
+                )
+            if text_payload.get("page") is not None:
+                lines.append(
+                    f"- Page: {text_payload.get('page')}/{text_payload.get('total_pages')} (next={text_payload.get('next_page')})"
+                )
+            if text_payload.get("line_start") is not None:
+                lines.append(
+                    f"- Returned lines: {text_payload.get('line_start')}-{text_payload.get('line_end')} / {text_payload.get('total_lines')}"
+                )
+            lines.extend([
                 "Content:",
                 str(text_payload["content"]),
-            ]
+            ])
             return ToolResult(success=True, output="\n".join(lines), data=data)
 
         return await self._with_db(_handler)
@@ -3081,6 +3468,7 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
             "case_sensitive": {"type": "boolean", "default": False, "description": "是否大小写敏感。"},
             "is_regex": {"type": "boolean", "default": False, "description": "是否将 query 按正则表达式处理。"},
             "glob": {"type": "string", "description": "可选文件 glob，例如 `*.py` 或 `**/*.ipynb`。"},
+            "context_lines": {"type": "integer", "default": 0, "description": "可选，返回每个命中点上下各多少行上下文。适合先 search 再按行读局部。"},
         },
         "required": ["project_id", "query"],
     }
@@ -3281,6 +3669,7 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
             case_sensitive = bool(kwargs.get("case_sensitive", False))
             is_regex = bool(kwargs.get("is_regex", False))
             glob = str(kwargs.get("glob") or "").strip() or None
+            context_lines = int(kwargs.get("context_lines") or 0)
             project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
             if project_payload is None:
                 return self._project_not_found(project_id)
@@ -3339,11 +3728,32 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
                 )
 
             matches = list(search_payload.get("matches") or [])
+            if context_lines > 0:
+                enriched_matches: List[Dict[str, Any]] = []
+                for item in matches:
+                    enriched_matches.append(
+                        {
+                            **item,
+                            **self._build_repo_match_context(
+                                repo_dir=repo_dir,
+                                repo_relative_path=str(item.get("repo_relative_path") or ""),
+                                line_number=int(item.get("line_number") or 1),
+                                context_lines=context_lines,
+                            ),
+                        }
+                    )
+                matches = enriched_matches
             matched_files = list(search_payload.get("matched_files") or [])
-            result_lines = [
-                f"- {item.get('relative_path')}:{item.get('line_number')} | {item.get('line_text')}"
-                for item in matches
-            ]
+            result_lines: List[str] = []
+            for item in matches:
+                result_lines.append(
+                    f"- {item.get('relative_path')}:{item.get('line_number')} | {item.get('line_text')}"
+                )
+                context_text = str(item.get("context_text") or "").strip()
+                if context_text:
+                    result_lines.append(
+                        f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
+                    )
             lines = [
                 "已搜索 repo/source。",
                 f"- Project: /projects/{project_id}",
@@ -3352,6 +3762,7 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
                 f"- Regex: {is_regex}",
                 f"- Case sensitive: {case_sensitive}",
                 f"- Glob: {glob or 'none'}",
+                f"- Context lines: {context_lines}",
                 f"- Matched files: {len(matched_files)}",
                 f"- Returned matches: {len(matches)}/{max_results}",
                 f"- Truncated: {bool(search_payload.get('truncated'))}",
@@ -3365,6 +3776,7 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
                     **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                     "query": query,
                     "glob": glob,
+                    "context_lines": context_lines,
                     "case_sensitive": case_sensitive,
                     "is_regex": is_regex,
                     "engine": str(search_payload.get("engine") or "unknown"),
@@ -3455,7 +3867,19 @@ class PaperResearchReadImplementationSpecTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "max_chars": {"type": "integer", "default": 20000, "description": "文本输出字符上限；JSON 会完整返回到结构化 data 中。"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "chunk", "page", "line_range"],
+                "default": "auto",
+                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
+            },
+            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
+            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
+            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
+            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
+            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
+            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
+            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
         },
         "required": ["project_id"],
     }
@@ -3468,7 +3892,14 @@ class PaperResearchReadImplementationSpecTool(_PaperResearchToolBase):
         ).execute(
             project_id=int(kwargs["project_id"]),
             relative_path="specs/implementation_spec.json",
+            mode=str(kwargs.get("mode") or "auto"),
             max_chars=int(kwargs.get("max_chars") or 20000),
+            chunk_index=kwargs.get("chunk_index"),
+            chunk_chars=kwargs.get("chunk_chars"),
+            page=kwargs.get("page"),
+            page_size_lines=kwargs.get("page_size_lines"),
+            line_start=kwargs.get("line_start"),
+            line_end=kwargs.get("line_end"),
         )
 
 
@@ -3588,7 +4019,19 @@ class PaperResearchReadRunDraftsTool(_PaperResearchToolBase):
         "type": "object",
         "properties": {
             "project_id": {"type": "integer", "description": "研究项目 ID。"},
-            "max_chars": {"type": "integer", "default": 20000, "description": "文本输出字符上限；JSON 会完整返回到结构化 data 中。"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "chunk", "page", "line_range"],
+                "default": "auto",
+                "description": "读取模式。full 返回全文；chunk/page/line_range 返回原文分段，不做摘要。",
+            },
+            "max_chars": {"type": "integer", "default": 20000, "description": "兼容旧调用的字符窗口参数；chunk 模式下会作为默认 chunk_chars。"},
+            "chunk_index": {"type": "integer", "description": "chunk 模式下的块序号（1-based）。"},
+            "chunk_chars": {"type": "integer", "description": "chunk 模式下每块字符数。"},
+            "page": {"type": "integer", "description": "page 模式下的页号（1-based，按行分页）。"},
+            "page_size_lines": {"type": "integer", "description": "page 模式下每页多少行。"},
+            "line_start": {"type": "integer", "description": "line_range 模式起始行号（1-based）。"},
+            "line_end": {"type": "integer", "description": "line_range 模式结束行号（1-based）。"},
         },
         "required": ["project_id"],
     }
@@ -3601,7 +4044,14 @@ class PaperResearchReadRunDraftsTool(_PaperResearchToolBase):
         ).execute(
             project_id=int(kwargs["project_id"]),
             relative_path="drafts/run_drafts.json",
+            mode=str(kwargs.get("mode") or "auto"),
             max_chars=int(kwargs.get("max_chars") or 20000),
+            chunk_index=kwargs.get("chunk_index"),
+            chunk_chars=kwargs.get("chunk_chars"),
+            page=kwargs.get("page"),
+            page_size_lines=kwargs.get("page_size_lines"),
+            line_start=kwargs.get("line_start"),
+            line_end=kwargs.get("line_end"),
         )
 
 
@@ -3979,8 +4429,9 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                     "input_notebook/parameters/expected_outputs/evidence_files/external_dependencies/"
                     "preflight_checks/generated_files。preflight_checks 必须是对象数组，例如 "
                     "[{\"name\":\"check_python\",\"required\":true,\"status\":\"passed\"}]；不要传 "
-                    "{\"check_python\": true} 这种 map。generated_files 只能写入 executions、generated 或 tmp 下的"
-                    "执行级文件，不能覆盖 repo/source。"
+                    "{\"check_python\": true} 这种 map。generated_files 每项至少需要 content，"
+                    "并应显式给出 relative_path；如果误写成 path/file_path/filename/name，writer 会尝试吸收。"
+                    "generated_files 只能写入 executions、generated 或 tmp 下的执行级文件，不能覆盖 repo/source。"
                 ),
             },
         },

@@ -68,6 +68,37 @@ def _safe_slug(value: Any, fallback: str = "execution") -> str:
     return (text or fallback)[:80]
 
 
+def _strip_repo_root_prefix(value: Any, *, repo_root_relative_path: str) -> str:
+    raw = str(value or "").strip()
+    normalized = _normalize_relative_path(raw)
+    if not raw or not normalized or not repo_root_relative_path:
+        return raw
+    repo_root = _normalize_relative_path(repo_root_relative_path)
+    if not repo_root:
+        return raw
+    if normalized == repo_root:
+        return "."
+    prefix = f"{repo_root}/"
+    if normalized.startswith(prefix):
+        return normalized.removeprefix(prefix)
+    return raw
+
+
+def _rewrite_generated_path_for_cwd(value: Any, *, cwd_relative_path: str) -> str:
+    raw = str(value or "").strip()
+    normalized = _normalize_relative_path(raw)
+    cwd = _normalize_relative_path(cwd_relative_path)
+    if not raw or not normalized or not cwd:
+        return raw
+    if not _is_safe_generated_file_path(normalized):
+        return raw
+    try:
+        relative = os.path.relpath(normalized, start=cwd).replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        return raw
+    return relative or raw
+
+
 def _json_dumps(payload: Dict[str, Any]) -> str:
     return json.dumps(payload or {}, ensure_ascii=False, indent=2, default=str)
 
@@ -615,6 +646,8 @@ class ProjectRuntimeService:
         if not raw_cwd or raw_cwd == "repo/source":
             normalized["cwd"] = detected_repo_root
 
+        normalized = self._normalize_repo_root_relative_command_paths(normalized)
+
         raw_preflight_checks = normalized.get("preflight_checks")
         if isinstance(raw_preflight_checks, dict):
             normalized_checks: List[Dict[str, Any]] = []
@@ -637,10 +670,142 @@ class ProjectRuntimeService:
                 normalized_checks.append(item)
             normalized["preflight_checks"] = normalized_checks
 
+        raw_generated_files = normalized.get("generated_files")
+        if isinstance(raw_generated_files, dict):
+            raw_generated_files = [raw_generated_files]
+        if isinstance(raw_generated_files, list):
+            execution_slug = _safe_slug(
+                normalized.get("execution_id")
+                or normalized.get("draft_id")
+                or normalized.get("label")
+                or normalized.get("runtime_type")
+                or "execution"
+            )
+            normalized_generated_files: List[Dict[str, Any]] = []
+            for index, entry in enumerate(raw_generated_files, start=1):
+                if not isinstance(entry, dict):
+                    normalized_generated_files.append(entry)
+                    continue
+                item = dict(entry)
+                relative_path = _normalize_relative_path(
+                    item.get("relative_path")
+                    or item.get("path")
+                    or item.get("target_path")
+                    or item.get("file_path")
+                    or item.get("output_path")
+                    or item.get("filename")
+                    or item.get("name")
+                    or ""
+                )
+                content = item.get("content")
+                if not relative_path and isinstance(content, str):
+                    raw_name = str(
+                        item.get("filename")
+                        or item.get("name")
+                        or item.get("id")
+                        or f"generated_file_{index}"
+                    ).strip()
+                    base_name = _safe_slug(raw_name) or f"generated_file_{index}"
+                    if "." not in base_name:
+                        base_name = f"{base_name}.py"
+                    relative_path = f"executions/{execution_slug}/{base_name}"
+                if relative_path:
+                    item["relative_path"] = relative_path
+                normalized_generated_files.append(item)
+            normalized["generated_files"] = normalized_generated_files
+
         if self._looks_like_env_check_spec(normalized):
             normalized["repo_root_relative_path"] = detected_repo_root
             normalized["cwd"] = detected_repo_root
             normalized["command"] = self._runtime_env_check_command()
+        return normalized
+
+    @staticmethod
+    def _normalize_repo_root_relative_command_paths(payload: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(payload or {})
+        repo_root_relative_path = _normalize_relative_path(normalized.get("repo_root_relative_path") or "")
+        cwd = _normalize_relative_path(normalized.get("cwd") or "")
+        if not repo_root_relative_path or not cwd:
+            return normalized
+
+        command = normalized.get("command")
+        if isinstance(command, list) and command:
+            command_items = [str(item or "") for item in command]
+            command_items = [
+                _strip_repo_root_prefix(item, repo_root_relative_path=repo_root_relative_path)
+                for item in command_items
+            ]
+            command_items = [
+                _rewrite_generated_path_for_cwd(item, cwd_relative_path=cwd)
+                for item in command_items
+            ]
+            if len(command_items) >= 3 and command_items[0].startswith("python") and command_items[1] == "-c":
+                prefix = f"{repo_root_relative_path}/"
+                command_items[2] = str(command_items[2] or "").replace(prefix, "")
+            normalized["command"] = command_items
+
+        entrypoint = normalized.get("entrypoint")
+        if isinstance(entrypoint, dict):
+            entrypoint_item = dict(entrypoint)
+            path_or_hint = entrypoint_item.get("path_or_hint")
+            if isinstance(path_or_hint, str):
+                entrypoint_item["path_or_hint"] = _strip_repo_root_prefix(
+                    path_or_hint,
+                    repo_root_relative_path=repo_root_relative_path,
+                )
+                entrypoint_item["path_or_hint"] = _rewrite_generated_path_for_cwd(
+                    entrypoint_item["path_or_hint"],
+                    cwd_relative_path=cwd,
+                )
+            for key in ("path", "file"):
+                if isinstance(entrypoint_item.get(key), str):
+                    entrypoint_item[key] = _strip_repo_root_prefix(
+                        entrypoint_item.get(key),
+                        repo_root_relative_path=repo_root_relative_path,
+                    )
+                    entrypoint_item[key] = _rewrite_generated_path_for_cwd(
+                        entrypoint_item.get(key),
+                        cwd_relative_path=cwd,
+                    )
+            normalized["entrypoint"] = entrypoint_item
+
+        expected_outputs = normalized.get("expected_outputs")
+        if isinstance(expected_outputs, list):
+            normalized_outputs: List[Any] = []
+            for item in expected_outputs:
+                if not isinstance(item, dict):
+                    normalized_outputs.append(item)
+                    continue
+                output_item = dict(item)
+                if isinstance(output_item.get("path"), str):
+                    output_item["path"] = _strip_repo_root_prefix(
+                        output_item.get("path"),
+                        repo_root_relative_path=repo_root_relative_path,
+                    )
+                normalized_outputs.append(output_item)
+            normalized["expected_outputs"] = normalized_outputs
+
+        preflight_checks = normalized.get("preflight_checks")
+        if isinstance(preflight_checks, list):
+            normalized_checks: List[Any] = []
+            for item in preflight_checks:
+                if not isinstance(item, dict):
+                    normalized_checks.append(item)
+                    continue
+                check_item = dict(item)
+                details = check_item.get("details")
+                if isinstance(details, dict):
+                    details_item = dict(details)
+                    for key in ("file", "path"):
+                        if isinstance(details_item.get(key), str):
+                            details_item[key] = _strip_repo_root_prefix(
+                                details_item.get(key),
+                                repo_root_relative_path=repo_root_relative_path,
+                            )
+                    check_item["details"] = details_item
+                normalized_checks.append(check_item)
+            normalized["preflight_checks"] = normalized_checks
+
         return normalized
 
     @staticmethod

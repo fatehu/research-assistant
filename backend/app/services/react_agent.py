@@ -36,7 +36,7 @@ from app.services.agent_tool_error_contract import (
     merge_error_contract,
 )
 from app.services.llm_service import LLMService
-from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
+from app.services.smart_chunking.token_utils import estimate_tokens
 
 
 class AgentState(Enum):
@@ -141,6 +141,7 @@ class ExecutedToolCall:
     tool_message: Dict[str, Any]
     tool_name: str
     observation_output: str
+    result_data: Dict[str, Any]
     tool_call_id: str
     arguments: Dict[str, Any]
     success: bool
@@ -1151,6 +1152,10 @@ class AgentCore:
         aliases = {
             "dashscope": "aliyun",
             "aliyun": "aliyun",
+            "aliyun_qwen35_flash": "aliyun",
+            "aliyun_qwen35_plus": "aliyun",
+            "aliyun_qwen_plus": "aliyun",
+            "aliyun_qwen_max": "aliyun",
             "deepseek_test": "deepseek",
             "azure_openai": "openai",
             "azure-openai": "openai",
@@ -1190,6 +1195,8 @@ class AgentCore:
             "aliyun:qwen-max": 131072,
             "aliyun:qwen-plus": 131072,
             "aliyun:qwen-turbo": 65536,
+            "aliyun:qwen3.5-flash": 131072,
+            "aliyun:qwen3.5-plus": 131072,
         }
 
     @classmethod
@@ -1582,6 +1589,169 @@ class AgentCore:
         except Exception as exc:
             logger.warning(f"[AgentCore] failed to persist active skills for conversation {conversation_id}: {exc}")
 
+    @classmethod
+    def _normalize_workflow_binding(cls, binding: Any) -> Dict[str, Any]:
+        if not isinstance(binding, dict):
+            return {}
+
+        def _coerce_int(value: Any) -> Optional[int]:
+            if value in (None, "", False):
+                return None
+            try:
+                normalized = int(value)
+            except Exception:
+                return None
+            return normalized if normalized > 0 else None
+
+        def _coerce_text(value: Any) -> Optional[str]:
+            text = str(value or "").strip()
+            return text or None
+
+        normalized: Dict[str, Any] = {}
+        for field in ("skill", "notebook_id", "current_stage", "current_draft_id", "baseline_execution_id", "tuning_execution_id", "updated_at"):
+            value = _coerce_text(binding.get(field))
+            if value:
+                normalized[field] = value
+        for field in ("paper_id", "project_id", "workspace_id"):
+            value = _coerce_int(binding.get(field))
+            if value is not None:
+                normalized[field] = value
+        return normalized
+
+    @classmethod
+    def _merge_workflow_binding(cls, existing: Any, incoming: Any) -> Dict[str, Any]:
+        existing_normalized = cls._normalize_workflow_binding(existing)
+        incoming_normalized = cls._normalize_workflow_binding(incoming)
+        if not existing_normalized and not incoming_normalized:
+            return {}
+
+        merged = dict(existing_normalized)
+        merged.update(incoming_normalized)
+        merged["updated_at"] = (
+            str(
+                incoming_normalized.get("updated_at")
+                or existing_normalized.get("updated_at")
+                or datetime.utcnow().isoformat()
+            ).strip()
+            or datetime.utcnow().isoformat()
+        )
+        return merged
+
+    @classmethod
+    def _merge_conversation_state_with_workflow_binding(
+        cls,
+        existing_state: Any,
+        next_state: Any,
+    ) -> Dict[str, Any]:
+        merged_state = dict(next_state or {}) if isinstance(next_state, dict) else {}
+        existing_binding = dict(existing_state.get("workflow_binding") or {}) if isinstance(existing_state, dict) else {}
+        next_binding = dict(merged_state.get("workflow_binding") or {}) if isinstance(merged_state, dict) else {}
+        merged_binding = cls._merge_workflow_binding(existing_binding, next_binding)
+        if merged_binding:
+            merged_state["workflow_binding"] = merged_binding
+        else:
+            merged_state.pop("workflow_binding", None)
+        return merged_state
+
+    @classmethod
+    def _extract_workflow_binding_from_tool_result(
+        cls,
+        *,
+        tool_name: str,
+        result_data: Any,
+    ) -> Dict[str, Any]:
+        if not str(tool_name or "").startswith(cls._PAPER_RESEARCH_TOOL_PREFIX):
+            return {}
+        if not isinstance(result_data, dict):
+            return {}
+
+        paper_payload = dict(result_data.get("paper") or {})
+        project_payload = dict(result_data.get("project") or {})
+        workspace_payload = dict(result_data.get("workspace") or {})
+        status_summary = dict(result_data.get("status_summary") or {})
+        background_execution = (
+            dict(result_data.get("background_execution") or {})
+            if isinstance(result_data.get("background_execution"), dict)
+            else {}
+        )
+
+        binding: Dict[str, Any] = {
+            "skill": cls._PAPER_SKILL_NAME,
+            "paper_id": paper_payload.get("id"),
+            "project_id": project_payload.get("id") or result_data.get("project_id") or background_execution.get("project_id"),
+            "workspace_id": workspace_payload.get("id") or result_data.get("workspace_id"),
+            "notebook_id": workspace_payload.get("notebook_id") or result_data.get("notebook_id"),
+            "current_stage": (
+                status_summary.get("current_stage")
+                or background_execution.get("stage")
+                or result_data.get("current_stage")
+            ),
+            "current_draft_id": (
+                result_data.get("draft_id")
+                or result_data.get("run_id")
+                or result_data.get("label")
+            ),
+            "baseline_execution_id": (
+                status_summary.get("baseline_execution_id")
+                or (
+                    background_execution.get("execution_id")
+                    if str(background_execution.get("stage") or "").strip().lower() == "baseline_repro"
+                    else None
+                )
+            ),
+            "tuning_execution_id": (
+                status_summary.get("tuning_execution_id")
+                or (
+                    background_execution.get("execution_id")
+                    if str(background_execution.get("stage") or "").strip().lower() == "tuning"
+                    else None
+                )
+            ),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        return cls._normalize_workflow_binding(binding)
+
+    async def _maybe_update_workflow_binding_from_tool_result(
+        self,
+        context: AgentContext,
+        call: ParsedToolCall,
+        result: ToolResult,
+    ) -> None:
+        if not bool(result.success):
+            return
+
+        next_binding = self._extract_workflow_binding_from_tool_result(
+            tool_name=call.name,
+            result_data=result.data,
+        )
+        if not next_binding:
+            return
+
+        existing_state = dict(context.conversation_state or {}) if isinstance(context.conversation_state, dict) else {}
+        merged_state = self._merge_conversation_state_with_workflow_binding(
+            existing_state,
+            {
+                **existing_state,
+                "workflow_binding": next_binding,
+            },
+        )
+        if merged_state == existing_state:
+            return
+        context.conversation_state = merged_state
+
+        conversation_id = getattr(self.runtime_context, "conversation_id", None)
+        if conversation_id is None:
+            return
+        try:
+            await self.runtime_service.upsert_conversation_context_state(
+                int(conversation_id),
+                dict(merged_state),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[AgentCore] failed to persist workflow binding for conversation {conversation_id}: {exc}"
+            )
+
     async def _maybe_pin_skill_from_tool_result(
         self,
         context: AgentContext,
@@ -1773,6 +1943,7 @@ class AgentCore:
             return ""
 
         lines: List[str] = []
+        workflow_binding = cls._normalize_workflow_binding(state.get("workflow_binding") or {})
         active_topic = cls._compact_debug_text(state.get("active_topic") or "", 220)
         user_goal = cls._compact_debug_text(state.get("user_goal") or "", 220)
         constraints = [
@@ -1830,6 +2001,38 @@ class AgentCore:
             suffix = f"（{'；'.join(suffix_parts)}）" if suffix_parts else ""
             evidence_ledger.append(f"{summary}{suffix}")
         last_reasoning_summary = cls._compact_debug_text(state.get("last_reasoning_summary") or "", 180)
+
+        if workflow_binding:
+            skill_name = cls._compact_debug_text(workflow_binding.get("skill") or "", 64)
+            paper_id = workflow_binding.get("paper_id")
+            project_id = workflow_binding.get("project_id")
+            workspace_id = workflow_binding.get("workspace_id")
+            notebook_id = cls._compact_debug_text(workflow_binding.get("notebook_id") or "", 96)
+            current_stage = cls._compact_debug_text(workflow_binding.get("current_stage") or "", 96)
+            current_draft_id = cls._compact_debug_text(workflow_binding.get("current_draft_id") or "", 96)
+            baseline_execution_id = cls._compact_debug_text(workflow_binding.get("baseline_execution_id") or "", 96)
+            tuning_execution_id = cls._compact_debug_text(workflow_binding.get("tuning_execution_id") or "", 96)
+            if skill_name:
+                lines.append(f"- 当前 workflow: {skill_name}")
+            binding_parts: List[str] = []
+            if paper_id is not None:
+                binding_parts.append(f"paper_id={paper_id}")
+            if project_id is not None:
+                binding_parts.append(f"project_id={project_id}")
+            if workspace_id is not None:
+                binding_parts.append(f"workspace_id={workspace_id}")
+            if binding_parts:
+                lines.append(f"- Workflow 绑定: {', '.join(binding_parts)}")
+            if notebook_id:
+                lines.append(f"- Notebook 绑定: {notebook_id}")
+            if current_stage:
+                lines.append(f"- 当前阶段绑定: {current_stage}")
+            if current_draft_id:
+                lines.append(f"- 当前 draft 绑定: {current_draft_id}")
+            if baseline_execution_id:
+                lines.append(f"- baseline_execution_id: {baseline_execution_id}")
+            if tuning_execution_id:
+                lines.append(f"- tuning_execution_id: {tuning_execution_id}")
 
         if active_topic:
             lines.append(f"- 当前主题: {active_topic}")
@@ -2188,7 +2391,63 @@ class AgentCore:
         )
 
     @staticmethod
-    def _summarize_messages(messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
+    def _normalize_compacted_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @staticmethod
+    async def _compress_text_with_qwen_turbo(
+        text: str,
+        *,
+        target_token_budget: int,
+        source: str,
+        compression_kind: str,
+    ) -> str:
+        normalized = AgentCore._normalize_compacted_text(text)
+        if not normalized:
+            return ""
+
+        provider = str(getattr(settings, "agent_budget_compression_provider", "aliyun") or "aliyun").strip()
+        model_name = str(getattr(settings, "agent_budget_compression_model", "qwen-turbo") or "qwen-turbo").strip()
+        output_budget = max(min(int(getattr(settings, "agent_budget_compression_max_tokens", 420) or 420), 1200), 96)
+        output_budget = min(output_budget, max(int(target_token_budget or 0), 96))
+
+        current = normalized
+        for attempt in range(2):
+            try:
+                llm = LLMService(provider)
+                llm.config = dict(llm.config)
+                llm.config["model"] = model_name
+                response = await llm.chat(
+                    messages=[{"role": "user", "content": current}],
+                    system_prompt=(
+                        "你是上下文压缩器。"
+                        f"当前任务是压缩{compression_kind}。"
+                        "请保留任务目标、关键事实、路径、文件名、参数名、错误名、execution_id、tool 名称等可继续执行所必需的信息。"
+                        "删除寒暄、重复描述、冗余细节。"
+                        "不要使用 markdown，不要解释，不要加前言。"
+                        f"请尽量把结果压到约 {max(int(target_token_budget or 0), 96)} token 以内。"
+                    ),
+                    temperature=0.1,
+                    max_tokens=output_budget,
+                    source=source,
+                )
+                compressed = AgentCore._normalize_compacted_text(response.get("content", ""))
+            except Exception as exc:
+                logger.warning(f"[AgentCore] qwen-turbo compression failed source={source}: {exc}")
+                compressed = ""
+
+            if not compressed:
+                break
+            current = compressed
+            if estimate_tokens(current) <= max(int(target_token_budget or 0), 0):
+                return current
+
+        if current and estimate_tokens(current) <= estimate_tokens(normalized):
+            return current
+        return f"[上下文压缩失败，请在需要时重新读取原始内容。kind={compression_kind}]"
+
+    @classmethod
+    async def _summarize_messages(cls, messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
         lines: List[str] = []
         for msg in messages:
             role = str(msg.get("role", "unknown") or "unknown")
@@ -2204,17 +2463,25 @@ class AgentCore:
             lines.append(f"- {role}: {content[:160]}")
             if len(lines) >= max_lines:
                 break
-        return "\n".join(lines)
+        rendered = "\n".join(lines).strip()
+        if not rendered:
+            return ""
+        return await cls._compress_text_with_qwen_turbo(
+            rendered,
+            target_token_budget=max(160, max_lines * 40),
+            source="chat.budget.message_summary",
+            compression_kind="消息摘要",
+        )
 
     @classmethod
-    def _build_system_compression_message(
+    async def _build_system_compression_message(
         cls,
         messages: Sequence[Dict[str, Any]],
         *,
         title: str,
         max_lines: int = 8,
     ) -> Optional[Dict[str, str]]:
-        summary = cls._summarize_messages(messages, max_lines=max_lines).strip()
+        summary = (await cls._summarize_messages(messages, max_lines=max_lines)).strip()
         if not summary:
             return None
         return {"role": "system", "content": f"{title}：\n{summary}"}
@@ -2238,7 +2505,13 @@ class AgentCore:
         return rows[:keep_start], rows[keep_start:]
 
     @staticmethod
-    def _truncate_message_content_to_token_budget(content: str, token_budget: int) -> str:
+    async def _truncate_message_content_to_token_budget(
+        content: str,
+        token_budget: int,
+        *,
+        role: str,
+        kind: str,
+    ) -> str:
         text = str(content or "")
         if not text:
             return text
@@ -2246,17 +2519,15 @@ class AgentCore:
         if current_tokens <= max(int(token_budget or 0), 0):
             return text
 
-        token_budget = max(int(token_budget or 0), 24)
-        char_budget = max(tokens_to_chars(token_budget, text), 96)
-        marker = "\n...[system-compression-truncated]...\n"
-        head_chars = max(48, int(char_budget * 0.7))
-        tail_budget = max(0, char_budget - head_chars - len(marker))
-        if tail_budget > 0 and len(text) > head_chars:
-            return f"{text[:head_chars]}{marker}{text[-tail_budget:]}"
-        return f"{text[: max(48, char_budget - len(marker))]}{marker}"
+        return await AgentCore._compress_text_with_qwen_turbo(
+            text,
+            target_token_budget=max(int(token_budget or 0), 96),
+            source="chat.budget.message_truncation",
+            compression_kind=f"消息裁剪 role={role or 'unknown'} kind={kind or 'unknown'}",
+        )
 
     @classmethod
-    def _apply_content_truncation_until_budget(
+    async def _apply_content_truncation_until_budget(
         cls,
         messages: Sequence[Dict[str, Any]],
         *,
@@ -2307,7 +2578,12 @@ class AgentCore:
             overshoot = max(cls._estimate_messages_tokens(candidate) - budget, 1)
             shrink_by = max(overshoot + 16, current_tokens // 3)
             target_budget = max(24, current_tokens - shrink_by)
-            truncated = cls._truncate_message_content_to_token_budget(current_content, target_budget)
+            truncated = await cls._truncate_message_content_to_token_budget(
+                current_content,
+                target_budget,
+                role=role,
+                kind=kind,
+            )
             if truncated == current_content:
                 break
             candidate[idx]["content"] = truncated
@@ -3333,10 +3609,7 @@ class AgentCore:
 
     @staticmethod
     def _compact_debug_text(value: Any, limit: int = 180) -> str:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
-        if len(text) <= limit:
-            return text
-        return text[: max(0, limit - 1)].rstrip() + "…"
+        return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @classmethod
     def _debug_message_preview(cls, item: Dict[str, Any]) -> str:
@@ -3744,14 +4017,14 @@ class AgentCore:
         ]
 
         if older:
-            compressed_older = self._build_system_compression_message(
+            compressed_older = await self._build_system_compression_message(
                 older,
                 title="更早历史系统压缩",
                 max_lines=10,
             )
             if compressed_older:
                 overflow_compression_messages.append(compressed_older)
-                older_summary = self._summarize_messages(older, max_lines=10)
+                older_summary = await self._summarize_messages(older, max_lines=10)
                 if older_summary:
                     older_summary_parts.append(older_summary)
                     context.context_summary = older_summary
@@ -3776,14 +4049,14 @@ class AgentCore:
         budget = max(int(budget_state.get("effective_budget") or 0), 256)
 
         if self._estimate_messages_tokens(candidate) > budget and raw_recently_slid:
-            compressed_slid = self._build_system_compression_message(
+            compressed_slid = await self._build_system_compression_message(
                 raw_recently_slid,
                 title="滑出窗口历史系统压缩",
                 max_lines=8,
             )
             if compressed_slid:
                 overflow_compression_messages.append(compressed_slid)
-                slid_summary = self._summarize_messages(raw_recently_slid, max_lines=8)
+                slid_summary = await self._summarize_messages(raw_recently_slid, max_lines=8)
                 if slid_summary:
                     older_summary_parts.append(slid_summary)
                 raw_recently_slid = []
@@ -3796,14 +4069,14 @@ class AgentCore:
                 preserve_recent_turns=preserve_recent_turns,
             )
             if compactable_recent:
-                compressed_recent = self._build_system_compression_message(
+                compressed_recent = await self._build_system_compression_message(
                     compactable_recent,
                     title="近期历史系统压缩",
                     max_lines=8,
                 )
                 if compressed_recent:
                     overflow_compression_messages.append(compressed_recent)
-                    recent_summary = self._summarize_messages(compactable_recent, max_lines=8)
+                    recent_summary = await self._summarize_messages(compactable_recent, max_lines=8)
                     if recent_summary:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
@@ -3816,14 +4089,14 @@ class AgentCore:
                 preserve_recent_turns=1,
             )
             if compactable_recent:
-                compressed_recent = self._build_system_compression_message(
+                compressed_recent = await self._build_system_compression_message(
                     compactable_recent,
                     title="临近上下文历史系统压缩",
                     max_lines=6,
                 )
                 if compressed_recent:
                     overflow_compression_messages.append(compressed_recent)
-                    recent_summary = self._summarize_messages(compactable_recent, max_lines=6)
+                    recent_summary = await self._summarize_messages(compactable_recent, max_lines=6)
                     if recent_summary:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
@@ -3837,12 +4110,12 @@ class AgentCore:
             and not replacement_history_entries
             and self._estimate_messages_tokens(history_source + ephemeral_messages) >= summary_trigger_tokens
         ):
-            opportunistic_summary = self._summarize_messages(raw_recently_slid, max_lines=10)
+            opportunistic_summary = await self._summarize_messages(raw_recently_slid, max_lines=10)
             if opportunistic_summary:
                 older_summary_parts.append(opportunistic_summary)
 
         candidate = build_candidate(opportunistic_summary=opportunistic_summary)
-        candidate, content_truncated = self._apply_content_truncation_until_budget(candidate, budget=budget)
+        candidate, content_truncated = await self._apply_content_truncation_until_budget(candidate, budget=budget)
         if content_truncated:
             context.context_truncated = True
 
@@ -3992,8 +4265,8 @@ class AgentCore:
             compact_source = older_rows + recently_slid_rows
             if not compact_source:
                 return {}, artifacts
-            fallback_summary = self._summarize_messages(compact_source, max_lines=10)
-            fallback_anchors = self._summarize_messages(compact_source, max_lines=6)
+            fallback_summary = await self._summarize_messages(compact_source, max_lines=10)
+            fallback_anchors = await self._summarize_messages(compact_source, max_lines=6)
             compacted_history = ConversationContextCompactionService._normalize_compacted_history_payload(
                 {
                     "history_anchors": fallback_anchors,
@@ -4028,9 +4301,15 @@ class AgentCore:
         compacted_history = dict(compacted_history or {})
         compacted_history["mid_run"] = mode == "mid_run"
         compacted_history["mode"] = mode
+        merged_context_state = self._merge_conversation_state_with_workflow_binding(
+            context.conversation_state,
+            artifacts.context_state,
+        )
+        artifacts.context_state = dict(merged_context_state)
+        context.conversation_state = dict(merged_context_state)
         await self.runtime_service.upsert_conversation_context_state(
             int(conversation_id),
-            dict(artifacts.context_state or {}),
+            dict(merged_context_state),
         )
         await self.runtime_service.upsert_conversation_compacted_history(
             int(conversation_id),
@@ -4333,10 +4612,7 @@ class AgentCore:
 
     @staticmethod
     def _truncate_failure_text(value: str, limit: int = 180) -> str:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
-        if len(text) <= limit:
-            return text
-        return text[: max(0, limit - 3)] + "..."
+        return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @staticmethod
     def _normalize_search_query_tokens(query: str) -> set[str]:
@@ -4723,6 +4999,7 @@ class AgentCore:
             observation_output=observation_output,
             result_data=result.data if isinstance(result.data, dict) else {},
         )
+        await self._maybe_update_workflow_binding_from_tool_result(context, call, result)
         await self._maybe_pin_skill_from_tool_result(context, call, result)
         self._remember_source_items(
             context,
@@ -4754,6 +5031,7 @@ class AgentCore:
             observation_event=observation_event,
             tool_name=call.name,
             observation_output=observation_output,
+            result_data=dict(result.data or {}) if isinstance(result.data, dict) else {},
             tool_call_id=call.call_id,
             arguments=dict(effective_arguments or {}),
             success=bool(result.success),
@@ -4792,7 +5070,69 @@ class AgentCore:
         return cls._truncate_failure_text(fallback, limit=320)
 
     @classmethod
-    def _tool_use_summary_text(cls, executed_calls: Sequence[ExecutedToolCall]) -> str:
+    async def _tool_result_ledger_summary_text(cls, item: ExecutedToolCall) -> str:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        metadata = dict(item.metadata or {}) if isinstance(item.metadata, dict) else {}
+        status = (
+            "需授权"
+            if item.permission_required
+            else "成功"
+            if item.success
+            else "失败"
+        )
+
+        parts: List[str] = [f"tool={item.tool_name}", f"status={status}"]
+        for key in ("relative_path", "repo_relative_path", "execution_id", "content_type", "mode"):
+            value = result_data.get(key)
+            if value is not None and str(value).strip():
+                parts.append(f"{key}={str(value).strip()}")
+        for key in ("line_start", "line_end", "page", "total_pages", "chunk_index", "total_chunks"):
+            value = result_data.get(key)
+            if value is not None:
+                parts.append(f"{key}={value}")
+
+        background_execution = (
+            dict(result_data.get("background_execution") or {})
+            if isinstance(result_data.get("background_execution"), dict)
+            else {}
+        )
+        if background_execution:
+            for key in ("execution_id", "stage", "status"):
+                value = background_execution.get(key)
+                if value is not None and str(value).strip():
+                    parts.append(f"background_{key}={str(value).strip()}")
+
+        source_labels = [
+            str(label).strip()
+            for label in list(metadata.get("source_labels") or [])
+            if str(label or "").strip()
+        ]
+        if source_labels:
+            parts.append(f"source_labels={','.join(source_labels[:6])}")
+        if metadata.get("result_count") is not None:
+            parts.append(f"result_count={metadata.get('result_count')}")
+
+        detail = cls._normalize_compacted_text(item.error or item.observation_output or "")
+        if detail:
+            if len(detail) > 1600:
+                detail = detail[:1600].rstrip()
+            raw_summary = f"{' | '.join(parts)}\nDetail:\n{detail}"
+        else:
+            raw_summary = " | ".join(parts)
+
+        compressed = await cls._compress_text_with_qwen_turbo(
+            raw_summary,
+            target_token_budget=120,
+            source="chat.tool_result_ledger_summary",
+            compression_kind="单次工具结果摘要",
+        )
+        compressed = cls._normalize_compacted_text(compressed)
+        if compressed:
+            return compressed
+        return cls._normalize_compacted_text(" | ".join(parts))
+
+    @classmethod
+    async def _tool_use_summary_text(cls, executed_calls: Sequence[ExecutedToolCall]) -> str:
         rows = [item for item in list(executed_calls or []) if isinstance(item, ExecutedToolCall)]
         if not rows:
             return ""
@@ -4818,15 +5158,43 @@ class AgentCore:
         if permission_rows:
             detail_parts.append(f"需授权 {len(permission_rows)}")
 
-        summaries = [
-            cls._truncate_failure_text(item.observation_output or item.error or "", limit=90)
-            for item in rows
-            if cls._truncate_failure_text(item.observation_output or item.error or "", limit=90)
-        ]
         suffix = f"（{'，'.join(detail_parts)}）" if detail_parts else ""
-        preview = "；".join(summaries[:2])
-        if preview:
-            return f"{headline}{suffix}：{preview}"
+        detail_lines: List[str] = []
+        for item in rows[:8]:
+            status = (
+                "需授权"
+                if item.permission_required
+                else "成功"
+                if item.success
+                else "失败"
+            )
+            detail = cls._normalize_compacted_text(item.error or item.observation_output or "")
+            if len(detail) > 360:
+                detail = detail[:360].rstrip()
+            line = f"- tool={item.tool_name or 'unknown'} status={status}"
+            if detail:
+                line += f" detail={detail}"
+            metadata = dict(item.metadata or {}) if isinstance(item.metadata, dict) else {}
+            execution_id = str(metadata.get("execution_id") or "").strip()
+            if execution_id:
+                line += f" execution_id={execution_id}"
+            detail_lines.append(line)
+
+        raw_summary = "\n".join(
+            [
+                f"headline={headline}{suffix}",
+                *detail_lines,
+            ]
+        ).strip()
+        compressed = await cls._compress_text_with_qwen_turbo(
+            raw_summary,
+            target_token_budget=180,
+            source="chat.tool_use_summary",
+            compression_kind="工具批次摘要",
+        )
+        compressed = cls._normalize_compacted_text(compressed)
+        if compressed:
+            return compressed
         return f"{headline}{suffix}"
 
     async def _append_tool_use_summary_item(
@@ -4839,7 +5207,7 @@ class AgentCore:
         conversation_id = getattr(self.runtime_context, "conversation_id", None)
         if conversation_id is None:
             return
-        summary_text = self._tool_use_summary_text(executed_calls)
+        summary_text = await self._tool_use_summary_text(executed_calls)
         permission_rows = [
             item for item in executed_calls
             if isinstance(item, ExecutedToolCall) and item.permission_required
@@ -4964,7 +5332,7 @@ class AgentCore:
             for call in calls
         ]
 
-    def _build_tool_result_ledger_entries(
+    async def _build_tool_result_ledger_entries(
         self,
         context: AgentContext,
         executed_calls: Sequence[ExecutedToolCall],
@@ -4973,6 +5341,7 @@ class AgentCore:
         for item in executed_calls:
             status = "authorization_required" if item.permission_required else ("succeeded" if item.success else "failed")
             fallback = item.error or ("tool call succeeded" if item.success else "tool call failed")
+            summary = await self._tool_result_ledger_summary_text(item)
             entries.append(
                 {
                     "entry_id": uuid.uuid4().hex,
@@ -4984,7 +5353,7 @@ class AgentCore:
                     "iteration": context.iteration,
                     "status": status,
                     "arguments": dict(item.arguments or {}),
-                    "summary": self._tool_ledger_summary(item.observation_output, fallback=fallback),
+                    "summary": summary or self._tool_ledger_summary(item.observation_output, fallback=fallback),
                     "success": item.success,
                     "error": item.error,
                     "permission_required": item.permission_required,
@@ -5037,7 +5406,7 @@ class AgentCore:
         executed_calls = [item for item in results if item is not None]
         await self._append_tool_ledger_entries(
             context,
-            self._build_tool_result_ledger_entries(context, executed_calls),
+            await self._build_tool_result_ledger_entries(context, executed_calls),
         )
         await self._append_tool_use_summary_item(
             context,

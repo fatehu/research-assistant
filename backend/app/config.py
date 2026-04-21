@@ -36,7 +36,17 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 1440
 
     # LLM providers
-    default_llm_provider: Literal["deepseek", "deepseek_test", "openai", "aliyun", "ollama"] = "deepseek"
+    default_llm_provider: Literal[
+        "deepseek",
+        "deepseek_test",
+        "openai",
+        "aliyun",
+        "aliyun_qwen35_flash",
+        "aliyun_qwen35_plus",
+        "aliyun_qwen_plus",
+        "aliyun_qwen_max",
+        "ollama",
+    ] = "aliyun_qwen35_flash"
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
@@ -49,6 +59,10 @@ class Settings(BaseSettings):
     aliyun_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     aliyun_dashscope_api_base: str = "https://dashscope.aliyuncs.com/api/v1"
     aliyun_model: str = "qwen-plus"
+    aliyun_qwen35_flash_model: str = "qwen3.5-flash"
+    aliyun_qwen35_plus_model: str = "qwen3.5-plus"
+    aliyun_qwen_plus_model: str = "qwen-plus"
+    aliyun_qwen_max_model: str = "qwen-max"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     local_structured_pdf_hybrid_model: str = ""
@@ -215,6 +229,7 @@ class Settings(BaseSettings):
     # Generic tool runtime
     tool_default_timeout_seconds: int = 20
     tool_default_retry_count: int = 1
+    tool_output_truncation_enabled: bool = False
     tool_output_max_tokens: int = 1200
     tool_output_truncate_head_ratio: float = 0.75
     tool_selection_enabled: bool = True
@@ -282,8 +297,11 @@ class Settings(BaseSettings):
     agent_context_state_open_questions_max_items: int = 3
     agent_context_state_evidence_max_items: int = 6
     agent_context_state_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
-    agent_context_state_model: str = "qwen3.5-flash"
-    agent_context_state_max_tokens: int = 420
+    agent_context_state_model: str = "qwen-turbo"
+    agent_context_state_max_tokens: int = 1200
+    agent_budget_compression_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
+    agent_budget_compression_model: str = "qwen-turbo"
+    agent_budget_compression_max_tokens: int = 1200
     conversation_context_compaction_enabled: bool = True
     agent_context_transcript_keep_entries: int = 160
     agent_context_tool_ledger_keep_entries: int = 240
@@ -291,7 +309,7 @@ class Settings(BaseSettings):
     agent_context_snapshot_keep_items: int = 12
     agent_reasoning_summary_enabled: bool = True
     agent_reasoning_summary_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
-    agent_reasoning_summary_model: str = "qwen3.5-flash"
+    agent_reasoning_summary_model: str = "qwen-turbo"
     agent_reasoning_summary_max_tokens: int = 220
     agent_reasoning_summary_min_iterations: int = 2
     agent_send_plan_ttl_seconds: int = 900
@@ -500,6 +518,39 @@ class Settings(BaseSettings):
                 "api_key": self.aliyun_api_key,
                 "base_url": self.aliyun_base_url,
                 "model": self.aliyun_model,
+                "provider_family": "aliyun",
+            },
+            "aliyun_qwen35_flash": {
+                "api_key": self.aliyun_api_key,
+                "base_url": self.aliyun_base_url,
+                "model": self.aliyun_qwen35_flash_model,
+                "display_model": self.aliyun_qwen35_flash_model,
+                "context_window_model": self.aliyun_qwen35_flash_model,
+                "provider_family": "aliyun",
+            },
+            "aliyun_qwen35_plus": {
+                "api_key": self.aliyun_api_key,
+                "base_url": self.aliyun_base_url,
+                "model": self.aliyun_qwen35_plus_model,
+                "display_model": self.aliyun_qwen35_plus_model,
+                "context_window_model": self.aliyun_qwen35_plus_model,
+                "provider_family": "aliyun",
+            },
+            "aliyun_qwen_plus": {
+                "api_key": self.aliyun_api_key,
+                "base_url": self.aliyun_base_url,
+                "model": self.aliyun_qwen_plus_model,
+                "display_model": self.aliyun_qwen_plus_model,
+                "context_window_model": self.aliyun_qwen_plus_model,
+                "provider_family": "aliyun",
+            },
+            "aliyun_qwen_max": {
+                "api_key": self.aliyun_api_key,
+                "base_url": self.aliyun_base_url,
+                "model": self.aliyun_qwen_max_model,
+                "display_model": self.aliyun_qwen_max_model,
+                "context_window_model": self.aliyun_qwen_max_model,
+                "provider_family": "aliyun",
             },
             "ollama": {
                 "api_key": "ollama",
@@ -507,7 +558,8 @@ class Settings(BaseSettings):
                 "model": self.ollama_model,
             },
         }
-        return configs.get(provider, configs["deepseek"])
+        default_config = configs.get(self.default_llm_provider) or configs.get("aliyun_qwen35_flash") or configs["deepseek"]
+        return configs.get(provider, default_config)
 
     def get_cors_allow_origins(self) -> list[str]:
         origins = [item.strip() for item in self.cors_allow_origins.split(",")]

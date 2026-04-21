@@ -29,7 +29,7 @@ class User(Base):
     preferences = Column(JSON, default=dict)
     
     # LLM 偏好
-    preferred_llm_provider = Column(String(50), default="deepseek")
+    preferred_llm_provider = Column(String(50), default="aliyun_qwen35_flash")
     
     # === 角色系统扩展字段 ===
     role = Column(String(20), default="student", nullable=False)  # admin, mentor, student

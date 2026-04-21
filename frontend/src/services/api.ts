@@ -1189,6 +1189,18 @@ export const chatApi = {
     return response.data
   },
 
+  getActiveConversationRun: async (conversationId: number): Promise<ChatRunResponse | null> => {
+    try {
+      const response = await api.get(`/api/v1/chat/conversations/${conversationId}/active-run`)
+      return response.data || null
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        return null
+      }
+      throw error
+    }
+  },
+
   sendMessageStream: async (
     message: string,
     conversationId?: number,

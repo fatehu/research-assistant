@@ -103,6 +103,7 @@ stages:
       - planning/experiment_spec.json
       - repo/repo_reference.json
       - repo/repo_file_index.json
+      - runtime_worker.environment
     writes:
       - specs/implementation_spec.json
   - id: run_drafts

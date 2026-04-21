@@ -36,7 +36,7 @@ Then decide the next action from state:
 
 1. If no workspace or structured intake exists, run intake with `paper_research_prepare`.
 2. If intake exists but repo/data evidence is missing, materialize or inspect repo evidence.
-3. If `specs/implementation_spec.json` is missing or stale, create or revise it from intake plus repo/data evidence.
+3. If `specs/implementation_spec.json` is missing or stale, create or revise it from intake plus repo/data evidence and the current runtime/environment snapshot.
 4. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
 5. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
 6. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
@@ -134,6 +134,10 @@ Use helper scripts when deterministic output is safer:
 
 ## Execution Rules
 
+- Environment constraints must enter the workflow before execution.
+  - During `implementation_prep`, call `paper_research_inspect_runtime` and treat `runtime_candidates` plus `runtime_worker.environment` as planning inputs, not only execution diagnostics.
+  - The generated `implementation_spec.json` should reflect the current runtime snapshot, available commands, and any grounded missing packages that constrain later execution.
+  - Do not postpone all environment reasoning until `execution`; the plan should already know whether the current machine supports `devcontainer`, `docker compose`, `repo2docker`, `papermill`, or only `plain-python`.
 - Always inspect runtime with `paper_research_inspect_runtime` before writing an execution spec.
 - Before writing a new execution spec, read the latest relevant truth file first:
   - `implementation_spec.json` for baseline assumptions and blockers
@@ -142,6 +146,10 @@ Use helper scripts when deterministic output is safer:
 - For repo-backed execution, infer dependencies from repo evidence first:
   - read `README.md` and any dependency files such as `requirements.txt`, `pyproject.toml`, `environment.yml`, `setup.py`
   - read the selected entrypoint script and only the local modules needed to understand its imports
+- When locating a code block, do not keep increasing `max_chars` on the same file.
+  - First use `paper_research_search_repo` to get the hit line number.
+  - Then use `paper_research_read_repo_file` with `line_start` and `line_end` to read only the needed range.
+  - If search already returns `context_lines`, use that local snippet first before widening the read.
 - use the model to form the concrete dependency set for the selected draft from those files
 - Include locally imported helper-module dependencies in `env_requirements` when they are needed by the selected entrypoint.
 - Write an archived execution spec before starting execution.
@@ -171,6 +179,10 @@ Use helper scripts when deterministic output is safer:
 - First tuning should be one minimal, low-risk change: one parameter, one small algorithmic switch, or one lightweight model/config variant.
 - Do not change dataset or add heavyweight dependencies for the first tuning unless the user explicitly asks.
 - If params are hard-coded, create an execution-scoped generated script via `execution_spec.generated_files`; do not overwrite repo files.
+- Each `generated_files` item should contain:
+  - `relative_path`
+  - `content`
+  Use execution-scoped paths such as `executions/{execution_id}/train_variant.py`.
 - When `cwd` is `repo/source`, run generated files via a relative path such as `../executions/{execution_id}/train_variant.py`.
 - Compare baseline and tuning with shared metrics and state whether the result improved, regressed, or is inconclusive.
 

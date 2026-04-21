@@ -143,9 +143,12 @@ Prefer the smallest useful first tuning:
 For repo-driven projects:
 
 - Use `paper_research_search_repo` to locate CLI/config/notebook parameter entrypoints before reading individual files.
+- When you already know the hit line number, read local code by line range instead of repeatedly increasing whole-file `max_chars`.
+  - Preferred pattern: `paper_research_search_repo(..., context_lines=3)` -> `paper_research_read_repo_file(..., line_start=hit-10, line_end=hit+20)`.
 - Prefer existing CLI/config/notebook parameters.
 - If params are hard-coded, create an execution-scoped sibling variant script through `execution_spec.generated_files`.
 - Do not overwrite original repo files.
+- Each `generated_files` item must at minimum include `relative_path` and `content`.
 - `generated_files.relative_path` must stay under the execution workspace, for example `executions/{execution_id}/train_variant.py`.
 - If `cwd` remains `repo/source`, invoke generated files with a path relative to the repo root, for example `../executions/{execution_id}/train_variant.py`.
 

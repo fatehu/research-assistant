@@ -34,7 +34,7 @@ class Conversation(Base):
     title = Column(String(500), default="新对话")
     
     # LLM 配置
-    llm_provider = Column(String(50), default="deepseek")
+    llm_provider = Column(String(50), default="aliyun_qwen35_flash")
     llm_model = Column(String(100), nullable=True)
     
     # 元数据

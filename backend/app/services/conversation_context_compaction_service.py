@@ -53,6 +53,21 @@ class ConversationContextCompactionService:
         except Exception:
             return None
 
+    @staticmethod
+    def _extract_tool_call_arguments(response: Dict[str, Any]) -> Dict[str, Any]:
+        tool_calls = [dict(item) for item in list((response or {}).get("tool_calls") or []) if isinstance(item, dict)]
+        for item in tool_calls:
+            arguments = str(item.get("arguments") or "").strip()
+            if not arguments:
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+
     @classmethod
     def _message_to_state_preview(cls, item: Dict[str, Any]) -> Dict[str, Any]:
         preview: Dict[str, Any] = {
@@ -560,7 +575,8 @@ class ConversationContextCompactionService:
             if len(resolved_facts) >= 6:
                 break
 
-        return {
+        workflow_binding = ReActAgent._normalize_workflow_binding(payload.get("workflow_binding") or {})
+        normalized = {
             "version": "conversation_context_state.v3",
             "active_topic": ReActAgent._compact_debug_text(payload.get("active_topic", ""), 220),
             "user_goal": ReActAgent._compact_debug_text(payload.get("user_goal", ""), 220),
@@ -572,6 +588,9 @@ class ConversationContextCompactionService:
             "turn_count": int(max(0, turn_count)),
             "updated_at": datetime.utcnow().isoformat(),
         }
+        if workflow_binding:
+            normalized["workflow_binding"] = workflow_binding
+        return normalized
 
     @classmethod
     def _normalize_compacted_history_payload(
@@ -620,35 +639,78 @@ class ConversationContextCompactionService:
         }
         system_prompt = (
             "你是会话上下文状态提取器。"
-            "请根据给定的多轮对话、工具账本预览和推理摘要，提取持续性的会话状态。"
-            "只输出严格 JSON，不要带 markdown，不要解释。"
-            "字段固定为："
-            "{\"active_topic\":\"...\",\"user_goal\":\"...\",\"constraints\":[...],"
-            "\"open_questions\":[...],\"resolved_facts\":[...],\"evidence_ledger\":[{\"summary\":\"...\",\"status\":\"confirmed\",\"source_labels\":[...],\"tool_names\":[...],\"turn_ids\":[...],\"tool_call_ids\":[...]}],\"last_reasoning_summary\":\"...\"}。"
+            "请根据给定的多轮对话、工具账本预览和证据候选，提取持续性的会话状态。"
+            "不要直接输出自由文本；请使用提供的函数提交结构化结果。"
             "要求："
             "1. active_topic 必须是稳定主题，不要填'继续'、'这个'、'为什么以前没发现'这类跟进句。"
             "2. user_goal 必须描述当前会话正在解决的任务。"
             "3. constraints 只保留仍然有效的用户约束。"
             "4. open_questions 只保留尚未解决的问题。"
             "5. resolved_facts 只保留已经相对稳定、后续回答可直接复用的事实。"
-            "6. evidence_ledger 只保留已获得且后续可复用的证据、来源或检索结论，优先根据 tool_ledger_preview 提炼。"
-            "7. 如果 evidence_candidates 已经给出了稳定证据，不要遗漏，除非它们明显与当前主题无关。"
-            "8. evidence_ledger 中 source_labels 只写类似 来源1 这样的标签，不要抄整段 observation。"
-            "9. 如果 evidence_candidates 已提供 turn_ids 或 tool_call_ids，优先保留这些归属信息。"
-            "10. last_reasoning_summary 只保留最近一轮仍有后续价值的推理摘要，没有就输出空字符串。"
+            "6. evidence_ledger 只保留已获得且后续可复用的证据、来源或检索结论，优先根据 tool_ledger_preview 和 evidence_candidates 提炼。"
+            "7. evidence_ledger 中 source_labels 只写类似 来源1 这样的标签，不要抄整段 observation。"
+            "8. 如果 evidence_candidates 已提供 turn_ids 或 tool_call_ids，优先保留这些归属信息。"
+            "9. last_reasoning_summary 只保留最近一轮仍有后续价值的推理摘要，没有就输出空字符串。"
         )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_context_state",
+                    "description": "提交会话上下文状态。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "active_topic": {"type": "string"},
+                            "user_goal": {"type": "string"},
+                            "constraints": {"type": "array", "items": {"type": "string"}},
+                            "open_questions": {"type": "array", "items": {"type": "string"}},
+                            "resolved_facts": {"type": "array", "items": {"type": "string"}},
+                            "evidence_ledger": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "summary": {"type": "string"},
+                                        "status": {"type": "string"},
+                                        "source_labels": {"type": "array", "items": {"type": "string"}},
+                                        "tool_names": {"type": "array", "items": {"type": "string"}},
+                                        "turn_ids": {"type": "array", "items": {"type": "string"}},
+                                        "tool_call_ids": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                },
+                            },
+                            "last_reasoning_summary": {"type": "string"},
+                        },
+                        "required": [
+                            "active_topic",
+                            "user_goal",
+                            "constraints",
+                            "open_questions",
+                            "resolved_facts",
+                            "evidence_ledger",
+                            "last_reasoning_summary",
+                        ],
+                    },
+                },
+            }
+        ]
 
         llm = LLMService(provider)
         llm.config = dict(llm.config)
         llm.config["model"] = model_name
-        response = await llm.chat(
+        response = await llm.chat_with_tools(
             messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             system_prompt=system_prompt,
             temperature=0.1,
             max_tokens=max_tokens,
             source="chat_compaction.context_state",
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "set_context_state"}},
         )
-        parsed = ReActAgent._extract_json_object(response.get("content") or "")
+        parsed = cls._extract_tool_call_arguments(response)
+        if not parsed:
+            parsed = ReActAgent._extract_json_object(response.get("content") or "")
         if not parsed:
             return {}
         return cls._normalize_context_state_payload(
@@ -832,9 +894,14 @@ class ConversationContextCompactionService:
         )
 
         if artifacts.context_state:
-            state_payload = dict(artifacts.context_state)
+            current_context_state = dict(await self._runtime_service.get_conversation_context_state(int(conversation_id)) or {})
+            state_payload = ReActAgent._merge_conversation_state_with_workflow_binding(
+                current_context_state,
+                artifacts.context_state,
+            )
             state_payload["updated_at"] = state_payload.get("updated_at") or ""
             await self._runtime_service.upsert_conversation_context_state(conversation_id, state_payload)
+            artifacts.context_state = dict(state_payload)
         if artifacts.compacted_history:
             await self._runtime_service.upsert_conversation_compacted_history(
                 conversation_id,

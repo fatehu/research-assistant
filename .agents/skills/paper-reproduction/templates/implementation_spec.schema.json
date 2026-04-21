@@ -37,6 +37,18 @@
     "entrypoint_candidates": [],
     "files_read": []
   },
+  "runtime_snapshot": {
+    "captured_from": "paper_research_inspect_runtime",
+    "runtime_worker_available": true,
+    "preferred_runtime_type": "",
+    "candidate_summaries": [],
+    "environment": {
+      "python_version": "",
+      "available_commands": [],
+      "installed_key_packages": [],
+      "missing_required_packages": []
+    }
+  },
   "data_plan": {
     "datasets": [],
     "artifacts": [],

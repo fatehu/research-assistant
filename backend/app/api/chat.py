@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -670,6 +670,112 @@ def _item_entry_role(kind: str, role: Optional[str]) -> Optional[str]:
     if normalized_kind == "system_message":
         return "system"
     return None
+
+
+async def _cleanup_stale_conversation_chat_runs(
+    *,
+    conversation_id: int,
+    db: AsyncSession,
+) -> List[str]:
+    timeout_seconds = max(
+        int(getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900),
+        60,
+    )
+    threshold = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+    result = await db.execute(
+        select(AgentRun).where(
+            AgentRun.conversation_id == int(conversation_id),
+            AgentRun.status == "running",
+            AgentRun.channel.in_(["chat", "chat_background"]),
+            AgentRun.started_at <= threshold,
+        )
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return []
+
+    cleaned_ids: List[str] = []
+    cleanup_at = datetime.utcnow()
+    for record in rows:
+        record.status = "error"
+        record.finished_at = cleanup_at
+        merged = dict(record.metadata_ or {})
+        merged.update(
+            {
+                "error": "stale_run_cleanup",
+                "cleanup_reason": "stale_running_run",
+                "cleanup_threshold_seconds": timeout_seconds,
+                "cleanup_at": cleanup_at.isoformat(),
+            }
+        )
+        record.metadata_ = merged
+        cleaned_ids.append(str(record.id))
+    await db.commit()
+    logger.warning(
+        "[Chat] cleaned stale conversation runs: conversation_id={}, count={}, run_ids={}",
+        conversation_id,
+        len(cleaned_ids),
+        cleaned_ids,
+    )
+    return cleaned_ids
+
+
+async def _interrupt_orphaned_conversation_background_runs(
+    *,
+    conversation_id: int,
+    user_id: int,
+    db: AsyncSession,
+) -> List[str]:
+    manager = get_chat_background_run_manager()
+    result = await db.execute(
+        select(AgentRun).where(
+            AgentRun.conversation_id == int(conversation_id),
+            AgentRun.user_id == int(user_id),
+            AgentRun.status == "running",
+            AgentRun.channel.in_(["chat", "chat_background"]),
+        )
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return []
+
+    running_background = [
+        row for row in rows if str(row.channel or "").strip() == "chat_background"
+    ]
+    if not running_background:
+        return []
+
+    orphaned_background_ids: List[str] = []
+    for record in running_background:
+        snapshot = await manager.get(str(record.id), user_id=int(user_id))
+        if snapshot is None:
+            orphaned_background_ids.append(str(record.id))
+    if not orphaned_background_ids:
+        return []
+
+    cleanup_at = datetime.utcnow()
+    cleaned_ids: List[str] = []
+    for record in rows:
+        record.status = "error"
+        record.finished_at = cleanup_at
+        merged = dict(record.metadata_ or {})
+        merged.update(
+            {
+                "error": "background_run_interrupted",
+                "cleanup_reason": "orphaned_background_run",
+                "cleanup_at": cleanup_at.isoformat(),
+            }
+        )
+        record.metadata_ = merged
+        cleaned_ids.append(str(record.id))
+    await db.commit()
+    logger.warning(
+        "[Chat] interrupted orphaned conversation runs: conversation_id={}, background_run_ids={}, affected_run_ids={}",
+        conversation_id,
+        orphaned_background_ids,
+        cleaned_ids,
+    )
+    return cleaned_ids
 
 
 def _project_message_from_item_entry(
@@ -1579,6 +1685,22 @@ async def get_conversation(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="对话不存在"
         )
+
+    stale_run_ids = await _cleanup_stale_conversation_chat_runs(
+        conversation_id=conversation.id,
+        db=db,
+    )
+    orphaned_run_ids = await _interrupt_orphaned_conversation_background_runs(
+        conversation_id=conversation.id,
+        user_id=current_user.id,
+        db=db,
+    )
+    if stale_run_ids or orphaned_run_ids:
+        await get_agent_runtime_service().cleanup_stale_conversation_turns(
+            conversation_id=conversation.id,
+            older_than_seconds=60,
+        )
+        await db.refresh(conversation)
     
     # 手动构建响应
     item_stream = conversation_item_stream_from_metadata(conversation.metadata_)
@@ -2084,6 +2206,60 @@ async def get_chat_background_run(
     record = await db.get(AgentRun, str(run_id or "").strip())
     if not record or int(record.user_id) != int(current_user.id) or not str(record.channel or "").startswith("chat"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="后台对话任务不存在")
+    return _agent_run_to_chat_run_response(record)
+
+
+@router.get("/conversations/{conversation_id}/active-run")
+async def get_active_conversation_chat_run(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the latest running background chat run for a conversation, if any."""
+    conversation_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == int(conversation_id),
+            Conversation.user_id == int(current_user.id),
+        )
+    )
+    conversation = conversation_result.scalar_one_or_none()
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="对话不存在")
+
+    stale_run_ids = await _cleanup_stale_conversation_chat_runs(
+        conversation_id=int(conversation_id),
+        db=db,
+    )
+    orphaned_run_ids = await _interrupt_orphaned_conversation_background_runs(
+        conversation_id=int(conversation_id),
+        user_id=current_user.id,
+        db=db,
+    )
+    if stale_run_ids or orphaned_run_ids:
+        await get_agent_runtime_service().cleanup_stale_conversation_turns(
+            conversation_id=int(conversation_id),
+            older_than_seconds=60,
+        )
+
+    run_result = await db.execute(
+        select(AgentRun)
+        .where(
+            AgentRun.user_id == int(current_user.id),
+            AgentRun.conversation_id == int(conversation_id),
+            AgentRun.channel == "chat_background",
+            AgentRun.status == "running",
+        )
+        .order_by(desc(AgentRun.started_at), desc(AgentRun.id))
+        .limit(1)
+    )
+    record = run_result.scalar_one_or_none()
+    if record is None:
+        return None
+
+    manager = get_chat_background_run_manager()
+    snapshot = await manager.get(str(record.id), user_id=current_user.id)
+    if snapshot is not None:
+        return snapshot
     return _agent_run_to_chat_run_response(record)
 
 
