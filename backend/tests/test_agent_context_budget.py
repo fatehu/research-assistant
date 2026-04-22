@@ -275,6 +275,38 @@ def test_context_window_uses_deepseek_test_alias_window(monkeypatch):
 
     assert agent._current_model_context_window() == 4096
 
+
+def test_context_window_uses_current_deepseek_and_qwen35_flash_windows():
+    llm = _BudgetLLM()
+    llm.provider = "deepseek"
+    llm.config = {"model": "deepseek-chat"}
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+    assert agent._current_model_context_window() == 128000
+
+    llm.provider = "aliyun_qwen35_flash"
+    llm.config = {
+        "model": "qwen3.5-flash",
+        "context_window_model": "qwen3.5-flash",
+        "provider_family": "aliyun",
+    }
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+    assert agent._current_model_context_window() == 1000000
+
+
+def test_context_budget_cap_can_follow_model_window_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_max_input_tokens", 0)
+
+    llm = _BudgetLLM()
+    llm.provider = "aliyun_qwen35_flash"
+    llm.config = {
+        "model": "qwen3.5-flash",
+        "context_window_model": "qwen3.5-flash",
+        "provider_family": "aliyun",
+    }
+    agent = ReActAgent(llm, _BudgetTools(), max_iterations=1)
+
+    assert agent._resolve_system_budget_cap(model_context_window=agent._current_model_context_window()) == 1000000
+
 @pytest.mark.asyncio
 async def test_prepare_llm_messages_includes_conversation_context_state_prefix(monkeypatch):
     monkeypatch.setattr(settings, "agent_context_budget_enabled", True)

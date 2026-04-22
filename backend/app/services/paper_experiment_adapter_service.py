@@ -950,6 +950,8 @@ class PaperExperimentAdapterService:
         next_payload = dict(payload or {})
         if "paper_markdown" in next_payload:
             next_payload["paper_markdown"] = None
+        if "stored_paper_markdown" in next_payload:
+            next_payload["stored_paper_markdown"] = None
         if "paper_markdown_spans" in next_payload:
             next_payload["paper_markdown_spans"] = None
         return next_payload

@@ -1,16 +1,16 @@
 name: paper-reproduction
 description: >-
   Saved-paper control-plane skill. Continue a Project from PDF/intake through
-  structured fact extraction, reusable paper summary, grounding of
-  repo/data/runtime evidence, run qualification, explicit blocker reporting,
-  and execution only when qualification and preflight conditions are
-  satisfied.
+  structured fact extraction, reusable paper summary, reproduction-readiness
+  investigation of repo/resources/runtime evidence, explicit blocker
+  reporting, run qualification, and execution only when qualification and
+  preflight conditions are satisfied.
 when_to_use: >-
   Use when the user wants to understand or explain a saved paper, extract
   structured facts, summarize it for reuse, gather supporting material,
-  prepare or validate a reproduction path, qualify run drafts, run or debug
-  grounded experiments, tune parameters or models, compare results, design
-  verification steps, or continue an existing paper Project.
+  investigate whether a reproduction path is viable, qualify run drafts, run
+  or debug grounded experiments, tune parameters or models, compare results,
+  design verification steps, or continue an existing paper Project.
 category: paper
 family: paper-reproduction
 allowed_channels:
@@ -116,7 +116,7 @@ stages:
       - planning/paper_summary.json
       - planning/experiment_spec.json
   - id: grounding
-    title: Grounding
+    title: Grounding / Reproduction Readiness
     continue_policy: ask_to_continue
     reads:
       - planning/paper_intake_result.json
@@ -191,7 +191,7 @@ references:
   - path: references/intake-contract.md
     when: Prepare or explain PDF/markdown/intake JSON.
   - path: references/grounding-contract.md
-    when: Write or revise grounding_report and close repo/dataset/runtime/external URL evidence.
+    when: Write or revise grounding_report as a reproduction-readiness checklist for repo/dataset/runtime/external URL evidence.
   - path: references/implementation-planning.md
     when: Generate or revise implementation_spec and run_drafts.
   - path: references/execution-and-tuning.md

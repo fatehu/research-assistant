@@ -25,6 +25,7 @@ from app.services.paper_experiment_adapter_service import PaperExperimentAdapter
 from app.services.notebook_service import NotebookService
 from app.services.online_mm_ingest_service import OnlineMmIngestService
 from app.services.pdf_rag_ingest_service import PdfRagIngestService
+from app.services.model_context_windows import resolve_model_context_window
 
 
 _REPO_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -36,7 +37,7 @@ _LOWER_IS_BETTER_TOKENS = ("loss", "error", "wer", "perplexity", "rmse", "mae", 
 _PAPER_INTAKE_OUTPUT_TOKENS = 8192
 _PAPER_INTAKE_TIMEOUT_SECONDS = 600
 _RAW_DATA_CONTEXT_MAX_CHARS = 24000
-_PAPER_MARKDOWN_STORE_MAX_CHARS = 180000
+_PAPER_MARKDOWN_STORE_MAX_CHARS = 1200000
 _PAPER_TEMPLATE_FORBIDDEN_PATTERNS = tuple(sorted(SANDBOX_FORBIDDEN_IMPORT_ROOTS)) + (
     "open(",
     "exec(",
@@ -55,10 +56,14 @@ Use the full paper content to extract the structured facts and discovery hints n
 This stage does not execute code, inspect external repositories, or generate runnable code.
 
 Current task:
-- Read the paper as a research engineer preparing later repo inspection, execution, and tuning work.
-- First produce a reliable paper understanding artifact, not an execution plan.
+- Read the paper as a research engineer preparing later repo and notebook verification.
+- First produce a reliable paper-guidance artifact, not an execution plan.
 - Identify and classify links that the paper explicitly provides.
-- Summarize the paper's research direction, research method, research content, and reusable tuning hints.
+- Prioritize four outputs:
+  1. author intent: what problem the authors want to solve, their core idea, and the main innovation
+  2. paper pipeline: how data enters, how the model processes it, and the high-level train/eval flow
+  3. verification questions: what later repo/notebook inspection must confirm, what the paper leaves unclear, and what is most likely to block reproduction
+  4. weak hypotheses: likely important factors, key gain sources, or modules worth verifying later
 - Extract datasets, models, metrics, protocols, and discovery hints only as paper-grounded clues for later repo/runtime work.
 
 Rules:
@@ -82,21 +87,21 @@ Rules:
 - If a URL is used only for a compared baseline model, set role="baseline_implementation".
 - If a URL is a general external library/tool/reference, set role="third_party_reference".
 - Keep verification_status="paper_claimed" for links asserted by the PDF; do not set "externally_verified" because this stage does not browse the web.
-- Parameter/model choices should be proposed as optimization candidates for later planning and tuning discussion.
-- Optimization candidates are analysis artifacts, not executable repo parameters.
-- Do not imply candidate parameters are directly runnable until repo/data/configs have been inspected.
+- Keep `entrypoint_hints`, `optimization_candidates`, and `model_swap_candidates` sparse and optional.
+- Only include them when the paper explicitly provides strong narrative evidence; otherwise use [].
+- Do not imply any hint, optimization candidate, or model swap is directly runnable until repo/data/configs have been inspected.
 - Keep symbolic parameter values as JSON strings. Do not output invalid JSON expressions such as 4/3, 2/3, NaN, Infinity, or comments.
 - Keep the JSON concise but complete.
-- Include all important items needed for downstream paper understanding, reproduction, and tuning.
-- Do not drop main benchmark datasets, primary repositories, core baselines, metrics, protocols, or high-impact optimization candidates just to be brief.
-- Do not generate runnable execution plans, baseline commands, variant scripts, or first-run instructions from the paper alone.
+- Include all important items needed for downstream paper understanding and repo verification.
+- Do not drop main benchmark datasets, primary repositories, core baselines, metrics, protocols, or critical verification questions just to be brief.
+- Do not generate runnable execution plans, baseline commands, variant scripts, first-run instructions, or tuning plans from the paper alone.
 - Order items by downstream importance:
   1. primary official repository and reproduction-critical links
   2. main benchmark datasets and required splits
   3. proposed models and strong baselines
   4. metrics and protocol details
-  5. high-impact optimization candidates
-  6. required discovery tasks and blockers
+  5. required discovery tasks, verification questions, and blockers
+  6. weak hypotheses and optional low-confidence hints
   7. optional or low-priority references
 - Avoid repetitive or low-value items.
 - If something is not present, use null or [].
@@ -108,10 +113,12 @@ Required JSON shape:
   "paper_profile": {
     "task_type": string|null,
     "domain": string|null,
+    "author_intent": string|null,
     "problem_statement": string|null,
     "research_direction": string|null,
     "research_method": string|null,
     "research_content": string|null,
+    "core_innovation": string|null,
     "contribution_summary": string|null,
     "experiment_goal": string|null
   },
@@ -170,6 +177,20 @@ Required JSON shape:
     "artifacts": [string],
     "evidence_text": string|null
   },
+  "paper_pipeline": {
+    "data_flow": string|null,
+    "model_flow": string|null,
+    "train_eval_flow": string|null,
+    "evidence_text": string|null
+  },
+  "verification_questions": [
+    {
+      "id": string,
+      "question": string,
+      "why_it_matters": string,
+      "target": "repo"|"notebook"|"dataset"|"runtime"|"metric"|"unknown"
+    }
+  ],
   "entrypoint_hints": [
     {"kind": "repo"|"notebook"|"train_script"|"eval_script"|"config"|"readme"|"example"|"project_page"|"unknown", "value": string|null, "evidence_text": string}
   ],
@@ -634,8 +655,11 @@ class PaperExperimentService:
             "source_mode": intake_payload.get("source_mode"),
             "extractor": intake_payload.get("extractor"),
             "total_chars": intake_payload.get("total_chars"),
+            "stored_chars": intake_payload.get("stored_chars"),
             "sent_chars": intake_payload.get("sent_chars"),
             "truncated": intake_payload.get("truncated"),
+            "store_truncated": intake_payload.get("store_truncated"),
+            "llm_truncated": intake_payload.get("llm_truncated"),
             "sha256": intake_payload.get("sha256"),
             "span_count": len(list(intake_payload.get("paper_markdown_spans") or [])),
             "report": intake_payload.get("report") or {},
@@ -680,7 +704,11 @@ class PaperExperimentService:
         return {
             "summary": summary,
             "materials": {
-                "paper_markdown": str(intake_payload.get("paper_markdown") or ""),
+                "paper_markdown": str(
+                    intake_payload.get("stored_paper_markdown")
+                    or intake_payload.get("paper_markdown")
+                    or ""
+                ),
                 "paper_markdown_spans": list(intake_payload.get("paper_markdown_spans") or []),
                 "intake_payload": intake_payload,
                 "paper_intake": paper_intake,
@@ -716,7 +744,7 @@ class PaperExperimentService:
             "entrypoint_hints": entrypoint_hints,
         }
         reference_links = self._as_list(intake.get("reference_links"))
-        tuning_hints = [
+        weak_hypotheses = [
             {
                 "name": str(item.get("name") or item.get("id") or "").strip() or None,
                 "category": str(item.get("category") or "").strip() or None,
@@ -745,10 +773,12 @@ class PaperExperimentService:
                     intake_profile.get("experiment_goal"),
                 ]
             ),
-            "tuning_hints": tuning_hints,
+            "weak_hypotheses": weak_hypotheses,
         }
         return {
             "execution_spec_version": "v3_paper_intake_scaffold",
+            "spec_role": "paper_derived_hypothesis",
+            "grounding_status": "paper_only",
             "paper_id": int(paper.id),
             "title": paper.title,
             "execution_mode": summary.get("execution_mode") or "paper_backed",
@@ -1115,11 +1145,19 @@ class PaperExperimentService:
                 extractor_name = "abstract_fallback"
                 source_mode = "metadata_abstract_fallback"
 
-        provider = str(getattr(settings, "default_llm_provider", "deepseek") or "deepseek")
+        provider = str(
+            getattr(settings, "paper_intake_provider", "")
+            or getattr(settings, "default_llm_provider", "deepseek")
+            or "deepseek"
+        )
         model = str((settings.get_llm_config(provider) or {}).get("model") or "")
         text_budget = self._resolve_paper_context_char_budget(provider=provider, model=model)
-        paper_markdown = paper_markdown[:_PAPER_MARKDOWN_STORE_MAX_CHARS]
+        original_paper_markdown = paper_markdown
+        original_total_chars = len(original_paper_markdown)
+        paper_markdown = original_paper_markdown[:_PAPER_MARKDOWN_STORE_MAX_CHARS]
+        store_truncated = original_total_chars > len(paper_markdown)
         paper_markdown_for_llm = paper_markdown[:text_budget]
+        llm_truncated = len(paper_markdown) > len(paper_markdown_for_llm)
         raw_data_text = json.dumps(paper.raw_data or {}, ensure_ascii=False, indent=2, default=str)
         raw_data_text = raw_data_text[:_RAW_DATA_CONTEXT_MAX_CHARS]
         metadata = {
@@ -1142,6 +1180,7 @@ class PaperExperimentService:
             "metadata": metadata,
             "raw_data_text": raw_data_text,
             "paper_markdown": paper_markdown_for_llm,
+            "stored_paper_markdown": paper_markdown,
             "paper_markdown_spans": markdown_spans,
             "source_mode": source_mode,
             "pdf_path": str(pdf_path or ""),
@@ -1150,9 +1189,12 @@ class PaperExperimentService:
             "page_count": int(page_count),
             "provider": provider,
             "model": model,
-            "total_chars": len(paper_markdown),
+            "total_chars": original_total_chars,
+            "stored_chars": len(paper_markdown),
             "sent_chars": len(paper_markdown_for_llm),
-            "truncated": len(paper_markdown) > len(paper_markdown_for_llm),
+            "truncated": bool(store_truncated or llm_truncated),
+            "store_truncated": bool(store_truncated),
+            "llm_truncated": bool(llm_truncated),
             "sha256": text_hash,
         }
 
@@ -1371,20 +1413,15 @@ class PaperExperimentService:
 
     @staticmethod
     def _resolve_paper_context_char_budget(*, provider: str, model: str) -> int:
-        normalized_provider = str(provider or "").strip().lower()
-        normalized_model = str(model or "").strip().lower()
-        window = 64000
-        if normalized_provider == "aliyun":
-            window = 131072 if "plus" in normalized_model or "max" in normalized_model else 65536
-        elif normalized_provider == "openai":
-            window = 128000
-        elif normalized_provider == "deepseek":
-            window = 64000
-        elif normalized_provider == "ollama":
-            window = 32000
+        window = resolve_model_context_window(
+            provider=provider,
+            model_name=model,
+            deepseek_test_alias=str(getattr(settings, "deepseek_test_model_alias", "deepseek-chat-test") or "deepseek-chat-test"),
+            deepseek_test_window=max(int(getattr(settings, "deepseek_test_model_window", 4096) or 4096), 1024),
+        ) or 64000
         reserved_tokens = max(_PAPER_INTAKE_OUTPUT_TOKENS + 2500, 9000)
         input_tokens = max(window - reserved_tokens, 12000)
-        return max(60000, min(int(input_tokens * 3.4), 420000))
+        return max(60000, min(int(input_tokens * 3.4), _PAPER_MARKDOWN_STORE_MAX_CHARS))
 
     @staticmethod
     def _parse_json_object(raw_text: str) -> Dict[str, Any]:

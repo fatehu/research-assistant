@@ -3361,6 +3361,241 @@ class _PaperResearchToolBase(ToolBase):
             errors.append("`summary.blockers` must be a list when provided.")
         return errors
 
+    @staticmethod
+    def _structured_validation_issue(
+        *,
+        path: str,
+        code: str,
+        message: str,
+        evidence_needed: Optional[str] = None,
+        suggested_tool_calls: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "path": path,
+            "code": code,
+            "message": message,
+        }
+        if evidence_needed:
+            payload["evidence_needed"] = evidence_needed
+        if suggested_tool_calls:
+            payload["suggested_tool_calls"] = suggested_tool_calls
+        return payload
+
+    @classmethod
+    def _structured_grounding_validation_errors(
+        cls,
+        *,
+        project_id: int,
+        payload: Dict[str, Any],
+        validation_errors: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        dataset = dict(payload.get("dataset") or {})
+        external_dependencies = dict(payload.get("external_dependencies") or {})
+        dataset_source_urls = cls._extract_grounding_urls(dataset.get("sources"))
+        external_urls = cls._extract_grounding_urls(external_dependencies.get("urls"))
+
+        for raw_error in validation_errors:
+            message = str(raw_error or "").strip()
+            if not message:
+                continue
+            if message.startswith("`dataset.status` is `grounded`, but these remote dataset sources do not have successful "):
+                issues.append(
+                    cls._structured_validation_issue(
+                        path="dataset.sources",
+                        code="missing_probe_or_local_evidence",
+                        message=message,
+                        evidence_needed="successful probe result for each required dataset URL, or dataset.local_presence.available=true",
+                        suggested_tool_calls=[
+                            {
+                                "tool": "paper_research_probe_url",
+                                "args": {
+                                    "project_id": project_id,
+                                    "url": url,
+                                    "resolve_download_gate": True,
+                                },
+                            }
+                            for url in dataset_source_urls[:4]
+                        ]
+                        or None,
+                    )
+                )
+                continue
+            if message.startswith("`external_dependencies.status` is `grounded` but these urls do not have successful "):
+                issues.append(
+                    cls._structured_validation_issue(
+                        path="external_dependencies.urls",
+                        code="missing_successful_probe",
+                        message=message,
+                        evidence_needed="successful probe result for each required external URL",
+                        suggested_tool_calls=[
+                            {
+                                "tool": "paper_research_probe_url",
+                                "args": {
+                                    "project_id": project_id,
+                                    "url": url,
+                                    "resolve_download_gate": True,
+                                },
+                            }
+                            for url in external_urls[:4]
+                        ]
+                        or None,
+                    )
+                )
+                continue
+            if message.startswith("`external_dependencies.status` is `grounded` but these urls have failed probe results:"):
+                issues.append(
+                    cls._structured_validation_issue(
+                        path="external_dependencies.probe_results",
+                        code="failed_probe_present",
+                        message=message,
+                        evidence_needed="replace failed probe results with successful ones, or mark the section blocked/partial instead of grounded",
+                    )
+                )
+                continue
+            if message.startswith("`summary.run_decision` marks the main path as runnable, but these sections are not grounded:"):
+                issues.append(
+                    cls._structured_validation_issue(
+                        path="summary.run_decision",
+                        code="run_decision_conflicts_with_sections",
+                        message=message,
+                        evidence_needed="align run_decision with grounded repo/entrypoint/runtime evidence",
+                    )
+                )
+                continue
+            field_match = re.match(r"^`([^`]+)` (must .+)$", message)
+            if field_match:
+                issues.append(
+                    cls._structured_validation_issue(
+                        path=field_match.group(1),
+                        code="schema_constraint_failed",
+                        message=message,
+                    )
+                )
+                continue
+            issues.append(
+                cls._structured_validation_issue(
+                    path="unknown",
+                    code="validation_error",
+                    message=message,
+                )
+            )
+        return issues
+
+    @classmethod
+    def _implementation_grounding_conflicts(
+        cls,
+        *,
+        payload: Dict[str, Any],
+        grounding_report: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(grounding_report, dict) or not grounding_report:
+            return []
+        conflicts: List[Dict[str, Any]] = []
+        summary = dict(grounding_report.get("summary") or {})
+        entrypoint = dict(grounding_report.get("entrypoint") or {})
+        readiness = dict(payload.get("readiness") or {})
+        baseline = dict(payload.get("baseline") or {})
+
+        run_decision = str(summary.get("run_decision") or "").strip().lower()
+        if bool(readiness.get("can_execute")) and run_decision not in {"ready", "runnable_with_patch"}:
+            conflicts.append(
+                {
+                    "path": "readiness.can_execute",
+                    "code": "conflicts_with_grounding_run_decision",
+                    "message": (
+                        f"`readiness.can_execute=true` but `grounding_report.summary.run_decision={run_decision or 'unknown'}`."
+                    ),
+                }
+            )
+        external_grounded = summary.get("external_dependencies_grounded")
+        if isinstance(readiness.get("external_dependencies_grounded"), bool) and isinstance(external_grounded, bool):
+            if readiness.get("external_dependencies_grounded") != external_grounded:
+                conflicts.append(
+                    {
+                        "path": "readiness.external_dependencies_grounded",
+                        "code": "conflicts_with_grounding_summary",
+                        "message": (
+                            "`readiness.external_dependencies_grounded` does not match "
+                            "`grounding_report.summary.external_dependencies_grounded`."
+                        ),
+                    }
+                )
+        selected_candidate = dict(entrypoint.get("selected_candidate") or {})
+        grounded_path = str(selected_candidate.get("path") or "").strip()
+        entrypoint_path = cls._normalize_repo_relative_path(baseline.get("entrypoint_path_or_hint"))
+        if grounded_path and entrypoint_path and grounded_path != entrypoint_path:
+            conflicts.append(
+                {
+                    "path": "baseline.entrypoint_path_or_hint",
+                    "code": "conflicts_with_grounding_entrypoint",
+                    "message": (
+                        f"`baseline.entrypoint_path_or_hint={entrypoint_path}` does not match "
+                        f"`grounding_report.entrypoint.selected_candidate.path={grounded_path}`."
+                    ),
+                }
+            )
+        return conflicts
+
+    @classmethod
+    def _group_run_draft_validation_errors(
+        cls,
+        *,
+        payload: Dict[str, Any],
+        validation_errors: Sequence[str],
+    ) -> Dict[str, Any]:
+        drafts = [dict(item) for item in list(payload.get("drafts") or []) if isinstance(item, dict)]
+        grouped: Dict[int, Dict[str, Any]] = {}
+        global_errors: List[Dict[str, Any]] = []
+
+        for raw_error in validation_errors:
+            message = str(raw_error or "").strip()
+            if not message:
+                continue
+            match = re.match(r"^drafts\[(\d+)\]\.([^\s]+)\s+(.*)$", message)
+            if match:
+                draft_index = int(match.group(1))
+                field_path = match.group(2)
+                suffix = match.group(3).strip()
+                draft = drafts[draft_index] if 0 <= draft_index < len(drafts) else {}
+                bucket = grouped.setdefault(
+                    draft_index,
+                    {
+                        "draft_index": draft_index,
+                        "draft_id": str(draft.get("id") or "").strip() or None,
+                        "title": str(draft.get("title") or "").strip() or None,
+                        "errors": [],
+                    },
+                )
+                bucket["errors"].append(
+                    {
+                        "path": field_path,
+                        "code": "draft_field_invalid",
+                        "message": f"drafts[{draft_index}].{field_path} {suffix}",
+                    }
+                )
+                continue
+            if message.startswith("`drafts` must be a non-empty list."):
+                global_errors.append(
+                    {
+                        "path": "drafts",
+                        "code": "missing_drafts",
+                        "message": message,
+                    }
+                )
+                continue
+            global_errors.append(
+                {
+                    "path": "unknown",
+                    "code": "validation_error",
+                    "message": message,
+                }
+            )
+        return {
+            "draft_errors": [grouped[index] for index in sorted(grouped)],
+            "global_errors": global_errors,
+        }
+
     @classmethod
     def _read_grounding_report_payload(cls, workspace_dir: Path) -> Dict[str, Any]:
         return cls._read_json_file(workspace_dir / "specs" / "grounding_report.json")
@@ -5401,11 +5636,14 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
         *,
         path: str,
         hints: Sequence[str],
+        readme_commands: Sequence[str],
         readme_text: str,
-    ) -> tuple[int, List[str]]:
+    ) -> tuple[int, List[str], List[str], List[str]]:
         lowered = str(path or "").strip().lower()
         score = 0
         reasons: List[str] = []
+        cautions: List[str] = []
+        evidence_excerpts: List[str] = []
         if lowered.endswith(".sh"):
             score += 5
             reasons.append("shell entrypoint")
@@ -5424,11 +5662,32 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
             if hint and hint in lowered:
                 score += 5
                 reasons.append(f"matches entrypoint hint `{hint}`")
+                evidence_excerpts.append(f"Hint match: {hint}")
         basename = lowered.split("/")[-1]
-        if basename and basename in readme_text.lower():
+        readme_text_lower = readme_text.lower()
+        if basename and basename in readme_text_lower:
             score += 4
             reasons.append("mentioned in README excerpt")
-        return score, reasons
+            evidence_excerpts.append(f"README mentions `{basename}`")
+        matching_commands = [
+            command
+            for command in readme_commands
+            if basename and basename in str(command).strip().lower()
+        ]
+        if matching_commands:
+            score += 8
+            reasons.append("appears in README command")
+            evidence_excerpts.extend(f"README command: {command}" for command in matching_commands[:2])
+        if "/alignment/" in f"/{lowered}":
+            score -= 5
+            cautions.append("alignment subdirectory looks task-specific and may not match the current paper task")
+        if any(token in lowered for token in ("/examples/", "/example/", "/demo/")):
+            score -= 3
+            cautions.append("example/demo style path is often illustrative rather than the main reproduction path")
+        if lowered.startswith("docs/") or "/docs/" in lowered:
+            score -= 4
+            cautions.append("documentation path is usually not an executable main path")
+        return score, reasons, cautions, evidence_excerpts
 
     async def _execute(self, **kwargs) -> ToolResult:
         async def _handler(db: AsyncSession) -> ToolResult:
@@ -5488,8 +5747,14 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                 deduped_paths.append(key)
 
             scored_candidates: List[Dict[str, Any]] = []
+            readme_commands = self._extract_readme_commands(readme_excerpt)
             for path in deduped_paths:
-                score, reasons = self._score_mainpath_candidate(path=path, hints=hint_tokens, readme_text=readme_excerpt)
+                score, reasons, cautions, evidence_excerpts = self._score_mainpath_candidate(
+                    path=path,
+                    hints=hint_tokens,
+                    readme_commands=readme_commands,
+                    readme_text=readme_excerpt,
+                )
                 if score <= 0:
                     continue
                 scored_candidates.append(
@@ -5498,12 +5763,33 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                         "entrypoint_type": self._classify_mainpath(path),
                         "score": score,
                         "reasons": reasons,
+                        "cautions": cautions,
+                        "evidence_excerpts": evidence_excerpts[:4],
                     }
                 )
             scored_candidates.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("path") or "")))
-            readme_commands = self._extract_readme_commands(readme_excerpt)
             selected_candidate = scored_candidates[0] if scored_candidates else None
             status = "identified" if selected_candidate else ("ambiguous" if scored_candidates else "missing")
+            top_candidates: List[Dict[str, Any]] = []
+            for index, item in enumerate(scored_candidates[:8]):
+                candidate = {
+                    "path": item.get("path"),
+                    "entrypoint_type": item.get("entrypoint_type"),
+                    "score": item.get("score"),
+                    "task_match": "high" if int(item.get("score") or 0) >= 12 else ("medium" if int(item.get("score") or 0) >= 7 else "low"),
+                    "reasons": list(item.get("reasons") or []),
+                    "cautions": list(item.get("cautions") or []),
+                    "evidence_excerpts": list(item.get("evidence_excerpts") or []),
+                }
+                if index == 0:
+                    candidate["why_selected"] = ", ".join(list(item.get("reasons") or [])) or "highest score"
+                else:
+                    not_selected_parts = []
+                    if item.get("cautions"):
+                        not_selected_parts.append(", ".join(list(item.get("cautions") or [])[:2]))
+                    not_selected_parts.append("lower score than selected candidate")
+                    candidate["why_not_selected"] = "; ".join(part for part in not_selected_parts if part)
+                top_candidates.append(candidate)
             lines = [
                 "已评估 repo 主路径。",
                 f"- Project: /projects/{project_id}",
@@ -5519,15 +5805,20 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                 )
                 if selected_candidate.get("reasons"):
                     lines.append(f"- Why: {', '.join(list(selected_candidate.get('reasons') or []))}")
+                if selected_candidate.get("evidence_excerpts"):
+                    lines.append("- Selected evidence:")
+                    lines.extend(f"  - {item}" for item in list(selected_candidate.get("evidence_excerpts") or [])[:3])
             if readme_commands:
                 lines.append("- README commands:")
                 lines.extend(f"  - {item}" for item in readme_commands[:6])
-            if scored_candidates:
+            if top_candidates:
                 lines.append("- Top candidates:")
-                for item in scored_candidates[:8]:
+                for item in top_candidates:
                     lines.append(
                         f"  - repo/source/{item.get('path')} [{item.get('entrypoint_type')}] score={item.get('score')}"
                     )
+                    if item.get("why_not_selected"):
+                        lines.append(f"    why_not_selected: {item.get('why_not_selected')}")
 
             return ToolResult(
                 success=True,
@@ -5539,6 +5830,7 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                     "repo_url": repo_reference.get("repo_url"),
                     "readme_main_commands": readme_commands,
                     "main_entry_candidates": scored_candidates[:12],
+                    "top_candidates": top_candidates,
                     "selected_main_path": selected_candidate,
                     "selected_main_path_reason": ", ".join(list(selected_candidate.get("reasons") or [])) if selected_candidate else None,
                 },
@@ -6144,6 +6436,11 @@ class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
             payload = self._normalize_grounding_report_payload(payload, workspace_dir=workspace_dir)
             validation_errors = self._validate_grounding_report_payload(payload, workspace_dir=workspace_dir)
             if validation_errors:
+                structured_errors = self._structured_grounding_validation_errors(
+                    project_id=project_id,
+                    payload=payload,
+                    validation_errors=validation_errors,
+                )
                 return ToolResult(
                     success=False,
                     output=(
@@ -6156,6 +6453,7 @@ class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
                         "relative_path": relative_path,
                         "saved": False,
                         "validation_errors": validation_errors,
+                        "structured_validation_errors": structured_errors,
                     },
                 )
 
@@ -6295,12 +6593,25 @@ class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
                 runtime_inspection=runtime_inspection,
             )
             validation_errors = self._validate_implementation_spec_payload(payload, workspace_dir=workspace_dir)
-            if validation_errors:
+            grounding_report = self._read_grounding_report_payload(workspace_dir)
+            grounding_conflicts = self._implementation_grounding_conflicts(
+                payload=payload,
+                grounding_report=grounding_report,
+            )
+            if validation_errors or grounding_conflicts:
                 return ToolResult(
                     success=False,
                     output=(
                         "implementation_spec JSON 未通过归档校验，未写入文件。\n"
                         + "\n".join(f"- {item}" for item in validation_errors[:12])
+                        + (
+                            (
+                                "\n- 与 grounding_report 的冲突:\n"
+                                + "\n".join(f"  - {item.get('message')}" for item in grounding_conflicts[:8])
+                            )
+                            if grounding_conflicts
+                            else ""
+                        )
                     ),
                     error="implementation_spec_invalid",
                     data={
@@ -6308,6 +6619,15 @@ class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
                         "relative_path": relative_path,
                         "saved": False,
                         "validation_errors": validation_errors,
+                        "schema_errors": [
+                            {
+                                "path": re.match(r"^`([^`]+)`", item).group(1) if re.match(r"^`([^`]+)`", item) else "unknown",
+                                "code": "schema_constraint_failed",
+                                "message": item,
+                            }
+                            for item in validation_errors
+                        ],
+                        "grounding_conflicts": grounding_conflicts,
                     },
                 )
 
@@ -6435,6 +6755,10 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
 
             validation_errors = self._validate_run_drafts_payload(payload, workspace_dir=workspace_dir)
             if validation_errors:
+                grouped_errors = self._group_run_draft_validation_errors(
+                    payload=payload,
+                    validation_errors=validation_errors,
+                )
                 return ToolResult(
                     success=False,
                     output=(
@@ -6447,6 +6771,8 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
                         "relative_path": relative_path,
                         "saved": False,
                         "validation_errors": validation_errors,
+                        "draft_errors": grouped_errors.get("draft_errors") or [],
+                        "global_errors": grouped_errors.get("global_errors") or [],
                         "allowed_kinds": sorted(self._RUN_DRAFT_KINDS),
                         "allowed_entrypoint_types": sorted(self._RUN_DRAFT_ENTRYPOINT_TYPES),
                         "required_draft_fields": [
@@ -6933,6 +7259,13 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 and not resolve_download_gate
             ):
                 suggested_next_action = "retry_with_resolve_download_gate"
+            status_code = get_status or head_status
+            reachable = bool(status_code is not None and int(status_code) < 400)
+            usable = bool(ok) or (
+                detected_kind == "html"
+                and str(page_semantics.get("page_kind") or "") == "reference_page"
+                and expected_kind in {"auto", "html", "text"}
+            )
             payload = {
                 **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                 "project_id": project_id,
@@ -6940,10 +7273,14 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "expected_kind": expected_kind,
                 "resolve_download_gate": resolve_download_gate,
                 "head_status": head_status,
-                "status_code": get_status or head_status,
+                "status_code": status_code,
                 "final_url": final_url,
                 "content_type": content_type or None,
                 "content_length": content_length,
+                "reachable": reachable,
+                "usable": usable,
+                "paper_aligned": None,
+                "reason": str(page_semantics.get("rationale") or diagnosis or "") if page_semantics else str(diagnosis or ""),
                 "downloadable": bool(downloadable),
                 "ok": bool(ok),
                 "detected_kind": detected_kind,
@@ -6956,6 +7293,8 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "page_kind": str(page_semantics.get("page_kind") or "") if page_semantics else "",
                 "page_signals": list(page_semantics.get("signals") or []) if page_semantics else [],
                 "page_text_excerpt": str(page_semantics.get("text_excerpt") or "") if page_semantics else "",
+                "page_links": list(page_semantics.get("links") or [])[:6] if page_semantics else [],
+                "page_forms": list(page_semantics.get("forms") or [])[:4] if page_semantics else [],
                 "page_semantics_source": str(page_semantics.get("classification_source") or "") if page_semantics else "",
                 "page_semantics_rationale": str(page_semantics.get("rationale") or "") if page_semantics else "",
             }
@@ -6966,6 +7305,8 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 f"- Status: {payload.get('status_code')}",
                 f"- Content-Type: {payload.get('content_type') or 'unknown'}",
                 f"- Content-Length: {payload.get('content_length') if payload.get('content_length') is not None else 'unknown'}",
+                f"- Reachable: {reachable}",
+                f"- Usable: {usable}",
                 f"- Detected kind: {detected_kind}",
                 f"- Downloadable: {payload['downloadable']}",
                 f"- Diagnosis: {diagnosis}",
@@ -6979,6 +7320,8 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 signals_preview = ", ".join(str(item) for item in list(payload.get("page_signals") or [])[:6])
                 if signals_preview:
                     lines.append(f"- Page signals: {signals_preview}")
+            if payload.get("page_text_excerpt"):
+                lines.append(f"- Page text excerpt: {payload.get('page_text_excerpt')[:300]}")
             if suggested_next_action:
                 lines.append(f"- Suggested next action: {suggested_next_action}")
             if payload.get("page_semantics_rationale"):

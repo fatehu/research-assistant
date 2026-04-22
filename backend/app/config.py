@@ -225,6 +225,17 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
     paper_intake_timeout_seconds: int = 600
+    paper_intake_provider: Literal[
+        "deepseek",
+        "deepseek_test",
+        "openai",
+        "aliyun",
+        "aliyun_qwen35_flash",
+        "aliyun_qwen35_plus",
+        "aliyun_qwen_plus",
+        "aliyun_qwen_max",
+        "ollama",
+    ] = "aliyun_qwen35_flash"
     paper_intake_multimodal_enabled: bool = True
     paper_intake_multimodal_model: str = "qwen3-vl-flash"
     paper_intake_multimodal_max_pages: int = 24
@@ -281,7 +292,7 @@ class Settings(BaseSettings):
     agent_parallel_tool_calls_max_concurrency: int = 4
     agent_tool_failure_streak_limit: int = 3
     agent_context_budget_enabled: bool = True
-    agent_context_max_input_tokens: int = 10000
+    agent_context_max_input_tokens: int = 0
     agent_context_budget_reserve_tokens: int = 3072
     agent_context_budget_min_tokens: int = 1024
     agent_context_model_window_overrides: str = "{}"

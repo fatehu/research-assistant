@@ -36,6 +36,13 @@ from app.services.agent_tool_error_contract import (
     merge_error_contract,
 )
 from app.services.llm_service import LLMService
+from app.services.model_context_windows import (
+    builtin_model_context_windows,
+    normalize_model_window_key,
+    normalize_provider_name,
+    parse_model_window_overrides,
+    resolve_model_context_window,
+)
 from app.services.smart_chunking.token_utils import estimate_tokens
 
 
@@ -1243,140 +1250,34 @@ class AgentCore:
     @classmethod
     def _context_window_overrides(cls) -> Dict[str, int]:
         raw = str(getattr(settings, "agent_context_model_window_overrides", "{}") or "{}").strip()
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return {}
-        if not isinstance(parsed, dict):
-            return {}
-        normalized: Dict[str, int] = {}
-        for key, value in parsed.items():
-            normalized_key = cls._normalize_model_window_key(str(key or "").strip())
-            if isinstance(value, dict):
-                provider_key = cls._normalize_provider_name(str(key or "").strip())
-                for nested_key, nested_value in value.items():
-                    try:
-                        window = int(nested_value)
-                    except Exception:
-                        continue
-                    nested_name = str(nested_key or "").strip()
-                    if not nested_name or window <= 0:
-                        continue
-                    if nested_name in {"*", "default"}:
-                        normalized[provider_key] = window
-                        continue
-                    normalized_nested_key = cls._normalize_model_window_key(f"{provider_key}:{nested_name}")
-                    if normalized_nested_key:
-                        normalized[normalized_nested_key] = window
-                continue
-            try:
-                window = int(value)
-            except Exception:
-                continue
-            if normalized_key and window > 0:
-                normalized[normalized_key] = window
-        return normalized
+        return parse_model_window_overrides(raw)
 
     @classmethod
     def _normalize_provider_name(cls, provider: str) -> str:
-        normalized = str(provider or "").strip().lower()
-        aliases = {
-            "dashscope": "aliyun",
-            "aliyun": "aliyun",
-            "aliyun_qwen35_flash": "aliyun",
-            "aliyun_qwen35_plus": "aliyun",
-            "aliyun_qwen_plus": "aliyun",
-            "aliyun_qwen_max": "aliyun",
-            "deepseek_test": "deepseek",
-            "azure_openai": "openai",
-            "azure-openai": "openai",
-            "openai_compat": "openai",
-        }
-        return aliases.get(normalized, normalized)
+        return normalize_provider_name(provider)
 
     @classmethod
     def _normalize_model_window_key(cls, key: str) -> str:
-        raw = str(key or "").strip().lower()
-        if not raw:
-            return ""
-        if ":" not in raw:
-            return raw
-        provider, model_name = raw.split(":", 1)
-        normalized_provider = cls._normalize_provider_name(provider)
-        normalized_model_name = str(model_name or "").strip().lower()
-        if not normalized_provider:
-            return normalized_model_name
-        if not normalized_model_name:
-            return normalized_provider
-        return f"{normalized_provider}:{normalized_model_name}"
+        return normalize_model_window_key(key)
 
     @classmethod
     def _builtin_model_context_windows(cls) -> Dict[str, int]:
         deepseek_test_alias = str(getattr(settings, "deepseek_test_model_alias", "deepseek-chat-test") or "deepseek-chat-test").strip().lower()
         deepseek_test_window = max(int(getattr(settings, "deepseek_test_model_window", 4096) or 4096), 1024)
-        return {
-            "openai:gpt-4.1": 128000,
-            "openai:gpt-4o": 128000,
-            "openai:gpt-5": 128000,
-            "openai:o1": 128000,
-            "openai:o3": 128000,
-            "deepseek:deepseek-chat": 64000,
-            "deepseek:deepseek-reasoner": 64000,
-            f"deepseek:{deepseek_test_alias}": deepseek_test_window,
-            "aliyun:qwen-max": 131072,
-            "aliyun:qwen-plus": 131072,
-            "aliyun:qwen-turbo": 65536,
-            "aliyun:qwen3.5-flash": 131072,
-            "aliyun:qwen3.5-plus": 131072,
-        }
+        return builtin_model_context_windows(
+            deepseek_test_alias=deepseek_test_alias,
+            deepseek_test_window=deepseek_test_window,
+        )
 
     @classmethod
     def _resolve_model_context_window(cls, provider: str, model_name: str) -> Optional[int]:
-        normalized_provider = cls._normalize_provider_name(provider)
-        normalized_model = str(model_name or "").strip().lower()
-        overrides = cls._context_window_overrides()
-        for key in (
-            cls._normalize_model_window_key(f"{normalized_provider}:{normalized_model}"),
-            normalized_model,
-            normalized_provider,
-        ):
-            if key and key in overrides:
-                return overrides[key]
-
-        builtin = cls._builtin_model_context_windows()
-        for key in (
-            cls._normalize_model_window_key(f"{normalized_provider}:{normalized_model}"),
-            normalized_model,
-            normalized_provider,
-        ):
-            if key and key in builtin:
-                return builtin[key]
-
-        heuristics: List[tuple[str, int]] = []
-        if normalized_provider == "openai":
-            heuristics = [
-                ("gpt-4.1", 128000),
-                ("gpt-4o", 128000),
-                ("gpt-5", 128000),
-                ("o3", 128000),
-                ("o1", 128000),
-            ]
-        elif normalized_provider == "deepseek":
-            heuristics = [("deepseek", 64000)]
-        elif normalized_provider == "aliyun":
-            heuristics = [
-                ("qwen3", 131072),
-                ("qwen-max", 131072),
-                ("qwen-plus", 131072),
-                ("qwen-turbo", 65536),
-            ]
-        elif normalized_provider == "ollama":
-            heuristics = [("", 32768)]
-
-        for needle, window in heuristics:
-            if not needle or needle in normalized_model:
-                return window
-        return None
+        return resolve_model_context_window(
+            provider=provider,
+            model_name=model_name,
+            overrides_json=str(getattr(settings, "agent_context_model_window_overrides", "{}") or "{}"),
+            deepseek_test_alias=str(getattr(settings, "deepseek_test_model_alias", "deepseek-chat-test") or "deepseek-chat-test"),
+            deepseek_test_window=max(int(getattr(settings, "deepseek_test_model_window", 4096) or 4096), 1024),
+        )
 
     def _current_model_context_window(self) -> Optional[int]:
         provider = self._normalize_provider_name(
@@ -1390,6 +1291,19 @@ class AgentCore:
             or ""
         ).strip()
         return self._resolve_model_context_window(provider, model_name)
+
+    @staticmethod
+    def _configured_system_budget_cap() -> int:
+        raw = int(getattr(settings, "agent_context_max_input_tokens", 0) or 0)
+        return raw if raw > 0 else 0
+
+    def _resolve_system_budget_cap(self, *, model_context_window: Optional[int]) -> int:
+        configured_cap = self._configured_system_budget_cap()
+        if configured_cap > 0:
+            return max(configured_cap, 1024)
+        if model_context_window is not None:
+            return max(int(model_context_window), 1024)
+        return 10000
 
     def _estimate_tool_schema_tokens(self, user_text: str) -> int:
         if not self._supports_function_calling():
@@ -1407,14 +1321,14 @@ class AgentCore:
         return max(estimate_tokens(raw), 0)
 
     def _build_budget_state(self, *, user_text: str, system_prompt: str) -> Dict[str, Any]:
-        system_cap = max(int(getattr(settings, "agent_context_max_input_tokens", 10000) or 10000), 1024)
+        model_context_window = self._current_model_context_window()
+        system_cap = self._resolve_system_budget_cap(model_context_window=model_context_window)
         min_budget = max(int(getattr(settings, "agent_context_budget_min_tokens", 1024) or 1024), 256)
         configured_reserve_tokens = max(int(getattr(settings, "agent_context_budget_reserve_tokens", 3072) or 3072), 0)
         completion_reserve_tokens = max(int(getattr(settings, "llm_max_tokens", 0) or 0), 0)
         reserve_tokens = max(configured_reserve_tokens, completion_reserve_tokens)
         system_prompt_tokens = max(estimate_tokens(system_prompt), 0)
         tool_schema_tokens = self._estimate_tool_schema_tokens(user_text)
-        model_context_window = self._current_model_context_window()
 
         if model_context_window is None:
             effective_budget = max(min_budget, system_cap - system_prompt_tokens - tool_schema_tokens)
@@ -2699,7 +2613,7 @@ class AgentCore:
         return f"[上下文压缩失败，请在需要时重新读取原始内容。kind={compression_kind}]"
 
     @classmethod
-    async def _summarize_messages(cls, messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
+    def _summarize_messages(cls, messages: Sequence[Dict[str, Any]], max_lines: int = 8) -> str:
         lines: List[str] = []
         for msg in messages:
             role = str(msg.get("role", "unknown") or "unknown")
@@ -2715,15 +2629,7 @@ class AgentCore:
             lines.append(f"- {role}: {content[:160]}")
             if len(lines) >= max_lines:
                 break
-        rendered = "\n".join(lines).strip()
-        if not rendered:
-            return ""
-        return await cls._compress_text_with_qwen_turbo(
-            rendered,
-            target_token_budget=max(160, max_lines * 40),
-            source="chat.budget.message_summary",
-            compression_kind="消息摘要",
-        )
+        return "\n".join(lines).strip()
 
     @classmethod
     async def _build_system_compression_message(
@@ -2733,9 +2639,16 @@ class AgentCore:
         title: str,
         max_lines: int = 8,
     ) -> Optional[Dict[str, str]]:
-        summary = (await cls._summarize_messages(messages, max_lines=max_lines)).strip()
+        summary = cls._summarize_messages(messages, max_lines=max_lines).strip()
         if not summary:
             return None
+        if estimate_tokens(summary) > max(160, max_lines * 40):
+            summary = await cls._compress_text_with_qwen_turbo(
+                summary,
+                target_token_budget=max(160, max_lines * 40),
+                source="chat.budget.message_summary",
+                compression_kind="消息摘要",
+            )
         return {"role": "system", "content": f"{title}：\n{summary}"}
 
     @staticmethod
@@ -2771,12 +2684,19 @@ class AgentCore:
         if current_tokens <= max(int(token_budget or 0), 0):
             return text
 
-        return await AgentCore._compress_text_with_qwen_turbo(
+        marker = f"[system-compression-truncated role={role or 'unknown'} kind={kind or 'unknown'}]"
+        marker_tokens = estimate_tokens(marker)
+        target_budget = max(int(token_budget or 0), 96)
+        compressed_budget = max(target_budget - marker_tokens - 8, 48)
+        compressed = await AgentCore._compress_text_with_qwen_turbo(
             text,
-            target_token_budget=max(int(token_budget or 0), 96),
+            target_token_budget=compressed_budget,
             source="chat.budget.message_truncation",
             compression_kind=f"消息裁剪 role={role or 'unknown'} kind={kind or 'unknown'}",
         )
+        if compressed:
+            return f"{marker}\n{compressed}"
+        return marker
 
     @classmethod
     async def _apply_content_truncation_until_budget(
@@ -2830,11 +2750,13 @@ class AgentCore:
             overshoot = max(cls._estimate_messages_tokens(candidate) - budget, 1)
             shrink_by = max(overshoot + 16, current_tokens // 3)
             target_budget = max(24, current_tokens - shrink_by)
+            target_role = str(candidate[idx].get("role", "")).strip().lower()
+            target_kind = cls._context_prefix_kind(candidate[idx])
             truncated = await cls._truncate_message_content_to_token_budget(
                 current_content,
                 target_budget,
-                role=role,
-                kind=kind,
+                role=target_role,
+                kind=target_kind,
             )
             if truncated == current_content:
                 break
@@ -4135,6 +4057,27 @@ class AgentCore:
                     }
                 )
             )
+        if history_messages:
+            return history_messages
+        for entry in list(entries or []):
+            if not isinstance(entry, dict):
+                continue
+            kind = str(entry.get("kind") or "").strip().lower()
+            if kind not in {"reasoning_summary", "tool_use_summary"}:
+                continue
+            summary = str(entry.get("summary") or "").strip()
+            if not summary:
+                continue
+            history_messages.append(
+                cls._sanitize_message_for_context(
+                    {
+                        "role": str(entry.get("role") or "assistant").strip().lower() or "assistant",
+                        "content": "",
+                        "thought": summary,
+                        "metadata": dict(entry.get("metadata") or {}) if isinstance(entry.get("metadata"), dict) else {},
+                    }
+                )
+            )
         return history_messages
 
     @classmethod
@@ -4221,7 +4164,10 @@ class AgentCore:
                 llm_messages=sanitized,
                 recently_slid_messages=recently_slid,
                 estimated_tokens=self._estimate_messages_tokens(sanitized),
-                budget=int(budget_state.get("effective_budget") or max(int(getattr(settings, "agent_context_max_input_tokens", 10000)), 1024)),
+                budget=int(
+                    budget_state.get("effective_budget")
+                    or self._resolve_system_budget_cap(model_context_window=self._current_model_context_window())
+                ),
                 budget_state=budget_state,
                 window_turns=max(int(getattr(settings, "agent_context_window_turns", 8)), 1),
                 total_messages=len(sanitized),
@@ -4285,7 +4231,7 @@ class AgentCore:
             )
             if compressed_older:
                 overflow_compression_messages.append(compressed_older)
-                older_summary = await self._summarize_messages(older, max_lines=10)
+                older_summary = self._summarize_messages(older, max_lines=10)
                 if older_summary:
                     older_summary_parts.append(older_summary)
                     context.context_summary = older_summary
@@ -4317,7 +4263,7 @@ class AgentCore:
             )
             if compressed_slid:
                 overflow_compression_messages.append(compressed_slid)
-                slid_summary = await self._summarize_messages(raw_recently_slid, max_lines=8)
+                slid_summary = self._summarize_messages(raw_recently_slid, max_lines=8)
                 if slid_summary:
                     older_summary_parts.append(slid_summary)
                 raw_recently_slid = []
@@ -4337,7 +4283,7 @@ class AgentCore:
                 )
                 if compressed_recent:
                     overflow_compression_messages.append(compressed_recent)
-                    recent_summary = await self._summarize_messages(compactable_recent, max_lines=8)
+                    recent_summary = self._summarize_messages(compactable_recent, max_lines=8)
                     if recent_summary:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
@@ -4357,7 +4303,7 @@ class AgentCore:
                 )
                 if compressed_recent:
                     overflow_compression_messages.append(compressed_recent)
-                    recent_summary = await self._summarize_messages(compactable_recent, max_lines=6)
+                    recent_summary = self._summarize_messages(compactable_recent, max_lines=6)
                     if recent_summary:
                         older_summary_parts.append(recent_summary)
                     raw_recent = preserved_recent
@@ -4371,7 +4317,7 @@ class AgentCore:
             and not replacement_history_entries
             and self._estimate_messages_tokens(history_source + ephemeral_messages) >= summary_trigger_tokens
         ):
-            opportunistic_summary = await self._summarize_messages(raw_recently_slid, max_lines=10)
+            opportunistic_summary = self._summarize_messages(raw_recently_slid, max_lines=10)
             if opportunistic_summary:
                 older_summary_parts.append(opportunistic_summary)
 
@@ -4526,8 +4472,8 @@ class AgentCore:
             compact_source = older_rows + recently_slid_rows
             if not compact_source:
                 return {}, artifacts
-            fallback_summary = await self._summarize_messages(compact_source, max_lines=10)
-            fallback_anchors = await self._summarize_messages(compact_source, max_lines=6)
+            fallback_summary = self._summarize_messages(compact_source, max_lines=10)
+            fallback_anchors = self._summarize_messages(compact_source, max_lines=6)
             compacted_history = ConversationContextCompactionService._normalize_compacted_history_payload(
                 {
                     "history_anchors": fallback_anchors,
@@ -4699,7 +4645,7 @@ class AgentCore:
         effective_budget = max(
             int(
                 (context.context_debug or {}).get("effective_budget")
-                or getattr(settings, "agent_context_max_input_tokens", 10000)
+                or self._resolve_system_budget_cap(model_context_window=self._current_model_context_window())
                 or 0
             ),
             1024,
@@ -4750,13 +4696,13 @@ class AgentCore:
             for item in list((self._last_skill_resolution or {}).get("active_skills") or [])
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         ]
-        if self._PAPER_SKILL_NAME in active_skill_names:
+        if active_skill_names:
             context.context_debug = {
                 **dict(context.context_debug or {}),
-                "mid_run_compaction_skipped": "skill_exempt",
                 "mid_run_compaction_active_skills": active_skill_names,
             }
-            return False
+            if self._PAPER_SKILL_NAME in active_skill_names:
+                context.context_debug["mid_run_compaction_skill_mark"] = self._PAPER_SKILL_NAME
         min_iteration = max(int(getattr(settings, "agent_mid_run_compaction_min_iteration", 2) or 2), 1)
         if int(context.iteration or 0) < min_iteration:
             return False
@@ -4768,7 +4714,7 @@ class AgentCore:
         effective_budget = max(
             int(
                 (context.context_debug or {}).get("effective_budget")
-                or getattr(settings, "agent_context_max_input_tokens", 10000)
+                or self._resolve_system_budget_cap(model_context_window=self._current_model_context_window())
                 or 0
             ),
             1024,

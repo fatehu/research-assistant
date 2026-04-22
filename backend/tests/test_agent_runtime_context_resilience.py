@@ -95,10 +95,21 @@ class _CompactionLLM:
                     "resolved_facts": ["旧问题已解释"],
                     "evidence_ledger": [],
                     "last_reasoning_summary": "已压缩旧历史，保留当前轮任务。",
+                    "decision_state": {
+                        "status": "in_progress",
+                        "evidence_status": "partial",
+                        "next_action": "continue",
+                        "blocked_reason": "",
+                        "allowed_actions": [],
+                        "repo_edit_allowed": False,
+                    },
                 },
                 ensure_ascii=False,
             )
         }
+
+    async def chat_with_tools(self, messages, tools=None, system_prompt=None, **kwargs):
+        return await self.chat(messages, system_prompt=system_prompt, **kwargs)
 
 
 class _MidRunRuntime(_RuntimeRecorder):
@@ -718,7 +729,9 @@ async def test_mid_run_compaction_can_trigger_on_message_pressure_without_trim(m
 
 
 @pytest.mark.asyncio
-async def test_mid_run_compaction_skips_paper_reproduction_skill(monkeypatch):
+async def test_mid_run_compaction_marks_paper_reproduction_skill_but_still_runs(monkeypatch):
+    monkeypatch.setattr(settings, "agent_context_window_turns", 1)
+    monkeypatch.setattr(settings, "agent_context_recently_slid_turns", 0)
     monkeypatch.setattr(settings, "agent_mid_run_compaction_enabled", True)
     monkeypatch.setattr(settings, "agent_mid_run_compaction_min_iteration", 2)
     monkeypatch.setattr(settings, "agent_mid_run_compaction_max_per_run", 2)
@@ -756,11 +769,11 @@ async def test_mid_run_compaction_skips_paper_reproduction_skill(monkeypatch):
 
     compacted = await agent._maybe_mid_run_compact(run_context, "system")
 
-    assert compacted is False
-    assert run_context.mid_run_compactions == 0
-    assert not runtime.compacted_histories
-    assert run_context.context_debug["mid_run_compaction_skipped"] == "skill_exempt"
+    assert compacted is True
+    assert run_context.mid_run_compactions == 1
+    assert runtime.compacted_histories
     assert "paper-reproduction" in run_context.context_debug["mid_run_compaction_active_skills"]
+    assert run_context.context_debug["mid_run_compaction_skill_mark"] == "paper-reproduction"
 
 
 @pytest.mark.asyncio

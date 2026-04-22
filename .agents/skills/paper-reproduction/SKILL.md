@@ -7,7 +7,7 @@ description: Turn archived machine-learning or deep-learning papers into a gated
 
 Use this skill as the control-plane workflow for a saved paper Project.
 
-The goal is not to push execution at any cost. First read the saved Project state, produce reusable paper understanding artifacts, and ground repo/data/runtime facts. Then make the current reproduction path explicit, qualify which drafts are actually runnable, and enter execution only when preflight says the run is ready to start. When the required conditions are not satisfied, stop clearly, report the blocker, and leave behind artifacts that still support explanation, source gathering, tuning, and validation design.
+The goal is not to push execution at any cost. First read the saved Project state, produce reusable paper understanding artifacts, and investigate whether the repo/resources look reproducible enough to continue. Stage 2 should leave behind a reproduction-readiness checklist, not a rushed execution plan. Only after the repo, data, runtime, and external resources have been investigated clearly should the workflow define an implementation path, qualify runnable drafts, and enter execution. When the required conditions are not satisfied, stop clearly, report the blocker, and leave behind artifacts that still support explanation, source gathering, feasibility judgment, and validation design.
 
 Think in seven workflow stages even if the user does not name them:
 
@@ -34,10 +34,16 @@ During `intake_summary`, preserve three planning artifacts together:
 
 In `intake_summary`, the paper is a background and clue source, not the final execution truth.
 
-- Focus on paper understanding, link classification, and tuning hints.
+- Stage 1 only does paper guidance, not experiment execution planning.
+- Focus on four outputs:
+  - paper understanding and author intent
+  - high-level pipeline extraction
+  - repo verification questions for the next stage
+  - weak hypotheses about likely important factors or gain sources
 - Prefer narrative evidence from正文/method/experiment prose/figure captions.
 - Treat table cells as reference evidence only.
 - Do not let stage 1 decide the final repo main path or executable run scope.
+- Do not treat `planning/experiment_spec.json` as grounded truth; it is a paper-derived hypothesis artifact with `grounding_status=paper_only`.
 
 ## Truth Files
 
@@ -77,8 +83,8 @@ Then decide the next action from state:
 
 1. If no workspace or structured intake exists, run intake with `paper_research_prepare`.
 2. If any planning artifact is missing or stale, refresh planning with `paper_research_prepare` before moving to later stages.
-3. If `specs/grounding_report.json` is missing or stale, stay in `grounding`: probe repo/url first, then clone/read/search/inspect only as needed, and write a grounded evidence report before any implementation work.
-4. If `grounding_report.json` says repo, entrypoint, dataset, runtime, or external dependencies are `blocked`, stop clearly and report those blockers instead of moving on to implementation or execution.
+3. If `specs/grounding_report.json` is missing or stale, stay in `grounding`: read README first, inspect repo structure, merge paper links with repo-discovered links, probe only what the selected reproduction path depends on, and write a reproduction-readiness report before any implementation work.
+4. If `grounding_report.json` says the current repo/resources are blocked or high-risk for continuation, stop clearly and report those blockers instead of moving on to implementation or execution.
 5. If `specs/implementation_spec.json` is missing or stale, create or revise it from planning plus `grounding_report`.
 6. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
 7. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
@@ -152,7 +158,7 @@ Use web tools only for focused diagnosis or official-source recovery after local
 Read only the reference needed for the current state:
 
 - PDF/intake facts and JSON constraints: `references/intake-contract.md`
-- Grounding report contract and URL evidence shape: `references/grounding-contract.md`
+- Grounding/readiness checklist contract and URL evidence shape: `references/grounding-contract.md`
 - Implementation spec and run drafts: `references/implementation-planning.md`
 - Runtime execution, source recovery, long tasks, and tuning/compare: `references/execution-and-tuning.md`
 - Backend artifact fields and UI-facing explanations: `references/output-fields.md`
@@ -160,11 +166,27 @@ Read only the reference needed for the current state:
 - Runtime environment and execution examples: `references/runtime-environment.md`
 - Run-draft repo heuristics: `references/run-draft-heuristics.md`
 
-`grounding` is a formal evidence-closure stage between `planning` and `implementation_prep`.
+`grounding` is the stage-2 reproduction-readiness investigation between `planning` and `implementation_prep`.
 
-Its job is to write `specs/grounding_report.json`, not to produce execution specs.
+Its job is to write `specs/grounding_report.json` as a reproduction preparation checklist, not to produce execution specs.
 
-Grounding must explicitly classify:
+Stage 2 should answer four things in order:
+
+1. Which repo / project page / dataset / external resources does the paper or README point to.
+2. Whether the repo looks structurally reproducible enough to continue.
+3. Which code/data/runtime/external items are reachable, usable, and paper-aligned.
+4. Whether the current evidence says it is worth entering implementation.
+
+The fixed stage-2 order is:
+
+1. Read README.
+2. Inspect repo structure.
+3. Merge stage-1 links with new links discovered in README/repo.
+4. Probe the merged checklist lightly.
+5. Write the reproduction-readiness checklist.
+6. Only then decide whether to continue deeper into implementation.
+
+Grounding must still classify the canonical sections:
 
 - repo
 - entrypoint
@@ -172,13 +194,16 @@ Grounding must explicitly classify:
 - runtime
 - external dependencies
 
-Grounding should also answer one engineering question first:
+But treat them as investigation buckets, not as a fill-the-checklist race.
 
-- what is the repo's most likely runnable main path right now
-- can that main path run now
-- if not, is it blocked or runnable_with_patch
+For each checklist item or source, explicitly distinguish:
 
-Each area should end in one of:
+- `reachable`
+- `usable`
+- `paper_aligned`
+- `reason`
+
+Each major section should end in one of:
 
 - `grounded`
 - `absent`
@@ -187,16 +212,24 @@ Each area should end in one of:
 
 During `grounding`:
 
+- read README before deep repo reading, and inspect repo structure before broad grep
 - prefer `paper_research_probe_repo` / `paper_research_probe_url` before deeper clone/read/search
 - when a probe returns HTML, treat it as a diagnosis step first, not as success or failure by status code alone; use page title, page kind, page signals, suggested next action, and rationale to decide the blocker
 - for download pages such as Google Drive gates, first write the concrete blocker (`download_gate`, `login_required`, `quota_limited`, `access_denied`, `not_found`) before deciding whether to recover, patch, or stop
 - once repo evidence exists, use `paper_research_assess_repo_mainpath` so stage 2 converges on a concrete main-path judgment instead of only broad grep evidence
 - when debugging old repos or verifying minimal fixes, prefer `paper_research_git_status` / `paper_research_git_diff` / `paper_research_git_log` / `paper_research_git_show` before inventing a workaround script
-- use `paper_research_clone_repo`, `paper_research_read_repo_file`, `paper_research_search_repo`, and `paper_research_inspect_runtime` only to close a specific missing fact
+- use `paper_research_clone_repo`, `paper_research_read_repo_file`, `paper_research_search_repo`, and `paper_research_inspect_runtime` only to close a specific missing fact after README/structure review
+- maintain one reproduction-readiness checklist that merges:
+  - stage-1 paper links
+  - README links
+  - repo-discovered links
 - write `specs/grounding_report.json` as the stage-2 truth artifact
 - if you claim a list of datasets or external downloads is `grounded`, every required official link in that list must be individually probed or be explicitly covered by grounded local presence; one successful sample link cannot stand in for sibling links
 - if an official repo/data/dependency source is `blocked`, first write the blocker clearly, then do one focused recovery pass for alternative sources using `web_search` / `web_scrape`; record trustworthy candidates in `alternative_source_candidates`, but do not erase the official-source blocker
 - blocked sections should explain *why* they are blocked in `blockers` and, when possible, `blocker_details` with concrete URL / diagnosis / status-code context
+- page reachable does not mean resource usable; resource usable does not mean paper aligned
+- if an official link fails, only do one light replacement check; if no clearly trustworthy replacement exists, keep it as a high-risk signal instead of widening search forever
+- if the repo is badly structured, README is too weak, or key data/resources are blocked with no trustworthy fallback, mark that clearly and stop before deep code reading
 - do not start execution
 - do not generate execution scripts as a workaround
 - do not skip straight to `implementation_spec`

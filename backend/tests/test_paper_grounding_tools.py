@@ -247,12 +247,18 @@ async def test_probe_url_requires_explicit_resolve_download_gate_for_google_driv
     assert without_resolve.data["diagnosis"] in {"download_gate", "gdrive_confirm_required"}
     assert without_resolve.data["suggested_next_action"] == "retry_with_resolve_download_gate"
     assert without_resolve.data["resolve_download_gate"] is False
+    assert without_resolve.data["reachable"] is True
+    assert without_resolve.data["usable"] is False
+    assert "Google Drive" in without_resolve.data["page_title"]
+    assert without_resolve.data["page_text_excerpt"]
 
     assert with_resolve.success is True
     assert with_resolve.data["status_code"] == 206
     assert with_resolve.data["content_type"] == "application/octet-stream"
     assert with_resolve.data["diagnosis"] == "valid_gzip"
     assert with_resolve.data["resolve_download_gate"] is True
+    assert with_resolve.data["reachable"] is True
+    assert with_resolve.data["usable"] is True
 
 
 @pytest.mark.asyncio
@@ -397,6 +403,8 @@ async def test_assess_repo_mainpath_prefers_readme_commands_and_entrypoint_hints
     repo_dir.mkdir(parents=True, exist_ok=True)
     (repo_dir / "classification-results.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (repo_dir / "train.py").write_text("print('train')\n", encoding="utf-8")
+    (repo_dir / "alignment").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "alignment" / "example.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "repo_readme_excerpt.md").write_text(
         "Run the main reproduction with:\n```bash\nbash classification-results.sh\n```\n",
         encoding="utf-8",
@@ -409,8 +417,8 @@ async def test_assess_repo_mainpath_prefers_readme_commands_and_entrypoint_hints
         json.dumps(
             {
                 "readme_excerpt_file": "repo_readme_excerpt.md",
-                "files": ["classification-results.sh", "train.py", "README.md"],
-                "entrypoint_candidates": [{"path": "train.py"}, {"path": "classification-results.sh"}],
+                "files": ["classification-results.sh", "train.py", "alignment/example.sh", "README.md"],
+                "entrypoint_candidates": [{"path": "train.py"}, {"path": "classification-results.sh"}, {"path": "alignment/example.sh"}],
             }
         ),
         encoding="utf-8",
@@ -432,6 +440,9 @@ async def test_assess_repo_mainpath_prefers_readme_commands_and_entrypoint_hints
     assert result.data["status"] == "identified"
     assert result.data["selected_main_path"]["path"] == "classification-results.sh"
     assert "classification-results.sh" in result.data["selected_main_path_reason"]
+    assert result.data["top_candidates"][0]["path"] == "classification-results.sh"
+    assert result.data["top_candidates"][0]["evidence_excerpts"]
+    assert any(item["path"] == "alignment/example.sh" and item.get("why_not_selected") for item in result.data["top_candidates"])
 
 
 @pytest.mark.asyncio
@@ -465,6 +476,8 @@ async def test_grounding_report_requires_successful_probe_results_for_grounded_u
     assert result.error == "grounding_report_invalid"
     assert any("external_dependencies.status" in str(item) for item in result.data["validation_errors"])
     assert any("dataset.status" in str(item) for item in result.data["validation_errors"])
+    assert any(item.get("path") == "external_dependencies.urls" for item in result.data["structured_validation_errors"])
+    assert any(item.get("path") == "dataset.sources" for item in result.data["structured_validation_errors"])
 
 
 @pytest.mark.asyncio
@@ -640,6 +653,115 @@ async def test_grounding_report_rejects_html_landing_page_probe_for_grounded_url
     assert result.success is False
     assert result.error == "grounding_report_invalid"
     assert result.data["validation_errors"]
+
+
+@pytest.mark.asyncio
+async def test_implementation_spec_returns_grounding_conflicts(tmp_path, monkeypatch):
+    write_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+
+    specs_dir = tmp_path / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    grounding_payload = _complete_grounding_payload()
+    grounding_payload["entrypoint"]["selected_candidate"] = {"path": "classification-results.sh"}
+    (specs_dir / "grounding_report.json").write_text(
+        json.dumps(grounding_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    repo_dir = tmp_path / "paper_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "train.py").write_text("print('train')\n", encoding="utf-8")
+
+    from app.services.project_runtime_service import ProjectRuntimeService
+
+    async def _fake_inspect_runtime(self, **kwargs):
+        return {
+            "repo": {"detected_root_relative_path": "repo/source"},
+            "runtime_worker": {"available": True, "environment": {"packages": {}, "commands": {}}},
+            "runtime_candidates": [{"runtime_type": "plain-python", "status": "ready", "reason": "ok"}],
+        }
+
+    monkeypatch.setattr(ProjectRuntimeService, "inspect_runtime", _fake_inspect_runtime)
+
+    payload = {
+        "source_summary": {},
+        "baseline": {
+            "entrypoint_type": "repo_script",
+            "entrypoint_path_or_hint": "train.py",
+        },
+        "repo_plan": {"repo_status": "grounded"},
+        "runtime_snapshot": {},
+        "data_plan": {},
+        "tuning_plan": {},
+        "readiness": {
+            "can_create_run_draft": False,
+            "can_execute": False,
+            "external_dependencies_grounded": False,
+        },
+    }
+
+    result = await write_tool._execute(project_id=7, implementation_spec=payload)
+
+    assert result.success is False
+    assert result.error == "implementation_spec_invalid"
+    conflicts = list(result.data.get("grounding_conflicts") or [])
+    assert any(item.get("path") == "baseline.entrypoint_path_or_hint" for item in conflicts)
+    assert any(item.get("path") == "readiness.external_dependencies_grounded" for item in conflicts)
+
+
+@pytest.mark.asyncio
+async def test_run_drafts_returns_draft_level_errors(tmp_path, monkeypatch):
+    write_tool = agent_tools.PaperResearchWriteRunDraftsTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    monkeypatch.setattr(write_tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(write_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+
+    specs_dir = tmp_path / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    (specs_dir / "grounding_report.json").write_text(
+        json.dumps(_complete_grounding_payload(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    payload = {
+        "drafts": [
+            {
+                "id": "baseline_ag_news",
+                "kind": "baseline_repro",
+                "title": "Baseline AG News",
+                "objective": "Run baseline",
+                "entrypoint": {"type": "repo_script", "path_or_hint": "missing.py"},
+                "depends_on": [],
+                "data_requirements": [],
+                "env_requirements": [],
+                "params": {},
+                "expected_outputs": [],
+                "blockers": [],
+                "evidence_files": ["specs/implementation_spec.json"],
+                "grounding_notes": [],
+            }
+        ]
+    }
+
+    result = await write_tool._execute(project_id=7, run_drafts=payload)
+
+    assert result.success is False
+    assert result.error == "run_drafts_schema_invalid"
+    draft_errors = list(result.data.get("draft_errors") or [])
+    assert draft_errors
+    assert draft_errors[0]["draft_id"] == "baseline_ag_news"
+    assert any(item.get("path") == "entrypoint.path_or_hint" for item in draft_errors[0]["errors"])
 
 
 @pytest.mark.asyncio

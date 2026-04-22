@@ -99,6 +99,55 @@ async def test_build_paper_intake_payload_prefers_local_markdown_even_when_multi
 
 
 @pytest.mark.asyncio
+async def test_build_paper_intake_payload_uses_paper_intake_provider_over_default(monkeypatch, tmp_path: Path):
+    service = PaperExperimentService(db=None)
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    paper = SimpleNamespace(
+        id=113,
+        title="Bag of Tricks for Efficient Text Classification",
+        abstract="demo abstract",
+        authors=[],
+        year=2016,
+        venue="arXiv",
+        journal=None,
+        arxiv_id="1607.01759",
+        doi=None,
+        url="https://arxiv.org/abs/1607.01759",
+        pdf_url="https://arxiv.org/pdf/1607.01759",
+        arxiv_url="https://arxiv.org/abs/1607.01759",
+        fields_of_study=[],
+        raw_data={},
+    )
+
+    async def _fake_ingest_pdf(**kwargs):
+        return {
+            "document_text": "# Demo\n\nTable 1 data",
+            "extractor": "local_structured_pdf_fast",
+            "report": {"page_count": 8},
+            "document_source_spans": [],
+        }
+
+    async def _fake_ensure_pdf_available(*args, **kwargs):
+        return pdf_path
+
+    monkeypatch.setattr(service.pdf_ingest_service, "ingest_pdf", _fake_ingest_pdf)
+    monkeypatch.setattr(service, "_ensure_pdf_available", _fake_ensure_pdf_available)
+    monkeypatch.setattr(service, "_paper_intake_multimodal_ready", lambda: False)
+    monkeypatch.setattr(service, "_count_pdf_pages", lambda _path: 8)
+    monkeypatch.setattr(settings, "default_llm_provider", "deepseek", raising=False)
+    monkeypatch.setattr(settings, "deepseek_model", "deepseek-chat", raising=False)
+    monkeypatch.setattr(settings, "paper_intake_provider", "aliyun_qwen35_flash", raising=False)
+    monkeypatch.setattr(settings, "aliyun_qwen35_flash_model", "qwen3.5-flash", raising=False)
+
+    payload = await service._build_paper_intake_payload(paper, user_id=1)
+
+    assert payload["provider"] == "aliyun_qwen35_flash"
+    assert payload["model"] == "qwen3.5-flash"
+
+
+@pytest.mark.asyncio
 async def test_build_paper_intake_payload_falls_back_to_page_images_when_markdown_missing(monkeypatch, tmp_path: Path):
     service = PaperExperimentService(db=None)
     pdf_path = tmp_path / "paper.pdf"
@@ -197,10 +246,76 @@ def test_build_experiment_spec_keeps_stage1_as_paper_scaffold():
     spec = service._build_experiment_spec(paper, summary)
 
     assert spec["execution_spec_version"] == "v3_paper_intake_scaffold"
+    assert spec["spec_role"] == "paper_derived_hypothesis"
+    assert spec["grounding_status"] == "paper_only"
     assert spec["paper_focus"]["research_direction"] == "efficient text classification"
+    assert "tuning_hints" not in spec["paper_focus"]
+    assert "weak_hypotheses" in spec["paper_focus"]
     assert spec["execution_contract"]["runtime"] == "repo_assessment_pending"
     assert spec["optimization_brief"]["first_runs"] == []
     assert spec["codelab_run_templates"] == []
+
+
+def test_resolve_paper_context_char_budget_uses_current_model_windows():
+    assert PaperExperimentService._resolve_paper_context_char_budget(provider="deepseek", model="deepseek-chat") == 398847
+    assert PaperExperimentService._resolve_paper_context_char_budget(provider="aliyun_qwen35_flash", model="qwen3.5-flash") == 1200000
+    assert PaperExperimentService._resolve_paper_context_char_budget(provider="openai", model="gpt-5") == 1200000
+
+
+@pytest.mark.asyncio
+async def test_build_paper_intake_payload_reports_store_and_llm_truncation(monkeypatch, tmp_path: Path):
+    service = PaperExperimentService(db=None)
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    paper = SimpleNamespace(
+        id=114,
+        title="Long Paper",
+        abstract="demo abstract",
+        authors=[],
+        year=2026,
+        venue="arXiv",
+        journal=None,
+        arxiv_id="0000.00000",
+        doi=None,
+        url="https://example.com/paper",
+        pdf_url="https://example.com/paper.pdf",
+        arxiv_url="https://example.com/paper",
+        fields_of_study=[],
+        raw_data={},
+    )
+
+    very_long_text = "A" * 1_300_000
+
+    async def _fake_ingest_pdf(**kwargs):
+        return {
+            "document_text": very_long_text,
+            "extractor": "local_structured_pdf_fast",
+            "report": {"page_count": 8},
+            "document_source_spans": [],
+        }
+
+    async def _fake_ensure_pdf_available(*args, **kwargs):
+        return pdf_path
+
+    monkeypatch.setattr(service.pdf_ingest_service, "ingest_pdf", _fake_ingest_pdf)
+    monkeypatch.setattr(service, "_ensure_pdf_available", _fake_ensure_pdf_available)
+    monkeypatch.setattr(service, "_paper_intake_multimodal_ready", lambda: False)
+    monkeypatch.setattr(service, "_count_pdf_pages", lambda _path: 8)
+    monkeypatch.setattr(settings, "default_llm_provider", "deepseek", raising=False)
+    monkeypatch.setattr(settings, "deepseek_model", "deepseek-chat", raising=False)
+    monkeypatch.setattr(settings, "paper_intake_provider", "deepseek", raising=False)
+
+    payload = await service._build_paper_intake_payload(paper, user_id=1)
+
+    assert payload["total_chars"] == 1_300_000
+    assert payload["stored_chars"] == 1_200_000
+    assert payload["sent_chars"] == 398847
+    assert payload["store_truncated"] is True
+    assert payload["llm_truncated"] is True
+    assert payload["truncated"] is True
+    assert len(payload["stored_paper_markdown"]) == 1_200_000
+    assert len(payload["paper_markdown"]) == 398847
 
 
 def test_paper_experiment_repo_index_builds_workspace_assets(tmp_path: Path):
