@@ -593,6 +593,73 @@ async def test_compact_conversation_skips_when_boundary_already_covers_latest_me
     assert _FakeStateLLM.calls == []
 
 
+@pytest.mark.asyncio
+async def test_compact_conversation_preserves_existing_context_state_when_new_artifacts_are_empty(monkeypatch):
+    conversation = Conversation(
+        id=146,
+        user_id=5,
+        title="测试",
+        llm_provider="aliyun",
+        is_archived=0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    runtime_service = _FakeRuntimeService(
+        {
+            "version": "conversation_item_stream.v1",
+            "entries": [
+                {
+                    "item_id": "user-1",
+                    "kind": "user_message",
+                    "turn_id": "turn:2",
+                    "role": "user",
+                    "content": "继续",
+                    "message_id": 729,
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            ],
+        },
+        context_state={
+            "version": "conversation_context_state.v3",
+            "active_topic": "复现 paperid 113",
+            "workflow_binding": {
+                "skill": "paper-reproduction",
+                "paper_id": 113,
+                "project_id": 6,
+                "workspace_id": 6,
+            },
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker"],
+            },
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+    service = ConversationContextCompactionService()
+    service._runtime_service = runtime_service
+    monkeypatch.setattr(compaction_module, "async_session_factory", lambda: _FakeSession(conversation))
+
+    async def _fake_build_artifacts(*args, **kwargs):
+        return compaction_module.ConversationCompactionArtifacts(
+            context_state={},
+            compacted_history={},
+            summary_text="",
+            up_to_message_id=None,
+            message_count=1,
+            compacted_message_count=0,
+        )
+
+    monkeypatch.setattr(service, "build_artifacts", _fake_build_artifacts)
+
+    artifacts = await service.compact_now(146)
+
+    assert artifacts.context_state["workflow_binding"]["paper_id"] == 113
+    assert runtime_service.context_state["workflow_binding"]["project_id"] == 6
+    assert runtime_service.snapshots
+    assert runtime_service.snapshots[-1]["context_state"]["workflow_binding"]["workspace_id"] == 6
+
+
 def test_normalize_context_state_payload_strips_unverified_reasoning_claims():
     payload = ConversationContextCompactionService._normalize_context_state_payload(
         {

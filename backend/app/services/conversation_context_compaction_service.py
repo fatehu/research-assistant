@@ -956,15 +956,16 @@ class ConversationContextCompactionService:
             force_compact=(str(mode).strip().lower() == "manual"),
         )
 
-        if artifacts.context_state:
-            current_context_state = dict(await self._runtime_service.get_conversation_context_state(int(conversation_id)) or {})
+        current_context_state = dict(await self._runtime_service.get_conversation_context_state(int(conversation_id)) or {})
+        if current_context_state or artifacts.context_state:
             state_payload = ReActAgent._merge_conversation_state_with_workflow_binding(
                 current_context_state,
                 artifacts.context_state,
             )
-            state_payload["updated_at"] = state_payload.get("updated_at") or ""
-            await self._runtime_service.upsert_conversation_context_state(conversation_id, state_payload)
-            artifacts.context_state = dict(state_payload)
+            if state_payload:
+                state_payload["updated_at"] = state_payload.get("updated_at") or ""
+                await self._runtime_service.upsert_conversation_context_state(conversation_id, state_payload)
+                artifacts.context_state = dict(state_payload)
         if artifacts.compacted_history:
             await self._runtime_service.upsert_conversation_compacted_history(
                 conversation_id,

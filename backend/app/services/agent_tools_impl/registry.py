@@ -48,6 +48,8 @@ from app.services.agent_tool_error_contract import (
     build_tool_error_contract,
     merge_error_contract,
 )
+from app.services.html_page_semantics import analyze_html_page_semantics
+from app.services.google_drive_utils import is_google_drive_url, probe_google_drive_confirm_download
 from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
 
 # 尝试导入共享模块（可选）
@@ -1375,6 +1377,16 @@ class PaperResearchReadArtifactInput(BaseModel):
     line_end: Optional[int] = Field(default=None, ge=1, le=2000000)
 
 
+class PaperResearchSearchOutputsInput(BaseModel):
+    project_id: int = Field(ge=1)
+    query: str = Field(min_length=1, max_length=400)
+    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
+    max_results: int = Field(default=20, ge=1, le=100)
+    case_sensitive: bool = False
+    is_regex: bool = False
+    context_lines: int = Field(default=0, ge=0, le=20)
+
+
 class PaperResearchReadRepoFileInput(BaseModel):
     project_id: int = Field(ge=1)
     repo_relative_path: str = Field(
@@ -1506,6 +1518,98 @@ class PaperResearchProbeUrlInput(BaseModel):
     url: str = Field(min_length=1, max_length=2000)
     expected_kind: Literal["auto", "html", "file", "hdf5", "zip", "json", "text"] = "auto"
     read_bytes: int = Field(default=64, ge=8, le=512)
+    resolve_download_gate: bool = False
+
+
+class PaperResearchAssessRepoMainpathInput(BaseModel):
+    project_id: int = Field(ge=1)
+
+
+class PaperResearchListOutputsInput(BaseModel):
+    project_id: int = Field(ge=1)
+    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
+
+
+class PaperResearchDeleteOutputInput(BaseModel):
+    project_id: int = Field(ge=1)
+    relative_path: str = Field(min_length=1, max_length=400)
+
+
+class PaperResearchCleanupScopeInput(BaseModel):
+    project_id: int = Field(ge=1)
+    scope: Literal["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"] = "all"
+
+
+class PaperResearchGitStatusInput(BaseModel):
+    project_id: int = Field(ge=1)
+    include_untracked: bool = True
+    max_entries: int = Field(default=200, ge=1, le=1000)
+
+
+class PaperResearchGitDiffInput(BaseModel):
+    project_id: int = Field(ge=1)
+    repo_relative_paths: List[str] = Field(
+        default_factory=list,
+        max_length=50,
+        validation_alias=AliasChoices("repo_relative_paths", "paths"),
+    )
+    cached: bool = False
+    ref: Optional[str] = Field(default=None, max_length=200)
+    max_chars: int = Field(default=20000, ge=200, le=200000)
+
+    @field_validator("repo_relative_paths", mode="before")
+    @classmethod
+    def _normalize_repo_relative_paths(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        raw_items = list(value) if isinstance(value, (list, tuple, set)) else [value]
+        normalized_items: List[str] = []
+        for item in raw_items:
+            normalized = PaperResearchReadRepoFileInput._normalize_repo_relative_path(str(item or ""))
+            if normalized:
+                normalized_items.append(normalized)
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for item in normalized_items:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+
+class PaperResearchGitLogInput(BaseModel):
+    project_id: int = Field(ge=1)
+    repo_relative_paths: List[str] = Field(
+        default_factory=list,
+        max_length=50,
+        validation_alias=AliasChoices("repo_relative_paths", "paths"),
+    )
+    max_count: int = Field(default=10, ge=1, le=100)
+
+    @field_validator("repo_relative_paths", mode="before")
+    @classmethod
+    def _normalize_repo_relative_paths(cls, value: Any) -> List[str]:
+        return PaperResearchGitDiffInput._normalize_repo_relative_paths(value)
+
+
+class PaperResearchGitShowInput(BaseModel):
+    project_id: int = Field(ge=1)
+    ref: str = Field(min_length=1, max_length=200)
+    repo_relative_path: Optional[str] = Field(
+        default=None,
+        max_length=400,
+        validation_alias=AliasChoices("repo_relative_path", "relative_path", "path", "file_path", "file"),
+    )
+    max_chars: int = Field(default=20000, ge=200, le=200000)
+
+    @field_validator("repo_relative_path")
+    @classmethod
+    def _normalize_repo_relative_path(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = PaperResearchReadRepoFileInput._normalize_repo_relative_path(value)
+        return normalized or None
 
 
 class PaperResearchWriteExecutionSpecInput(BaseModel):
@@ -1539,6 +1643,12 @@ class PaperResearchReadExecutionInput(BaseModel):
     execution_id: str = Field(min_length=1, max_length=120)
     include_logs: bool = True
     max_log_chars: int = Field(default=20000, ge=0, le=200000)
+
+
+class PaperResearchTailExecutionLogInput(BaseModel):
+    project_id: int = Field(ge=1)
+    execution_id: str = Field(min_length=1, max_length=120)
+    max_log_chars: int = Field(default=12000, ge=200, le=200000)
 
 
 class PaperResearchCancelExecutionInput(BaseModel):
@@ -1659,6 +1769,13 @@ class _PaperResearchToolBase(ToolBase):
             "actual_rel_path": "drafts/run_drafts.json",
         },
     }
+
+    @staticmethod
+    def _normalize_line_preview(value: str, *, limit: int = 240) -> str:
+        text = str(value or "").replace("\r", "").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[: max(40, limit - 3)].rstrip()}..."
 
     def __init__(
         self,
@@ -1957,6 +2074,87 @@ class _PaperResearchToolBase(ToolBase):
             return {}
         return dict(content) if isinstance(content, dict) else {}
 
+    @staticmethod
+    def _normalize_repo_relative_path(value: Any) -> str:
+        normalized = _normalize_relative_path(value)
+        if normalized == "repo/source":
+            return ""
+        if normalized.startswith("repo/source/"):
+            return normalized.removeprefix("repo/source/")
+        if normalized.startswith("paper_repo/"):
+            return normalized.removeprefix("paper_repo/")
+        return normalized
+
+    async def _resolve_repo_workspace(
+        self,
+        db: AsyncSession,
+        *,
+        project_id: int,
+    ) -> tuple[Optional[Dict[str, Any]], Any, Optional[Path], Optional[ToolResult]]:
+        project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+        if project_payload is None:
+            return None, None, None, self._project_not_found(project_id)
+        if workspace is None:
+            return project_payload, None, None, self._workspace_not_ready(project_payload, project_id)
+        repo_dir = self._workspace_dir_for(workspace) / "paper_repo"
+        if not repo_dir.is_dir():
+            return project_payload, workspace, None, ToolResult(
+                success=False,
+                output="当前 Project 还没有可用的 repo/source。请先调用 paper_research_prepare 或 paper_research_clone_repo。",
+                error="repo_not_available",
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "project_id": int(project_id),
+                    "relative_path": "repo/source",
+                },
+            )
+        return project_payload, workspace, repo_dir, None
+
+    @classmethod
+    async def _run_repo_git_command(
+        cls,
+        *,
+        repo_dir: Path,
+        git_args: Sequence[str],
+        timeout_seconds: float = 20.0,
+    ) -> Dict[str, Any]:
+        if not shutil.which("git"):
+            return {
+                "available": False,
+                "returncode": None,
+                "stdout": "",
+                "stderr": "git_not_installed",
+                "command": ["git", *list(git_args)],
+            }
+        command = ["git", "--no-pager", *list(git_args)]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(repo_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            process.kill()
+            stdout_bytes, stderr_bytes = await process.communicate()
+            return {
+                "available": True,
+                "timeout": True,
+                "returncode": None,
+                "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+                "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+                "command": command,
+            }
+        return {
+            "available": True,
+            "timeout": False,
+            "returncode": int(process.returncode or 0),
+            "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+            "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+            "command": command,
+        }
+
     @classmethod
     def _classify_magic_bytes(cls, head_bytes: bytes, content_type: str) -> str:
         normalized_type = str(content_type or "").lower()
@@ -2009,7 +2207,9 @@ class _PaperResearchToolBase(ToolBase):
 
         if normalized_expected == "auto":
             if detected_kind == "html":
-                return ok, downloadable, "html_page", "use_as_reference_page"
+                # A generic HTML response proves the URL is reachable, but it does
+                # not prove the target file is directly downloadable.
+                return False, False, "html_page", "use_as_reference_page"
             if detected_kind == "hdf5":
                 return ok, downloadable, "valid_hdf5", "use_as_official_source"
             if detected_kind in {"zip", "gzip", "binary", "json", "text"}:
@@ -2422,6 +2622,9 @@ class _PaperResearchToolBase(ToolBase):
         explicit_status = str(summary.get("overall_status") or "").strip().lower()
         if explicit_status not in cls._GROUNDING_STATUSES:
             explicit_status = ""
+        explicit_run_decision = str(summary.get("run_decision") or "").strip().lower()
+        if explicit_run_decision not in {"ready", "runnable_with_patch", "blocked"}:
+            explicit_run_decision = ""
         any_blocked = any(
             str(section.get("status") or "").strip().lower() == "blocked"
             for section in (repo, entrypoint, dataset, runtime, external_dependencies)
@@ -2448,6 +2651,14 @@ class _PaperResearchToolBase(ToolBase):
             overall_status = "absent"
         else:
             overall_status = "unknown"
+        if explicit_run_decision:
+            run_decision = explicit_run_decision
+        elif repo_grounded and entrypoint_grounded and runtime_grounded and not any_blocked:
+            run_decision = "ready"
+        elif overall_status == "blocked":
+            run_decision = "blocked"
+        else:
+            run_decision = "unknown"
         return {
             "repo_grounded": repo_grounded,
             "entrypoint_grounded": entrypoint_grounded,
@@ -2455,9 +2666,11 @@ class _PaperResearchToolBase(ToolBase):
             "runtime_grounded": runtime_grounded,
             "external_dependencies_grounded": external_dependencies_grounded,
             "overall_status": overall_status,
+            "run_decision": run_decision,
             "blockers": list(dict.fromkeys(section_blockers)),
             "next_actions": explicit_next_actions,
-            "complete": all_grounded and overall_status == "grounded",
+            "complete": run_decision in {"ready", "runnable_with_patch", "blocked"},
+            "ready_for_next_stage": run_decision in {"ready", "runnable_with_patch"},
         }
 
     @classmethod
@@ -2534,6 +2747,39 @@ class _PaperResearchToolBase(ToolBase):
                 if isinstance(dataset.get(alias), list):
                     dataset["sources"] = list(dataset.get(alias) or [])
                     break
+        normalized_sources: List[Any] = []
+        dataset_probe_results: List[Dict[str, Any]] = []
+        for item in list(dataset.get("sources") or []):
+            if not isinstance(item, dict):
+                normalized_sources.append(item)
+                continue
+            source = dict(item)
+            source_url = str(
+                source.get("url")
+                or source.get("source_url")
+                or source.get("download_url")
+                or source.get("href")
+                or source.get("link")
+                or ""
+            ).strip()
+            probe_result = source.get("probe_result")
+            if isinstance(probe_result, dict):
+                probe_payload = dict(probe_result)
+                if source_url:
+                    probe_payload.setdefault("url", source_url)
+                inferred_ok = cls._infer_probe_result_ok(probe_payload)
+                if inferred_ok is not None and "ok" not in probe_payload:
+                    probe_payload["ok"] = inferred_ok
+                source["probe_result"] = probe_payload
+                dataset_probe_results.append(probe_payload)
+                if (
+                    inferred_ok is True
+                    and str(source.get("status") or "").strip().lower() in {"", "unknown", "partial", "blocked"}
+                    and not list(source.get("blockers") or [])
+                ):
+                    source["status"] = "grounded"
+            normalized_sources.append(source)
+        dataset["sources"] = normalized_sources
         local_presence = dataset.get("local_presence")
         if isinstance(local_presence, bool):
             dataset["local_presence"] = {"available": bool(local_presence)}
@@ -2554,9 +2800,22 @@ class _PaperResearchToolBase(ToolBase):
 
         external_dependencies = dict(normalized.get("external_dependencies") or {})
         raw_urls = list(external_dependencies.get("urls") or [])
-        existing_probe_results = list(external_dependencies.get("probe_results") or [])
+        existing_probe_results = [*list(external_dependencies.get("probe_results") or []), *dataset_probe_results]
         normalized_urls: List[str] = []
         flattened_probe_results: List[Dict[str, Any]] = []
+        for item in list(dataset.get("sources") or []):
+            if not isinstance(item, dict):
+                continue
+            dataset_url = str(
+                item.get("url")
+                or item.get("source_url")
+                or item.get("download_url")
+                or item.get("href")
+                or item.get("link")
+                or ""
+            ).strip()
+            if dataset_url:
+                normalized_urls.append(dataset_url)
         for item in raw_urls:
             if isinstance(item, str):
                 url = str(item or "").strip()
@@ -2641,14 +2900,16 @@ class _PaperResearchToolBase(ToolBase):
         successful_probe_urls, failed_probe_urls = cls._probe_result_url_sets(external_dependencies.get("probe_results"))
         failed_probe_map = cls._failed_probe_result_map(external_dependencies.get("probe_results"))
 
-        if str(dataset.get("status") or "").strip().lower() == "unknown":
+        dataset_status = str(dataset.get("status") or "").strip().lower()
+        if dataset_status != "blocked":
             if any(url in failed_probe_urls for url in dataset_source_urls):
                 dataset["status"] = "blocked"
             elif bool(dict(dataset.get("local_presence") or {}).get("available")):
                 dataset["status"] = "grounded"
             elif dataset_source_urls and all(url in successful_probe_urls for url in dataset_source_urls):
                 dataset["status"] = "grounded"
-        if str(external_dependencies.get("status") or "").strip().lower() == "unknown":
+        external_status = str(external_dependencies.get("status") or "").strip().lower()
+        if external_status != "blocked":
             if any(url in failed_probe_urls for url in external_urls):
                 external_dependencies["status"] = "blocked"
             elif external_urls and all(url in successful_probe_urls for url in external_urls):
@@ -2690,6 +2951,7 @@ class _PaperResearchToolBase(ToolBase):
             "overall_status",
         ):
             summary[field] = completion[field]
+        summary["run_decision"] = completion["run_decision"]
         existing_next_actions = [
             str(item).strip()
             for item in list(summary.get("next_actions") or [])
@@ -2719,6 +2981,8 @@ class _PaperResearchToolBase(ToolBase):
                 next_actions.append("继续 probe/clone repo，补齐 repo commit/ref 与 blocker 归因。")
             if str(entrypoint.get("status") or "").strip().lower() == "unknown":
                 next_actions.append("继续 read/search repo，确认 entrypoint candidate、selected_candidate 与 evidence_files。")
+            if completion["run_decision"] == "unknown":
+                next_actions.append("先判断 repo 主路径能否运行；必要时调用 `paper_research_assess_repo_mainpath`，再把结论写入 `summary.run_decision`。")
             summary["next_actions"] = list(dict.fromkeys(next_actions))
         normalized["summary"] = summary
         return normalized
@@ -2778,11 +3042,20 @@ class _PaperResearchToolBase(ToolBase):
             "accepted_but_empty",
             "redirect_broken",
             "checksum_mismatch",
+            "gdrive_confirm_required",
+            "html_page",
+            "html_landing_page_for_file",
             "license_gate",
             "manual_download_required",
             "repo_unreachable",
             "repo_page_reachable_but_not_cloneable",
         }:
+            return False
+        detected_kind = str(item.get("detected_kind") or item.get("kind") or "").strip().lower()
+        if detected_kind == "html":
+            return False
+        content_type = str(item.get("content_type") or "").strip().lower()
+        if "text/html" in content_type:
             return False
         raw_status = item.get("status_code", item.get("status"))
         try:
@@ -3065,6 +3338,23 @@ class _PaperResearchToolBase(ToolBase):
             errors.append(
                 f"`summary.overall_status` must be one of {sorted(cls._GROUNDING_STATUSES)}, got `{overall_status}`."
             )
+        run_decision = str(summary.get("run_decision") or "").strip().lower()
+        if run_decision and run_decision not in {"ready", "runnable_with_patch", "blocked"}:
+            errors.append("`summary.run_decision` must be one of ready/runnable_with_patch/blocked when provided.")
+        if run_decision in {"ready", "runnable_with_patch"}:
+            missing_prereqs: List[str] = []
+            if str(repo.get("status") or "").strip().lower() != "grounded":
+                missing_prereqs.append("repo")
+            if str(entrypoint.get("status") or "").strip().lower() != "grounded":
+                missing_prereqs.append("entrypoint")
+            if str(runtime.get("status") or "").strip().lower() != "grounded":
+                missing_prereqs.append("runtime")
+            if missing_prereqs:
+                errors.append(
+                    "`summary.run_decision` marks the main path as runnable, but these sections are not grounded: "
+                    + ", ".join(missing_prereqs)
+                    + "."
+                )
         if summary.get("next_actions") is not None and not isinstance(summary.get("next_actions"), list):
             errors.append("`summary.next_actions` must be a list when provided.")
         if summary.get("blockers") is not None and not isinstance(summary.get("blockers"), list):
@@ -3089,8 +3379,10 @@ class _PaperResearchToolBase(ToolBase):
             }
         completion = cls._grounding_completion_summary(report)
         return {
-            "ready": bool(completion.get("complete")),
+            "ready": bool(completion.get("ready_for_next_stage")),
+            "complete": bool(completion.get("complete")),
             "status": str(completion.get("overall_status") or "unknown"),
+            "run_decision": str(completion.get("run_decision") or "unknown"),
             "relative_path": "specs/grounding_report.json",
             "blockers": list(completion.get("blockers") or []),
             "next_actions": list(completion.get("next_actions") or []),
@@ -3115,6 +3407,7 @@ class _PaperResearchToolBase(ToolBase):
             f"- Project: /projects/{int(project_payload.get('id') or 0)}",
             f"- Grounding report: {gate_state.get('relative_path')}",
             f"- Grounding status: {status}",
+            f"- Run decision: {gate_state.get('run_decision') or 'unknown'}",
         ]
         if blockers:
             lines.append("- Grounding blockers:")
@@ -3130,7 +3423,7 @@ class _PaperResearchToolBase(ToolBase):
         return ToolResult(
             success=False,
             output="\n".join(lines),
-            error="grounding_incomplete",
+            error="grounding_blocked" if status == "blocked" else "grounding_incomplete",
             data={
                 **cls._root_descriptor(project_payload=project_payload, workspace=workspace),
                 "project_id": int(project_payload.get("id") or 0),
@@ -3138,7 +3431,9 @@ class _PaperResearchToolBase(ToolBase):
                 "blocked_stage": stage_name,
                 "grounding_report_relative_path": gate_state.get("relative_path"),
                 "grounding_status": status,
-                "grounding_ready": False,
+                "grounding_complete": bool(gate_state.get("complete")),
+                "grounding_ready": bool(gate_state.get("ready")),
+                "run_decision": gate_state.get("run_decision"),
                 "grounding_blockers": blockers,
                 "next_actions": next_actions,
             },
@@ -4339,6 +4634,206 @@ class PaperResearchReadArtifactTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
+class PaperResearchSearchOutputsTool(_PaperResearchToolBase):
+    name = "paper_research_search_outputs"
+    input_model = PaperResearchSearchOutputsInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "在当前 Project/workspace 的归档产物中按关键词或正则搜索内容，适合搜索 `paper_intake_markdown.md`、planning/specs/drafts/executions 等输出。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "query": {"type": "string", "description": "搜索词或正则表达式。默认按固定字符串搜索；只有在 `is_regex=true` 时才按正则处理。"},
+            "scope": {
+                "type": "string",
+                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
+                "default": "all",
+                "description": "只在指定 scope 的 workspace 产物里搜索；all 表示全部可管理输出。",
+            },
+            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条匹配。范围 1-100。"},
+            "case_sensitive": {"type": "boolean", "default": False, "description": "是否大小写敏感。"},
+            "is_regex": {"type": "boolean", "default": False, "description": "是否将 query 按正则表达式处理。"},
+            "context_lines": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 20,
+                "description": "返回每个命中点上下各多少行上下文。范围 0-20，适合先 search 再按行读局部。",
+            },
+        },
+        "required": ["project_id", "query"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_service import ProjectService
+
+            project_id = int(kwargs["project_id"])
+            query = str(kwargs.get("query") or "").strip()
+            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
+            max_results = int(kwargs.get("max_results") or 20)
+            case_sensitive = bool(kwargs.get("case_sensitive", False))
+            is_regex = bool(kwargs.get("is_regex", False))
+            context_lines = int(kwargs.get("context_lines") or 0)
+
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            service = ProjectService(db)
+            outputs = await service.list_workspace_outputs(
+                project_id=project_id,
+                user_id=self.user_id,
+                workspace_id=int(workspace.id),
+            )
+            if outputs is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            searchable_items: List[Dict[str, Any]] = []
+            skipped_non_file_outputs: List[str] = []
+            for item in list(outputs or []):
+                relative_path = self._normalize_relative_path(item.get("relative_path"))
+                if not relative_path:
+                    continue
+                if scope != "all" and str(item.get("scope") or "").strip() != scope:
+                    continue
+                if str(item.get("storage") or "file").strip() != "file":
+                    skipped_non_file_outputs.append(relative_path)
+                    continue
+                target = workspace_dir / relative_path
+                if not target.is_file():
+                    continue
+                searchable_items.append(
+                    {
+                        "relative_path": relative_path,
+                        "scope": str(item.get("scope") or "").strip(),
+                        "kind": str(item.get("kind") or "").strip(),
+                        "path": target,
+                    }
+                )
+
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                regex = re.compile(query, flags) if is_regex else None
+            except re.error as exc:
+                return ToolResult(
+                    success=False,
+                    output=f"搜索正则无效: {exc}",
+                    error="invalid_search_regex",
+                    data={"project_id": project_id, "query": query, "scope": scope},
+                )
+            fixed_query = query if case_sensitive else query.lower()
+            matches: List[Dict[str, Any]] = []
+            matched_files: Set[str] = set()
+            truncated = False
+            parse_errors = 0
+
+            for item in searchable_items:
+                try:
+                    with Path(item["path"]).open("r", encoding="utf-8", errors="ignore") as handle:
+                        for line_number, line in enumerate(handle, start=1):
+                            haystack = line if case_sensitive else line.lower()
+                            matched = bool(regex.search(line)) if regex is not None else fixed_query in haystack
+                            if not matched:
+                                continue
+                            relative_path = str(item["relative_path"])
+                            matched_files.add(relative_path)
+                            row: Dict[str, Any] = {
+                                "relative_path": relative_path,
+                                "line_number": line_number,
+                                "line_text": self._normalize_line_preview(line),
+                                "scope": item["scope"],
+                                "kind": item["kind"],
+                                "submatches": [],
+                            }
+                            if context_lines > 0:
+                                preview = self._read_text_payload(
+                                    Path(item["path"]),
+                                    mode="line_range",
+                                    max_chars=800,
+                                    chunk_index=None,
+                                    chunk_chars=None,
+                                    page=None,
+                                    page_size_lines=None,
+                                    line_start=max(1, line_number - context_lines),
+                                    line_end=max(1, line_number + context_lines),
+                                )
+                                row.update(
+                                    {
+                                        "context_start_line": preview.get("line_start"),
+                                        "context_end_line": preview.get("line_end"),
+                                        "context_text": preview.get("content"),
+                                        "context_truncated": preview.get("truncated"),
+                                    }
+                                )
+                            matches.append(row)
+                            if len(matches) >= max_results:
+                                truncated = True
+                                break
+                    if truncated:
+                        break
+                except Exception:
+                    parse_errors += 1
+                    continue
+
+            result_lines: List[str] = []
+            for item in matches:
+                result_lines.append(
+                    f"- {item.get('relative_path')}:{item.get('line_number')} | {item.get('line_text')}"
+                )
+                context_text = str(item.get("context_text") or "").strip()
+                if context_text:
+                    result_lines.append(
+                        f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
+                    )
+
+            lines = [
+                "已搜索 Project/workspace 归档产物。",
+                f"- Project: /projects/{project_id}",
+                f"- Scope: {scope}",
+                f"- Query: {query}",
+                f"- Regex: {is_regex}",
+                f"- Case sensitive: {case_sensitive}",
+                f"- Context lines: {context_lines}",
+                f"- Searchable outputs: {len(searchable_items)}",
+                f"- Matched files: {len(matched_files)}",
+                f"- Returned matches: {len(matches)}/{max_results}",
+                f"- Truncated: {truncated}",
+                "- Matches:",
+                *(result_lines or ["- none"]),
+            ]
+            if skipped_non_file_outputs:
+                lines.append("- Skipped non-file outputs:")
+                lines.extend(f"  - {item}" for item in skipped_non_file_outputs[:10])
+
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "scope": scope,
+                    "query": query,
+                    "context_lines": context_lines,
+                    "case_sensitive": case_sensitive,
+                    "is_regex": is_regex,
+                    "engine": "python_fallback",
+                    "searchable_output_count": len(searchable_items),
+                    "matched_file_count": len(matched_files),
+                    "returned_matches": len(matches),
+                    "truncated": truncated,
+                    "parse_errors": parse_errors,
+                    "skipped_non_file_outputs": skipped_non_file_outputs,
+                    "matches": matches,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
 class PaperResearchReadRepoFileTool(_PaperResearchToolBase):
     name = "paper_research_read_repo_file"
     input_model = PaperResearchReadRepoFileInput
@@ -4836,6 +5331,771 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
+class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
+    name = "paper_research_assess_repo_mainpath"
+    input_model = PaperResearchAssessRepoMainpathInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = (
+        "基于 README、repo_file_index、entrypoint hints 和仓库文件名，评估当前 Project 最可能的 repo 主路径。"
+        "这是主路径判断工具，不执行代码。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+        },
+        "required": ["project_id"],
+    }
+
+    @staticmethod
+    def _normalize_hint_token(value: str) -> str:
+        token = re.sub(r"[^a-z0-9._/-]+", " ", str(value or "").strip().lower())
+        token = re.sub(r"\s+", " ", token).strip()
+        return token
+
+    @staticmethod
+    def _extract_readme_commands(text: str) -> List[str]:
+        commands: List[str] = []
+        content = str(text or "")
+        fence_pattern = re.compile(r"```(?:bash|sh|shell|python)?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+        for block in fence_pattern.findall(content):
+            for line in str(block).splitlines():
+                stripped = line.strip()
+                if stripped:
+                    commands.append(stripped)
+        for line in content.splitlines():
+            stripped = line.strip()
+            if re.match(r"^(python|python3|bash|sh|make|docker|docker-compose|docker compose|papermill|jupyter)\b", stripped):
+                commands.append(stripped)
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for item in commands:
+            key = item.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+        return deduped[:12]
+
+    @staticmethod
+    def _classify_mainpath(path: str) -> str:
+        lowered = str(path or "").strip().lower()
+        if lowered.endswith(".ipynb"):
+            return "notebook"
+        if lowered.endswith(".sh"):
+            return "shell_script"
+        if lowered.endswith(".py"):
+            return "python_script"
+        if lowered.endswith("docker-compose.yml") or lowered.endswith("compose.yaml"):
+            return "docker_compose"
+        if lowered.endswith("dockerfile"):
+            return "dockerfile"
+        if lowered.endswith("readme.md"):
+            return "readme"
+        return "file"
+
+    @classmethod
+    def _score_mainpath_candidate(
+        cls,
+        *,
+        path: str,
+        hints: Sequence[str],
+        readme_text: str,
+    ) -> tuple[int, List[str]]:
+        lowered = str(path or "").strip().lower()
+        score = 0
+        reasons: List[str] = []
+        if lowered.endswith(".sh"):
+            score += 5
+            reasons.append("shell entrypoint")
+        elif lowered.endswith(".py"):
+            score += 4
+            reasons.append("python entrypoint")
+        elif lowered.endswith(".ipynb"):
+            score += 3
+            reasons.append("notebook entrypoint")
+        for token in ("classification-results", "train", "main", "run", "demo", "example", "eval", "infer", "predict"):
+            if token in lowered:
+                score += 3
+                reasons.append(f"filename contains `{token}`")
+                break
+        for hint in hints:
+            if hint and hint in lowered:
+                score += 5
+                reasons.append(f"matches entrypoint hint `{hint}`")
+        basename = lowered.split("/")[-1]
+        if basename and basename in readme_text.lower():
+            score += 4
+            reasons.append("mentioned in README excerpt")
+        return score, reasons
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            repo_dir = workspace_dir / "paper_repo"
+            if not repo_dir.is_dir():
+                return ToolResult(
+                    success=False,
+                    output="当前 Project 还没有可用的 repo/source。请先准备 workspace 或 clone repo。",
+                    error="repo_not_available",
+                    data={**self._root_descriptor(project_payload=project_payload, workspace=workspace), "project_id": project_id},
+                )
+
+            repo_index = self._read_json_file(workspace_dir / "repo_file_index.json")
+            repo_reference = self._read_json_file(workspace_dir / "repo_reference.json")
+            experiment_spec = self._read_json_file(workspace_dir / "experiment_spec.json")
+            readme_excerpt = ""
+            excerpt_path = workspace_dir / str(repo_index.get("readme_excerpt_file") or "repo_readme_excerpt.md")
+            if excerpt_path.is_file():
+                try:
+                    readme_excerpt = excerpt_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    readme_excerpt = ""
+
+            hint_tokens = [
+                self._normalize_hint_token(str(item.get("value") or item.get("evidence_text") or ""))
+                for item in list(experiment_spec.get("entrypoint_hints") or [])
+                if isinstance(item, dict)
+            ]
+            hint_tokens = [item for item in hint_tokens if item]
+
+            repo_files = [str(item).strip() for item in list(repo_index.get("files") or []) if str(item).strip()]
+            ranked_seed = [dict(item) for item in list(repo_index.get("entrypoint_candidates") or []) if isinstance(item, dict)]
+            candidate_paths: List[str] = []
+            for item in ranked_seed:
+                path = str(item.get("path") or "").strip()
+                if path:
+                    candidate_paths.append(path)
+            for path in repo_files:
+                lowered = path.lower()
+                if lowered.endswith((".sh", ".py", ".ipynb")) or lowered in {"readme.md", "docker-compose.yml", "compose.yaml", "dockerfile"}:
+                    candidate_paths.append(path)
+            deduped_paths: List[str] = []
+            seen_paths: set[str] = set()
+            for path in candidate_paths:
+                key = path.strip()
+                if not key or key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                deduped_paths.append(key)
+
+            scored_candidates: List[Dict[str, Any]] = []
+            for path in deduped_paths:
+                score, reasons = self._score_mainpath_candidate(path=path, hints=hint_tokens, readme_text=readme_excerpt)
+                if score <= 0:
+                    continue
+                scored_candidates.append(
+                    {
+                        "path": path,
+                        "entrypoint_type": self._classify_mainpath(path),
+                        "score": score,
+                        "reasons": reasons,
+                    }
+                )
+            scored_candidates.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("path") or "")))
+            readme_commands = self._extract_readme_commands(readme_excerpt)
+            selected_candidate = scored_candidates[0] if scored_candidates else None
+            status = "identified" if selected_candidate else ("ambiguous" if scored_candidates else "missing")
+            lines = [
+                "已评估 repo 主路径。",
+                f"- Project: /projects/{project_id}",
+                f"- Repo URL: {repo_reference.get('repo_url') or 'unknown'}",
+                f"- Status: {status}",
+                f"- README commands: {len(readme_commands)}",
+                f"- Candidate count: {len(scored_candidates)}",
+            ]
+            if selected_candidate:
+                lines.append(
+                    f"- Selected main path: repo/source/{selected_candidate.get('path')} "
+                    f"({selected_candidate.get('entrypoint_type')}, score={selected_candidate.get('score')})"
+                )
+                if selected_candidate.get("reasons"):
+                    lines.append(f"- Why: {', '.join(list(selected_candidate.get('reasons') or []))}")
+            if readme_commands:
+                lines.append("- README commands:")
+                lines.extend(f"  - {item}" for item in readme_commands[:6])
+            if scored_candidates:
+                lines.append("- Top candidates:")
+                for item in scored_candidates[:8]:
+                    lines.append(
+                        f"  - repo/source/{item.get('path')} [{item.get('entrypoint_type')}] score={item.get('score')}"
+                    )
+
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "project_id": project_id,
+                    "status": status,
+                    "repo_url": repo_reference.get("repo_url"),
+                    "readme_main_commands": readme_commands,
+                    "main_entry_candidates": scored_candidates[:12],
+                    "selected_main_path": selected_candidate,
+                    "selected_main_path_reason": ", ".join(list(selected_candidate.get("reasons") or [])) if selected_candidate else None,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchListOutputsTool(_PaperResearchToolBase):
+    name = "paper_research_list_outputs"
+    input_model = PaperResearchListOutputsInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "列出当前 Project/workspace 可管理的归档产物，可按 scope 过滤，供 LLM 判断是否需要清理现场。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "scope": {
+                "type": "string",
+                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
+                "default": "all",
+                "description": "只返回指定 scope 的产物；all 返回全部。",
+            },
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_service import ProjectService
+
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
+            service = ProjectService(db)
+            outputs = await service.list_workspace_outputs(
+                project_id=project_id,
+                user_id=self.user_id,
+                workspace_id=int(workspace.id),
+            )
+            if outputs is None:
+                return self._workspace_not_ready(project_payload, project_id)
+            items = list(outputs or [])
+            if scope != "all":
+                items = [item for item in items if str(item.get("scope") or "").strip() == scope]
+
+            lines = [
+                "已列出当前 Project/workspace 的归档产物。",
+                f"- Project: /projects/{project_id}",
+                f"- Scope: {scope}",
+                f"- Count: {len(items)}",
+            ]
+            if items:
+                lines.append("- Outputs:")
+                for item in items[:40]:
+                    lines.append(
+                        "  - "
+                        f"{item.get('relative_path')} "
+                        f"[scope={item.get('scope')}, kind={item.get('kind')}, present={bool(item.get('present'))}]"
+                    )
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "scope": scope,
+                    "outputs": items,
+                    "count": len(items),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchDeleteOutputTool(_PaperResearchToolBase):
+    name = "paper_research_delete_output"
+    input_model = PaperResearchDeleteOutputInput
+    description = "删除当前 Project/workspace 下的单个归档产物文件或 compare_report 记录。用于让 LLM 清理旧现场后重做。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "relative_path": {"type": "string", "description": "要删除的产物相对路径，例如 `specs/grounding_report.json`。"},
+        },
+        "required": ["project_id", "relative_path"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_service import ProjectService
+
+            project_id = int(kwargs["project_id"])
+            relative_path = str(kwargs.get("relative_path") or "").strip()
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            service = ProjectService(db)
+            payload = await service.delete_workspace_output(
+                project_id=project_id,
+                user_id=self.user_id,
+                workspace_id=int(workspace.id),
+                relative_path=relative_path,
+            )
+            if payload is None:
+                return ToolResult(
+                    success=False,
+                    output=f"未找到可删除的产物：{relative_path}",
+                    error="workspace_output_not_found",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "relative_path": relative_path,
+                    },
+                )
+            return ToolResult(
+                success=True,
+                output=(
+                    "已删除 Project/workspace 产物。\n"
+                    f"- Project: /projects/{project_id}\n"
+                    f"- Relative path: {relative_path}"
+                ),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchCleanupScopeTool(_PaperResearchToolBase):
+    name = "paper_research_cleanup_scope"
+    input_model = PaperResearchCleanupScopeInput
+    description = "按 scope 清理当前 Project/workspace 产物，例如 planning/grounding/executions。用于让 LLM 重做某阶段前先清现场。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "scope": {
+                "type": "string",
+                "enum": ["all", "planning", "repo_analysis", "grounding", "implementation", "run_drafts", "executions", "results"],
+                "default": "all",
+                "description": "要清理的产物范围。all 表示清空全部可管理产物并保留 paper_repo。",
+            },
+        },
+        "required": ["project_id", "scope"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_service import ProjectService
+
+            project_id = int(kwargs["project_id"])
+            scope = str(kwargs.get("scope") or "all").strip().lower() or "all"
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            service = ProjectService(db)
+            payload = await service.cleanup_workspace_outputs_scope(
+                project_id=project_id,
+                user_id=self.user_id,
+                workspace_id=int(workspace.id),
+                scope=scope,
+            )
+            if payload is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            lines = [
+                "已清理 Project/workspace 产物。",
+                f"- Project: /projects/{project_id}",
+                f"- Scope: {scope}",
+                f"- Deleted files: {int(payload.get('deleted_file_count') or 0)}",
+                f"- Deleted dirs: {int(payload.get('deleted_dir_count') or 0)}",
+                f"- Deleted runs: {int(payload.get('deleted_run_count') or 0)}",
+            ]
+            deleted_paths = [str(item).strip() for item in list(payload.get("deleted_paths") or []) if str(item).strip()]
+            if deleted_paths:
+                lines.append("- Deleted paths:")
+                lines.extend(f"  - {item}" for item in deleted_paths[:30])
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchGitStatusTool(_PaperResearchToolBase):
+    name = "paper_research_git_status"
+    input_model = PaperResearchGitStatusInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取当前 Project 仓库的 git status，返回分支、脏文件和未跟踪文件。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "include_untracked": {"type": "boolean", "default": True, "description": "是否包含未跟踪文件。"},
+            "max_entries": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000, "description": "最多返回多少条状态项。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+
+            command = ["status", "--short", "--branch"]
+            if not bool(kwargs.get("include_untracked", True)):
+                command.append("--untracked-files=no")
+            git_result = await self._run_repo_git_command(repo_dir=repo_dir, git_args=command)
+            if not git_result.get("available"):
+                return ToolResult(success=False, output="当前环境没有可用的 git 命令。", error="git_not_installed")
+            if git_result.get("timeout"):
+                return ToolResult(success=False, output="git status 超时，未能返回结果。", error="git_status_timeout")
+            if int(git_result.get("returncode") or 0) != 0:
+                stderr = str(git_result.get("stderr") or "").strip()
+                return ToolResult(
+                    success=False,
+                    output=f"git status 失败: {stderr or 'unknown error'}",
+                    error="git_status_failed",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "command": git_result.get("command"),
+                        "stderr": stderr,
+                    },
+                )
+
+            max_entries = int(kwargs.get("max_entries") or 200)
+            lines = str(git_result.get("stdout") or "").splitlines()
+            branch_line = lines[0].strip() if lines and lines[0].startswith("## ") else None
+            status_lines = lines[1:] if branch_line else lines
+            entries = status_lines[:max_entries]
+            truncated = len(status_lines) > len(entries)
+            clean = len(status_lines) == 0
+
+            output_lines = [
+                "已读取 repo git status。",
+                f"- Project: /projects/{project_id}",
+                f"- Repo root: repo/source",
+                f"- Branch: {branch_line.removeprefix('## ').strip() if branch_line else 'unknown'}",
+                f"- Clean: {clean}",
+                f"- Returned entries: {len(entries)}/{len(status_lines)}",
+            ]
+            if entries:
+                output_lines.append("Status entries:")
+                output_lines.extend(entries)
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "branch": branch_line.removeprefix("## ").strip() if branch_line else None,
+                    "clean": clean,
+                    "entries": entries,
+                    "returned_entries": len(entries),
+                    "total_entries": len(status_lines),
+                    "truncated": truncated,
+                    "command": git_result.get("command"),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchGitDiffTool(_PaperResearchToolBase):
+    name = "paper_research_git_diff"
+    input_model = PaperResearchGitDiffInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取当前 Project 仓库的 git diff，可按 pathspec 聚焦具体文件。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "repo_relative_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，repo/source 下的 pathspec 列表；不需要带 `repo/source/` 前缀。",
+            },
+            "cached": {"type": "boolean", "default": False, "description": "是否读取 staged diff（git diff --cached）。"},
+            "ref": {"type": "string", "description": "可选，对比基准 ref，例如 `HEAD~1`。"},
+            "max_chars": {"type": "integer", "default": 20000, "minimum": 200, "maximum": 200000, "description": "最多返回多少字符。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+
+            repo_relative_paths = list(kwargs.get("repo_relative_paths") or [])
+            cached = bool(kwargs.get("cached", False))
+            ref = str(kwargs.get("ref") or "").strip() or None
+            max_chars = int(kwargs.get("max_chars") or 20000)
+            command = ["diff", "--no-ext-diff"]
+            if cached:
+                command.append("--cached")
+            if ref:
+                command.append(ref)
+            if repo_relative_paths:
+                command.append("--")
+                command.extend(repo_relative_paths)
+
+            git_result = await self._run_repo_git_command(repo_dir=repo_dir, git_args=command)
+            if not git_result.get("available"):
+                return ToolResult(success=False, output="当前环境没有可用的 git 命令。", error="git_not_installed")
+            if git_result.get("timeout"):
+                return ToolResult(success=False, output="git diff 超时，未能返回结果。", error="git_diff_timeout")
+            if int(git_result.get("returncode") or 0) != 0:
+                stderr = str(git_result.get("stderr") or "").strip()
+                return ToolResult(
+                    success=False,
+                    output=f"git diff 失败: {stderr or 'unknown error'}",
+                    error="git_diff_failed",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "command": git_result.get("command"),
+                        "stderr": stderr,
+                    },
+                )
+
+            diff_text = str(git_result.get("stdout") or "")
+            truncated = len(diff_text) > max_chars
+            rendered = diff_text[:max_chars]
+            output_lines = [
+                "已读取 repo git diff。",
+                f"- Project: /projects/{project_id}",
+                f"- Repo root: repo/source",
+                f"- Cached: {cached}",
+                f"- Ref: {ref or 'working-tree vs index/HEAD'}",
+                f"- Paths: {', '.join(repo_relative_paths) if repo_relative_paths else '(all)'}",
+                f"- Returned chars: {len(rendered)}/{len(diff_text)}",
+                "Diff:",
+                rendered or "(no diff)",
+            ]
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "diff": rendered,
+                    "total_chars": len(diff_text),
+                    "returned_chars": len(rendered),
+                    "truncated": truncated,
+                    "cached": cached,
+                    "ref": ref,
+                    "repo_relative_paths": repo_relative_paths,
+                    "command": git_result.get("command"),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchGitLogTool(_PaperResearchToolBase):
+    name = "paper_research_git_log"
+    input_model = PaperResearchGitLogInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取当前 Project 仓库最近提交历史，可按 pathspec 聚焦文件。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "repo_relative_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，repo/source 下的 pathspec 列表；不需要带 `repo/source/` 前缀。",
+            },
+            "max_count": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100, "description": "最多返回多少条提交记录。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+
+            repo_relative_paths = list(kwargs.get("repo_relative_paths") or [])
+            max_count = int(kwargs.get("max_count") or 10)
+            command = [
+                "log",
+                f"-n{max_count}",
+                "--date=short",
+                "--pretty=format:%H%x09%h%x09%ad%x09%s",
+            ]
+            if repo_relative_paths:
+                command.append("--")
+                command.extend(repo_relative_paths)
+
+            git_result = await self._run_repo_git_command(repo_dir=repo_dir, git_args=command)
+            if not git_result.get("available"):
+                return ToolResult(success=False, output="当前环境没有可用的 git 命令。", error="git_not_installed")
+            if git_result.get("timeout"):
+                return ToolResult(success=False, output="git log 超时，未能返回结果。", error="git_log_timeout")
+            if int(git_result.get("returncode") or 0) != 0:
+                stderr = str(git_result.get("stderr") or "").strip()
+                return ToolResult(
+                    success=False,
+                    output=f"git log 失败: {stderr or 'unknown error'}",
+                    error="git_log_failed",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "command": git_result.get("command"),
+                        "stderr": stderr,
+                    },
+                )
+
+            commits: List[Dict[str, Any]] = []
+            rendered_lines: List[str] = []
+            for raw_line in str(git_result.get("stdout") or "").splitlines():
+                parts = raw_line.split("\t", 3)
+                if len(parts) < 4:
+                    continue
+                full_sha, short_sha, commit_date, subject = parts
+                commits.append(
+                    {
+                        "sha": full_sha,
+                        "short_sha": short_sha,
+                        "date": commit_date,
+                        "subject": subject,
+                    }
+                )
+                rendered_lines.append(f"{short_sha} {commit_date} {subject}")
+
+            output_lines = [
+                "已读取 repo git log。",
+                f"- Project: /projects/{project_id}",
+                f"- Repo root: repo/source",
+                f"- Paths: {', '.join(repo_relative_paths) if repo_relative_paths else '(all)'}",
+                f"- Returned commits: {len(commits)}",
+            ]
+            if rendered_lines:
+                output_lines.append("Commits:")
+                output_lines.extend(rendered_lines)
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "commits": commits,
+                    "repo_relative_paths": repo_relative_paths,
+                    "command": git_result.get("command"),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchGitShowTool(_PaperResearchToolBase):
+    name = "paper_research_git_show"
+    input_model = PaperResearchGitShowInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取某个 git ref 的提交摘要，或直接读取该 ref 下某个文件的内容。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "ref": {"type": "string", "description": "git ref，例如 `HEAD`、`HEAD~1`、commit sha。"},
+            "repo_relative_path": {"type": "string", "description": "可选，repo/source 下的文件路径；提供后读取 `ref:path` 的文件内容。"},
+            "max_chars": {"type": "integer", "default": 20000, "minimum": 200, "maximum": 200000, "description": "最多返回多少字符。"},
+        },
+        "required": ["project_id", "ref"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+
+            ref = str(kwargs.get("ref") or "").strip()
+            repo_relative_path = self._normalize_repo_relative_path(kwargs.get("repo_relative_path"))
+            max_chars = int(kwargs.get("max_chars") or 20000)
+            if repo_relative_path:
+                command = ["show", f"{ref}:{repo_relative_path}"]
+            else:
+                command = ["show", "--stat", "--summary", "--format=fuller", ref]
+
+            git_result = await self._run_repo_git_command(repo_dir=repo_dir, git_args=command)
+            if not git_result.get("available"):
+                return ToolResult(success=False, output="当前环境没有可用的 git 命令。", error="git_not_installed")
+            if git_result.get("timeout"):
+                return ToolResult(success=False, output="git show 超时，未能返回结果。", error="git_show_timeout")
+            if int(git_result.get("returncode") or 0) != 0:
+                stderr = str(git_result.get("stderr") or "").strip()
+                return ToolResult(
+                    success=False,
+                    output=f"git show 失败: {stderr or 'unknown error'}",
+                    error="git_show_failed",
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        "command": git_result.get("command"),
+                        "stderr": stderr,
+                        "ref": ref,
+                        "repo_relative_path": repo_relative_path or None,
+                    },
+                )
+
+            content = str(git_result.get("stdout") or "")
+            truncated = len(content) > max_chars
+            rendered = content[:max_chars]
+            output_lines = [
+                "已读取 repo git show。",
+                f"- Project: /projects/{project_id}",
+                f"- Repo root: repo/source",
+                f"- Ref: {ref}",
+                f"- Path: {repo_relative_path or '(commit summary)'}",
+                f"- Returned chars: {len(rendered)}/{len(content)}",
+                "Content:",
+                rendered,
+            ]
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "ref": ref,
+                    "repo_relative_path": repo_relative_path or None,
+                    "content": rendered,
+                    "total_chars": len(content),
+                    "returned_chars": len(rendered),
+                    "truncated": truncated,
+                    "command": git_result.get("command"),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
 class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
     name = "paper_research_write_grounding_report"
     input_model = PaperResearchWriteGroundingReportInput
@@ -4849,6 +6109,7 @@ class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
                 "description": (
                     "要保存的 grounding_report JSON。必须覆盖 repo、entrypoint、dataset、runtime、"
                     "external_dependencies、summary 六个顶层对象，并将事实收敛为 grounded/absent/blocked/unknown。"
+                    "summary 里应尽量明确 `run_decision=ready|runnable_with_patch|blocked`，表示当前 repo 主路径的可运行判断。"
                     "如果把一组 dataset/external URLs 声明为 grounded，必须为每个必要官方链接提供成功的 probe 结果，"
                     "或明确证明本地已存在。canonical 结构中 `dataset.sources` 保存数据源，"
                     "`external_dependencies.urls` 只放 URL 字符串，`external_dependencies.probe_results` 单独保存逐条 probe 结果。"
@@ -5511,6 +6772,11 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "description": "期望拿到的内容类型，用于判断官方链接是否已失效或落到错误页面。",
             },
             "read_bytes": {"type": "integer", "default": 64, "description": "最多读取多少字节用于 magic-bytes 判断。范围 8-512；不会下载整个文件。"},
+            "resolve_download_gate": {
+                "type": "boolean",
+                "default": False,
+                "description": "仅当探到下载门页/确认页时显式设为 true。开启后会尝试解析 Google Drive confirm/cookie/download-form，把门页继续解析成真实文件流验证；默认 false。",
+            },
         },
         "required": ["project_id", "url"],
     }
@@ -5527,6 +6793,7 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
             url = str(kwargs.get("url") or "").strip()
             expected_kind = str(kwargs.get("expected_kind") or "auto").strip().lower() or "auto"
             read_bytes = max(int(kwargs.get("read_bytes") or 64), 8)
+            resolve_download_gate = bool(kwargs.get("resolve_download_gate"))
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 return ToolResult(
@@ -5551,6 +6818,7 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
             content_length = None
             head_bytes = b""
             request_error = None
+            page_semantics: Optional[Dict[str, Any]] = None
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
                 try:
                     head_response = await client.head(url)
@@ -5583,6 +6851,60 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                     else:
                         request_error = f"GET {type(exc).__name__}: {exc}"
 
+                initial_kind = self._classify_magic_bytes(head_bytes, content_type)
+                if is_google_drive_url(final_url or url) and initial_kind == "html":
+                    try:
+                        html_response = await client.get(url)
+                    except Exception as exc:  # noqa: BLE001
+                        if request_error:
+                            request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                        else:
+                            request_error = f"HTML {type(exc).__name__}: {exc}"
+                    else:
+                        page_semantics = await analyze_html_page_semantics(
+                            html_response.text or "",
+                            url=url,
+                            final_url=str(html_response.url),
+                            content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                            source="agent_tools_impl.probe_url_html_semantics",
+                        )
+                    if resolve_download_gate:
+                        try:
+                            confirmed = await probe_google_drive_confirm_download(
+                                client=client,
+                                url=url,
+                                read_bytes=read_bytes,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            if request_error:
+                                request_error = f"{request_error}; GDRIVE {type(exc).__name__}: {exc}"
+                            else:
+                                request_error = f"GDRIVE {type(exc).__name__}: {exc}"
+                        else:
+                            if confirmed:
+                                get_status = int(confirmed.get("status_code") or get_status or 0) or get_status
+                                final_url = str(confirmed.get("final_url") or final_url or url)
+                                content_type = str(confirmed.get("content_type") or content_type or "")
+                                if confirmed.get("content_length") is not None:
+                                    content_length = confirmed.get("content_length")
+                                head_bytes = bytes(confirmed.get("head_bytes") or b"")
+                elif initial_kind == "html":
+                    try:
+                        html_response = await client.get(url)
+                    except Exception as exc:  # noqa: BLE001
+                        if request_error:
+                            request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                        else:
+                            request_error = f"HTML {type(exc).__name__}: {exc}"
+                    else:
+                        page_semantics = await analyze_html_page_semantics(
+                            html_response.text or "",
+                            url=url,
+                            final_url=str(html_response.url),
+                            content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                            source="agent_tools_impl.probe_url_html_semantics",
+                        )
+
             detected_kind = self._classify_magic_bytes(head_bytes, content_type)
             ok, downloadable, diagnosis, suggested_next_action = self._probe_url_diagnosis(
                 status_code=get_status or head_status,
@@ -5591,11 +6913,32 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 expected_kind=expected_kind,
                 head_bytes=head_bytes,
             )
+            if diagnosis == "html_page" and is_google_drive_url(final_url or url):
+                diagnosis = "gdrive_confirm_required"
+                suggested_next_action = (
+                    "download_with_confirm_cookie_helper"
+                    if resolve_download_gate
+                    else "retry_with_resolve_download_gate"
+                )
+            if page_semantics and detected_kind == "html":
+                semantic_diagnosis = str(page_semantics.get("diagnosis") or "").strip()
+                semantic_next_action = str(page_semantics.get("suggested_next_action") or "").strip()
+                if semantic_diagnosis:
+                    diagnosis = semantic_diagnosis
+                if semantic_next_action:
+                    suggested_next_action = semantic_next_action
+            if (
+                is_google_drive_url(final_url or url)
+                and diagnosis in {"download_gate", "gdrive_confirm_required", "html_page"}
+                and not resolve_download_gate
+            ):
+                suggested_next_action = "retry_with_resolve_download_gate"
             payload = {
                 **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                 "project_id": project_id,
                 "url": url,
                 "expected_kind": expected_kind,
+                "resolve_download_gate": resolve_download_gate,
                 "head_status": head_status,
                 "status_code": get_status or head_status,
                 "final_url": final_url,
@@ -5609,6 +6952,12 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "diagnosis": diagnosis,
                 "suggested_next_action": suggested_next_action,
                 "request_error": request_error,
+                "page_title": str(page_semantics.get("title") or "") if page_semantics else "",
+                "page_kind": str(page_semantics.get("page_kind") or "") if page_semantics else "",
+                "page_signals": list(page_semantics.get("signals") or []) if page_semantics else [],
+                "page_text_excerpt": str(page_semantics.get("text_excerpt") or "") if page_semantics else "",
+                "page_semantics_source": str(page_semantics.get("classification_source") or "") if page_semantics else "",
+                "page_semantics_rationale": str(page_semantics.get("rationale") or "") if page_semantics else "",
             }
             lines = [
                 "已探测外部 URL 存活状态。",
@@ -5620,7 +6969,20 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 f"- Detected kind: {detected_kind}",
                 f"- Downloadable: {payload['downloadable']}",
                 f"- Diagnosis: {diagnosis}",
+                f"- Resolve download gate: {resolve_download_gate}",
             ]
+            if payload.get("page_title"):
+                lines.append(f"- Page title: {payload.get('page_title')}")
+            if payload.get("page_kind"):
+                lines.append(f"- Page kind: {payload.get('page_kind')}")
+            if payload.get("page_signals"):
+                signals_preview = ", ".join(str(item) for item in list(payload.get("page_signals") or [])[:6])
+                if signals_preview:
+                    lines.append(f"- Page signals: {signals_preview}")
+            if suggested_next_action:
+                lines.append(f"- Suggested next action: {suggested_next_action}")
+            if payload.get("page_semantics_rationale"):
+                lines.append(f"- Rationale: {payload.get('page_semantics_rationale')}")
             if request_error:
                 lines.append(f"- Request error: {request_error}")
             return ToolResult(
@@ -6122,6 +7484,74 @@ class PaperResearchReadExecutionTool(_PaperResearchToolBase):
                 data={
                     **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                     **payload,
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchTailExecutionLogTool(_PaperResearchToolBase):
+    name = "paper_research_tail_execution_log"
+    input_model = PaperResearchTailExecutionLogInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "快速读取 execution 日志尾部，适合持续观察运行进度或错误。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "execution_id": {"type": "string", "description": "execution ID；不是 draft_id。"},
+            "max_log_chars": {"type": "integer", "default": 12000, "minimum": 200, "maximum": 200000, "description": "最多返回多少日志字符。"},
+        },
+        "required": ["project_id", "execution_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            from app.services.project_runtime_service import ProjectRuntimeService
+
+            project_id = int(kwargs["project_id"])
+            execution_id = str(kwargs.get("execution_id") or "").strip()
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+
+            payload = await ProjectRuntimeService().get_execution(
+                workspace_dir=self._workspace_dir_for(workspace),
+                project_id=project_id,
+                execution_id=execution_id,
+                include_logs=True,
+                max_log_chars=int(kwargs.get("max_log_chars") or 12000),
+            )
+            result = dict(payload.get("result") or {})
+            log_text = str(result.get("log") or "")
+            output_lines = [
+                "已读取 execution 日志尾部。",
+                f"- Project: /projects/{project_id}",
+                f"- Execution ID: {payload.get('execution_id') or execution_id}",
+                f"- Status: {payload.get('status')}",
+                f"- Log exists: {result.get('log_exists')}",
+            ]
+            if result.get("error"):
+                output_lines.append(f"- Error: {result.get('error')}")
+            if result.get("message"):
+                output_lines.append(f"- Message: {result.get('message')}")
+            output_lines.extend(["Log tail:", log_text or "(empty)"])
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "project_id": project_id,
+                    "execution_id": payload.get("execution_id") or execution_id,
+                    "status": payload.get("status"),
+                    "log_exists": bool(result.get("log_exists")),
+                    "log": log_text,
+                    "result_exists": bool(result.get("result_exists")),
+                    "message": result.get("message"),
+                    "error": result.get("error"),
                 },
             )
 
@@ -8002,12 +9432,57 @@ class DefaultToolProvider:
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
                         ),
+                        PaperResearchSearchOutputsTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
                         PaperResearchReadRepoFileTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
                         ),
                         PaperResearchSearchRepoTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchGitStatusTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchGitDiffTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchGitLogTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchGitShowTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchAssessRepoMainpathTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchListOutputsTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchDeleteOutputTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchCleanupScopeTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,
@@ -8080,6 +9555,11 @@ class DefaultToolProvider:
                             route_profile=ctx.route_profile,
                         ),
                         PaperResearchReadExecutionTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchTailExecutionLogTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,

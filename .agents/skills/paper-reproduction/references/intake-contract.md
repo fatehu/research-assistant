@@ -12,10 +12,14 @@ Current runtime stage id is still `planning`; semantically, that stage now corre
 
 - The intake stage uses the saved paper and the local PDF-to-markdown pipeline when available.
 - The intake stage must produce both structured extraction facts and a reusable paper summary, not only experiment-oriented planning hints.
+- Treat the paper's narrative sections as primary evidence: title, abstract, introduction, method, experiment text, conclusion, and figure captions.
+- Treat table cells as reference evidence, not as the sole source of truth for execution scope.
 - If the tool reports `source_mode=metadata_abstract_fallback`, explicitly say the result came from metadata/abstract fallback, not full PDF parsing.
 - The structured intake artifact is JSON facts and discovery hints. It is not runnable code.
 - Do not ask the intake model to generate Python code, shell commands, package installs, or fake repo paths from the paper alone.
 - If the paper does not contain repo/data/code evidence, output missing discovery tasks instead of guessed implementation details.
+- Stage 1 should classify paper-provided links and summarize research direction, research method, research content, and tuning hints.
+- `planning/experiment_spec.json` at this stage is only a light paper-derived scaffold. It must not be treated as the final repo execution truth.
 
 ## JSON Output Rules
 

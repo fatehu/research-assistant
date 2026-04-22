@@ -968,11 +968,11 @@ class PaperExperimentAdapterService:
             "",
             "## Workspace Assets",
             "",
-            "- `paper_intake_markdown.md`: local PDF -> markdown auxiliary text kept for reference/fallback; stage-1 intake may use page images as the primary LLM input.",
+            "- `paper_intake_markdown.md`: local PDF -> markdown primary intake text; page images are fallback evidence when markdown is unavailable or clearly insufficient.",
             "- `paper_intake_payload.json`: metadata and context summary sent into the intake pipeline.",
             "- `paper_intake_result.json`: structured JSON returned by the intake LLM.",
             "- `paper_summary.json`: reusable paper summary for explanation, grounding, tuning, and verification design.",
-            "- `experiment_spec.json`: execution-oriented spec consumed by CodeLab runs.",
+            "- `experiment_spec.json`: light paper-derived planning scaffold; it is not the final repo execution truth.",
             "- `workspace_adapter_manifest.json`: repo/materialization status for this workspace.",
             "- `repo_reference.json`: resolved repo acquisition result.",
             "- `repo_file_index.json`: indexed repo files, dependency files, and entrypoint candidates.",
@@ -1025,6 +1025,11 @@ class PaperExperimentAdapterService:
             for item in cls._as_list(intake.get("entrypoint_hints"))
             if isinstance(item, dict)
         ]
+        reference_links = [
+            cls._as_dict(item)
+            for item in cls._as_list(intake.get("reference_links"))
+            if isinstance(item, dict)
+        ]
 
         problem_definition = cls._first_text(
             [
@@ -1032,22 +1037,53 @@ class PaperExperimentAdapterService:
                 paper.abstract,
             ]
         )
-        core_method = cls._first_text(
+        research_direction = cls._first_text(
             [
+                paper_profile.get("research_direction"),
+                paper_profile.get("problem_statement"),
+            ]
+        )
+        research_method = cls._first_text(
+            [
+                paper_profile.get("research_method"),
                 paper_profile.get("contribution_summary"),
                 paper_profile.get("experiment_goal"),
+            ]
+        )
+        research_content = cls._first_text(
+            [
+                paper_profile.get("research_content"),
+                paper_profile.get("experiment_goal"),
+            ]
+        )
+        core_method = cls._first_text(
+            [
+                research_method,
+                paper_profile.get("contribution_summary"),
+                research_content,
                 paper.abstract,
             ]
         )
         task_type = cls._first_text([paper_profile.get("task_type"), cls._as_dict(experiment_spec.get("task")).get("task_type")])
         domain = cls._first_text([paper_profile.get("domain"), cls._as_dict(experiment_spec.get("task")).get("domain")])
-        dataset_names = [item["name"] for item in datasets[:6]]
-        metric_names = [item["name"] for item in metrics[:6]]
-        model_names = [item["name"] for item in models[:6]]
+        dataset_names = cls._unique_names([item["name"] for item in datasets])
+        metric_names = cls._unique_names([item["name"] for item in metrics])
+        model_names = cls._unique_names([item["name"] for item in models])
         entrypoint_values = [
             cls._first_text([item.get("value"), item.get("evidence_text")])
             for item in entrypoint_hints[:6]
             if cls._first_text([item.get("value"), item.get("evidence_text")])
+        ]
+        link_inventory = [
+            {
+                "url": str(item.get("url") or "").strip() or None,
+                "category": str(item.get("category") or "").strip() or None,
+                "label": str(item.get("label") or "").strip() or None,
+                "role": str(item.get("role") or "").strip() or None,
+                "evidence_text": cls._first_text([item.get("evidence_text")]),
+            }
+            for item in reference_links[:20]
+            if str(item.get("url") or "").strip()
         ]
 
         claimed_contributions = []
@@ -1087,6 +1123,11 @@ class PaperExperimentAdapterService:
             for item in optimization_candidates[:4]
             if str(item.get("name") or item.get("id") or "").strip()
         ]
+        tuning_directions = [
+            cls._first_text([item.get("rationale"), item.get("expected_effect")])
+            for item in optimization_candidates[:6]
+            if cls._first_text([item.get("rationale"), item.get("expected_effect")])
+        ]
 
         verification_questions = [
             cls._first_text([item.get("reason"), item.get("query_or_hint")])
@@ -1124,6 +1165,12 @@ class PaperExperimentAdapterService:
                 "focus": verification_questions[0] if verification_questions else "定义下一步需要验证的关键问题",
             },
         ]
+        one_paragraph_summary = cls._first_text(
+            [
+                "；".join([item for item in [research_direction, research_method, research_content] if item]),
+                cls._first_text([problem_definition, core_method]),
+            ]
+        )
 
         return {
             "schema_version": "paper_summary_v1",
@@ -1132,6 +1179,10 @@ class PaperExperimentAdapterService:
             "task_type": task_type,
             "domain": domain,
             "source_mode": cls._as_dict(summary.get("paper_llm_input")).get("source_mode"),
+            "one_paragraph_summary": one_paragraph_summary,
+            "research_direction": research_direction,
+            "research_method": research_method,
+            "research_content": research_content,
             "problem_definition": problem_definition,
             "core_method": core_method,
             "method_flow_or_architecture": {
@@ -1154,6 +1205,13 @@ class PaperExperimentAdapterService:
             "limitations": limitations[:8],
             "glossary": glossary,
             "reproduction_risks": reproduction_risks[:8],
+            "link_inventory": link_inventory,
+            "evidence_priority": {
+                "primary": ["正文", "方法描述", "实验叙述", "图注"],
+                "secondary": ["表格", "附录式列表"],
+                "policy": "表格仅作参考证据，不单独作为执行真相。",
+            },
+            "tuning_directions": tuning_directions,
             "tuning_hypotheses": tuning_hypotheses,
             "verification_questions": verification_questions[:8],
             "teaching_outline": teaching_outline,
@@ -1186,6 +1244,21 @@ class PaperExperimentAdapterService:
             if text:
                 return text
         return None
+
+    @staticmethod
+    def _unique_names(values: List[str]) -> List[str]:
+        rows: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(text)
+        return rows
 
     @classmethod
     def _named_items(cls, value: Any) -> List[Dict[str, str]]:

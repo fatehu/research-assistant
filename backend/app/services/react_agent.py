@@ -632,6 +632,36 @@ class AgentCore:
         return any(str(marker or "").lower() in lowered for marker in markers if str(marker or "").strip())
 
     @staticmethod
+    def _decision_action_for_tool(tool_name: str) -> Optional[str]:
+        normalized = str(tool_name or "").strip()
+        mapping = {
+            "paper_research_write_grounding_report": "write_grounding_report",
+            "paper_research_read_grounding_report": "read_grounding_report",
+            "paper_research_write_implementation_spec": "write_implementation_spec",
+            "paper_research_read_implementation_spec": "read_implementation_spec",
+            "paper_research_write_run_drafts": "write_run_drafts",
+            "paper_research_read_run_drafts": "read_run_drafts",
+            "paper_research_write_execution_spec": "write_execution_spec",
+            "paper_research_write_execution_script": "write_execution_script",
+            "paper_research_start_execution": "start_execution",
+            "paper_research_read_execution": "observe_execution",
+            "paper_research_search_repo": "search_repo",
+            "paper_research_probe_repo": "probe_repo",
+            "paper_research_probe_url": "probe_url",
+            "paper_research_assess_repo_mainpath": "assess_repo_mainpath",
+            "web_search": "web_search",
+            "web_scrape": "web_scrape",
+        }
+        return mapping.get(normalized)
+
+    @classmethod
+    def _should_enforce_decision_state_gate(cls, tool_name: str) -> bool:
+        normalized = str(tool_name or "").strip()
+        if normalized.startswith(cls._PAPER_RESEARCH_TOOL_PREFIX):
+            return False
+        return True
+
+    @staticmethod
     def _tool_action_names(context: AgentContext) -> set[str]:
         return {
             str(step.tool_name or "").strip()
@@ -657,6 +687,7 @@ class AgentCore:
 
         workflow_binding = dict((context.conversation_state or {}).get("workflow_binding") or {})
         current_stage = str(workflow_binding.get("current_stage") or "").strip().lower()
+        has_paper_binding = bool(workflow_binding.get("paper_id") or workflow_binding.get("project_id") or workflow_binding.get("workspace_id"))
         is_run_draft_request = self._contains_any_marker(user_text, self._PAPER_RUN_DRAFT_MARKERS)
         is_implementation_spec_request = self._contains_any_marker(user_text, self._PAPER_IMPLEMENTATION_SPEC_MARKERS)
         is_prepare_or_status_request = self._contains_any_marker(user_text, self._PAPER_PREPARE_MARKERS)
@@ -2251,7 +2282,7 @@ class AgentCore:
             lines.append("- 证据账本:")
             lines.extend(f"  - {item}" for item in evidence_ledger[:4])
         if decision_state:
-            lines.append("- 当前决策状态:")
+            lines.append("- 当前决策提示（供参考，不是硬门禁）:")
             if decision_state.get("status"):
                 lines.append(f"  - 状态: {decision_state.get('status')}")
             if decision_state.get("evidence_status"):
@@ -5092,6 +5123,11 @@ class AgentCore:
             if status_code is not None and status_code >= 400:
                 return True
             return diagnosis in {
+                "gdrive_confirm_required",
+                "download_gate",
+                "login_required",
+                "quota_limited",
+                "access_denied",
                 "auth_required",
                 "forbidden",
                 "not_found",
@@ -5366,7 +5402,56 @@ class AgentCore:
                     data=merge_error_contract(None, contract),
                 )
             else:
-                result = await self.tools.execute(call.name, **effective_arguments)
+                decision_state = self._normalize_decision_state(
+                    dict((context.conversation_state or {}).get("decision_state") or {})
+                    if isinstance(context.conversation_state, dict)
+                    else {},
+                    workflow_binding=(context.conversation_state or {}).get("workflow_binding") or {},
+                )
+                allowed_action_list = [
+                    str(item).strip()
+                    for item in list(decision_state.get("allowed_actions") or [])
+                    if str(item or "").strip()
+                ]
+                allowed_actions = set(allowed_action_list)
+                requested_action = self._decision_action_for_tool(call.name)
+                if (
+                    self._should_enforce_decision_state_gate(call.name)
+                    and (
+                    allowed_actions
+                    and requested_action
+                    and requested_action not in allowed_actions
+                    )
+                ):
+                    contract = build_tool_error_contract(
+                        code="tool_not_allowed_by_decision_state",
+                        message="当前决策状态不允许调用该工具",
+                        tool_name=call.name,
+                        stage="agent_execute",
+                        detail=(
+                            f"requested_action={requested_action}; "
+                            f"allowed_actions={allowed_action_list}; "
+                            f"decision_status={decision_state.get('status') or 'unknown'}"
+                        ),
+                        retryable=False,
+                        metadata={
+                            "requested_action": requested_action,
+                            "allowed_actions": allowed_action_list,
+                            "decision_status": decision_state.get("status"),
+                            "next_action": decision_state.get("next_action"),
+                        },
+                    )
+                    result = ToolResult(
+                        success=False,
+                        output=(
+                            f"{contract['message']}: `{call.name}` 对应动作 `{requested_action}`，"
+                            f"但当前只允许 {', '.join(allowed_action_list)}。"
+                        ),
+                        error=str(contract["code"]),
+                        data=merge_error_contract(None, contract),
+                    )
+                else:
+                    result = await self.tools.execute(call.name, **effective_arguments)
         except Exception as exc:
             contract = build_tool_error_contract(
                 code="tool_dispatch_failed",

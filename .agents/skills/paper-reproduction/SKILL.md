@@ -32,6 +32,13 @@ During `intake_summary`, preserve three planning artifacts together:
 - `planning/paper_summary.json`
 - `planning/experiment_spec.json`
 
+In `intake_summary`, the paper is a background and clue source, not the final execution truth.
+
+- Focus on paper understanding, link classification, and tuning hints.
+- Prefer narrative evidence from正文/method/experiment prose/figure captions.
+- Treat table cells as reference evidence only.
+- Do not let stage 1 decide the final repo main path or executable run scope.
+
 ## Truth Files
 
 Treat these archived files as the workflow truth:
@@ -110,8 +117,17 @@ Allowed paper workflow tools:
 - `paper_research_probe_url`
 - `paper_research_get_artifact_manifest`
 - `paper_research_read_artifact`
+- `paper_research_search_outputs`
 - `paper_research_read_repo_file`
 - `paper_research_search_repo`
+- `paper_research_git_status`
+- `paper_research_git_diff`
+- `paper_research_git_log`
+- `paper_research_git_show`
+- `paper_research_assess_repo_mainpath`
+- `paper_research_list_outputs`
+- `paper_research_delete_output`
+- `paper_research_cleanup_scope`
 - `paper_research_write_grounding_report`
 - `paper_research_read_grounding_report`
 - `paper_research_write_implementation_spec`
@@ -124,6 +140,7 @@ Allowed paper workflow tools:
 - `paper_research_read_execution_spec`
 - `paper_research_start_execution`
 - `paper_research_read_execution`
+- `paper_research_tail_execution_log`
 - `paper_research_cancel_execution`
 - `web_search`
 - `web_scrape`
@@ -155,6 +172,12 @@ Grounding must explicitly classify:
 - runtime
 - external dependencies
 
+Grounding should also answer one engineering question first:
+
+- what is the repo's most likely runnable main path right now
+- can that main path run now
+- if not, is it blocked or runnable_with_patch
+
 Each area should end in one of:
 
 - `grounded`
@@ -165,6 +188,10 @@ Each area should end in one of:
 During `grounding`:
 
 - prefer `paper_research_probe_repo` / `paper_research_probe_url` before deeper clone/read/search
+- when a probe returns HTML, treat it as a diagnosis step first, not as success or failure by status code alone; use page title, page kind, page signals, suggested next action, and rationale to decide the blocker
+- for download pages such as Google Drive gates, first write the concrete blocker (`download_gate`, `login_required`, `quota_limited`, `access_denied`, `not_found`) before deciding whether to recover, patch, or stop
+- once repo evidence exists, use `paper_research_assess_repo_mainpath` so stage 2 converges on a concrete main-path judgment instead of only broad grep evidence
+- when debugging old repos or verifying minimal fixes, prefer `paper_research_git_status` / `paper_research_git_diff` / `paper_research_git_log` / `paper_research_git_show` before inventing a workaround script
 - use `paper_research_clone_repo`, `paper_research_read_repo_file`, `paper_research_search_repo`, and `paper_research_inspect_runtime` only to close a specific missing fact
 - write `specs/grounding_report.json` as the stage-2 truth artifact
 - if you claim a list of datasets or external downloads is `grounded`, every required official link in that list must be individually probed or be explicitly covered by grounded local presence; one successful sample link cannot stand in for sibling links
@@ -243,6 +270,7 @@ Use helper scripts when deterministic output is safer:
 - Preserve official repo/data URLs in `command` or `external_dependencies`; runtime preflight will verify them.
 - Use workspace-relative paths only. Prefer `repo/source/...` for repository files.
 - Read execution results with `paper_research_read_execution`; never use `paper_research_read_artifact` for `executions/*`.
+- When only the live progress or latest failure matters, prefer `paper_research_tail_execution_log` instead of re-reading the full execution payload.
 - If `paper_research_start_execution` starts a prerequisite job such as `env_setup` or `data_prep`, continue the workflow by reading its result and resuming the original task.
 - If `paper_research_start_execution` returns `running` or `pending` for a true experiment execution, return the execution id/status and stop the turn.
 - `scripts/check_runtime_environment.py` is only a verifier. Do not let a fixed generic ML package list override direct repo dependency evidence.

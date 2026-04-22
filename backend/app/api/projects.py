@@ -10,6 +10,12 @@ from app.schemas.projects import (
     ResearchProjectCreateRequest,
     ResearchProjectResponse,
     ResearchProjectRuntimeOverviewResponse,
+    ResearchProjectWorkspaceOutputCleanupRequest,
+    ResearchProjectWorkspaceOutputCleanupResponse,
+    ResearchProjectWorkspaceOutputContentResponse,
+    ResearchProjectWorkspaceOutputScopeCleanupRequest,
+    ResearchProjectWorkspaceOutputSummary,
+    ResearchProjectWorkspaceOutputUpdateRequest,
 )
 from app.services.project_service import ProjectService
 
@@ -99,3 +105,189 @@ async def cancel_project_execution(
     if payload is None:
         raise HTTPException(status_code=404, detail="项目或 execution 不存在")
     return payload
+
+
+@router.get("/{project_id}/workspaces/{workspace_id}/outputs", response_model=list[ResearchProjectWorkspaceOutputSummary])
+async def list_project_workspace_outputs(
+    project_id: int,
+    workspace_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    payload = await service.list_workspace_outputs(
+        project_id=int(project_id),
+        user_id=int(current_user.id),
+        workspace_id=int(workspace_id),
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目或 workspace 不存在")
+    return [ResearchProjectWorkspaceOutputSummary(**item) for item in payload]
+
+
+@router.get("/{project_id}/workspaces/{workspace_id}/outputs/content", response_model=ResearchProjectWorkspaceOutputContentResponse)
+async def read_project_workspace_output(
+    project_id: int,
+    workspace_id: int,
+    relative_path: str = Query(..., min_length=1, max_length=400),
+    max_chars: int = Query(default=120000, ge=1000, le=400000),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    try:
+        payload = await service.read_workspace_output(
+            project_id=int(project_id),
+            user_id=int(current_user.id),
+            workspace_id=int(workspace_id),
+            relative_path=str(relative_path or ""),
+            max_chars=int(max_chars),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目、workspace 或产物不存在")
+    return ResearchProjectWorkspaceOutputContentResponse(**payload)
+
+
+@router.put("/{project_id}/workspaces/{workspace_id}/outputs/content", response_model=ResearchProjectWorkspaceOutputContentResponse)
+async def write_project_workspace_output(
+    project_id: int,
+    workspace_id: int,
+    request: ResearchProjectWorkspaceOutputUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    try:
+        payload = await service.write_workspace_output(
+            project_id=int(project_id),
+            user_id=int(current_user.id),
+            workspace_id=int(workspace_id),
+            relative_path=str(request.relative_path or ""),
+            content=str(request.content or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目或 workspace 不存在")
+    return ResearchProjectWorkspaceOutputContentResponse(**payload)
+
+
+@router.delete("/{project_id}/workspaces/{workspace_id}/outputs", response_model=dict[str, Any])
+async def delete_project_workspace_output(
+    project_id: int,
+    workspace_id: int,
+    relative_path: str = Query(..., min_length=1, max_length=400),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    try:
+        payload = await service.delete_workspace_output(
+            project_id=int(project_id),
+            user_id=int(current_user.id),
+            workspace_id=int(workspace_id),
+            relative_path=str(relative_path or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目、workspace 或产物不存在")
+    return payload
+
+
+@router.post("/{project_id}/workspaces/{workspace_id}/outputs/cleanup", response_model=ResearchProjectWorkspaceOutputCleanupResponse)
+async def cleanup_project_workspace_outputs(
+    project_id: int,
+    workspace_id: int,
+    request: ResearchProjectWorkspaceOutputCleanupRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    payload = await service.cleanup_workspace_outputs(
+        project_id=int(project_id),
+        user_id=int(current_user.id),
+        workspace_id=int(workspace_id),
+        preserve_repo=bool(request.preserve_repo),
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目或 workspace 不存在")
+    return ResearchProjectWorkspaceOutputCleanupResponse(**payload)
+
+
+@router.post("/{project_id}/workspaces/{workspace_id}/outputs/cleanup-scope", response_model=ResearchProjectWorkspaceOutputCleanupResponse)
+async def cleanup_project_workspace_outputs_scope(
+    project_id: int,
+    workspace_id: int,
+    request: ResearchProjectWorkspaceOutputScopeCleanupRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ProjectService(db)
+    payload = await service.cleanup_workspace_outputs_scope(
+        project_id=int(project_id),
+        user_id=int(current_user.id),
+        workspace_id=int(workspace_id),
+        scope=str(request.scope),
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="项目或 workspace 不存在")
+    return ResearchProjectWorkspaceOutputCleanupResponse(**payload)
+
+
+# Deprecated compatibility aliases.
+@router.get("/{project_id}/workspaces/{workspace_id}/assets", response_model=list[ResearchProjectWorkspaceOutputSummary], include_in_schema=False)
+async def list_project_workspace_assets(
+    project_id: int,
+    workspace_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await list_project_workspace_outputs(project_id, workspace_id, db, current_user)
+
+
+@router.get("/{project_id}/workspaces/{workspace_id}/assets/content", response_model=ResearchProjectWorkspaceOutputContentResponse, include_in_schema=False)
+async def read_project_workspace_asset(
+    project_id: int,
+    workspace_id: int,
+    relative_path: str = Query(..., min_length=1, max_length=400),
+    max_chars: int = Query(default=120000, ge=1000, le=400000),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await read_project_workspace_output(project_id, workspace_id, relative_path, max_chars, db, current_user)
+
+
+@router.put("/{project_id}/workspaces/{workspace_id}/assets/content", response_model=ResearchProjectWorkspaceOutputContentResponse, include_in_schema=False)
+async def write_project_workspace_asset(
+    project_id: int,
+    workspace_id: int,
+    request: ResearchProjectWorkspaceOutputUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await write_project_workspace_output(project_id, workspace_id, request, db, current_user)
+
+
+@router.delete("/{project_id}/workspaces/{workspace_id}/assets", response_model=dict[str, Any], include_in_schema=False)
+async def delete_project_workspace_asset(
+    project_id: int,
+    workspace_id: int,
+    relative_path: str = Query(..., min_length=1, max_length=400),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await delete_project_workspace_output(project_id, workspace_id, relative_path, db, current_user)
+
+
+@router.post("/{project_id}/workspaces/{workspace_id}/assets/cleanup", response_model=ResearchProjectWorkspaceOutputCleanupResponse, include_in_schema=False)
+async def cleanup_project_workspace_assets(
+    project_id: int,
+    workspace_id: int,
+    request: ResearchProjectWorkspaceOutputCleanupRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await cleanup_project_workspace_outputs(project_id, workspace_id, request, db, current_user)

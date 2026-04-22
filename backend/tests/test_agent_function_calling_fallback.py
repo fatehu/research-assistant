@@ -370,6 +370,26 @@ class _NoopTools:
         raise AssertionError("no tool call expected")
 
 
+class _ForbiddenRunDraftTools:
+    async def execute(self, tool_name: str, **kwargs):
+        raise AssertionError(f"tool should have been blocked before execution: {tool_name}")
+
+
+class _GroundingRefreshTools:
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name in {
+            "paper_research_read_grounding_report",
+            "paper_research_write_grounding_report",
+        }
+        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
+
+
+class _PassThroughPaperTools:
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name.startswith("paper_research_")
+        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
+
+
 class _KnowledgeIntentTools:
     def classify_intent(self, user_text: str) -> str:
         return "knowledge_query"
@@ -848,6 +868,43 @@ async def test_paper_read_only_grounding_summary_can_answer_without_rewriting_re
     assert "paper_research_write_grounding_report" not in missing
 
 
+@pytest.mark.asyncio
+async def test_paper_workflow_binding_still_requires_real_tool_call_for_followup_request():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _NoopTools(), max_iterations=1)
+    agent._last_tool_selection = {"active_skill_names": ["paper-reproduction"]}
+
+    context = AgentContext(
+        messages=[{"role": "user", "content": "重新跑一次"}],
+        conversation_state={
+            "workflow_binding": {
+                "skill": "paper-reproduction",
+                "current_stage": "grounding",
+                "paper_id": 113,
+                "project_id": 6,
+                "workspace_id": 6,
+            }
+        },
+        steps=[],
+    )
+
+    missing = agent._missing_required_paper_skill_tool_calls(context)
+    assert "any paper_research_* tool call" in missing
+
+    events, done = await agent._finalize_function_calling_iteration(
+        context,
+        content="Grounding 已重新完成，可以继续。",
+        reasoning="",
+        parsed_calls=[],
+    )
+
+    assert done is False
+    assert any(
+        "真实 paper_research 工具调用" in str(event.get("data", ""))
+        for event in events
+        if event.get("type") == "thought"
+    )
+
+
 def test_grounding_blocked_without_alternative_candidates_prefers_alternative_source_search():
     row = ExecutedToolCall(
         action_event={},
@@ -890,6 +947,102 @@ def test_grounding_blocked_without_alternative_candidates_prefers_alternative_so
     assert "替代源搜索" in message
     assert decision["next_action"] == "search_alternative_sources"
     assert "web_search" in decision["allowed_actions"]
+
+
+@pytest.mark.asyncio
+async def test_paper_tools_are_not_hard_blocked_by_decision_state_allowed_actions():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _PassThroughPaperTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[{"role": "user", "content": "继续复现"}],
+        conversation_state={
+            "workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"},
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker", "read_grounding_report"],
+            },
+        },
+    )
+    call = ParsedToolCall(
+        name="paper_research_write_run_drafts",
+        arguments={"project_id": 6, "run_drafts": {"drafts": []}},
+        call_id="call_1",
+        arguments_raw='{"project_id":6,"run_drafts":{"drafts":[]}}',
+    )
+
+    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
+
+    assert executed.success is True
+    assert executed.error is None
+    assert executed.result_data["tool_name"] == "paper_research_write_run_drafts"
+
+
+@pytest.mark.asyncio
+async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_read_grounding_report():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _GroundingRefreshTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[{"role": "user", "content": "再做一次grounding"}],
+        conversation_state={
+            "workflow_binding": {
+                "skill": "paper-reproduction",
+                "current_stage": "grounding",
+                "paper_id": 113,
+                "project_id": 6,
+                "workspace_id": 6,
+            },
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker"],
+            },
+        },
+    )
+    call = ParsedToolCall(
+        name="paper_research_read_grounding_report",
+        arguments={"project_id": 6, "mode": "full"},
+        call_id="call_refresh_read",
+        arguments_raw='{"project_id":6,"mode":"full"}',
+    )
+
+    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
+
+    assert executed.success is True
+    assert executed.error is None
+    assert executed.result_data["tool_name"] == "paper_research_read_grounding_report"
+
+
+@pytest.mark.asyncio
+async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_write_grounding_report():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _GroundingRefreshTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[{"role": "user", "content": "重新跑一次 grounding"}],
+        conversation_state={
+            "workflow_binding": {
+                "skill": "paper-reproduction",
+                "current_stage": "grounding",
+                "paper_id": 113,
+                "project_id": 6,
+                "workspace_id": 6,
+            },
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker"],
+            },
+        },
+    )
+    call = ParsedToolCall(
+        name="paper_research_write_grounding_report",
+        arguments={"project_id": 6, "grounding_report": {"summary": {}}},
+        call_id="call_refresh_write",
+        arguments_raw='{"project_id":6,"grounding_report":{"summary":{}}}',
+    )
+
+    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
+
+    assert executed.success is True
+    assert executed.error is None
+    assert executed.result_data["tool_name"] == "paper_research_write_grounding_report"
 
 
 @pytest.mark.asyncio
@@ -945,6 +1098,16 @@ def test_grounding_probe_failures_do_not_trigger_generic_failure_streak():
                 "error": "url_probe_failed",
                 "output": "license gate",
                 "data": {"diagnosis": "license_gate"},
+            },
+        },
+        {
+            "type": "observation",
+            "data": {
+                "tool": "paper_research_probe_url",
+                "success": False,
+                "error": "url_probe_failed",
+                "output": "drive confirm gate",
+                "data": {"status_code": 200, "diagnosis": "gdrive_confirm_required", "page_kind": "download_gate"},
             },
         },
     ]

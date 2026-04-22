@@ -387,6 +387,92 @@ async def test_start_execution_blocks_on_failed_external_dependency_preflight(tm
 
 
 @pytest.mark.asyncio
+async def test_probe_url_dependency_uses_google_drive_confirm_helper(monkeypatch):
+    service = ProjectRuntimeService()
+
+    class _Response:
+        def __init__(self, *, status_code, url, headers):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+
+    class _StreamResponse:
+        def __init__(self, *, status_code, url, headers, body: bytes):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_bytes(self):
+            yield self._body
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.cookies = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def head(self, url):
+            return _Response(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "512"},
+            )
+
+        def stream(self, method, url, headers=None):
+            del method, headers
+            return _StreamResponse(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "512"},
+                body=b"<!DOCTYPE html><html><body>Google Drive</body></html>",
+            )
+
+    async def _fake_confirm_download(*, client, url, read_bytes):
+        del client, read_bytes
+        return {
+            "status_code": 206,
+            "final_url": f"{url}&confirm=token",
+            "content_type": "application/octet-stream",
+            "content_length": 1024,
+            "head_bytes": b"\x00\x01\x02\x03",
+            "confirm_url": f"{url}&confirm=token",
+            "confirm_token_present": True,
+        }
+
+    monkeypatch.setattr(runtime_module.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(runtime_module, "probe_google_drive_confirm_download", _fake_confirm_download)
+
+    result = await service._probe_url_dependency(
+        {
+            "name": "sogou-news",
+            "kind": "url",
+            "target": "https://drive.google.com/file/d/demo/view",
+            "expected_kind": "auto",
+            "required": True,
+            "source": "official",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "passed"
+    assert result["status_code"] == 206
+    assert result["detected_kind"] == "binary"
+    assert result["content_type"] == "application/octet-stream"
+    assert result["diagnosis"] == "response_ok"
+
+
+@pytest.mark.asyncio
 async def test_plain_python_execution_writes_result_and_log(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module.settings, "project_runtime_worker_enabled", False)
     repo = tmp_path / "paper_repo"

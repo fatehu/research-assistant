@@ -255,7 +255,8 @@ services:
         condition: service_started
     command: >
       sh -c 'set -eu; alembic upgrade head; if [ "${BACKEND_UVICORN_RELOAD:-true}" = "true" ]; then
-        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --reload-exclude "model_cache/*" --reload-exclude ".cache/*" --reload-exclude "tests/*" --reload-exclude "docs/*" --reload-exclude "e2e/*" --reload-exclude "uploads/*" --reload-exclude "uploads/**" --reload-exclude "/app/uploads/*" --reload-exclude "/app/uploads/**" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
+        cd /tmp &&
+        exec uvicorn app.main:app --app-dir /app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}";
       fi; exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers "${BACKEND_UVICORN_WORKERS:-1}" --timeout-graceful-shutdown "${BACKEND_UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN:-30}"'
     networks:
       - research_network

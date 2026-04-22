@@ -4,11 +4,13 @@ import ast
 from collections import defaultdict
 from datetime import datetime
 import json
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -33,6 +35,19 @@ _RESULT_STAGE_LABELS = {
     "run_drafts": "Run Drafts",
     "execution": "Execution",
     "results": "Results",
+}
+
+_WORKSPACE_ROOT_LABELS = {
+    "paper_intake_markdown.md": "Paper Markdown",
+    "paper_intake_payload.json": "Intake payload",
+    "paper_intake_result.json": "Intake result",
+    "paper_summary.json": "Paper summary",
+    "experiment_spec.json": "Experiment spec",
+    "workspace_adapter_manifest.json": "Workspace manifest",
+    "repo_reference.json": "Repo reference",
+    "repo_file_index.json": "Repo index",
+    "repo_history_url_candidates.json": "Repo history candidates",
+    "repo_readme_excerpt.md": "Repo README excerpt",
 }
 
 
@@ -211,6 +226,397 @@ class ProjectService:
             project_id=int(project.id),
             execution_id=str(execution_id or ""),
             workspace_dir=workspace_dir,
+        )
+
+    async def list_workspace_outputs(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, workspace_row, workspace_model, workspace_dir = resolved
+        assets = self._scan_workspace_outputs(workspace_dir)
+        compare_report = dict(getattr(workspace_model, "compare_report_json", {}) or {})
+        if compare_report:
+            assets.append(
+                {
+                    "label": "Compare report",
+                    "relative_path": "workspace.compare_report_json",
+                    "category": "results",
+                    "scope": "results",
+                    "scope_label": "Results",
+                    "kind": "db_record",
+                    "storage": "db_record",
+                    "present": True,
+                    "size_bytes": len(json.dumps(compare_report, ensure_ascii=False)),
+                    "editable": True,
+                    "deletable": True,
+                    "updated_at": str(workspace_row.get("latest_run_at") or workspace_row.get("updated_at") or "") or None,
+                }
+            )
+        assets.sort(key=lambda item: (str(item.get("category") or ""), str(item.get("relative_path") or "")))
+        return assets
+
+    async def read_workspace_output(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+        max_chars: int = 120000,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, workspace_row, workspace_model, workspace_dir = resolved
+        normalized = self._normalize_workspace_output_path(relative_path)
+        if normalized == "workspace.compare_report_json":
+            compare_report = dict(getattr(workspace_model, "compare_report_json", {}) or {})
+            if not compare_report:
+                return None
+            content = json.dumps(compare_report, ensure_ascii=False, indent=2)
+            return {
+                "label": "Compare report",
+                "relative_path": normalized,
+                "category": "results",
+                "scope": "results",
+                "scope_label": "Results",
+                "kind": "db_record",
+                "storage": "db_record",
+                "editable": True,
+                "updated_at": str(workspace_row.get("latest_run_at") or workspace_row.get("updated_at") or "") or None,
+                "content": content[:max_chars],
+                "total_chars": len(content),
+                "truncated": len(content) > max_chars,
+            }
+        if not self._is_manageable_workspace_output(normalized):
+            raise ValueError("relative_path 不在可管理产物范围内")
+        target = workspace_dir / normalized
+        if not target.is_file():
+            return None
+        content = target.read_text(encoding="utf-8", errors="replace")
+        summary = self._build_workspace_output_summary(workspace_dir, normalized, target)
+        return {
+            **summary,
+            "content": content[:max_chars],
+            "total_chars": len(content),
+            "truncated": len(content) > max_chars,
+        }
+
+    async def write_workspace_output(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+        content: str,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, workspace_row, workspace_model, workspace_dir = resolved
+        normalized = self._normalize_workspace_output_path(relative_path)
+        if normalized == "workspace.compare_report_json":
+            payload = dict(json.loads(str(content or "{}")) or {})
+            workspace_model.compare_report_json = payload
+            workspace_model.updated_at = datetime.utcnow()
+            await self.db.commit()
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+            return {
+                "label": "Compare report",
+                "relative_path": normalized,
+                "category": "results",
+                "scope": "results",
+                "scope_label": "Results",
+                "kind": "db_record",
+                "storage": "db_record",
+                "editable": True,
+                "updated_at": datetime.utcnow().isoformat(),
+                "content": serialized,
+                "total_chars": len(serialized),
+                "truncated": False,
+            }
+        if not self._is_manageable_workspace_output(normalized):
+            raise ValueError("relative_path 不在可管理产物范围内")
+        if self._workspace_output_kind(normalized) == "json":
+            json.loads(str(content or "{}"))
+        target = workspace_dir / normalized
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(content or ""), encoding="utf-8")
+        self._sync_workspace_model_for_asset(
+            workspace_model=workspace_model,
+            relative_path=normalized,
+            content=str(content or ""),
+            deleted=False,
+        )
+        workspace_model.updated_at = datetime.utcnow()
+        await self.db.commit()
+        summary = self._build_workspace_output_summary(workspace_dir, normalized, target)
+        return {
+            **summary,
+            "content": str(content or ""),
+            "total_chars": len(str(content or "")),
+            "truncated": False,
+        }
+
+    async def delete_workspace_output(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, _workspace_row, workspace_model, workspace_dir = resolved
+        normalized = self._normalize_workspace_output_path(relative_path)
+        if normalized == "workspace.compare_report_json":
+            workspace_model.compare_report_json = {}
+            workspace_model.updated_at = datetime.utcnow()
+            await self.db.commit()
+            return {"success": True, "relative_path": normalized, "deleted": True}
+        if not self._is_manageable_workspace_output(normalized):
+            raise ValueError("relative_path 不在可管理产物范围内")
+        target = workspace_dir / normalized
+        if not target.exists():
+            return None
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        self._sync_workspace_model_for_asset(
+            workspace_model=workspace_model,
+            relative_path=normalized,
+            content="",
+            deleted=True,
+        )
+        workspace_model.updated_at = datetime.utcnow()
+        await self.db.commit()
+        return {"success": True, "relative_path": normalized, "deleted": True}
+
+    async def cleanup_workspace_outputs(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        preserve_repo: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, _workspace_row, workspace_model, workspace_dir = resolved
+        deleted_paths: List[str] = []
+        deleted_file_count = 0
+        deleted_dir_count = 0
+        for child in list(workspace_dir.iterdir()) if workspace_dir.is_dir() else []:
+            if preserve_repo and child.name == "paper_repo":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+                deleted_dir_count += 1
+            else:
+                child.unlink()
+                deleted_file_count += 1
+            deleted_paths.append(child.name)
+
+        deleted_run_count = 0
+        if getattr(workspace_model, "id", None) is not None:
+            deleted_run_count = await self._delete_workspace_runs(int(workspace_model.id))
+
+        workspace_model.summary_json = {}
+        workspace_model.experiment_spec_json = {}
+        workspace_model.compare_report_json = {}
+        workspace_model.status = "ready"
+        workspace_model.updated_at = datetime.utcnow()
+        await self.db.commit()
+        return {
+            "project_id": int(project_id),
+            "workspace_id": int(workspace_id),
+            "preserve_repo": bool(preserve_repo),
+            "scope": "all",
+            "deleted_file_count": deleted_file_count,
+            "deleted_dir_count": deleted_dir_count,
+            "deleted_run_count": deleted_run_count,
+            "deleted_paths": deleted_paths[:120],
+        }
+
+    async def cleanup_workspace_outputs_scope(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        scope: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_scope = str(scope or "").strip()
+        if normalized_scope == "all":
+            return await self.cleanup_workspace_outputs(
+                project_id=project_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                preserve_repo=True,
+            )
+        resolved = await self._resolve_workspace_context(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if resolved is None:
+            return None
+        _project, _workspace_row, workspace_model, workspace_dir = resolved
+        outputs = await self.list_workspace_outputs(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        deleted_paths: List[str] = []
+        deleted_file_count = 0
+        deleted_dir_count = 0
+        deleted_run_count = 0
+        for item in list(outputs or []):
+            relative_path = str(item.get("relative_path") or "").strip()
+            if not relative_path or str(item.get("scope") or "") != normalized_scope:
+                continue
+            target = workspace_dir / relative_path if relative_path != "workspace.compare_report_json" else None
+            is_dir = bool(target and target.exists() and target.is_dir())
+            payload = await self.delete_workspace_output(
+                project_id=project_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                relative_path=relative_path,
+            )
+            if payload is None:
+                continue
+            deleted_paths.append(relative_path)
+            if relative_path == "workspace.compare_report_json":
+                deleted_file_count += 1
+                continue
+            if is_dir:
+                deleted_dir_count += 1
+            else:
+                deleted_file_count += 1
+
+        if normalized_scope == "executions" and getattr(workspace_model, "id", None) is not None:
+            deleted_run_count = await self._delete_workspace_runs(int(workspace_model.id))
+            workspace_model.updated_at = datetime.utcnow()
+            await self.db.commit()
+
+        return {
+            "project_id": int(project_id),
+            "workspace_id": int(workspace_id),
+            "preserve_repo": True,
+            "scope": normalized_scope,
+            "deleted_file_count": deleted_file_count,
+            "deleted_dir_count": deleted_dir_count,
+            "deleted_run_count": deleted_run_count,
+            "deleted_paths": deleted_paths[:120],
+        }
+
+    # Backward-compatible wrappers for older asset-oriented callers.
+    async def list_workspace_assets(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        return await self.list_workspace_outputs(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+
+    async def read_workspace_asset(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+        max_chars: int = 120000,
+    ) -> Optional[Dict[str, Any]]:
+        return await self.read_workspace_output(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            relative_path=relative_path,
+            max_chars=max_chars,
+        )
+
+    async def write_workspace_asset(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+        content: str,
+    ) -> Optional[Dict[str, Any]]:
+        return await self.write_workspace_output(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            relative_path=relative_path,
+            content=content,
+        )
+
+    async def delete_workspace_asset(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        relative_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        return await self.delete_workspace_output(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            relative_path=relative_path,
+        )
+
+    async def cleanup_workspace_assets(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+        preserve_repo: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        return await self.cleanup_workspace_outputs(
+            project_id=project_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            preserve_repo=preserve_repo,
         )
 
     async def serialize_projects(self, projects: Iterable[ResearchProject]) -> List[Dict[str, Any]]:
@@ -609,6 +1015,15 @@ class ProjectService:
     def _grounding_status_text(report: Dict[str, Any], key: str) -> str:
         return str(dict(report.get(key) or {}).get("status") or "unknown").strip().lower() or "unknown"
 
+    @staticmethod
+    def _resolve_grounded_flag(*, status: str, summary_value: Any) -> bool:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status == "grounded":
+            return True
+        if normalized_status in {"blocked", "absent", "unknown"}:
+            return False
+        return bool(summary_value)
+
     def _grounding_completion_state(self, report: Dict[str, Any]) -> Dict[str, Any]:
         summary = dict(report.get("summary") or {})
         statuses = {
@@ -636,12 +1051,24 @@ class ProjectService:
             for item in list(summary.get("blockers") or [])
             if str(item).strip()
         )
-        repo_grounded = bool(summary.get("repo_grounded")) or statuses["repo"] == "grounded"
-        entrypoint_grounded = bool(summary.get("entrypoint_grounded")) or statuses["entrypoint"] == "grounded"
-        dataset_grounded = bool(summary.get("dataset_grounded")) or statuses["dataset"] == "grounded"
-        runtime_grounded = bool(summary.get("runtime_grounded")) or statuses["runtime"] == "grounded"
-        external_dependencies_grounded = bool(summary.get("external_dependencies_grounded")) or statuses["external_dependencies"] == "grounded"
-        complete = all(
+        repo_grounded = self._resolve_grounded_flag(status=statuses["repo"], summary_value=summary.get("repo_grounded"))
+        entrypoint_grounded = self._resolve_grounded_flag(
+            status=statuses["entrypoint"],
+            summary_value=summary.get("entrypoint_grounded"),
+        )
+        dataset_grounded = self._resolve_grounded_flag(
+            status=statuses["dataset"],
+            summary_value=summary.get("dataset_grounded"),
+        )
+        runtime_grounded = self._resolve_grounded_flag(
+            status=statuses["runtime"],
+            summary_value=summary.get("runtime_grounded"),
+        )
+        external_dependencies_grounded = self._resolve_grounded_flag(
+            status=statuses["external_dependencies"],
+            summary_value=summary.get("external_dependencies_grounded"),
+        )
+        all_grounded = all(
             (
                 repo_grounded,
                 entrypoint_grounded,
@@ -650,9 +1077,17 @@ class ProjectService:
                 external_dependencies_grounded,
             )
         )
+        run_decision = str(summary.get("run_decision") or "").strip().lower()
+        if run_decision not in {"ready", "runnable_with_patch", "blocked"}:
+            if repo_grounded and entrypoint_grounded and runtime_grounded and not blockers:
+                run_decision = "ready"
+            elif blockers or any(value == "blocked" for value in statuses.values()):
+                run_decision = "blocked"
+            else:
+                run_decision = "unknown"
         overall_status = str(summary.get("overall_status") or "").strip().lower()
         if not overall_status:
-            if complete:
+            if all_grounded:
                 overall_status = "grounded"
             elif blockers or any(value == "blocked" for value in statuses.values()):
                 overall_status = "blocked"
@@ -661,8 +1096,10 @@ class ProjectService:
             else:
                 overall_status = "unknown"
         return {
-            "complete": complete and overall_status == "grounded",
+            "complete": run_decision in {"ready", "runnable_with_patch", "blocked"},
+            "ready_for_next_stage": run_decision in {"ready", "runnable_with_patch"},
             "overall_status": overall_status,
+            "run_decision": run_decision,
             "blockers": list(dict.fromkeys(blockers)),
             "statuses": statuses,
             "next_actions": [
@@ -737,10 +1174,12 @@ class ProjectService:
         }
         if not planning_complete:
             grounding_status = "missing"
+        elif bool(grounding_state.get("ready_for_next_stage")):
+            grounding_status = "completed"
+        elif str(grounding_state.get("run_decision") or "") == "blocked":
+            grounding_status = "blocked"
         elif bool(grounding_state.get("complete")):
             grounding_status = "completed"
-        elif grounding_report and str(grounding_state.get("overall_status") or "") == "blocked":
-            grounding_status = "blocked"
         else:
             grounding_status = "ready"
         grounding_statuses = dict(grounding_state.get("statuses") or {})
@@ -760,8 +1199,8 @@ class ProjectService:
         )
         implementation_blockers = self._extract_blockers(implementation_spec)
         readiness = dict(implementation_spec.get("readiness") or {})
-        grounding_complete = bool(grounding_state.get("complete"))
-        if not grounding_complete:
+        grounding_ready_for_next = bool(grounding_state.get("ready_for_next_stage"))
+        if not grounding_ready_for_next:
             implementation_status = "missing"
         elif not implementation_artifacts[0]["present"]:
             implementation_status = "missing"
@@ -782,7 +1221,7 @@ class ProjectService:
             workspace_dir,
             [("Run drafts", "drafts/run_drafts.json", "json")],
         )
-        if not grounding_complete:
+        if not grounding_ready_for_next:
             run_drafts_status = "missing"
         elif run_drafts_artifacts[0]["present"] and draft_items:
             run_drafts_status = "completed"
@@ -1068,6 +1507,263 @@ class ProjectService:
             return dict(json.loads(path.read_text(encoding="utf-8")) or {})
         except Exception:
             return {}
+
+    async def _resolve_workspace_context(
+        self,
+        *,
+        project_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> Optional[Tuple[ResearchProject, Dict[str, Any], PaperExperimentWorkspace, Path]]:
+        project = await self.get_project(project_id=int(project_id), user_id=int(user_id))
+        if project is None:
+            return None
+        workspace_rows = list((await self._load_project_workspaces([int(project.id)])).get(int(project.id), []) or [])
+        workspace_row = next((item for item in workspace_rows if int(item.get("id") or 0) == int(workspace_id)), None)
+        if workspace_row is None:
+            return None
+        workspace_result = await self.db.execute(
+            select(PaperExperimentWorkspace).where(
+                PaperExperimentWorkspace.id == int(workspace_id),
+                PaperExperimentWorkspace.user_id == int(user_id),
+            )
+        )
+        workspace_model = workspace_result.scalar_one_or_none()
+        if workspace_model is None:
+            return None
+        notebook_id = str(workspace_row.get("notebook_id") or workspace_model.notebook_id or "").strip()
+        if not notebook_id:
+            return None
+        return project, workspace_row, workspace_model, Path(get_notebook_workspace_dir(notebook_id, int(user_id)))
+
+    @staticmethod
+    def _normalize_workspace_output_path(relative_path: str) -> str:
+        raw = str(relative_path or "").strip().replace("\\", "/")
+        if not raw:
+            raise ValueError("relative_path 不能为空")
+        if raw == "workspace.compare_report_json":
+            return raw
+        path = Path(raw)
+        if path.is_absolute():
+            raise ValueError("relative_path 不能是绝对路径")
+        parts = [str(part).strip() for part in path.parts if str(part).strip() not in {"", "."}]
+        if not parts or any(part == ".." for part in parts):
+            raise ValueError("relative_path 非法")
+        normalized = Path(*parts).as_posix()
+        if not normalized:
+            raise ValueError("relative_path 非法")
+        return normalized
+
+    @classmethod
+    def _is_manageable_workspace_output(cls, relative_path: str) -> bool:
+        normalized = cls._normalize_workspace_output_path(relative_path)
+        if normalized == "workspace.compare_report_json":
+            return True
+        return normalized != "paper_repo" and not normalized.startswith("paper_repo/")
+
+    @staticmethod
+    def _workspace_output_category(relative_path: str) -> str:
+        normalized = str(relative_path or "").strip()
+        if normalized == "workspace.compare_report_json":
+            return "results"
+        if normalized.startswith("specs/"):
+            return "specs"
+        if normalized.startswith("drafts/"):
+            return "drafts"
+        if normalized.startswith("executions/"):
+            return "executions"
+        if normalized in {"repo_reference.json", "repo_file_index.json", "repo_history_url_candidates.json", "repo_readme_excerpt.md"}:
+            return "repo_metadata"
+        return "planning"
+
+    @staticmethod
+    def _workspace_output_scope(relative_path: str) -> str:
+        normalized = str(relative_path or "").strip()
+        if normalized == "workspace.compare_report_json":
+            return "results"
+        if normalized == "specs/grounding_report.json":
+            return "grounding"
+        if normalized == "specs/implementation_spec.json":
+            return "implementation"
+        if normalized.startswith("drafts/"):
+            return "run_drafts"
+        if normalized.startswith("executions/"):
+            return "executions"
+        if normalized in {"repo_reference.json", "repo_file_index.json", "repo_history_url_candidates.json", "repo_readme_excerpt.md"}:
+            return "repo_analysis"
+        return "planning"
+
+    @staticmethod
+    def _workspace_output_scope_label(relative_path: str) -> str:
+        scope = ProjectService._workspace_output_scope(relative_path)
+        if scope == "planning":
+            return "Planning / Intake"
+        if scope == "repo_analysis":
+            return "Repo Analysis"
+        if scope == "grounding":
+            return "Grounding"
+        if scope == "implementation":
+            return "Implementation"
+        if scope == "run_drafts":
+            return "Run Drafts"
+        if scope == "executions":
+            return "Executions"
+        if scope == "results":
+            return "Results"
+        return "Workspace Output"
+
+    @staticmethod
+    def _workspace_output_kind(relative_path: str) -> str:
+        normalized = str(relative_path or "").strip()
+        if normalized == "workspace.compare_report_json":
+            return "db_record"
+        suffix = Path(normalized).suffix.lower()
+        if suffix == ".json":
+            return "json"
+        if suffix in {".md", ".markdown"}:
+            return "markdown"
+        if suffix in {".log", ".out"}:
+            return "log"
+        return "artifact"
+
+    @staticmethod
+    def _workspace_output_label(relative_path: str) -> str:
+        normalized = str(relative_path or "").strip()
+        if normalized == "workspace.compare_report_json":
+            return "Compare report"
+        basename = Path(normalized).name
+        if basename in _WORKSPACE_ROOT_LABELS:
+            return _WORKSPACE_ROOT_LABELS[basename]
+        if normalized.startswith("specs/"):
+            return f"Spec · {basename}"
+        if normalized.startswith("drafts/"):
+            return f"Draft · {basename}"
+        if normalized.startswith("executions/"):
+            return f"Execution · {basename}"
+        return basename or normalized
+
+    @classmethod
+    def _is_editable_text_output(cls, path: Path, relative_path: str, *, max_size: int = 400000) -> bool:
+        if cls._workspace_output_kind(relative_path) == "db_record":
+            return True
+        try:
+            if not path.is_file():
+                return False
+            stat = path.stat()
+            if stat.st_size > max_size:
+                return False
+            with path.open("rb") as handle:
+                sample = handle.read(4096)
+            return b"\x00" not in sample
+        except OSError:
+            return False
+
+    def _build_workspace_output_summary(self, workspace_dir: Path, relative_path: str, target: Path) -> Dict[str, Any]:
+        size_bytes = 0
+        updated_at = None
+        try:
+            stat = target.stat()
+            size_bytes = int(stat.st_size or 0)
+            updated_at = datetime.utcfromtimestamp(stat.st_mtime).isoformat()
+        except OSError:
+            pass
+        return {
+            "label": self._workspace_output_label(relative_path),
+            "relative_path": relative_path,
+            "category": self._workspace_output_category(relative_path),
+            "scope": self._workspace_output_scope(relative_path),
+            "scope_label": self._workspace_output_scope_label(relative_path),
+            "kind": self._workspace_output_kind(relative_path),
+            "storage": "file",
+            "present": bool(target.exists()),
+            "size_bytes": size_bytes,
+            "editable": self._is_editable_text_output(target, relative_path),
+            "deletable": True,
+            "updated_at": updated_at,
+        }
+
+    def _scan_workspace_outputs(self, workspace_dir: Path) -> List[Dict[str, Any]]:
+        assets: List[Dict[str, Any]] = []
+        if not workspace_dir.is_dir():
+            return assets
+        for root, dirs, files in os.walk(workspace_dir):
+            root_path = Path(root)
+            dirs[:] = [
+                item for item in dirs
+                if item != "paper_repo" and item != "__pycache__" and not str(item).startswith(".")
+            ]
+            for name in files:
+                if str(name).startswith("."):
+                    continue
+                target = root_path / name
+                relative_path = target.relative_to(workspace_dir).as_posix()
+                if not self._is_manageable_workspace_output(relative_path):
+                    continue
+                assets.append(self._build_workspace_output_summary(workspace_dir, relative_path, target))
+        return assets
+
+    # Backward-compatible aliases for older asset-oriented internals/tests.
+    _normalize_workspace_asset_path = _normalize_workspace_output_path
+    _is_manageable_workspace_asset = _is_manageable_workspace_output
+    _workspace_asset_category = _workspace_output_category
+    _workspace_asset_kind = _workspace_output_kind
+    _workspace_asset_label = _workspace_output_label
+    _is_editable_text_asset = _is_editable_text_output
+    _build_workspace_asset_summary = _build_workspace_output_summary
+    _scan_workspace_assets = _scan_workspace_outputs
+
+    def _sync_workspace_model_for_asset(
+        self,
+        *,
+        workspace_model: PaperExperimentWorkspace,
+        relative_path: str,
+        content: str,
+        deleted: bool,
+    ) -> None:
+        normalized = str(relative_path or "").strip()
+        if normalized == "paper_summary.json":
+            summary = dict(getattr(workspace_model, "summary_json", {}) or {})
+            if deleted:
+                summary.pop("paper_summary", None)
+            else:
+                try:
+                    summary["paper_summary"] = dict(json.loads(content or "{}") or {})
+                except Exception:
+                    return
+            workspace_model.summary_json = summary
+        elif normalized == "experiment_spec.json":
+            if deleted:
+                workspace_model.experiment_spec_json = {}
+            else:
+                try:
+                    workspace_model.experiment_spec_json = dict(json.loads(content or "{}") or {})
+                except Exception:
+                    return
+        elif normalized == "workspace_adapter_manifest.json":
+            try:
+                payload = {} if deleted else dict(json.loads(content or "{}") or {})
+            except Exception:
+                return
+            summary = dict(getattr(workspace_model, "summary_json", {}) or {})
+            experiment_spec = dict(getattr(workspace_model, "experiment_spec_json", {}) or {})
+            if deleted:
+                summary.pop("workspace_adapter", None)
+                experiment_spec.pop("workspace_adapter", None)
+            else:
+                summary["workspace_adapter"] = payload
+                experiment_spec["workspace_adapter"] = payload
+            workspace_model.summary_json = summary
+            workspace_model.experiment_spec_json = experiment_spec
+
+    async def _delete_workspace_runs(self, workspace_id: int) -> int:
+        count_result = await self.db.execute(
+            select(func.count(PaperExperimentRun.id)).where(PaperExperimentRun.workspace_id == int(workspace_id))
+        )
+        deleted_count = int(count_result.scalar() or 0)
+        await self.db.execute(
+            delete(PaperExperimentRun).where(PaperExperimentRun.workspace_id == int(workspace_id))
+        )
+        return deleted_count
 
     def _artifact_group(
         self,

@@ -41,8 +41,17 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
     paper_tool_names = {
         "paper_research_get_artifact_manifest",
         "paper_research_prepare",
+        "paper_research_assess_repo_mainpath",
+        "paper_research_list_outputs",
+        "paper_research_delete_output",
+        "paper_research_cleanup_scope",
+        "paper_research_search_outputs",
         "paper_research_probe_repo",
         "paper_research_probe_url",
+        "paper_research_git_status",
+        "paper_research_git_diff",
+        "paper_research_git_log",
+        "paper_research_git_show",
         "paper_research_read_artifact",
         "paper_research_read_grounding_report",
         "paper_research_read_implementation_spec",
@@ -50,6 +59,7 @@ def test_tool_registry_registers_knowledge_search_only_when_db_available(monkeyp
         "paper_research_read_repo_file",
         "paper_research_search_repo",
         "paper_research_status",
+        "paper_research_tail_execution_log",
         "paper_research_write_grounding_report",
         "paper_research_write_execution_script",
         "paper_research_write_implementation_spec",
@@ -506,6 +516,23 @@ def test_paper_research_probe_url_flags_empty_202_response():
     assert downloadable is False
     assert diagnosis == "accepted_but_empty"
     assert next_action == "diagnose_official_source_failure"
+
+
+def test_paper_research_probe_url_treats_html_landing_page_as_not_downloadable():
+    tool = agent_tools.PaperResearchStatusTool(db=None, user_id=1)
+
+    ok, downloadable, diagnosis, next_action = tool._probe_url_diagnosis(
+        status_code=200,
+        content_length=4096,
+        detected_kind="html",
+        expected_kind="auto",
+        head_bytes=b"<!DOCTYPE html><html><body>Google Drive</body></html>",
+    )
+
+    assert ok is False
+    assert downloadable is False
+    assert diagnosis == "html_page"
+    assert next_action == "use_as_reference_page"
 
 
 def test_paper_research_parse_git_ls_remote_extracts_default_branch():

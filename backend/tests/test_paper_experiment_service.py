@@ -51,7 +51,7 @@ def test_paper_experiment_missing_template_uses_guard_not_fake_baseline():
 
 
 @pytest.mark.asyncio
-async def test_build_paper_intake_payload_prefers_page_images_when_multimodal_ready(monkeypatch, tmp_path: Path):
+async def test_build_paper_intake_payload_prefers_local_markdown_even_when_multimodal_ready(monkeypatch, tmp_path: Path):
     service = PaperExperimentService(db=None)
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4 fake")
@@ -92,10 +92,55 @@ async def test_build_paper_intake_payload_prefers_page_images_when_multimodal_re
 
     payload = await service._build_paper_intake_payload(paper, user_id=1)
 
-    assert payload["source_mode"] == "local_pdf_page_images"
-    assert payload["extractor"] == "dashscope_multimodal_pages"
+    assert payload["source_mode"] == "local_pdf_markdown"
+    assert payload["extractor"] == "local_structured_pdf_fast"
     assert payload["page_count"] == 8
     assert "Table 1 data" in payload["paper_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_build_paper_intake_payload_falls_back_to_page_images_when_markdown_missing(monkeypatch, tmp_path: Path):
+    service = PaperExperimentService(db=None)
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    paper = SimpleNamespace(
+        id=113,
+        title="Bag of Tricks for Efficient Text Classification",
+        abstract="demo abstract",
+        authors=[],
+        year=2016,
+        venue="arXiv",
+        journal=None,
+        arxiv_id="1607.01759",
+        doi=None,
+        url="https://arxiv.org/abs/1607.01759",
+        pdf_url="https://arxiv.org/pdf/1607.01759",
+        arxiv_url="https://arxiv.org/abs/1607.01759",
+        fields_of_study=[],
+        raw_data={},
+    )
+
+    async def _fake_ingest_pdf(**kwargs):
+        return {
+            "document_text": "",
+            "extractor": "local_structured_pdf_fast",
+            "report": {"page_count": 8},
+            "document_source_spans": [],
+        }
+
+    async def _fake_ensure_pdf_available(*args, **kwargs):
+        return pdf_path
+
+    monkeypatch.setattr(service.pdf_ingest_service, "ingest_pdf", _fake_ingest_pdf)
+    monkeypatch.setattr(service, "_ensure_pdf_available", _fake_ensure_pdf_available)
+    monkeypatch.setattr(service, "_paper_intake_multimodal_ready", lambda: True)
+    monkeypatch.setattr(service, "_count_pdf_pages", lambda _path: 8)
+
+    payload = await service._build_paper_intake_payload(paper, user_id=1)
+
+    assert payload["source_mode"] == "local_pdf_page_images"
+    assert payload["extractor"] == "dashscope_multimodal_pages"
 
 
 @pytest.mark.asyncio
@@ -120,6 +165,42 @@ async def test_extract_paper_intake_json_uses_multimodal_path_for_page_images(mo
     )
 
     assert result == expected
+
+
+def test_build_experiment_spec_keeps_stage1_as_paper_scaffold():
+    service = PaperExperimentService(db=None)
+    paper = SimpleNamespace(id=113, title="Bag of Tricks for Efficient Text Classification", url="u", pdf_url="p", arxiv_url="a")
+
+    summary = {
+        "execution_mode": "repo_backed",
+        "repo_urls": ["https://github.com/facebookresearch/fastText"],
+        "dataset_urls": ["https://example.com/ag"],
+        "paper_intake": {
+            "paper_profile": {
+                "task_type": "text classification",
+                "domain": "nlp",
+                "research_direction": "efficient text classification",
+                "research_method": "bag of tricks over fastText style linear models",
+                "research_content": "classification and tag prediction experiments",
+                "contribution_summary": "strong simple baseline",
+                "experiment_goal": "show simple models remain competitive",
+            },
+            "dataset_candidates": [{"name": "AG News"}, {"name": "Sogou"}],
+            "models": [{"name": "fastText"}],
+            "metrics": [{"name": "accuracy"}],
+            "entrypoint_hints": [{"kind": "repo", "value": "official repo"}],
+            "optimization_candidates": [{"id": "lr", "name": "learning rate", "category": "hyperparameter", "rationale": "paper discusses tuning"}],
+            "reference_links": [{"url": "https://github.com/facebookresearch/fastText", "category": "official_repo", "role": "primary_official"}],
+        },
+    }
+
+    spec = service._build_experiment_spec(paper, summary)
+
+    assert spec["execution_spec_version"] == "v3_paper_intake_scaffold"
+    assert spec["paper_focus"]["research_direction"] == "efficient text classification"
+    assert spec["execution_contract"]["runtime"] == "repo_assessment_pending"
+    assert spec["optimization_brief"]["first_runs"] == []
+    assert spec["codelab_run_templates"] == []
 
 
 def test_paper_experiment_repo_index_builds_workspace_assets(tmp_path: Path):

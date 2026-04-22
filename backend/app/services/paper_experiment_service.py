@@ -55,20 +55,24 @@ Use the full paper content to extract the structured facts and discovery hints n
 This stage does not execute code, inspect external repositories, or generate runnable code.
 
 Current task:
-- Read the paper as a research engineer preparing a later reproduction/tuning workflow.
-- Identify the paper's primary official code repository when the PDF provides enough evidence.
-- Distinguish the paper's primary repo from baseline implementations, third-party references, project pages, and unrelated links.
-- Extract datasets, models, metrics, protocols, optimization candidates, and discovery tasks that a later LLM/agent should use.
+- Read the paper as a research engineer preparing later repo inspection, execution, and tuning work.
+- First produce a reliable paper understanding artifact, not an execution plan.
+- Identify and classify links that the paper explicitly provides.
+- Summarize the paper's research direction, research method, research content, and reusable tuning hints.
+- Extract datasets, models, metrics, protocols, and discovery hints only as paper-grounded clues for later repo/runtime work.
 
 Rules:
 - Do not invent URLs, repository names, dataset links, commands, or dependencies.
+- Prioritize the narrative sections of the paper: title, abstract, introduction, method, experiment text, conclusion, and figure captions.
+- Treat table cells as supporting evidence, not as the single source of truth.
 - When the PDF contains multiple experiment groups, tables, or benchmark suites, keep their boundaries clear.
 - Do not merge datasets across different tables/experiments unless the paper explicitly says they belong to the same reproduction target.
+- If table structure is ambiguous after PDF parsing, trust the surrounding narrative text first and record the ambiguity in `limitations` or `discovery_tasks`.
 - If the paper mentions a dataset name but no URL, return the name with url=null.
 - Every extracted item must include short evidence_text copied or tightly paraphrased from the paper.
 - Keep evidence_text concise: no more than 120 characters per item.
 - Prefer concrete evidence about code availability, dataset availability, task, models, metrics, train/eval settings, hyperparameters, scripts, and artifacts.
-- Output planning constraints and follow-up discovery tasks, not implementation.
+- Output paper understanding, planning constraints, and follow-up discovery tasks, not implementation.
 - Do not output Python code, shell commands, package installation commands, synthetic scripts, or fake repo file paths.
 - If repo/code/data are not in the PDF, mark them as missing and add discovery_tasks.
 - Distinguish dataset purpose and source type. For example, prior dumps for pretraining are different from sklearn built-in demo datasets or benchmark evaluation datasets.
@@ -78,13 +82,14 @@ Rules:
 - If a URL is used only for a compared baseline model, set role="baseline_implementation".
 - If a URL is a general external library/tool/reference, set role="third_party_reference".
 - Keep verification_status="paper_claimed" for links asserted by the PDF; do not set "externally_verified" because this stage does not browse the web.
-- Parameter/model choices should be proposed as optimization candidates for later LLM planning.
+- Parameter/model choices should be proposed as optimization candidates for later planning and tuning discussion.
 - Optimization candidates are analysis artifacts, not executable repo parameters.
 - Do not imply candidate parameters are directly runnable until repo/data/configs have been inspected.
 - Keep symbolic parameter values as JSON strings. Do not output invalid JSON expressions such as 4/3, 2/3, NaN, Infinity, or comments.
 - Keep the JSON concise but complete.
-- Include all important items needed for downstream reproduction and tuning.
+- Include all important items needed for downstream paper understanding, reproduction, and tuning.
 - Do not drop main benchmark datasets, primary repositories, core baselines, metrics, protocols, or high-impact optimization candidates just to be brief.
+- Do not generate runnable execution plans, baseline commands, variant scripts, or first-run instructions from the paper alone.
 - Order items by downstream importance:
   1. primary official repository and reproduction-critical links
   2. main benchmark datasets and required splits
@@ -104,9 +109,23 @@ Required JSON shape:
     "task_type": string|null,
     "domain": string|null,
     "problem_statement": string|null,
+    "research_direction": string|null,
+    "research_method": string|null,
+    "research_content": string|null,
     "contribution_summary": string|null,
     "experiment_goal": string|null
   },
+  "reference_links": [
+    {
+      "url": string,
+      "category": "official_repo"|"project_page"|"dataset_or_download"|"benchmark_reference"|"third_party_reference"|"unknown",
+      "label": string|null,
+      "role": "primary_official"|"supporting"|"reference"|"unknown",
+      "verification_status": "paper_claimed"|"unverified",
+      "evidence_text": string,
+      "evidence_section": string|null
+    }
+  ],
   "code_repositories": [
     {
       "url": string,
@@ -184,17 +203,6 @@ Required JSON shape:
       "evidence_text": string|null
     }
   ],
-  "optimization_brief": {
-    "human_summary": string|null,
-    "recommended_strategy": string|null,
-    "first_runs": [
-      {"label": string, "goal": string, "changes": object, "expected_effect": string|null}
-    ],
-    "do_not_change_first": [string]
-  },
-  "variant_ideas": [
-    {"label": string, "change": object, "rationale": string}
-  ],
   "discovery_tasks": [
     {
       "id": string,
@@ -202,19 +210,6 @@ Required JSON shape:
       "query_or_hint": string,
       "reason": string,
       "required_before_execution": boolean
-    }
-  ],
-  "run_plan_templates": [
-    {
-      "id": string,
-      "title": string,
-      "target": "baseline"|"variant"|"sweep",
-      "description": string,
-      "requires_repo": boolean,
-      "requires_dataset": boolean,
-      "params": object,
-      "expected_metrics": [string],
-      "blocked_by": [string]
     }
   ],
   "limitations": [string]
@@ -713,7 +708,6 @@ class PaperExperimentService:
         risky_knobs = self._as_list(intake.get("risky_knobs"))
         default_params = self._as_dict(training_setup.get("default_params"))
         first_entrypoint = self._first_entrypoint_hint(entrypoint_hints)
-        run_templates = self._resolve_codelab_run_templates(intake=intake)
         execution_assets = {
             "code_repositories": self._as_list(intake.get("code_repositories")),
             "repo_candidates": self._as_list(intake.get("repo_candidates")),
@@ -721,8 +715,40 @@ class PaperExperimentService:
             "dataset_candidates": self._as_list(intake.get("dataset_candidates")),
             "entrypoint_hints": entrypoint_hints,
         }
+        reference_links = self._as_list(intake.get("reference_links"))
+        tuning_hints = [
+            {
+                "name": str(item.get("name") or item.get("id") or "").strip() or None,
+                "category": str(item.get("category") or "").strip() or None,
+                "rationale": str(item.get("rationale") or "").strip() or None,
+                "expected_effect": str(item.get("expected_effect") or "").strip() or None,
+            }
+            for item in optimization_candidates[:8]
+            if isinstance(item, dict) and str(item.get("name") or item.get("id") or "").strip()
+        ]
+        paper_focus = {
+            "research_direction": self._first_string(
+                [
+                    intake_profile.get("research_direction"),
+                    intake_profile.get("problem_statement"),
+                ]
+            ),
+            "research_method": self._first_string(
+                [
+                    intake_profile.get("research_method"),
+                    intake_profile.get("contribution_summary"),
+                ]
+            ),
+            "research_content": self._first_string(
+                [
+                    intake_profile.get("research_content"),
+                    intake_profile.get("experiment_goal"),
+                ]
+            ),
+            "tuning_hints": tuning_hints,
+        }
         return {
-            "execution_spec_version": "v2_local_pdf_markdown_workspace",
+            "execution_spec_version": "v3_paper_intake_scaffold",
             "paper_id": int(paper.id),
             "title": paper.title,
             "execution_mode": summary.get("execution_mode") or "paper_backed",
@@ -730,22 +756,23 @@ class PaperExperimentService:
             "datasets": self._as_list(intake.get("dataset_candidates")),
             "models": models,
             "metrics": metrics,
+            "paper_focus": paper_focus,
             "execution_assets": execution_assets,
             "training_setup": training_setup,
             "evaluation_setup": self._as_dict(intake.get("evaluation_setup")),
             "entrypoint_hints": entrypoint_hints,
             "baseline": {
-                "entrypoint_type": str(first_entrypoint.get("kind") or "manual_scaffold"),
+                "entrypoint_type": str(first_entrypoint.get("kind") or "paper_hint"),
                 "entrypoint_hint": str(
                     first_entrypoint.get("value")
                     or first_entrypoint.get("evidence_text")
-                    or "Review repo/notebook entrypoint and execute baseline from CodeLab."
+                    or "Paper-only hint. Derive the real repo main path later from README/scripts/notebooks."
                 ),
                 "model_family": default_model_family,
                 "default_params": default_params,
             },
             "execution_contract": {
-                "runtime": "codelab_notebook",
+                "runtime": "repo_assessment_pending",
                 "file_access": "workspace_helpers_only",
                 "sync_keys": ["run_metrics", "run_artifacts"],
             },
@@ -753,18 +780,32 @@ class PaperExperimentService:
             "risky_knobs": risky_knobs,
             "optimization_candidates": optimization_candidates,
             "allowed_model_swaps": self._as_list(intake.get("model_swap_candidates")),
-            "optimization_brief": self._as_dict(intake.get("optimization_brief")),
-            "variant_ideas": self._as_list(intake.get("variant_ideas")),
+            "optimization_brief": {
+                "human_summary": self._first_string(
+                    [
+                        paper_focus.get("research_method"),
+                        paper_focus.get("research_content"),
+                    ]
+                ),
+                "recommended_strategy": "Treat these as paper-grounded hints only. Use repo evidence before turning them into executable changes.",
+                "first_runs": [],
+                "do_not_change_first": [
+                    "Do not treat stage-1 paper hints as executable repo commands.",
+                    "Do not lock the execution scope until repo mainpath assessment is complete.",
+                ],
+            },
+            "variant_ideas": [],
             "discovery_tasks": self._as_list(intake.get("discovery_tasks")),
-            "run_plan_templates": self._as_list(intake.get("run_plan_templates")),
-            "notebook_scaffold": self._as_list(intake.get("notebook_scaffold")),
-            "codelab_run_templates": run_templates,
+            "run_plan_templates": [],
+            "notebook_scaffold": [],
+            "codelab_run_templates": [],
             "sources": {
                 "paper_url": paper.url,
                 "pdf_url": paper.pdf_url,
                 "arxiv_url": paper.arxiv_url,
                 "repo_urls": summary.get("repo_urls") or [],
                 "dataset_urls": summary.get("dataset_urls") or [],
+                "reference_links": reference_links[:24],
             },
             "intake_status": {
                 "has_llm_intake": bool(intake),
@@ -1060,11 +1101,11 @@ class PaperExperimentService:
                 extractor_name = str(ingest.get("extractor") or "local_structured_pdf_fast").strip() or "local_structured_pdf_fast"
                 report = dict(ingest.get("report") or {})
                 markdown_spans = list(ingest.get("document_source_spans") or [])
-                if paper_markdown.strip() and not self._paper_intake_multimodal_ready():
+                if paper_markdown.strip():
                     source_mode = "local_pdf_markdown"
             except Exception as exc:  # noqa: BLE001 - intake can still use abstract/raw metadata
                 logger.warning(f"[PaperExperiment] local PDF markdown extraction failed paper_id={paper.id}: {exc}")
-            if self._paper_intake_multimodal_ready():
+            if not paper_markdown.strip() and self._paper_intake_multimodal_ready():
                 source_mode = "local_pdf_page_images"
                 extractor_name = "dashscope_multimodal_pages"
 

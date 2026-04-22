@@ -61,8 +61,17 @@ enforced_tool_names:
   - paper_research_probe_url
   - paper_research_get_artifact_manifest
   - paper_research_read_artifact
+  - paper_research_search_outputs
   - paper_research_read_repo_file
   - paper_research_search_repo
+  - paper_research_git_status
+  - paper_research_git_diff
+  - paper_research_git_log
+  - paper_research_git_show
+  - paper_research_assess_repo_mainpath
+  - paper_research_list_outputs
+  - paper_research_delete_output
+  - paper_research_cleanup_scope
   - paper_research_write_grounding_report
   - paper_research_read_grounding_report
   - paper_research_write_implementation_spec
@@ -75,6 +84,7 @@ enforced_tool_names:
   - paper_research_read_execution_spec
   - paper_research_start_execution
   - paper_research_read_execution
+  - paper_research_tail_execution_log
   - paper_research_cancel_execution
   - web_search
   - web_scrape

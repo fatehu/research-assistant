@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 import httpx
 
 from app.config import settings
+from app.services.html_page_semantics import analyze_html_page_semantics
+from app.services.google_drive_utils import is_google_drive_url, probe_google_drive_confirm_download
 
 
 _MAX_GENERATED_FILE_BYTES = 256_000
@@ -1245,6 +1247,8 @@ class ProjectRuntimeService:
         content_length = None
         head_bytes = b""
         request_error = None
+        page_semantics: Optional[Dict[str, Any]] = None
+        suggested_next_action = ""
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
             try:
                 head_response = await client.head(target)
@@ -1272,6 +1276,62 @@ class ProjectRuntimeService:
                             break
             except Exception as exc:  # noqa: BLE001
                 request_error = f"{request_error}; GET {type(exc).__name__}: {exc}" if request_error else f"GET {type(exc).__name__}: {exc}"
+
+            initial_kind = _classify_magic_bytes(head_bytes, content_type)
+            if is_google_drive_url(final_url or target) and initial_kind == "html":
+                try:
+                    html_response = await client.get(target)
+                except Exception as exc:  # noqa: BLE001
+                    request_error = (
+                        f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                        if request_error
+                        else f"HTML {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    page_semantics = await analyze_html_page_semantics(
+                        html_response.text or "",
+                        url=target,
+                        final_url=str(html_response.url),
+                        content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                        source="project_runtime_service.probe_url_dependency_html_semantics",
+                    )
+                try:
+                    confirmed = await probe_google_drive_confirm_download(
+                        client=client,
+                        url=target,
+                        read_bytes=64,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    request_error = (
+                        f"{request_error}; GDRIVE {type(exc).__name__}: {exc}"
+                        if request_error
+                        else f"GDRIVE {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if confirmed:
+                        get_status = int(confirmed.get("status_code") or get_status or 0) or get_status
+                        final_url = str(confirmed.get("final_url") or final_url or target)
+                        if confirmed.get("content_length") is not None:
+                            content_length = confirmed.get("content_length")
+                        content_type = str(confirmed.get("content_type") or content_type or "")
+                        head_bytes = bytes(confirmed.get("head_bytes") or b"")
+            elif initial_kind == "html":
+                try:
+                    html_response = await client.get(target)
+                except Exception as exc:  # noqa: BLE001
+                    request_error = (
+                        f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                        if request_error
+                        else f"HTML {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    page_semantics = await analyze_html_page_semantics(
+                        html_response.text or "",
+                        url=target,
+                        final_url=str(html_response.url),
+                        content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                        source="project_runtime_service.probe_url_dependency_html_semantics",
+                    )
 
         status_code = get_status or head_status
         detected_kind = _classify_magic_bytes(head_bytes, content_type)
@@ -1302,6 +1362,15 @@ class ProjectRuntimeService:
         elif expected_kind != "auto" and expected_kind == "text" and detected_kind not in {"text", "html"}:
             diagnosis = f"unexpected_content:{detected_kind}"
             ok = False
+        elif detected_kind == "html" and is_google_drive_url(final_url or target):
+            diagnosis = "gdrive_confirm_required"
+            ok = False
+        if page_semantics and detected_kind == "html":
+            semantic_diagnosis = str(page_semantics.get("diagnosis") or "").strip()
+            suggested_next_action = str(page_semantics.get("suggested_next_action") or "").strip()
+            if semantic_diagnosis:
+                diagnosis = semantic_diagnosis
+                ok = False
 
         return {
             **dependency,
@@ -1313,7 +1382,13 @@ class ProjectRuntimeService:
             "content_length": content_length,
             "detected_kind": detected_kind,
             "diagnosis": diagnosis,
+            "suggested_next_action": suggested_next_action or None,
             "request_error": request_error,
+            "page_title": str(page_semantics.get("title") or "") if page_semantics else "",
+            "page_kind": str(page_semantics.get("page_kind") or "") if page_semantics else "",
+            "page_signals": list(page_semantics.get("signals") or []) if page_semantics else [],
+            "page_text_excerpt": str(page_semantics.get("text_excerpt") or "") if page_semantics else "",
+            "page_semantics_source": str(page_semantics.get("classification_source") or "") if page_semantics else "",
         }
 
     async def _probe_repo_dependency(self, dependency: Dict[str, Any]) -> Dict[str, Any]:

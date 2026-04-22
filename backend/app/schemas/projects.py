@@ -153,6 +153,77 @@ class ResearchProjectRuntimeOverviewResponse(BaseModel):
     workspaces: List[ResearchProjectWorkspaceRuntimeOverview] = Field(default_factory=list)
 
 
+class ResearchProjectWorkspaceOutputSummary(BaseModel):
+    label: str
+    relative_path: str
+    category: str = "workspace"
+    scope: str = "workspace"
+    scope_label: str = "Workspace Output"
+    kind: str = "artifact"
+    storage: str = "file"
+    present: bool = False
+    size_bytes: int = 0
+    editable: bool = False
+    deletable: bool = False
+    updated_at: Optional[str] = None
+
+
+class ResearchProjectWorkspaceOutputContentResponse(BaseModel):
+    label: str
+    relative_path: str
+    category: str = "workspace"
+    scope: str = "workspace"
+    scope_label: str = "Workspace Output"
+    kind: str = "artifact"
+    storage: str = "file"
+    editable: bool = False
+    updated_at: Optional[str] = None
+    content: str = ""
+    total_chars: int = 0
+    truncated: bool = False
+
+
+class ResearchProjectWorkspaceOutputUpdateRequest(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=400)
+    content: str = ""
+
+
+class ResearchProjectWorkspaceOutputCleanupRequest(BaseModel):
+    preserve_repo: bool = True
+
+
+class ResearchProjectWorkspaceOutputScopeCleanupRequest(BaseModel):
+    scope: Literal[
+        "planning",
+        "repo_analysis",
+        "grounding",
+        "implementation",
+        "run_drafts",
+        "executions",
+        "results",
+    ]
+
+
+class ResearchProjectWorkspaceOutputCleanupResponse(BaseModel):
+    project_id: int
+    workspace_id: int
+    preserve_repo: bool = True
+    scope: str = "all"
+    deleted_file_count: int = 0
+    deleted_dir_count: int = 0
+    deleted_run_count: int = 0
+    deleted_paths: List[str] = Field(default_factory=list)
+
+
+# Backward-compatible aliases for older asset-oriented callers.
+ResearchProjectWorkspaceAssetSummary = ResearchProjectWorkspaceOutputSummary
+ResearchProjectWorkspaceAssetContentResponse = ResearchProjectWorkspaceOutputContentResponse
+ResearchProjectWorkspaceAssetUpdateRequest = ResearchProjectWorkspaceOutputUpdateRequest
+ResearchProjectWorkspaceAssetCleanupRequest = ResearchProjectWorkspaceOutputCleanupRequest
+ResearchProjectWorkspaceAssetScopeCleanupRequest = ResearchProjectWorkspaceOutputScopeCleanupRequest
+ResearchProjectWorkspaceAssetCleanupResponse = ResearchProjectWorkspaceOutputCleanupResponse
+
+
 class ResearchProjectCreateRequest(BaseModel):
     title: Optional[str] = Field(default=None, max_length=300)
     goal: Optional[str] = None

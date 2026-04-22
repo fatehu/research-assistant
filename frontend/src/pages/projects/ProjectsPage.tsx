@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   Alert,
@@ -18,7 +18,9 @@ import {
 import {
   BookOutlined,
   CodeOutlined,
+  DeleteOutlined,
   ExperimentOutlined,
+  EyeOutlined,
   LinkOutlined,
   PlusOutlined,
   ProjectOutlined,
@@ -31,6 +33,7 @@ import {
   type ResearchProject,
   type ResearchProjectExecutionSummary,
   type ResearchProjectResultSummary,
+  type ResearchProjectWorkspaceOutputSummary,
   type ResearchProjectRuntimeCandidateSummary,
   type ResearchProjectRuntimeContextSummary,
   type ResearchProjectRuntimeOverview,
@@ -124,6 +127,24 @@ const artifactKindLabel = (kind: string) => {
   return kind.toUpperCase()
 }
 
+const outputCategoryLabel = (category: string) => {
+  if (category === 'planning') return 'Paper Analysis'
+  if (category === 'repo_metadata') return 'Repo Analysis'
+  if (category === 'specs') return 'Specs'
+  if (category === 'drafts') return 'Run Drafts'
+  if (category === 'executions') return 'Execution Outputs'
+  if (category === 'results') return 'Reports'
+  return 'Workspace Output'
+}
+
+const formatBytes = (value?: number) => {
+  const size = Number(value || 0)
+  if (!Number.isFinite(size) || size <= 0) return '0 B'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
 const openExternal = (url?: string) => {
   if (!url) return
   window.open(url, '_blank', 'noopener,noreferrer')
@@ -211,7 +232,7 @@ function RuntimeContextCard({
             </div>
           </div>
           <div className="rounded-2xl border border-slate-800/80 bg-slate-950/50 p-4">
-            <div className="text-xs uppercase tracking-[0.18em] text-slate-500">Assets</div>
+            <div className="text-xs uppercase tracking-[0.18em] text-slate-500">Workspace</div>
             <div className="mt-2 space-y-2">
               <div>repo: {runtimeContext.repo_available ? 'ready' : 'missing'}</div>
               <div>history candidates: {runtimeContext.repo_history_candidate_count}</div>
@@ -222,7 +243,7 @@ function RuntimeContextCard({
               ) : null}
               {runtimeContext.notebook_asset_relative_path && notebookId && onOpenNotebook ? (
                 <Button size="small" icon={<CodeOutlined />} onClick={onOpenNotebook}>
-                  查看 Notebook 资产
+                  查看 Notebook
                 </Button>
               ) : null}
             </div>
@@ -457,6 +478,232 @@ function ExecutionsCard({
         />
       )}
     </Card>
+  )
+}
+
+function WorkspaceOutputsCard({
+  projectId,
+  workspaceId,
+  onOutputsChanged,
+}: {
+  projectId: number
+  workspaceId: number
+  onOutputsChanged?: () => Promise<void> | void
+}) {
+  const [outputs, setOutputs] = useState<ResearchProjectWorkspaceOutputSummary[]>([])
+  const [loading, setLoading] = useState(false)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [modalLoading, setModalLoading] = useState(false)
+  const [cleanupLoading, setCleanupLoading] = useState(false)
+  const [scopeCleanupLoading, setScopeCleanupLoading] = useState<string | null>(null)
+  const [selectedPath, setSelectedPath] = useState('')
+  const [outputContent, setOutputContent] = useState('')
+
+  const outputScopes = useMemo(() => {
+    const grouped = new Map<string, { label: string; items: ResearchProjectWorkspaceOutputSummary[] }>()
+    for (const output of outputs) {
+      const scope = String(output.scope || 'planning')
+      const existing = grouped.get(scope)
+      if (existing) {
+        existing.items.push(output)
+        continue
+      }
+      grouped.set(scope, { label: output.scope_label || scope, items: [output] })
+    }
+    const scopeOrder = ['planning', 'repo_analysis', 'grounding', 'implementation', 'run_drafts', 'executions', 'results']
+    return scopeOrder
+      .map((scope) => ({ scope, ...(grouped.get(scope) || { label: scope, items: [] as ResearchProjectWorkspaceOutputSummary[] }) }))
+      .filter((entry) => entry.items.length > 0)
+  }, [outputs])
+
+  const loadOutputs = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) setLoading(true)
+    try {
+      const data = await projectApi.listWorkspaceOutputs(projectId, workspaceId)
+      setOutputs(data)
+    } catch (error) {
+      if (!options?.silent) {
+        message.error(String((error as Error)?.message || '加载项目产物失败'))
+      }
+    } finally {
+      if (!options?.silent) setLoading(false)
+    }
+  }, [projectId, workspaceId])
+
+  useEffect(() => {
+    void loadOutputs()
+  }, [loadOutputs])
+
+  const openOutput = async (output: ResearchProjectWorkspaceOutputSummary) => {
+    setModalLoading(true)
+    setModalOpen(true)
+    setSelectedPath(output.relative_path)
+    try {
+      const payload = await projectApi.readWorkspaceOutput(projectId, workspaceId, output.relative_path)
+      setOutputContent(payload.content)
+    } catch (error) {
+      message.error(String((error as Error)?.message || '读取项目产物失败'))
+      setModalOpen(false)
+    } finally {
+      setModalLoading(false)
+    }
+  }
+
+  const handleDelete = async (output: ResearchProjectWorkspaceOutputSummary) => {
+    try {
+      await projectApi.deleteWorkspaceOutput(projectId, workspaceId, output.relative_path)
+      message.success(`已删除 ${output.relative_path}`)
+      await loadOutputs({ silent: true })
+      await onOutputsChanged?.()
+    } catch (error) {
+      message.error(String((error as Error)?.message || '删除项目产物失败'))
+    }
+  }
+
+  const handleCleanup = () => {
+    Modal.confirm({
+      title: '一键清空项目产物',
+      content: '将删除当前 workspace 下除 repo/source 以外的报告、分析结果、spec、draft、执行结果与 compare report，并清空运行记录。是否继续？',
+      okText: '清空',
+      okButtonProps: { danger: true, loading: cleanupLoading },
+      cancelText: '取消',
+      onOk: async () => {
+        setCleanupLoading(true)
+        try {
+          const result = await projectApi.cleanupWorkspaceOutputs(projectId, workspaceId, { preserve_repo: true })
+          message.success(`已清理 ${result.deleted_file_count} 个文件、${result.deleted_dir_count} 个目录、${result.deleted_run_count} 条运行记录`)
+          await loadOutputs({ silent: true })
+          await onOutputsChanged?.()
+        } catch (error) {
+          message.error(String((error as Error)?.message || '清空项目产物失败'))
+        } finally {
+          setCleanupLoading(false)
+        }
+      },
+    })
+  }
+
+  const handleScopeCleanup = (scope: string, label: string) => {
+    Modal.confirm({
+      title: `清空 ${label}`,
+      content: `将删除当前 workspace 下属于 ${label} 的产物。是否继续？`,
+      okText: '清空',
+      okButtonProps: { danger: true, loading: scopeCleanupLoading === scope },
+      cancelText: '取消',
+      onOk: async () => {
+        setScopeCleanupLoading(scope)
+        try {
+          const result = await projectApi.cleanupWorkspaceOutputScope(projectId, workspaceId, {
+            scope: scope as 'planning' | 'repo_analysis' | 'grounding' | 'implementation' | 'run_drafts' | 'executions' | 'results',
+          })
+          message.success(`已清空 ${label}：${result.deleted_file_count} 个文件、${result.deleted_dir_count} 个目录、${result.deleted_run_count} 条运行记录`)
+          await loadOutputs({ silent: true })
+          await onOutputsChanged?.()
+        } catch (error) {
+          message.error(String((error as Error)?.message || `清空 ${label} 失败`))
+        } finally {
+          setScopeCleanupLoading(null)
+        }
+      },
+    })
+  }
+
+  return (
+    <>
+      <Card
+        className="!border-slate-700/60 !bg-slate-950/30"
+        title={<span className="text-slate-100">Project Outputs</span>}
+        extra={(
+          <Space wrap>
+            <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={() => void loadOutputs()}>刷新</Button>
+            <Button size="small" danger icon={<DeleteOutlined />} loading={cleanupLoading} onClick={handleCleanup}>一键清空产物</Button>
+          </Space>
+        )}
+      >
+        {outputScopes.length > 0 ? (
+          <div className="mb-4 flex flex-wrap gap-2">
+            {outputScopes.map((entry) => (
+              <Button
+                key={`scope:${entry.scope}`}
+                size="small"
+                danger
+                icon={<DeleteOutlined />}
+                loading={scopeCleanupLoading === entry.scope}
+                onClick={() => handleScopeCleanup(entry.scope, entry.label)}
+              >
+                清空 {entry.label}
+              </Button>
+            ))}
+          </div>
+        ) : null}
+        {loading ? (
+          <div className="flex min-h-[220px] items-center justify-center"><Spin /></div>
+        ) : outputs.length > 0 ? (
+          <div className="space-y-3">
+            {outputScopes.map((entry) => (
+              <div key={`group:${entry.scope}`} className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Text className="!text-xs !font-medium !uppercase !tracking-[0.16em] !text-slate-500">{entry.label}</Text>
+                  <Tag>{entry.items.length}</Tag>
+                </div>
+                {entry.items.map((output) => (
+                  <div key={output.relative_path} className="rounded-2xl border border-slate-800/80 bg-slate-950/50 p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium text-slate-100">{output.label}</div>
+                        <div className="mt-1 text-xs text-slate-500">{output.relative_path}</div>
+                      </div>
+                      <Space wrap>
+                        <Tag color="blue">{outputCategoryLabel(output.category)}</Tag>
+                        <Tag color={output.storage === 'db_record' ? 'purple' : 'cyan'}>{artifactKindLabel(output.kind)}</Tag>
+                      </Space>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-400">
+                      <div>size: {formatBytes(output.size_bytes)}</div>
+                      <div>updated: {formatDateTime(output.updated_at)}</div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button size="small" icon={<EyeOutlined />} onClick={() => void openOutput(output)}>查看</Button>
+                      <Button size="small" danger icon={<DeleteOutlined />} disabled={!output.deletable} onClick={() => void handleDelete(output)}>删除</Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前 workspace 还没有可管理的项目产物" />
+        )}
+      </Card>
+
+      <Modal
+        title="查看项目产物"
+        open={modalOpen}
+        onCancel={() => setModalOpen(false)}
+        onOk={() => setModalOpen(false)}
+        okText="关闭"
+        cancelButtonProps={{ style: { display: 'none' } }}
+        width={900}
+      >
+        {modalLoading ? (
+          <div className="flex min-h-[280px] items-center justify-center"><Spin /></div>
+        ) : (
+          <div className="space-y-3">
+            <Input
+              value={selectedPath}
+              disabled
+            />
+            <TextArea
+              rows={18}
+              value={outputContent}
+              readOnly
+              spellCheck={false}
+              className="font-mono"
+            />
+          </div>
+        )}
+      </Modal>
+    </>
   )
 }
 
@@ -796,7 +1043,7 @@ export default function ProjectsPage() {
                             ) : null}
                             {workspace.runtime_context.notebook_asset_relative_path && workspace.notebook_id ? (
                               <Button size="small" icon={<CodeOutlined />} onClick={() => navigate(`/code/${workspace.notebook_id}`)}>
-                                查看 Notebook 资产
+                                查看 Notebook
                               </Button>
                             ) : null}
                             {workspace.runtime_context.repo_reference_url ? (
@@ -821,6 +1068,14 @@ export default function ProjectsPage() {
                               cancelingExecutionId={cancelingExecutionId}
                             />
                           </div>
+                          <WorkspaceOutputsCard
+                            projectId={selectedProject.id}
+                            workspaceId={workspace.workspace_id}
+                            onOutputsChanged={async () => {
+                              await loadRuntimeOverview(selectedProject.id, { silent: true })
+                              await loadProjectDetail(selectedProject.id)
+                            }}
+                          />
                         </div>
                       </Card>
                     ))}

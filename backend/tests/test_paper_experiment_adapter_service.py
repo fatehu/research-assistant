@@ -112,6 +112,69 @@ def test_build_repo_index_extracts_repo_history_url_candidates(tmp_path):
     assert "figshare.com" in content
 
 
+def test_build_paper_summary_keeps_all_dataset_names_and_research_fields():
+    paper = SimpleNamespace(
+        id=113,
+        title="Bag of Tricks for Efficient Text Classification",
+        abstract="A simple and efficient text classifier.",
+    )
+    summary = {
+        "paper_llm_input": {"source_mode": "local_pdf_markdown"},
+        "paper_intake": {
+            "paper_profile": {
+                "task_type": "text classification",
+                "domain": "nlp",
+                "problem_statement": "Classify text efficiently.",
+                "research_direction": "efficient text classification",
+                "research_method": "simple bag-of-tricks linear model",
+                "research_content": "classification and tagging experiments",
+                "contribution_summary": "competitive simple baseline",
+                "experiment_goal": "show strong performance with simple methods",
+            },
+            "dataset_candidates": [
+                {"name": "AG News"},
+                {"name": "Sogou"},
+                {"name": "DBPedia"},
+                {"name": "Yelp Review Polarity"},
+                {"name": "Yelp Review Full"},
+                {"name": "Yahoo Answers"},
+                {"name": "Amazon Review Full"},
+                {"name": "Amazon Review Polarity"},
+            ],
+            "models": [{"name": "fastText"}],
+            "metrics": [{"name": "accuracy"}],
+            "optimization_candidates": [{"id": "lr", "name": "learning rate", "rationale": "Tune the learning rate."}],
+            "reference_links": [
+                {
+                    "url": "https://github.com/facebookresearch/fastText",
+                    "category": "official_repo",
+                    "label": "fastText",
+                    "role": "primary_official",
+                    "evidence_text": "code is open-sourced",
+                }
+            ],
+        },
+    }
+    experiment_spec = {
+        "task": {"task_type": "text classification", "domain": "nlp"},
+        "sources": {
+            "repo_urls": ["https://github.com/facebookresearch/fastText"],
+            "dataset_urls": [],
+        },
+    }
+
+    paper_summary = PaperExperimentAdapterService.build_paper_summary(
+        paper=paper,
+        summary=summary,
+        experiment_spec=experiment_spec,
+    )
+
+    assert paper_summary["research_direction"] == "efficient text classification"
+    assert "Amazon Review Polarity" in paper_summary["key_experiments"]["datasets"]
+    assert len(paper_summary["key_experiments"]["datasets"]) == 8
+    assert paper_summary["link_inventory"][0]["category"] == "official_repo"
+
+
 @pytest.mark.asyncio
 async def test_clone_repo_via_git_uses_non_shallow_clone(monkeypatch, tmp_path):
     captured = {}

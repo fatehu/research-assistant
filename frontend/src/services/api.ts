@@ -1734,6 +1734,51 @@ export interface ResearchProjectRuntimeOverview {
   workspaces: ResearchProjectWorkspaceRuntimeOverview[]
 }
 
+export interface ResearchProjectWorkspaceOutputSummary {
+  label: string
+  relative_path: string
+  category: string
+  scope: string
+  scope_label: string
+  kind: string
+  storage: string
+  present: boolean
+  size_bytes: number
+  editable: boolean
+  deletable: boolean
+  updated_at?: string
+}
+
+export interface ResearchProjectWorkspaceOutputContent {
+  label: string
+  relative_path: string
+  category: string
+  scope: string
+  scope_label: string
+  kind: string
+  storage: string
+  editable: boolean
+  updated_at?: string
+  content: string
+  total_chars: number
+  truncated: boolean
+}
+
+export interface ResearchProjectWorkspaceOutputCleanupResult {
+  project_id: number
+  workspace_id: number
+  preserve_repo: boolean
+  scope: string
+  deleted_file_count: number
+  deleted_dir_count: number
+  deleted_run_count: number
+  deleted_paths: string[]
+}
+
+export type ResearchProjectWorkspaceAssetSummary = ResearchProjectWorkspaceOutputSummary
+export type ResearchProjectWorkspaceAssetContent = ResearchProjectWorkspaceOutputContent
+export type ResearchProjectWorkspaceAssetCleanupResult = ResearchProjectWorkspaceOutputCleanupResult
+
 export interface ResearchProject {
   id: number
   user_id: number
@@ -4184,6 +4229,95 @@ export const projectApi = {
     )
     return response.data
   },
+
+  listWorkspaceOutputs: async (
+    projectId: number,
+    workspaceId: number,
+  ): Promise<ResearchProjectWorkspaceOutputSummary[]> => {
+    const response = await api.get(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs`)
+    return response.data
+  },
+
+  readWorkspaceOutput: async (
+    projectId: number,
+    workspaceId: number,
+    relativePath: string,
+    params?: { max_chars?: number },
+  ): Promise<ResearchProjectWorkspaceOutputContent> => {
+    const response = await api.get(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/content`, {
+      params: { relative_path: relativePath, max_chars: params?.max_chars },
+    })
+    return response.data
+  },
+
+  writeWorkspaceOutput: async (
+    projectId: number,
+    workspaceId: number,
+    data: { relative_path: string; content: string },
+  ): Promise<ResearchProjectWorkspaceOutputContent> => {
+    const response = await api.put(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/content`, data)
+    return response.data
+  },
+
+  deleteWorkspaceOutput: async (
+    projectId: number,
+    workspaceId: number,
+    relativePath: string,
+  ): Promise<Record<string, unknown>> => {
+    const response = await api.delete(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs`, {
+      params: { relative_path: relativePath },
+    })
+    return response.data
+  },
+
+  cleanupWorkspaceOutputs: async (
+    projectId: number,
+    workspaceId: number,
+    data?: { preserve_repo?: boolean },
+  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => {
+    const response = await api.post(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/cleanup`, data || {})
+    return response.data
+  },
+
+  cleanupWorkspaceOutputScope: async (
+    projectId: number,
+    workspaceId: number,
+    data: { scope: 'planning' | 'repo_analysis' | 'grounding' | 'implementation' | 'run_drafts' | 'executions' | 'results' },
+  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => {
+    const response = await api.post(`/api/v1/projects/${projectId}/workspaces/${workspaceId}/outputs/cleanup-scope`, data)
+    return response.data
+  },
+
+  // Backward-compatible aliases.
+  listWorkspaceAssets: async (
+    projectId: number,
+    workspaceId: number,
+  ): Promise<ResearchProjectWorkspaceOutputSummary[]> => projectApi.listWorkspaceOutputs(projectId, workspaceId),
+
+  readWorkspaceAsset: async (
+    projectId: number,
+    workspaceId: number,
+    relativePath: string,
+    params?: { max_chars?: number },
+  ): Promise<ResearchProjectWorkspaceOutputContent> => projectApi.readWorkspaceOutput(projectId, workspaceId, relativePath, params),
+
+  writeWorkspaceAsset: async (
+    projectId: number,
+    workspaceId: number,
+    data: { relative_path: string; content: string },
+  ): Promise<ResearchProjectWorkspaceOutputContent> => projectApi.writeWorkspaceOutput(projectId, workspaceId, data),
+
+  deleteWorkspaceAsset: async (
+    projectId: number,
+    workspaceId: number,
+    relativePath: string,
+  ): Promise<Record<string, unknown>> => projectApi.deleteWorkspaceOutput(projectId, workspaceId, relativePath),
+
+  cleanupWorkspaceAssets: async (
+    projectId: number,
+    workspaceId: number,
+    data?: { preserve_repo?: boolean },
+  ): Promise<ResearchProjectWorkspaceOutputCleanupResult> => projectApi.cleanupWorkspaceOutputs(projectId, workspaceId, data),
 
   createProject: async (data: ResearchProjectCreateRequest): Promise<ResearchProject> => {
     const response = await api.post('/api/v1/projects', data)

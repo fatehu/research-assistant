@@ -260,6 +260,7 @@ class _FakeSkillService:
     ("tool_name", "tool_payload"),
     [
         ("paper_research_inspect_runtime", {"project_id": 2}),
+        ("paper_research_assess_repo_mainpath", {"project_id": 2}),
         ("paper_research_probe_repo", {"project_id": 2, "repo_url": "https://github.com/example/repo"}),
         ("paper_research_probe_url", {"project_id": 2, "url": "https://example.com/data.zip"}),
     ],

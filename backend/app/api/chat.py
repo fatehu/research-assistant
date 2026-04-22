@@ -242,6 +242,7 @@ _PAPER_TOOL_STAGE_HINTS = {
     "paper_research_write_grounding_report": "grounding",
     "paper_research_read_repo_file": "grounding",
     "paper_research_search_repo": "grounding",
+    "paper_research_assess_repo_mainpath": "grounding",
     "paper_research_inspect_runtime": "grounding",
     "paper_research_read_implementation_spec": "implementation_prep",
     "paper_research_write_implementation_spec": "implementation_prep",

@@ -10,6 +10,14 @@ Use this reference when writing or revising `specs/grounding_report.json`.
 - `runtime`
 - `external_dependencies`
 
+It should also produce a repo-mainpath run decision:
+
+- `summary.run_decision = ready`
+- `summary.run_decision = runnable_with_patch`
+- `summary.run_decision = blocked`
+
+This run decision is about the currently selected repo main path, not about proving every paper artifact is executable today.
+
 Each section should end in:
 
 - `grounded`
@@ -72,12 +80,19 @@ Key section fields:
   - `dataset_grounded`
   - `runtime_grounded`
   - `external_dependencies_grounded`
+  - `run_decision`
   - `overall_status`
   - `next_actions`
 
 ## URL Evidence Rules
 
 `grounded` means the required evidence is actually closed.
+
+For HTML responses, do not classify by status code alone.
+
+- read probe semantics such as `page_title`, `page_kind`, `page_signals`, `suggested_next_action`, and `page_semantics_rationale`
+- treat HTML download gates, login walls, quota pages, and branded error pages as blocker evidence first
+- only treat a remote file URL as truly grounded when the probe reaches file-like bytes or grounded local presence explicitly covers it
 
 - If `dataset.status="grounded"` and the dataset depends on remote URLs, every required official dataset URL must either:
   - appear in `dataset.sources` and have a successful matching `external_dependencies.probe_results`, or
@@ -138,6 +153,7 @@ Examples:
 During `grounding`:
 
 - prefer `paper_research_probe_repo` and `paper_research_probe_url`
+- once repo evidence is present, use `paper_research_assess_repo_mainpath` to identify the most likely runnable main path
 - when official evidence is blocked, use `web_search` / `web_scrape` only for one focused alternative-source recovery pass
 - use clone/read/search/inspect only to close a specific missing fact
 - do not write `implementation_spec`
