@@ -2,9 +2,9 @@
 
 Use this reference when creating or revising `specs/implementation_spec.json` and `drafts/run_drafts.json`.
 
-This reference starts after stage-2 grounding is complete.
+This reference is for the optional path-synthesis layer that sits beside the repo-first run loop.
 
-Before `implementation_spec.json` is written, `specs/grounding_report.json` should already exist and classify repo, entrypoint, dataset, runtime, and external dependencies as `grounded`, `absent`, or `blocked`.
+Use it when `implementation_spec.json` or `run_drafts.json` would help stabilize the current path, preserve multiple runnable candidates, or sync facts learned from execution. `specs/grounding_report.json` is helpful when it already exists, but it is no longer a mandatory precondition for writing `implementation_spec.json`.
 
 ## Truth Maintenance
 
@@ -30,7 +30,7 @@ Do not leave stale blockers in place after local repo or execution evidence disp
 
 The implementation stage must not assume an abstract machine.
 
-Before finalizing `implementation_spec.json`, first read the grounded runtime section in `grounding_report.json`. If the report is missing or still incomplete, go back to grounding instead of writing implementation.
+Before finalizing `implementation_spec.json`, prefer reading the grounded runtime section in `grounding_report.json` when it already exists. If it does not exist, reuse README, repo, runtime inspection, and execution evidence directly instead of blocking on a missing readiness artifact.
 
 The implementation stage may still read `paper_research_inspect_runtime` results when they already exist, but runtime discovery itself belongs to `grounding`.
 
@@ -142,7 +142,8 @@ Rules:
 - `entrypoint` must be an object, never a string.
 - For repo-backed drafts, `entrypoint` must use `path_or_hint`, not `path`.
 - Use `repo_script`, `notebook`, or `config` only when the path exists in `repo/repo_file_index.json` or was read via `paper_research_read_repo_file`.
-- Use `entrypoint.type="repo_script"` for verified Python repo files. Do not emit legacy `python_script`.
+- Use `entrypoint.type="repo_script"` for verified repo files. Do not emit legacy `python_script`.
+- If that repo file is an executable shell script such as `classification-results.sh`, keep it as a run-draft `repo_script`, but remember that execution usually invokes it via direct argv like `["./classification-results.sh"]` rather than `execution_intent.repo_script`.
 - Use `readme_command`, `dataset_step`, or `manual_step` for README-derived setup/data actions that are not real repo scripts.
 - Never invent a file path to satisfy the schema.
 - Baseline drafts should depend on setup/data drafts when dependencies or data remain blockers.

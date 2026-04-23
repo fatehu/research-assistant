@@ -547,7 +547,7 @@ async def test_cleanup_workspace_outputs_preserves_repo_and_clears_derived_asset
 
 
 @pytest.mark.asyncio
-async def test_cleanup_workspace_outputs_scope_only_removes_requested_scope(tmp_path, monkeypatch):
+async def test_cleanup_workspace_outputs_scope_grounding_also_removes_repo_analysis_artifacts(tmp_path, monkeypatch):
     service = ProjectService(db=_AsyncCommitDB())
     workspace_model = SimpleNamespace(
         id=11,
@@ -585,9 +585,55 @@ async def test_cleanup_workspace_outputs_scope_only_removes_requested_scope(tmp_
 
     assert result is not None
     assert result["scope"] == "grounding"
+    assert result["effective_scopes"] == ["grounding", "repo_analysis"]
     assert "specs/grounding_report.json" in result["deleted_paths"]
+    assert "repo_reference.json" in result["deleted_paths"]
     assert not (tmp_path / "specs" / "grounding_report.json").exists()
+    assert not (tmp_path / "repo_reference.json").exists()
     assert (tmp_path / "paper_summary.json").is_file()
-    assert (tmp_path / "repo_reference.json").is_file()
     assert workspace_model.summary_json["paper_summary"]["research_direction"] == "efficient text classification"
     assert workspace_model.compare_report_json["summary"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_workspace_outputs_scope_repo_analysis_leaves_grounding_report(tmp_path, monkeypatch):
+    service = ProjectService(db=_AsyncCommitDB())
+    workspace_model = SimpleNamespace(
+        id=11,
+        compare_report_json={},
+        summary_json={},
+        experiment_spec_json={},
+        status="ready",
+        updated_at=None,
+    )
+    (tmp_path / "repo_reference.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "specs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "specs" / "grounding_report.json").write_text("{}", encoding="utf-8")
+
+    async def _fake_resolve_workspace_context(**kwargs):
+        return (
+            SimpleNamespace(id=7),
+            {"updated_at": "2026-04-22T00:00:00", "latest_run_at": None},
+            workspace_model,
+            tmp_path,
+        )
+
+    async def _fake_delete_workspace_runs(workspace_id: int) -> int:
+        raise AssertionError("repo_analysis scope cleanup should not delete execution runs")
+
+    monkeypatch.setattr(service, "_resolve_workspace_context", _fake_resolve_workspace_context)
+    monkeypatch.setattr(service, "_delete_workspace_runs", _fake_delete_workspace_runs)
+
+    result = await service.cleanup_workspace_outputs_scope(
+        project_id=7,
+        user_id=1,
+        workspace_id=11,
+        scope="repo_analysis",
+    )
+
+    assert result is not None
+    assert result["scope"] == "repo_analysis"
+    assert result["effective_scopes"] == ["repo_analysis"]
+    assert "repo_reference.json" in result["deleted_paths"]
+    assert not (tmp_path / "repo_reference.json").exists()
+    assert (tmp_path / "specs" / "grounding_report.json").is_file()

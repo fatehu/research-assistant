@@ -247,6 +247,15 @@ class Settings(BaseSettings):
     tool_output_max_tokens: int = 1200
     tool_output_truncate_head_ratio: float = 0.75
     tool_selection_enabled: bool = True
+    zoekt_search_binary: str = "zoekt"
+    zoekt_git_index_binary: str = "zoekt-git-index"
+    zoekt_index_binary: str = "zoekt-index"
+    zoekt_search_timeout_seconds: int = 20
+    zoekt_index_timeout_seconds: int = 180
+    aider_binary: str = "aider"
+    aider_timeout_seconds: int = 900
+    aider_api_timeout_seconds: int = 300
+    aider_map_tokens: int = 1024
 
     # Project runtime worker for paper reproduction execution.
     # Disabled by default so normal chat/backend startup never pulls the heavy
@@ -316,6 +325,7 @@ class Settings(BaseSettings):
     agent_budget_compression_provider: Literal["deepseek", "openai", "aliyun", "ollama"] = "aliyun"
     agent_budget_compression_model: str = "qwen-turbo"
     agent_budget_compression_max_tokens: int = 1200
+    agent_budget_compression_timeout_seconds: float = 8.0
     conversation_context_compaction_enabled: bool = True
     agent_context_transcript_keep_entries: int = 160
     agent_context_tool_ledger_keep_entries: int = 240

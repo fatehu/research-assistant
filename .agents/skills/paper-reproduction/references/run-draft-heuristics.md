@@ -15,6 +15,8 @@ Use the README/repo evidence the way mature ML repositories do:
 - Do not force every concern to have a repo script. README commands and manual dataset steps are valid draft entrypoints.
 - Only use `repo_script`, `notebook`, or `config` when the referenced path exists in `repo/repo_file_index.json` or was read via `paper_research_read_repo_file`.
 - For `repo_script`, write the repo file into `entrypoint.path_or_hint` as a repo-relative path such as `seq2seq.py`, not `repo/source/seq2seq.py`.
+- In run drafts, `repo_script` only means “this repo file is the chosen entrypoint artifact”. It can be a Python file or a real shell script such as `classification-results.sh`.
+- Do not carry that label mechanically into execution: Python repo files map well to `execution_intent.repo_script`, while executable shell scripts should usually be invoked with direct argv such as `["./classification-results.sh"]`.
 - If a README contains a download command but no script exists, use `entrypoint.type="readme_command"` or `entrypoint.type="dataset_step"` and cite `repo/source/README.md`.
 - If dependencies are only described in README and no dependency file exists, create an `env_setup` draft or add an explicit blocker. Do not invent `requirements.txt`.
 - Baseline reproduction should come before tuning. A tuning draft should depend on a baseline draft or state that the baseline is still blocked.

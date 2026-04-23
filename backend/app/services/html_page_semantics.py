@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -11,6 +12,33 @@ from app.services.reader_single_agent_controller import parse_json_dict_from_mod
 
 def _normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _score_follow_candidate(*, href: str, text: str, expected_kind: str) -> float:
+    href_norm = _normalize_text(href).lower()
+    text_norm = _normalize_text(text).lower()
+    if not href_norm:
+        return -1.0
+
+    score = 0.0
+    if href_norm.startswith("#"):
+        score -= 2.0
+    if href_norm.startswith(("mailto:", "javascript:", "tel:")):
+        score -= 4.0
+    if any(token in href_norm or token in text_norm for token in ["download", "dataset", "data", "corpus", "weights"]):
+        score += 3.5
+    if any(token in href_norm or token in text_norm for token in ["docs", "documentation", "readme", "guide", "tutorial"]):
+        score += 1.0
+    if any(token in href_norm or token in text_norm for token in ["sign in", "login", "register", "account"]):
+        score -= 2.5
+    if any(token in href_norm or token in text_norm for token in ["license", "terms", "privacy", "contact"]):
+        score -= 1.0
+    if expected_kind in {"file", "hdf5", "zip", "json", "text"}:
+        if re.search(r"\.(zip|gz|tgz|tar|tar\.gz|json|txt|csv|tsv|h5|hdf5|bin|pth|ckpt)(?:[?#].*)?$", href_norm):
+            score += 5.0
+    if href_norm.startswith(("http://", "https://", "/")):
+        score += 0.5
+    return score
 
 
 def extract_html_page_semantics(
@@ -89,10 +117,11 @@ def extract_html_page_semantics(
         "content_type": str(content_type or ""),
         "title": title,
         "headings": headings,
-        "buttons": [item for item in buttons if item][:8],
-        "links": links[:8],
-        "forms": forms[:4],
-        "text_excerpt": text_excerpt,
+        "buttons": [item for item in buttons if item][:12],
+        "links": links[:12],
+        "forms": forms[:6],
+        "text_excerpt": text_excerpt[:1600],
+        "analysis_text_excerpt": main_text[:4000],
         "signals": list(dict.fromkeys(signals)),
     }
 
@@ -271,4 +300,228 @@ async def analyze_html_page_semantics(
         **semantics,
         **classification,
         "classification_source": classification_source,
+    }
+
+
+def _fallback_probe_resolution(
+    semantics: Dict[str, Any],
+    *,
+    expected_kind: str,
+) -> Dict[str, Any]:
+    normalized_expected = _normalize_text(expected_kind).lower() or "auto"
+    page_kind = _normalize_text(semantics.get("page_kind")).lower()
+    diagnosis = _normalize_text(semantics.get("diagnosis")).lower()
+    suggested_next_action = _normalize_text(semantics.get("suggested_next_action")).lower()
+    rationale = _normalize_text(semantics.get("rationale"))
+    links = [item for item in list(semantics.get("links") or []) if isinstance(item, dict)]
+
+    if page_kind in {"not_found"}:
+        return {
+            "resolution": "dead",
+            "selected_link_index": None,
+            "selected_href": "",
+            "selected_text": "",
+            "diagnosis": diagnosis or "not_found",
+            "suggested_next_action": suggested_next_action or "diagnose_official_source_failure",
+            "reason": rationale or "页面文本明确提示资源不存在。",
+            "confidence": 0.98,
+        }
+    if page_kind in {"download_gate", "login_required", "quota_limited", "access_denied"}:
+        return {
+            "resolution": "blocked",
+            "selected_link_index": None,
+            "selected_href": "",
+            "selected_text": "",
+            "diagnosis": diagnosis or page_kind,
+            "suggested_next_action": suggested_next_action or "diagnose_official_source_failure",
+            "reason": rationale or "页面表现为门页或访问受限页面，需要额外恢复动作。",
+            "confidence": 0.9,
+        }
+
+    best_index = None
+    best_score = 0.0
+    for index, item in enumerate(links):
+        score = _score_follow_candidate(
+            href=str(item.get("href") or ""),
+            text=str(item.get("text") or ""),
+            expected_kind=str(expected_kind or "auto").strip().lower() or "auto",
+        )
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    if best_index is not None and best_score >= 3.0:
+        selected = links[best_index]
+        return {
+            "resolution": "follow_link",
+            "selected_link_index": int(best_index),
+            "selected_href": str(selected.get("href") or ""),
+            "selected_text": str(selected.get("text") or ""),
+            "diagnosis": diagnosis or "follow_candidate_found",
+            "suggested_next_action": "follow_selected_link",
+            "reason": rationale or "页面包含高置信度下载/数据集/资源链接，适合继续探测。",
+            "confidence": 0.72,
+        }
+
+    allow_reference_page = page_kind == "reference_page" and normalized_expected in {"auto", "html", "text"}
+    return {
+        "resolution": "reference_page_ok" if allow_reference_page else "blocked",
+        "selected_link_index": None,
+        "selected_href": "",
+        "selected_text": "",
+        "diagnosis": "reference_page_ok" if allow_reference_page else (diagnosis or "html_page"),
+        "suggested_next_action": "use_as_reference_page" if allow_reference_page else (suggested_next_action or "inspect_before_execute"),
+        "reason": rationale or (
+            "页面更适合作为参考页使用。"
+            if allow_reference_page
+            else "未找到足够明确的后续下载/资源线索。"
+        ),
+        "confidence": 0.6 if allow_reference_page else 0.35,
+    }
+
+
+async def resolve_html_probe_plan_with_llm(
+    html: str,
+    *,
+    url: str,
+    final_url: str,
+    content_type: str,
+    expected_kind: str,
+    source: str,
+    semantics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    page_semantics = dict(semantics or {})
+    if not page_semantics:
+        page_semantics = await analyze_html_page_semantics(
+            html,
+            url=url,
+            final_url=final_url,
+            content_type=content_type,
+            source=source,
+        )
+    fallback = _fallback_probe_resolution(page_semantics, expected_kind=expected_kind)
+    links = [item for item in list(page_semantics.get("links") or []) if isinstance(item, dict)]
+    link_lines = []
+    for index, item in enumerate(links):
+        link_lines.append(
+            {
+                "index": index,
+                "text": _normalize_text(item.get("text")),
+                "href": _normalize_text(item.get("href")),
+                "absolute_url": urljoin(str(final_url or url or ""), _normalize_text(item.get("href"))),
+            }
+        )
+
+    llm = LLMService()
+    system_prompt = (
+        "你是一个论文复现工作流里的外链探活决策器。"
+        "当前页面已经被判定为 HTML，不是直接文件流。"
+        "请根据页面摘要决定最终动作："
+        "reference_page_ok, follow_link, blocked, dead。"
+        "只有在页面明显提供后续下载/数据/仓库入口时才选择 follow_link。"
+        "如果 follow_link，必须从给定 links 中选择 selected_link_index。"
+        "必须输出 JSON 对象，字段包括：resolution, selected_link_index, diagnosis, suggested_next_action, reason, confidence。"
+    )
+    user_prompt = (
+        "请为下面的 HTML 探活页面做决策。\n"
+        f"expected_kind: {expected_kind}\n"
+        f"url: {url}\n"
+        f"final_url: {final_url}\n"
+        f"heuristic_page_kind: {page_semantics.get('page_kind')}\n"
+        f"heuristic_diagnosis: {page_semantics.get('diagnosis')}\n"
+        f"title: {page_semantics.get('title')}\n"
+        f"headings: {page_semantics.get('headings')}\n"
+        f"buttons: {page_semantics.get('buttons')}\n"
+        f"forms: {page_semantics.get('forms')}\n"
+        f"signals: {page_semantics.get('signals')}\n"
+        f"text_excerpt: {page_semantics.get('analysis_text_excerpt') or page_semantics.get('text_excerpt')}\n"
+        f"links: {link_lines}\n"
+        "如果页面本身就是有价值的文档/参考页，可选 reference_page_ok。"
+        "如果页面已经明确死掉，选 dead。"
+        "如果页面需要登录、确认、配额恢复或其它额外动作，选 blocked。"
+    )
+    try:
+        response = await llm.chat(
+            messages=[{"role": "user", "content": user_prompt}],
+            system_prompt=system_prompt,
+            temperature=0.0,
+            max_tokens=400,
+            source=source,
+            extra_body={"reasoning": {"effort": "none"}},
+        )
+    except Exception:
+        return {
+            **fallback,
+            "links": link_lines,
+            "source": "fallback",
+            "page_semantics": page_semantics,
+        }
+
+    parsed = await parse_json_dict_from_model_text(str(response.get("content", "") or ""))
+    if not isinstance(parsed, dict):
+        return {
+            **fallback,
+            "links": link_lines,
+            "source": "fallback",
+            "page_semantics": page_semantics,
+        }
+
+    resolution = _normalize_text(parsed.get("resolution")).lower()
+    try:
+        selected_link_index = int(parsed.get("selected_link_index")) if parsed.get("selected_link_index") is not None else None
+    except (TypeError, ValueError):
+        selected_link_index = None
+    diagnosis = _normalize_text(parsed.get("diagnosis")).lower() or str(fallback.get("diagnosis") or "")
+    suggested_next_action = _normalize_text(parsed.get("suggested_next_action")).lower() or str(
+        fallback.get("suggested_next_action") or ""
+    )
+    reason = _normalize_text(parsed.get("reason")) or str(fallback.get("reason") or "")
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if resolution not in {"reference_page_ok", "follow_link", "blocked", "dead"}:
+        return {
+            **fallback,
+            "links": link_lines,
+            "source": "fallback",
+            "page_semantics": page_semantics,
+        }
+    if resolution == "follow_link":
+        if selected_link_index is None or not (0 <= selected_link_index < len(link_lines)):
+            return {
+                **fallback,
+                "links": link_lines,
+                "source": "fallback",
+                "page_semantics": page_semantics,
+            }
+        selected = link_lines[selected_link_index]
+        return {
+            "resolution": resolution,
+            "selected_link_index": selected_link_index,
+            "selected_href": str(selected.get("href") or ""),
+            "selected_text": str(selected.get("text") or ""),
+            "selected_absolute_url": str(selected.get("absolute_url") or ""),
+            "diagnosis": diagnosis or "follow_candidate_found",
+            "suggested_next_action": suggested_next_action or "follow_selected_link",
+            "reason": reason or "模型判定页面包含明确的后续资源链接。",
+            "confidence": confidence,
+            "links": link_lines,
+            "source": "llm",
+            "page_semantics": page_semantics,
+        }
+    return {
+        "resolution": resolution,
+        "selected_link_index": None,
+        "selected_href": "",
+        "selected_text": "",
+        "selected_absolute_url": "",
+        "diagnosis": diagnosis or str(fallback.get("diagnosis") or ""),
+        "suggested_next_action": suggested_next_action or str(fallback.get("suggested_next_action") or ""),
+        "reason": reason or str(fallback.get("reason") or ""),
+        "confidence": confidence,
+        "links": link_lines,
+        "source": "llm",
+        "page_semantics": page_semantics,
     }

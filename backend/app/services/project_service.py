@@ -48,6 +48,7 @@ _WORKSPACE_ROOT_LABELS = {
     "repo_file_index.json": "Repo index",
     "repo_history_url_candidates.json": "Repo history candidates",
     "repo_readme_excerpt.md": "Repo README excerpt",
+    "repo_readme_reproduction_intake.json": "Repo README reproduction intake",
 }
 
 
@@ -498,13 +499,19 @@ class ProjectService:
             user_id=user_id,
             workspace_id=workspace_id,
         )
+        # Grounding stage in the stage ledger surfaces repo-analysis artifacts
+        # alongside the formal grounding report, so clearing grounding should
+        # also reset those repo-derived evidence files.
+        target_scopes = {normalized_scope}
+        if normalized_scope == "grounding":
+            target_scopes.add("repo_analysis")
         deleted_paths: List[str] = []
         deleted_file_count = 0
         deleted_dir_count = 0
         deleted_run_count = 0
         for item in list(outputs or []):
             relative_path = str(item.get("relative_path") or "").strip()
-            if not relative_path or str(item.get("scope") or "") != normalized_scope:
+            if not relative_path or str(item.get("scope") or "") not in target_scopes:
                 continue
             target = workspace_dir / relative_path if relative_path != "workspace.compare_report_json" else None
             is_dir = bool(target and target.exists() and target.is_dir())
@@ -535,6 +542,7 @@ class ProjectService:
             "workspace_id": int(workspace_id),
             "preserve_repo": True,
             "scope": normalized_scope,
+            "effective_scopes": sorted(target_scopes),
             "deleted_file_count": deleted_file_count,
             "deleted_dir_count": deleted_dir_count,
             "deleted_run_count": deleted_run_count,
@@ -1157,6 +1165,7 @@ class ProjectService:
                 ("Repo reference", "repo_reference.json", "json"),
                 ("Repo index", "repo_file_index.json", "json"),
                 ("Repo history candidates", "repo_history_url_candidates.json", "json"),
+                ("Repo README reproduction intake", "repo_readme_reproduction_intake.json", "json"),
             ],
         )
         grounding_state = self._grounding_completion_state(grounding_report) if grounding_report else {
@@ -1572,7 +1581,13 @@ class ProjectService:
             return "drafts"
         if normalized.startswith("executions/"):
             return "executions"
-        if normalized in {"repo_reference.json", "repo_file_index.json", "repo_history_url_candidates.json", "repo_readme_excerpt.md"}:
+        if normalized in {
+            "repo_reference.json",
+            "repo_file_index.json",
+            "repo_history_url_candidates.json",
+            "repo_readme_excerpt.md",
+            "repo_readme_reproduction_intake.json",
+        }:
             return "repo_metadata"
         return "planning"
 
@@ -1589,7 +1604,13 @@ class ProjectService:
             return "run_drafts"
         if normalized.startswith("executions/"):
             return "executions"
-        if normalized in {"repo_reference.json", "repo_file_index.json", "repo_history_url_candidates.json", "repo_readme_excerpt.md"}:
+        if normalized in {
+            "repo_reference.json",
+            "repo_file_index.json",
+            "repo_history_url_candidates.json",
+            "repo_readme_excerpt.md",
+            "repo_readme_reproduction_intake.json",
+        }:
             return "repo_analysis"
         return "planning"
 

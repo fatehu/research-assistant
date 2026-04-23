@@ -71,7 +71,21 @@ Runtime caches are mounted under `/app/runtime_cache`:
 
 Use the helper to render a valid skeleton, then pass the JSON to `paper_research_write_execution_spec`.
 
-Plain Python example:
+Preferred structured example for a Python repo entrypoint:
+
+```bash
+python .agents/skills/paper-reproduction/scripts/render_execution_spec.py \
+  --execution-id baseline-repro \
+  --draft-id baseline_repro \
+  --runtime-type plain-python \
+  --entrypoint-type repo_script \
+  --entrypoint-path train.py \
+  --args-json '[]' \
+  --artifact-glob 'executions/baseline-repro/**/*' \
+  --evidence-file drafts/run_drafts.json
+```
+
+Executable shell repo entrypoints should use direct argv, not `execution_intent.repo_script`:
 
 ```bash
 python .agents/skills/paper-reproduction/scripts/render_execution_spec.py \
@@ -79,7 +93,7 @@ python .agents/skills/paper-reproduction/scripts/render_execution_spec.py \
   --draft-id baseline_repro \
   --runtime-type plain-python \
   --cwd repo/source \
-  --command-json '["python","train.py"]' \
+  --command-json '["./classification-results.sh"]' \
   --artifact-glob 'executions/baseline-repro/**/*' \
   --evidence-file drafts/run_drafts.json
 ```
@@ -104,8 +118,8 @@ python .agents/skills/paper-reproduction/scripts/render_execution_spec.py \
   --execution-id notebook-baseline \
   --draft-id baseline_repro \
   --runtime-type papermill \
-  --cwd repo/source \
-  --input-notebook repo/source/demo.ipynb \
+  --entrypoint-type notebook \
+  --entrypoint-path repo/source/demo.ipynb \
   --parameters-json '{"epochs": 1}' \
   --artifact-glob 'executions/notebook-baseline/**/*' \
   --evidence-file drafts/run_drafts.json
@@ -120,14 +134,15 @@ python .agents/skills/paper-reproduction/scripts/render_execution_spec.py \
 5. Call `paper_research_inspect_runtime` and read `runtime_worker.environment`.
 6. If all matching runtime candidates are blocked, report the blocker and stop.
 7. Write one `execution_spec` with workspace-relative paths.
-8. Use argv-array commands. Example: `["python","train.py"]`; never use `"python train.py"` as a single string.
-9. If you include `preflight_checks`, encode them as a JSON array of check objects, for example `[{"name":"check_python","required":true,"status":"passed"}]`; never send a JSON object map like `{"check_python": true}`.
-10. Preserve the README or official repo command whenever possible. Do not rewrite official download URLs into ad-hoc mirrors.
-11. `start_execution` performs internal preflight for official external dependencies. It also heuristically checks URLs embedded in download commands such as `curl` / `wget`.
-12. Only after that should execution start.
-13. Read execution result/log with `paper_research_read_execution` before interpreting success or failure.
-14. If still running, return `execution_id` and status instead of pretending completion.
-15. If failed, use log evidence and propose the smallest next correction.
+8. Prefer `execution_intent` for Python repo files and notebooks. Use argv-array commands when the real entrypoint is an executable repo file such as `classification-results.sh`.
+9. `execution_intent.entrypoint_type="repo_script"` currently means a Python repo file. For executable shell entrypoints, use direct argv such as `["./classification-results.sh"]`.
+10. If you include `preflight_checks`, encode them as a JSON array of check objects, for example `[{"name":"check_python","required":true,"status":"passed"}]`; never send a JSON object map like `{"check_python": true}`.
+11. Preserve the README or official repo command whenever possible. Do not rewrite official download URLs into ad-hoc mirrors.
+12. `start_execution` performs internal preflight for official external dependencies. It also heuristically checks URLs embedded in download commands such as `curl` / `wget`.
+13. Only after that should execution start.
+14. Read execution result/log with `paper_research_read_execution` before interpreting success or failure.
+15. If still running, return `execution_id` and status instead of pretending completion.
+16. If failed, use log evidence and propose the smallest next correction.
 
 ## Failure Interpretation
 

@@ -1,23 +1,27 @@
 ---
 name: paper-reproduction
-description: Turn archived machine-learning or deep-learning papers into a gated workflow that first extracts structured facts and a reusable paper summary, then grounds repo/data/runtime evidence, defines a concrete reproduction path, surfaces blockers, and executes only when qualification and preflight conditions pass. Use when the user asks to understand or explain a saved paper, gather supporting material, prepare or validate a reproduction plan, qualify run drafts, run or debug grounded experiments, tune parameters/models, compare results, design verification steps, or continue a saved paper Project.
+description: Turn archived machine-learning or deep-learning papers into a repo-first workflow that extracts structured paper facts, captures a reusable README/repo clue pack, then helps the agent run, debug, patch, and tune the repository while treating readiness artifacts as optional support files instead of mandatory gates. Use when the user asks to understand or explain a saved paper, gather supporting material, prepare or validate a reproduction plan, qualify run drafts, run or debug experiments, tune parameters/models, compare results, design verification steps, or continue a saved paper Project.
 ---
 
 # Paper Reproduction
 
 Use this skill as the control-plane workflow for a saved paper Project.
 
-The goal is not to push execution at any cost. First read the saved Project state, produce reusable paper understanding artifacts, and investigate whether the repo/resources look reproducible enough to continue. Stage 2 should leave behind a reproduction-readiness checklist, not a rushed execution plan. Only after the repo, data, runtime, and external resources have been investigated clearly should the workflow define an implementation path, qualify runnable drafts, and enter execution. When the required conditions are not satisfied, stop clearly, report the blocker, and leave behind artifacts that still support explanation, source gathering, feasibility judgment, and validation design.
+The goal is to help the agent run the repo, not to surround execution with mandatory paperwork. First read the saved Project state and produce reusable paper/README understanding artifacts. After stage 1, default to a repo-first run loop: inspect the README and entrypoint, check the minimum environment, try to run, then use optional support artifacts only when they help with readiness judgment, multi-path planning, blocker reporting, or later tuning. When the required conditions are not satisfied, stop clearly, report the blocker, and leave behind artifacts that still support explanation, source gathering, feasibility judgment, and validation design.
 
-Think in seven workflow stages even if the user does not name them:
+Think in one hard stage and one default operating mode:
 
 1. `intake_summary`
-2. `grounding`
-3. `implementation_plan`
-4. `run_qualification`
-5. `execution_preflight`
-6. `execution_run`
-7. `analysis_tuning_report`
+2. `repo_first_run_loop`
+
+Optional support facilities that may be used after stage 1:
+
+- `grounding_report`
+- `implementation_spec`
+- `run_drafts`
+- `tuning_analysis`
+
+The older multi-stage design is preserved only as a reference in `references/legacy-stage-facilities.md`. It is no longer the default control flow of this skill.
 
 Current backend/runtime stage ids are not fully renamed yet.
 
@@ -32,6 +36,12 @@ During `intake_summary`, preserve three planning artifacts together:
 - `planning/paper_summary.json`
 - `planning/experiment_spec.json`
 
+If the repo is already materialized, stage 1 may also leave behind:
+
+- `repo/repo_readme_reproduction_intake.json`
+
+Treat that README intake artifact as a stage-1 clue pack for later repo exploration. It is not final execution truth, but it should usually be read before rereading the raw README.
+
 In `intake_summary`, the paper is a background and clue source, not the final execution truth.
 
 - Stage 1 only does paper guidance, not experiment execution planning.
@@ -45,15 +55,16 @@ In `intake_summary`, the paper is a background and clue source, not the final ex
 - Do not let stage 1 decide the final repo main path or executable run scope.
 - Do not treat `planning/experiment_spec.json` as grounded truth; it is a paper-derived hypothesis artifact with `grounding_status=paper_only`.
 
-## Truth Files
+## Support Files
 
-Treat these archived files as the workflow truth:
+Treat these archived files as optional support truth when they exist:
 
 - `specs/grounding_report.json`
 - `specs/implementation_spec.json`
 - `drafts/run_drafts.json`
 
 Execution artifacts are run attempts, not the main truth.
+These support files are useful for preserving blockers, settled paths, and alternatives, but they are not required before the first repo-backed run.
 
 When repo inspection or execution results reveal new grounded facts, revise the truth files first, then continue from the revised truth:
 
@@ -82,17 +93,21 @@ Outside that exception, call `paper_research_status` first when `paper_id` or `p
 Then decide the next action from state:
 
 1. If no workspace or structured intake exists, run intake with `paper_research_prepare`.
-2. If any planning artifact is missing or stale, refresh planning with `paper_research_prepare` before moving to later stages.
-3. If `specs/grounding_report.json` is missing or stale, stay in `grounding`: read README first, inspect repo structure, merge paper links with repo-discovered links, probe only what the selected reproduction path depends on, and write a reproduction-readiness report before any implementation work.
-4. If `grounding_report.json` says the current repo/resources are blocked or high-risk for continuation, stop clearly and report those blockers instead of moving on to implementation or execution.
-5. If `specs/implementation_spec.json` is missing or stale, create or revise it from planning plus `grounding_report`.
-6. If `drafts/run_drafts.json` is missing or stale, create grounded run drafts from `implementation_spec`.
-7. If the user asks to reproduce/run and baseline is not complete, prepare the missing prerequisite step or baseline execution, then continue toward the requested run.
-8. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
-9. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
-10. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
-11. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
-12. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
+2. If any planning artifact is missing or stale, refresh planning with `paper_research_prepare`.
+3. After stage 1, default to repo-first execution:
+   - read `repo/repo_readme_reproduction_intake.json` first when it exists
+   - reread the raw README only if that intake is missing, stale, contradictory, or too weak
+   - inspect the likely entrypoint plus the minimum dependency/runtime evidence
+   - write the smallest viable `execution_spec`
+   - start execution
+4. Use `grounding_report.json` only when the repo/resources are unclear, disputed, or risky enough that a readiness checklist will help.
+5. Use `implementation_spec.json` only when it helps stabilize the selected path, capture facts learned from execution, or explain blockers.
+6. Use `run_drafts.json` only when there are multiple plausible runnable paths, variants, or selection decisions worth preserving.
+7. If a prerequisite execution such as `env_setup` or `data_prep` is needed, start it, read its result in the same overall task, and continue when it completes.
+8. If a true experiment execution (`baseline_repro`, `tuning`, `compare`) is running or pending, report `execution_id` and stop the turn.
+9. If baseline completed and the user asks to optimize/tune/compare, first analyze current baseline plus repo evidence, then produce grounded tuning options for the user to choose from.
+10. Only start a `first_tuning` execution after the user explicitly confirms which option to run.
+11. If all requested work is complete, summarize evidence, metrics, blockers, and the smallest next action.
 
 Do not stop after intake when the user asked for full reproduction. Continue until a long execution starts, a required user confirmation is needed, or a real blocker is reached.
 
@@ -106,11 +121,12 @@ Do not stop after intake when the user asked for full reproduction. Continue unt
 - Do not use `knowledge_search`, `literature_search`, or `mcp.*` tools for this workflow.
 - Treat Project workspace artifacts as the source of truth; keep web evidence separate from paper/PDF evidence.
 - Execution uses `runtime-worker`, not the chat backend process.
-- During `grounding`, do not write `implementation_spec`, `run_drafts`, `execution_spec`, `execution` scripts, or start execution until `grounding_report` is complete.
+- `grounding_report`, `implementation_spec`, and `run_drafts` are support artifacts, not mandatory gates. If the repo-backed path is already clear after stage 1, you may proceed directly to `execution_spec` and execution.
 - During `grounding`, missing evidence must stay `absent`/`blocked`; do not translate “not found” into an invented path, entrypoint, or workaround script.
 - Long-running ML/DL jobs are background tasks. Once a real training/comparison job starts, report the execution and stop instead of waiting.
 - Short prerequisite jobs such as `env_setup` or `data_prep` should be treated as workflow continuation steps, not as the final answer.
 - Do not let `execution_spec` become the only source of truth. If an execution reveals new facts, sync them back into `implementation_spec` or `run_drafts`.
+- If repo/source or truth-file edits are required, prefer `paper_research_run_aider` over ad-hoc whole-file regeneration. Use `target_root=workspace` for local JSON/Markdown artifact surgery and `target_root=repo` for code patches.
 
 ## Tool Use
 
@@ -125,11 +141,16 @@ Allowed paper workflow tools:
 - `paper_research_read_artifact`
 - `paper_research_search_outputs`
 - `paper_research_read_repo_file`
+- `paper_research_build_zoekt_index`
+- `paper_research_search_repo_zoekt`
 - `paper_research_search_repo`
 - `paper_research_git_status`
 - `paper_research_git_diff`
 - `paper_research_git_log`
 - `paper_research_git_show`
+- `paper_research_run_aider`
+- `paper_research_read_aider_run`
+- `paper_research_tail_aider_log`
 - `paper_research_assess_repo_mainpath`
 - `paper_research_list_outputs`
 - `paper_research_delete_output`
@@ -153,92 +174,38 @@ Allowed paper workflow tools:
 
 Use web tools only for focused diagnosis or official-source recovery after local repo/runtime evidence is insufficient.
 
-## Stage Guidance
+Use `paper_research_run_aider` when you need precise local edits instead of whole-file rewrites:
 
-Read only the reference needed for the current state:
+- For `repo/source` edits, use `target_root=repo`.
+- For archived JSON/Markdown truth files such as `specs/implementation_spec.json` or `drafts/run_drafts.json`, use `target_root=workspace`.
+- Keep `editable_files` as small as possible.
+- Put supporting files in `read_only_files` instead of making everything editable.
+- Prefer `mode=architect` when the change spans multiple files, JSON schema-sensitive files, or models that often fail edit-format application.
+- Use `dry_run=true` first if you only want to preview or validate the plan.
+- If the run modifies files, immediately read back the changed file or the archived aider run before claiming success.
+
+## References
+
+Read only the reference needed for the current step:
 
 - PDF/intake facts and JSON constraints: `references/intake-contract.md`
-- Grounding/readiness checklist contract and URL evidence shape: `references/grounding-contract.md`
-- Implementation spec and run drafts: `references/implementation-planning.md`
 - Runtime execution, source recovery, long tasks, and tuning/compare: `references/execution-and-tuning.md`
-- Backend artifact fields and UI-facing explanations: `references/output-fields.md`
-- PDF/markdown fallback behavior: `references/pipeline.md`
 - Runtime environment and execution examples: `references/runtime-environment.md`
 - Run-draft repo heuristics: `references/run-draft-heuristics.md`
+- Backend artifact fields and UI-facing explanations: `references/output-fields.md`
+- PDF/markdown fallback behavior: `references/pipeline.md`
 
-`grounding` is the stage-2 reproduction-readiness investigation between `planning` and `implementation_prep`.
+Read these only when you explicitly decide to create or revise those support artifacts:
 
-Its job is to write `specs/grounding_report.json` as a reproduction preparation checklist, not to produce execution specs.
+- `references/grounding-contract.md`
+- `references/implementation-planning.md`
+- `references/legacy-stage-facilities.md`
 
-Stage 2 should answer four things in order:
+Before writing structured artifacts, read the relevant schema/contract:
 
-1. Which repo / project page / dataset / external resources does the paper or README point to.
-2. Whether the repo looks structurally reproducible enough to continue.
-3. Which code/data/runtime/external items are reachable, usable, and paper-aligned.
-4. Whether the current evidence says it is worth entering implementation.
-
-The fixed stage-2 order is:
-
-1. Read README.
-2. Inspect repo structure.
-3. Merge stage-1 links with new links discovered in README/repo.
-4. Probe the merged checklist lightly.
-5. Write the reproduction-readiness checklist.
-6. Only then decide whether to continue deeper into implementation.
-
-Grounding must still classify the canonical sections:
-
-- repo
-- entrypoint
-- dataset
-- runtime
-- external dependencies
-
-But treat them as investigation buckets, not as a fill-the-checklist race.
-
-For each checklist item or source, explicitly distinguish:
-
-- `reachable`
-- `usable`
-- `paper_aligned`
-- `reason`
-
-Each major section should end in one of:
-
-- `grounded`
-- `absent`
-- `blocked`
-- only use `unknown` when the evidence truly has not been collected yet
-
-During `grounding`:
-
-- read README before deep repo reading, and inspect repo structure before broad grep
-- prefer `paper_research_probe_repo` / `paper_research_probe_url` before deeper clone/read/search
-- when a probe returns HTML, treat it as a diagnosis step first, not as success or failure by status code alone; use page title, page kind, page signals, suggested next action, and rationale to decide the blocker
-- for download pages such as Google Drive gates, first write the concrete blocker (`download_gate`, `login_required`, `quota_limited`, `access_denied`, `not_found`) before deciding whether to recover, patch, or stop
-- once repo evidence exists, use `paper_research_assess_repo_mainpath` so stage 2 converges on a concrete main-path judgment instead of only broad grep evidence
-- when debugging old repos or verifying minimal fixes, prefer `paper_research_git_status` / `paper_research_git_diff` / `paper_research_git_log` / `paper_research_git_show` before inventing a workaround script
-- use `paper_research_clone_repo`, `paper_research_read_repo_file`, `paper_research_search_repo`, and `paper_research_inspect_runtime` only to close a specific missing fact after README/structure review
-- maintain one reproduction-readiness checklist that merges:
-  - stage-1 paper links
-  - README links
-  - repo-discovered links
-- write `specs/grounding_report.json` as the stage-2 truth artifact
-- if you claim a list of datasets or external downloads is `grounded`, every required official link in that list must be individually probed or be explicitly covered by grounded local presence; one successful sample link cannot stand in for sibling links
-- if an official repo/data/dependency source is `blocked`, first write the blocker clearly, then do one focused recovery pass for alternative sources using `web_search` / `web_scrape`; record trustworthy candidates in `alternative_source_candidates`, but do not erase the official-source blocker
-- blocked sections should explain *why* they are blocked in `blockers` and, when possible, `blocker_details` with concrete URL / diagnosis / status-code context
-- page reachable does not mean resource usable; resource usable does not mean paper aligned
-- if an official link fails, only do one light replacement check; if no clearly trustworthy replacement exists, keep it as a high-risk signal instead of widening search forever
-- if the repo is badly structured, README is too weak, or key data/resources are blocked with no trustworthy fallback, mark that clearly and stop before deep code reading
-- do not start execution
-- do not generate execution scripts as a workaround
-- do not skip straight to `implementation_spec`
-
-Before writing structured artifacts, read the relevant schema:
-
-- `specs/grounding_report.json` uses the stage-2 grounding contract enforced by `paper_research_write_grounding_report`
-- `templates/implementation_spec.schema.json`
-- `templates/run_drafts.schema.json`
+- `specs/grounding_report.json` -> `references/grounding-contract.md`
+- `specs/implementation_spec.json` -> `templates/implementation_spec.schema.json`
+- `drafts/run_drafts.json` -> `templates/run_drafts.schema.json`
 
 When writing `run_drafts`, follow the current schema exactly. Each draft must use:
 
@@ -270,24 +237,20 @@ Use helper scripts when deterministic output is safer:
 
 ## Execution Rules
 
-- Environment constraints must enter the workflow before execution.
-  - During `grounding`, call `paper_research_inspect_runtime` and treat `runtime_candidates` plus `runtime_worker.environment` as grounding inputs, not only execution diagnostics.
-  - `grounding_report.json` should already classify whether runtime is `grounded`, `absent`, or `blocked`, and should record explicit blocker text when the worker cannot support the paper's likely path.
-  - The generated `implementation_spec.json` should reflect the current runtime snapshot, available commands, and any grounded missing packages that constrain later execution.
-  - Do not postpone all environment reasoning until `execution`; the plan should already know whether the current machine supports `devcontainer`, `docker compose`, `repo2docker`, `papermill`, or only `plain-python`.
-- Always inspect runtime during `grounding` before writing `implementation_spec` or any execution artifact.
-- Always read `grounding_report.json` before writing `implementation_spec` or any execution artifact.
-- If `grounding_report.json` is missing or not complete, stop and update/report grounding instead of continuing into implementation or execution.
-- Before writing a new execution spec, read the latest relevant truth file first:
+- Environment constraints must enter the workflow before execution, but they do not require a separate stage artifact.
+  - Use the smallest reliable evidence set first: README intake, raw README if needed, entrypoint script, minimal dependency files, and `paper_research_inspect_runtime`.
+  - If `grounding_report.json` or `implementation_spec.json` already exists, reuse it; if it does not exist, do not block the first repo-backed run just to create it.
+  - `implementation_spec.json` and `run_drafts.json` are optional path-stabilization files. They should capture what execution already taught you, not delay the first executable attempt.
+- Before writing a new execution spec, read the latest relevant support artifact when it exists:
   - `grounding_report.json` for repo/data/runtime/external-dependency status
   - `implementation_spec.json` for baseline assumptions and blockers
-  - `run_drafts.json` for the current execution-ready draft
+  - `run_drafts.json` for a preserved execution-ready draft
 - If the latest execution result contradicts the truth files, revise the truth files first and only then create the next execution.
 - For repo-backed execution, infer dependencies from repo evidence first:
-  - read `README.md` and any dependency files such as `requirements.txt`, `pyproject.toml`, `environment.yml`, `setup.py`
+  - read `repo/repo_readme_reproduction_intake.json` first when it exists, then read `README.md` and any dependency files such as `requirements.txt`, `pyproject.toml`, `environment.yml`, `setup.py` only as needed to verify or extend that intake
   - read the selected entrypoint script and only the local modules needed to understand its imports
 - When locating a code block, do not keep increasing `max_chars` on the same file.
-  - First use `paper_research_search_repo` to get the hit line number.
+  - First use `paper_research_search_repo_zoekt` when available, otherwise `paper_research_search_repo`, to get the hit line number.
   - Then use `paper_research_read_repo_file` with `line_start` and `line_end` to read only the needed range.
   - If search already returns `context_lines`, use that local snippet first before widening the read.
 - use the model to form the concrete dependency set for the selected draft from those files
@@ -296,8 +259,10 @@ Use helper scripts when deterministic output is safer:
 - Prefer `execution_spec.execution_intent` over free-form `command`/`cwd`.
   - Use typed fields such as `runtime_type`, `entrypoint_type`, `entrypoint_path`, `cwd_mode`, and `args`.
   - Let the backend render the final argv/cwd deterministically.
+  - `execution_intent.entrypoint_type="repo_script"` is for Python repo files such as `train.py`.
+  - If the real repo entrypoint is an executable shell script such as `classification-results.sh`, use direct argv like `["./classification-results.sh"]` instead of `execution_intent.repo_script`.
 - Do not mix `execution_intent` with raw `command`, `cwd`, or `input_notebook`.
-- `execution_spec.command` must be a JSON string array, never a shell string.
+- `execution_spec.command` must be a JSON string array, never a shell string. Valid examples: `["python","train.py"]`, `["./classification-results.sh"]`.
 - Do not use shell wrappers such as `bash -lc`, `sh -c`, or PowerShell wrappers.
 - `execution_spec.preflight_checks` must be a JSON object array, never a key/value map. Use forms like `[{"name":"check_python","required":true,"status":"passed"}]`, not `{"check_python": true}`.
 - Preserve official repo/data URLs in `command` or `external_dependencies`; runtime preflight will verify them.

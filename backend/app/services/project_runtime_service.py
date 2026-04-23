@@ -960,8 +960,21 @@ class ProjectRuntimeService:
             repo_relative_path = _normalize_relative_path(entrypoint_path)
             if repo_relative_path.startswith("repo/source/"):
                 repo_relative_path = repo_relative_path.removeprefix("repo/source/")
+            repo_target = self.resolve_workspace_path(
+                workspace_dir,
+                f"{detected_repo_root}/{repo_relative_path}",
+            )
+            command_target = repo_relative_path
+            suffix = str(Path(repo_relative_path).suffix or "").lower()
+            if suffix != ".py" and "/" not in command_target and not command_target.startswith("."):
+                command_target = f"./{command_target}"
             normalized["cwd"] = detected_repo_root
-            normalized["command"] = ["python", repo_relative_path, *args]
+            if suffix == ".py":
+                normalized["command"] = ["python", repo_relative_path, *args]
+            elif repo_target is not None and os.access(repo_target, os.X_OK):
+                normalized["command"] = [command_target, *args]
+            else:
+                normalized["command"] = [command_target, *args]
             return normalized
 
         if entrypoint_type == "generated_python":

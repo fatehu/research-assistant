@@ -2,9 +2,9 @@
 
 Use this reference when writing or revising `specs/grounding_report.json`.
 
-`grounding_report.json` is the stage-2 truth artifact. Treat it as a reproduction-readiness checklist, not as a race to fill every grounding field as quickly as possible.
+`grounding_report.json` is the optional readiness truth artifact. Treat it as a reproduction-readiness checklist when the repo/data/runtime picture is still ambiguous, blocked, or worth preserving explicitly. It is not a mandatory gate in front of the first repo-backed execution.
 
-Its job is to investigate whether the current repo/resources are sufficiently clear and alive to justify moving into implementation.
+Its job is to investigate whether the current repo/resources are sufficiently clear and alive to justify continuing, patching, or reporting blockers.
 
 The stage-2 investigation still needs to cover these canonical buckets:
 
@@ -24,7 +24,7 @@ This run decision is about the currently selected repo main path, not about prov
 
 ## Investigation Order
 
-Stage 2 should follow this order:
+When you choose to do grounding, follow this order:
 
 1. Read README.
 2. Inspect repo structure.
@@ -152,6 +152,10 @@ For HTML responses, do not classify by status code alone.
 - If `external_dependencies.status="grounded"`, every URL in `external_dependencies.urls` must have a successful probe result.
 - Do not use one successful sample link to claim a whole sibling list is grounded.
 - If one required official URL fails probe, keep the affected area `blocked` and write the blocker explicitly.
+- `gdrive_confirm_required`, `download_gate`, or a Google Drive virus-scan warning page are not the same as `not_found`.
+  - If the gate is recoverable, or the repo's own script already handles confirm/cookies automatically, keep the official link alive/recoverable.
+  - Do not mark the whole `dataset` / `external_dependencies` section `blocked` just because the download needs one extra confirm step.
+  - Reserve `blocked` for terminal failures such as `not_found`, `access_denied`, `quota_limited`, `http_403`, `http_404`, or similar non-recoverable states.
 - When an official URL is `blocked`, do one focused recovery pass for alternative sources. Record any trustworthy fallback candidates in:
   - `dataset.alternative_source_candidates`
   - `external_dependencies.alternative_source_candidates`
@@ -173,6 +177,7 @@ Keep the URL evidence shape flat:
     - `url`
     - `ok`
   - optional fields such as `status_code`, `content_type`, `detected_kind`, `diagnosis`
+  - if a result is a recoverable Google Drive gate, keep `ok=true` and explain recoverability in `diagnosis` / `page_kind` instead of dropping the item or flipping the whole section to `blocked`
 
 Avoid nesting probe results inside individual `urls` items. The canonical report keeps:
 
@@ -214,9 +219,9 @@ During `grounding`:
   - repo-discovered links
 - when official evidence is blocked, use `web_search` / `web_scrape` only for one focused alternative-source recovery pass
 - use clone/read/search/inspect only to close a specific missing fact
-- do not write `implementation_spec`
-- do not write execution scripts
-- do not write `execution_spec`
-- do not start execution
+- do not write `implementation_spec` only when the runnable path is still too ambiguous and you are still in fact-finding mode
+- do not write execution scripts as a workaround for missing facts
+- if the runnable path is already clear from README/repo/runtime evidence, you may skip straight to `execution_spec` / execution instead of forcing more readiness paperwork
+- do not start execution only when the current repo/data/runtime picture is still too ambiguous to identify a runnable path
 
 If evidence stays incomplete, write the blockers and stop in `grounding`.

@@ -30,6 +30,7 @@ import {
 import {
   chatApi,
   projectApi,
+  type ResearchProjectArtifactSummary,
   type ResearchProject,
   type ResearchProjectExecutionSummary,
   type ResearchProjectResultSummary,
@@ -56,6 +57,8 @@ type ProjectFormValues = {
   title?: string
   goal?: string
 }
+
+type WorkspaceOutputScope = 'planning' | 'repo_analysis' | 'grounding' | 'implementation' | 'run_drafts' | 'executions' | 'results'
 
 const statusColorMap: Record<string, string> = {
   draft: 'default',
@@ -92,6 +95,16 @@ const stageActionLabelMap: Record<PaperWorkflowStage, string> = {
   run_drafts: '生成运行草案',
   execution: '继续执行',
   tuning: '调参与对比',
+}
+
+const outputScopeLabelMap: Record<WorkspaceOutputScope, string> = {
+  planning: 'Planning / Intake',
+  repo_analysis: 'Repo Analysis',
+  grounding: 'Grounding',
+  implementation: 'Implementation',
+  run_drafts: 'Run Drafts',
+  executions: 'Executions',
+  results: 'Results',
 }
 
 const formatDateTime = (value?: string) => {
@@ -158,54 +171,243 @@ const buildStageLaunch = (stage: PaperWorkflowStage, args: { paperId: number; pr
   return buildPaperExecutionLaunch(args)
 }
 
-function StageLedgerCard({ stages }: { stages: ResearchProjectStageSummary[] }) {
-  return (
-    <Card className="!border-slate-700/60 !bg-slate-950/30" title={<span className="text-slate-100">Stage Ledger</span>}>
-      <div className="space-y-3">
-        {stages.map((stage) => (
-          <div key={stage.stage} className="rounded-2xl border border-slate-800/80 bg-slate-950/50 p-4">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="text-sm font-medium text-slate-100">{stage.label}</div>
-                <div className="mt-1 text-xs text-slate-500">{stage.updated_at ? `Updated ${formatDateTime(stage.updated_at)}` : '尚无时间戳'}</div>
-              </div>
-              <Tag color={stageStatusColorMap[String(stage.status || 'missing')] || 'default'}>{stage.status}</Tag>
-            </div>
-            {stage.summary ? (
-              <div className="mt-3 text-sm text-slate-300">{stage.summary}</div>
-            ) : null}
-            {stage.blockers.length > 0 ? (
-              <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
-                <div className="font-medium">Blockers</div>
-                <div className="mt-1 space-y-1">
-                  {stage.blockers.map((blocker) => (
-                    <div key={blocker}>{blocker}</div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            {stage.artifacts.length > 0 ? (
-              <div className="mt-3 flex flex-wrap gap-2">
-                {stage.artifacts.map((artifact) => (
-                  <Tag key={`${stage.stage}:${artifact.relative_path}`} color={artifact.present ? 'cyan' : 'default'}>
-                    {artifact.label} · {artifactKindLabel(artifact.kind)}
-                  </Tag>
-                ))}
-              </div>
-            ) : null}
-            {stage.artifacts.length > 0 ? (
-              <div className="mt-2 space-y-1 text-[11px] text-slate-500">
-                {stage.artifacts.map((artifact) => (
-                  <div key={`${stage.stage}:path:${artifact.relative_path}`} className="truncate">
-                    <Text code className="!text-[11px]">{artifact.relative_path}</Text>
-                  </div>
-                ))}
-              </div>
-            ) : null}
+const stageToOutputScope = (
+  stage: string,
+): WorkspaceOutputScope | null => {
+  if (stage === 'planning') return 'planning'
+  if (stage === 'grounding') return 'grounding'
+  if (stage === 'implementation_prep') return 'implementation'
+  if (stage === 'run_drafts') return 'run_drafts'
+  if (stage === 'execution') return 'executions'
+  if (stage === 'tuning') return 'results'
+  return null
+}
+
+const resolveCleanupScopesForStage = (stage: string): WorkspaceOutputScope[] => {
+  const primary = stageToOutputScope(stage)
+  if (!primary) return []
+  if (stage === 'grounding') return ['grounding', 'repo_analysis']
+  return [primary]
+}
+
+const formatCleanupScopeLabels = (scopes?: string[]) => {
+  const labels = (scopes || [])
+    .map((scope) => outputScopeLabelMap[scope as WorkspaceOutputScope] || scope)
+    .filter(Boolean)
+  return labels.join(' + ')
+}
+
+const formatDeletedPathsPreview = (paths?: string[]) => {
+  const items = (paths || []).filter(Boolean)
+  if (items.length === 0) return ''
+  const preview = items.slice(0, 3).join('、')
+  return items.length > 3 ? `${preview} 等 ${items.length} 项` : preview
+}
+
+function StageLedgerCard({
+  projectId,
+  workspaceId,
+  stages,
+  onOutputsChanged,
+}: {
+  projectId: number
+  workspaceId: number
+  stages: ResearchProjectStageSummary[]
+  onOutputsChanged?: () => Promise<void> | void
+}) {
+  const [artifactModalOpen, setArtifactModalOpen] = useState(false)
+  const [artifactModalLoading, setArtifactModalLoading] = useState(false)
+  const [artifactPath, setArtifactPath] = useState('')
+  const [artifactContent, setArtifactContent] = useState('')
+  const [deletingArtifactPath, setDeletingArtifactPath] = useState<string | null>(null)
+  const [cleanupStageScope, setCleanupStageScope] = useState<string | null>(null)
+
+  const openArtifact = async (artifact: ResearchProjectArtifactSummary) => {
+    setArtifactModalOpen(true)
+    setArtifactModalLoading(true)
+    setArtifactPath(artifact.relative_path)
+    try {
+      const payload = await projectApi.readWorkspaceOutput(projectId, workspaceId, artifact.relative_path)
+      setArtifactContent(payload.content)
+    } catch (error) {
+      message.error(String((error as Error)?.message || '读取阶段产物失败'))
+      setArtifactModalOpen(false)
+    } finally {
+      setArtifactModalLoading(false)
+    }
+  }
+
+  const deleteArtifact = async (artifact: ResearchProjectArtifactSummary) => {
+    setDeletingArtifactPath(artifact.relative_path)
+    try {
+      await projectApi.deleteWorkspaceOutput(projectId, workspaceId, artifact.relative_path)
+      message.success(`已删除 ${artifact.relative_path}`)
+      await onOutputsChanged?.()
+    } catch (error) {
+      message.error(String((error as Error)?.message || '删除阶段产物失败'))
+    } finally {
+      setDeletingArtifactPath(null)
+    }
+  }
+
+  const cleanupStage = (stage: ResearchProjectStageSummary) => {
+    const scope = stageToOutputScope(stage.stage)
+    if (!scope) return
+    const effectiveScopes = resolveCleanupScopesForStage(stage.stage)
+    const presentArtifacts = stage.artifacts.filter((artifact) => artifact.present)
+    const artifactPreview = presentArtifacts.slice(0, 5)
+    Modal.confirm({
+      title: `清空 ${stage.label}`,
+      content: (
+        <div className="space-y-3">
+          <div>将删除当前 workspace 下属于 {stage.label} 的产物。</div>
+          <div className="text-xs text-slate-500">
+            生效范围：{formatCleanupScopeLabels(effectiveScopes)}
           </div>
-        ))}
-      </div>
-    </Card>
+          {stage.stage === 'grounding' ? (
+            <div className="text-xs text-amber-200">
+              Grounding 卡片里展示的 Repo Analysis 证据会一起清理，避免页面上看起来“没删掉”。
+            </div>
+          ) : null}
+          {artifactPreview.length > 0 ? (
+            <div className="rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2 text-xs text-slate-300">
+              <div className="font-medium text-slate-100">当前将影响 {presentArtifacts.length} 个已存在产物</div>
+              <div className="mt-1 space-y-1">
+                {artifactPreview.map((artifact) => (
+                  <div key={`${stage.stage}:${artifact.relative_path}`}>{artifact.relative_path}</div>
+                ))}
+                {presentArtifacts.length > artifactPreview.length ? (
+                  <div className="text-slate-500">还有 {presentArtifacts.length - artifactPreview.length} 个未展开</div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ),
+      okText: '清空',
+      okButtonProps: { danger: true, loading: cleanupStageScope === scope },
+      cancelText: '取消',
+      onOk: async () => {
+        setCleanupStageScope(scope)
+        try {
+          const result = await projectApi.cleanupWorkspaceOutputScope(projectId, workspaceId, { scope })
+          const scopeLabels = formatCleanupScopeLabels(result.effective_scopes || effectiveScopes)
+          const deletedPreview = formatDeletedPathsPreview(result.deleted_paths)
+          message.success(
+            `已清空 ${stage.label}（${scopeLabels}）：${result.deleted_file_count} 个文件、${result.deleted_dir_count} 个目录、${result.deleted_run_count} 条运行记录${deletedPreview ? `；删除了 ${deletedPreview}` : ''}`,
+          )
+          await onOutputsChanged?.()
+        } catch (error) {
+          message.error(String((error as Error)?.message || `清空 ${stage.label} 失败`))
+        } finally {
+          setCleanupStageScope(null)
+        }
+      },
+    })
+  }
+
+  return (
+    <>
+      <Card className="!border-slate-700/60 !bg-slate-950/30" title={<span className="text-slate-100">Stage Ledger</span>}>
+        <div className="space-y-3">
+          {stages.map((stage) => {
+            const cleanupScope = stageToOutputScope(stage.stage)
+            const presentArtifacts = stage.artifacts.filter((artifact) => artifact.present)
+            return (
+              <div key={stage.stage} className="rounded-2xl border border-slate-800/80 bg-slate-950/50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium text-slate-100">{stage.label}</div>
+                    <div className="mt-1 text-xs text-slate-500">{stage.updated_at ? `Updated ${formatDateTime(stage.updated_at)}` : '尚无时间戳'}</div>
+                  </div>
+                  <Space wrap>
+                    {presentArtifacts.length > 0 && cleanupScope ? (
+                      <Button
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        loading={cleanupStageScope === cleanupScope}
+                        onClick={() => cleanupStage(stage)}
+                      >
+                        清空阶段产物
+                      </Button>
+                    ) : null}
+                    <Tag color={stageStatusColorMap[String(stage.status || 'missing')] || 'default'}>{stage.status}</Tag>
+                  </Space>
+                </div>
+                {stage.summary ? (
+                  <div className="mt-3 text-sm text-slate-300">{stage.summary}</div>
+                ) : null}
+                {stage.blockers.length > 0 ? (
+                  <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                    <div className="font-medium">Blockers</div>
+                    <div className="mt-1 space-y-1">
+                      {stage.blockers.map((blocker) => (
+                        <div key={blocker}>{blocker}</div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {presentArtifacts.length > 0 ? (
+                  <div className="mt-3 space-y-2">
+                    {presentArtifacts.map((artifact) => (
+                      <div
+                        key={`${stage.stage}:${artifact.relative_path}`}
+                        className="rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap gap-2">
+                              <Tag color={artifact.present ? 'cyan' : 'default'}>
+                                {artifact.label} · {artifactKindLabel(artifact.kind)}
+                              </Tag>
+                            </div>
+                            <div className="mt-2 truncate text-[11px] text-slate-500">
+                              <Text code className="!text-[11px]">{artifact.relative_path}</Text>
+                            </div>
+                          </div>
+                          <Space wrap>
+                            <Button size="small" icon={<EyeOutlined />} onClick={() => void openArtifact(artifact)}>查看</Button>
+                            <Button
+                              size="small"
+                              danger
+                              icon={<DeleteOutlined />}
+                              loading={deletingArtifactPath === artifact.relative_path}
+                              onClick={() => void deleteArtifact(artifact)}
+                            >
+                              删除
+                            </Button>
+                          </Space>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            )
+          })}
+        </div>
+      </Card>
+
+      <Modal
+        title="查看阶段产物"
+        open={artifactModalOpen}
+        onCancel={() => setArtifactModalOpen(false)}
+        onOk={() => setArtifactModalOpen(false)}
+        okText="关闭"
+        cancelButtonProps={{ style: { display: 'none' } }}
+        width={900}
+      >
+        {artifactModalLoading ? (
+          <div className="flex min-h-[280px] items-center justify-center"><Spin /></div>
+        ) : (
+          <div className="space-y-3">
+            <Input value={artifactPath} disabled />
+            <TextArea rows={18} value={artifactContent} readOnly spellCheck={false} className="font-mono" />
+          </div>
+        )}
+      </Modal>
+    </>
   )
 }
 
@@ -584,9 +786,22 @@ function WorkspaceOutputsCard({
   }
 
   const handleScopeCleanup = (scope: string, label: string) => {
+    const effectiveScopes = scope === 'grounding' ? ['grounding', 'repo_analysis'] : [scope]
     Modal.confirm({
       title: `清空 ${label}`,
-      content: `将删除当前 workspace 下属于 ${label} 的产物。是否继续？`,
+      content: (
+        <div className="space-y-3">
+          <div>将删除当前 workspace 下属于 {label} 的产物。</div>
+          <div className="text-xs text-slate-500">
+            生效范围：{formatCleanupScopeLabels(effectiveScopes)}
+          </div>
+          {scope === 'grounding' ? (
+            <div className="text-xs text-amber-200">
+              Grounding 清理会同时带走 Repo Analysis 证据文件。
+            </div>
+          ) : null}
+        </div>
+      ),
       okText: '清空',
       okButtonProps: { danger: true, loading: scopeCleanupLoading === scope },
       cancelText: '取消',
@@ -596,7 +811,11 @@ function WorkspaceOutputsCard({
           const result = await projectApi.cleanupWorkspaceOutputScope(projectId, workspaceId, {
             scope: scope as 'planning' | 'repo_analysis' | 'grounding' | 'implementation' | 'run_drafts' | 'executions' | 'results',
           })
-          message.success(`已清空 ${label}：${result.deleted_file_count} 个文件、${result.deleted_dir_count} 个目录、${result.deleted_run_count} 条运行记录`)
+          const scopeLabels = formatCleanupScopeLabels(result.effective_scopes || effectiveScopes)
+          const deletedPreview = formatDeletedPathsPreview(result.deleted_paths)
+          message.success(
+            `已清空 ${label}（${scopeLabels}）：${result.deleted_file_count} 个文件、${result.deleted_dir_count} 个目录、${result.deleted_run_count} 条运行记录${deletedPreview ? `；删除了 ${deletedPreview}` : ''}`,
+          )
           await loadOutputs({ silent: true })
           await onOutputsChanged?.()
         } catch (error) {
@@ -1054,7 +1273,15 @@ export default function ProjectsPage() {
                           </div>
 
                           <div className="grid gap-4 xl:grid-cols-2">
-                            <StageLedgerCard stages={workspace.stage_ledger} />
+                            <StageLedgerCard
+                              projectId={selectedProject.id}
+                              workspaceId={workspace.workspace_id}
+                              stages={workspace.stage_ledger}
+                              onOutputsChanged={async () => {
+                                await loadRuntimeOverview(selectedProject.id, { silent: true })
+                                await loadProjectDetail(selectedProject.id)
+                              }}
+                            />
                             <RuntimeContextCard
                               runtimeContext={workspace.runtime_context}
                               notebookId={workspace.notebook_id}

@@ -102,6 +102,37 @@ def test_write_execution_spec_renders_repo_script_from_execution_intent(tmp_path
     assert content["validation"]["valid"] is True
 
 
+def test_write_execution_spec_renders_executable_shell_repo_script_from_execution_intent(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
+    repo = tmp_path / "paper_repo"
+    repo.mkdir()
+    script = repo / "classification-results.sh"
+    script.write_text("#!/usr/bin/env bash\necho ok\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    saved = ProjectRuntimeService().write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=1,
+        workspace_id=2,
+        notebook_id="nb",
+        execution_spec={
+            "execution_id": "intent-shell-repo-script",
+            "execution_intent": {
+                "runtime_type": "plain-python",
+                "entrypoint_type": "repo_script",
+                "entrypoint_path": "classification-results.sh",
+                "args": ["--dataset", "ag_news"],
+            },
+        },
+    )
+
+    content = saved["content"]
+    assert content["runtime_type"] == "plain-python"
+    assert content["cwd"] == "repo/source"
+    assert content["command"] == ["./classification-results.sh", "--dataset", "ag_news"]
+    assert content["validation"]["valid"] is True
+
+
 def test_write_execution_spec_renders_generated_python_from_execution_intent(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module.shutil, "which", _fake_which)
     (tmp_path / "paper_repo").mkdir()

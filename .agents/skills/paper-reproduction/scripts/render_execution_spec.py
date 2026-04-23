@@ -19,6 +19,12 @@ RUNTIME_TYPES = {
     "plain-python",
 }
 
+ENTRYPOINT_TYPES = {
+    "generated_python",
+    "notebook",
+    "repo_script",
+}
+
 
 def _safe_slug(value: str) -> str:
     text = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip()).strip("-._")
@@ -49,6 +55,15 @@ def _json_object(value: str, *, name: str) -> dict[str, Any]:
     return parsed
 
 
+def _json_optional_list(value: str | None, *, name: str) -> list[str]:
+    if value in (None, ""):
+        return []
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) and item for item in parsed):
+        raise ValueError(f"{name} must be a JSON string array")
+    return parsed
+
+
 def build_spec(args: argparse.Namespace) -> dict[str, Any]:
     if args.runtime_type not in RUNTIME_TYPES:
         raise ValueError(f"runtime_type must be one of {sorted(RUNTIME_TYPES)}")
@@ -58,21 +73,55 @@ def build_spec(args: argparse.Namespace) -> dict[str, Any]:
         "execution_id": execution_id,
         "draft_id": args.draft_id or execution_id,
         "runtime_type": args.runtime_type,
-        "cwd": _relative_path(args.cwd),
         "repo_root_relative_path": _relative_path(args.repo_root),
         "expected_outputs": list(args.expected_output or []),
         "artifact_globs": [_relative_path(item) for item in list(args.artifact_glob or [])],
         "evidence_files": [_relative_path(item) for item in list(args.evidence_file or [])],
         "blockers": list(args.blocker or []),
     }
-    if args.runtime_type == "papermill":
+
+    if args.entrypoint_type and args.command_json:
+        raise ValueError("--entrypoint-type cannot be combined with --command-json")
+
+    if args.entrypoint_type:
+        if args.entrypoint_type not in ENTRYPOINT_TYPES:
+            raise ValueError(f"entrypoint_type must be one of {sorted(ENTRYPOINT_TYPES)}")
+        entrypoint_path = args.entrypoint_path or args.input_notebook or ""
+        if args.entrypoint_type == "notebook":
+            if not entrypoint_path:
+                raise ValueError("notebook execution_intent requires --entrypoint-path or --input-notebook")
+        else:
+            if not entrypoint_path and args.entrypoint_type != "generated_python":
+                raise ValueError("execution_intent requires --entrypoint-path for repo_script")
+            if args.entrypoint_type == "repo_script" and str(entrypoint_path).strip().endswith(".sh"):
+                raise ValueError(
+                    "repo_script execution_intent is for Python repo files; "
+                    "for executable shell entrypoints use --command-json '[\"./classification-results.sh\"]'"
+                )
+
+        intent: dict[str, Any] = {
+            "runtime_type": args.runtime_type,
+            "entrypoint_type": args.entrypoint_type,
+            "cwd_mode": args.cwd_mode,
+            "args": _json_optional_list(args.args_json, name="args_json"),
+        }
+        if entrypoint_path:
+            intent["entrypoint_path"] = _relative_path(entrypoint_path)
+        if args.generated_program_name:
+            intent["generated_program_name"] = args.generated_program_name.strip()
+        spec["execution_intent"] = {key: value for key, value in intent.items() if value not in ("", [], None)}
+        if args.runtime_type == "papermill":
+            spec["parameters"] = _json_object(args.parameters_json or "{}", name="parameters_json")
+    elif args.runtime_type == "papermill":
         if not args.input_notebook:
-            raise ValueError("papermill execution requires --input-notebook")
+            raise ValueError("papermill execution requires --input-notebook or --entrypoint-type notebook")
+        spec["cwd"] = _relative_path(args.cwd)
         spec["input_notebook"] = _relative_path(args.input_notebook)
         spec["parameters"] = _json_object(args.parameters_json or "{}", name="parameters_json")
     else:
         if not args.command_json:
             raise ValueError(f"{args.runtime_type} execution requires --command-json")
+        spec["cwd"] = _relative_path(args.cwd)
         spec["command"] = _json_list(args.command_json, name="command_json")
     if args.service:
         spec["service"] = args.service
@@ -98,7 +147,12 @@ def main() -> int:
     parser.add_argument("--runtime-type", required=True, choices=sorted(RUNTIME_TYPES))
     parser.add_argument("--cwd", default="repo/source")
     parser.add_argument("--repo-root", default="repo/source")
-    parser.add_argument("--command-json", help='Example: ["python","train.py","--epochs","1"]')
+    parser.add_argument("--command-json", help='Legacy direct argv example: ["python","train.py","--epochs","1"] or ["./classification-results.sh"]')
+    parser.add_argument("--entrypoint-type", choices=sorted(ENTRYPOINT_TYPES), help="Preferred structured execution_intent entrypoint type.")
+    parser.add_argument("--entrypoint-path", help="Repo-relative path for execution_intent, for example train.py or demo.ipynb.")
+    parser.add_argument("--generated-program-name", help="Generated program name for execution_intent.entrypoint_type=generated_python.")
+    parser.add_argument("--cwd-mode", default="repo_root", help="execution_intent cwd_mode, for example repo_root or execution_root.")
+    parser.add_argument("--args-json", help='JSON string array for execution_intent args, for example ["--epochs","1"]')
     parser.add_argument("--input-notebook")
     parser.add_argument("--parameters-json")
     parser.add_argument("--service")

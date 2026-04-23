@@ -241,7 +241,12 @@ _PAPER_TOOL_STAGE_HINTS = {
     "paper_research_read_grounding_report": "grounding",
     "paper_research_write_grounding_report": "grounding",
     "paper_research_read_repo_file": "grounding",
+    "paper_research_build_zoekt_index": "grounding",
+    "paper_research_search_repo_zoekt": "grounding",
     "paper_research_search_repo": "grounding",
+    "paper_research_run_aider": "execution",
+    "paper_research_read_aider_run": "execution",
+    "paper_research_tail_aider_log": "execution",
     "paper_research_assess_repo_mainpath": "grounding",
     "paper_research_inspect_runtime": "grounding",
     "paper_research_read_implementation_spec": "implementation_prep",
@@ -1672,6 +1677,53 @@ def _iter_sse_payloads_from_buffer(buffer: str, *, flush: bool = False) -> tuple
     return payloads, remainder
 
 
+async def _consume_streaming_response_events(
+    response: StreamingResponse,
+    *,
+    publish,
+    idle_timeout_seconds: float,
+) -> tuple[dict, dict]:
+    buffer = ""
+    start_payload: dict[str, Any] = {}
+    done_payload: dict[str, Any] = {}
+    iterator = response.body_iterator.__aiter__()
+
+    while True:
+        try:
+            raw_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_timeout_seconds)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"chat_stream_idle_timeout_after_{int(idle_timeout_seconds)}s"
+            ) from exc
+
+        chunk = raw_chunk.decode("utf-8") if isinstance(raw_chunk, (bytes, bytearray)) else str(raw_chunk)
+        buffer += chunk
+        payloads, buffer = _iter_sse_payloads_from_buffer(buffer)
+        for payload in payloads:
+            event = str(payload.get("event") or "").strip()
+            data = payload.get("data")
+            if event == "start" and isinstance(data, dict):
+                start_payload = dict(data)
+            if event == "done" and isinstance(data, dict):
+                done_payload = dict(data)
+            if event:
+                await publish(event, data)
+
+    payloads, _ = _iter_sse_payloads_from_buffer(buffer, flush=True)
+    for payload in payloads:
+        event = str(payload.get("event") or "").strip()
+        data = payload.get("data")
+        if event == "start" and isinstance(data, dict):
+            start_payload = dict(data)
+        if event == "done" and isinstance(data, dict):
+            done_payload = dict(data)
+        if event:
+            await publish(event, data)
+    return start_payload, done_payload
+
+
 def _update_message_content_in_item_stream_payload(
     item_stream_payload: Optional[dict],
     *,
@@ -2368,9 +2420,12 @@ async def create_chat_background_run(
 
     async def _execute(publish):
         await publish("run_status", {"run_id": run_id, "status": "running"})
-        buffer = ""
         start_payload: dict[str, Any] = {}
         done_payload: dict[str, Any] = {}
+        idle_timeout_seconds = max(
+            float(getattr(settings, "agent_run_stale_timeout_seconds", 900) or 900),
+            30.0,
+        )
         try:
             async with async_session_factory() as run_db:
                 response = await send_message(background_request, current_user=user_snapshot, db=run_db)
@@ -2378,29 +2433,13 @@ async def create_chat_background_run(
                     done_payload = response if isinstance(response, dict) else {"response": str(response)}
                     await publish("done", done_payload)
                 else:
-                    async for raw_chunk in response.body_iterator:
-                        chunk = raw_chunk.decode("utf-8") if isinstance(raw_chunk, (bytes, bytearray)) else str(raw_chunk)
-                        buffer += chunk
-                        payloads, buffer = _iter_sse_payloads_from_buffer(buffer)
-                        for payload in payloads:
-                            event = str(payload.get("event") or "").strip()
-                            data = payload.get("data")
-                            if event == "start" and isinstance(data, dict):
-                                start_payload = dict(data)
-                            if event == "done" and isinstance(data, dict):
-                                done_payload = dict(data)
-                            if event:
-                                await publish(event, data)
-                    payloads, _ = _iter_sse_payloads_from_buffer(buffer, flush=True)
-                    for payload in payloads:
-                        event = str(payload.get("event") or "").strip()
-                        data = payload.get("data")
-                        if event == "start" and isinstance(data, dict):
-                            start_payload = dict(data)
-                        if event == "done" and isinstance(data, dict):
-                            done_payload = dict(data)
-                        if event:
-                            await publish(event, data)
+                    start_payload, done_payload = await _consume_streaming_response_events(
+                        response,
+                        publish=publish,
+                        idle_timeout_seconds=idle_timeout_seconds,
+                    )
+                    if not done_payload:
+                        raise RuntimeError("chat_stream_ended_without_done")
             await runtime_service.complete_run(
                 run_id,
                 status="completed",

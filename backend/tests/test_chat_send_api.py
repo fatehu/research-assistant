@@ -151,10 +151,55 @@ class _FakeSaveSession:
         return obj
 
 
+class _FakeStreamingResponse:
+    def __init__(self, iterator):
+        self.body_iterator = iterator
+
+
 @pytest.fixture(autouse=True)
 def _stub_compaction_service(monkeypatch):
     monkeypatch.setattr(chat_api, "get_conversation_context_compaction_service", lambda: _NoopCompactionService())
     monkeypatch.setattr(core_database, "async_session_factory", lambda: _FakeSaveSession())
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_response_events_collects_start_and_done():
+    async def _iterator():
+        yield chat_api._sse_event("start", {"turn_id": "turn:1", "conversation_id": 149}).encode("utf-8")
+        yield chat_api._sse_event("done", {"answer": "ok", "run_id": "run-1"}).encode("utf-8")
+
+    published = []
+
+    async def _publish(event, data):
+        published.append((event, data))
+
+    start_payload, done_payload = await chat_api._consume_streaming_response_events(
+        _FakeStreamingResponse(_iterator()),
+        publish=_publish,
+        idle_timeout_seconds=1.0,
+    )
+
+    assert start_payload["turn_id"] == "turn:1"
+    assert done_payload["answer"] == "ok"
+    assert [event for event, _ in published] == ["start", "done"]
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_response_events_raises_on_idle_timeout():
+    async def _iterator():
+        await asyncio.sleep(0.05)
+        if False:
+            yield b""
+
+    async def _publish(event, data):
+        return None
+
+    with pytest.raises(RuntimeError, match="chat_stream_idle_timeout_after_0s|chat_stream_idle_timeout_after_1s"):
+        await chat_api._consume_streaming_response_events(
+            _FakeStreamingResponse(_iterator()),
+            publish=_publish,
+            idle_timeout_seconds=0.01,
+        )
 
 
 class _FakePlanner:

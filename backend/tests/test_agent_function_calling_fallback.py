@@ -1,10 +1,12 @@
 import os
 import sys
+import asyncio
 
 import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import app.services.react_agent as react_agent_module
 from app.config import settings
 from app.services.agent_tools import ToolResult
 from app.services.react_agent import AgentContext, AgentRuntimeContext, AgentStep, ExecutedToolCall, ParsedToolCall, ReActAgent
@@ -322,6 +324,79 @@ class _RedundantKnowledgeSearchFCLLM:
         return {"content": "<answer>fallback</answer>"}
 
 
+@pytest.mark.asyncio
+async def test_tool_result_ledger_summary_surfaces_structured_grounding_errors():
+    executed = ExecutedToolCall(
+        action_event={},
+        observation_event={},
+        tool_message={},
+        tool_name="paper_research_write_grounding_report",
+        observation_output="grounding_report JSON 未通过归档校验",
+        result_data={
+            "relative_path": "specs/grounding_report.json",
+            "structured_validation_errors": [
+                {
+                    "path": "dataset.sources",
+                    "code": "missing_probe_or_local_evidence",
+                    "message": "sogou_news 写成 grounded，但没有本轮 probe 证据。",
+                    "evidence_needed": "successful probe for dataset source url or local_presence.available=true",
+                    "suggested_tool_calls": [
+                        {
+                            "tool": "paper_research_probe_url",
+                            "args": {
+                                "project_id": 6,
+                                "url": "https://example.com/sogou",
+                                "resolve_download_gate": True,
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        tool_call_id="call-1",
+        arguments={},
+        success=False,
+        error="grounding_report_invalid",
+        permission_required=False,
+        execution_time_ms=12.0,
+        output_tokens_estimate=0,
+        truncated=False,
+        metadata={},
+    )
+
+    summary = await ReActAgent._tool_result_ledger_summary_text(executed)
+
+    assert "paper_research_write_grounding_report" in summary
+    assert "dataset.sources" in summary
+    assert "missing_probe_or_local_evidence" in summary
+    assert "paper_research_probe_url" in summary
+
+
+@pytest.mark.asyncio
+async def test_budget_compression_times_out_instead_of_hanging(monkeypatch):
+    class _HangingCompressionLLM:
+        def __init__(self, provider):
+            self.provider = provider
+            self.config = {}
+
+        async def chat(self, *args, **kwargs):
+            await asyncio.sleep(0.2)
+            return {"content": "never"}
+
+    monkeypatch.setattr(react_agent_module, "LLMService", _HangingCompressionLLM)
+    monkeypatch.setattr(settings, "agent_budget_compression_timeout_seconds", 0.01)
+
+    compressed = await ReActAgent._compress_text_with_qwen_turbo(
+        "需要被压缩的长文本" * 100,
+        target_token_budget=120,
+        source="test.timeout",
+        compression_kind="测试压缩",
+    )
+
+    assert compressed
+    assert "需要被压缩的长文本" in compressed
+
+
 class _RepeatedPaperRepoReadFCLLM:
     provider = "test"
     config = {"model": "test-model"}
@@ -387,6 +462,12 @@ class _GroundingRefreshTools:
 class _PassThroughPaperTools:
     async def execute(self, tool_name: str, **kwargs):
         assert tool_name.startswith("paper_research_")
+        return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
+
+
+class _PassThroughWebTools:
+    async def execute(self, tool_name: str, **kwargs):
+        assert tool_name in {"web_search", "web_scrape"}
         return ToolResult(success=True, output="ok", data={"tool_name": tool_name, "kwargs": kwargs})
 
 
@@ -978,6 +1059,34 @@ async def test_paper_tools_are_not_hard_blocked_by_decision_state_allowed_action
 
 
 @pytest.mark.asyncio
+async def test_paper_web_search_is_not_blocked_by_decision_state_allowed_actions():
+    agent = ReActAgent(_DirectAnswerFCLLM(), _PassThroughWebTools(), max_iterations=1)
+    context = AgentContext(
+        messages=[{"role": "user", "content": "搜索 AG News 官方数据集来源"}],
+        conversation_state={
+            "workflow_binding": {"skill": "paper-reproduction", "current_stage": "grounding"},
+            "decision_state": {
+                "status": "blocked",
+                "next_action": "report_blocker",
+                "allowed_actions": ["report_blocker"],
+            },
+        },
+    )
+    call = ParsedToolCall(
+        name="web_search",
+        arguments={"query": "AG News dataset official source", "max_results": 5},
+        call_id="call_web_1",
+        arguments_raw='{"query":"AG News dataset official source","max_results":5}',
+    )
+
+    executed = await agent._execute_single_tool_call(context, call, parallel_group="iter-1-test")
+
+    assert executed.success is True
+    assert executed.error is None
+    assert executed.result_data["tool_name"] == "web_search"
+
+
+@pytest.mark.asyncio
 async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_read_grounding_report():
     agent = ReActAgent(_DirectAnswerFCLLM(), _GroundingRefreshTools(), max_iterations=1)
     context = AgentContext(
@@ -1043,6 +1152,81 @@ async def test_grounding_rerun_request_can_bypass_blocked_decision_state_for_wri
     assert executed.success is True
     assert executed.error is None
     assert executed.result_data["tool_name"] == "paper_research_write_grounding_report"
+
+
+def test_tool_workflow_next_action_prefers_execution_after_repo_evidence():
+    message, decision = ReActAgent._tool_workflow_next_action(
+        [
+            ExecutedToolCall(
+                action_event={},
+                observation_event={},
+                tool_message={},
+                tool_name="paper_research_read_repo_file",
+                observation_output="README and script read",
+                result_data={},
+                tool_call_id="call_repo_1",
+                arguments={"project_id": 6, "repo_relative_path": "classification-results.sh"},
+                success=True,
+                error=None,
+                permission_required=False,
+                execution_time_ms=12.0,
+                output_tokens_estimate=64,
+                truncated=False,
+            )
+        ],
+        paper_skill_active=True,
+        repo_edit_allowed=False,
+        workflow_binding={"current_stage": "grounding"},
+    )
+
+    assert "repo-first execution" in message
+    assert decision["next_action"] == "write_execution_spec"
+    assert "write_execution_spec" in decision["allowed_actions"]
+    assert "start_execution" in decision["allowed_actions"]
+    assert "write_grounding_report" in decision["allowed_actions"]
+
+
+def test_tool_workflow_next_action_does_not_force_implementation_after_grounding_report():
+    message, decision = ReActAgent._tool_workflow_next_action(
+        [
+            ExecutedToolCall(
+                action_event={},
+                observation_event={},
+                tool_message={},
+                tool_name="paper_research_write_grounding_report",
+                observation_output="saved grounding report",
+                result_data={
+                    "grounding_ready": True,
+                    "content": {
+                        "summary": {
+                            "repo_grounded": True,
+                            "entrypoint_grounded": True,
+                            "dataset_grounded": True,
+                            "runtime_grounded": True,
+                            "external_dependencies_grounded": True,
+                            "overall_status": "grounded",
+                        }
+                    },
+                },
+                tool_call_id="call_grounding_1",
+                arguments={"project_id": 6},
+                success=True,
+                error=None,
+                permission_required=False,
+                execution_time_ms=18.0,
+                output_tokens_estimate=96,
+                truncated=False,
+            )
+        ],
+        paper_skill_active=True,
+        repo_edit_allowed=True,
+        workflow_binding={"current_stage": "grounding"},
+    )
+
+    assert "repo-first execution" in message
+    assert decision["next_action"] == "write_execution_spec"
+    assert "start_execution" in decision["allowed_actions"]
+    assert "write_implementation_spec" in decision["allowed_actions"]
 
 
 @pytest.mark.asyncio
@@ -1133,9 +1317,10 @@ async def test_agent_stops_repeated_execution_spec_failures_with_script_guidance
     done_events = [event for event in events if event.get("type") == "done"]
 
     assert len(action_events) == 3
-    assert any("先写 execution 脚本" in str(event.get("data", "")) for event in thought_events)
+    assert any("合法路径" in str(event.get("data", "")) or "Python repo 文件" in str(event.get("data", "")) for event in thought_events)
     assert done_events
-    assert "paper_research_write_execution_script" in str(done_events[0]["data"]["answer"])
+    assert "execution_intent.entrypoint_type=\"repo_script\"" in str(done_events[0]["data"]["answer"])
+    assert "command=[\"./classification-results.sh\"]" in str(done_events[0]["data"]["answer"])
     assert done_events[0]["data"]["iterations"] == 3
 
 
@@ -1269,8 +1454,8 @@ async def test_execute_tool_calls_marks_script_followup_after_execution_spec_fai
 
     assert len(executed) == 1
     assert runtime_service.item_entries
-    assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "write_execution_script"
-    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "write_execution_script"
+    assert runtime_service.item_entries[0]["metadata"]["workflow_summary"]["decision_state"]["next_action"] == "inspect_execution_spec"
+    assert runtime_service.context_states[0]["decision_state"]["next_action"] == "inspect_execution_spec"
 
 
 def test_plain_chat_normalization_strips_tool_protocol_messages():

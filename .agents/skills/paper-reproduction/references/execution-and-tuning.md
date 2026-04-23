@@ -2,6 +2,8 @@
 
 Use this reference when the user asks to run, reproduce, test, verify, tune, compare, inspect background jobs, or debug execution failures.
 
+Execution is the default continuation after stage-1 intake for repo-backed projects whose README/entrypoint/runtime path is already clear. Treat `grounding_report.json`, `implementation_spec.json`, and `run_drafts.json` as optional support artifacts that can be created before, during, or after execution when they improve clarity.
+
 ## Execution State
 
 - Execution recovery is part of the execution stage, not a separate diagnostic branch.
@@ -49,8 +51,9 @@ An `execution_spec` is one concrete run attempt, not a research plan. It should 
 
 - `execution_id` or `draft_id`
 - `runtime_type`
+- `execution_intent` for Python repo files / notebooks when possible
 - `cwd`
-- `command` for command-driven runtimes
+- `command` for direct-argv runtimes and executable repo entrypoints
 - `input_notebook` and `parameters` for `papermill`
 - `expected_outputs`
 - `artifact_globs`
@@ -62,7 +65,12 @@ An `execution_spec` is one concrete run attempt, not a research plan. It should 
 Rules:
 
 - Save the spec with `paper_research_write_execution_spec` before starting it.
-- `command` must be an argv array, for example `["python", "train.py"]`.
+- Prefer `execution_intent` over raw `command`/`cwd` for Python repo files and notebooks.
+- `execution_intent.entrypoint_type="repo_script"` currently means a Python repo file such as `train.py`.
+- For executable shell entrypoints such as `classification-results.sh`, use direct argv such as `["./classification-results.sh"]` instead of `execution_intent.repo_script`.
+- `command` must be an argv array, for example `["python", "train.py"]` or `["./classification-results.sh"]`.
+- Never use shell wrappers such as `["bash","-lc","..."]` or `["sh","-lc","..."]`.
+- If you truly need a wrapper or helper program, write it first with `paper_research_write_execution_script`, then reference it from the spec.
 - `preflight_checks` must be a list of objects, for example `[{"name":"check_python","required":true,"status":"passed"}]`. Do not send a dict such as `{"check_python": true}`.
 - Use workspace-relative paths only.
 - Keep `cwd` aligned with the actual repo root. Do not drift into a data subdirectory unless the execution really targets that subdirectory.

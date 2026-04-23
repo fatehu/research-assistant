@@ -1769,6 +1769,7 @@ export interface ResearchProjectWorkspaceOutputCleanupResult {
   workspace_id: number
   preserve_repo: boolean
   scope: string
+  effective_scopes?: string[]
   deleted_file_count: number
   deleted_dir_count: number
   deleted_run_count: number

@@ -652,6 +652,10 @@ class AgentCore:
             "paper_research_write_execution_script": "write_execution_script",
             "paper_research_start_execution": "start_execution",
             "paper_research_read_execution": "observe_execution",
+            "paper_research_run_aider": "edit_repo_with_aider",
+            "paper_research_read_aider_run": "read_aider_run",
+            "paper_research_tail_aider_log": "observe_aider_run",
+            "paper_research_search_repo_zoekt": "search_repo",
             "paper_research_search_repo": "search_repo",
             "paper_research_probe_repo": "probe_repo",
             "paper_research_probe_url": "probe_url",
@@ -667,6 +671,25 @@ class AgentCore:
         if normalized.startswith(cls._PAPER_RESEARCH_TOOL_PREFIX):
             return False
         return True
+
+    @classmethod
+    def _should_bypass_decision_state_gate_for_tool(
+        cls,
+        context: AgentContext,
+        tool_name: str,
+    ) -> bool:
+        normalized = str(tool_name or "").strip()
+        if normalized not in {"web_search", "web_scrape"}:
+            return False
+        conversation_state = (
+            dict(context.conversation_state or {})
+            if isinstance(context.conversation_state, dict)
+            else {}
+        )
+        workflow_binding = cls._normalize_workflow_binding(
+            conversation_state.get("workflow_binding") or {}
+        )
+        return str(workflow_binding.get("skill") or "").strip().lower() == cls._PAPER_SKILL_NAME
 
     @staticmethod
     def _tool_action_names(context: AgentContext) -> set[str]:
@@ -725,6 +748,8 @@ class AgentCore:
             "paper_research_get_artifact_manifest",
             "paper_research_read_artifact",
             "paper_research_read_repo_file",
+            "paper_research_build_zoekt_index",
+            "paper_research_search_repo_zoekt",
             "paper_research_search_repo",
             "paper_research_inspect_runtime",
         }
@@ -2576,6 +2601,10 @@ class AgentCore:
         model_name = str(getattr(settings, "agent_budget_compression_model", "qwen-turbo") or "qwen-turbo").strip()
         output_budget = max(min(int(getattr(settings, "agent_budget_compression_max_tokens", 420) or 420), 1200), 96)
         output_budget = min(output_budget, max(int(target_token_budget or 0), 96))
+        timeout_seconds = max(
+            float(getattr(settings, "agent_budget_compression_timeout_seconds", 8.0) or 8.0),
+            0.1,
+        )
 
         current = normalized
         for attempt in range(2):
@@ -2583,21 +2612,29 @@ class AgentCore:
                 llm = LLMService(provider)
                 llm.config = dict(llm.config)
                 llm.config["model"] = model_name
-                response = await llm.chat(
-                    messages=[{"role": "user", "content": current}],
-                    system_prompt=(
-                        "你是上下文压缩器。"
-                        f"当前任务是压缩{compression_kind}。"
-                        "请保留任务目标、关键事实、路径、文件名、参数名、错误名、execution_id、tool 名称等可继续执行所必需的信息。"
-                        "删除寒暄、重复描述、冗余细节。"
-                        "不要使用 markdown，不要解释，不要加前言。"
-                        f"请尽量把结果压到约 {max(int(target_token_budget or 0), 96)} token 以内。"
+                response = await asyncio.wait_for(
+                    llm.chat(
+                        messages=[{"role": "user", "content": current}],
+                        system_prompt=(
+                            "你是上下文压缩器。"
+                            f"当前任务是压缩{compression_kind}。"
+                            "请保留任务目标、关键事实、路径、文件名、参数名、错误名、execution_id、tool 名称等可继续执行所必需的信息。"
+                            "删除寒暄、重复描述、冗余细节。"
+                            "不要使用 markdown，不要解释，不要加前言。"
+                            f"请尽量把结果压到约 {max(int(target_token_budget or 0), 96)} token 以内。"
+                        ),
+                        temperature=0.1,
+                        max_tokens=output_budget,
+                        source=source,
                     ),
-                    temperature=0.1,
-                    max_tokens=output_budget,
-                    source=source,
+                    timeout=timeout_seconds,
                 )
                 compressed = AgentCore._normalize_compacted_text(response.get("content", ""))
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[AgentCore] qwen-turbo compression timed out source={source} timeout={timeout_seconds}"
+                )
+                compressed = ""
             except Exception as exc:
                 logger.warning(f"[AgentCore] qwen-turbo compression failed source={source}: {exc}")
                 compressed = ""
@@ -4989,14 +5026,18 @@ class AgentCore:
             context.final_answer = (
                 "`paper_research_write_execution_spec` 已连续失败 "
                 f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
-                "当前更合适的路径是先调用 `paper_research_write_execution_script`，"
-                "把 execution 级脚本写到 `executions/{execution_id}/...`，"
-                "再用 `paper_research_write_execution_spec` 的 `execution_intent` 引用该脚本。"
+                "先检查当前入口到底是哪一类：如果是 Python repo 文件，用 "
+                "`execution_intent.entrypoint_type=\"repo_script\"`；"
+                "如果是可执行 shell 脚本（如 `classification-results.sh`），直接写 argv "
+                "如 `command=[\"./classification-results.sh\"]`；"
+                "只有在确实需要新 wrapper/辅助程序时，才调用 "
+                "`paper_research_write_execution_script` 写到 `executions/{execution_id}/...`，"
+                "再让 `paper_research_write_execution_spec` 引用它。"
             )
             context.state = AgentState.DONE
             return (
                 "检测到 execution_spec 连续失败且问题集中在脚本/命令表达，"
-                "已切换为“先写 execution 脚本，再引用 execution_intent”的收束路径。"
+                "已收束到“先分清 Python 入口 / 可执行 shell 入口 / 新建 wrapper”这三种合法路径。"
             )
         if stop_tool == "paper_research_write_run_drafts" and self._run_drafts_failure_is_entrypoint_schema_issue(stop_output):
             context.final_answer = (
@@ -5019,8 +5060,9 @@ class AgentCore:
                 "`paper_research_read_repo_file` 已连续失败 "
                 f"{stop_count} 次，已停止自动重试。最近失败信息：{recent_detail}。"
                 "这类失败通常不是文件不可读，而是 repo_relative_path 猜错了。"
-                "下一步应先调用 `paper_research_search_repo` 用文件名或关键字定位真实 repo-relative 路径，"
-                "再按命中结果读取；不要继续假设它在 `scripts/` 之类的目录下。"
+                "下一步应先调用 `paper_research_search_repo_zoekt` 或 `paper_research_search_repo` "
+                "用文件名或关键字定位真实 repo-relative 路径，再按命中结果读取；"
+                "不要继续假设它在 `scripts/` 之类的目录下。"
             )
             context.state = AgentState.DONE
             return (
@@ -5207,6 +5249,7 @@ class AgentCore:
             "notebook_cell",
             "notebook_variables",
             "paper_research_status",
+            "paper_research_search_repo_zoekt",
             "paper_research_search_repo",
             "paper_research_read_repo_file",
             "paper_research_read_artifact",
@@ -5257,7 +5300,7 @@ class AgentCore:
         latest_input = latest_matching.get("input") if isinstance(latest_matching.get("input"), dict) else {}
         if tool_name == "paper_research_read_repo_file":
             target_label = str(latest_input.get("repo_relative_path") or "").strip()
-        elif tool_name == "paper_research_search_repo":
+        elif tool_name in {"paper_research_search_repo", "paper_research_search_repo_zoekt"}:
             target_label = str(latest_input.get("query") or "").strip()
         interventions = int(context.context_debug.get("repeat_read_interventions") or 0)
         repo_read_family = tool_name.startswith("paper_research_")
@@ -5361,8 +5404,11 @@ class AgentCore:
                 ]
                 allowed_actions = set(allowed_action_list)
                 requested_action = self._decision_action_for_tool(call.name)
+                enforce_decision_state_gate = self._should_enforce_decision_state_gate(call.name)
+                if enforce_decision_state_gate and self._should_bypass_decision_state_gate_for_tool(context, call.name):
+                    enforce_decision_state_gate = False
                 if (
-                    self._should_enforce_decision_state_gate(call.name)
+                    enforce_decision_state_gate
                     and (
                     allowed_actions
                     and requested_action
@@ -5580,12 +5626,17 @@ class AgentCore:
                 return f"{status} · {ref} · {snippet}"
             if ref:
                 return f"{status} · {ref}"
-        if tool_name == "paper_research_search_repo":
+        if tool_name in {"paper_research_search_repo", "paper_research_search_repo_zoekt"}:
             matched_files = int(result_data.get("matched_file_count") or 0)
             returned_matches = int(result_data.get("returned_matches") or 0)
             query = cls._compact_debug_text(result_data.get("query") or item.arguments.get("query") or "", 72)
             if query:
-                return f"{status} · 搜索 `{query}` · 命中 {returned_matches} 处 / {matched_files} 个文件"
+                engine_label = "Zoekt" if tool_name == "paper_research_search_repo_zoekt" else "Repo Search"
+                return f"{status} · {engine_label} 搜索 `{query}` · 命中 {returned_matches} 处 / {matched_files} 个文件"
+        if tool_name == "paper_research_build_zoekt_index":
+            index_status = str(result_data.get("status") or "").strip() or "unknown"
+            index_file_count = int(result_data.get("index_file_count") or 0)
+            return f"{status} · Zoekt 索引 {index_status} · {index_file_count} 个分片"
         if tool_name == "paper_research_read_execution":
             execution_id = str(result_data.get("execution_id") or "").strip()
             execution_status = str(result_data.get("status") or "").strip()
@@ -5606,6 +5657,17 @@ class AgentCore:
             if execution_id:
                 suffix = f" · stage={stage}" if stage else ""
                 return f"{status} · 已启动 execution `{execution_id}`{suffix}"
+        if tool_name == "paper_research_run_aider":
+            run_id = str(result_data.get("run_id") or "").strip()
+            mode = str(result_data.get("mode") or "").strip() or "code"
+            target_root = str(result_data.get("target_root") or "").strip() or "repo"
+            changed_file_count = int(result_data.get("changed_file_count") or 0)
+            if run_id:
+                return f"{status} · aider={run_id} · {target_root}/{mode} · changed {changed_file_count}"
+        if tool_name in {"paper_research_read_aider_run", "paper_research_tail_aider_log"}:
+            run_id = str(result_data.get("run_id") or "").strip()
+            if run_id:
+                return f"{status} · aider={run_id}"
         if tool_name in {
             "paper_research_write_grounding_report",
             "paper_research_write_implementation_spec",
@@ -5664,26 +5726,15 @@ class AgentCore:
                 failure_detail = str(
                     last_failure.observation_output or last_failure.error or ""
                 )
-                if "grounding" in failure_detail.lower() and "grounding_report" in failure_detail.lower():
-                    return (
-                        "execution 仍被 grounding gate 拦住；先完成 grounding_report，不要继续尝试 execution。",
-                        {
-                            "status": "blocked",
-                            "evidence_status": "sufficient",
-                            "next_action": "write_grounding_report",
-                            "blocked_reason": "grounding_incomplete",
-                            "allowed_actions": ["write_grounding_report", "report_blocker"],
-                        },
-                    )
                 if cls._execution_spec_failure_requires_script(failure_detail):
                     return (
-                        "execution_spec 连续卡在脚本/命令表达；请先写 execution 级脚本，再引用它生成 execution_spec。",
+                        "execution_spec 连续卡在脚本/命令表达；先区分当前入口是 Python repo 文件、可执行 shell 脚本，还是确实需要新 wrapper，再按对应合法形态重写 execution_spec。",
                         {
                             "status": "blocked",
                             "evidence_status": "sufficient",
-                            "next_action": "write_execution_script",
-                            "blocked_reason": "execution_script_required",
-                            "allowed_actions": ["write_execution_script", "inspect_execution_spec"],
+                            "next_action": "inspect_execution_spec",
+                            "blocked_reason": "execution_contract_invalid",
+                            "allowed_actions": ["inspect_execution_spec", "write_execution_script"],
                         },
                     )
                 next_action = "inspect_execution_spec"
@@ -5695,13 +5746,13 @@ class AgentCore:
                 )
                 if cls._run_drafts_failure_is_entrypoint_schema_issue(failure_detail):
                     return (
-                        "run_drafts 当前卡在 entrypoint schema；请保持 run_drafts 只引用真实 repo 文件或 manual/readme 步骤，生成脚本应放到 execution 阶段。",
+                        "run_drafts 当前卡在 entrypoint schema；如果只是想尽快把 repo 跑起来，可以先跳过 run_drafts，直接写 execution_spec。只有在你确实需要保留多个候选运行方案时，再修 run_drafts schema。",
                         {
                             "status": "blocked",
                             "evidence_status": "sufficient",
-                            "next_action": "report_blocker",
+                            "next_action": "inspect_run_drafts",
                             "blocked_reason": "run_drafts_invalid",
-                            "allowed_actions": ["report_blocker", "read_run_drafts"],
+                            "allowed_actions": ["read_run_drafts", "write_execution_spec", "report_blocker"],
                         },
                     )
             elif last_tool == "paper_research_start_execution":
@@ -5709,17 +5760,6 @@ class AgentCore:
                 failure_detail = str(
                     last_failure.observation_output or last_failure.error or ""
                 )
-                if "grounding" in failure_detail.lower() and "grounding_report" in failure_detail.lower():
-                    return (
-                        "grounding 尚未完成，当前不能 start_execution；请先收束 grounding blockers 并写入 grounding_report。",
-                        {
-                            "status": "blocked",
-                            "evidence_status": "sufficient",
-                            "next_action": "write_grounding_report",
-                            "blocked_reason": "grounding_incomplete",
-                            "allowed_actions": ["write_grounding_report", "report_blocker"],
-                        },
-                    )
                 next_action = "inspect_execution_spec"
                 blocked_reason = "execution_contract_invalid"
             elif last_tool == "paper_research_read_repo_file":
@@ -5729,7 +5769,8 @@ class AgentCore:
                 )
                 if cls._repo_read_failure_requires_search(failure_detail):
                     return (
-                        "repo_relative_path 当前不成立；先用 `paper_research_search_repo` 定位真实文件路径，不要继续猜目录。",
+                        "repo_relative_path 当前不成立；先用 `paper_research_search_repo_zoekt` "
+                        "或 `paper_research_search_repo` 定位真实文件路径，不要继续猜目录。",
                         {
                             "status": "blocked",
                             "evidence_status": "sufficient",
@@ -5755,6 +5796,31 @@ class AgentCore:
                     "evidence_status": "sufficient",
                     "next_action": "observe_execution",
                     "allowed_actions": ["observe_execution"],
+                },
+            )
+        if last_tool == "paper_research_run_aider":
+            last_row = rows[-1] if rows else None
+            result_data = dict(last_row.result_data or {}) if isinstance(last_row, ExecutedToolCall) else {}
+            changed_file_count = int(result_data.get("changed_file_count") or 0)
+            target_root = str(result_data.get("target_root") or "").strip() or "repo"
+            if changed_file_count > 0:
+                return (
+                    "aider 已完成局部编辑；先读回关键文件或运行验证，再决定是否继续 execution / tuning。",
+                    {
+                        "status": "ready",
+                        "evidence_status": "sufficient",
+                        "next_action": "verify_aider_changes",
+                        "allowed_actions": ["read_aider_run", "read_repo_file", "start_execution", "report_blocker"],
+                    },
+                )
+            return (
+                "aider 已执行但未产生文件改动；先读回 run 结果或日志，判断是无需修改、提示不清，还是模型/edit-format 失败。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "read_aider_run",
+                    "allowed_actions": ["read_aider_run", "observe_aider_run", "report_blocker"],
+                    "blocked_reason": "no_repo_changes" if target_root == "repo" else "no_workspace_changes",
                 },
             )
         if last_tool == "paper_research_read_execution":
@@ -5814,17 +5880,23 @@ class AgentCore:
             )
             if grounding_ready:
                 return (
-                    "grounding_report 已完成，下一步进入 implementation_spec。",
+                    "grounding_report 已完成。后续可以按需要沉淀 implementation/run_drafts，也可以直接走 repo-first execution。",
                     {
                         "status": "ready",
                         "evidence_status": "sufficient",
-                        "next_action": "write_implementation_spec",
-                        "allowed_actions": ["write_implementation_spec", "report_blocker"],
+                        "next_action": "write_execution_spec",
+                        "allowed_actions": [
+                            "write_execution_spec",
+                            "start_execution",
+                            "write_implementation_spec",
+                            "write_run_drafts",
+                            "report_blocker",
+                        ],
                     },
                 )
             if (dataset_blocked or external_blocked) and not has_alternative_candidates:
                 return (
-                    "grounding_report 已写入且官方来源存在 blocker；先做一次 focused 替代源搜索并把候选写回 grounding_report，再决定是否直接报告 blocker。",
+                    "grounding_report 已写入且官方来源存在 blocker；如果这些 blocker 会影响当前运行路径，先做一次 focused 替代源搜索并把候选写回 grounding_report，否则可以回到 repo-first 主线先跑当前可执行部分。",
                     {
                         "status": "blocked",
                         "evidence_status": "sufficient",
@@ -5834,38 +5906,44 @@ class AgentCore:
                             "web_search",
                             "web_scrape",
                             "write_grounding_report",
+                            "write_execution_spec",
                             "report_blocker",
                         ],
                     },
                 )
             return (
-                "grounding_report 已写入但仍存在 absent/blocked 事实；请直接报告 blocker，不要跳到 implementation 或 execution。",
-                {
-                    "status": "blocked",
-                    "evidence_status": "sufficient",
-                    "next_action": "report_blocker",
-                    "blocked_reason": "grounding_blocked",
-                    "allowed_actions": ["report_blocker", "read_grounding_report"],
-                },
-            )
-        if last_tool == "paper_research_write_run_drafts":
-            return (
-                "run_drafts 已更新，继续写入 execution_spec 或选择要运行的 draft。",
+                "grounding_report 已写入。若当前缺口不会阻断主运行路径，可继续 repo-first execution；若确实阻断，再明确报告 blocker。",
                 {
                     "status": "ready",
                     "evidence_status": "sufficient",
                     "next_action": "write_execution_spec",
-                    "allowed_actions": ["write_execution_spec", "read_run_drafts"],
+                    "blocked_reason": "grounding_blocked",
+                    "allowed_actions": [
+                        "write_execution_spec",
+                        "write_implementation_spec",
+                        "report_blocker",
+                        "read_grounding_report",
+                    ],
+                },
+            )
+        if last_tool == "paper_research_write_run_drafts":
+            return (
+                "run_drafts 已更新。若你已经选定了要跑的路径，继续写 execution_spec；不必再额外补阶段文档。",
+                {
+                    "status": "ready",
+                    "evidence_status": "sufficient",
+                    "next_action": "write_execution_spec",
+                    "allowed_actions": ["write_execution_spec", "read_run_drafts", "report_blocker"],
                 },
             )
         if last_tool == "paper_research_write_implementation_spec":
             return (
-                "implementation_spec 已更新，继续整理 run_drafts 或报告已确认 blocker。",
+                "implementation_spec 已更新。若运行路径已经清晰，可直接写 execution_spec；run_drafts 只在需要保留多个候选方案时再写。",
                 {
                     "status": "ready",
                     "evidence_status": "sufficient",
-                    "next_action": "write_run_drafts",
-                    "allowed_actions": ["write_run_drafts", "report_blocker"],
+                    "next_action": "write_execution_spec",
+                    "allowed_actions": ["write_execution_spec", "write_run_drafts", "report_blocker"],
                 },
             )
         if grounding_context and last_tool in {
@@ -5875,39 +5953,45 @@ class AgentCore:
             "paper_research_get_artifact_manifest",
             "paper_research_read_artifact",
             "paper_research_read_repo_file",
+            "paper_research_build_zoekt_index",
+            "paper_research_search_repo_zoekt",
             "paper_research_search_repo",
             "paper_research_inspect_runtime",
             "paper_research_read_grounding_report",
         }:
             return (
-                "grounding 证据已更新；请收束 repo、entrypoint、dataset、runtime、external dependency 的事实状态，并写入 grounding_report。",
+                "repo / runtime / URL 证据已更新。如果主路径和最小环境已经清晰，可以直接进入 repo-first execution；如果你需要沉淀 readiness 结论，再写 grounding_report。",
                 {
                     "status": "ready",
                     "evidence_status": "sufficient",
-                    "next_action": "write_grounding_report",
-                    "allowed_actions": ["write_grounding_report", "report_blocker"],
+                    "next_action": "write_execution_spec",
+                    "allowed_actions": [
+                        "write_execution_spec",
+                        "start_execution",
+                        "write_grounding_report",
+                        "write_implementation_spec",
+                        "report_blocker",
+                    ],
                 },
             )
-        if last_tool in {"paper_research_search_repo", "paper_research_read_repo_file"}:
-            next_action = (
-                "report_blocker"
-                if paper_skill_active and repo_edit_allowed is False
-                else "synthesize_or_read_target"
-            )
+        if last_tool in {"paper_research_search_repo", "paper_research_search_repo_zoekt", "paper_research_read_repo_file"}:
+            next_action = "write_execution_spec"
             message = (
-                "repo 证据已更新；如果结论已经稳定，请直接收束，不要重复读取同一脚本。"
-                if next_action != "report_blocker"
-                else "已拿到 repo 证据，且当前 skill 不允许直接改 repo/source；请直接报告 blocker。"
+                "已拿到 repo 证据；如果主路径已经清晰，直接写 execution_spec 并开始运行。只有在需要补局部代码/配置时，再用 `paper_research_run_aider`。"
             )
             decision_state = {
-                "status": "ready" if next_action != "report_blocker" else "blocked",
+                "status": "ready",
                 "evidence_status": "sufficient",
                 "next_action": next_action,
-                "allowed_actions": ["report_blocker", "write_implementation_spec"]
-                if next_action == "report_blocker"
-                else ["write_implementation_spec", "report_blocker"],
+                "allowed_actions": [
+                    "write_execution_spec",
+                    "start_execution",
+                    "run_aider",
+                    "write_implementation_spec",
+                    "report_blocker",
+                ],
             }
-            if next_action == "report_blocker":
+            if paper_skill_active and repo_edit_allowed is False:
                 decision_state["blocked_reason"] = "repo_patch_required"
             return message, decision_state
 
@@ -5960,6 +6044,8 @@ class AgentCore:
             summary_status = "blocked"
         elif any(name == "paper_research_start_execution" for name in unique_tool_names):
             summary_status = "progressed"
+        elif any(name == "paper_research_run_aider" for name in unique_tool_names):
+            summary_status = "ready"
         elif any(name.startswith("paper_research_write_") for name in unique_tool_names):
             summary_status = "ready"
 
@@ -6045,13 +6131,16 @@ class AgentCore:
         if metadata.get("result_count") is not None:
             parts.append(f"result_count={metadata.get('result_count')}")
 
-        detail = cls._normalize_compacted_text(item.error or item.observation_output or "")
+        detail = cls._tool_result_detail_for_ledger(item)
         if detail:
             if len(detail) > 1600:
                 detail = detail[:1600].rstrip()
             raw_summary = f"{' | '.join(parts)}\nDetail:\n{detail}"
         else:
             raw_summary = " | ".join(parts)
+
+        if cls._tool_result_has_structured_debug_detail(item):
+            return cls._normalize_compacted_text(raw_summary)
 
         compressed = await cls._compress_text_with_qwen_turbo(
             raw_summary,
@@ -6063,6 +6152,149 @@ class AgentCore:
         if compressed:
             return compressed
         return cls._normalize_compacted_text(" | ".join(parts))
+
+    @classmethod
+    def _tool_result_has_structured_debug_detail(cls, item: ExecutedToolCall) -> bool:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        return any(
+            isinstance(result_data.get(key), list) and list(result_data.get(key) or [])
+            for key in (
+                "structured_validation_errors",
+                "schema_errors",
+                "grounding_conflicts",
+                "draft_errors",
+                "global_errors",
+            )
+        ) or bool(result_data.get("allowed_paths"))
+
+    @classmethod
+    def _tool_result_detail_for_ledger(cls, item: ExecutedToolCall) -> str:
+        result_data = dict(item.result_data or {}) if isinstance(item.result_data, dict) else {}
+        lines: List[str] = []
+
+        structured_validation_errors = [
+            dict(entry)
+            for entry in list(result_data.get("structured_validation_errors") or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in structured_validation_errors[:3]:
+            path = cls._compact_debug_text(entry.get("path") or "", 96)
+            code = cls._compact_debug_text(entry.get("code") or "", 72)
+            message = cls._compact_debug_text(entry.get("message") or "", 220)
+            evidence_needed = cls._compact_debug_text(entry.get("evidence_needed") or "", 140)
+            suggested_calls = [
+                cls._render_tool_call_suggestion(item)
+                for item in list(entry.get("suggested_tool_calls") or [])
+                if isinstance(item, dict)
+            ]
+            prefix_parts = [part for part in [path, code] if part]
+            prefix = f"[{' / '.join(prefix_parts)}] " if prefix_parts else ""
+            line = f"{prefix}{message}" if message else prefix.rstrip()
+            if evidence_needed:
+                line += f"；需要证据: {evidence_needed}"
+            if suggested_calls:
+                line += f"；建议: {'; '.join(suggested_calls[:2])}"
+            if line:
+                lines.append(line)
+
+        schema_errors = [
+            dict(entry)
+            for entry in list(result_data.get("schema_errors") or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in schema_errors[:3]:
+            path = cls._compact_debug_text(entry.get("path") or "", 96)
+            code = cls._compact_debug_text(entry.get("code") or "", 72)
+            message = cls._compact_debug_text(entry.get("message") or "", 220)
+            prefix_parts = [part for part in [path, code] if part]
+            prefix = f"[{' / '.join(prefix_parts)}] " if prefix_parts else ""
+            line = f"{prefix}{message}" if message else prefix.rstrip()
+            if line:
+                lines.append(line)
+
+        grounding_conflicts = [
+            dict(entry)
+            for entry in list(result_data.get("grounding_conflicts") or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in grounding_conflicts[:3]:
+            path = cls._compact_debug_text(entry.get("path") or "", 96)
+            code = cls._compact_debug_text(entry.get("code") or "", 72)
+            message = cls._compact_debug_text(entry.get("message") or "", 220)
+            prefix_parts = [part for part in [path, code] if part]
+            prefix = f"[{' / '.join(prefix_parts)}] " if prefix_parts else ""
+            line = f"{prefix}{message}" if message else prefix.rstrip()
+            if line:
+                lines.append(line)
+
+        draft_errors = [
+            dict(entry)
+            for entry in list(result_data.get("draft_errors") or [])
+            if isinstance(entry, dict)
+        ]
+        for group in draft_errors[:2]:
+            draft_id = cls._compact_debug_text(group.get("draft_id") or "", 72) or "unknown_draft"
+            errors = [
+                dict(entry)
+                for entry in list(group.get("errors") or [])
+                if isinstance(entry, dict)
+            ]
+            for entry in errors[:2]:
+                path = cls._compact_debug_text(entry.get("path") or "", 96)
+                message = cls._compact_debug_text(entry.get("message") or "", 220)
+                prefix = f"[draft={draft_id}"
+                if path:
+                    prefix += f" / {path}"
+                prefix += "] "
+                line = f"{prefix}{message}" if message else prefix.rstrip()
+                if line:
+                    lines.append(line)
+
+        global_errors = [
+            dict(entry)
+            for entry in list(result_data.get("global_errors") or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in global_errors[:3]:
+            path = cls._compact_debug_text(entry.get("path") or "", 96)
+            message = cls._compact_debug_text(entry.get("message") or "", 220)
+            prefix = f"[{path}] " if path else ""
+            line = f"{prefix}{message}" if message else prefix.rstrip()
+            if line:
+                lines.append(line)
+
+        allowed_paths = [
+            cls._compact_debug_text(item, 96)
+            for item in list(result_data.get("allowed_paths") or [])
+            if cls._compact_debug_text(item, 96)
+        ]
+        if allowed_paths:
+            lines.append(
+                "允许的 artifact 路径: " + ", ".join(allowed_paths[:6]) + "；可先调用 paper_research_get_artifact_manifest。"
+            )
+
+        if lines:
+            return "\n".join(f"- {line}" for line in lines)
+        return cls._normalize_compacted_text(item.error or item.observation_output or "")
+
+    @classmethod
+    def _render_tool_call_suggestion(cls, payload: Dict[str, Any]) -> str:
+        tool = cls._compact_debug_text(payload.get("tool") or "", 64)
+        args = dict(payload.get("args") or {}) if isinstance(payload.get("args"), dict) else {}
+        if not tool:
+            return ""
+        if not args:
+            return tool
+        preview_parts: List[str] = []
+        for key in sorted(args.keys())[:3]:
+            value = args.get(key)
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            else:
+                rendered = str(value)
+            preview_parts.append(f"{key}={cls._compact_debug_text(rendered, 80)}")
+        suffix = ", ".join(item for item in preview_parts if item)
+        return f"{tool}({suffix})" if suffix else tool
 
     @classmethod
     async def _tool_use_summary_text(

@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.paper_experiment_adapter_service import PaperExperimentAdapterService
+from app.services.repo_readme_reproduction_intake_service import RepoReadmeReproductionIntakeService
 
 
 def test_ensure_workspace_archive_from_existing_state_backfills_core_files(tmp_path):
@@ -173,6 +174,80 @@ def test_build_paper_summary_keeps_all_dataset_names_and_research_fields():
     assert "Amazon Review Polarity" in paper_summary["key_experiments"]["datasets"]
     assert len(paper_summary["key_experiments"]["datasets"]) == 8
     assert paper_summary["link_inventory"][0]["category"] == "official_repo"
+
+
+@pytest.mark.asyncio
+async def test_materialize_repo_readme_reproduction_intake_writes_json_and_updates_index(tmp_path, monkeypatch):
+    workspace_dir = tmp_path / "workspace"
+    repo_dir = workspace_dir / "paper_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "README.md").write_text(
+        "# Demo Repo\n\n```bash\nbash classification-results.sh\n```\n",
+        encoding="utf-8",
+    )
+    repo_index = {
+        "readme_candidates": ["README.md"],
+        "readme_reproduction_intake_file": None,
+        "readme_reproduction_intake_status": "pending",
+    }
+    repo_manifest = {
+        "status": "reused",
+        "repo_url": "https://github.com/example/demo",
+        "repo_dir": str(repo_dir),
+    }
+
+    async def _fake_generate(self, *, repo_url, readme_relative_path, readme_text):  # type: ignore[no-untyped-def]
+        assert repo_url == "https://github.com/example/demo"
+        assert readme_relative_path == "README.md"
+        assert "classification-results.sh" in readme_text
+        return {
+            "schema_version": "repo_readme_reproduction_intake_v1",
+            "readme_relative_path": readme_relative_path,
+            "repo_url": repo_url,
+            "reproduction_goal": "Run the benchmark script.",
+            "environment_requirements": {"languages": ["bash"], "package_managers": [], "system_dependencies": [], "python_version": None, "hardware_hints": [], "notes": []},
+            "installation_steps": [],
+            "run_commands": [
+                {
+                    "label": "benchmark",
+                    "command": "bash classification-results.sh",
+                    "purpose": "reproduce benchmark",
+                    "entrypoint_path_or_hint": "classification-results.sh",
+                    "evidence_text": "bash classification-results.sh",
+                }
+            ],
+            "entrypoints": [
+                {
+                    "path_or_hint": "classification-results.sh",
+                    "kind": "script",
+                    "purpose": "benchmark",
+                    "evidence_text": "classification-results.sh",
+                }
+            ],
+            "dataset_materials": [],
+            "evaluation_steps": [],
+            "expected_outputs": [],
+            "focus_files": ["classification-results.sh"],
+            "focus_directories": [],
+            "blocking_questions": [],
+            "evidence_snippets": [{"topic": "run", "text": "bash classification-results.sh"}],
+        }
+
+    monkeypatch.setattr(RepoReadmeReproductionIntakeService, "generate", _fake_generate)
+
+    result = await PaperExperimentAdapterService()._materialize_repo_readme_reproduction_intake(  # pylint: disable=protected-access
+        workspace_dir=workspace_dir,
+        repo_manifest=repo_manifest,
+        repo_index=repo_index,
+    )
+
+    assert result["status"] == "ready"
+    assert result["file_name"] == "repo_readme_reproduction_intake.json"
+    payload = json.loads((workspace_dir / "repo_readme_reproduction_intake.json").read_text(encoding="utf-8"))
+    assert payload["run_commands"][0]["entrypoint_path_or_hint"] == "classification-results.sh"
+    updated_index = json.loads((workspace_dir / "repo_file_index.json").read_text(encoding="utf-8"))
+    assert updated_index["readme_reproduction_intake_file"] == "repo_readme_reproduction_intake.json"
+    assert updated_index["readme_reproduction_intake_status"] == "ready"
 
 
 @pytest.mark.asyncio

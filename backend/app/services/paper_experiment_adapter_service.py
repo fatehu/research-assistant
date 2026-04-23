@@ -15,6 +15,7 @@ from loguru import logger
 
 from app.models.literature import Paper
 from app.services.notebook_workspace_service import ensure_notebook_workspace, list_notebook_workspace_files
+from app.services.repo_readme_reproduction_intake_service import RepoReadmeReproductionIntakeService
 
 
 _GITHUB_REPO_RE = re.compile(
@@ -70,10 +71,17 @@ class PaperExperimentAdapterService:
             repo_manifest=repo_manifest,
             experiment_spec=experiment_spec,
         )
+        readme_intake = await self._materialize_repo_readme_reproduction_intake(
+            workspace_dir=workspace_dir,
+            repo_manifest=repo_manifest,
+            repo_index=repo_index,
+        )
         repo_manifest.update(
             {
                 "repo_file_index_file": str(repo_index.get("repo_file_index_file") or "repo_file_index.json"),
                 "readme_excerpt_file": repo_index.get("readme_excerpt_file"),
+                "readme_reproduction_intake_file": readme_intake.get("file_name"),
+                "readme_reproduction_intake_status": readme_intake.get("status"),
                 "repo_history_candidates_file": repo_index.get("repo_history_candidates_file"),
                 "history_candidate_count": int(repo_index.get("history_candidate_count") or 0),
                 "indexed_file_count": int(repo_index.get("indexed_file_count") or 0),
@@ -162,10 +170,17 @@ class PaperExperimentAdapterService:
             repo_manifest=repo_manifest,
             experiment_spec=spec,
         )
+        readme_intake = await self._materialize_repo_readme_reproduction_intake(
+            workspace_dir=workspace_dir,
+            repo_manifest=repo_manifest,
+            repo_index=repo_index,
+        )
         repo_manifest.update(
             {
                 "repo_file_index_file": str(repo_index.get("repo_file_index_file") or "repo_file_index.json"),
                 "readme_excerpt_file": repo_index.get("readme_excerpt_file"),
+                "readme_reproduction_intake_file": readme_intake.get("file_name"),
+                "readme_reproduction_intake_status": readme_intake.get("status"),
                 "repo_history_candidates_file": repo_index.get("repo_history_candidates_file"),
                 "history_candidate_count": int(repo_index.get("history_candidate_count") or 0),
                 "indexed_file_count": int(repo_index.get("indexed_file_count") or 0),
@@ -234,10 +249,14 @@ class PaperExperimentAdapterService:
             experiment_spec=dict(experiment_spec or {}),
         )
         repo_manifest = self._read_json(workspace_dir / "repo_reference.json") or repo_manifest
+        readme_intake_payload = self._read_json(workspace_dir / "repo_readme_reproduction_intake.json")
         repo_manifest.update(
             {
                 "repo_file_index_file": str(repo_index.get("repo_file_index_file") or "repo_file_index.json"),
                 "readme_excerpt_file": repo_index.get("readme_excerpt_file"),
+                "readme_reproduction_intake_file": (
+                    "repo_readme_reproduction_intake.json" if readme_intake_payload else None
+                ),
                 "repo_history_candidates_file": repo_index.get("repo_history_candidates_file"),
                 "history_candidate_count": int(repo_index.get("history_candidate_count") or 0),
                 "indexed_file_count": int(repo_index.get("indexed_file_count") or 0),
@@ -636,6 +655,8 @@ class PaperExperimentAdapterService:
             "dependency_files": [],
             "readme_candidates": [],
             "readme_excerpt_file": None,
+            "readme_reproduction_intake_file": None,
+            "readme_reproduction_intake_status": "missing",
             "repo_history_candidates_file": None,
             "history_candidate_count": 0,
         }
@@ -700,6 +721,8 @@ class PaperExperimentAdapterService:
                 "dependency_files": dependency_files,
                 "readme_candidates": readme_candidates[:12],
                 "readme_excerpt_file": readme_excerpt_file,
+                "readme_reproduction_intake_file": None,
+                "readme_reproduction_intake_status": "pending",
                 "repo_history_candidates_file": repo_history_candidates_file,
                 "history_candidate_count": history_candidate_count,
             }
@@ -760,6 +783,65 @@ class PaperExperimentAdapterService:
             self._write_text(workspace_dir / file_name, excerpt + ("\n" if not excerpt.endswith("\n") else ""))
             return file_name
         return None
+
+    async def _materialize_repo_readme_reproduction_intake(
+        self,
+        *,
+        workspace_dir: Path,
+        repo_manifest: Dict[str, Any],
+        repo_index: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        repo_status = str(repo_manifest.get("status") or "").strip().lower()
+        repo_dir_text = str(repo_manifest.get("repo_dir") or "").strip()
+        repo_dir = Path(repo_dir_text) if repo_dir_text else None
+        if repo_status not in {"reused", "cloned", "archived"} or repo_dir is None or not repo_dir.is_dir():
+            repo_index["readme_reproduction_intake_file"] = None
+            repo_index["readme_reproduction_intake_status"] = "missing"
+            self._write_json(workspace_dir / "repo_file_index.json", repo_index)
+            return {"status": "missing", "file_name": None, "readme_relative_path": None}
+
+        readme_candidates = [
+            str(item).strip()
+            for item in list(repo_index.get("readme_candidates") or [])
+            if str(item or "").strip()
+        ]
+        if not readme_candidates:
+            repo_index["readme_reproduction_intake_file"] = None
+            repo_index["readme_reproduction_intake_status"] = "missing"
+            self._write_json(workspace_dir / "repo_file_index.json", repo_index)
+            return {"status": "missing", "file_name": None, "readme_relative_path": None}
+
+        for relative in readme_candidates[:3]:
+            try:
+                readme_text = (repo_dir / relative).read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if not readme_text:
+                continue
+            try:
+                payload = await RepoReadmeReproductionIntakeService().generate(
+                    repo_url=str(repo_manifest.get("repo_url") or "").strip() or None,
+                    readme_relative_path=relative,
+                    readme_text=readme_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[PaperExperimentAdapter] repo README reproduction intake failed: {exc}")
+                repo_index["readme_reproduction_intake_file"] = None
+                repo_index["readme_reproduction_intake_status"] = "failed"
+                self._write_json(workspace_dir / "repo_file_index.json", repo_index)
+                return {"status": "failed", "file_name": None, "readme_relative_path": relative}
+
+            file_name = "repo_readme_reproduction_intake.json"
+            self._write_json(workspace_dir / file_name, payload)
+            repo_index["readme_reproduction_intake_file"] = file_name
+            repo_index["readme_reproduction_intake_status"] = "ready"
+            self._write_json(workspace_dir / "repo_file_index.json", repo_index)
+            return {"status": "ready", "file_name": file_name, "readme_relative_path": relative}
+
+        repo_index["readme_reproduction_intake_file"] = None
+        repo_index["readme_reproduction_intake_status"] = "missing"
+        self._write_json(workspace_dir / "repo_file_index.json", repo_index)
+        return {"status": "missing", "file_name": None, "readme_relative_path": None}
 
     def _write_repo_history_candidates(
         self,
@@ -978,6 +1060,7 @@ class PaperExperimentAdapterService:
             "- `workspace_adapter_manifest.json`: repo/materialization status for this workspace.",
             "- `repo_reference.json`: resolved repo acquisition result.",
             "- `repo_file_index.json`: indexed repo files, dependency files, and entrypoint candidates.",
+            "- `repo_readme_reproduction_intake.json`: full-README LLM extraction of reproduction methods, commands, materials, and environment requirements.",
             "- `repo_history_url_candidates.json`: official repo history candidate URLs extracted from commit diffs when git history is available.",
             "",
             "## Resolved Signals",

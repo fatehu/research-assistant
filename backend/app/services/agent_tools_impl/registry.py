@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Callable, Type, Protocol, Mapping, Sequence, Literal
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, or_, and_, tuple_
@@ -44,13 +44,15 @@ from app.services.contextual_compression_service import (
     CompressionInput,
     get_contextual_compression_service,
 )
+from app.services.aider_cli_service import AiderCliService
 from app.services.agent_tool_error_contract import (
     build_tool_error_contract,
     merge_error_contract,
 )
-from app.services.html_page_semantics import analyze_html_page_semantics
+from app.services.html_page_semantics import analyze_html_page_semantics, resolve_html_probe_plan_with_llm
 from app.services.google_drive_utils import is_google_drive_url, probe_google_drive_confirm_download
 from app.services.smart_chunking.token_utils import estimate_tokens, tokens_to_chars
+from app.services.zoekt_cli_service import ZoektCliService
 
 # 尝试导入共享模块（可选）
 try:
@@ -1453,6 +1455,60 @@ class PaperResearchSearchRepoInput(BaseModel):
     context_lines: int = Field(default=0, ge=0, le=20)
 
 
+class PaperResearchBuildZoektIndexInput(BaseModel):
+    project_id: int = Field(ge=1)
+    force_reindex: bool = False
+
+
+class PaperResearchSearchRepoZoektInput(BaseModel):
+    project_id: int = Field(ge=1)
+    query: str = Field(min_length=1, max_length=800)
+    max_results: int = Field(default=20, ge=1, le=100)
+    context_lines: int = Field(default=0, ge=0, le=20)
+    auto_index: bool = True
+    force_reindex: bool = False
+
+
+class PaperResearchRunAiderInput(BaseModel):
+    project_id: int = Field(ge=1)
+    instruction: str = Field(min_length=1, max_length=12000)
+    target_root: Literal["repo", "workspace"] = "repo"
+    mode: Literal["code", "architect", "ask"] = "code"
+    editable_files: List[str] = Field(default_factory=list)
+    read_only_files: List[str] = Field(default_factory=list)
+    context_artifacts: List[str] = Field(default_factory=list)
+    llm_provider: Optional[str] = Field(default=None, max_length=64)
+    model_name: Optional[str] = Field(default=None, max_length=255)
+    editor_model: Optional[str] = Field(default=None, max_length=255)
+    weak_model: Optional[str] = Field(default=None, max_length=255)
+    edit_format: Optional[str] = Field(default=None, max_length=64)
+    editor_edit_format: Optional[str] = Field(default=None, max_length=64)
+    reasoning_effort: Optional[str] = Field(default=None, max_length=32)
+    dry_run: bool = False
+    map_tokens: Optional[int] = Field(default=None, ge=0, le=64000)
+    api_timeout_seconds: Optional[int] = Field(default=None, ge=30, le=3600)
+    auto_test: bool = False
+    test_cmd: Optional[str] = Field(default=None, max_length=2000)
+    auto_lint: bool = False
+    lint_cmds: List[str] = Field(default_factory=list)
+    allow_dirty_repo: bool = False
+
+
+class PaperResearchReadAiderRunInput(BaseModel):
+    project_id: int = Field(ge=1)
+    run_id: str = Field(min_length=1, max_length=128)
+    include_stdout: bool = True
+    include_prompt: bool = False
+    include_diff: bool = False
+    max_chars: int = Field(default=20000, ge=200, le=200000)
+
+
+class PaperResearchTailAiderLogInput(BaseModel):
+    project_id: int = Field(ge=1)
+    run_id: str = Field(min_length=1, max_length=128)
+    max_chars: int = Field(default=12000, ge=200, le=200000)
+
+
 class PaperResearchWriteImplementationSpecInput(BaseModel):
     project_id: int = Field(ge=1)
     implementation_spec: Dict[str, Any] = Field(default_factory=dict)
@@ -1737,6 +1793,12 @@ class _PaperResearchToolBase(ToolBase):
             "name": "repo_readme_excerpt",
             "content_type": "text",
             "actual_rel_path": "repo_readme_excerpt.md",
+        },
+        "repo/repo_readme_reproduction_intake.json": {
+            "kind": "repo",
+            "name": "repo_readme_reproduction_intake",
+            "content_type": "json",
+            "actual_rel_path": "repo_readme_reproduction_intake.json",
         },
         "meta/workspace_adapter_manifest.json": {
             "kind": "meta",
@@ -3033,7 +3095,7 @@ class _PaperResearchToolBase(ToolBase):
         if isinstance(raw_valid, bool):
             return raw_valid
         diagnosis = str(item.get("diagnosis") or "").strip().lower()
-        if diagnosis.startswith("valid_") or diagnosis in {"ready", "ok", "downloadable"}:
+        if diagnosis.startswith("valid_") or diagnosis in {"ready", "ok", "downloadable", "reference_page_ok", "followed_link_ok"}:
             return True
         if diagnosis in {
             "auth_required",
@@ -3047,6 +3109,9 @@ class _PaperResearchToolBase(ToolBase):
             "html_landing_page_for_file",
             "license_gate",
             "manual_download_required",
+            "follow_link_failed",
+            "follow_link_cycle",
+            "follow_depth_exceeded",
             "repo_unreachable",
             "repo_page_reachable_but_not_cloneable",
         }:
@@ -3412,6 +3477,7 @@ class _PaperResearchToolBase(ToolBase):
                                 "args": {
                                     "project_id": project_id,
                                     "url": url,
+                                    "expected_kind": "file",
                                     "resolve_download_gate": True,
                                 },
                             }
@@ -5566,6 +5632,555 @@ class PaperResearchSearchRepoTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
+class PaperResearchBuildZoektIndexTool(_PaperResearchToolBase):
+    name = "paper_research_build_zoekt_index"
+    input_model = PaperResearchBuildZoektIndexInput
+    parallel_safe = True
+    description = "为当前 Project 的 repo/source 构建或刷新 Zoekt 代码检索索引。适合在大仓库里做高质量代码检索前先建立索引。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "force_reindex": {"type": "boolean", "default": False, "description": "是否强制重建索引。"},
+        },
+        "required": ["project_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            force_reindex = bool(kwargs.get("force_reindex", False))
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+            assert project_payload is not None and workspace is not None and repo_dir is not None
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            payload = await ZoektCliService.build_index(
+                repo_dir=repo_dir,
+                workspace_dir=workspace_dir,
+                force_reindex=force_reindex,
+            )
+            if not bool(payload.get("success")):
+                error = str(payload.get("error") or "zoekt_index_failed")
+                return ToolResult(
+                    success=False,
+                    output=(
+                        "Zoekt 索引构建失败。\n"
+                        f"- Project: /projects/{project_id}\n"
+                        f"- Error: {error}\n"
+                        f"- Search binary: {payload.get('search_binary') or 'missing'}\n"
+                        f"- Git index binary: {payload.get('git_index_binary') or 'missing'}\n"
+                        f"- Plain index binary: {payload.get('plain_index_binary') or 'missing'}\n"
+                        f"- Stderr: {str(payload.get('stderr') or '').strip() or 'none'}"
+                    ),
+                    error=error,
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **dict(payload or {}),
+                    },
+                )
+
+            lines = [
+                "Zoekt 索引已就绪。",
+                f"- Project: /projects/{project_id}",
+                f"- Status: {payload.get('status')}",
+                f"- Engine: {payload.get('engine') or 'zoekt'}",
+                f"- Repo head: {payload.get('repo_head') or 'unknown'}",
+                f"- Repo dirty: {payload.get('repo_dirty')}",
+                f"- Index dir: {payload.get('index_dir')}",
+                f"- Index files: {payload.get('index_file_count')}",
+            ]
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchSearchRepoZoektTool(_PaperResearchToolBase):
+    name = "paper_research_search_repo_zoekt"
+    input_model = PaperResearchSearchRepoZoektInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = (
+        "使用 Zoekt 对 repo/source 做 trigram 代码检索。适合大仓库、跨文件搜索和高召回代码定位。"
+        "query 使用 Zoekt 查询语法，例如 `classification-results file:\\.sh$`。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "query": {"type": "string", "description": "Zoekt 查询语法，例如 `classify file:\\.py$` 或 `symbol:train`。"},
+            "max_results": {"type": "integer", "default": 20, "description": "最多返回多少条命中。范围 1-100。"},
+            "context_lines": {
+                "type": "integer",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 20,
+                "description": "命中点上下各返回多少行局部上下文。",
+            },
+            "auto_index": {"type": "boolean", "default": True, "description": "索引缺失时是否自动构建 Zoekt 索引。"},
+            "force_reindex": {"type": "boolean", "default": False, "description": "搜索前是否强制重建索引。"},
+        },
+        "required": ["project_id", "query"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            query = str(kwargs.get("query") or "").strip()
+            max_results = int(kwargs.get("max_results") or 20)
+            context_lines = int(kwargs.get("context_lines") or 0)
+            auto_index = bool(kwargs.get("auto_index", True))
+            force_reindex = bool(kwargs.get("force_reindex", False))
+            project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+            if repo_error is not None:
+                return repo_error
+            assert project_payload is not None and workspace is not None and repo_dir is not None
+
+            workspace_dir = self._workspace_dir_for(workspace)
+            index_payload: Dict[str, Any] = {}
+            if auto_index or force_reindex:
+                index_payload = await ZoektCliService.build_index(
+                    repo_dir=repo_dir,
+                    workspace_dir=workspace_dir,
+                    force_reindex=force_reindex,
+                )
+                if not bool(index_payload.get("success")):
+                    error = str(index_payload.get("error") or "zoekt_index_failed")
+                    return ToolResult(
+                        success=False,
+                        output=(
+                            "Zoekt 代码检索前的索引准备失败。\n"
+                            f"- Project: /projects/{project_id}\n"
+                            f"- Error: {error}\n"
+                            f"- Search binary: {index_payload.get('search_binary') or 'missing'}\n"
+                            f"- Git index binary: {index_payload.get('git_index_binary') or 'missing'}\n"
+                            f"- Plain index binary: {index_payload.get('plain_index_binary') or 'missing'}\n"
+                            f"- Stderr: {str(index_payload.get('stderr') or '').strip() or 'none'}"
+                        ),
+                        error=error,
+                        data={
+                            **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                            **dict(index_payload or {}),
+                        },
+                    )
+
+            search_payload = await ZoektCliService.search(
+                workspace_dir=workspace_dir,
+                query=query,
+                max_results=max_results,
+            )
+            if not bool(search_payload.get("success")):
+                error = str(search_payload.get("error") or "zoekt_search_failed")
+                if error == "zoekt_index_missing" and not auto_index:
+                    error_message = "Zoekt 索引不存在。请先调用 `paper_research_build_zoekt_index`，或把 auto_index 设为 true。"
+                else:
+                    error_message = (
+                        "Zoekt 代码检索失败。\n"
+                        f"- Error: {error}\n"
+                        f"- Search binary: {search_payload.get('search_binary') or 'missing'}\n"
+                        f"- Index dir: {search_payload.get('index_dir') or 'missing'}"
+                    )
+                return ToolResult(
+                    success=False,
+                    output=error_message,
+                    error=error,
+                    data={
+                        **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                        **dict(search_payload or {}),
+                    },
+                )
+
+            matches = list(search_payload.get("matches") or [])
+            if context_lines > 0:
+                enriched_matches: List[Dict[str, Any]] = []
+                for item in matches:
+                    line_number = int(item.get("line_number") or 0)
+                    if line_number > 0:
+                        enriched_matches.append(
+                            {
+                                **item,
+                                **self._build_repo_match_context(
+                                    repo_dir=repo_dir,
+                                    repo_relative_path=str(item.get("repo_relative_path") or ""),
+                                    line_number=line_number,
+                                    context_lines=context_lines,
+                                ),
+                            }
+                        )
+                    else:
+                        enriched_matches.append(dict(item))
+                matches = enriched_matches
+
+            result_lines: List[str] = []
+            for item in matches:
+                line_number = int(item.get("line_number") or 0)
+                score = float(item.get("score") or 0.0)
+                if line_number > 0:
+                    result_lines.append(
+                        f"- {item.get('relative_path')}:{line_number} | {item.get('line_text')} (score={score:.2f})"
+                    )
+                else:
+                    result_lines.append(
+                        f"- {item.get('relative_path')} | filename match (score={score:.2f})"
+                    )
+                context_text = str(item.get("context_text") or "").strip()
+                if context_text:
+                    result_lines.append(
+                        f"  context {item.get('context_start_line')}-{item.get('context_end_line')}:\n{context_text}"
+                    )
+            lines = [
+                "已使用 Zoekt 搜索 repo/source。",
+                f"- Project: /projects/{project_id}",
+                f"- Query: {query}",
+                f"- Auto index: {auto_index}",
+                f"- Force reindex: {force_reindex}",
+                f"- Index status: {index_payload.get('status') or 'unchanged'}",
+                f"- Index dir: {search_payload.get('index_dir')}",
+                f"- Context lines: {context_lines}",
+                f"- Matched files: {len(list(search_payload.get('matched_files') or []))}",
+                f"- Returned matches: {len(matches)}/{max_results}",
+                f"- Truncated: {bool(search_payload.get('truncated'))}",
+                "- Matches:",
+                *(result_lines or ["- none"]),
+            ]
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    "query": query,
+                    "context_lines": context_lines,
+                    "auto_index": auto_index,
+                    "force_reindex": force_reindex,
+                    "engine": "zoekt",
+                    "index_status": index_payload.get("status"),
+                    "index_dir": search_payload.get("index_dir"),
+                    "matched_file_count": len(list(search_payload.get("matched_files") or [])),
+                    "returned_matches": len(matches),
+                    "truncated": bool(search_payload.get("truncated")),
+                    "matches": matches,
+                    "matched_files": list(search_payload.get("matched_files") or []),
+                    "zoekt": {
+                        **dict(index_payload or {}),
+                        **dict(search_payload or {}),
+                    },
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchRunAiderTool(_PaperResearchToolBase):
+    name = "paper_research_run_aider"
+    input_model = PaperResearchRunAiderInput
+    output_max_tokens = 9000
+    description = (
+        "使用隔离安装的 aider CLI 对当前 Project 做受控编辑。"
+        "支持 `target_root=repo` 修改 repo/source，也支持 `target_root=workspace` 局部修改 planning/specs/drafts 下的 JSON/Markdown 产物。"
+        "优先把 `editable_files` 缩到最小；`read_only_files` 只提供上下文不允许修改；"
+        "`mode=architect` 适合多文件或 edit-format 容易失真的场景；"
+        "`dry_run=true` 只预演不落盘；`auto_test + test_cmd` 可在编辑后自动跑验证。"
+        "默认禁用 aider auto-commit，避免偷偷提交 git。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "instruction": {
+                "type": "string",
+                "description": "交给 aider 的单次自然语言任务说明。要求清楚写出目标、限制和验收标准。",
+            },
+            "target_root": {
+                "type": "string",
+                "enum": ["repo", "workspace"],
+                "default": "repo",
+                "description": "repo=在 repo/source 根目录运行 aider；workspace=在 Project workspace 根目录运行，并用 --no-git 允许局部改 JSON/MD truth files。",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["code", "architect", "ask"],
+                "default": "code",
+                "description": "code=直接编辑；architect=先规划再编辑，通常更稳；ask=以只读分析为主，适合修改前讨论或 dry_run。",
+            },
+            "editable_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "允许 aider 修改的相对路径列表。repo 模式下相对 repo/source；workspace 模式下相对 workspace 根。建议尽量小，减少上下文和误改范围。",
+            },
+            "read_only_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "只读上下文文件列表，加入 chat 但不允许修改。适合 README、schema、参考实现、关键配置等。",
+            },
+            "context_artifacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "把已有 workspace 归档产物内容拼进 prompt。支持 `paper_summary`、`paper_intake_result`、`experiment_spec`、`grounding_report`、`implementation_spec`、`run_drafts` 或直接给相对路径。",
+            },
+            "llm_provider": {
+                "type": "string",
+                "description": "可选，覆盖 aider 使用的 LLM provider。默认走当前后端默认 provider，并通过 OpenAI-compatible API 方式接入。",
+            },
+            "model_name": {"type": "string", "description": "可选，覆盖主模型。未显式写 provider 前缀时会自动按 openai-compatible 模型名处理。"},
+            "editor_model": {"type": "string", "description": "可选，architect 模式下的 editor model。"},
+            "weak_model": {"type": "string", "description": "可选，用于 commit message/history summarization 的弱模型。"},
+            "edit_format": {"type": "string", "description": "可选，覆盖 aider 主 edit format。"},
+            "editor_edit_format": {"type": "string", "description": "可选，覆盖 architect/editor 二段式里的 editor edit format。"},
+            "reasoning_effort": {"type": "string", "description": "可选，传给 aider 的 reasoning_effort 参数。仅在底层模型支持时才有意义。"},
+            "dry_run": {
+                "type": "boolean",
+                "default": False,
+                "description": "true 时只预演，不修改文件。适合先看 aider 会怎么动手。",
+            },
+            "map_tokens": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 64000,
+                "description": "可选，覆盖 aider repo map token budget。大仓库默认不宜过高。",
+            },
+            "api_timeout_seconds": {
+                "type": "integer",
+                "minimum": 30,
+                "maximum": 3600,
+                "description": "可选，单次模型 API timeout，作用于 aider 内部 LLM 请求。",
+            },
+            "auto_test": {
+                "type": "boolean",
+                "default": False,
+                "description": "是否在编辑后自动执行 test_cmd。",
+            },
+            "test_cmd": {
+                "type": "string",
+                "description": "可选，传给 aider 的测试命令，例如 `pytest backend/tests/test_x.py -q`。配合 auto_test=true 使用。",
+            },
+            "auto_lint": {
+                "type": "boolean",
+                "default": False,
+                "description": "是否在编辑后自动执行 lint_cmds。",
+            },
+            "lint_cmds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，传给 aider 的 lint commands。",
+            },
+            "allow_dirty_repo": {
+                "type": "boolean",
+                "default": False,
+                "description": "repo 模式下是否允许在已有未提交改动的工作树里继续运行 aider。默认 false，避免混入用户脏改动。",
+            },
+        },
+        "required": ["project_id", "instruction"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            target_root = str(kwargs.get("target_root") or "repo").strip().lower() or "repo"
+            if target_root == "repo":
+                project_payload, workspace, repo_dir, repo_error = await self._resolve_repo_workspace(db, project_id=project_id)
+                if repo_error is not None:
+                    return repo_error
+                assert project_payload is not None and workspace is not None and repo_dir is not None
+                workspace_dir = self._workspace_dir_for(workspace)
+            else:
+                project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+                if project_payload is None:
+                    return self._project_not_found(project_id)
+                if workspace is None:
+                    return self._workspace_not_ready(project_payload, project_id)
+                workspace_dir = self._workspace_dir_for(workspace)
+
+            payload = await AiderCliService.run(
+                workspace_dir=workspace_dir,
+                instruction=str(kwargs.get("instruction") or ""),
+                target_root=target_root,
+                editable_files=list(kwargs.get("editable_files") or []),
+                read_only_files=list(kwargs.get("read_only_files") or []),
+                context_artifacts=list(kwargs.get("context_artifacts") or []),
+                provider=str(kwargs.get("llm_provider") or settings.default_llm_provider or "").strip() or None,
+                model_name=str(kwargs.get("model_name") or "").strip() or None,
+                editor_model=str(kwargs.get("editor_model") or "").strip() or None,
+                weak_model=str(kwargs.get("weak_model") or "").strip() or None,
+                mode=str(kwargs.get("mode") or "code").strip() or "code",
+                edit_format=str(kwargs.get("edit_format") or "").strip() or None,
+                editor_edit_format=str(kwargs.get("editor_edit_format") or "").strip() or None,
+                reasoning_effort=str(kwargs.get("reasoning_effort") or "").strip() or None,
+                dry_run=bool(kwargs.get("dry_run", False)),
+                map_tokens=kwargs.get("map_tokens"),
+                api_timeout_seconds=kwargs.get("api_timeout_seconds"),
+                auto_test=bool(kwargs.get("auto_test", False)),
+                test_cmd=str(kwargs.get("test_cmd") or "").strip() or None,
+                auto_lint=bool(kwargs.get("auto_lint", False)),
+                lint_cmds=list(kwargs.get("lint_cmds") or []),
+                allow_dirty_repo=bool(kwargs.get("allow_dirty_repo", False)),
+            )
+
+            lines = [
+                "aider 已执行。",
+                f"- Project: /projects/{project_id}",
+                f"- Run ID: {payload.get('run_id')}",
+                f"- Target root: {payload.get('target_root')}",
+                f"- Mode: {payload.get('mode')}",
+                f"- Success: {bool(payload.get('success'))}",
+                f"- Dry run: {bool(payload.get('dry_run'))}",
+                f"- Changed files: {payload.get('changed_file_count')}",
+                f"- Run dir: {payload.get('run_dir')}",
+            ]
+            if payload.get("diff_path"):
+                lines.append(f"- Diff: {payload.get('diff_path')}")
+            if payload.get("stdout_path"):
+                lines.append(f"- Stdout: {payload.get('stdout_path')}")
+            if payload.get("error"):
+                lines.append(f"- Error: {payload.get('error')}")
+            excerpt = str(payload.get("stdout_excerpt") or "").strip()
+            if excerpt:
+                lines.extend(["Stdout excerpt:", excerpt])
+            return ToolResult(
+                success=bool(payload.get("success")),
+                output="\n".join(lines),
+                error=str(payload.get("error") or "") or None,
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                    "aider_run": {
+                        "run_id": payload.get("run_id"),
+                        "target_root": payload.get("target_root"),
+                        "mode": payload.get("mode"),
+                        "success": bool(payload.get("success")),
+                        "changed_file_count": int(payload.get("changed_file_count") or 0),
+                        "changed_files": list(payload.get("changed_files") or []),
+                    },
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchReadAiderRunTool(_PaperResearchToolBase):
+    name = "paper_research_read_aider_run"
+    input_model = PaperResearchReadAiderRunInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "读取已归档 aider run 的摘要、stdout、prompt 或 diff。适合在 run 后回看它到底改了什么、为什么失败。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "run_id": {"type": "string", "description": "aider run ID。"},
+            "include_stdout": {"type": "boolean", "default": True},
+            "include_prompt": {"type": "boolean", "default": False},
+            "include_diff": {"type": "boolean", "default": False},
+            "max_chars": {"type": "integer", "minimum": 200, "maximum": 200000, "default": 20000},
+        },
+        "required": ["project_id", "run_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+            payload = AiderCliService.read_run(
+                workspace_dir=self._workspace_dir_for(workspace),
+                run_id=str(kwargs.get("run_id") or "").strip(),
+                include_stdout=bool(kwargs.get("include_stdout", True)),
+                include_prompt=bool(kwargs.get("include_prompt", False)),
+                include_diff=bool(kwargs.get("include_diff", False)),
+                max_chars=int(kwargs.get("max_chars") or 20000),
+            )
+            lines = [
+                "已读取 aider run。",
+                f"- Project: /projects/{project_id}",
+                f"- Run ID: {payload.get('run_id') or kwargs.get('run_id')}",
+                f"- Success: {bool(payload.get('success'))}",
+            ]
+            if payload.get("error"):
+                lines.append(f"- Error: {payload.get('error')}")
+            if payload.get("message"):
+                lines.append(f"- Message: {payload.get('message')}")
+            if payload.get("stdout"):
+                lines.extend(["Stdout:", str(payload.get("stdout") or "")])
+            if payload.get("diff"):
+                lines.extend(["Diff:", str(payload.get("diff") or "")])
+            if payload.get("prompt"):
+                lines.extend(["Prompt:", str(payload.get("prompt") or "")])
+            return ToolResult(
+                success=bool(payload.get("success")),
+                output="\n".join(lines),
+                error=str(payload.get("error") or "") or None,
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
+class PaperResearchTailAiderLogTool(_PaperResearchToolBase):
+    name = "paper_research_tail_aider_log"
+    input_model = PaperResearchTailAiderLogInput
+    parallel_safe = True
+    output_max_tokens = 9000
+    description = "快速读取 aider stdout 日志尾部。适合看最近一次编辑 run 的错误、模型拒绝、edit format 失败等。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project_id": {"type": "integer", "description": "研究项目 ID。"},
+            "run_id": {"type": "string", "description": "aider run ID。"},
+            "max_chars": {"type": "integer", "minimum": 200, "maximum": 200000, "default": 12000},
+        },
+        "required": ["project_id", "run_id"],
+    }
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        async def _handler(db: AsyncSession) -> ToolResult:
+            project_id = int(kwargs["project_id"])
+            project_payload, workspace = await self._resolve_project_workspace(db, project_id=project_id)
+            if project_payload is None:
+                return self._project_not_found(project_id)
+            if workspace is None:
+                return self._workspace_not_ready(project_payload, project_id)
+            payload = AiderCliService.tail_log(
+                workspace_dir=self._workspace_dir_for(workspace),
+                run_id=str(kwargs.get("run_id") or "").strip(),
+                max_chars=int(kwargs.get("max_chars") or 12000),
+            )
+            lines = [
+                "已读取 aider 日志尾部。",
+                f"- Project: /projects/{project_id}",
+                f"- Run ID: {payload.get('run_id') or kwargs.get('run_id')}",
+            ]
+            if payload.get("error"):
+                lines.append(f"- Error: {payload.get('error')}")
+            if payload.get("message"):
+                lines.append(f"- Message: {payload.get('message')}")
+            if payload.get("tail"):
+                lines.extend(["Log tail:", str(payload.get("tail") or "")])
+            return ToolResult(
+                success=bool(payload.get("success")),
+                output="\n".join(lines),
+                error=str(payload.get("error") or "") or None,
+                data={
+                    **self._root_descriptor(project_payload=project_payload, workspace=workspace),
+                    **dict(payload or {}),
+                },
+            )
+
+        return await self._with_db(_handler)
+
+
 class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
     name = "paper_research_assess_repo_mainpath"
     input_model = PaperResearchAssessRepoMainpathInput
@@ -5612,6 +6227,73 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
             seen.add(key)
             deduped.append(key)
         return deduped[:12]
+
+    @staticmethod
+    def _extract_readme_intake_commands(payload: Dict[str, Any]) -> List[str]:
+        commands: List[str] = []
+        for item in list(payload.get("run_commands") or []):
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command") or "").strip()
+            if command:
+                commands.append(command)
+        for item in list(payload.get("installation_steps") or []):
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command") or "").strip()
+            if command:
+                commands.append(command)
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for item in commands:
+            if item and item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped[:12]
+
+    @staticmethod
+    def _extract_readme_intake_path_hints(payload: Dict[str, Any]) -> List[str]:
+        hints: List[str] = []
+        for item in list(payload.get("entrypoints") or []):
+            if not isinstance(item, dict):
+                continue
+            hint = str(item.get("path_or_hint") or "").strip()
+            if hint:
+                hints.append(hint)
+        for item in list(payload.get("run_commands") or []):
+            if not isinstance(item, dict):
+                continue
+            hint = str(item.get("entrypoint_path_or_hint") or "").strip()
+            if hint:
+                hints.append(hint)
+        for item in list(payload.get("focus_files") or []):
+            text = str(item or "").strip()
+            if text:
+                hints.append(text)
+        return hints[:20]
+
+    @staticmethod
+    def _extract_readme_intake_evidence(payload: Dict[str, Any]) -> List[str]:
+        evidence: List[str] = []
+        for item in list(payload.get("evidence_snippets") or []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                evidence.append(text)
+        for item in list(payload.get("run_commands") or []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("evidence_text") or "").strip()
+            if text:
+                evidence.append(text)
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for item in evidence:
+            if item and item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped[:8]
 
     @staticmethod
     def _classify_mainpath(path: str) -> str:
@@ -5711,6 +6393,9 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
             repo_index = self._read_json_file(workspace_dir / "repo_file_index.json")
             repo_reference = self._read_json_file(workspace_dir / "repo_reference.json")
             experiment_spec = self._read_json_file(workspace_dir / "experiment_spec.json")
+            readme_intake = self._read_json_file(
+                workspace_dir / str(repo_index.get("readme_reproduction_intake_file") or "repo_readme_reproduction_intake.json")
+            )
             readme_excerpt = ""
             excerpt_path = workspace_dir / str(repo_index.get("readme_excerpt_file") or "repo_readme_excerpt.md")
             if excerpt_path.is_file():
@@ -5724,6 +6409,7 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                 for item in list(experiment_spec.get("entrypoint_hints") or [])
                 if isinstance(item, dict)
             ]
+            hint_tokens.extend(self._normalize_hint_token(item) for item in self._extract_readme_intake_path_hints(readme_intake))
             hint_tokens = [item for item in hint_tokens if item]
 
             repo_files = [str(item).strip() for item in list(repo_index.get("files") or []) if str(item).strip()]
@@ -5747,7 +6433,9 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                 deduped_paths.append(key)
 
             scored_candidates: List[Dict[str, Any]] = []
-            readme_commands = self._extract_readme_commands(readme_excerpt)
+            readme_commands = self._extract_readme_intake_commands(readme_intake)
+            if not readme_commands:
+                readme_commands = self._extract_readme_commands(readme_excerpt)
             for path in deduped_paths:
                 score, reasons, cautions, evidence_excerpts = self._score_mainpath_candidate(
                     path=path,
@@ -5755,6 +6443,8 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                     readme_commands=readme_commands,
                     readme_text=readme_excerpt,
                 )
+                if evidence_excerpts:
+                    evidence_excerpts = list(dict.fromkeys([*evidence_excerpts, *self._extract_readme_intake_evidence(readme_intake)]))
                 if score <= 0:
                     continue
                 scored_candidates.append(
@@ -5796,6 +6486,7 @@ class PaperResearchAssessRepoMainpathTool(_PaperResearchToolBase):
                 f"- Repo URL: {repo_reference.get('repo_url') or 'unknown'}",
                 f"- Status: {status}",
                 f"- README commands: {len(readme_commands)}",
+                f"- README intake: {bool(readme_intake)}",
                 f"- Candidate count: {len(scored_candidates)}",
             ]
             if selected_candidate:
@@ -6405,6 +7096,10 @@ class PaperResearchWriteGroundingReportTool(_PaperResearchToolBase):
                     "如果把一组 dataset/external URLs 声明为 grounded，必须为每个必要官方链接提供成功的 probe 结果，"
                     "或明确证明本地已存在。canonical 结构中 `dataset.sources` 保存数据源，"
                     "`external_dependencies.urls` 只放 URL 字符串，`external_dependencies.probe_results` 单独保存逐条 probe 结果。"
+                    "每条 `external_dependencies.probe_results` 至少应包含 `url` 与布尔 `ok`，可附带 `status_code/content_type/detected_kind/diagnosis/page_kind`。"
+                    "如果 probe 结果是 `gdrive_confirm_required`、`download_gate`、Google Drive virus-scan warning，或脚本已能自动处理 confirm gate，这表示官方链接仍然存活且可恢复；"
+                    "此时不要把 `dataset.status` / `external_dependencies.status` 写成 `blocked`，也不要把它重写成 `not_found`。"
+                    "只有明确 `not_found` / `access_denied` / `quota_limited` / `http_4xx` 这类终态时，才应把对应 section 写成 `blocked`。"
                     "blocked 场景应把失败原因写进各 section 的 `blockers`/`blocker_details`，并把替代源候选写进 "
                     "`dataset.alternative_source_candidates` 或 `external_dependencies.alternative_source_candidates`。"
                 ),
@@ -6561,15 +7256,6 @@ class PaperResearchWriteImplementationSpecTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
-            grounding_gate = self._grounding_gate_state(workspace_dir)
-            if not bool(grounding_gate.get("ready")):
-                return self._grounding_gate_result(
-                    project_payload=project_payload,
-                    workspace=workspace,
-                    stage_name="implementation_prep",
-                    action_label="写入 implementation_spec",
-                    gate_state=grounding_gate,
-                )
             relative_path = "specs/implementation_spec.json"
             actual_path = workspace_dir / "specs" / "implementation_spec.json"
             payload = dict(kwargs.get("implementation_spec") or {})
@@ -6704,6 +7390,10 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
         "校验并归档 implementation-spec 派生出的 run drafts JSON 到当前 Project 工作区。"
         "每个 draft 必须使用当前 schema：id/title/objective/entrypoint{type,path_or_hint}/"
         "depends_on/data_requirements/env_requirements/params/expected_outputs/blockers/evidence_files/grounding_notes。"
+        "repo_script/notebook/config 只能引用已经存在的 repo 文件；README 里的手工步骤或命令摘要应写成 "
+        "readme_command/dataset_step/manual_step，不要伪造一个 repo_script。"
+        "这里的 repo_script 只表示“真实存在的 repo 文件”，并不等于 execution_spec 阶段一定使用 "
+        "execution_intent.repo_script；如果该文件是可执行 shell 脚本，execution 阶段通常应直接写 argv。"
     )
     parameters = {
         "type": "object",
@@ -6716,6 +7406,13 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
                     "readme_command/dataset_step/manual_step/unknown。"
                     "repo_script/notebook/config 必须提供 repo-relative 的 entrypoint.path_or_hint，例如 seq2seq.py。"
                     "evidence_files 必须是 canonical artifact 路径，例如 repo/source/seq2seq.py 或 specs/implementation_spec.json。"
+                    "如果当前动作只是“按 README 运行某条命令”或“先下载数据再执行”，优先用 readme_command/dataset_step/manual_step；"
+                    "不要把尚未存在的 wrapper 脚本名填成 repo_script。"
+                    "无效示例：entrypoint.type=repo_script 且 path_or_hint=classification-results-ag-news-only.sh（仓库里并不存在）。"
+                    "有效示例：entrypoint.type=repo_script,path_or_hint=classification-results.sh；"
+                    "或 entrypoint.type=readme_command,path_or_hint='run classification-results.sh after make'。"
+                    "注意：如果该 repo_script 是 shell 脚本，execution_spec 阶段应直接写 argv，如 "
+                    "[\"./classification-results.sh\"]，不要把它误翻译成 Python repo_script intent。"
                 ),
             },
         },
@@ -6732,15 +7429,6 @@ class PaperResearchWriteRunDraftsTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
-            grounding_gate = self._grounding_gate_state(workspace_dir)
-            if not bool(grounding_gate.get("ready")):
-                return self._grounding_gate_result(
-                    project_payload=project_payload,
-                    workspace=workspace,
-                    stage_name="run_drafts",
-                    action_label="写入 run_drafts",
-                    gate_state=grounding_gate,
-                )
             relative_path = "drafts/run_drafts.json"
             actual_path = workspace_dir / "drafts" / "run_drafts.json"
             payload = dict(kwargs.get("run_drafts") or {})
@@ -7084,7 +7772,9 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
     timeout_seconds = 45.0
     description = (
         "对论文流程中的官方下载链接或外部文档链接做轻量测活。"
-        "只读取响应头和极小字节片段，不执行真实下载。"
+        "如果直接命中文件流，会立即确认；如果返回 HTML 页，会先做页面语义解析并在小范围内继续 resolve 页面中的候选下载/资源链接，再给出最终标记。"
+        "Google Drive 的 confirm/virus-scan/download gate 页面应视为“官方链接存活但仍需确认步骤”，不是 dead link；只有明确 not_found/access_denied/quota 等终态才算 blocked。"
+        "只读取响应头、极小字节片段和少量 HTML 内容，不执行真实下载。"
     )
     parameters = {
         "type": "object",
@@ -7095,13 +7785,13 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "type": "string",
                 "enum": ["auto", "html", "file", "hdf5", "zip", "json", "text"],
                 "default": "auto",
-                "description": "期望拿到的内容类型，用于判断官方链接是否已失效或落到错误页面。",
+                "description": "期望拿到的内容类型。对 README/项目页/文档页优先用 html；对数据集、模型权重、压缩包、Google Drive 下载门页这类真实下载链接优先用 file。只有在你明确需要证明特定文件格式时才用 hdf5/zip/json/text；否则不要把 .tar.gz / gzip 这类可下载文件误判成 zip 失败。",
             },
             "read_bytes": {"type": "integer", "default": 64, "description": "最多读取多少字节用于 magic-bytes 判断。范围 8-512；不会下载整个文件。"},
             "resolve_download_gate": {
                 "type": "boolean",
                 "default": False,
-                "description": "仅当探到下载门页/确认页时显式设为 true。开启后会尝试解析 Google Drive confirm/cookie/download-form，把门页继续解析成真实文件流验证；默认 false。",
+                "description": "仅当探到下载门页/确认页时显式设为 true。开启后会尝试解析 Google Drive confirm/cookie/download-form，把门页继续解析成真实文件流验证；若结果是 gdrive_confirm_required / download_gate / virus-scan warning，应把它当作“链接存活、仍需确认步骤”，而不是 dead link。普通 HTML 参考页会自动做一次内部 resolve，不需要依赖这个开关。",
             },
         },
         "required": ["project_id", "url"],
@@ -7137,166 +7827,352 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 "User-Agent": "Mozilla/5.0 (paper-research-probe)",
                 "Accept": "*/*",
             }
-            head_status = None
-            get_status = None
-            final_url = url
-            content_type = ""
-            content_length = None
-            head_bytes = b""
-            request_error = None
-            page_semantics: Optional[Dict[str, Any]] = None
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
-                try:
-                    head_response = await client.head(url)
-                    head_status = int(head_response.status_code)
-                    final_url = str(head_response.url)
-                    content_type = str(head_response.headers.get("content-type") or "")
-                    raw_content_length = str(head_response.headers.get("content-length") or "").strip()
-                    content_length = int(raw_content_length) if raw_content_length.isdigit() else None
-                except Exception as exc:  # noqa: BLE001
-                    request_error = f"HEAD {type(exc).__name__}: {exc}"
+                async def _fetch_probe_snapshot(target_url: str, *, allow_gate_resolution: bool) -> Dict[str, Any]:
+                    head_status = None
+                    get_status = None
+                    final_target_url = target_url
+                    content_type = ""
+                    content_length = None
+                    head_bytes = b""
+                    request_error = None
+                    page_semantics: Optional[Dict[str, Any]] = None
+                    html_text = ""
 
-                try:
-                    async with client.stream("GET", url, headers={"Range": f"bytes=0-{read_bytes - 1}"}) as response:
-                        get_status = int(response.status_code)
-                        final_url = str(response.url)
-                        if not content_type:
-                            content_type = str(response.headers.get("content-type") or "")
-                        raw_content_length = str(response.headers.get("content-length") or "").strip()
-                        if content_length is None and raw_content_length.isdigit():
-                            content_length = int(raw_content_length)
-                        async for chunk in response.aiter_bytes():
-                            if chunk:
-                                remaining = read_bytes - len(head_bytes)
-                                head_bytes += chunk[:remaining]
-                            if len(head_bytes) >= read_bytes:
-                                break
-                except Exception as exc:  # noqa: BLE001
-                    if request_error:
-                        request_error = f"{request_error}; GET {type(exc).__name__}: {exc}"
-                    else:
-                        request_error = f"GET {type(exc).__name__}: {exc}"
-
-                initial_kind = self._classify_magic_bytes(head_bytes, content_type)
-                if is_google_drive_url(final_url or url) and initial_kind == "html":
                     try:
-                        html_response = await client.get(url)
+                        head_response = await client.head(target_url)
+                        head_status = int(head_response.status_code)
+                        final_target_url = str(head_response.url)
+                        content_type = str(head_response.headers.get("content-type") or "")
+                        raw_content_length = str(head_response.headers.get("content-length") or "").strip()
+                        content_length = int(raw_content_length) if raw_content_length.isdigit() else None
+                    except Exception as exc:  # noqa: BLE001
+                        request_error = f"HEAD {type(exc).__name__}: {exc}"
+
+                    try:
+                        async with client.stream("GET", target_url, headers={"Range": f"bytes=0-{read_bytes - 1}"}) as response:
+                            get_status = int(response.status_code)
+                            final_target_url = str(response.url)
+                            if not content_type:
+                                content_type = str(response.headers.get("content-type") or "")
+                            raw_content_length = str(response.headers.get("content-length") or "").strip()
+                            if content_length is None and raw_content_length.isdigit():
+                                content_length = int(raw_content_length)
+                            async for chunk in response.aiter_bytes():
+                                if chunk:
+                                    remaining = read_bytes - len(head_bytes)
+                                    head_bytes += chunk[:remaining]
+                                if len(head_bytes) >= read_bytes:
+                                    break
                     except Exception as exc:  # noqa: BLE001
                         if request_error:
-                            request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                            request_error = f"{request_error}; GET {type(exc).__name__}: {exc}"
                         else:
-                            request_error = f"HTML {type(exc).__name__}: {exc}"
-                    else:
-                        page_semantics = await analyze_html_page_semantics(
-                            html_response.text or "",
-                            url=url,
-                            final_url=str(html_response.url),
-                            content_type=str(html_response.headers.get("content-type") or content_type or ""),
-                            source="agent_tools_impl.probe_url_html_semantics",
-                        )
-                    if resolve_download_gate:
+                            request_error = f"GET {type(exc).__name__}: {exc}"
+
+                    initial_kind = self._classify_magic_bytes(head_bytes, content_type)
+                    if is_google_drive_url(final_target_url or target_url) and initial_kind == "html":
                         try:
-                            confirmed = await probe_google_drive_confirm_download(
-                                client=client,
-                                url=url,
-                                read_bytes=read_bytes,
-                            )
+                            html_response = await client.get(target_url)
                         except Exception as exc:  # noqa: BLE001
                             if request_error:
-                                request_error = f"{request_error}; GDRIVE {type(exc).__name__}: {exc}"
+                                request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
                             else:
-                                request_error = f"GDRIVE {type(exc).__name__}: {exc}"
+                                request_error = f"HTML {type(exc).__name__}: {exc}"
                         else:
-                            if confirmed:
-                                get_status = int(confirmed.get("status_code") or get_status or 0) or get_status
-                                final_url = str(confirmed.get("final_url") or final_url or url)
-                                content_type = str(confirmed.get("content_type") or content_type or "")
-                                if confirmed.get("content_length") is not None:
-                                    content_length = confirmed.get("content_length")
-                                head_bytes = bytes(confirmed.get("head_bytes") or b"")
-                elif initial_kind == "html":
-                    try:
-                        html_response = await client.get(url)
-                    except Exception as exc:  # noqa: BLE001
-                        if request_error:
-                            request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                            html_text = html_response.text or ""
+                            page_semantics = await analyze_html_page_semantics(
+                                html_text,
+                                url=target_url,
+                                final_url=str(html_response.url),
+                                content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                                source="agent_tools_impl.probe_url_html_semantics",
+                            )
+                        if allow_gate_resolution:
+                            try:
+                                confirmed = await probe_google_drive_confirm_download(
+                                    client=client,
+                                    url=target_url,
+                                    read_bytes=read_bytes,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                if request_error:
+                                    request_error = f"{request_error}; GDRIVE {type(exc).__name__}: {exc}"
+                                else:
+                                    request_error = f"GDRIVE {type(exc).__name__}: {exc}"
+                            else:
+                                if confirmed:
+                                    get_status = int(confirmed.get("status_code") or get_status or 0) or get_status
+                                    final_target_url = str(confirmed.get("final_url") or final_target_url or target_url)
+                                    content_type = str(confirmed.get("content_type") or content_type or "")
+                                    if confirmed.get("content_length") is not None:
+                                        content_length = confirmed.get("content_length")
+                                    head_bytes = bytes(confirmed.get("head_bytes") or b"")
+                    elif initial_kind == "html":
+                        try:
+                            html_response = await client.get(target_url)
+                        except Exception as exc:  # noqa: BLE001
+                            if request_error:
+                                request_error = f"{request_error}; HTML {type(exc).__name__}: {exc}"
+                            else:
+                                request_error = f"HTML {type(exc).__name__}: {exc}"
                         else:
-                            request_error = f"HTML {type(exc).__name__}: {exc}"
-                    else:
-                        page_semantics = await analyze_html_page_semantics(
-                            html_response.text or "",
-                            url=url,
-                            final_url=str(html_response.url),
-                            content_type=str(html_response.headers.get("content-type") or content_type or ""),
-                            source="agent_tools_impl.probe_url_html_semantics",
-                        )
+                            html_text = html_response.text or ""
+                            page_semantics = await analyze_html_page_semantics(
+                                html_text,
+                                url=target_url,
+                                final_url=str(html_response.url),
+                                content_type=str(html_response.headers.get("content-type") or content_type or ""),
+                                source="agent_tools_impl.probe_url_html_semantics",
+                            )
 
-            detected_kind = self._classify_magic_bytes(head_bytes, content_type)
-            ok, downloadable, diagnosis, suggested_next_action = self._probe_url_diagnosis(
-                status_code=get_status or head_status,
-                content_length=content_length,
-                detected_kind=detected_kind,
-                expected_kind=expected_kind,
-                head_bytes=head_bytes,
-            )
-            if diagnosis == "html_page" and is_google_drive_url(final_url or url):
-                diagnosis = "gdrive_confirm_required"
-                suggested_next_action = (
-                    "download_with_confirm_cookie_helper"
-                    if resolve_download_gate
-                    else "retry_with_resolve_download_gate"
-                )
-            if page_semantics and detected_kind == "html":
-                semantic_diagnosis = str(page_semantics.get("diagnosis") or "").strip()
-                semantic_next_action = str(page_semantics.get("suggested_next_action") or "").strip()
-                if semantic_diagnosis:
-                    diagnosis = semantic_diagnosis
-                if semantic_next_action:
-                    suggested_next_action = semantic_next_action
-            if (
-                is_google_drive_url(final_url or url)
-                and diagnosis in {"download_gate", "gdrive_confirm_required", "html_page"}
-                and not resolve_download_gate
-            ):
-                suggested_next_action = "retry_with_resolve_download_gate"
-            status_code = get_status or head_status
-            reachable = bool(status_code is not None and int(status_code) < 400)
-            usable = bool(ok) or (
-                detected_kind == "html"
-                and str(page_semantics.get("page_kind") or "") == "reference_page"
-                and expected_kind in {"auto", "html", "text"}
-            )
+                    detected_kind = self._classify_magic_bytes(head_bytes, content_type)
+                    direct_ok, direct_downloadable, direct_diagnosis, direct_next_action = self._probe_url_diagnosis(
+                        status_code=get_status or head_status,
+                        content_length=content_length,
+                        detected_kind=detected_kind,
+                        expected_kind=expected_kind,
+                        head_bytes=head_bytes,
+                    )
+                    if direct_diagnosis == "html_page" and is_google_drive_url(final_target_url or target_url):
+                        direct_diagnosis = "gdrive_confirm_required"
+                        direct_next_action = (
+                            "download_with_confirm_cookie_helper"
+                            if allow_gate_resolution
+                            else "retry_with_resolve_download_gate"
+                        )
+                    if (
+                        is_google_drive_url(final_target_url or target_url)
+                        and direct_diagnosis in {"download_gate", "gdrive_confirm_required", "html_page"}
+                        and not allow_gate_resolution
+                    ):
+                        direct_next_action = "retry_with_resolve_download_gate"
+
+                    return {
+                        "target_url": target_url,
+                        "head_status": head_status,
+                        "status_code": get_status or head_status,
+                        "final_url": final_target_url,
+                        "content_type": content_type or None,
+                        "content_length": content_length,
+                        "head_bytes": head_bytes,
+                        "request_error": request_error,
+                        "page_semantics": page_semantics,
+                        "html_text": html_text,
+                        "detected_kind": detected_kind,
+                        "direct_ok": bool(direct_ok),
+                        "direct_downloadable": bool(direct_downloadable),
+                        "direct_diagnosis": direct_diagnosis,
+                        "direct_next_action": direct_next_action,
+                    }
+
+                async def _resolve_probe_target(
+                    target_url: str,
+                    *,
+                    depth: int,
+                    visited: Set[str],
+                    trace: List[Dict[str, Any]],
+                ) -> Dict[str, Any]:
+                    snapshot = await _fetch_probe_snapshot(target_url, allow_gate_resolution=resolve_download_gate)
+                    current_url = str(snapshot.get("final_url") or target_url or "")
+                    visited.add(current_url or target_url)
+                    status_code = snapshot.get("status_code")
+                    reachable = bool(status_code is not None and int(status_code) < 400)
+                    detected_kind = str(snapshot.get("detected_kind") or "")
+                    page_semantics = dict(snapshot.get("page_semantics") or {})
+                    direct_ok = bool(snapshot.get("direct_ok"))
+                    direct_downloadable = bool(snapshot.get("direct_downloadable"))
+                    direct_diagnosis = str(snapshot.get("direct_diagnosis") or "")
+                    direct_next_action = str(snapshot.get("direct_next_action") or "")
+
+                    trace_entry = {
+                        "depth": int(depth),
+                        "url": target_url,
+                        "final_url": current_url or target_url,
+                        "status_code": status_code,
+                        "detected_kind": detected_kind,
+                        "page_kind": str(page_semantics.get("page_kind") or ""),
+                        "diagnosis": direct_diagnosis or str(page_semantics.get("diagnosis") or ""),
+                    }
+
+                    if detected_kind != "html":
+                        trace_entry["resolution"] = "direct_file_ok" if direct_ok else "direct_probe_failed"
+                        trace.append(trace_entry)
+                        return {
+                            **snapshot,
+                            "reachable": reachable,
+                            "usable": bool(direct_ok),
+                            "ok": bool(direct_ok),
+                            "downloadable": bool(direct_downloadable),
+                            "direct_file_ok": bool(direct_ok),
+                            "diagnosis": direct_diagnosis,
+                            "suggested_next_action": direct_next_action,
+                            "reason": direct_diagnosis,
+                            "resolution_status": "direct_file_ok" if direct_ok else "direct_probe_failed",
+                            "resolution_trace": list(trace),
+                            "resolved_target_url": current_url or target_url,
+                            "resolved_target_kind": detected_kind,
+                            "resolved_status_code": status_code,
+                            "resolved_content_type": snapshot.get("content_type"),
+                            "resolved_content_length": snapshot.get("content_length"),
+                            "resolved_downloadable": bool(direct_downloadable),
+                            "resolved_via": "direct",
+                            "html_resolution": None,
+                        }
+
+                    resolution = await resolve_html_probe_plan_with_llm(
+                        str(snapshot.get("html_text") or ""),
+                        url=target_url,
+                        final_url=current_url or target_url,
+                        content_type=str(snapshot.get("content_type") or ""),
+                        expected_kind=expected_kind,
+                        source="agent_tools_impl.probe_url_html_resolver",
+                        semantics=page_semantics,
+                    )
+                    resolution_status = str(resolution.get("resolution") or "").strip().lower() or "blocked"
+                    selected_follow_url = str(
+                        resolution.get("selected_absolute_url")
+                        or urljoin(current_url or target_url, str(resolution.get("selected_href") or ""))
+                    ).strip()
+                    final_diagnosis = str(resolution.get("diagnosis") or direct_diagnosis or page_semantics.get("diagnosis") or "")
+                    final_next_action = str(
+                        resolution.get("suggested_next_action")
+                        or direct_next_action
+                        or page_semantics.get("suggested_next_action")
+                        or ""
+                    )
+                    final_reason = str(resolution.get("reason") or page_semantics.get("rationale") or final_diagnosis or "")
+
+                    trace_entry["resolution"] = resolution_status
+                    if selected_follow_url:
+                        trace_entry["selected_follow_url"] = selected_follow_url
+                    trace.append(trace_entry)
+
+                    if (
+                        resolution_status == "follow_link"
+                        and selected_follow_url
+                        and depth < 2
+                        and selected_follow_url not in visited
+                    ):
+                        child = await _resolve_probe_target(
+                            selected_follow_url,
+                            depth=depth + 1,
+                            visited=visited,
+                            trace=trace,
+                        )
+                        child_ok = bool(child.get("ok"))
+                        return {
+                            **snapshot,
+                            "reachable": reachable,
+                            "usable": child_ok,
+                            "ok": child_ok,
+                            "downloadable": bool(child.get("downloadable")),
+                            "direct_file_ok": False,
+                            "diagnosis": "followed_link_ok" if child_ok else (str(child.get("diagnosis") or final_diagnosis or "follow_link_failed")),
+                            "suggested_next_action": "use_followed_resource" if child_ok else (str(child.get("suggested_next_action") or final_next_action or "")),
+                            "reason": str(child.get("reason") or final_reason),
+                            "resolution_status": "followed_link_ok" if child_ok else "follow_link_failed",
+                            "resolution_trace": list(trace),
+                            "resolved_target_url": str(child.get("resolved_target_url") or child.get("final_url") or selected_follow_url),
+                            "resolved_target_kind": str(child.get("resolved_target_kind") or child.get("detected_kind") or ""),
+                            "resolved_status_code": child.get("resolved_status_code", child.get("status_code")),
+                            "resolved_content_type": child.get("resolved_content_type", child.get("content_type")),
+                            "resolved_content_length": child.get("resolved_content_length", child.get("content_length")),
+                            "resolved_downloadable": bool(child.get("resolved_downloadable", child.get("downloadable"))),
+                            "resolved_via": "follow_link",
+                            "html_resolution": resolution,
+                        }
+
+                    ok = resolution_status == "reference_page_ok"
+                    if resolution_status == "follow_link" and selected_follow_url and selected_follow_url in visited:
+                        final_diagnosis = "follow_link_cycle"
+                        final_next_action = "inspect_before_execute"
+                        final_reason = "页面建议继续跟随的链接已访问过，停止循环探测。"
+                        resolution_status = "blocked"
+                        ok = False
+                    elif resolution_status == "follow_link" and selected_follow_url and depth >= 2:
+                        final_diagnosis = "follow_depth_exceeded"
+                        final_next_action = "inspect_before_execute"
+                        final_reason = "HTML 探活已达到内部跳转上限，停止继续跟随。"
+                        resolution_status = "blocked"
+                        ok = False
+                    elif resolution_status not in {"reference_page_ok"}:
+                        ok = False
+
+                    return {
+                        **snapshot,
+                        "reachable": reachable,
+                        "usable": bool(ok),
+                        "ok": bool(ok),
+                        "downloadable": False,
+                        "direct_file_ok": False,
+                        "diagnosis": final_diagnosis,
+                        "suggested_next_action": final_next_action,
+                        "reason": final_reason,
+                        "resolution_status": resolution_status,
+                        "resolution_trace": list(trace),
+                        "resolved_target_url": current_url or target_url,
+                        "resolved_target_kind": "html",
+                        "resolved_status_code": status_code,
+                        "resolved_content_type": snapshot.get("content_type"),
+                        "resolved_content_length": snapshot.get("content_length"),
+                        "resolved_downloadable": False,
+                        "resolved_via": "html_resolution",
+                        "html_resolution": resolution,
+                    }
+
+                resolved = await _resolve_probe_target(url, depth=0, visited=set(), trace=[])
+
             payload = {
                 **self._root_descriptor(project_payload=project_payload, workspace=workspace),
                 "project_id": project_id,
                 "url": url,
                 "expected_kind": expected_kind,
                 "resolve_download_gate": resolve_download_gate,
-                "head_status": head_status,
-                "status_code": status_code,
-                "final_url": final_url,
-                "content_type": content_type or None,
-                "content_length": content_length,
-                "reachable": reachable,
-                "usable": usable,
+                "head_status": resolved.get("head_status"),
+                "status_code": resolved.get("status_code"),
+                "final_url": resolved.get("final_url"),
+                "content_type": resolved.get("content_type"),
+                "content_length": resolved.get("content_length"),
+                "reachable": bool(resolved.get("reachable")),
+                "usable": bool(resolved.get("usable")),
                 "paper_aligned": None,
-                "reason": str(page_semantics.get("rationale") or diagnosis or "") if page_semantics else str(diagnosis or ""),
-                "downloadable": bool(downloadable),
-                "ok": bool(ok),
-                "detected_kind": detected_kind,
-                "magic_bytes_hex": head_bytes[:16].hex() or None,
-                "magic_bytes_ascii": head_bytes[:32].decode("utf-8", errors="replace") if head_bytes else "",
-                "diagnosis": diagnosis,
-                "suggested_next_action": suggested_next_action,
-                "request_error": request_error,
-                "page_title": str(page_semantics.get("title") or "") if page_semantics else "",
-                "page_kind": str(page_semantics.get("page_kind") or "") if page_semantics else "",
-                "page_signals": list(page_semantics.get("signals") or []) if page_semantics else [],
-                "page_text_excerpt": str(page_semantics.get("text_excerpt") or "") if page_semantics else "",
-                "page_links": list(page_semantics.get("links") or [])[:6] if page_semantics else [],
-                "page_forms": list(page_semantics.get("forms") or [])[:4] if page_semantics else [],
-                "page_semantics_source": str(page_semantics.get("classification_source") or "") if page_semantics else "",
-                "page_semantics_rationale": str(page_semantics.get("rationale") or "") if page_semantics else "",
+                "reason": str(resolved.get("reason") or ""),
+                "downloadable": bool(resolved.get("downloadable")),
+                "direct_downloadable": bool(resolved.get("direct_downloadable")),
+                "ok": bool(resolved.get("ok")),
+                "direct_file_ok": bool(resolved.get("direct_file_ok")),
+                "detected_kind": str(resolved.get("detected_kind") or ""),
+                "magic_bytes_hex": bytes(resolved.get("head_bytes") or b"")[:16].hex() or None,
+                "magic_bytes_ascii": (
+                    bytes(resolved.get("head_bytes") or b"")[:32].decode("utf-8", errors="replace")
+                    if resolved.get("head_bytes")
+                    else ""
+                ),
+                "diagnosis": str(resolved.get("diagnosis") or ""),
+                "suggested_next_action": str(resolved.get("suggested_next_action") or ""),
+                "request_error": resolved.get("request_error"),
+                "page_title": str((resolved.get("page_semantics") or {}).get("title") or ""),
+                "page_kind": str((resolved.get("page_semantics") or {}).get("page_kind") or ""),
+                "page_signals": list((resolved.get("page_semantics") or {}).get("signals") or []),
+                "page_text_excerpt": str((resolved.get("page_semantics") or {}).get("text_excerpt") or ""),
+                "page_links": list((resolved.get("page_semantics") or {}).get("links") or [])[:6],
+                "page_forms": list((resolved.get("page_semantics") or {}).get("forms") or [])[:4],
+                "page_semantics_source": str((resolved.get("page_semantics") or {}).get("classification_source") or ""),
+                "page_semantics_rationale": str((resolved.get("page_semantics") or {}).get("rationale") or ""),
+                "resolution_status": str(resolved.get("resolution_status") or ""),
+                "resolved_target_url": str(resolved.get("resolved_target_url") or ""),
+                "resolved_target_kind": str(resolved.get("resolved_target_kind") or ""),
+                "resolved_status_code": resolved.get("resolved_status_code"),
+                "resolved_content_type": resolved.get("resolved_content_type"),
+                "resolved_content_length": resolved.get("resolved_content_length"),
+                "resolved_downloadable": bool(resolved.get("resolved_downloadable")),
+                "resolved_via": str(resolved.get("resolved_via") or ""),
+                "resolution_trace": list(resolved.get("resolution_trace") or []),
+                "html_resolution": dict(resolved.get("html_resolution") or {}) if isinstance(resolved.get("html_resolution"), dict) else None,
+            }
+            payload = {
+                **payload,
             }
             lines = [
                 "已探测外部 URL 存活状态。",
@@ -7305,11 +8181,12 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                 f"- Status: {payload.get('status_code')}",
                 f"- Content-Type: {payload.get('content_type') or 'unknown'}",
                 f"- Content-Length: {payload.get('content_length') if payload.get('content_length') is not None else 'unknown'}",
-                f"- Reachable: {reachable}",
-                f"- Usable: {usable}",
-                f"- Detected kind: {detected_kind}",
+                f"- Reachable: {payload.get('reachable')}",
+                f"- Usable: {payload.get('usable')}",
+                f"- Detected kind: {payload.get('detected_kind')}",
                 f"- Downloadable: {payload['downloadable']}",
-                f"- Diagnosis: {diagnosis}",
+                f"- Diagnosis: {payload.get('diagnosis')}",
+                f"- Resolution status: {payload.get('resolution_status') or 'unknown'}",
                 f"- Resolve download gate: {resolve_download_gate}",
             ]
             if payload.get("page_title"):
@@ -7322,17 +8199,21 @@ class PaperResearchProbeUrlTool(_PaperResearchToolBase):
                     lines.append(f"- Page signals: {signals_preview}")
             if payload.get("page_text_excerpt"):
                 lines.append(f"- Page text excerpt: {payload.get('page_text_excerpt')[:300]}")
-            if suggested_next_action:
-                lines.append(f"- Suggested next action: {suggested_next_action}")
+            if payload.get("resolved_target_url") and payload.get("resolved_target_url") != payload.get("final_url"):
+                lines.append(f"- Resolved target URL: {payload.get('resolved_target_url')}")
+            if payload.get("resolved_target_kind"):
+                lines.append(f"- Resolved target kind: {payload.get('resolved_target_kind')}")
+            if payload.get("suggested_next_action"):
+                lines.append(f"- Suggested next action: {payload.get('suggested_next_action')}")
             if payload.get("page_semantics_rationale"):
                 lines.append(f"- Rationale: {payload.get('page_semantics_rationale')}")
-            if request_error:
-                lines.append(f"- Request error: {request_error}")
+            if payload.get("request_error"):
+                lines.append(f"- Request error: {payload.get('request_error')}")
             return ToolResult(
-                success=bool(ok),
+                success=bool(payload.get("ok")),
                 output="\n".join(lines),
                 data=payload,
-                error=None if ok else "url_probe_failed",
+                error=None if payload.get("ok") else "url_probe_failed",
             )
 
         return await self._with_db(_handler)
@@ -7362,6 +8243,14 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                     "并应显式给出 relative_path；如果误写成 path/file_path/filename/name，writer 会尝试吸收。"
                     "generated_files 只能写入 executions、generated 或 tmp 下的执行级文件，不能覆盖 repo/source。"
                     "execution_intent 与原始 command/cwd/input_notebook 不能混用。"
+                    "如果 runtime_type 是 plain-python/dockerfile/docker_compose/repo2docker/devcontainer，"
+                    "command 必须是直接 argv 数组，例如 [\"python\",\"train.py\",\"--epochs\",\"5\"] 或 "
+                    "[\"./classification-results.sh\"]；"
+                    "不要传 [\"bash\",\"-lc\",\"...\"]、here-doc、source venv && python ... 这类 shell wrapper。"
+                    "execution_intent.entrypoint_type=repo_script 适用于 Python repo 文件；"
+                    "如果真实入口是可执行 shell 脚本，请直接用 argv 调它，不要把 .sh 填成 repo_script。"
+                    "如果你确实需要 wrapper 脚本，先调用 paper_research_write_execution_script 把脚本写到 "
+                    "executions/{execution_id}/...，再在 execution_spec 里通过 execution_intent 或直接 argv 引用它。"
                 ),
             },
         },
@@ -7380,15 +8269,6 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
-            grounding_gate = self._grounding_gate_state(workspace_dir)
-            if not bool(grounding_gate.get("ready")):
-                return self._grounding_gate_result(
-                    project_payload=project_payload,
-                    workspace=workspace,
-                    stage_name="execution",
-                    action_label="写入 execution_spec",
-                    gate_state=grounding_gate,
-                )
             try:
                 saved = ProjectRuntimeService().write_execution_spec(
                     workspace_dir=workspace_dir,
@@ -7398,9 +8278,22 @@ class PaperResearchWriteExecutionSpecTool(_PaperResearchToolBase):
                     execution_spec=dict(kwargs.get("execution_spec") or {}),
                 )
             except ValueError as exc:
+                detail = str(exc)
+                guidance = ""
+                lowered = detail.lower()
+                if "shell wrapper commands are not allowed" in lowered:
+                    guidance = (
+                        " 合法写法示例：Python repo 文件可用 "
+                        "`execution_intent={\"runtime_type\":\"plain-python\",\"entrypoint_type\":\"repo_script\","
+                        "\"entrypoint_path\":\"train.py\",\"args\":[\"--epochs\",\"5\"]}`；"
+                        "可执行 shell 脚本可直接用 "
+                        "`command=[\"./classification-results.sh\"]`。"
+                        "只有在你确实需要新 wrapper/辅助程序时，才先调用 "
+                        "`paper_research_write_execution_script` 再引用它。"
+                    )
                 return ToolResult(
                     success=False,
-                    output=f"execution_spec 无效，未写入: {exc}",
+                    output=f"execution_spec 无效，未写入: {detail}.{guidance}",
                     error="execution_spec_invalid",
                     data={
                         **self._root_descriptor(project_payload=project_payload, workspace=workspace),
@@ -7466,15 +8359,6 @@ class PaperResearchWriteExecutionScriptTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
-            grounding_gate = self._grounding_gate_state(workspace_dir)
-            if not bool(grounding_gate.get("ready")):
-                return self._grounding_gate_result(
-                    project_payload=project_payload,
-                    workspace=workspace,
-                    stage_name="execution",
-                    action_label="写入 execution 脚本",
-                    gate_state=grounding_gate,
-                )
             try:
                 saved = ProjectRuntimeService().write_execution_generated_file(
                     workspace_dir=workspace_dir,
@@ -7657,15 +8541,6 @@ class PaperResearchStartExecutionTool(_PaperResearchToolBase):
                 return self._workspace_not_ready(project_payload, project_id)
 
             workspace_dir = self._workspace_dir_for(workspace)
-            grounding_gate = self._grounding_gate_state(workspace_dir)
-            if not bool(grounding_gate.get("ready")):
-                return self._grounding_gate_result(
-                    project_payload=project_payload,
-                    workspace=workspace,
-                    stage_name="execution",
-                    action_label="启动 execution",
-                    gate_state=grounding_gate,
-                )
 
             service = ProjectRuntimeService()
             spec_content: Dict[str, Any] = {}
@@ -9806,6 +10681,21 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                         ),
                         PaperResearchGitShowTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchRunAiderTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchReadAiderRunTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                        ),
+                        PaperResearchTailAiderLogTool(
                             ctx.db,
                             int(ctx.user_id),
                             db_session_factory=ctx.db_session_factory,

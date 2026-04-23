@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.services.agent_tools_impl import registry as agent_tools
+from app.services.project_runtime_service import ProjectRuntimeService
 from app.services.project_service import ProjectService
 
 
@@ -230,10 +231,21 @@ async def test_probe_url_requires_explicit_resolve_download_gate_for_google_driv
             "confirm_token_present": True,
         }
 
+    async def _fake_resolver(*args, **kwargs):
+        return {
+            "resolution": "blocked",
+            "diagnosis": "download_gate",
+            "suggested_next_action": "retry_with_resolve_download_gate",
+            "reason": "Google Drive 门页，需要显式打开 resolve_download_gate。",
+            "confidence": 0.99,
+            "page_semantics": kwargs.get("semantics") or {},
+        }
+
     monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
     monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
     monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
     monkeypatch.setattr(agent_tools, "probe_google_drive_confirm_download", _fake_confirm_download)
+    monkeypatch.setattr(agent_tools, "resolve_html_probe_plan_with_llm", _fake_resolver)
 
     base_kwargs = {
         "project_id": 7,
@@ -259,6 +271,245 @@ async def test_probe_url_requires_explicit_resolve_download_gate_for_google_driv
     assert with_resolve.data["resolve_download_gate"] is True
     assert with_resolve.data["reachable"] is True
     assert with_resolve.data["usable"] is True
+
+
+@pytest.mark.asyncio
+async def test_probe_url_accepts_reference_page_after_html_resolution(monkeypatch):
+    tool = agent_tools.PaperResearchProbeUrlTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    class _Response:
+        def __init__(self, *, status_code, url, headers, text=""):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+            self.text = text
+
+    class _StreamResponse:
+        def __init__(self, *, status_code, url, headers, body: bytes):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_bytes(self):
+            yield self._body
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def head(self, url):
+            return _Response(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+            )
+
+        def stream(self, method, url, headers=None):
+            del method, headers
+            return _StreamResponse(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+                body=b"<!DOCTYPE html><html><title>Datasets \xc2\xb7 fastText</title><body>download</body></html>",
+            )
+
+        async def get(self, url):
+            return _Response(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+                text=(
+                    "<!DOCTYPE html><html><head><title>Datasets · fastText</title></head>"
+                    "<body><h1>Datasets</h1><a href=\"/docs/en/crawl-vectors.html\">Download YFCC100M Dataset</a></body></html>"
+                ),
+            )
+
+    async def _fake_page_semantics(*args, **kwargs):
+        return {
+            "title": "Datasets · fastText",
+            "page_kind": "reference_page",
+            "signals": ["documentation"],
+            "text_excerpt": "Datasets Download YFCC100M Dataset",
+            "classification_source": "heuristic",
+            "rationale": "文档页，列出了可进一步探索的数据集条目。",
+            "diagnosis": "html_page",
+            "suggested_next_action": "use_as_reference_page",
+            "links": [{"text": "Download YFCC100M Dataset", "href": "/docs/en/crawl-vectors.html"}],
+            "forms": [],
+        }
+
+    async def _fake_resolver(*args, **kwargs):
+        return {
+            "resolution": "reference_page_ok",
+            "diagnosis": "reference_page_ok",
+            "suggested_next_action": "use_as_reference_page",
+            "reason": "这是官方文档索引页，可作为后续下载探索的参考页。",
+            "confidence": 0.93,
+            "page_semantics": kwargs.get("semantics") or {},
+        }
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
+    monkeypatch.setattr(agent_tools, "resolve_html_probe_plan_with_llm", _fake_resolver)
+
+    result = await tool._execute(
+        project_id=7,
+        url="https://fasttext.cc/docs/en/dataset.html",
+        expected_kind="auto",
+    )
+
+    assert result.success is True
+    assert result.data["ok"] is True
+    assert result.data["usable"] is True
+    assert result.data["diagnosis"] == "reference_page_ok"
+    assert result.data["resolution_status"] == "reference_page_ok"
+    assert result.data["resolved_target_kind"] == "html"
+    assert result.data["downloadable"] is False
+
+
+@pytest.mark.asyncio
+async def test_probe_url_can_follow_html_page_link_until_file_resolves(monkeypatch):
+    tool = agent_tools.PaperResearchProbeUrlTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    docs_url = "https://fasttext.cc/docs/en/dataset.html"
+    file_url = "https://fasttext.cc/data/wiki-news-300d-1M.vec.zip"
+
+    class _Response:
+        def __init__(self, *, status_code, url, headers, text=""):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+            self.text = text
+
+    class _StreamResponse:
+        def __init__(self, *, status_code, url, headers, body: bytes):
+            self.status_code = status_code
+            self.url = url
+            self.headers = headers
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_bytes(self):
+            yield self._body
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def head(self, url):
+            if url == docs_url:
+                return _Response(
+                    status_code=200,
+                    url=url,
+                    headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+                )
+            return _Response(
+                status_code=200,
+                url=url,
+                headers={"content-type": "application/zip", "content-length": "4096"},
+            )
+
+        def stream(self, method, url, headers=None):
+            del method, headers
+            if url == docs_url:
+                return _StreamResponse(
+                    status_code=200,
+                    url=url,
+                    headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+                    body=b"<!DOCTYPE html><html><title>Datasets \xc2\xb7 fastText</title><body>download</body></html>",
+                )
+            return _StreamResponse(
+                status_code=206,
+                url=url,
+                headers={"content-type": "application/zip", "content-length": "4096"},
+                body=b"PK\x03\x04zip-data",
+            )
+
+        async def get(self, url):
+            assert url == docs_url
+            return _Response(
+                status_code=200,
+                url=url,
+                headers={"content-type": "text/html; charset=utf-8", "content-length": "2048"},
+                text=(
+                    "<!DOCTYPE html><html><head><title>Datasets · fastText</title></head>"
+                    f"<body><a href=\"{file_url}\">Download vectors</a></body></html>"
+                ),
+            )
+
+    async def _fake_page_semantics(*args, **kwargs):
+        return {
+            "title": "Datasets · fastText",
+            "page_kind": "reference_page",
+            "signals": ["documentation"],
+            "text_excerpt": "Download vectors",
+            "classification_source": "heuristic",
+            "rationale": "文档页，包含明确下载链接。",
+            "diagnosis": "html_page",
+            "suggested_next_action": "follow_selected_link",
+            "links": [{"text": "Download vectors", "href": file_url}],
+            "forms": [],
+        }
+
+    async def _fake_resolver(*args, **kwargs):
+        return {
+            "resolution": "follow_link",
+            "selected_href": file_url,
+            "selected_absolute_url": file_url,
+            "diagnosis": "follow_candidate_found",
+            "suggested_next_action": "follow_selected_link",
+            "reason": "页面给出了明确的压缩包下载链接。",
+            "confidence": 0.96,
+            "page_semantics": kwargs.get("semantics") or {},
+        }
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(agent_tools.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(agent_tools, "analyze_html_page_semantics", _fake_page_semantics)
+    monkeypatch.setattr(agent_tools, "resolve_html_probe_plan_with_llm", _fake_resolver)
+
+    result = await tool._execute(project_id=7, url=docs_url, expected_kind="auto")
+
+    assert result.success is True
+    assert result.data["ok"] is True
+    assert result.data["diagnosis"] == "followed_link_ok"
+    assert result.data["resolution_status"] == "followed_link_ok"
+    assert result.data["resolved_target_url"] == file_url
+    assert result.data["resolved_target_kind"] == "zip"
+    assert result.data["resolved_downloadable"] is True
 
 
 @pytest.mark.asyncio
@@ -310,7 +561,7 @@ async def test_paper_research_git_tools_surface_repo_state(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_grounding_incomplete_blocks_implementation_and_execution_tools(tmp_path, monkeypatch):
+async def test_repo_first_tools_do_not_require_grounding_report(tmp_path, monkeypatch):
     project_payload = _project_payload()
     workspace = _workspace()
 
@@ -321,12 +572,14 @@ async def test_grounding_incomplete_blocks_implementation_and_execution_tools(tm
     implementation_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
     monkeypatch.setattr(implementation_tool, "_resolve_project_workspace", _resolve_project_workspace)
     monkeypatch.setattr(implementation_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    repo_dir = tmp_path / "repo" / "source"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
     implementation_result = await implementation_tool._execute(
         project_id=7,
         implementation_spec={"source_summary": {}, "baseline": {}, "repo_plan": {}, "runtime_snapshot": {}, "data_plan": {}, "tuning_plan": {}, "readiness": {}},
     )
-    assert implementation_result.success is False
-    assert implementation_result.error == "grounding_incomplete"
+    assert implementation_result.success is True
 
     execution_spec_tool = agent_tools.PaperResearchWriteExecutionSpecTool(db=object(), user_id=1)
     monkeypatch.setattr(execution_spec_tool, "_resolve_project_workspace", _resolve_project_workspace)
@@ -335,8 +588,7 @@ async def test_grounding_incomplete_blocks_implementation_and_execution_tools(tm
         project_id=7,
         execution_spec={"execution_id": "baseline", "runtime_type": "plain-python", "command": [sys.executable, "main.py"], "cwd": "repo/source"},
     )
-    assert execution_spec_result.success is False
-    assert execution_spec_result.error == "grounding_incomplete"
+    assert execution_spec_result.success is True
 
     execution_script_tool = agent_tools.PaperResearchWriteExecutionScriptTool(db=object(), user_id=1)
     monkeypatch.setattr(execution_script_tool, "_resolve_project_workspace", _resolve_project_workspace)
@@ -347,19 +599,43 @@ async def test_grounding_incomplete_blocks_implementation_and_execution_tools(tm
         relative_path="variant.py",
         content="print('hi')\n",
     )
-    assert execution_script_result.success is False
-    assert execution_script_result.error == "grounding_incomplete"
+    assert execution_script_result.success is True
+
+    ProjectRuntimeService().write_execution_spec(
+        workspace_dir=tmp_path,
+        project_id=7,
+        workspace_id=int(workspace.id),
+        notebook_id=str(workspace.notebook_id or ""),
+        execution_spec={
+            "execution_id": "baseline-start",
+            "runtime_type": "plain-python",
+            "command": [sys.executable, "main.py"],
+            "cwd": "repo/source",
+        },
+    )
+
+    async def _fake_start_execution(self, *, project_id: int, workspace_id: int, workspace_dir, execution_id: str):
+        assert project_id == 7
+        assert workspace_id == int(workspace.id)
+        assert execution_id == "baseline-start"
+        return {
+            "execution_id": execution_id,
+            "status": "running",
+            "runtime_type": "plain-python",
+            "background_execution": {"execution_id": execution_id, "stage": "baseline_repro"},
+        }
+
+    monkeypatch.setattr(ProjectRuntimeService, "start_execution", _fake_start_execution)
 
     start_tool = agent_tools.PaperResearchStartExecutionTool(db=object(), user_id=1)
     monkeypatch.setattr(start_tool, "_resolve_project_workspace", _resolve_project_workspace)
     monkeypatch.setattr(start_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
-    start_result = await start_tool._execute(project_id=7, execution_id="baseline")
-    assert start_result.success is False
-    assert start_result.error == "grounding_incomplete"
+    start_result = await start_tool._execute(project_id=7, execution_id="baseline-start")
+    assert start_result.success is True
 
 
 @pytest.mark.asyncio
-async def test_grounding_blocked_is_complete_but_still_blocks_execution_tools(tmp_path, monkeypatch):
+async def test_repo_first_tools_do_not_stop_at_blocked_grounding_report(tmp_path, monkeypatch):
     project_payload = _project_payload()
     workspace = _workspace()
 
@@ -377,15 +653,23 @@ async def test_grounding_blocked_is_complete_but_still_blocks_execution_tools(tm
     implementation_tool = agent_tools.PaperResearchWriteImplementationSpecTool(db=object(), user_id=1)
     monkeypatch.setattr(implementation_tool, "_resolve_project_workspace", _resolve_project_workspace)
     monkeypatch.setattr(implementation_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    repo_dir = tmp_path / "repo" / "source"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
     implementation_result = await implementation_tool._execute(
         project_id=7,
         implementation_spec={"source_summary": {}, "baseline": {}, "repo_plan": {}, "runtime_snapshot": {}, "data_plan": {}, "tuning_plan": {}, "readiness": {}},
     )
-    assert implementation_result.success is False
-    assert implementation_result.error == "grounding_blocked"
-    assert implementation_result.data["grounding_complete"] is True
-    assert implementation_result.data["grounding_ready"] is False
-    assert implementation_result.data["run_decision"] == "blocked"
+    assert implementation_result.success is True
+
+    execution_spec_tool = agent_tools.PaperResearchWriteExecutionSpecTool(db=object(), user_id=1)
+    monkeypatch.setattr(execution_spec_tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(execution_spec_tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    execution_spec_result = await execution_spec_tool._execute(
+        project_id=7,
+        execution_spec={"execution_id": "blocked-grounding-baseline", "runtime_type": "plain-python", "command": [sys.executable, "main.py"], "cwd": "repo/source"},
+    )
+    assert execution_spec_result.success is True
 
 
 @pytest.mark.asyncio
@@ -443,6 +727,297 @@ async def test_assess_repo_mainpath_prefers_readme_commands_and_entrypoint_hints
     assert result.data["top_candidates"][0]["path"] == "classification-results.sh"
     assert result.data["top_candidates"][0]["evidence_excerpts"]
     assert any(item["path"] == "alignment/example.sh" and item.get("why_not_selected") for item in result.data["top_candidates"])
+
+
+@pytest.mark.asyncio
+async def test_assess_repo_mainpath_uses_readme_reproduction_intake_when_available(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchAssessRepoMainpathTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+
+    repo_dir = tmp_path / "paper_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "classification-results.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (repo_dir / "train.py").write_text("print('train')\n", encoding="utf-8")
+    (tmp_path / "repo_reference.json").write_text(
+        json.dumps({"repo_url": "https://github.com/facebookresearch/fastText.git"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "repo_file_index.json").write_text(
+        json.dumps(
+            {
+                "readme_reproduction_intake_file": "repo_readme_reproduction_intake.json",
+                "files": ["classification-results.sh", "train.py", "README.md"],
+                "entrypoint_candidates": [{"path": "train.py"}, {"path": "classification-results.sh"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "repo_readme_reproduction_intake.json").write_text(
+        json.dumps(
+            {
+                "run_commands": [
+                    {
+                        "command": "bash classification-results.sh",
+                        "entrypoint_path_or_hint": "classification-results.sh",
+                        "evidence_text": "bash classification-results.sh",
+                    }
+                ],
+                "entrypoints": [
+                    {
+                        "path_or_hint": "classification-results.sh",
+                        "kind": "script",
+                        "evidence_text": "classification-results.sh",
+                    }
+                ],
+                "focus_files": ["classification-results.sh"],
+                "evidence_snippets": [{"topic": "run", "text": "bash classification-results.sh"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "experiment_spec.json").write_text(json.dumps({"entrypoint_hints": []}), encoding="utf-8")
+
+    result = await tool._execute(project_id=7)
+
+    assert result.success is True
+    assert result.data["selected_main_path"]["path"] == "classification-results.sh"
+    assert result.data["readme_main_commands"][0] == "bash classification-results.sh"
+
+
+@pytest.mark.asyncio
+async def test_build_zoekt_index_tool_returns_manifest_payload(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchBuildZoektIndexTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    repo_dir = tmp_path / "paper_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _fake_build_index(*, repo_dir, workspace_dir, force_reindex=False):
+        assert repo_dir == tmp_path / "paper_repo"
+        assert workspace_dir == tmp_path
+        return {
+            "success": True,
+            "available": True,
+            "status": "created",
+            "engine": "zoekt-git-index",
+            "repo_head": "abc123",
+            "repo_dirty": False,
+            "index_dir": str(tmp_path / ".zoekt" / "index"),
+            "manifest_path": str(tmp_path / ".zoekt" / "manifest.json"),
+            "index_file_count": 1,
+            "search_binary": "/usr/local/bin/zoekt",
+            "git_index_binary": "/usr/local/bin/zoekt-git-index",
+            "plain_index_binary": "/usr/local/bin/zoekt-index",
+        }
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    monkeypatch.setattr(agent_tools.ZoektCliService, "build_index", _fake_build_index)
+
+    result = await tool._execute(project_id=7, force_reindex=False)
+
+    assert result.success is True
+    assert result.data["status"] == "created"
+    assert result.data["index_file_count"] == 1
+    assert "Zoekt 索引已就绪" in result.output
+
+
+@pytest.mark.asyncio
+async def test_search_repo_zoekt_tool_enriches_context_from_repo_files(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchSearchRepoZoektTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    repo_dir = tmp_path / "paper_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "classification-results.sh").write_text(
+        "#!/usr/bin/env bash\nset -e\nbash classification-results.sh --dry-run\n",
+        encoding="utf-8",
+    )
+
+    async def _fake_build_index(*, repo_dir, workspace_dir, force_reindex=False):
+        assert repo_dir == tmp_path / "paper_repo"
+        assert workspace_dir == tmp_path
+        return {
+            "success": True,
+            "available": True,
+            "status": "created",
+            "index_dir": str(tmp_path / ".zoekt" / "index"),
+            "search_binary": "/usr/local/bin/zoekt",
+            "git_index_binary": "/usr/local/bin/zoekt-git-index",
+            "plain_index_binary": "/usr/local/bin/zoekt-index",
+        }
+
+    async def _fake_search(*, workspace_dir, query, max_results):
+        assert workspace_dir == tmp_path
+        assert query == "classification-results"
+        assert max_results == 5
+        return {
+            "success": True,
+            "available": True,
+            "engine": "zoekt",
+            "query": query,
+            "index_dir": str(tmp_path / ".zoekt" / "index"),
+            "manifest_path": str(tmp_path / ".zoekt" / "manifest.json"),
+            "matched_files": ["classification-results.sh"],
+            "truncated": False,
+            "matches": [
+                {
+                    "repo_relative_path": "classification-results.sh",
+                    "relative_path": "repo/source/classification-results.sh",
+                    "line_number": 3,
+                    "line_text": "bash classification-results.sh --dry-run",
+                    "line_fragments": [{"line_offset": 5, "match_length": 22, "text": "classification-results"}],
+                    "match_source": "content",
+                    "score": 12.5,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    monkeypatch.setattr(agent_tools.ZoektCliService, "build_index", _fake_build_index)
+    monkeypatch.setattr(agent_tools.ZoektCliService, "search", _fake_search)
+
+    result = await tool._execute(project_id=7, query="classification-results", max_results=5, context_lines=1)
+
+    assert result.success is True
+    assert result.data["engine"] == "zoekt"
+    assert result.data["matches"][0]["repo_relative_path"] == "classification-results.sh"
+    assert "context 2-3" in result.output
+    assert "classification-results.sh --dry-run" in result.output
+
+
+@pytest.mark.asyncio
+async def test_run_aider_tool_repo_mode_delegates_to_service(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchRunAiderTool(db=object(), user_id=1)
+
+    async def _resolve_repo_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace(), tmp_path / "paper_repo", None
+
+    monkeypatch.setattr(tool, "_resolve_repo_workspace", _resolve_repo_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+
+    captured = {}
+
+    async def _fake_run(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "run_id": "run123",
+            "run_dir": str(tmp_path / "aider_runs" / "run123"),
+            "target_root": "repo",
+            "mode": "architect",
+            "dry_run": False,
+            "changed_file_count": 1,
+            "changed_files": ["foo.py"],
+            "stdout_path": str(tmp_path / "aider_runs" / "run123" / "stdout.log"),
+            "stdout_excerpt": "updated foo.py",
+            "diff_path": str(tmp_path / "aider_runs" / "run123" / "changes.patch"),
+        }
+
+    monkeypatch.setattr(agent_tools.AiderCliService, "run", _fake_run)
+
+    result = await tool._execute(
+        project_id=7,
+        instruction="Update foo.py.",
+        target_root="repo",
+        mode="architect",
+        editable_files=["foo.py"],
+        read_only_files=["README.md"],
+        context_artifacts=["paper_summary"],
+        llm_provider="openai",
+        model_name="gpt-4o-mini",
+        auto_test=True,
+        test_cmd="pytest -q",
+    )
+
+    assert result.success is True
+    assert captured["workspace_dir"] == tmp_path
+    assert captured["target_root"] == "repo"
+    assert captured["editable_files"] == ["foo.py"]
+    assert captured["read_only_files"] == ["README.md"]
+    assert captured["context_artifacts"] == ["paper_summary"]
+    assert result.data["aider_run"]["run_id"] == "run123"
+    assert result.data["aider_run"]["changed_files"] == ["foo.py"]
+    assert "updated foo.py" in result.output
+
+
+@pytest.mark.asyncio
+async def test_read_aider_run_tool_returns_archived_payload(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchReadAiderRunTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    monkeypatch.setattr(
+        agent_tools.AiderCliService,
+        "read_run",
+        lambda **kwargs: {
+            "success": True,
+            "run_id": kwargs["run_id"],
+            "stdout": "aider stdout",
+            "diff": "--- a/foo.py\n+++ b/foo.py\n",
+            "prompt": "fix foo",
+        },
+    )
+
+    result = await tool._execute(
+        project_id=7,
+        run_id="run123",
+        include_stdout=True,
+        include_prompt=True,
+        include_diff=True,
+    )
+
+    assert result.success is True
+    assert result.data["run_id"] == "run123"
+    assert "aider stdout" in result.output
+    assert "+++ b/foo.py" in result.output
+    assert "fix foo" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tail_aider_log_tool_returns_tail(tmp_path, monkeypatch):
+    tool = agent_tools.PaperResearchTailAiderLogTool(db=object(), user_id=1)
+
+    async def _resolve_project_workspace(_db, *, project_id: int):
+        assert project_id == 7
+        return _project_payload(), _workspace()
+
+    monkeypatch.setattr(tool, "_resolve_project_workspace", _resolve_project_workspace)
+    monkeypatch.setattr(tool, "_workspace_dir_for", lambda _workspace_obj: tmp_path)
+    monkeypatch.setattr(
+        agent_tools.AiderCliService,
+        "tail_log",
+        lambda **kwargs: {
+            "success": True,
+            "run_id": kwargs["run_id"],
+            "tail": "recent aider output",
+            "stdout_path": str(tmp_path / "aider_runs" / kwargs["run_id"] / "stdout.log"),
+        },
+    )
+
+    result = await tool._execute(project_id=7, run_id="run123", max_chars=8000)
+
+    assert result.success is True
+    assert result.data["run_id"] == "run123"
+    assert "recent aider output" in result.output
 
 
 @pytest.mark.asyncio
