@@ -238,6 +238,75 @@ async def test_search_papers_multi_uses_fused_service_and_batches_saved_lookup()
 
 
 @pytest.mark.asyncio
+async def test_search_papers_passes_remote_filters_and_sort_to_service():
+    class _FakeService:
+        def __init__(self):
+            self.call = None
+
+        async def search(self, query, source, limit, offset, **kwargs):
+            self.call = {
+                "query": query,
+                "source": source,
+                "limit": limit,
+                "offset": offset,
+                "kwargs": kwargs,
+            }
+            return {
+                "total": 1,
+                "offset": offset,
+                "has_more": False,
+                "papers": [
+                    _paper_result(source="openalex", external_id="W1", title="Filtered Paper"),
+                ],
+            }
+
+    service = _FakeService()
+    db = _SearchDB(results=[_FakeResult(rows=[])])
+
+    original_get_service = literature_api.get_literature_service
+    literature_api.get_literature_service = lambda: service
+    try:
+        response = await literature_api.search_papers(
+            query="bag",
+            source="openalex",
+            limit=20,
+            offset=0,
+            page_token=None,
+            year_start=2022,
+            year_end=None,
+            fields=None,
+            open_access=True,
+            sort_by="latest",
+            sort_order="desc",
+            db=db,
+            current_user=SimpleNamespace(id=7),
+        )
+    finally:
+        literature_api.get_literature_service = original_get_service
+
+    assert service.call == {
+        "query": "bag",
+        "source": "openalex",
+        "limit": 20,
+        "offset": 0,
+        "kwargs": {
+            "year_range": (2022, None),
+            "open_access_only": True,
+            "sort_by": "latest",
+            "sort_order": "desc",
+        },
+    }
+    assert response.total == 1
+    assert response.papers[0].title == "Filtered Paper"
+    assert len(db.added) == 1
+    assert db.added[0].filters["year_start"] == 2022
+    assert db.added[0].filters["open_access"] is True
+    assert db.added[0].filters["sort_by"] == "latest"
+    assert isinstance(db.added[0], PaperSearchHistory)
+    assert db.added[0].source == "openalex"
+
+
+@pytest.mark.asyncio
 async def test_save_paper_persists_pubmed_identifier(monkeypatch):
     db = _SaveDB(
         results=[
@@ -593,6 +662,32 @@ def test_openalex_parse_work_handles_missing_primary_source():
     assert paper.doi == "10.48550/arxiv.1706.03762"
     assert paper.url == "https://arxiv.org/abs/1706.03762"
     assert paper.venue is None
+
+
+@pytest.mark.asyncio
+async def test_openalex_latest_sort_caps_future_publication_dates(monkeypatch):
+    service = OpenAlexService()
+    captured = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"meta": {"count": 0}, "results": []}
+
+    async def _fake_request(_client, _url, *, params):
+        captured["params"] = params
+        return _Response()
+
+    monkeypatch.setattr(service, "_request_with_retry", _fake_request)
+
+    await service.search("bag", limit=3, year_range=(2022, None), sort_by="latest")
+
+    today = datetime.utcnow().date().isoformat()
+    assert captured["params"]["sort"] == "publication_date:desc"
+    assert captured["params"]["filter"] == (
+        f"from_publication_date:2022-01-01,to_publication_date:{today}"
+    )
 
 
 def test_build_save_request_from_paper_result_infers_arxiv_pdf_fields():

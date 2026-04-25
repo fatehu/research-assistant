@@ -3339,6 +3339,8 @@ export default function PaperReaderPage() {
       resolveAvailableKbId(requestedKbId)
       ?? resolveAvailableKbId(cachedReader?.selected_kb_id)
       ?? resolveAvailableKbId(nextSession.selected_kb_id)
+      ?? resolveAvailableKbId(nextLinks.find((item) => normalizeKnowledgeLinkStatus(item.status) === 'completed')?.knowledge_base_id)
+      ?? resolveAvailableKbId(nextLinks[0]?.knowledge_base_id)
     setSelectedKbId(fallbackKb)
     lastSavedReaderSignatureRef.current = JSON.stringify({
       page: restoredPage,
@@ -4023,7 +4025,7 @@ export default function PaperReaderPage() {
   }, [askSessionId])
 
   useEffect(() => {
-    if (askScope !== 'collection' || !askCollectionId || !selectedKbId) {
+    if (askScope !== 'collection' || !askCollectionId) {
       setCollectionReadiness(null)
       setCollectionReadinessLoading(false)
       return
@@ -4314,7 +4316,7 @@ export default function PaperReaderPage() {
   }
 
   const handleAsk = async () => {
-    if (!validPaperId || !selectedKbId || !askQuestion.trim()) {
+    if (!validPaperId || !askQuestion.trim()) {
       message.warning('请补全提问参数')
       return
     }
@@ -4327,7 +4329,7 @@ export default function PaperReaderPage() {
       collectionReadiness &&
       !collectionReadiness.can_cross_paper_answer
     ) {
-      message.warning('当前收藏夹在所选知识库暂无 completed 论文，请先入库后再询问')
+      message.warning('当前收藏夹暂无 completed 入库论文，请先加入任意知识库并等待处理完成')
       return
     }
 
@@ -4340,12 +4342,18 @@ export default function PaperReaderPage() {
           scope: askScope,
           paper_id: askScope === 'paper' ? parsedPaperId : undefined,
           collection_id: askScope === 'collection' ? askCollectionId : undefined,
-          knowledge_base_id: selectedKbId,
+          knowledge_base_id: selectedKbId && selectedKbId > 0 ? selectedKbId : undefined,
           question: askQuestion.trim(),
           mode: askMode,
           session_id: askSessionId,
         },
         (event, data) => {
+          if (event === 'start') {
+            const resolvedKbId = Number(data?.knowledge_base_id || 0)
+            if (Number.isFinite(resolvedKbId) && resolvedKbId > 0) {
+              setSelectedKbId(resolvedKbId)
+            }
+          }
           if (event === 'token') {
             const token = String(data?.text || '')
             setAskAnswer((prev) => prev + token)
@@ -6825,12 +6833,13 @@ export default function PaperReaderPage() {
                             />
                           ) : null}
                           <Select
-                            placeholder="选择知识库"
+                            allowClear
+                            placeholder="优先知识库（可选，默认自动）"
                             options={kbOptions}
                             value={selectedKbId}
                             onChange={(v) => setSelectedKbId(v)}
                           />
-                          {askScope === 'collection' && askCollectionId && selectedKbId ? (
+                          {askScope === 'collection' && askCollectionId ? (
                             collectionReadinessLoading ? (
                               <Space>
                                 <Spin size="small" />
@@ -6848,7 +6857,7 @@ export default function PaperReaderPage() {
                                 description={(
                                   <Space direction="vertical" size={6} style={{ width: '100%' }}>
                                     <Text type="secondary">
-                                      联合回答仅覆盖 `completed` 状态论文；未入库/处理中/失败论文不会参与本轮答案。
+                                      联合回答仅覆盖 `completed` 状态论文；如选择了优先知识库会优先使用它，否则自动使用任意已入库知识库。
                                     </Text>
                                     <Space wrap size={6}>
                                       <Tag color="green">completed: {collectionReadiness.completed_papers}</Tag>

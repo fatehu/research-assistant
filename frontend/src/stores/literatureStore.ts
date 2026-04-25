@@ -21,6 +21,7 @@ const getSearchResultIdentity = (paper: Pick<PaperSearchResult, 'source' | 'exte
 }
 
 let activeSearchRequestId = 0
+const TOKEN_PAGINATED_SOURCES = new Set(['semantic_scholar', 'crossref'])
 
 interface LiteratureState {
   // 论文列表
@@ -33,6 +34,11 @@ interface LiteratureState {
   searchSource: string
   searchTotal: number
   searchOffset: number
+  searchNextToken: string | null
+  searchYearStart: number | null
+  searchYearEnd: number | null
+  searchOpenAccessOnly: boolean
+  searchSortBy: string
   searchLoading: boolean
   searchLoadingMore: boolean
   searchHasMore: boolean
@@ -62,6 +68,9 @@ interface LiteratureState {
     offset?: number
     year_start?: number
     year_end?: number
+    open_access?: boolean
+    sort_by?: string
+    sort_order?: string
   }) => Promise<void>
   loadMoreSearchResults: () => Promise<void>
   clearSearch: () => void
@@ -103,9 +112,14 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   papersLoading: false,
   searchResults: [],
   searchQuery: '',
-  searchSource: 'multi',
+  searchSource: 'openalex',
   searchTotal: 0,
   searchOffset: 0,
+  searchNextToken: null,
+  searchYearStart: null,
+  searchYearEnd: null,
+  searchOpenAccessOnly: false,
+  searchSortBy: 'relevance',
   searchLoading: false,
   searchLoadingMore: false,
   searchHasMore: false,
@@ -139,7 +153,7 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
   },
 
   // 搜索论文
-  searchPapers: async (query, source = 'multi', options = {}) => {
+  searchPapers: async (query, source = 'openalex', options = {}) => {
     const limit = options.limit || 20
     const requestId = ++activeSearchRequestId
     set({
@@ -148,6 +162,11 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       searchQuery: query,
       searchSource: source,
       searchOffset: 0,
+      searchNextToken: null,
+      searchYearStart: options.year_start ?? null,
+      searchYearEnd: options.year_end ?? null,
+      searchOpenAccessOnly: Boolean(options.open_access),
+      searchSortBy: options.sort_by || 'relevance',
       searchResults: [],
       searchTotal: 0,
       searchHasMore: false,
@@ -156,20 +175,26 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       const response = await literatureApi.searchPapers({
         query,
         source,
-        limit,
+        ...(source === 'semantic_scholar' ? {} : { limit }),
         offset: 0,
         year_start: options.year_start,
         year_end: options.year_end,
+        open_access: options.open_access,
+        sort_by: options.sort_by,
+        sort_order: options.sort_order,
       })
       if (requestId !== activeSearchRequestId) {
         return
       }
       const newOffset = response.papers.length
-      const hasMore = response.has_more && response.papers.length > 0
+      const hasMore = TOKEN_PAGINATED_SOURCES.has(source)
+        ? Boolean(response.next_token || response.has_more) && response.papers.length > 0
+        : response.has_more && response.papers.length > 0
       set({
         searchResults: response.papers,
         searchTotal: response.total,
         searchOffset: newOffset,
+        searchNextToken: response.next_token ?? null,
         searchHasMore: hasMore,
         searchLoading: false,
       })
@@ -180,6 +205,11 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
           searchResults: [],
           searchTotal: 0,
           searchOffset: 0,
+          searchNextToken: null,
+          searchYearStart: null,
+          searchYearEnd: null,
+          searchOpenAccessOnly: false,
+          searchSortBy: 'relevance',
           searchHasMore: false,
           searchLoading: false,
         })
@@ -190,8 +220,22 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
 
   // 加载更多搜索结果
   loadMoreSearchResults: async () => {
-    const { searchQuery, searchSource, searchOffset, searchTotal, searchLoadingMore, searchHasMore } = get()
+    const {
+      searchQuery,
+      searchSource,
+      searchOffset,
+      searchTotal,
+      searchNextToken,
+      searchYearStart,
+      searchYearEnd,
+      searchOpenAccessOnly,
+      searchSortBy,
+      searchLoadingMore,
+      searchHasMore,
+    } = get()
     if (searchLoadingMore || !searchHasMore) return
+    const isTokenPaginatedSource = TOKEN_PAGINATED_SOURCES.has(searchSource)
+    if (isTokenPaginatedSource && !searchNextToken) return
 
     const requestId = activeSearchRequestId
     const limit = 20
@@ -200,8 +244,33 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
       const response = await literatureApi.searchPapers({
         query: searchQuery,
         source: searchSource,
-        limit,
-        offset: searchOffset,
+        ...(searchSource === 'semantic_scholar'
+          ? {
+              offset: searchOffset,
+              page_token: searchNextToken ?? undefined,
+              year_start: searchYearStart ?? undefined,
+              year_end: searchYearEnd ?? undefined,
+              open_access: searchOpenAccessOnly,
+              sort_by: searchSortBy,
+            }
+          : isTokenPaginatedSource
+            ? {
+                limit,
+                offset: searchOffset,
+                page_token: searchNextToken ?? undefined,
+                year_start: searchYearStart ?? undefined,
+                year_end: searchYearEnd ?? undefined,
+                open_access: searchOpenAccessOnly,
+                sort_by: searchSortBy,
+              }
+          : {
+              limit,
+              offset: searchOffset,
+              year_start: searchYearStart ?? undefined,
+              year_end: searchYearEnd ?? undefined,
+              open_access: searchOpenAccessOnly,
+              sort_by: searchSortBy,
+            }),
       })
       const latest = get()
       if (
@@ -213,11 +282,14 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
         return
       }
       const newOffset = searchOffset + response.papers.length
-      const hasMore = response.has_more && response.papers.length > 0
+      const hasMore = isTokenPaginatedSource
+        ? Boolean(response.next_token || response.has_more) && response.papers.length > 0
+        : response.has_more && response.papers.length > 0
       set(state => ({
         searchResults: [...state.searchResults, ...response.papers],
         searchTotal: response.total,
         searchOffset: newOffset,
+        searchNextToken: response.next_token ?? null,
         searchHasMore: hasMore,
         searchLoadingMore: false,
       }))
@@ -231,7 +303,18 @@ export const useLiteratureStore = create<LiteratureState>((set, get) => ({
 
   clearSearch: () => {
     activeSearchRequestId += 1
-    set({ searchResults: [], searchQuery: '', searchTotal: 0, searchOffset: 0, searchHasMore: false })
+    set({
+      searchResults: [],
+      searchQuery: '',
+      searchTotal: 0,
+      searchOffset: 0,
+      searchNextToken: null,
+      searchYearStart: null,
+      searchYearEnd: null,
+      searchOpenAccessOnly: false,
+      searchSortBy: 'relevance',
+      searchHasMore: false,
+    })
   },
 
   loadSearchHistory: async () => {

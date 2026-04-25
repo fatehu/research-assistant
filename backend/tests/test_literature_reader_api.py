@@ -3422,6 +3422,74 @@ async def test_list_literature_ask_messages_raises_404_for_unknown_session():
     assert exc.value.status_code == 404
 
 
+def test_select_link_for_query_should_fallback_to_any_completed_link():
+    now = datetime.now(timezone.utc)
+    preferred_pending = SimpleNamespace(
+        id=10,
+        paper_id=78,
+        knowledge_base_id=3,
+        document_id=101,
+        status=KnowledgeLinkStatus.PENDING.value,
+        error_message=None,
+        updated_at=now,
+    )
+    other_completed = SimpleNamespace(
+        id=11,
+        paper_id=78,
+        knowledge_base_id=4,
+        document_id=102,
+        status=KnowledgeLinkStatus.COMPLETED.value,
+        error_message=None,
+        updated_at=now,
+    )
+
+    selected = literature_api._select_link_for_query(  # pylint: disable=protected-access
+        [preferred_pending, other_completed],
+        preferred_kb_id=3,
+    )
+
+    assert selected is other_completed
+
+
+@pytest.mark.asyncio
+async def test_sync_link_status_should_resolve_duplicate_document_to_indexed_document():
+    duplicate_doc = SimpleNamespace(
+        id=22,
+        status=DocumentStatus.COMPLETED.value,
+        error_message=None,
+        metadata_={"dedupe": {"duplicate_of_document_id": 7}},
+        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+    indexed_doc = SimpleNamespace(
+        id=7,
+        status=DocumentStatus.COMPLETED.value,
+        error_message=None,
+        metadata_={"dedupe": {"duplicate_of_document_id": None}},
+        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc),
+    )
+    link = SimpleNamespace(
+        id=5,
+        document_id=22,
+        status=KnowledgeLinkStatus.COMPLETED.value,
+        error_message=None,
+    )
+
+    class _FakeGetDB:
+        async def get(self, _model, doc_id):
+            return {22: duplicate_doc, 7: indexed_doc}.get(int(doc_id))
+
+    document_changed, link_changed = await literature_api._sync_link_status_from_document(  # pylint: disable=protected-access
+        _FakeGetDB(),
+        link,
+    )
+
+    assert document_changed is False
+    assert link_changed is True
+    assert link.document_id == 7
+
+
 @pytest.mark.asyncio
 async def test_build_generative_reader_agent_tool_registry_for_paper_should_keep_web_mcp_tools(monkeypatch, tmp_path: Path):
     pdf_path = tmp_path / "paper.pdf"

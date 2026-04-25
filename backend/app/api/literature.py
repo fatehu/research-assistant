@@ -44,8 +44,6 @@ from app.models.literature import (
     PaperCollection,
     PaperComment,
     PaperEntity,
-    PaperExperimentRun,
-    PaperExperimentWorkspace,
     PaperKnowledgeLink,
     PaperReaderPageCache,
     PaperReaderPlanCache,
@@ -77,10 +75,6 @@ from app.schemas.literature import (
     PaperCommentCreate,
     PaperCommentResponse,
     PaperCommentUpdate,
-    PaperExperimentRunCreateRequest,
-    PaperExperimentRunResponse,
-    PaperExperimentRunUpdateRequest,
-    PaperExperimentWorkspaceResponse,
     PaperCreate,
     ReaderGenerativePlanRequest,
     ReaderGenerativePlanResponse,
@@ -154,7 +148,6 @@ from app.services.llm_service import (
     log_tagged_llm_request_error,
     log_tagged_llm_request_start,
 )
-from app.services.paper_experiment_service import PaperExperimentService
 from app.services.render_pipeline_contract import RenderPipelineContractError
 from app.services.react_agent import AgentCore, AgentRuntimeContext
 from app.services.agent_tools_impl.registry import ToolBase, ToolRegistry, ToolResult
@@ -431,50 +424,6 @@ def paper_to_response(paper, collection_ids: List[int] = None) -> dict:
         "created_at": paper.created_at,
         "updated_at": paper.updated_at,
         "collection_ids": collection_ids,
-    }
-
-
-def _paper_experiment_run_to_response(run: PaperExperimentRun) -> dict:
-    return {
-        "id": run.id,
-        "workspace_id": run.workspace_id,
-        "user_id": run.user_id,
-        "notebook_id": run.notebook_id,
-        "notebook_cell_id": run.notebook_cell_id,
-        "base_run_id": run.base_run_id,
-        "run_kind": run.run_kind,
-        "status": run.status,
-        "label": run.label,
-        "model_name": run.model_name,
-        "hypothesis": run.hypothesis,
-        "variant_spec": run.variant_spec_json or {},
-        "params": run.params_json or {},
-        "metrics": run.metrics_json or {},
-        "artifacts": run.artifacts_json or {},
-        "summary": run.summary_json or {},
-        "notes": run.notes,
-        "created_at": run.created_at,
-        "updated_at": run.updated_at,
-        "started_at": run.started_at,
-        "completed_at": run.completed_at,
-    }
-
-
-def _paper_experiment_workspace_to_response(workspace: PaperExperimentWorkspace) -> dict:
-    runs = list(workspace.runs or [])
-    return {
-        "id": workspace.id,
-        "user_id": workspace.user_id,
-        "paper_id": workspace.paper_id,
-        "notebook_id": workspace.notebook_id,
-        "status": workspace.status,
-        "title": workspace.title,
-        "summary": workspace.summary_json or {},
-        "experiment_spec": workspace.experiment_spec_json or {},
-        "compare_report": workspace.compare_report_json or {},
-        "runs": [_paper_experiment_run_to_response(item) for item in runs],
-        "created_at": workspace.created_at,
-        "updated_at": workspace.updated_at,
     }
 
 
@@ -1585,6 +1534,123 @@ def _build_arxiv_pdf_url(arxiv_id: Optional[str]) -> Optional[str]:
     return f"https://arxiv.org/pdf/{normalized}"
 
 
+_MDPI_ISSN_SLUGS: Dict[str, str] = {
+    "1424-8220": "sensors",
+    "2072-4292": "remotesensing",
+    "2073-4395": "agronomy",
+}
+
+_MDPI_CODE_SLUGS: Dict[str, str] = {
+    "s": "sensors",
+    "rs": "remotesensing",
+    "agronomy": "agronomy",
+    "sustainability": "sustainability",
+    "applsci": "applsci",
+    "plants": "plants",
+    "agriculture": "agriculture",
+    "animals": "animals",
+    "water": "water",
+    "energies": "energies",
+    "ijms": "ijms",
+    "ijerph": "ijerph",
+    "foods": "foods",
+}
+
+_MDPI_VENUE_SLUGS: Dict[str, str] = {
+    "remote sensing": "remotesensing",
+    "sensors": "sensors",
+    "agronomy": "agronomy",
+}
+
+
+def _mdpi_slug_from_metadata(venue: Optional[str], doi: Optional[str], issn: str = "") -> str:
+    venue_key = re.sub(r"\s+", " ", str(venue or "").strip().lower())
+    if venue_key in _MDPI_VENUE_SLUGS:
+        return _MDPI_VENUE_SLUGS[venue_key]
+    compact_venue = re.sub(r"[^a-z0-9]+", "", venue_key)
+    if compact_venue:
+        return compact_venue
+
+    if issn and issn in _MDPI_ISSN_SLUGS:
+        return _MDPI_ISSN_SLUGS[issn]
+
+    doi_tail = re.sub(
+        r"^(?:https?://)?(?:dx\.)?doi\.org/10\.3390/",
+        "",
+        str(doi or "").strip().lower(),
+        flags=re.IGNORECASE,
+    )
+    doi_tail = re.sub(r"^10\.3390/", "", doi_tail, flags=re.IGNORECASE)
+    match = re.match(r"([a-z]+)", doi_tail)
+    if match:
+        code = match.group(1)
+        return _MDPI_CODE_SLUGS.get(code, code)
+    return ""
+
+
+def _build_mdpi_pdf_candidates(
+    *,
+    pdf_url: Optional[str],
+    url: Optional[str],
+    external_id: Optional[str],
+    venue: Optional[str],
+    doi: Optional[str],
+) -> List[str]:
+    candidates: List[str] = []
+    for value in (pdf_url, url, external_id):
+        token = str(value or "").strip()
+        if not token:
+            continue
+        parsed = urlparse(token)
+        if "mdpi.com" not in parsed.netloc.lower():
+            continue
+        match = re.search(
+            r"/(?P<issn>\d{4}-\d{3}[\dXx])/(?P<volume>\d+)/(?P<issue>\d+)/(?P<article>\d+)/pdf\b",
+            parsed.path,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        slug = _mdpi_slug_from_metadata(venue, doi, match.group("issn"))
+        if not slug:
+            continue
+        volume = str(int(match.group("volume")))
+        article = match.group("article").lstrip("0") or "0"
+        article_tokens = [article.zfill(5)]
+        if article_tokens[0] != article:
+            article_tokens.append(article)
+        for article_token in article_tokens:
+            base = f"{slug}-{volume}-{article_token}"
+            for suffix in ("", "-v2", "-v3"):
+                candidates.append(
+                    f"https://mdpi-res.com/d_attachment/{slug}/{base}/article_deploy/{base}{suffix}.pdf"
+                )
+    return candidates
+
+
+def _extract_ieee_arnumber(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        token = unquote(str(value or "").strip())
+        if not token:
+            continue
+        for pattern in (
+            r"[?&]arnumber=(\d+)",
+            r"/document/(\d+)",
+            r"/0*(\d{7,8})\.pdf\b",
+        ):
+            match = re.search(pattern, token, flags=re.IGNORECASE)
+            if match:
+                return str(int(match.group(1)))
+    return None
+
+
+def _build_ieee_pdf_candidates(*values: Optional[str]) -> List[str]:
+    arnumber = _extract_ieee_arnumber(*values)
+    if not arnumber:
+        return []
+    return [f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"]
+
+
 def _infer_arxiv_id_from_candidates(*values: Optional[str]) -> Optional[str]:
     for value in values:
         arxiv_id = _extract_arxiv_id_from_text(value)
@@ -1613,6 +1679,16 @@ def _build_pdf_download_candidates(paper: Paper) -> List[str]:
         if arxiv_pdf_url:
             candidates.append(arxiv_pdf_url)
 
+    candidates.extend(
+        _build_mdpi_pdf_candidates(
+            pdf_url=direct_pdf_url,
+            url=getattr(paper, "url", None),
+            external_id=str(getattr(paper, "external_id", "") or raw_data.get("id") or ""),
+            venue=getattr(paper, "venue", None),
+            doi=getattr(paper, "doi", None),
+        )
+    )
+
     if direct_pdf_url:
         candidates.append(direct_pdf_url)
 
@@ -1625,6 +1701,14 @@ def _build_pdf_download_candidates(paper: Paper) -> List[str]:
         token = str(candidate or "").strip()
         if token.lower().endswith(".pdf"):
             candidates.append(token)
+
+    candidates.extend(
+        _build_ieee_pdf_candidates(
+            direct_pdf_url,
+            getattr(paper, "url", None),
+            str(getattr(paper, "external_id", "") or raw_data.get("id") or ""),
+        )
+    )
 
     unique_candidates: List[str] = []
     seen: Set[str] = set()
@@ -8857,21 +8941,179 @@ async def _retrieve_scope_ready_links(
     return ready_links, {"missing_paper_ids": missing_paper_ids, "not_ready": not_ready}
 
 
+def _is_ready_knowledge_link(link: PaperKnowledgeLink) -> bool:
+    return bool(
+        link
+        and str(link.status or "").strip().lower() == KnowledgeLinkStatus.COMPLETED.value
+        and getattr(link, "document_id", None)
+    )
+
+
+def _knowledge_link_updated_sort_value(link: PaperKnowledgeLink) -> float:
+    value = getattr(link, "updated_at", None) or getattr(link, "created_at", None)
+    if isinstance(value, datetime):
+        try:
+            return float(value.timestamp())
+        except (OverflowError, OSError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _sort_links_for_query_selection(
+    links: Sequence[PaperKnowledgeLink],
+    preferred_kb_id: Optional[int],
+) -> List[PaperKnowledgeLink]:
+    preferred = int(preferred_kb_id or 0)
+
+    def sort_key(link: PaperKnowledgeLink) -> tuple[int, int, float, int]:
+        kb_value = int(getattr(link, "knowledge_base_id", 0) or 0)
+        return (
+            0 if preferred > 0 and kb_value == preferred else 1,
+            0 if _is_ready_knowledge_link(link) else 1,
+            -_knowledge_link_updated_sort_value(link),
+            -int(getattr(link, "id", 0) or 0),
+        )
+
+    return sorted(list(links or []), key=sort_key)
+
+
+def _select_link_for_query(
+    links: Sequence[PaperKnowledgeLink],
+    preferred_kb_id: Optional[int],
+) -> Optional[PaperKnowledgeLink]:
+    candidates = _sort_links_for_query_selection(links, preferred_kb_id)
+    ready_candidates = [item for item in candidates if _is_ready_knowledge_link(item)]
+    if ready_candidates:
+        return ready_candidates[0]
+    return candidates[0] if candidates else None
+
+
+async def _retrieve_scope_links_for_query(
+    db: AsyncSession,
+    current_user: User,
+    paper_ids: Sequence[int],
+    preferred_kb_id: Optional[int] = None,
+) -> List[PaperKnowledgeLink]:
+    normalized_paper_ids = sorted({int(item) for item in paper_ids if int(item) > 0})
+    if not normalized_paper_ids:
+        return []
+
+    stmt = (
+        select(PaperKnowledgeLink)
+        .join(KnowledgeBase, KnowledgeBase.id == PaperKnowledgeLink.knowledge_base_id)
+        .where(
+            and_(
+                PaperKnowledgeLink.user_id == int(current_user.id),
+                KnowledgeBase.user_id == int(current_user.id),
+                PaperKnowledgeLink.paper_id.in_(normalized_paper_ids),
+            )
+        )
+    )
+    links = list((await db.execute(stmt)).scalars().all())
+
+    need_commit = False
+    changed_link_ids: set[int] = set()
+    for link in links:
+        document_changed, link_changed = await _sync_link_status_from_document(db, link)
+        if document_changed or link_changed:
+            need_commit = True
+        if link_changed:
+            changed_link_ids.add(int(link.id))
+
+    if need_commit:
+        await db.commit()
+        for link in links:
+            if int(link.id) in changed_link_ids:
+                await db.refresh(link)
+                await _publish_paper_link_status_event(link)
+
+    return _sort_links_for_query_selection(links, preferred_kb_id)
+
+
+async def _retrieve_scope_ready_links_for_query(
+    db: AsyncSession,
+    current_user: User,
+    paper_ids: Sequence[int],
+    preferred_kb_id: Optional[int] = None,
+) -> tuple[List[PaperKnowledgeLink], Dict[str, Any]]:
+    links = await _retrieve_scope_links_for_query(
+        db,
+        current_user=current_user,
+        paper_ids=paper_ids,
+        preferred_kb_id=preferred_kb_id,
+    )
+    links_by_paper_id: Dict[int, List[PaperKnowledgeLink]] = {}
+    for link in links:
+        links_by_paper_id.setdefault(int(link.paper_id), []).append(link)
+
+    ready_links: List[PaperKnowledgeLink] = []
+    missing_paper_ids: List[int] = []
+    not_ready: List[Dict[str, Any]] = []
+
+    for paper_id in paper_ids:
+        candidates = links_by_paper_id.get(int(paper_id), [])
+        selected = _select_link_for_query(candidates, preferred_kb_id)
+        if selected is None:
+            missing_paper_ids.append(int(paper_id))
+            continue
+        if _is_ready_knowledge_link(selected):
+            ready_links.append(selected)
+            continue
+        not_ready.append(
+            {
+                "paper_id": int(paper_id),
+                "knowledge_base_id": int(selected.knowledge_base_id),
+                "status": selected.status,
+                "error_message": selected.error_message,
+            }
+        )
+
+    selected_kb_ids = sorted({int(item.knowledge_base_id) for item in ready_links})
+    return ready_links, {
+        "missing_paper_ids": missing_paper_ids,
+        "not_ready": not_ready,
+        "selected_knowledge_base_ids": selected_kb_ids,
+        "preferred_knowledge_base_id": int(preferred_kb_id or 0) or None,
+    }
+
+
 async def _retrieve_rag_sources(
     db: AsyncSession,
-    knowledge_base_id: int,
+    knowledge_base_id: Optional[int],
     document_ids: Sequence[int],
     question: str,
     limit: int = 6,
+    knowledge_base_ids: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, Any]]:
     if not document_ids:
         return []
 
     fts_query = segment_text_for_fts(question or "")
+    resolved_kb_ids = sorted({int(item) for item in list(knowledge_base_ids or []) if int(item) > 0})
+    where_clauses = [
+        "dc.document_id = ANY(:doc_ids)",
+        "COALESCE(NULLIF(dc.content_segmented, ''), dc.content) IS NOT NULL",
+        "COALESCE(NULLIF(dc.content_segmented, ''), dc.content) <> ''",
+        "to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content))"
+        " @@ websearch_to_tsquery('simple', :fts_query)",
+    ]
+    sql_params: Dict[str, Any] = {
+        "doc_ids": list(document_ids),
+        "fts_query": fts_query,
+        "top_k": int(limit),
+    }
+    if resolved_kb_ids:
+        where_clauses.insert(0, "dc.knowledge_base_id = ANY(:kb_ids)")
+        sql_params["kb_ids"] = resolved_kb_ids
+    elif knowledge_base_id:
+        where_clauses.insert(0, "dc.knowledge_base_id = :kb_id")
+        sql_params["kb_id"] = int(knowledge_base_id)
+
     sql = text(
-        """
+        f"""
         SELECT
             dc.id AS chunk_id,
+            dc.knowledge_base_id,
             dc.document_id,
             d.original_filename AS document_name,
             d.file_path,
@@ -8886,13 +9128,7 @@ async def _retrieve_rag_sources(
             ) AS score
         FROM document_chunks dc
         JOIN documents d ON d.id = dc.document_id
-        WHERE
-            dc.knowledge_base_id = :kb_id
-            AND dc.document_id = ANY(:doc_ids)
-            AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) IS NOT NULL
-            AND COALESCE(NULLIF(dc.content_segmented, ''), dc.content) <> ''
-            AND to_tsvector('simple', COALESCE(NULLIF(dc.content_segmented, ''), dc.content))
-                @@ websearch_to_tsquery('simple', :fts_query)
+        WHERE {" AND ".join(where_clauses)}
         ORDER BY score DESC, dc.id DESC
         LIMIT :top_k
         """
@@ -8902,23 +9138,25 @@ async def _retrieve_rag_sources(
     if fts_query.strip():
         try:
             rows = (
-                await db.execute(
-                    sql,
-                    {
-                        "kb_id": int(knowledge_base_id),
-                        "doc_ids": list(document_ids),
-                        "fts_query": fts_query,
-                        "top_k": int(limit),
-                    },
-                )
+                await db.execute(sql, sql_params)
             ).fetchall()
         except Exception as exc:
             logger.warning(f"[Literature Ask] FTS 检索失败，回退 ILIKE: {exc}")
 
     if not rows:
+        fallback_filters = [
+            DocumentChunk.document_id.in_(list(document_ids)),
+            DocumentChunk.content.ilike(f"%{question[:200]}%"),
+        ]
+        if resolved_kb_ids:
+            fallback_filters.insert(0, DocumentChunk.knowledge_base_id.in_(resolved_kb_ids))
+        elif knowledge_base_id:
+            fallback_filters.insert(0, DocumentChunk.knowledge_base_id == int(knowledge_base_id))
+
         fallback_stmt = (
             select(
                 DocumentChunk.id.label("chunk_id"),
+                DocumentChunk.knowledge_base_id,
                 DocumentChunk.document_id,
                 Document.original_filename.label("document_name"),
                 Document.file_path,
@@ -8929,13 +9167,7 @@ async def _retrieve_rag_sources(
                 DocumentChunk.metadata_,
             )
             .join(Document, Document.id == DocumentChunk.document_id)
-            .where(
-                and_(
-                    DocumentChunk.knowledge_base_id == int(knowledge_base_id),
-                    DocumentChunk.document_id.in_(list(document_ids)),
-                    DocumentChunk.content.ilike(f"%{question[:200]}%"),
-                )
-            )
+            .where(and_(*fallback_filters))
             .order_by(DocumentChunk.id.desc())
             .limit(int(limit))
         )
@@ -8978,6 +9210,7 @@ async def _retrieve_rag_sources(
             {
                 "idx": idx,
                 "chunk_id": int(getattr(row, "chunk_id")),
+                "knowledge_base_id": int(getattr(row, "knowledge_base_id") or 0) or None,
                 "document_id": int(getattr(row, "document_id")),
                 "document_name": getattr(row, "document_name") or "未知文档",
                 "page": page,
@@ -9020,6 +9253,7 @@ def _normalize_agent_source_rows(rows: Any) -> List[Dict[str, Any]]:
             {
                 "idx": int(idx),
                 "chunk_id": _to_int(row.get("chunk_id")),
+                "knowledge_base_id": _to_int(row.get("knowledge_base_id")),
                 "document_id": int(document_id),
                 "document_name": str(row.get("document_name") or row.get("document") or "未知文档"),
                 "page": _to_int(row.get("page")),
@@ -9044,6 +9278,7 @@ def _build_public_sources_from_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict
             {
                 "idx": source.get("idx"),
                 "chunk_id": source.get("chunk_id"),
+                "knowledge_base_id": source.get("knowledge_base_id"),
                 "document_id": source.get("document_id"),
                 "document_name": source.get("document_name"),
                 "page": source.get("page"),
@@ -9110,12 +9345,14 @@ class LiteratureScopedKnowledgeSearchTool(ToolBase):
         knowledge_base_id: int,
         knowledge_base_name: str,
         document_ids: Sequence[int],
+        knowledge_base_ids: Optional[Sequence[int]] = None,
         source_index_allocator: Optional["LiteratureSourceIndexAllocator"] = None,
     ):
         self.db = db
         self.knowledge_base_id = int(knowledge_base_id)
         self.knowledge_base_name = str(knowledge_base_name or f"KB#{knowledge_base_id}")
         self.document_ids = sorted({int(item) for item in document_ids if int(item) > 0})
+        self.knowledge_base_ids = sorted({int(item) for item in list(knowledge_base_ids or []) if int(item) > 0})
         self.source_index_allocator = source_index_allocator or LiteratureSourceIndexAllocator()
 
     def _build_source_key(self, source: Dict[str, Any]) -> str:
@@ -9152,6 +9389,7 @@ class LiteratureScopedKnowledgeSearchTool(ToolBase):
             document_ids=self.document_ids,
             question=query,
             limit=min(max(int(top_k or 8), 1), 12),
+            knowledge_base_ids=self.knowledge_base_ids,
         )
         normalized_rows = _normalize_agent_source_rows(rows)
         stable_rows: List[Dict[str, Any]] = []
@@ -9183,6 +9421,7 @@ class LiteratureScopedKnowledgeSearchTool(ToolBase):
                 {
                     "idx": idx,
                     "chunk_id": source.get("chunk_id"),
+                    "knowledge_base_id": source.get("knowledge_base_id"),
                     "document_id": source["document_id"],
                     "document_name": source["document_name"],
                     "document": source["document_name"],
@@ -9712,6 +9951,7 @@ async def _build_literature_agent_tool_registry(
     knowledge_base_id: int,
     knowledge_base_name: str,
     document_ids: Sequence[int],
+    knowledge_base_ids: Optional[Sequence[int]] = None,
     paper_id: Optional[int] = None,
     paper_title: Optional[str] = None,
     paper_pdf_path: Optional[str] = None,
@@ -9729,6 +9969,7 @@ async def _build_literature_agent_tool_registry(
         knowledge_base_id=int(knowledge_base_id),
         knowledge_base_name=str(knowledge_base_name or f"KB#{knowledge_base_id}"),
         document_ids=document_ids,
+        knowledge_base_ids=knowledge_base_ids,
         source_index_allocator=source_index_allocator,
     )
     registry.register(scoped_tool)
@@ -9902,6 +10143,36 @@ def _derive_link_status_from_document(doc: Optional[Document]) -> tuple[str, Opt
     return KnowledgeLinkStatus.RUNNING.value, None, int(doc.id)
 
 
+def _extract_duplicate_of_document_id(doc: Optional[Document]) -> Optional[int]:
+    if doc is None:
+        return None
+    metadata = getattr(doc, "metadata_", None)
+    if not isinstance(metadata, dict):
+        return None
+    dedupe = metadata.get("dedupe")
+    if not isinstance(dedupe, dict):
+        return None
+    duplicate_id = _to_int(dedupe.get("duplicate_of_document_id"))
+    if duplicate_id is None or duplicate_id <= 0 or duplicate_id == int(getattr(doc, "id", 0) or 0):
+        return None
+    return int(duplicate_id)
+
+
+async def _resolve_indexed_document_for_link(db: AsyncSession, doc: Optional[Document]) -> Optional[Document]:
+    """Resolve completed duplicate marker documents to the original indexed document."""
+    if doc is None:
+        return None
+    duplicate_doc_id = _extract_duplicate_of_document_id(doc)
+    if duplicate_doc_id is None:
+        return doc
+    duplicate_doc = await db.get(Document, int(duplicate_doc_id))
+    if not duplicate_doc:
+        return doc
+    if str(duplicate_doc.status or "").strip().lower() != DocumentStatus.COMPLETED.value:
+        return doc
+    return duplicate_doc
+
+
 def _mark_stale_document_timeout(doc: Optional[Document]) -> bool:
     """将长时间未收尾的 processing 文档统一回写为 timeout。"""
     if doc is None:
@@ -9943,6 +10214,10 @@ async def _sync_link_status_from_document(
 
     document_changed = _mark_stale_document_timeout(doc)
     next_status, next_error, resolved_doc_id = _derive_link_status_from_document(doc)
+    if next_status == KnowledgeLinkStatus.COMPLETED.value:
+        indexed_doc = await _resolve_indexed_document_for_link(db, doc)
+        if indexed_doc is not None:
+            resolved_doc_id = int(indexed_doc.id)
 
     link_changed = False
     if link.status != next_status or (link.error_message or None) != (next_error or None):
@@ -9959,24 +10234,31 @@ async def _sync_link_status_from_document(
 async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_size: int, chunk_overlap: int) -> None:
     """
     论文入库后台任务：
-    1) link -> running
-    2) 复用 knowledge.process_document_task
+    1) link -> pending/queued
+    2) 复用 knowledge 文档队列，避免文献 PDF 绕过全局入库并发限制
     3) 根据 document.status 回写 link 状态
     """
-    from app.api.knowledge import process_document_task
+    from app.api.knowledge import schedule_document_processing_task, wait_for_document_processing_task
     from app.core.database import async_session_factory
 
     async with async_session_factory() as db:
         link = await db.get(PaperKnowledgeLink, link_id)
         if not link:
             return
-        link.status = KnowledgeLinkStatus.RUNNING.value
+        link.status = KnowledgeLinkStatus.PENDING.value
         link.error_message = None
         await db.commit()
         await db.refresh(link)
         await _publish_paper_link_status_event(link)
 
-    await process_document_task(doc_id, chunk_size, chunk_overlap)
+    queued = await schedule_document_processing_task(doc_id, chunk_size, chunk_overlap)
+    if not queued:
+        logger.info(
+            "[Literature API] 文献入库任务已在队列中，等待已有任务完成: link={}, doc={}",
+            int(link_id),
+            int(doc_id),
+        )
+    await wait_for_document_processing_task(doc_id)
 
     async with async_session_factory() as db:
         link = await db.get(PaperKnowledgeLink, link_id)
@@ -9985,6 +10267,10 @@ async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_siz
             return
 
         link_status, error_message, resolved_doc_id = _derive_link_status_from_document(doc)
+        if link_status == KnowledgeLinkStatus.COMPLETED.value:
+            indexed_doc = await _resolve_indexed_document_for_link(db, doc)
+            if indexed_doc is not None:
+                resolved_doc_id = int(indexed_doc.id)
         link.status = link_status
         link.error_message = error_message
         if resolved_doc_id is not None:
@@ -10016,11 +10302,15 @@ async def _run_document_processing_for_link(link_id: int, doc_id: int, chunk_siz
 
 
 def _knowledge_not_ready_error(details: Dict[str, Any]) -> HTTPException:
+    message = str(
+        details.get("message")
+        or "目标论文尚未完成任一知识库入库处理，请先加入任意知识库并等待处理完成。"
+    )
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail={
             "code": "KNOWLEDGE_NOT_READY",
-            "message": "目标论文尚未在所选知识库完成入库处理，请先加入知识库并等待处理完成。",
+            "message": message,
             "details": details,
         },
     )
@@ -10062,10 +10352,13 @@ async def search_papers(
     ),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    page_token: Optional[str] = Query(None, description="支持 token/cursor 分页的数据源续页 token"),
     year_start: Optional[int] = Query(None, description="起始年份"),
     year_end: Optional[int] = Query(None, description="结束年份"),
     fields: Optional[str] = Query(None, description="研究领域，逗号分隔"),
     open_access: bool = Query(False, description="仅开放获取"),
+    sort_by: Optional[str] = Query(None, description="排序字段：relevance, latest, citations, updated, submitted, recent"),
+    sort_order: str = Query("desc", description="排序方向：asc, desc"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -10081,18 +10374,29 @@ async def search_papers(
     - crossref: CrossRef (DOI 元数据)
     - multi: OpenAlex + Semantic Scholar + arXiv + PubMed 并行融合
     """
-    logger.info(f"[Literature API] 搜索: {query}, source={source}, user={current_user.id}")
+    logger.info(
+        "[Literature API] 搜索: "
+        f"{query}, source={source}, user={current_user.id}, "
+        f"limit={limit}, offset={offset}, year_start={year_start}, year_end={year_end}, "
+        f"open_access={open_access}, sort_by={sort_by}, sort_order={sort_order}, "
+        f"page_token={bool(page_token)}"
+    )
     
     service = get_literature_service()
-    
+
     # 构建搜索参数
     kwargs = {}
-    if year_start and year_end:
+    if year_start is not None or year_end is not None:
         kwargs["year_range"] = (year_start, year_end)
     if fields:
-        kwargs["fields_of_study"] = fields.split(",")
+        kwargs["fields_of_study"] = [token.strip() for token in fields.split(",") if token.strip()]
     if open_access:
         kwargs["open_access_only"] = True
+    if page_token:
+        kwargs["page_token"] = page_token
+    if sort_by:
+        kwargs["sort_by"] = sort_by
+        kwargs["sort_order"] = sort_order
     
     # 执行搜索
     if source == "multi":
@@ -10101,6 +10405,10 @@ async def search_papers(
             limit_per_source=limit,
             offset=offset,
             year_range=kwargs.get("year_range"),
+            fields_of_study=kwargs.get("fields_of_study"),
+            open_access_only=kwargs.get("open_access_only", False),
+            sort_by=kwargs.get("sort_by"),
+            sort_order=kwargs.get("sort_order"),
         )
     else:
         result = await service.search(query, source, limit, offset, **kwargs)
@@ -10141,7 +10449,14 @@ async def search_papers(
         query=query,
         source=source,
         result_count=result.get("total", 0),
-        filters={"year_start": year_start, "year_end": year_end, "fields": fields, "open_access": open_access}
+        filters={
+            "year_start": year_start,
+            "year_end": year_end,
+            "fields": fields,
+            "open_access": open_access,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        }
     )
     db.add(history)
     await db.commit()
@@ -10150,6 +10465,7 @@ async def search_papers(
         total=result.get("total", 0),
         offset=result.get("offset", offset),
         has_more=bool(result.get("has_more", offset + len(search_results) < int(result.get("total", 0) or 0))),
+        next_token=result.get("next_token"),
         papers=search_results,
         query=query,
         source=source
@@ -10279,112 +10595,8 @@ async def get_paper(
     )
     coll_result = await db.execute(coll_stmt)
     collection_ids = [row[0] for row in coll_result.fetchall()]
-    
+
     return PaperResponse(**paper_to_response(paper, collection_ids))
-
-
-@router.get("/papers/{paper_id}/experiment-workspace", response_model=PaperExperimentWorkspaceResponse)
-async def get_paper_experiment_workspace(
-    paper_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    await _get_owned_paper_or_404(db, current_user, paper_id)
-    service = PaperExperimentService(db)
-    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="实验工作台不存在")
-    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
-
-
-@router.post("/papers/{paper_id}/experiment-workspace/bootstrap", response_model=PaperExperimentWorkspaceResponse)
-async def bootstrap_paper_experiment_workspace(
-    paper_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
-    service = PaperExperimentService(db)
-    workspace = await service.bootstrap_workspace(paper=paper, user_id=current_user.id)
-    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
-
-
-@router.post("/papers/{paper_id}/experiment-workspace/refresh-intake", response_model=PaperExperimentWorkspaceResponse)
-async def refresh_paper_experiment_workspace_intake(
-    paper_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    paper = await _get_owned_paper_or_404(db, current_user, paper_id)
-    service = PaperExperimentService(db)
-    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
-    if workspace is None:
-        workspace = await service.bootstrap_workspace(paper=paper, user_id=current_user.id)
-    else:
-        workspace = await service.refresh_workspace_intake(paper=paper, workspace=workspace)
-    return PaperExperimentWorkspaceResponse(**_paper_experiment_workspace_to_response(workspace))
-
-
-@router.post("/papers/{paper_id}/experiment-workspace/runs", response_model=PaperExperimentRunResponse)
-async def create_paper_experiment_run(
-    paper_id: int,
-    request: PaperExperimentRunCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    await _get_owned_paper_or_404(db, current_user, paper_id)
-    service = PaperExperimentService(db)
-    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="请先创建实验工作台")
-
-    base_run_id = request.base_run_id
-    if request.run_kind == "variant" and base_run_id is None:
-        baseline = next((item for item in list(workspace.runs or []) if str(item.run_kind or "") == "baseline"), None)
-        if baseline is not None:
-            base_run_id = int(baseline.id)
-
-    run = await service.create_run(
-        workspace=workspace,
-        label=request.label,
-        run_kind=request.run_kind,
-        model_name=request.model_name,
-        hypothesis=request.hypothesis,
-        params=request.params,
-        variant_spec=request.variant_spec,
-        base_run_id=base_run_id,
-    )
-    return PaperExperimentRunResponse(**_paper_experiment_run_to_response(run))
-
-
-@router.patch("/papers/{paper_id}/experiment-workspace/runs/{run_id}", response_model=PaperExperimentRunResponse)
-async def update_paper_experiment_run(
-    paper_id: int,
-    run_id: int,
-    request: PaperExperimentRunUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    await _get_owned_paper_or_404(db, current_user, paper_id)
-    service = PaperExperimentService(db)
-    workspace = await service.get_workspace(paper_id=paper_id, user_id=current_user.id)
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="实验工作台不存在")
-
-    run = await service.get_run(workspace_id=int(workspace.id), run_id=run_id, user_id=current_user.id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="实验运行记录不存在")
-
-    updated = await service.update_run(
-        workspace=workspace,
-        run=run,
-        status=request.status,
-        metrics=request.metrics,
-        artifacts=request.artifacts,
-        summary=request.summary,
-        notes=request.notes,
-    )
-    return PaperExperimentRunResponse(**_paper_experiment_run_to_response(updated))
 
 
 @router.post("/papers", response_model=PaperResponse)
@@ -10766,13 +10978,15 @@ async def get_collections(
 )
 async def get_collection_knowledge_readiness(
     collection_id: int,
-    knowledge_base_id: int = Query(..., ge=1),
+    knowledge_base_id: Optional[int] = Query(default=None, ge=1),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取收藏夹在指定知识库下的入库就绪度摘要。"""
+    """获取收藏夹在指定知识库或任意已入库知识库下的入库就绪度摘要。"""
     await _get_owned_collection_or_404(db, current_user, int(collection_id))
-    await _get_owned_kb_or_404(db, current_user, int(knowledge_base_id))
+    preferred_kb_id = int(knowledge_base_id or 0)
+    if preferred_kb_id > 0:
+        await _get_owned_kb_or_404(db, current_user, preferred_kb_id)
 
     paper_stmt = (
         select(Paper)
@@ -10789,7 +11003,7 @@ async def get_collection_knowledge_readiness(
     if not papers:
         return CollectionKnowledgeReadinessResponse(
             collection_id=int(collection_id),
-            knowledge_base_id=int(knowledge_base_id),
+            knowledge_base_id=preferred_kb_id or None,
             total_papers=0,
             completed_papers=0,
             running_papers=0,
@@ -10803,29 +11017,15 @@ async def get_collection_knowledge_readiness(
         )
 
     paper_ids = [int(item.id) for item in papers]
-    link_stmt = select(PaperKnowledgeLink).where(
-        and_(
-            PaperKnowledgeLink.user_id == current_user.id,
-            PaperKnowledgeLink.knowledge_base_id == int(knowledge_base_id),
-            PaperKnowledgeLink.paper_id.in_(paper_ids),
-        )
+    links = await _retrieve_scope_links_for_query(
+        db,
+        current_user=current_user,
+        paper_ids=paper_ids,
+        preferred_kb_id=preferred_kb_id or None,
     )
-    links = list((await db.execute(link_stmt)).scalars().all())
-    changed_link_ids: set[int] = set()
-    need_commit = False
+    links_by_paper_id: Dict[int, List[PaperKnowledgeLink]] = {}
     for link in links:
-        document_changed, link_changed = await _sync_link_status_from_document(db, link)
-        if document_changed or link_changed:
-            need_commit = True
-        if link_changed:
-            changed_link_ids.add(int(link.id))
-    if need_commit:
-        await db.commit()
-        for link in links:
-            if int(link.id) in changed_link_ids:
-                await db.refresh(link)
-                await _publish_paper_link_status_event(link)
-    link_by_paper_id = {int(item.paper_id): item for item in links}
+        links_by_paper_id.setdefault(int(link.paper_id), []).append(link)
 
     counts = {
         "completed": 0,
@@ -10838,7 +11038,7 @@ async def get_collection_knowledge_readiness(
     }
     items: List[CollectionKnowledgeReadinessItem] = []
     for paper in papers:
-        link = link_by_paper_id.get(int(paper.id))
+        link = _select_link_for_query(links_by_paper_id.get(int(paper.id), []), preferred_kb_id or None)
         if link is None:
             status_value = "missing"
             document_id = None
@@ -10876,7 +11076,7 @@ async def get_collection_knowledge_readiness(
 
     return CollectionKnowledgeReadinessResponse(
         collection_id=int(collection_id),
-        knowledge_base_id=int(knowledge_base_id),
+        knowledge_base_id=preferred_kb_id or None,
         total_papers=len(paper_ids),
         completed_papers=int(counts["completed"]),
         running_papers=int(counts["running"]),
@@ -11425,7 +11625,7 @@ async def stream_reader_docmind_page_image(
 
 async def process_document_background(doc_id: int, kb_id: int, file_path: str):
     """兼容旧调用：转发到知识库文档处理任务。"""
-    from app.api.knowledge import process_document_task
+    from app.api.knowledge import schedule_document_processing_task
     from app.core.database import async_session_factory
 
     async with async_session_factory() as db:
@@ -11436,7 +11636,7 @@ async def process_document_background(doc_id: int, kb_id: int, file_path: str):
         chunk_size = int(kb.chunk_size or 500)
         chunk_overlap = int(kb.chunk_overlap or 50)
 
-    await process_document_task(doc_id, chunk_size, chunk_overlap)
+    await schedule_document_processing_task(doc_id, chunk_size, chunk_overlap)
 
 
 def _chunk_reader_blocks(blocks: Sequence[Dict[str, Any]], size: int = 5) -> List[List[Dict[str, Any]]]:
@@ -15716,6 +15916,7 @@ async def literature_ask(
     target_id: int
     paper_ids: List[int] = []
     document_ids: List[int] = []
+    source_kb_ids: List[int] = []
     session_id: int = 0
     kb_id: int = 0
     kb_name: str = ""
@@ -15755,44 +15956,8 @@ async def literature_ask(
                     }
                 )
 
-        kb = await _get_owned_kb_or_404(db, current_user, int(payload.knowledge_base_id))
-        kb_id = int(kb.id)
-        kb_name = str(kb.name or f"KB#{kb.id}")
-        ready_links, ready_details = await _retrieve_scope_ready_links(
-            db,
-            user_id=current_user.id,
-            kb_id=kb.id,
-            paper_ids=paper_ids,
-        )
-        allow_agentic_pdf_only = (
-            ask_mode == "agentic"
-            and scope == AskScope.PAPER.value
-            and paper is not None
-            and bool(paper_pdf_path)
-        )
-
-        if not ready_links and not allow_agentic_pdf_only:
-            ready_details.update(
-                {
-                    "scope": scope,
-                    "knowledge_base_id": kb.id,
-                    "paper_ids": paper_ids,
-                }
-            )
-            raise _knowledge_not_ready_error(ready_details)
-
-        document_ids = sorted({int(link.document_id) for link in ready_links if link.document_id})
-        if not document_ids and not allow_agentic_pdf_only:
-            ready_details.update(
-                {
-                    "scope": scope,
-                    "knowledge_base_id": kb.id,
-                    "paper_ids": paper_ids,
-                    "message": "已入库文档缺失，建议重新入库处理。",
-                }
-            )
-            raise _knowledge_not_ready_error(ready_details)
-
+        preferred_kb_id = int(payload.knowledge_base_id or 0)
+        session: Optional[LiteratureQASession] = None
         if payload.session_id is not None:
             session_stmt = select(LiteratureQASession).where(
                 and_(
@@ -15805,18 +15970,86 @@ async def literature_ask(
                 raise HTTPException(status_code=404, detail="问答会话不存在")
             if (
                 session.scope != scope
-                or int(session.knowledge_base_id) != int(kb.id)
                 or int(session.paper_id or 0) != (target_id if scope == AskScope.PAPER.value else 0)
                 or int(session.collection_id or 0) != (target_id if scope == AskScope.COLLECTION.value else 0)
             ):
                 raise HTTPException(status_code=400, detail="会话与当前提问范围不一致")
-        else:
+            preferred_kb_id = int(session.knowledge_base_id)
+
+        preferred_kb: Optional[KnowledgeBase] = None
+        if preferred_kb_id > 0:
+            preferred_kb = await _get_owned_kb_or_404(db, current_user, preferred_kb_id)
+            preferred_kb_id = int(preferred_kb.id)
+
+        ready_links, ready_details = await _retrieve_scope_ready_links_for_query(
+            db,
+            current_user=current_user,
+            paper_ids=paper_ids,
+            preferred_kb_id=preferred_kb_id or None,
+        )
+        allow_agentic_pdf_only = (
+            ask_mode == "agentic"
+            and scope == AskScope.PAPER.value
+            and paper is not None
+            and bool(paper_pdf_path)
+            and preferred_kb is not None
+        )
+
+        if not ready_links and not allow_agentic_pdf_only:
+            ready_details.update(
+                {
+                    "scope": scope,
+                    "knowledge_base_id": preferred_kb_id or None,
+                    "paper_ids": paper_ids,
+                    "message": "目标论文尚未完成任一知识库入库处理，请先加入任意知识库并等待处理完成。",
+                }
+            )
+            raise _knowledge_not_ready_error(ready_details)
+
+        document_ids = sorted({int(link.document_id) for link in ready_links if link.document_id})
+        source_kb_ids = sorted({int(link.knowledge_base_id) for link in ready_links})
+        if source_kb_ids:
+            kb_id = int(source_kb_ids[0])
+            if len(source_kb_ids) == 1:
+                if preferred_kb is not None and int(preferred_kb.id) == kb_id:
+                    kb_name = str(preferred_kb.name or f"KB#{kb_id}")
+                else:
+                    resolved_kb = await _get_owned_kb_or_404(db, current_user, kb_id)
+                    kb_name = str(resolved_kb.name or f"KB#{kb_id}")
+            else:
+                kb_name = f"多个知识库({len(source_kb_ids)})"
+        elif preferred_kb is not None:
+            kb_id = int(preferred_kb.id)
+            kb_name = str(preferred_kb.name or f"KB#{preferred_kb.id}")
+
+        if not document_ids and not allow_agentic_pdf_only:
+            ready_details.update(
+                {
+                    "scope": scope,
+                    "knowledge_base_id": kb_id or preferred_kb_id or None,
+                    "paper_ids": paper_ids,
+                    "message": "已入库文档缺失，建议重新入库处理。",
+                }
+            )
+            raise _knowledge_not_ready_error(ready_details)
+
+        if kb_id <= 0:
+            raise _knowledge_not_ready_error(
+                {
+                    "scope": scope,
+                    "knowledge_base_id": preferred_kb_id or None,
+                    "paper_ids": paper_ids,
+                    "message": "目标论文尚未完成任一知识库入库处理，请先加入任意知识库并等待处理完成。",
+                }
+            )
+
+        if session is None:
             session = LiteratureQASession(
                 user_id=current_user.id,
                 scope=scope,
                 paper_id=target_id if scope == AskScope.PAPER.value else None,
                 collection_id=target_id if scope == AskScope.COLLECTION.value else None,
-                knowledge_base_id=kb.id,
+                knowledge_base_id=kb_id,
                 title=payload.question.strip()[:80],
             )
             db.add(session)
@@ -15837,7 +16070,7 @@ async def literature_ask(
 
         cache_key = _ask_cache_key(
             user_id=current_user.id,
-            kb_id=kb.id,
+            kb_id=kb_id,
             scope=scope,
             target_id=target_id,
             question=payload.question,
@@ -15881,15 +16114,22 @@ async def literature_ask(
         else:
             sources = await _retrieve_rag_sources(
                 db,
-                knowledge_base_id=kb.id,
+                knowledge_base_id=kb_id,
                 document_ids=document_ids,
                 question=payload.question,
                 limit=8,
+                knowledge_base_ids=source_kb_ids,
             )
             if not sources:
+                fallback_filters = [DocumentChunk.document_id.in_(document_ids)]
+                if source_kb_ids:
+                    fallback_filters.insert(0, DocumentChunk.knowledge_base_id.in_(source_kb_ids))
+                elif kb_id > 0:
+                    fallback_filters.insert(0, DocumentChunk.knowledge_base_id == kb_id)
                 fallback_stmt = (
                     select(
                         DocumentChunk.id,
+                        DocumentChunk.knowledge_base_id,
                         DocumentChunk.document_id,
                         Document.original_filename,
                         Document.file_path,
@@ -15900,12 +16140,7 @@ async def literature_ask(
                         DocumentChunk.metadata_,
                     )
                     .join(Document, Document.id == DocumentChunk.document_id)
-                    .where(
-                        and_(
-                            DocumentChunk.knowledge_base_id == kb.id,
-                            DocumentChunk.document_id.in_(document_ids),
-                        )
-                    )
+                    .where(and_(*fallback_filters))
                     .order_by(DocumentChunk.id.desc())
                     .limit(6)
                 )
@@ -15938,6 +16173,7 @@ async def literature_ask(
                         {
                             "idx": idx,
                             "chunk_id": int(getattr(row, "id")),
+                            "knowledge_base_id": int(getattr(row, "knowledge_base_id") or 0) or None,
                             "document_id": int(getattr(row, "document_id")),
                             "document_name": getattr(row, "original_filename") or "未知文档",
                             "page": page,
@@ -15990,6 +16226,7 @@ async def literature_ask(
                 {
                     "idx": source.get("idx"),
                     "chunk_id": source["chunk_id"],
+                    "knowledge_base_id": source.get("knowledge_base_id"),
                     "document_id": source["document_id"],
                     "document_name": source["document_name"],
                     "page": source.get("page"),
@@ -16079,6 +16316,7 @@ async def literature_ask(
                     {
                         "session_id": session_id,
                         "knowledge_base_id": kb_id,
+                        "knowledge_base_ids": source_kb_ids or ([kb_id] if kb_id > 0 else []),
                         "scope": scope,
                         "cache_hit": False,
                         "mode": "agentic",
@@ -16092,6 +16330,7 @@ async def literature_ask(
                         knowledge_base_id=kb_id,
                         knowledge_base_name=kb_name,
                         document_ids=document_ids,
+                        knowledge_base_ids=source_kb_ids,
                         paper_id=paper_id_for_agent,
                         paper_title=paper_title_for_agent,
                         paper_pdf_path=paper_pdf_path,
@@ -16144,6 +16383,7 @@ async def literature_ask(
                             document_ids=document_ids,
                             question=payload.question,
                             limit=6,
+                            knowledge_base_ids=source_kb_ids,
                         )
                     latest_sources = _normalize_agent_source_rows(fallback_sources)
 
@@ -16217,6 +16457,7 @@ async def literature_ask(
                 {
                     "session_id": session_id,
                     "knowledge_base_id": kb_id,
+                    "knowledge_base_ids": source_kb_ids or ([kb_id] if kb_id > 0 else []),
                     "scope": scope,
                     "cache_hit": False,
                     "mode": "classic",
