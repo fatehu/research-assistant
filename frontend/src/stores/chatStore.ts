@@ -177,7 +177,9 @@ const appendClaudeProgressOutput = (existing: string | undefined, incoming: stri
 }
 
 const isClaudeRuntimeTool = (toolName: string): boolean =>
-  toolName === 'project_claude' || toolName === 'docx_generate_with_claude'
+  toolName === 'project_claude' ||
+  toolName === 'docx_generate_with_claude' ||
+  toolName === 'docx_refine_with_claude'
 
 export type SendPhase =
   | 'idle'

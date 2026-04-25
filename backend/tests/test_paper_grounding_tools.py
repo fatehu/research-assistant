@@ -436,6 +436,7 @@ def test_tool_registry_registers_docx_tool_and_resolves_generation_intent():
 
     assert registry.resolve_intent(user_text) == "document_generation"
     assert "docx_generate_with_claude" in registry._tools
+    assert "docx_refine_with_claude" in registry._tools
 
 
 @pytest.mark.asyncio
@@ -768,6 +769,67 @@ async def test_docx_generate_tool_applies_docx_template_constraints(tmp_path, mo
     assert result.data["template_id"] == template["template_id"]
     assert result.data["template_files"]
     assert result.data["md_constraints_path"].endswith("template_md_constraints.md")
+
+
+@pytest.mark.asyncio
+async def test_docx_refine_tool_modifies_existing_workspace_docx(tmp_path, monkeypatch):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    workspace_dir = tmp_path / "docx" / "doc-1"
+    workspace_dir.mkdir(parents=True)
+    target_docx = workspace_dir / "generated_document.docx"
+    target_docx.write_bytes(b"original")
+    (workspace_dir / "docx_request.json").write_text(
+        json.dumps(
+            {
+                "docx_id": "doc-1",
+                "output_basename": "generated_document",
+                "docx_path": str(target_docx),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tool = agent_tools.DocxRefineWithClaudeTool()
+
+    class _FakeDocxRuntimeWorkerClient:
+        @staticmethod
+        def enabled():
+            return True
+
+        async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
+            assert docx_id == "doc-1"
+            assert continue_session is True
+            assert "docx_refine_request.json" in prompt
+            assert "不要调用 project_* 工具" in prompt
+            target_docx.write_bytes(b"refined")
+            return {
+                "docx_id": docx_id,
+                "workspace_dir": str(workspace_dir),
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "session_id": "docx-session-id",
+                "assistant_text": "refined",
+                "result_text": "All validations PASSED!",
+                "is_error": False,
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "error": None,
+                "worker": "runtime-worker",
+            }
+
+    monkeypatch.setattr(
+        "app.services.docx_runtime_service.DocxRuntimeWorkerClient",
+        _FakeDocxRuntimeWorkerClient,
+    )
+
+    result = await tool._execute(docx_id="doc-1", instruction="修复目录跳转和页码。")
+
+    assert result.success is True
+    assert result.data["docx_id"] == "doc-1"
+    assert result.data["docx_path"] == str(target_docx)
+    assert target_docx.read_bytes() == b"refined"
+    assert (workspace_dir / "docx_refine_request.json").is_file()
 
 
 @pytest.mark.asyncio

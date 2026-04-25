@@ -1296,6 +1296,7 @@ async def run_docx_claude_stream(payload: DocxClaudeRunRequest):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=CLAUDE_STREAM_PIPE_LIMIT,
     )
 
     async def _generate():

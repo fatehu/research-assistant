@@ -739,9 +739,9 @@ class AgentCore:
                 "应跳过这篇或重新搜索可下载的开放获取论文；不要反复调用同一个失败链接。"
             )
 
-        if normalized_tool_name == "docx_generate_with_claude":
+        if normalized_tool_name in {"docx_generate_with_claude", "docx_refine_with_claude"}:
             return (
-                "工具适用范围提示：`docx_generate_with_claude` 只负责 DOCX 工作区生成。"
+                f"工具适用范围提示：`{normalized_tool_name}` 只负责 DOCX 工作区生成/修改。"
                 "如果它失败或没有产出文件，应向用户报告 Claude/DOCX 生成失败或重新调用该工具重试；"
                 "不要改用 `project_tree`、`project_read_file`、`project_bash`、`project_claude` 检查或补救。"
                 "Project 工具只用于论文复现、代码优化、代码编写 Project 工作区。"
@@ -5488,6 +5488,7 @@ class AgentCore:
         if getattr(self.runtime_context, "live_event_callback", None) and call.name in {
             "project_claude",
             "docx_generate_with_claude",
+            "docx_refine_with_claude",
         }:
             live_event_token = set_tool_live_event_emitter(self.runtime_context.live_event_callback)
         try:

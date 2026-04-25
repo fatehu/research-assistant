@@ -34,6 +34,7 @@ export const toolNames: Record<string, string> = {
   project_bash: '项目 Bash',
   project_claude: 'Claude 执行者',
   docx_generate_with_claude: 'DOCX Claude',
+  docx_refine_with_claude: 'DOCX 修改',
   paper_research_search_project_zoekt: '项目 Zoekt 搜索',
   paper_research_inspect_runtime: '探测运行环境',
   paper_research_write_execution_script: '写入执行脚本',

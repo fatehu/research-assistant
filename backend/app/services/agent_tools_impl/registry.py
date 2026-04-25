@@ -1463,6 +1463,14 @@ class DocxGenerateWithClaudeInput(BaseModel):
     continue_session: bool = False
 
 
+class DocxRefineWithClaudeInput(BaseModel):
+    docx_id: str = Field(min_length=1, max_length=160)
+    instruction: str = Field(min_length=1, max_length=20000)
+    target_docx_path: Optional[str] = Field(default=None, max_length=2000)
+    output_basename: Optional[str] = None
+    continue_session: bool = True
+
+
 class LiteratureReviewStartInput(BaseModel):
     literature_review_id: Optional[str] = None
     topic: str = Field(min_length=1, max_length=1000)
@@ -4708,6 +4716,466 @@ class DocxGenerateWithClaudeTool(ToolBase):
                 "pdf_path": files.get("pdf_path") or "",
                 "files": files.get("files") or [],
                 "template_files": template_files,
+                "validation_status": validation_status,
+                "session_id": str(worker_payload.get("session_id") or ""),
+                "assistant_text": assistant_text,
+                "result_text": result_text,
+                "stdout": str(worker_payload.get("stdout") or ""),
+                "stderr": str(worker_payload.get("stderr") or ""),
+                "exit_code": worker_payload.get("exit_code"),
+                "worker": str(worker_payload.get("worker") or "runtime-worker"),
+                "is_error": bool(worker_payload.get("is_error")),
+            },
+        )
+
+
+class DocxRefineWithClaudeTool(DocxGenerateWithClaudeTool):
+    name = "docx_refine_with_claude"
+    input_model = DocxRefineWithClaudeInput
+    timeout_seconds = 0.0
+    retry_count = 0
+    output_max_tokens = 9000
+    description = (
+        "在已有 `/app/uploads/docx/{docx_id}` 工作目录内继续调用 runtime-worker 里的 Claude Code，"
+        "让它修改、润色或修复该 docx_id 目录下已经生成的 DOCX/PDF。"
+        "它不创建新 docx 工作区，不属于 Project，不需要 project_id；只允许操作指定 docx_id 工作目录内的文件。"
+        "适合根据用户反馈修改已有 DOCX、修复目录/页码/样式、补充内容或重新导出 PDF。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "docx_id": {"type": "string", "description": "必填，已有 DOCX 工作区 ID，对应 `/app/uploads/docx/{docx_id}`。"},
+            "instruction": {"type": "string", "description": "必填，用户对现有 DOCX 的修改要求。不要传整篇文档全文；引用工作区路径即可。"},
+            "target_docx_path": {"type": "string", "description": "可选，要修改的 DOCX 路径。必须位于该 docx_id 工作目录内；未传则自动选择当前输出 DOCX。"},
+            "output_basename": {"type": "string", "description": "可选输出文件基础名。不传时沿用现有输出名，通常会原位更新当前 DOCX。"},
+            "continue_session": {"type": "boolean", "default": True, "description": "是否继续该 docx 工作区已有 Claude session。默认 true。"},
+        },
+        "required": ["docx_id", "instruction"],
+    }
+
+    @classmethod
+    def _resolve_workspace_file(cls, raw_path: Any, *, workspace_dir: Path) -> Optional[Path]:
+        raw = str(raw_path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = workspace_dir / raw
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(workspace_dir.resolve())
+        except Exception:
+            return None
+        return resolved if resolved.is_file() else None
+
+    @staticmethod
+    def _read_json_if_exists(path: Path) -> Dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return dict(payload or {}) if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _pick_target_docx(cls, workspace_dir: Path, *, raw_target: str, metadata: Dict[str, Any]) -> Optional[Path]:
+        explicit = cls._resolve_workspace_file(raw_target, workspace_dir=workspace_dir)
+        if explicit is not None and explicit.suffix.lower() == ".docx":
+            return explicit
+        metadata_path = cls._resolve_workspace_file(metadata.get("docx_path"), workspace_dir=workspace_dir)
+        if metadata_path is not None and metadata_path.suffix.lower() == ".docx":
+            return metadata_path
+        output_basename = str(metadata.get("output_basename") or "").strip()
+        if output_basename:
+            candidate = workspace_dir / f"{cls._safe_slug(output_basename, fallback='generated_document')}.docx"
+            if candidate.is_file():
+                return candidate
+        candidates = sorted(
+            workspace_dir.glob("*.docx"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0.0,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _workspace_doc_outputs_snapshot(workspace_dir: Path) -> Dict[str, float]:
+        return {
+            str(path): path.stat().st_mtime
+            for path in workspace_dir.glob("*")
+            if path.is_file() and path.suffix.lower() in {".docx", ".pdf"}
+        }
+
+    @staticmethod
+    def _changed_doc_outputs(workspace_dir: Path, before: Dict[str, float]) -> List[str]:
+        changed: List[str] = []
+        for path in workspace_dir.glob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".docx", ".pdf"}:
+                continue
+            current = path.stat().st_mtime
+            previous = before.get(str(path))
+            if previous is None or abs(current - previous) > 0.001:
+                changed.append(str(path))
+        return sorted(changed)
+
+    @staticmethod
+    def _build_refine_prompt(
+        *,
+        workspace_dir: Path,
+        request_file: Path,
+        target_docx: Path,
+        output_docx: Path,
+        output_pdf: Path,
+        instruction: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "你现在只负责在已有 DOCX 工作区内修改文档，不处理 Project/论文复现语义。",
+                f"工作目录：{workspace_dir}",
+                f"修改请求文件：{request_file}",
+                f"目标 DOCX：{target_docx}",
+                f"期望 DOCX 输出：{output_docx}",
+                f"期望 PDF 输出：{output_pdf}",
+                "",
+                "用户修改要求：",
+                instruction.strip(),
+                "",
+                "工作规则：",
+                "1. 只在当前 docx_id 工作目录内读写文件；不要调用 project_* 工具，不要访问 `/app/uploads/projects`。",
+                "2. 可以读取 docx_inputs_manifest.json、docx_request.json、requirements.md、template_md_constraints.md 等小清单/约束文件。",
+                "3. 不要用 Read 把大型 artifact/source/template 文件全文读入对话流；如需读取，使用脚本按路径读取并直接处理。",
+                "4. 修改目标 DOCX 时可以原位覆盖；如果需要保留原件，先在同目录创建简短备份文件。",
+                "5. 修改后尽量重新导出 PDF 预览；如果无法导出 PDF，明确说明原因。",
+                "6. stdout/stderr 只输出短进度和最终路径，不要打印大文件全文。",
+                "最终回复必须给出 docx_path、pdf_path（没有则空）、changed_files、validation_status、notes。",
+            ]
+        )
+
+    async def _execute(self, **kwargs) -> ToolResult:
+        from app.services.docx_runtime_service import DocxRuntimeWorkerClient
+        from app.services.docx_template_service import DocxTemplateService
+
+        docx_id = self._safe_slug(kwargs.get("docx_id"), fallback="")
+        if not docx_id:
+            return ToolResult(success=False, output="docx_id 不能为空。", error="missing_docx_id")
+        instruction = str(kwargs.get("instruction") or "").strip()
+        if not instruction:
+            return ToolResult(success=False, output="instruction 不能为空。", error="missing_instruction")
+
+        upload_root = self._upload_root()
+        workspace_dir = (upload_root / "docx" / docx_id).resolve()
+        try:
+            workspace_dir.relative_to((upload_root / "docx").resolve())
+        except Exception:
+            return ToolResult(
+                success=False,
+                output="docx_id 无效，不能解析到 DOCX 工作区。",
+                error="invalid_docx_id",
+                data={"docx_id": docx_id},
+            )
+        if not workspace_dir.is_dir():
+            return ToolResult(
+                success=False,
+                output=f"DOCX 工作区不存在：{workspace_dir}",
+                error="docx_workspace_not_found",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
+
+        metadata_file = workspace_dir / "docx_request.json"
+        input_manifest_file = workspace_dir / "docx_inputs_manifest.json"
+        metadata = self._read_json_if_exists(metadata_file)
+        manifest = self._read_json_if_exists(input_manifest_file)
+        raw_target_docx = str(kwargs.get("target_docx_path") or "").strip()
+        if raw_target_docx:
+            explicit_target = self._resolve_workspace_file(raw_target_docx, workspace_dir=workspace_dir)
+            if explicit_target is None or explicit_target.suffix.lower() != ".docx":
+                return ToolResult(
+                    success=False,
+                    output="target_docx_path 不存在、不是 DOCX，或不在该 docx_id 工作区内。",
+                    error="invalid_target_docx_path",
+                    data={"docx_id": docx_id, "target_docx_path": raw_target_docx, "workspace_dir": str(workspace_dir)},
+                )
+        target_docx = self._pick_target_docx(
+            workspace_dir,
+            raw_target=raw_target_docx,
+            metadata={**manifest, **metadata},
+        )
+        if target_docx is None:
+            return ToolResult(
+                success=False,
+                output="该 docx_id 工作区下没有可修改的 DOCX 文件。",
+                error="target_docx_not_found",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
+
+        output_basename = self._safe_slug(
+            kwargs.get("output_basename") or metadata.get("output_basename") or target_docx.stem,
+            fallback=target_docx.stem or "generated_document",
+        )
+        output_docx = workspace_dir / f"{output_basename}.docx"
+        output_pdf = workspace_dir / f"{output_basename}.pdf"
+        continue_session = bool(kwargs.get("continue_session", True))
+        request_file = workspace_dir / "docx_refine_request.json"
+        request_payload = {
+            "docx_id": docx_id,
+            "workspace_dir": str(workspace_dir),
+            "target_docx_path": str(target_docx),
+            "output_docx_path": str(output_docx),
+            "output_pdf_path": str(output_pdf),
+            "instruction": instruction,
+            "input_manifest_path": str(input_manifest_file) if input_manifest_file.is_file() else "",
+            "docx_request_path": str(metadata_file) if metadata_file.is_file() else "",
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        request_file.write_text(json.dumps(request_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._relaxed_chmod(request_file, 0o666)
+
+        template_service = DocxTemplateService(upload_root=upload_root)
+        running_job_payload = {
+            "docx_id": docx_id,
+            "template_id": str(metadata.get("template_id") or manifest.get("template_id") or ""),
+            "template_name": str(metadata.get("template_name") or manifest.get("template_name") or ""),
+            "artifact_id": str(metadata.get("artifact_id") or manifest.get("artifact_id") or ""),
+            "conversation_id": self.conversation_id or metadata.get("conversation_id") or manifest.get("conversation_id"),
+            "workspace_dir": str(workspace_dir),
+            "source_path": str(metadata.get("source_file") or metadata.get("source_path") or manifest.get("source_path") or ""),
+            "requirements_path": str(metadata.get("requirements_file") or metadata.get("requirements_path") or manifest.get("requirements_path") or ""),
+            "output_basename": output_basename,
+            "docx_path": str(target_docx),
+            "pdf_path": str(output_pdf) if output_pdf.is_file() else str(metadata.get("pdf_path") or ""),
+            "status": "running",
+            "validation_status": "",
+            "files": self._collect_generated_files(workspace_dir, output_basename=output_basename).get("files") or [],
+            "metadata": {
+                **dict(metadata.get("metadata") or {}),
+                "refine_request_path": str(request_file),
+                "target_docx_path": str(target_docx),
+                "input_manifest_path": str(input_manifest_file) if input_manifest_file.is_file() else "",
+            },
+        }
+        await self._upsert_docx_job(template_service, running_job_payload)
+
+        if not DocxRuntimeWorkerClient.enabled():
+            await self._upsert_docx_job(
+                template_service,
+                {**running_job_payload, "status": "failed", "error": "runtime_worker_disabled"},
+            )
+            return ToolResult(
+                success=False,
+                output="runtime-worker 未启用，当前不能调用 Claude Code 修改 DOCX。",
+                error="runtime_worker_disabled",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
+
+        prompt = self._build_refine_prompt(
+            workspace_dir=workspace_dir,
+            request_file=request_file,
+            target_docx=target_docx,
+            output_docx=output_docx,
+            output_pdf=output_pdf,
+            instruction=instruction,
+        )
+        before_outputs = self._workspace_doc_outputs_snapshot(workspace_dir)
+        live_stream_payload: Optional[Dict[str, Any]] = None
+        stream_errors: List[str] = []
+        try:
+            if _TOOL_LIVE_EVENT_EMITTER.get() is not None:
+                async for stream_item in DocxRuntimeWorkerClient().claude_stream(
+                    docx_id=docx_id,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    continue_session=continue_session,
+                ):
+                    stream_item_type = str(stream_item.get("type") or "")
+                    if stream_item_type == "stream_error":
+                        stream_error_text = str(
+                            stream_item.get("error")
+                            or stream_item.get("text")
+                            or "runtime-worker stream interrupted"
+                        )
+                        stream_errors.append(stream_error_text)
+                        await emit_tool_live_event(
+                            {
+                                "type": "tool_output",
+                                "data": {
+                                    "tool": self.name,
+                                    "input": {"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+                                    "stream": "stderr",
+                                    "text": f"runtime-worker stream warning: {stream_error_text}\n",
+                                },
+                            }
+                        )
+                        continue
+                    if stream_item_type == "chunk":
+                        text = str(stream_item.get("text") or "")
+                        if text:
+                            await emit_tool_live_event(
+                                {
+                                    "type": "tool_output",
+                                    "data": {
+                                        "tool": self.name,
+                                        "input": {"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+                                        "stream": str(stream_item.get("stream") or "stdout"),
+                                        "text": text,
+                                    },
+                                }
+                            )
+                        continue
+                    if stream_item_type == "result" and isinstance(stream_item.get("payload"), dict):
+                        live_stream_payload = dict(stream_item.get("payload") or {})
+                worker_payload = live_stream_payload or {
+                    "docx_id": docx_id,
+                    "workspace_dir": str(workspace_dir),
+                    "prompt": prompt,
+                    "continue_session": continue_session,
+                    "session_id": "",
+                    "assistant_text": "",
+                    "result_text": "",
+                    "is_error": True,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "\n".join(stream_errors),
+                    "error": "docx_refine_stream_interrupted" if stream_errors else "docx_refine_stream_missing_result",
+                    "worker": "runtime-worker",
+                }
+            else:
+                worker_payload = await DocxRuntimeWorkerClient().claude(
+                    docx_id=docx_id,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    continue_session=continue_session,
+                )
+        except Exception as exc:
+            stream_error = f"{type(exc).__name__}: {exc}"
+            changed_files = self._changed_doc_outputs(workspace_dir, before_outputs)
+            files = self._collect_generated_files(workspace_dir, output_basename=output_basename)
+            if changed_files and files.get("docx_path"):
+                validation_status = self._infer_validation_status_from_workspace(
+                    workspace_dir,
+                    fallback="refined_after_stream_error",
+                )
+                await self._upsert_docx_job(
+                    template_service,
+                    {
+                        **running_job_payload,
+                        "status": "completed",
+                        "docx_path": files.get("docx_path") or "",
+                        "pdf_path": files.get("pdf_path") or "",
+                        "files": files.get("files") or [],
+                        "validation_status": validation_status,
+                        "error": f"stream_transport_error_after_refine: {stream_error}",
+                        "metadata": {
+                            **dict(running_job_payload.get("metadata") or {}),
+                            "changed_files": changed_files,
+                            "stream_error": stream_error,
+                        },
+                    },
+                )
+                return ToolResult(
+                    success=True,
+                    output="\n".join(
+                        [
+                            "Claude 已修改 DOCX，但 runtime-worker 流式连接在结束前中断；平台已从工作区变更恢复为成功。",
+                            f"- Docx ID: {docx_id}",
+                            f"- Workspace: {workspace_dir}",
+                            f"- DOCX: {files.get('docx_path') or '(missing)'}",
+                            f"- PDF: {files.get('pdf_path') or '(missing)'}",
+                            f"- Changed files: {', '.join(changed_files)}",
+                            f"- Stream error: {stream_error}",
+                        ]
+                    ),
+                    data={
+                        "docx_id": docx_id,
+                        "workspace_dir": str(workspace_dir),
+                        "docx_path": files.get("docx_path") or "",
+                        "pdf_path": files.get("pdf_path") or "",
+                        "changed_files": changed_files,
+                        "stream_error": stream_error,
+                        "worker": "runtime-worker",
+                        "is_error": False,
+                    },
+                )
+            await self._upsert_docx_job(
+                template_service,
+                {**running_job_payload, "status": "failed", "error": stream_error},
+            )
+            return ToolResult(
+                success=False,
+                output="\n".join(
+                    [
+                        "DOCX refine 调用 runtime-worker 失败。",
+                        f"- Docx ID: {docx_id}",
+                        f"- Workspace: {workspace_dir}",
+                        f"- Error: {stream_error}",
+                    ]
+                ),
+                error="docx_refine_worker_failed",
+                data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
+            )
+
+        changed_files = self._changed_doc_outputs(workspace_dir, before_outputs)
+        files = self._collect_generated_files(workspace_dir, output_basename=output_basename)
+        validation_status = self._infer_validation_status(
+            worker_payload=worker_payload,
+            docx_path=str(files.get("docx_path") or ""),
+        )
+        workspace_validation_status = self._infer_validation_status_from_workspace(workspace_dir)
+        if workspace_validation_status:
+            validation_status = workspace_validation_status
+        result_text = str(worker_payload.get("result_text") or "").strip()
+        assistant_text = str(worker_payload.get("assistant_text") or "").strip()
+        rendered_text = result_text or assistant_text or "(empty)"
+        stream_missing_result = str(worker_payload.get("error") or "") in {
+            "docx_refine_stream_missing_result",
+            "docx_refine_stream_interrupted",
+        }
+        success = bool(files.get("docx_path")) and (
+            not bool(worker_payload.get("is_error")) or bool(changed_files and stream_missing_result)
+        )
+        completed_status = "completed" if success else "failed"
+        completed_error = str(worker_payload.get("error") or "") or ("" if success else "docx_refine_missing_output")
+        completed_job_payload = {
+            **running_job_payload,
+            "status": completed_status,
+            "docx_path": files.get("docx_path") or "",
+            "pdf_path": files.get("pdf_path") or "",
+            "files": files.get("files") or [],
+            "validation_status": validation_status,
+            "session_id": str(worker_payload.get("session_id") or ""),
+            "error": completed_error,
+            "metadata": {
+                **dict(running_job_payload.get("metadata") or {}),
+                "assistant_text": assistant_text,
+                "result_text": result_text,
+                "changed_files": changed_files,
+            },
+        }
+        await self._upsert_docx_job(template_service, completed_job_payload)
+        return ToolResult(
+            success=success,
+            output="\n".join(
+                [
+                    "已通过 runtime-worker 调用 Claude Code 修改 DOCX。",
+                    f"- Docx ID: {docx_id}",
+                    f"- Workspace: {workspace_dir}",
+                    f"- Continue session: {continue_session}",
+                    f"- Session: {str(worker_payload.get('session_id') or '').strip() or '(missing)'}",
+                    f"- Target DOCX: {target_docx}",
+                    f"- DOCX: {files.get('docx_path') or '(missing)'}",
+                    f"- PDF: {files.get('pdf_path') or '(missing)'}",
+                    f"- Changed files: {', '.join(changed_files) if changed_files else '(none detected)'}",
+                    f"- Validation: {validation_status}",
+                    "Claude result:",
+                    rendered_text,
+                ]
+            ),
+            error=None if success else completed_error,
+            data={
+                "docx_id": docx_id,
+                "workspace_dir": str(workspace_dir),
+                "target_docx_path": str(target_docx),
+                "docx_path": files.get("docx_path") or "",
+                "pdf_path": files.get("pdf_path") or "",
+                "changed_files": changed_files,
+                "files": files.get("files") or [],
                 "validation_status": validation_status,
                 "session_id": str(worker_payload.get("session_id") or ""),
                 "assistant_text": assistant_text,
@@ -10894,6 +11362,12 @@ class DefaultToolProvider:
                             db_session_factory=ctx.db_session_factory,
                             conversation_id=ctx.conversation_id,
                         ),
+                        DocxRefineWithClaudeTool(
+                            ctx.db,
+                            int(ctx.user_id),
+                            db_session_factory=ctx.db_session_factory,
+                            conversation_id=ctx.conversation_id,
+                        ),
                         PaperResearchPrepareTool(
                             ctx.db,
                             int(ctx.user_id),
@@ -10979,7 +11453,7 @@ class ToolRegistry:
             "unit_converter",
         },
         "literature_task": {"literature_search"},
-        "document_generation": {"docx_generate_with_claude"},
+        "document_generation": {"docx_generate_with_claude", "docx_refine_with_claude"},
         "general_chat": {"datetime", "calculator", "text_analysis"},
     }
     _CODELAB_INTENT_TOOL_MAP: Dict[str, Set[str]] = {
