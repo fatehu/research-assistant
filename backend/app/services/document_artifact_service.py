@@ -456,8 +456,12 @@ class DocumentArtifactService:
         include_constraints: bool = True,
         include_markdown: bool = True,
     ) -> Dict[str, Any]:
-        artifact = await self.get_active_artifact(db, user_id=user_id, conversation_id=conversation_id)
-        if artifact is None:
+        conversation = await self._load_conversation(db, user_id=user_id, conversation_id=conversation_id)
+        path = self._active_path_from_conversation(conversation)
+        if path is None or not path.is_file():
+            raise ValueError("当前对话没有 active document artifact")
+        artifact = self._read_json(path)
+        if not artifact:
             raise ValueError("当前对话没有 active document artifact")
         selected = {str(item).strip() for item in list(block_ids or []) if str(item).strip()}
         blocks: List[Dict[str, Any]] = []
@@ -482,6 +486,7 @@ class DocumentArtifactService:
             blocks.append(item)
         return {
             "artifact_id": artifact.get("artifact_id"),
+            "artifact_path": str(path),
             "template_id": artifact.get("template_id"),
             "title": artifact.get("title"),
             "global_constraints": artifact.get("global_constraints") if include_constraints else "",

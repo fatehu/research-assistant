@@ -127,6 +127,7 @@ async def test_project_tree_tool_returns_project_directory_tree(tmp_path, monkey
 
     monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+
     async def _load_project_tree_focus_context(_db, *, project_payload):
         return {"project_goal": "inspect repo structure", "recent_tool_calls": [{"tool_name": "paper_research_status"}]}
 
@@ -208,6 +209,13 @@ async def test_project_bash_tool_executes_in_project_root(tmp_path, monkeypatch)
 
     monkeypatch.setattr(tool, "_resolve_project_payload_only", _resolve_project_payload_only)
     monkeypatch.setattr(tool, "_project_dir_for", lambda _project_id: tmp_path)
+
+    class _DisabledWorkerClient:
+        @staticmethod
+        def enabled():
+            return False
+
+    monkeypatch.setattr("app.services.project_runtime_service.ProjectRuntimeWorkerClient", _DisabledWorkerClient)
 
     result = await tool._execute(
         project_id=7,
@@ -411,7 +419,12 @@ async def test_docx_template_service_analyzes_files_and_generates_constraints(tm
     analysis = service.build_template_analysis(template["template_id"])
     result = await service.generate_constraints_with_llm(template["template_id"])
 
-    assert any(item.get("kind") == "docx_ooxml" for item in analysis["files"])
+    assert any(
+        item.get("kind") == "sample_template_docx"
+        and isinstance(item.get("ooxml"), dict)
+        and item["ooxml"].get("kind") == "docx_ooxml"
+        for item in analysis["files"]
+    )
     assert "立项依据" in json.dumps(analysis, ensure_ascii=False)
     assert result["md_constraints"] == "必须包含立项依据、研究内容、创新点。"
     assert result["docx_constraints"] == "一级标题采用标题 1 样式。"
@@ -542,7 +555,7 @@ async def test_literature_review_workspace_tools_generate_review_files(tmp_path,
         lambda: _FakePdfIngestService(),
     )
 
-    read_result = await agent_tools.ReadFullPdfTool(user_id=1).execute(
+    read_result = await agent_tools.LiteratureReviewPdfToMarkdownTool(user_id=1).execute(
         literature_review_id=review_id,
         paper_key="graph-rag-survey",
     )
@@ -585,7 +598,8 @@ def test_tool_registry_registers_literature_review_tools():
 
     assert "literature_review_start" in registry._tools
     assert "literature_review_download_pdf" in registry._tools
-    assert "read_full_pdf" in registry._tools
+    assert "literature_review_pdf_to_markdown" in registry._tools
+    assert "read_full_pdf" not in registry._tools
     assert "review_writer" in registry._tools
 
 
@@ -601,7 +615,7 @@ def test_literature_review_skill_injects_session_prompt():
 
     assert resolution.active_skills[0].name == "literature-review"
     assert "默认目标是 12 篇" in resolution.active_system_prompt
-    assert "read_full_pdf" in resolution.active_system_prompt
+    assert "literature_review_pdf_to_markdown" in resolution.active_system_prompt
 
 
 def test_tool_output_truncation_defaults_enabled_for_long_outputs():
@@ -615,7 +629,7 @@ def test_tool_output_truncation_defaults_enabled_for_long_outputs():
             return agent_tools.ToolResult(success=True, output="x " * 5000)
 
     assert settings.tool_output_truncation_enabled is True
-    assert agent_tools.ReadFullPdfTool(user_id=1)._resolve_output_max_tokens() == 9000
+    assert agent_tools.LiteratureReviewPdfToMarkdownTool(user_id=1)._resolve_output_max_tokens() == 9000
     assert agent_tools.ReviewWriterTool(user_id=1)._resolve_output_max_tokens() == 12000
 
     result = _EchoTool()._with_finalized_result(
@@ -642,6 +656,7 @@ async def test_docx_generate_tool_writes_inputs_and_uses_docx_worker(tmp_path, m
         async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
             assert docx_id == "test-doc"
             assert workspace_dir == tmp_path / "docx" / "test-doc"
+            assert "docx_inputs_manifest.json" in prompt
             assert "source.md" in prompt
             assert "requirements.md" in prompt
             assert "Project/论文复现" in prompt
@@ -679,7 +694,10 @@ async def test_docx_generate_tool_writes_inputs_and_uses_docx_worker(tmp_path, m
 
     workspace_dir = tmp_path / "docx" / "test-doc"
     assert (workspace_dir / "source.md").read_text(encoding="utf-8") == "# Title\n\nBody"
-    assert (workspace_dir / "requirements.md").read_text(encoding="utf-8") == "生成论文综述模板。"
+    assert (workspace_dir / "requirements.md").read_text(encoding="utf-8").startswith("生成论文综述模板。")
+    manifest = json.loads((workspace_dir / "docx_inputs_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_path"] == str(workspace_dir / "source.md")
+    assert manifest["requirements_path"] == str(workspace_dir / "requirements.md")
     assert result.success is True
     assert result.data["docx_id"] == "test-doc"
     assert result.data["docx_path"] == str(workspace_dir / "review.docx")
@@ -712,9 +730,11 @@ async def test_docx_generate_tool_applies_docx_template_constraints(tmp_path, mo
 
         async def claude(self, *, docx_id: str, workspace_dir, prompt: str, continue_session: bool):
             assert docx_id == "templated-doc"
-            assert (workspace_dir / "template_files" / "reference.docx").is_file()
             assert "一级标题使用三号黑体。" in (workspace_dir / "requirements.md").read_text(encoding="utf-8")
             assert "必须输出固定 Markdown 章节。" in (workspace_dir / "template_md_constraints.md").read_text(encoding="utf-8")
+            manifest = json.loads((workspace_dir / "docx_inputs_manifest.json").read_text(encoding="utf-8"))
+            assert manifest["template_files"][0]["path"].endswith("reference.docx")
+            assert not (workspace_dir / "template_files").exists()
             (workspace_dir / "generated_document.docx").write_bytes(b"fake-docx")
             return {
                 "docx_id": docx_id,

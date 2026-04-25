@@ -16,6 +16,8 @@ import {
   type ConversationTurnStore,
   type ConversationToolLedger,
   type ConversationItemStream,
+  type DocumentArtifact,
+  type DocumentArtifactBlock,
   type MessageSpanRewriteResponse,
 } from '@/services/api'
 import { handleApiError } from '@/utils/apiErrorHandler'
@@ -84,6 +86,26 @@ const formatClaudeStreamLine = (rawLine: string): string[] => {
   const content = Array.isArray(message?.content) ? message.content : []
   const lines: string[] = []
 
+  if (eventType === 'system') {
+    const subtype = String(parsed?.subtype || '').trim()
+    if (subtype === 'init') {
+      const model = truncateToolLine(parsed?.model, 80)
+      const session = truncateToolLine(parsed?.session_id, 48)
+      const cwd = truncateToolLine(parsed?.cwd, 120)
+      lines.push(
+        [
+          'Claude 已启动',
+          model ? `model=${model}` : '',
+          session ? `session=${session}` : '',
+          cwd ? `cwd=${cwd}` : '',
+        ]
+          .filter(Boolean)
+          .join(' · '),
+      )
+    }
+    return lines
+  }
+
   if (eventType === 'assistant') {
     content.forEach((item: any) => {
       const itemType = String(item?.type || '').trim()
@@ -126,12 +148,25 @@ const formatClaudeStreamLine = (rawLine: string): string[] => {
   return []
 }
 
+const isStructuredClaudeStreamLine = (rawLine: string): boolean => {
+  const normalized = String(rawLine || '').trim()
+  if (!normalized) return false
+  try {
+    const parsed = JSON.parse(normalized)
+    return Boolean(parsed && typeof parsed === 'object' && typeof parsed.type === 'string')
+  } catch {
+    return false
+  }
+}
+
 const appendClaudeProgressOutput = (existing: string | undefined, incoming: string, maxLines = 8): string => {
-  const extracted = String(incoming || '')
-    .split('\n')
+  const rawLines = String(incoming || '').split('\n')
+  const hasStructuredClaudeEvent = rawLines.some((line) => isStructuredClaudeStreamLine(line))
+  const extracted = rawLines
     .flatMap((line) => formatClaudeStreamLine(line))
     .filter(Boolean)
   if (!extracted.length) {
+    if (hasStructuredClaudeEvent) return String(existing || '')
     return appendRollingToolOutput(existing, incoming, maxLines)
   }
   const previousLines = String(existing || '')
@@ -140,6 +175,9 @@ const appendClaudeProgressOutput = (existing: string | undefined, incoming: stri
     .filter(Boolean)
   return [...previousLines, ...extracted].slice(-maxLines).join('\n')
 }
+
+const isClaudeRuntimeTool = (toolName: string): boolean =>
+  toolName === 'project_claude' || toolName === 'docx_generate_with_claude'
 
 export type SendPhase =
   | 'idle'
@@ -303,6 +341,73 @@ const applySpanRewriteToConversation = (
     ...conversation,
     ...(nextItemStream ? { item_stream: nextItemStream } : {}),
     ...(nextTurnStore ? { turn_store: nextTurnStore } : {}),
+  }
+}
+
+const isDocumentArtifact = (value: unknown): value is DocumentArtifact =>
+  Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as DocumentArtifact).artifact_id === 'string' &&
+      Array.isArray((value as DocumentArtifact).blocks),
+  )
+
+const isDocumentArtifactBlock = (value: unknown): value is DocumentArtifactBlock =>
+  Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as DocumentArtifactBlock).block_id === 'string',
+  )
+
+const applyDocumentArtifactUpdateToConversation = (
+  conversation: Conversation | null,
+  payload: unknown,
+): Conversation | null => {
+  if (!conversation || !payload || typeof payload !== 'object') return conversation
+  const data = payload as Record<string, unknown>
+  if (isDocumentArtifact(data.document_artifact)) {
+    return {
+      ...conversation,
+      document_artifact: data.document_artifact,
+      updated_at:
+        typeof data.document_artifact.updated_at === 'string'
+          ? data.document_artifact.updated_at
+          : conversation.updated_at,
+    }
+  }
+
+  const artifact = conversation.document_artifact
+  const block = isDocumentArtifactBlock(data.block) ? data.block : null
+  if (!artifact || !block) return conversation
+
+  const artifactId = typeof data.artifact_id === 'string' ? data.artifact_id : ''
+  if (artifactId && artifact.artifact_id !== artifactId) return conversation
+
+  let found = false
+  const blocks = artifact.blocks.map((item) => {
+    if (item.block_id !== block.block_id) return item
+    found = true
+    return {
+      ...item,
+      ...block,
+    }
+  })
+  if (!found) return conversation
+
+  const updatedAt =
+    typeof data.updated_at === 'string'
+      ? data.updated_at
+      : typeof block.updated_at === 'string'
+        ? block.updated_at
+        : artifact.updated_at
+  return {
+    ...conversation,
+    document_artifact: {
+      ...artifact,
+      blocks,
+      ...(updatedAt ? { updated_at: updatedAt } : {}),
+    },
+    updated_at: updatedAt || conversation.updated_at,
   }
 }
 
@@ -730,6 +835,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
               })
               break
 
+            case 'artifact_updated':
+              set((state) => {
+                const nextConversation = applyDocumentArtifactUpdateToConversation(
+                  state.currentConversation,
+                  data,
+                )
+                return {
+                  currentConversation: nextConversation,
+                  conversations: upsertConversationListItem(state.conversations, nextConversation),
+                }
+              })
+              break
+
             case 'tool_output': {
               const toolName = typeof data?.tool === 'string' ? data.tool : 'project_claude'
               const toolInput = data && typeof data?.input === 'object' ? data.input : {}
@@ -740,10 +858,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   state.currentToolCall && state.currentToolCall.tool === toolName
                     ? state.currentToolCall.output
                     : undefined
-                const mergedOutput =
-                  toolName === 'project_claude'
-                    ? appendClaudeProgressOutput(previousOutput, text)
-                    : appendRollingToolOutput(previousOutput, text)
+                const mergedOutput = isClaudeRuntimeTool(toolName)
+                  ? appendClaudeProgressOutput(previousOutput, text)
+                  : appendRollingToolOutput(previousOutput, text)
+                const shouldAppendSyntheticAction =
+                  !state.currentToolCall &&
+                  !state.iterationSteps.some((step) => step.type === 'action' && step.tool === toolName)
                 return {
                   currentToolCall: {
                     tool: toolName,
@@ -751,6 +871,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     output: mergedOutput,
                     timestamp: Date.now(),
                   },
+                  isThinking: false,
+                  sendPhase: 'tool',
+                  sendPhaseLabel: null,
+                  sendPhaseHint: null,
+                  iterationSteps: shouldAppendSyntheticAction
+                    ? [
+                        ...state.iterationSteps,
+                        {
+                          type: 'action',
+                          content: `调用工具: ${toolName}`,
+                          tool: toolName,
+                          toolInput,
+                          timestamp: Date.now(),
+                        },
+                      ]
+                    : state.iterationSteps,
                 }
               })
               break
@@ -810,6 +946,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           completedPayload.workflow_control && typeof completedPayload.workflow_control === 'object'
             ? (completedPayload.workflow_control as ChatWorkflowControl)
             : null
+        const completedDocumentArtifact = isDocumentArtifact(completedPayload.document_artifact)
+          ? completedPayload.document_artifact
+          : undefined
         const finalAssistantContent = String(fullContent || completedPayload.answer || '')
         const finalAssistantThought =
           typeof completedPayload.thought === 'string' && completedPayload.thought.trim()
@@ -831,6 +970,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 ...(conversationTurnStore ? { turn_store: conversationTurnStore } : {}),
                 ...(conversationToolLedger ? { tool_ledger: conversationToolLedger } : {}),
                 ...(conversationItemStream ? { item_stream: conversationItemStream } : {}),
+                ...(completedDocumentArtifact ? { document_artifact: completedDocumentArtifact } : {}),
               }
             : state.currentConversation
           return {
@@ -1205,6 +1345,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
               })
               break
 
+            case 'artifact_updated':
+              set((state) => {
+                const nextConversation = applyDocumentArtifactUpdateToConversation(
+                  state.currentConversation,
+                  data,
+                )
+                return {
+                  currentConversation: nextConversation,
+                  conversations: upsertConversationListItem(state.conversations, nextConversation),
+                }
+              })
+              break
+
             case 'tool_output': {
               const toolName = typeof data?.tool === 'string' ? data.tool : 'project_claude'
               const toolInput = data && typeof data?.input === 'object' ? data.input : {}
@@ -1215,10 +1368,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   state.currentToolCall && state.currentToolCall.tool === toolName
                     ? state.currentToolCall.output
                     : undefined
-                const mergedOutput =
-                  toolName === 'project_claude'
-                    ? appendClaudeProgressOutput(previousOutput, text)
-                    : appendRollingToolOutput(previousOutput, text)
+                const mergedOutput = isClaudeRuntimeTool(toolName)
+                  ? appendClaudeProgressOutput(previousOutput, text)
+                  : appendRollingToolOutput(previousOutput, text)
+                const shouldAppendSyntheticAction =
+                  !state.currentToolCall &&
+                  !state.iterationSteps.some((step) => step.type === 'action' && step.tool === toolName)
                 return {
                   currentToolCall: {
                     tool: toolName,
@@ -1226,6 +1381,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     output: mergedOutput,
                     timestamp: Date.now(),
                   },
+                  isThinking: false,
+                  sendPhase: 'tool',
+                  sendPhaseLabel: null,
+                  sendPhaseHint: null,
+                  iterationSteps: shouldAppendSyntheticAction
+                    ? [
+                        ...state.iterationSteps,
+                        {
+                          type: 'action',
+                          content: `调用工具: ${toolName}`,
+                          tool: toolName,
+                          toolInput,
+                          timestamp: Date.now(),
+                        },
+                      ]
+                    : state.iterationSteps,
                 }
               })
               break
@@ -1310,6 +1481,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 doneData.workflow_control && typeof doneData.workflow_control === 'object'
                   ? (doneData.workflow_control as ChatWorkflowControl)
                   : null
+              const doneDocumentArtifact = isDocumentArtifact(doneData.document_artifact)
+                ? doneData.document_artifact
+                : undefined
               const metadata: MessageMetadata | undefined =
                 ragMetrics || reasoningSummary || citationIndex
                   ? {
@@ -1349,6 +1523,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                       ...(conversationTurnStore ? { turn_store: conversationTurnStore } : {}),
                       ...(conversationToolLedger ? { tool_ledger: conversationToolLedger } : {}),
                       ...(conversationItemStream ? { item_stream: conversationItemStream } : {}),
+                      ...(doneDocumentArtifact ? { document_artifact: doneDocumentArtifact } : {}),
                       updated_at: new Date().toISOString(),
                     }
                   : state.currentConversation

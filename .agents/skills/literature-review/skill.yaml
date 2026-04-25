@@ -16,7 +16,7 @@ session_system_prompt: |-
   - 本 workflow 不属于 Project，不做论文复现，不使用 paper_research/project_* 语义；也不把 PDF 强行加入知识库。
   - 搜索优先使用 `literature_search` 的 `source=auto`，按需要使用 max_results、offset、page_token、year_start、year_end、fields、open_access、sort_by、sort_order。
   - 选择有 pdf_url 或 arxiv_id 的候选，调用 `literature_review_download_pdf` 保存到 review 的 `pdf/`。
-  - 调用 `read_full_pdf` 把 PDF 完整转换为 Markdown，默认 `return_content=false`，让全文落盘到 `md/`，不要把整篇论文塞进普通对话上下文。
+  - 调用 `literature_review_pdf_to_markdown` 把 PDF 完整转换为 Markdown，让全文落盘到 `md/`，并把返回的 `md_path` 或 `paper_key` 交给 `review_writer mode=paper`；不要把整篇论文塞进普通对话上下文。
   - 调用 `review_writer mode=paper` 为每篇论文生成 `review/{paper_key}.md`。
   - 收集到足够单篇 review 后，调用 `review_writer mode=final` 生成 `review/final.md`，再向用户复述最终综述。
   - 如果 PDF 下载、全文读取或写作失败，报告具体阻塞点和当前已完成数量，不要假装完成。

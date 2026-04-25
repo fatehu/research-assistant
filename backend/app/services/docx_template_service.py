@@ -157,6 +157,16 @@ class DocxTemplateService:
         except Exception:
             return {}
 
+    @classmethod
+    def _validation_status_from_path(cls, path: Path) -> str:
+        payload = cls._read_json(path / "validation_result.json")
+        raw_status = str(payload.get("status") or payload.get("validation_status") or "").strip().lower()
+        if raw_status in {"success", "passed", "pass", "ok"}:
+            return "passed"
+        if raw_status in {"failed", "failure", "error"}:
+            return "failed"
+        return ""
+
     def get_default_docx_style_prompt(self) -> str:
         self.ensure_roots()
         text = self._read_text(self.default_docx_style_prompt_path()).strip()
@@ -635,6 +645,31 @@ class DocxTemplateService:
             "template": template,
             "template_files_dir": str(target_dir),
             "copied_files": copied,
+        }
+
+    def template_file_references(self, *, template_id: str) -> Dict[str, Any]:
+        template = self.get_template(template_id)
+        if template is None:
+            raise ValueError("模板不存在")
+        source_root = self._template_dir(template["template_id"]) / "files"
+        manifest = self._load_manifest(template["template_id"])
+        files_meta = dict(manifest.get("files") or {}) if isinstance(manifest.get("files"), dict) else {}
+        files: List[Dict[str, Any]] = []
+        if source_root.exists():
+            for path in sorted(source_root.rglob("*")):
+                if not path.is_file():
+                    continue
+                files.append(
+                    self.file_payload(
+                        path,
+                        base=self.docx_root,
+                        file_meta=dict(files_meta.get(path.name) or {}),
+                    )
+                )
+        return {
+            "template": template,
+            "template_files_dir": str(source_root),
+            "files": files,
         }
 
     @staticmethod
@@ -1144,6 +1179,15 @@ class DocxTemplateService:
         output_basename = str(metadata.get("output_basename") or "generated_document").strip() or "generated_document"
         docx_path = path / f"{output_basename}.docx"
         pdf_path = path / f"{output_basename}.pdf"
+        actual_docx_path = str(docx_path) if docx_path.is_file() else str(metadata.get("docx_path") or "")
+        actual_pdf_path = str(pdf_path) if pdf_path.is_file() else str(metadata.get("pdf_path") or "")
+        status = str(metadata.get("status") or "unknown").strip() or "unknown"
+        validation_status = str(metadata.get("validation_status") or "").strip()
+        workspace_validation_status = self._validation_status_from_path(path)
+        if workspace_validation_status:
+            validation_status = workspace_validation_status
+        if actual_docx_path and status in {"running", "unknown", "failed"}:
+            status = "completed"
         return {
             "docx_id": str(metadata.get("docx_id") or path.name),
             "template_id": str(metadata.get("template_id") or ""),
@@ -1156,10 +1200,10 @@ class DocxTemplateService:
             "source_path": str(metadata.get("source_file") or metadata.get("source_path") or ""),
             "requirements_path": str(metadata.get("requirements_file") or metadata.get("requirements_path") or ""),
             "output_basename": output_basename,
-            "docx_path": str(docx_path) if docx_path.is_file() else str(metadata.get("docx_path") or ""),
-            "pdf_path": str(pdf_path) if pdf_path.is_file() else str(metadata.get("pdf_path") or ""),
-            "status": str(metadata.get("status") or "unknown"),
-            "validation_status": str(metadata.get("validation_status") or ""),
+            "docx_path": actual_docx_path,
+            "pdf_path": actual_pdf_path,
+            "status": status,
+            "validation_status": validation_status,
             "session_id": str(metadata.get("session_id") or ""),
             "error": str(metadata.get("error") or ""),
             "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat(),

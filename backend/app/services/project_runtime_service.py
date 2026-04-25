@@ -488,22 +488,29 @@ class ProjectRuntimeWorkerClient:
             "continue_session": bool(continue_session),
         }
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=3.0)) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/claude/run_stream",
-                json=payload,
-                headers=self._headers(),
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(payload, dict):
-                        yield payload
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/claude/run_stream",
+                    json=payload,
+                    headers=self._headers(),
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        if isinstance(payload, dict):
+                            yield payload
+            except httpx.RemoteProtocolError as exc:
+                yield {
+                    "type": "stream_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "worker": "runtime-worker",
+                }
 
 
 class ProjectRuntimeService:

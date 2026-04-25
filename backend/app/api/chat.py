@@ -68,7 +68,9 @@ _PERSISTED_CHAT_BACKGROUND_EVENTS = {
     "thinking_start",
     "thought",
     "action",
+    "tool_output",
     "observation",
+    "artifact_updated",
     "context_debug",
     "done",
     "error",
@@ -103,6 +105,75 @@ async def _active_document_artifact_or_none(
             exc,
         )
         return None
+
+
+async def _attach_active_document_artifact(
+    done_payload: dict[str, Any],
+    db: AsyncSession,
+    *,
+    user_id: int,
+    conversation_id: int,
+) -> dict[str, Any]:
+    artifact = await _active_document_artifact_or_none(
+        db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if artifact:
+        done_payload["document_artifact"] = artifact
+    return done_payload
+
+
+def _document_artifact_update_payload_from_observation(
+    observation_payload: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if str(observation_payload.get("tool") or "").strip() != "document_artifact_update_block":
+        return None
+    if observation_payload.get("success") is False:
+        return None
+    data = observation_payload.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    artifact_digest = data.get("artifact") if isinstance(data.get("artifact"), dict) else {}
+    document_artifact = data.get("document_artifact") if isinstance(data.get("document_artifact"), dict) else None
+    block = data.get("block") if isinstance(data.get("block"), dict) else None
+    block_id = str(data.get("block_id") or (block or {}).get("block_id") or "").strip()
+    artifact_id = str(
+        data.get("artifact_id")
+        or artifact_digest.get("artifact_id")
+        or (document_artifact or {}).get("artifact_id")
+        or ""
+    ).strip()
+    if not artifact_id or not block_id:
+        return None
+
+    if block is None and document_artifact:
+        blocks = document_artifact.get("blocks")
+        if isinstance(blocks, list):
+            block = next(
+                (
+                    item
+                    for item in blocks
+                    if isinstance(item, dict) and str(item.get("block_id") or "") == block_id
+                ),
+                None,
+            )
+
+    payload: dict[str, Any] = {
+        "artifact_id": artifact_id,
+        "block_id": block_id,
+        "updated_at": data.get("updated_at")
+        or artifact_digest.get("updated_at")
+        or (document_artifact or {}).get("updated_at"),
+    }
+    if artifact_digest:
+        payload["artifact"] = artifact_digest
+    if block:
+        payload["block"] = block
+    if document_artifact:
+        payload["document_artifact"] = document_artifact
+    return payload
 
 
 def _sanitize_reasoning_summary_text(value: object, *, limit: int = 240) -> Optional[str]:
@@ -1786,6 +1857,80 @@ def _align_chat_citation_payload(
     return normalized_metrics, normalized_index
 
 
+def _citation_source_item_has_details(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return any(
+        bool(str(item.get(key) or "").strip())
+        for key in (
+            "title",
+            "url",
+            "domain",
+            "knowledge_base",
+            "document",
+            "source_label",
+            "citation_label",
+            "provider",
+            "content_preview",
+        )
+    )
+
+
+async def _backfill_chat_citation_index_from_history(
+    db: AsyncSession,
+    *,
+    conversation_id: int,
+    answer_text: str,
+    citation_index: object,
+) -> Optional[dict]:
+    used_labels = _extract_chat_citation_labels_in_order(answer_text)
+    if not used_labels:
+        return _normalized_message_citation_index(citation_index)
+
+    current_index = _normalized_message_citation_index(citation_index) or {}
+    missing_labels = [
+        label
+        for label in used_labels
+        if not _citation_source_item_has_details(current_index.get(label))
+    ]
+    if not missing_labels:
+        return {label: current_index[label] for label in used_labels if label in current_index} or None
+
+    result = await db.execute(
+        select(Message.metadata_)
+        .where(
+            Message.conversation_id == int(conversation_id),
+            Message.role == MessageRole.ASSISTANT,
+            Message.metadata_.is_not(None),
+        )
+        .order_by(desc(Message.created_at), desc(Message.id))
+        .limit(32)
+    )
+    historical_items: Dict[str, dict] = {}
+    for raw_metadata in result.scalars().all():
+        metadata = dict(raw_metadata or {}) if isinstance(raw_metadata, dict) else {}
+        historical_index = _normalized_message_citation_index(metadata.get("citation_index")) or {}
+        for label, item in historical_index.items():
+            if label not in historical_items and _citation_source_item_has_details(item):
+                historical_items[label] = item
+
+    merged: dict[str, Any] = {}
+    for label in used_labels:
+        current_item = current_index.get(label)
+        if _citation_source_item_has_details(current_item):
+            merged[label] = current_item
+        elif label in historical_items:
+            merged[label] = historical_items[label]
+        elif current_item:
+            merged[label] = current_item
+        else:
+            merged[label] = {
+                "label": label,
+                "source_kind": "knowledge_base_search" if label.startswith("来源") else "public_web_search",
+            }
+    return merged or None
+
+
 def _chat_span_has_markdown_heading(text: str) -> bool:
     return any(
         re.match(r"^\s{0,3}#{1,6}\s+", line)
@@ -3203,10 +3348,16 @@ async def create_chat_background_run(
         event = str(payload.get("event") or "").strip()
         if event not in _PERSISTED_CHAT_BACKGROUND_EVENTS:
             return
+        event_data = payload.get("data")
+        if event == "tool_output" and isinstance(event_data, dict):
+            event_data = dict(event_data)
+            text = str(event_data.get("text") or "")
+            if len(text) > 6000:
+                event_data["text"] = text[:6000].rstrip() + "\n...[truncated tool stream chunk]"
         await runtime_service.append_chat_run_event(
             run_id,
             event=event,
-            data=payload.get("data"),
+            data=event_data,
             created_at=str(payload.get("created_at") or ""),
         )
 
@@ -3835,6 +3986,12 @@ async def send_message(
                             if conversation_item_stream:
                                 done_payload["item_stream"] = conversation_item_stream
 
+                            done_payload = await _attach_active_document_artifact(
+                                done_payload,
+                                save_db,
+                                user_id=int(current_user.id),
+                                conversation_id=conversation_id,
+                            )
                             done_payload = _attach_workflow_control(done_payload, request)
                             yield _sse_event("done", done_payload)
                         return
@@ -3924,6 +4081,12 @@ async def send_message(
                             if conversation_item_stream:
                                 done_payload["item_stream"] = conversation_item_stream
 
+                            done_payload = await _attach_active_document_artifact(
+                                done_payload,
+                                save_db,
+                                user_id=int(current_user.id),
+                                conversation_id=conversation_id,
+                            )
                             done_payload = _attach_workflow_control(done_payload, request)
                             yield _sse_event("done", done_payload)
                         return
@@ -4014,6 +4177,11 @@ async def send_message(
                                     observation_payload["workflow_control"] = workflow_control
                                     active_workflow_control = workflow_control
                                 yield _sse_event("observation", observation_payload)
+                                artifact_update_payload = _document_artifact_update_payload_from_observation(
+                                    observation_payload
+                                )
+                                if artifact_update_payload:
+                                    yield _sse_event("artifact_updated", artifact_update_payload)
                             elif event_type == "context_debug":
                                 if isinstance(event_data, dict):
                                     context_debug = event_data
@@ -4055,6 +4223,17 @@ async def send_message(
                                     )
 
                                     async with async_session_factory() as save_db:
+                                        citation_index = await _backfill_chat_citation_index_from_history(
+                                            save_db,
+                                            conversation_id=conversation_id,
+                                            answer_text=full_content,
+                                            citation_index=citation_index,
+                                        )
+                                        rag_metrics, citation_index = _align_chat_citation_payload(
+                                            answer_text=full_content,
+                                            rag_metrics=rag_metrics,
+                                            citation_index=citation_index,
+                                        )
                                         message_metadata: dict[str, Any] = {}
                                         if isinstance(rag_metrics, dict):
                                             message_metadata["rag_metrics"] = rag_metrics
@@ -4144,6 +4323,12 @@ async def send_message(
                                         if persisted_thought:
                                             done_payload["reasoning_summary"] = persisted_thought
 
+                                        done_payload = await _attach_active_document_artifact(
+                                            done_payload,
+                                            save_db,
+                                            user_id=int(current_user.id),
+                                            conversation_id=conversation_id,
+                                        )
                                         done_payload = _attach_workflow_control(
                                             done_payload,
                                             request,
@@ -4243,6 +4428,12 @@ async def send_message(
                             done_payload["tool_ledger"] = conversation_tool_ledger
                         if conversation_item_stream:
                             done_payload["item_stream"] = conversation_item_stream
+                        done_payload = await _attach_active_document_artifact(
+                            done_payload,
+                            save_db,
+                            user_id=int(current_user.id),
+                            conversation_id=conversation_id,
+                        )
                         done_payload = _attach_workflow_control(done_payload, request)
                         yield _sse_event("done", done_payload)
                 
@@ -4407,6 +4598,19 @@ async def send_message(
                     "rag_metrics": None,
                     "citation_index": None,
                 }
+            response["citation_index"] = await _backfill_chat_citation_index_from_history(
+                db,
+                conversation_id=conversation.id,
+                answer_text=str(response.get("content") or ""),
+                citation_index=response.get("citation_index"),
+            )
+            aligned_rag_metrics, aligned_citation_index = _align_chat_citation_payload(
+                answer_text=str(response.get("content") or ""),
+                rag_metrics=response.get("rag_metrics"),
+                citation_index=response.get("citation_index"),
+            )
+            response["rag_metrics"] = aligned_rag_metrics
+            response["citation_index"] = aligned_citation_index
             persisted_message_metadata = _sanitized_persisted_chat_metadata(
                 {
                     "rag_metrics": response.get("rag_metrics"),

@@ -26,6 +26,8 @@ from app.services.project_runtime_service import ProjectRuntimeService, _json_du
 
 app = FastAPI(title="Project Runtime Worker", version="0.1.0")
 
+CLAUDE_STREAM_PIPE_LIMIT = 8 * 1024 * 1024
+
 
 class RuntimeStartRequest(BaseModel):
     project_id: int = Field(ge=1)
@@ -990,6 +992,7 @@ async def run_bash(payload: BashRunRequest) -> Dict[str, Any]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=CLAUDE_STREAM_PIPE_LIMIT,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=120.0)
@@ -1059,6 +1062,7 @@ async def run_claude(payload: ClaudeRunRequest) -> Dict[str, Any]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=CLAUDE_STREAM_PIPE_LIMIT,
     )
     stdout_bytes, stderr_bytes = await process.communicate()
 
@@ -1121,6 +1125,7 @@ async def run_claude_stream(payload: ClaudeRunRequest):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=CLAUDE_STREAM_PIPE_LIMIT,
     )
 
     async def _generate():
@@ -1130,7 +1135,17 @@ async def run_claude_stream(payload: ClaudeRunRequest):
 
         async def _pump(reader: asyncio.StreamReader, stream_name: str, sink: List[str]) -> None:
             while True:
-                chunk = await reader.readline()
+                try:
+                    chunk = await reader.readline()
+                except ValueError as exc:
+                    await queue.put(
+                        {
+                            "type": "stream_error",
+                            "stream": stream_name,
+                            "text": f"Claude stream line exceeded buffer limit: {exc}",
+                        }
+                    )
+                    break
                 if not chunk:
                     break
                 text = chunk.decode("utf-8", errors="replace")
@@ -1218,6 +1233,7 @@ async def run_docx_claude(payload: DocxClaudeRunRequest) -> Dict[str, Any]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=CLAUDE_STREAM_PIPE_LIMIT,
     )
     stdout_bytes, stderr_bytes = await process.communicate()
 
@@ -1289,7 +1305,17 @@ async def run_docx_claude_stream(payload: DocxClaudeRunRequest):
 
         async def _pump(reader: asyncio.StreamReader, stream_name: str, sink: List[str]) -> None:
             while True:
-                chunk = await reader.readline()
+                try:
+                    chunk = await reader.readline()
+                except ValueError as exc:
+                    await queue.put(
+                        {
+                            "type": "stream_error",
+                            "stream": stream_name,
+                            "text": f"Claude stream line exceeded buffer limit: {exc}",
+                        }
+                    )
+                    break
                 if not chunk:
                     break
                 text = chunk.decode("utf-8", errors="replace")

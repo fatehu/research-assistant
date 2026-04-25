@@ -256,9 +256,9 @@ class AgentCore:
     _LITERATURE_REVIEW_TOOL_NAMES: set[str] = {
         "literature_review_start",
         "literature_review_download_pdf",
-        "literature_review_json_read",
+        "literature_review_read",
         "literature_review_search_zoekt",
-        "read_full_pdf",
+        "literature_review_pdf_to_markdown",
         "review_writer",
     }
     _PAPER_SKILL_SELF_WORK_TOOL_NAMES: set[str] = {
@@ -267,6 +267,13 @@ class AgentCore:
         "paper_research_write_execution_script",
         "paper_research_write_execution_spec",
         "paper_research_start_execution",
+    }
+    _PROJECT_TOOL_NAMES: set[str] = {
+        "project_tree",
+        "project_read_file",
+        "project_write_file",
+        "project_bash",
+        "project_claude",
     }
     _PAPER_SKILL_HIDDEN_TOOL_NAMES: set[str] = set(_PAPER_SKILL_SELF_WORK_TOOL_NAMES)
     _PAPER_PREPARE_MARKERS = (
@@ -732,6 +739,22 @@ class AgentCore:
                 "应跳过这篇或重新搜索可下载的开放获取论文；不要反复调用同一个失败链接。"
             )
 
+        if normalized_tool_name == "docx_generate_with_claude":
+            return (
+                "工具适用范围提示：`docx_generate_with_claude` 只负责 DOCX 工作区生成。"
+                "如果它失败或没有产出文件，应向用户报告 Claude/DOCX 生成失败或重新调用该工具重试；"
+                "不要改用 `project_tree`、`project_read_file`、`project_bash`、`project_claude` 检查或补救。"
+                "Project 工具只用于论文复现、代码优化、代码编写 Project 工作区。"
+            )
+
+        if normalized_tool_name in self._PROJECT_TOOL_NAMES:
+            return (
+                "工具适用范围提示：Project 工具只用于论文复现、代码优化、代码编写 Project 工作区，"
+                "目录语义固定为 `/app/uploads/projects/{project_id}`。"
+                "不要用于 DOCX 生成、文献综述工作区、模板管理、普通文件查看/下载，"
+                "也不要作为其他 Claude/docx 工具失败后的 fallback。"
+            )
+
         scope_reminders = {
             "project_bash": (
                 "`project_bash` 只适用于明确允许主 agent 在 Project 根目录执行一次受控命令的场景；"
@@ -1171,6 +1194,23 @@ class AgentCore:
         available_tools: Sequence[str],
     ) -> str:
         return build_agent_channel_tool_policy_prompt(self._agent_profile(), available_tools)
+
+    @classmethod
+    def _project_tool_policy_prompt(cls, available_tools: Sequence[str]) -> str:
+        selected = {str(name or "").strip() for name in available_tools if str(name or "").strip()}
+        project_tools = sorted(selected.intersection(cls._PROJECT_TOOL_NAMES))
+        if not project_tools:
+            return ""
+        return "\n".join(
+            [
+                "## Project 工具适用范围（必须遵守）",
+                "Project 工具是一组专用于论文复现、代码优化、代码编写 Project 工作区的工具。",
+                "它们只操作 `/app/uploads/projects/{project_id}`，只在用户任务明确属于论文复现、代码实现/调试/优化时使用。",
+                "DOCX 生成、文献综述、模板管理、普通文件查看/下载、artifact 更新，不要使用 project_* 工具。",
+                "如果 DOCX/综述/其他 Claude 工具失败，不要把 project_* 当作 fallback；应报告对应工具失败或重试原工具。",
+                "当前可用 Project 工具: " + ", ".join(project_tools),
+            ]
+        )
 
     @staticmethod
     def _normalize_think_tag_aliases(text: str) -> str:
@@ -3092,6 +3132,9 @@ class AgentCore:
         composed = str(prompt or "").strip()
         if include_generic_citation_policy:
             composed = f"{composed}\n\n{self.CITATION_POLICY_PROMPT}"
+        project_tool_policy_prompt = self._project_tool_policy_prompt(list(available_tools or []))
+        if project_tool_policy_prompt:
+            composed = f"{composed}\n\n{project_tool_policy_prompt}"
         if profile.include_channel_system_context:
             channel_system_context = str(getattr(self, "_active_channel_system_context", "") or "").strip()
             if channel_system_context:
@@ -5442,7 +5485,10 @@ class AgentCore:
             if str(item or "").strip()
         }
         live_event_token = None
-        if getattr(self.runtime_context, "live_event_callback", None) and call.name == "project_claude":
+        if getattr(self.runtime_context, "live_event_callback", None) and call.name in {
+            "project_claude",
+            "docx_generate_with_claude",
+        }:
             live_event_token = set_tool_live_event_emitter(self.runtime_context.live_event_callback)
         try:
             if self._paper_skill_is_active_for_context(context) and call.name in self._PAPER_SKILL_SELF_WORK_TOOL_NAMES:

@@ -4653,7 +4653,7 @@ export interface AgentChatRequest {
 }
 
 export interface AgentChatEvent {
-  type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'answer' | 'start' | 'authorization_required'
+  type: 'content' | 'done' | 'error' | 'thought' | 'action' | 'observation' | 'artifact_updated' | 'answer' | 'start' | 'authorization_required'
   content?: string
   code_blocks?: AgentCodeBlock[]
   react_steps?: ReactStep[]

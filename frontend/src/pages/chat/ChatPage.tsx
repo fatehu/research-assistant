@@ -80,6 +80,7 @@ const ChatPage = () => {
   const [documentPanelOpen, setDocumentPanelOpen] = useState(false)
   const [selectedDocumentBlockIds, setSelectedDocumentBlockIds] = useState<string[]>([])
   const previewRequestIdRef = useRef(0)
+  const loadedConversationIdRef = useRef<number | null>(null)
   const serializedPreferenceOverrides = useMemo(
     () => JSON.stringify(chatPreferenceOverrides || {}),
     [chatPreferenceOverrides],
@@ -137,6 +138,7 @@ const ChatPage = () => {
     setIgnoredCandidateIds([])
     setRagResetToken((current) => current + 1)
     setSelectedDocumentBlockIds([])
+    loadedConversationIdRef.current = null
   }, [conversationId])
 
   useEffect(() => {
@@ -151,9 +153,15 @@ const ChatPage = () => {
     const loadConversation = async () => {
       if (conversationId) {
         const parsedConversationId = parseInt(conversationId, 10)
+        if (isSending && currentConversation?.id === parsedConversationId) {
+          setLoadError(null)
+          setConversationLoaded(true)
+          return
+        }
         if (
           currentConversation?.id === parsedConversationId &&
-          (messages.length > 0 || isSending)
+          messages.length > 0 &&
+          loadedConversationIdRef.current === parsedConversationId
         ) {
           setLoadError(null)
           setConversationLoaded(true)
@@ -165,6 +173,7 @@ const ChatPage = () => {
         }
         try {
           await selectConversation(parsedConversationId)
+          loadedConversationIdRef.current = parsedConversationId
           if (!cancelled) {
             setLoadError(null)
             setConversationLoaded(true)

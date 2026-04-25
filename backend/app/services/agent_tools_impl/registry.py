@@ -1453,9 +1453,12 @@ class ProjectClaudeInput(BaseModel):
 class DocxGenerateWithClaudeInput(BaseModel):
     docx_id: Optional[str] = None
     template_id: Optional[str] = None
+    artifact_id: Optional[str] = None
+    artifact_json: Optional[Dict[str, Any]] = None
+    artifact_path: Optional[str] = None
     markdown: Optional[str] = None
     source_path: Optional[str] = None
-    requirements: str = Field(min_length=1)
+    requirements: Optional[str] = None
     output_basename: Optional[str] = None
     continue_session: bool = False
 
@@ -1487,7 +1490,7 @@ class LiteratureReviewDownloadPdfInput(BaseModel):
     overwrite: bool = False
 
 
-class LiteratureReviewJsonReadInput(BaseModel):
+class LiteratureReviewReadInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     literature_review_id: str = Field(min_length=1, max_length=160)
@@ -1509,12 +1512,11 @@ class LiteratureReviewSearchZoektInput(BaseModel):
     force_reindex: bool = False
 
 
-class ReadFullPdfInput(BaseModel):
+class LiteratureReviewPdfToMarkdownInput(BaseModel):
     literature_review_id: str = Field(min_length=1, max_length=160)
     paper_key: Optional[str] = Field(default=None, max_length=180)
     pdf_path: Optional[str] = Field(default=None, max_length=2000)
     mode: Literal["fast", "hybrid"] = "fast"
-    return_content: bool = False
 
 
 class ReviewWriterInput(BaseModel):
@@ -3191,12 +3193,21 @@ class PaperSearchTool(_PaperResearchToolBase):
         return await self._with_db(_handler)
 
 
+_PROJECT_TOOL_SCOPE_DESCRIPTION = (
+    "适用范围：Project 工具只用于论文复现、代码优化、代码编写等 Project 工作区任务；"
+    "Project 根目录固定为 `/app/uploads/projects/{project_id}`。"
+    "不要用于 DOCX 生成、文献综述工作区、模板管理、普通文件下载/查看，"
+    "也不要作为 Claude/docx 工具失败后的 fallback。"
+)
+
+
 class ProjectTreeTool(_PaperResearchToolBase):
     name = "project_tree"
     input_model = ProjectTreeInput
     parallel_safe = True
     output_max_tokens = 32000
     description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
         "返回指定 Project 根目录的目录树，用来浏览项目结构、确认文件位置和发现可读文件。"
         "根目录就是 `/app/uploads/projects/{project_id}`。"
         "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
@@ -3274,6 +3285,7 @@ class ProjectReadFileTool(_PaperResearchToolBase):
     parallel_safe = True
     output_max_tokens = 9000
     description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
         "读取 Project 根目录中的单个文件，并返回完整文件内容。"
         "`relative_path` 必须是相对于 `/app/uploads/projects/{project_id}` 的相对路径。"
         "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
@@ -3355,6 +3367,7 @@ class ProjectWriteFileTool(_PaperResearchToolBase):
     input_model = ProjectWriteFileInput
     output_max_tokens = 9000
     description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
         "把完整内容写入 Project 根目录中的单个文件。"
         "`relative_path` 必须是相对于 `/app/uploads/projects/{project_id}` 的相对路径。"
         "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
@@ -3431,11 +3444,12 @@ class ProjectBashTool(_PaperResearchToolBase):
     input_model = ProjectBashInput
     output_max_tokens = 9000
     description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
         "在 Project 根目录里执行一条 bash 命令。"
         "工作目录固定为 `/app/uploads/projects/{project_id}`。"
         "`project_id` 只能传 Project ID，不能传论文 `paper_id`。"
         "如果只知道 `paper_id`，先用 `paper_research_status` 或 `paper_research_prepare` 解析出 Project。"
-        "这个工具适合在当前 Project 里运行 shell 命令、检查文件、调用 CLI 或做最小脚本操作。"
+        "这个工具只适合在论文复现/代码优化 Project 里运行必要 shell 命令、检查代码、调用 CLI 或做最小脚本操作。"
         "它不会切到 Project 根目录之外执行。"
     )
     parameters = {
@@ -3600,10 +3614,12 @@ class ProjectClaudeTool(_PaperResearchToolBase):
     timeout_seconds = 0.0
     output_max_tokens = 9000
     description = (
+        _PROJECT_TOOL_SCOPE_DESCRIPTION +
         "在 runtime-worker 里调用 Claude Code，让它在当前 Project 根目录工作。"
         "它会把 `/app/uploads/projects/{project_id}` 作为 Claude 的当前目录，并返回 Claude 的 session_id 和文本结果。"
         "如果当前 Project 目录已有 Claude session，就自动复用；没有就自动新建。"
         "通常只需要传 prompt。"
+        "它用于论文复现、代码优化、代码编写项目，不用于 DOCX 生成或文献综述生成。"
         "这个工具只负责和 Claude 交互，不直接执行 bash。"
     )
     parameters = {
@@ -3653,7 +3669,29 @@ class ProjectClaudeTool(_PaperResearchToolBase):
                         prompt=prompt,
                         continue_session=continue_session,
                     ):
-                        if str(stream_item.get("type") or "") == "chunk":
+                        stream_item_type = str(stream_item.get("type") or "")
+                        if stream_item_type == "stream_error":
+                            text = str(
+                                stream_item.get("error")
+                                or stream_item.get("text")
+                                or "runtime-worker stream interrupted"
+                            )
+                            await emit_tool_live_event(
+                                {
+                                    "type": "tool_output",
+                                    "data": {
+                                        "tool": self.name,
+                                        "input": {
+                                            "project_id": project_id,
+                                            "prompt": prompt,
+                                        },
+                                        "stream": "stderr",
+                                        "text": f"runtime-worker stream warning: {text}\n",
+                                    },
+                                }
+                            )
+                            continue
+                        if stream_item_type == "chunk":
                             text = str(stream_item.get("text") or "")
                             if text:
                                 await emit_tool_live_event(
@@ -3756,24 +3794,27 @@ class DocxGenerateWithClaudeTool(ToolBase):
     retry_count = 0
     output_max_tokens = 9000
     description = (
-        "把 Markdown 和文档生成要求写入独立 docx 工作目录，然后调用 runtime-worker 里的 Claude Code "
+        "把文档 artifact/source、模板文件和生成要求的路径写入独立 docx 工作目录清单，然后调用 runtime-worker 里的 Claude Code "
         "使用官方 document-skills/docx 生成 DOCX/PDF。"
         "它不属于 Project，不需要 project_id；工作目录固定为 `/app/uploads/docx/{docx_id}`。"
-        "长 Markdown 优先传 source_path；直接传 markdown 时工具会原样写入 source.md，不截断输入。"
+        "优先接收当前对话 active document artifact；也可传 artifact_json/artifact_path、source_path 或 markdown。"
+        "正常情况下只把 artifact_path、template_file_paths、requirements_path 等路径交给 Claude，不复制模板文件，"
+        "也不要求 Claude 用 Read 把大文件全文读进对话流。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "docx_id": {"type": "string", "description": "可选文档任务 ID。未提供时自动生成，用作 `/app/uploads/docx/{docx_id}` 目录名。"},
-            "template_id": {"type": "string", "description": "可选模板 ID。工具会复制 `/app/uploads/docx/templates/{template_id}/files` 到工作区，并把模板 DOCX 约束附加到 requirements.md。"},
-            "artifact_id": {"type": "string", "description": "可选文档 artifact ID，用于把本次 DOCX 生成任务关联回结构化文档草稿。"},
-            "markdown": {"type": "string", "description": "完整 Markdown 原文。工具会原样写入 source.md，不截断。长文也可改传 source_path。"},
-            "source_path": {"type": "string", "description": "可选已有 Markdown 文件路径。支持 `/app/uploads` 下绝对路径或相对上传目录路径，用于避免在工具参数里塞超长文本。"},
-            "requirements": {"type": "string", "description": "文档生成要求、模板说明、章节要求、格式要求。工具会原样写入 requirements.md。"},
+            "template_id": {"type": "string", "description": "可选模板 ID。工具会把 `/app/uploads/docx/templates/{template_id}/files` 下的原始模板路径写入输入清单，并把模板 DOCX 约束附加到 requirements.md。"},
+            "artifact_id": {"type": "string", "description": "可选文档 artifact ID。未传 source 时，工具会优先读取当前对话 active artifact；传 artifact_id 时会尝试读取该 artifact。"},
+            "artifact_json": {"type": "object", "description": "可选结构化文档草稿 JSON。仅当没有 artifact_path/active artifact 文件时，工具才会在工作区物化为 artifact.json。"},
+            "artifact_path": {"type": "string", "description": "可选 artifact JSON 文件路径。支持 `/app/uploads` 下绝对路径或相对上传目录路径。"},
+            "markdown": {"type": "string", "description": "可选完整 Markdown 原文。仅当直接传 markdown 时，工具会在工作区物化为 source.md；长文优先传 source_path。"},
+            "source_path": {"type": "string", "description": "可选已有 Markdown 文件路径。支持 `/app/uploads` 下绝对路径或相对上传目录路径。"},
+            "requirements": {"type": "string", "description": "可选文档生成要求、模板说明、章节要求、格式要求。未提供时工具会根据 artifact/template 生成基础要求。"},
             "output_basename": {"type": "string", "description": "可选输出文件基础名，不含扩展名。默认 generated_document。"},
             "continue_session": {"type": "boolean", "default": False, "description": "是否强制继续该 docx 工作目录下已有 Claude session。通常不用传；runtime 会自动检测可续 session。"},
         },
-        "required": ["requirements"],
     }
 
     def __init__(
@@ -3825,6 +3866,102 @@ class DocxGenerateWithClaudeTool(ToolBase):
         return resolved if resolved.is_file() else None
 
     @staticmethod
+    def _parse_artifact_payload(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        raw = str(value or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return dict(parsed or {}) if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _artifact_to_markdown(cls, artifact: Dict[str, Any]) -> str:
+        title = str(artifact.get("title") or "文档草稿").strip() or "文档草稿"
+        lines: List[str] = [
+            f"# {title}",
+            "",
+            f"<!-- artifact_id: {artifact.get('artifact_id') or ''} -->",
+            f"<!-- template_id: {artifact.get('template_id') or ''} -->",
+            "",
+        ]
+        global_constraints = str(artifact.get("global_constraints") or "").strip()
+        if global_constraints:
+            lines.extend(["<!-- global_constraints", global_constraints, "-->", ""])
+        blocks = list(artifact.get("blocks") or [])
+        for index, raw_block in enumerate(blocks, start=1):
+            if not isinstance(raw_block, dict):
+                continue
+            title = str(raw_block.get("title") or f"章节 {index}").strip() or f"章节 {index}"
+            heading_path = raw_block.get("heading_path")
+            if isinstance(heading_path, list) and heading_path:
+                title = str(heading_path[-1] or title).strip() or title
+            block_id = str(raw_block.get("block_id") or f"block-{index}").strip()
+            lines.extend(
+                [
+                    f"## {title}",
+                    "",
+                    f"<!-- block_id: {block_id} -->",
+                    f"<!-- status: {raw_block.get('status') or ''}; target_words: {raw_block.get('target_words') or 0} -->",
+                ]
+            )
+            block_constraints = str(raw_block.get("block_constraints") or "").strip()
+            if block_constraints:
+                lines.extend(["<!-- block_constraints", block_constraints, "-->"])
+            markdown = str(raw_block.get("markdown") or "").strip()
+            lines.extend(["", markdown or "> 本块尚未填写。", ""])
+        return "\n".join(lines).strip() + "\n"
+
+    @classmethod
+    def _read_artifact_json_file(cls, path: Path) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return dict(parsed or {}) if isinstance(parsed, dict) else {}
+
+    async def _load_conversation_artifact(
+        self,
+        *,
+        upload_root: Path,
+        artifact_id: str,
+    ) -> tuple[Dict[str, Any], str]:
+        if self.conversation_id is None or self.user_id is None:
+            return {}, ""
+        from app.services.document_artifact_service import DocumentArtifactService
+
+        service = DocumentArtifactService(upload_root=upload_root)
+        if artifact_id:
+            candidate = service._artifact_path(int(self.conversation_id), artifact_id)
+            if candidate.is_file():
+                return self._read_artifact_json_file(candidate), str(candidate)
+        if self.db_session_factory is not None:
+            async with self.db_session_factory() as db:
+                artifact = await service.get_active_artifact(
+                    db,
+                    user_id=int(self.user_id),
+                    conversation_id=int(self.conversation_id),
+                )
+                payload = dict(artifact or {})
+                active_id = str(payload.get("artifact_id") or "").strip()
+                active_path = service._artifact_path(int(self.conversation_id), active_id) if active_id else None
+                return payload, str(active_path) if active_path is not None and active_path.is_file() else ""
+        if self.db is not None:
+            artifact = await service.get_active_artifact(
+                self.db,
+                user_id=int(self.user_id),
+                conversation_id=int(self.conversation_id),
+            )
+            payload = dict(artifact or {})
+            active_id = str(payload.get("artifact_id") or "").strip()
+            active_path = service._artifact_path(int(self.conversation_id), active_id) if active_id else None
+            return payload, str(active_path) if active_path is not None and active_path.is_file() else ""
+        return {}, ""
+
+    @staticmethod
     def _relaxed_chmod(path: Path, mode: int) -> None:
         try:
             os.chmod(path, mode)
@@ -3857,6 +3994,82 @@ class DocxGenerateWithClaudeTool(ToolBase):
         }
 
     @staticmethod
+    def _read_docx_validation_result(workspace_dir: Path) -> Dict[str, Any]:
+        path = workspace_dir / "validation_result.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return dict(payload or {}) if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _infer_validation_status_from_workspace(cls, workspace_dir: Path, *, fallback: str = "") -> str:
+        payload = cls._read_docx_validation_result(workspace_dir)
+        raw_status = str(payload.get("status") or payload.get("validation_status") or "").strip().lower()
+        if raw_status in {"success", "passed", "pass", "ok"}:
+            return "passed"
+        if raw_status in {"failed", "failure", "error"}:
+            return "failed"
+        return fallback
+
+    @classmethod
+    def _write_docx_request_metadata(
+        cls,
+        metadata_file: Path,
+        *,
+        docx_id: str,
+        template_id: str,
+        template_name: str,
+        artifact_id: str,
+        conversation_id: Optional[int],
+        user_id: Optional[int],
+        output_basename: str,
+        source_file: Optional[Path],
+        artifact_file: Optional[Path],
+        artifact_source_path: str,
+        requirements_file: Path,
+        default_docx_style_file: Path,
+        md_constraints_file: Path,
+        input_manifest_file: Optional[Path],
+        template_files: List[str],
+        status: str,
+        validation_status: str,
+        session_id: str,
+        files: Dict[str, Any],
+        error: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "docx_id": docx_id,
+            "template_id": template_id,
+            "template_name": template_name,
+            "artifact_id": artifact_id,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "output_basename": output_basename,
+            "source_file": str(source_file) if source_file else "",
+            "artifact_file": str(artifact_file) if artifact_file else "",
+            "artifact_source_path": artifact_source_path,
+            "requirements_file": str(requirements_file),
+            "default_docx_style_prompt_file": str(default_docx_style_file),
+            "md_constraints_path": str(md_constraints_file) if template_id else "",
+            "input_manifest_file": str(input_manifest_file) if input_manifest_file else "",
+            "template_files": template_files,
+            "status": status,
+            "validation_status": validation_status,
+            "session_id": session_id,
+            "docx_path": files.get("docx_path") or "",
+            "pdf_path": files.get("pdf_path") or "",
+            "files": files.get("files") or [],
+            "error": error,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if extra:
+            payload.update(extra)
+        metadata_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        cls._relaxed_chmod(metadata_file, 0o666)
+
+    @staticmethod
     def _infer_validation_status(*, worker_payload: Dict[str, Any], docx_path: str) -> str:
         combined_text = "\n".join(
             str(worker_payload.get(key) or "")
@@ -3869,26 +4082,44 @@ class DocxGenerateWithClaudeTool(ToolBase):
         return "generated_unverified" if docx_path else "missing"
 
     @staticmethod
-    def _build_claude_prompt(*, workspace_dir: Path, output_basename: str) -> str:
+    def _build_claude_prompt(
+        *,
+        workspace_dir: Path,
+        output_basename: str,
+        input_manifest_file: Path,
+        artifact_file: Optional[Path],
+        source_file: Optional[Path],
+        requirements_file: Path,
+        template_files: List[str],
+    ) -> str:
         docx_path = workspace_dir / f"{output_basename}.docx"
         pdf_path = workspace_dir / f"{output_basename}.pdf"
+        template_hint = "\n".join(f"- {path}" for path in template_files[:20]) or "- (none)"
         return "\n".join(
             [
                 "你现在只负责 DOCX 文档生成，不处理 Project/论文复现语义。",
                 f"工作目录：{workspace_dir}",
-                "输入文件：",
-                "- source.md：Markdown 原文",
-                "- requirements.md：文档模板、章节和格式要求",
-                "- default_docx_style_prompt.md：平台默认 DOCX 样式与 Word 原生结构要求，已合并进 requirements.md",
-                "- template_files/：可选模板参考文件（如果存在）",
-                "- template_md_constraints.md：可选上游 Markdown 生成约束，仅作追踪和一致性参考",
+                f"输入清单：{input_manifest_file}",
+                "关键输入路径：",
+                f"- artifact_path: {artifact_file or ''}",
+                f"- source_path: {source_file or ''}",
+                f"- requirements_path: {requirements_file}",
+                "- template_file_paths:",
+                template_hint,
                 "任务：",
-                "1. 阅读 source.md 和 requirements.md，按要求生成高质量 DOCX。",
-                "2. 如有 template_files/，优先参考里面的模板、样例、图片或规范文件。",
-                "3. 优先使用官方 document-skills/docx 工作流和校验脚本；不要只生成一个能打开的空壳文件。",
-                f"4. DOCX 输出到：{docx_path}",
-                f"5. 如环境支持，同时生成 PDF 预览到：{pdf_path}",
-                "6. 如果无法完成，明确说明阻塞点，不要假装成功。",
+                "1. 先读取小清单 docx_inputs_manifest.json，按里面的路径处理 artifact、source、requirements 和模板文件。",
+                "2. artifact_path 是结构化章节、block 顺序和正文内容的权威来源；source_path 只在清单提供时作为 Markdown 原文参考。",
+                "3. 如有模板文件，优先参考原始 template_file_paths 中的样例、指南、图片或规范文件。",
+                "4. 优先使用官方 document-skills/docx 工作流和校验脚本；不要只生成一个能打开的空壳文件。",
+                f"5. DOCX 输出到：{docx_path}",
+                f"6. 如环境支持，同时生成 PDF 预览到：{pdf_path}",
+                "7. 如果无法完成，明确说明阻塞点，不要假装成功。",
+                "",
+                "流式输出约束（必须遵守）：",
+                "- 不要用 Read 工具把 artifact_path、source_path、requirements_path 或模板文件的全文读入对话流。",
+                "- 如需读取大文件，使用 Python/脚本按路径读取并直接生成 DOCX/PDF；stdout/stderr 只输出短进度和最终路径。",
+                "- 不要把 artifact/source/requirements/template 的全文打印到 stdout/stderr。",
+                "- 不要调用 project_* 工具；docx 工作区不是 Project。",
                 "最终回复必须给出 docx_path、pdf_path（没有则空）、validation_status、notes。",
             ]
         )
@@ -3920,9 +4151,10 @@ class DocxGenerateWithClaudeTool(ToolBase):
         template_id = self._safe_slug(kwargs.get("template_id"), fallback="")
         artifact_id = self._safe_slug(kwargs.get("artifact_id"), fallback="")
         output_basename = self._safe_slug(kwargs.get("output_basename"), fallback="generated_document")
-        requirements = str(kwargs.get("requirements") or "")
+        requirements = str(kwargs.get("requirements") or "").strip()
         markdown = kwargs.get("markdown")
         source_path = str(kwargs.get("source_path") or "").strip()
+        artifact_path = str(kwargs.get("artifact_path") or "").strip()
         continue_session = bool(kwargs.get("continue_session"))
 
         upload_root = self._upload_root()
@@ -3931,8 +4163,52 @@ class DocxGenerateWithClaudeTool(ToolBase):
         workspace_dir.mkdir(parents=True, exist_ok=True)
         self._relaxed_chmod(workspace_dir, 0o777)
 
-        source_file = workspace_dir / "source.md"
+        artifact_payload = self._parse_artifact_payload(kwargs.get("artifact_json"))
+        artifact_source_path = ""
+        if not artifact_payload and artifact_path:
+            resolved_artifact = self._resolve_source_file(artifact_path, upload_root=upload_root)
+            if resolved_artifact is None:
+                return ToolResult(
+                    success=False,
+                    output="artifact_path 不存在，或不在上传目录内。",
+                    error="invalid_artifact_path",
+                    data={"docx_id": docx_id, "artifact_path": artifact_path, "workspace_dir": str(workspace_dir)},
+                )
+            artifact_payload = self._read_artifact_json_file(resolved_artifact)
+            artifact_source_path = str(resolved_artifact)
+        if not artifact_payload and not markdown and not source_path:
+            artifact_payload, artifact_source_path = await self._load_conversation_artifact(
+                upload_root=upload_root,
+                artifact_id=artifact_id,
+            )
+        if artifact_payload:
+            artifact_id = self._safe_slug(artifact_id or artifact_payload.get("artifact_id"), fallback=artifact_id or "artifact")
+            if not template_id:
+                template_id = self._safe_slug(artifact_payload.get("template_id"), fallback="")
+            if not requirements:
+                requirements = "\n".join(
+                    [
+                        "请基于 artifact_path 指向的结构化文档草稿生成正式 DOCX 文档。",
+                        "artifact 是结构化草稿，必须按 blocks 顺序组织章节；block.markdown 是正文内容来源。",
+                        "如存在 template_file_paths 和模板 DOCX 约束，优先遵循模板文件和 DOCX 约束。",
+                    ]
+                )
+
+        artifact_file: Optional[Path] = None
+        if artifact_payload:
+            if artifact_source_path:
+                artifact_file = Path(artifact_source_path)
+            else:
+                artifact_file = workspace_dir / "artifact.json"
+                artifact_file.write_text(
+                    json.dumps(artifact_payload, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                self._relaxed_chmod(artifact_file, 0o666)
+
+        source_file: Optional[Path] = None
         if markdown is not None and str(markdown) != "":
+            source_file = workspace_dir / "source.md"
             source_file.write_text(str(markdown), encoding="utf-8")
         elif source_path:
             resolved_source = self._resolve_source_file(source_path, upload_root=upload_root)
@@ -3943,16 +4219,20 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     error="invalid_source_path",
                     data={"docx_id": docx_id, "source_path": source_path, "workspace_dir": str(workspace_dir)},
                 )
-            shutil.copyfile(resolved_source, source_file)
+            source_file = resolved_source
+        elif artifact_payload:
+            source_file = None
         else:
             return ToolResult(
                 success=False,
-                output="必须提供 markdown 或 source_path。",
+                output="必须提供 markdown、source_path、artifact_json、artifact_path，或在当前对话中存在 active document artifact。",
                 error="missing_source",
                 data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
             )
 
         requirements_file = workspace_dir / "requirements.md"
+        if not requirements:
+            requirements = "请基于输入清单中的 artifact_path/source_path 生成正式 DOCX 文档；如存在模板文件或模板约束，优先遵循模板。"
         requirements_file.write_text(requirements, encoding="utf-8")
         default_docx_style_prompt = template_service.get_default_docx_style_prompt()
         default_docx_style_file = workspace_dir / "default_docx_style_prompt.md"
@@ -3976,7 +4256,9 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     "conversation_id": self.conversation_id,
                     "user_id": self.user_id,
                     "output_basename": output_basename,
-                    "source_file": str(source_file),
+                    "source_file": str(source_file) if source_file else "",
+                    "artifact_file": str(artifact_file) if artifact_file else "",
+                    "artifact_source_path": artifact_source_path,
                     "requirements_file": str(requirements_file),
                     "default_docx_style_prompt_file": str(default_docx_style_file),
                     "status": "preparing",
@@ -3988,17 +4270,16 @@ class DocxGenerateWithClaudeTool(ToolBase):
             encoding="utf-8",
         )
         for path in (source_file, requirements_file, default_docx_style_file, metadata_file):
-            self._relaxed_chmod(path, 0o666)
+            if path is not None:
+                self._relaxed_chmod(path, 0o666)
 
         template_payload: Optional[Dict[str, Any]] = None
         template_files: List[str] = []
+        template_file_refs: List[Dict[str, Any]] = []
         md_constraints_file = workspace_dir / "template_md_constraints.md"
         if template_id:
             try:
-                copied = template_service.copy_template_files_to_workspace(
-                    template_id=template_id,
-                    workspace_dir=workspace_dir,
-                )
+                refs = template_service.template_file_references(template_id=template_id)
             except ValueError:
                 return ToolResult(
                     success=False,
@@ -4006,8 +4287,9 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     error="template_not_found",
                     data={"docx_id": docx_id, "template_id": template_id, "workspace_dir": str(workspace_dir)},
                 )
-            template_payload = dict(copied.get("template") or {})
-            template_files = [str(item) for item in list(copied.get("copied_files") or [])]
+            template_payload = dict(refs.get("template") or {})
+            template_file_refs = [dict(item or {}) for item in list(refs.get("files") or []) if isinstance(item, dict)]
+            template_files = [str(item.get("path") or "") for item in template_file_refs if str(item.get("path") or "").strip()]
             md_constraints = str(template_payload.get("md_constraints") or "")
             docx_constraints = str(template_payload.get("docx_constraints") or "")
             md_constraints_file.write_text(md_constraints, encoding="utf-8")
@@ -4022,6 +4304,30 @@ class DocxGenerateWithClaudeTool(ToolBase):
                 requirements_file.write_text(requirements, encoding="utf-8")
             self._relaxed_chmod(md_constraints_file, 0o666)
 
+        input_manifest_file = workspace_dir / "docx_inputs_manifest.json"
+        input_manifest = {
+            "docx_id": docx_id,
+            "workspace_dir": str(workspace_dir),
+            "conversation_id": self.conversation_id,
+            "user_id": self.user_id,
+            "artifact_id": artifact_id,
+            "artifact_path": str(artifact_file) if artifact_file else "",
+            "source_path": str(source_file) if source_file else "",
+            "requirements_path": str(requirements_file),
+            "default_docx_style_prompt_path": str(default_docx_style_file),
+            "md_constraints_path": str(md_constraints_file) if template_id else "",
+            "template_id": template_id,
+            "template_name": str((template_payload or {}).get("name") or ""),
+            "template_files_dir": str((template_payload or {}).get("files_path") or ""),
+            "template_files": template_file_refs,
+            "output_basename": output_basename,
+            "output_docx_path": str(workspace_dir / f"{output_basename}.docx"),
+            "output_pdf_path": str(workspace_dir / f"{output_basename}.pdf"),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        input_manifest_file.write_text(json.dumps(input_manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        self._relaxed_chmod(input_manifest_file, 0o666)
+
         running_job_payload = {
             "docx_id": docx_id,
             "template_id": template_id,
@@ -4029,16 +4335,20 @@ class DocxGenerateWithClaudeTool(ToolBase):
             "artifact_id": artifact_id,
             "conversation_id": self.conversation_id,
             "workspace_dir": str(workspace_dir),
-            "source_path": str(source_file),
+            "source_path": str(source_file) if source_file else "",
+            "artifact_path": str(artifact_file) if artifact_file else "",
             "requirements_path": str(requirements_file),
             "output_basename": output_basename,
             "status": "running",
             "validation_status": "",
             "files": [],
             "metadata": {
+                "artifact_source_path": artifact_source_path,
+                "input_manifest_path": str(input_manifest_file),
                 "default_docx_style_prompt_file": str(default_docx_style_file),
                 "md_constraints_path": str(md_constraints_file) if template_id else "",
                 "template_files": template_files,
+                "template_file_refs": template_file_refs,
             },
         }
         metadata_file.write_text(
@@ -4051,11 +4361,15 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     "conversation_id": self.conversation_id,
                     "user_id": self.user_id,
                     "output_basename": output_basename,
-                    "source_file": str(source_file),
+                    "source_file": str(source_file) if source_file else "",
+                    "artifact_file": str(artifact_file) if artifact_file else "",
+                    "artifact_source_path": artifact_source_path,
                     "requirements_file": str(requirements_file),
                     "default_docx_style_prompt_file": str(default_docx_style_file),
                     "md_constraints_path": str(md_constraints_file) if template_id else "",
+                    "input_manifest_file": str(input_manifest_file),
                     "template_files": template_files,
+                    "template_file_refs": template_file_refs,
                     "status": "running",
                     "created_at": datetime.utcnow().isoformat(),
                 },
@@ -4083,9 +4397,18 @@ class DocxGenerateWithClaudeTool(ToolBase):
                 data={"docx_id": docx_id, "workspace_dir": str(workspace_dir)},
             )
 
-        prompt = self._build_claude_prompt(workspace_dir=workspace_dir, output_basename=output_basename)
+        prompt = self._build_claude_prompt(
+            workspace_dir=workspace_dir,
+            output_basename=output_basename,
+            input_manifest_file=input_manifest_file,
+            artifact_file=artifact_file,
+            source_file=source_file,
+            requirements_file=requirements_file,
+            template_files=template_files,
+        )
+        live_stream_payload: Optional[Dict[str, Any]] = None
+        stream_errors: List[str] = []
         try:
-            live_stream_payload: Optional[Dict[str, Any]] = None
             if _TOOL_LIVE_EVENT_EMITTER.get() is not None:
                 async for stream_item in DocxRuntimeWorkerClient().claude_stream(
                     docx_id=docx_id,
@@ -4093,6 +4416,29 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     prompt=prompt,
                     continue_session=continue_session,
                 ):
+                    stream_item_type = str(stream_item.get("type") or "")
+                    if stream_item_type == "stream_error":
+                        stream_error_text = str(
+                            stream_item.get("error")
+                            or stream_item.get("text")
+                            or "runtime-worker stream interrupted"
+                        )
+                        stream_errors.append(stream_error_text)
+                        await emit_tool_live_event(
+                            {
+                                "type": "tool_output",
+                                "data": {
+                                    "tool": self.name,
+                                    "input": {
+                                        "docx_id": docx_id,
+                                        "workspace_dir": str(workspace_dir),
+                                    },
+                                    "stream": "stderr",
+                                    "text": f"runtime-worker stream warning: {stream_error_text}\n",
+                                },
+                            }
+                        )
+                        continue
                     if str(stream_item.get("type") or "") == "chunk":
                         text = str(stream_item.get("text") or "")
                         if text:
@@ -4124,8 +4470,8 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     "is_error": True,
                     "exit_code": None,
                     "stdout": "",
-                    "stderr": "",
-                    "error": "docx_claude_stream_missing_result",
+                    "stderr": "\n".join(stream_errors),
+                    "error": "docx_claude_stream_interrupted" if stream_errors else "docx_claude_stream_missing_result",
                     "worker": "runtime-worker",
                 }
             else:
@@ -4136,12 +4482,102 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     continue_session=continue_session,
                 )
         except Exception as exc:
+            stream_error = f"{type(exc).__name__}: {exc}"
+            files = self._collect_generated_files(workspace_dir, output_basename=output_basename)
+            if files.get("docx_path"):
+                recovered_payload = dict(live_stream_payload or {})
+                validation_status = self._infer_validation_status_from_workspace(
+                    workspace_dir,
+                    fallback="generated_after_stream_error",
+                )
+                recovered_error = f"stream_transport_error_after_output: {stream_error}"
+                recovered_job_payload = {
+                    **running_job_payload,
+                    "status": "completed",
+                    "docx_path": files.get("docx_path") or "",
+                    "pdf_path": files.get("pdf_path") or "",
+                    "files": files.get("files") or [],
+                    "validation_status": validation_status,
+                    "session_id": str(recovered_payload.get("session_id") or ""),
+                    "error": recovered_error,
+                    "metadata": {
+                        **dict(running_job_payload.get("metadata") or {}),
+                        "assistant_text": str(recovered_payload.get("assistant_text") or ""),
+                        "result_text": str(recovered_payload.get("result_text") or ""),
+                        "stream_error": stream_error,
+                        "recovered_from_stream_error": True,
+                    },
+                }
+                self._write_docx_request_metadata(
+                    metadata_file,
+                    docx_id=docx_id,
+                    template_id=template_id,
+                    template_name=str((template_payload or {}).get("name") or ""),
+                    artifact_id=artifact_id,
+                    conversation_id=self.conversation_id,
+                    user_id=self.user_id,
+                    output_basename=output_basename,
+                    source_file=source_file,
+                    artifact_file=artifact_file,
+                    artifact_source_path=artifact_source_path,
+                    requirements_file=requirements_file,
+                    default_docx_style_file=default_docx_style_file,
+                    md_constraints_file=md_constraints_file,
+                    input_manifest_file=input_manifest_file,
+                    template_files=template_files,
+                    status="completed",
+                    validation_status=validation_status,
+                    session_id=str(recovered_payload.get("session_id") or ""),
+                    files=files,
+                    error=recovered_error,
+                    extra={"stream_error": stream_error, "recovered_from_stream_error": True},
+                )
+                await self._upsert_docx_job(template_service, recovered_job_payload)
+                return ToolResult(
+                    success=True,
+                    output="\n".join(
+                        [
+                            "Claude 已生成 DOCX，但 runtime-worker 流式连接在结束前中断；平台已从工作区产物恢复为成功。",
+                            f"- Docx ID: {docx_id}",
+                            f"- Workspace: {workspace_dir}",
+                            f"- DOCX: {files.get('docx_path') or '(missing)'}",
+                            f"- PDF: {files.get('pdf_path') or '(missing)'}",
+                            f"- Validation: {validation_status}",
+                            f"- Stream error: {stream_error}",
+                        ]
+                    ),
+                    error=None,
+                    data={
+                        "docx_id": docx_id,
+                        "template_id": template_id,
+                        "template_name": str((template_payload or {}).get("name") or ""),
+                        "artifact_id": artifact_id,
+                        "conversation_id": self.conversation_id,
+                        "workspace_dir": str(workspace_dir),
+                        "source_path": str(source_file) if source_file else "",
+                        "artifact_path": str(artifact_file) if artifact_file else "",
+                        "requirements_path": str(requirements_file),
+                        "input_manifest_path": str(input_manifest_file),
+                        "md_constraints_path": str(md_constraints_file) if template_id else "",
+                        "output_basename": output_basename,
+                        "docx_path": files.get("docx_path") or "",
+                        "pdf_path": files.get("pdf_path") or "",
+                        "files": files.get("files") or [],
+                        "template_files": template_files,
+                        "validation_status": validation_status,
+                        "session_id": str(recovered_payload.get("session_id") or ""),
+                        "stream_error": stream_error,
+                        "recovered_from_stream_error": True,
+                        "worker": "runtime-worker",
+                        "is_error": False,
+                    },
+                )
             await self._upsert_docx_job(
                 template_service,
                 {
                     **running_job_payload,
                     "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": stream_error,
                 },
             )
             return ToolResult(
@@ -4151,7 +4587,7 @@ class DocxGenerateWithClaudeTool(ToolBase):
                         "DOCX Claude 调用 runtime-worker 失败。",
                         f"- Docx ID: {docx_id}",
                         f"- Workspace: {workspace_dir}",
-                        f"- Error: {type(exc).__name__}: {exc}",
+                        f"- Error: {stream_error}",
                     ]
                 ),
                 error="docx_claude_worker_failed",
@@ -4163,11 +4599,23 @@ class DocxGenerateWithClaudeTool(ToolBase):
             worker_payload=worker_payload,
             docx_path=str(files.get("docx_path") or ""),
         )
+        workspace_validation_status = self._infer_validation_status_from_workspace(workspace_dir)
+        if workspace_validation_status:
+            validation_status = workspace_validation_status
         result_text = str(worker_payload.get("result_text") or "").strip()
         assistant_text = str(worker_payload.get("assistant_text") or "").strip()
         rendered_text = result_text or assistant_text or "(empty)"
-        success = bool(files.get("docx_path")) and not bool(worker_payload.get("is_error"))
+        stream_missing_result = str(worker_payload.get("error") or "") in {
+            "docx_claude_stream_missing_result",
+            "docx_claude_stream_interrupted",
+        }
+        success = bool(files.get("docx_path")) and (
+            not bool(worker_payload.get("is_error")) or stream_missing_result
+        )
         completed_status = "completed" if success else "failed"
+        completed_error = str(worker_payload.get("error") or "") or ("" if success else "docx_missing_output")
+        if success and stream_missing_result:
+            completed_error = "stream_missing_result_after_output"
         completed_job_payload = {
             **running_job_payload,
             "status": completed_status,
@@ -4176,11 +4624,12 @@ class DocxGenerateWithClaudeTool(ToolBase):
             "files": files.get("files") or [],
             "validation_status": validation_status,
             "session_id": str(worker_payload.get("session_id") or ""),
-            "error": str(worker_payload.get("error") or "") or ("" if success else "docx_missing_output"),
+            "error": completed_error,
             "metadata": {
                 **dict(running_job_payload.get("metadata") or {}),
                 "assistant_text": assistant_text,
                 "result_text": result_text,
+                "stream_missing_result_recovered": bool(success and stream_missing_result),
             },
         }
         metadata_file.write_text(
@@ -4193,11 +4642,15 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     "conversation_id": self.conversation_id,
                     "user_id": self.user_id,
                     "output_basename": output_basename,
-                    "source_file": str(source_file),
+                    "source_file": str(source_file) if source_file else "",
+                    "artifact_file": str(artifact_file) if artifact_file else "",
+                    "artifact_source_path": artifact_source_path,
                     "requirements_file": str(requirements_file),
                     "default_docx_style_prompt_file": str(default_docx_style_file),
                     "md_constraints_path": str(md_constraints_file) if template_id else "",
+                    "input_manifest_file": str(input_manifest_file),
                     "template_files": template_files,
+                    "template_file_refs": template_file_refs,
                     "status": completed_status,
                     "validation_status": validation_status,
                     "session_id": str(worker_payload.get("session_id") or ""),
@@ -4214,6 +4667,12 @@ class DocxGenerateWithClaudeTool(ToolBase):
         )
         self._relaxed_chmod(metadata_file, 0o666)
         await self._upsert_docx_job(template_service, completed_job_payload)
+        failure_guidance_lines: List[str] = []
+        if not success:
+            failure_guidance_lines = [
+                "范围提示：DOCX 生成未产出目标文件时，不要改用 project_tree、project_read_file、project_bash 或 project_claude 检查/补救。",
+                "docx 工作区不是 Project；如需重试请重新调用 docx_generate_with_claude，或向用户报告 Claude 未产出文件。",
+            ]
         return ToolResult(
             success=success,
             output="\n".join(
@@ -4226,11 +4685,12 @@ class DocxGenerateWithClaudeTool(ToolBase):
                     f"- DOCX: {files.get('docx_path') or '(missing)'}",
                     f"- PDF: {files.get('pdf_path') or '(missing)'}",
                     f"- Validation: {validation_status}",
+                    *failure_guidance_lines,
                     "Claude result:",
                     rendered_text,
                 ]
             ),
-            error=str(worker_payload.get("error") or "") or (None if success else "docx_missing_output"),
+            error=None if success else (str(worker_payload.get("error") or "") or "docx_missing_output"),
             data={
                 "docx_id": docx_id,
                 "template_id": template_id,
@@ -4238,8 +4698,10 @@ class DocxGenerateWithClaudeTool(ToolBase):
                 "artifact_id": artifact_id,
                 "conversation_id": self.conversation_id,
                 "workspace_dir": str(workspace_dir),
-                "source_path": str(source_file),
+                "source_path": str(source_file) if source_file else "",
+                "artifact_path": str(artifact_file) if artifact_file else "",
                 "requirements_path": str(requirements_file),
+                "input_manifest_path": str(input_manifest_file),
                 "md_constraints_path": str(md_constraints_file) if template_id else "",
                 "output_basename": output_basename,
                 "docx_path": files.get("docx_path") or "",
@@ -8219,7 +8681,9 @@ class ActivateSkillTool(ToolBase):
 class DocumentArtifactReadTool(ToolBase):
     name = "document_artifact_read"
     description = (
-        "读取当前会话绑定的文档 artifact。用于生成文档、按模板填写内容、修改某些章节前，先查看整体约束、block 列表和现有 Markdown。"
+        "读取当前会话绑定的文档 artifact。用于按模板填写内容、修改某些章节前，查看整体约束、block 列表和现有 Markdown。"
+        "返回中包含 artifact_path；如果只是要交给 docx_generate_with_claude 生成 DOCX，优先传 artifact_id/template_id，"
+        "不要为了 DOCX 生成把 include_markdown=true 的全文读进上下文。"
     )
     parameters = {
         "type": "object",
@@ -8237,7 +8701,7 @@ class DocumentArtifactReadTool(ToolBase):
             },
             "include_markdown": {
                 "type": "boolean",
-                "description": "是否返回当前 Markdown 内容。",
+                "description": "是否返回当前 Markdown 内容。DOCX 生成场景不建议开启，避免把大 artifact 塞进上下文。",
                 "default": True,
             },
         },
@@ -8367,7 +8831,16 @@ class DocumentArtifactUpdateBlockTool(ToolBase):
                 )
             except ValueError as exc:
                 return ToolResult(success=False, output=str(exc), error="document_artifact_update_failed")
-            block_count = len(list(artifact.get("blocks") or []))
+            blocks = list(artifact.get("blocks") or [])
+            block_count = len(blocks)
+            updated_block = next(
+                (
+                    block
+                    for block in blocks
+                    if isinstance(block, dict) and str(block.get("block_id") or "") == str(block_id)
+                ),
+                None,
+            )
             output = "\n".join(
                 [
                     "已更新文档 artifact block。",
@@ -8382,7 +8855,15 @@ class DocumentArtifactUpdateBlockTool(ToolBase):
                 output=output,
                 data={
                     "artifact_id": artifact.get("artifact_id"),
+                    "artifact": {
+                        "artifact_id": artifact.get("artifact_id"),
+                        "template_id": artifact.get("template_id"),
+                        "title": artifact.get("title"),
+                        "block_count": block_count,
+                        "updated_at": artifact.get("updated_at"),
+                    },
                     "block_id": block_id,
+                    "block": updated_block,
                     "updated_at": artifact.get("updated_at"),
                 },
             )
@@ -9335,7 +9816,7 @@ class LiteratureReviewDownloadPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase)
                     f"- paper_key: {paper_key}",
                     f"- pdf_path: {pdf_path}",
                     f"- download_url: {download_url or pdf_candidates[0]}",
-                    "下一步通常调用 read_full_pdf 生成完整 Markdown。",
+                    "下一步通常调用 literature_review_pdf_to_markdown 生成完整 Markdown。",
                 ]
             ),
             data={
@@ -9349,24 +9830,25 @@ class LiteratureReviewDownloadPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase)
         )
 
 
-class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
-    name = "literature_review_json_read"
-    input_model = LiteratureReviewJsonReadInput
+class LiteratureReviewReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_read"
+    input_model = LiteratureReviewReadInput
     timeout_seconds = 20.0
     retry_count = 0
     output_max_tokens = 64000
     parallel_safe = True
     description = (
-        "按 review_id 浏览文献综述工作区。默认 mode=list，主列 `review/*.md` 和 `review/final.md`，"
-        "并附 DOI/链接、标题、作者、年份、来源和引用格式。mode=read 可读取 list 返回的 review Markdown，"
-        "也可读取 `md/*.json` PDF-to-Markdown 解析报告。注意：`md/*.json` 是 PDF 解析副产物，不是综述 JSON。"
+        "按 review_id 浏览文献综述工作区内已经生成的 review Markdown。职责边界：只列出和读取 "
+        "`review/*.md` 与 `review/final.md`，用于查看单篇论文 review 或最终综述；list 会为每个单篇 "
+        "review 附带所属论文的标题、作者、年份、来源、DOI/链接和引用格式。不要用本工具读取论文全文 "
+        "`md/*.md`，也不要读取 PDF-to-Markdown 解析报告 `md/*.json`。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "literature_review_id": {"type": "string", "description": "综述任务 ID，例如 review-20260425053243-85976a3c。"},
-            "mode": {"type": "string", "enum": ["list", "read"], "default": "list", "description": "list=列出 review/*.md 为主，并附 md/*.json 解析报告数量；read=全量读取指定 review Markdown 或 md/*.json。"},
-            "relative_path": {"type": "string", "description": "mode=read 时使用。建议传 list 返回的路径，例如 review/final.md、review/paper.md 或 md/paper.json。"},
+            "mode": {"type": "string", "enum": ["list", "read"], "default": "list", "description": "list=列出已有 review/*.md，并附每篇 review 对应的论文元数据；read=全量读取指定 review Markdown。"},
+            "relative_path": {"type": "string", "description": "mode=read 时使用。必须传 list 返回的 review 路径，例如 review/final.md 或 review/10.3390-s21113758.md。"},
         },
         "required": ["literature_review_id"],
     }
@@ -9377,7 +9859,7 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         if not raw or "\x00" in raw:
             return None
         candidate = Path(raw)
-        allowed_roots = [root / "review", root / "md"]
+        allowed_roots = [root / "review"]
         if candidate.is_absolute():
             if not any(cls._path_under_root(candidate, allowed_root) for allowed_root in allowed_roots):
                 return None
@@ -9392,7 +9874,7 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
             if not any(cls._path_under_root(candidate, allowed_root) for allowed_root in allowed_roots):
                 return None
         resolved = candidate.resolve()
-        if resolved.suffix.lower() not in {".md", ".json"} or not resolved.is_file():
+        if resolved.suffix.lower() != ".md" or not resolved.is_file():
             return None
         return resolved
 
@@ -9404,7 +9886,7 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         return {
             "relative_path": relative_path,
             "filename": path.name,
-            "kind": "final_review" if relative_path == "review/final.md" else ("paper_review" if relative_path.startswith("review/") else "pdf2md_report"),
+            "kind": "final_review" if relative_path == "review/final.md" else "paper_review",
             "paper_key": identity.get("paper_key") or paper_key,
             "title": identity.get("title") or "未提供",
             "authors": identity.get("authors") or [],
@@ -9418,6 +9900,12 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         }
 
     def _metadata_lines_for_entry(self, entry: Dict[str, Any], *, include_citation: bool = True) -> List[str]:
+        if entry.get("kind") == "final_review":
+            return [
+                "   - kind: final_review",
+                "   - 所属论文: 综合综述，不对应单篇论文",
+                f"   - 文件大小: {entry.get('size_bytes') or 0} bytes",
+            ]
         authors = ", ".join(entry["authors"]) if entry.get("authors") else "未提供"
         doi = str(entry.get("doi") or "").strip()
         link = str(entry.get("link") or "").strip()
@@ -9438,7 +9926,6 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         review_id = self._review_id(kwargs.get("literature_review_id"))
         root = self._review_root_for(review_id)
         review_dir = root / "review"
-        md_dir = root / "md"
         mode = str(kwargs.get("mode") or "list").strip().lower()
         if not root.is_dir():
             return ToolResult(
@@ -9453,30 +9940,20 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
             if path is None:
                 return ToolResult(
                     success=False,
-                    output="找不到可读取的文献综述文件。请先用 mode=list 获取路径，再传 relative_path。可读：review/*.md、review/final.md、md/*.json。",
+                    output="找不到可读取的 review Markdown。请先用 literature_review_read mode=list 获取路径，再传 relative_path。可读范围仅限：review/*.md、review/final.md。",
                     error="literature_review_artifact_not_found",
-                    data={"literature_review_id": review_id, "review_dir": str(review_dir), "md_dir": str(md_dir)},
+                    data={"literature_review_id": review_id, "review_dir": str(review_dir)},
                 )
             content = path.read_text(encoding="utf-8", errors="replace")
-            parsed: Optional[Any] = None
             fence = "markdown"
-            if path.suffix.lower() == ".json":
-                fence = "json"
-                try:
-                    parsed = json.loads(content)
-                    content = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
-                except Exception:
-                    parsed = None
             entry = self._artifact_file_entry(root, path)
             output_lines = [
-                "已全量读取文献综述工作区文件。",
+                "已全量读取文献综述 review Markdown。",
                 f"- literature_review_id: {review_id}",
                 f"- relative_path: {entry['relative_path']}",
                 f"- kind: {entry['kind']}",
                 *self._metadata_lines_for_entry(entry, include_citation=True),
             ]
-            if path.suffix.lower() == ".json":
-                output_lines.append("- 注意: 这是 PDF-to-Markdown 解析报告 JSON，不是 LLM 综述 JSON。")
             output_lines.extend(
                 [
                     "",
@@ -9492,7 +9969,6 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
                     "literature_review_id": review_id,
                     "relative_path": entry["relative_path"],
                     "entry": entry,
-                    "json": parsed,
                     "content": content,
                 },
             )
@@ -9501,19 +9977,15 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         final_files = [path for path in review_files if path.name == "final.md"]
         paper_review_files = [path for path in review_files if path.name != "final.md"]
         ordered_review_files = final_files + paper_review_files
-        report_files = sorted(path for path in md_dir.glob("*.json") if path.is_file()) if md_dir.is_dir() else []
-        md_files = sorted(path for path in md_dir.glob("*.md") if path.is_file()) if md_dir.is_dir() else []
         review_entries = [self._artifact_file_entry(root, path) for path in ordered_review_files]
-        report_entries = [self._artifact_file_entry(root, path) for path in report_files]
         lines = [
             "已列出文献综述 review Markdown 文件。",
             f"- literature_review_id: {review_id}",
             f"- review_dir: {review_dir}",
             f"- review_md_count: {len(review_entries)}",
-            f"- paper_fulltext_md_count: {len(md_files)}",
-            f"- pdf2md_report_json_count: {len(report_entries)}",
-            "- 说明: 论文全文大多是英文；检索 `md/*.md` 请优先使用英文 query。中文 query 更适合检索 `review/*.md`。",
-            "- 说明: `md/*.json` 是 PDF-to-Markdown 解析报告，不是综述 JSON。",
+            "- 职责: 本工具只列出和读取已生成的 `review/*.md`；每个单篇 review 会附所属论文元数据。",
+            "- 不读取: 论文全文 `md/*.md` 和 PDF-to-Markdown 解析报告 `md/*.json` 不属于本工具范围。",
+            "- 如需论文全文证据，请用 `literature_review_search_zoekt` 检索 `scope=paper`；如需生成单篇/最终 review，请用 `review_writer`。",
             "",
         ]
         if not review_entries:
@@ -9522,15 +9994,6 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
             for index, entry in enumerate(review_entries, start=1):
                 lines.append(f"{index}. `{entry['relative_path']}`")
                 lines.extend(self._metadata_lines_for_entry(entry, include_citation=True))
-        if report_entries:
-            lines.extend(
-                [
-                    "",
-                    "PDF-to-Markdown 解析报告 JSON 路径（需要解析结构/页数/来源映射时再读）：",
-                ]
-            )
-            for index, entry in enumerate(report_entries, start=1):
-                lines.append(f"{index}. `{entry['relative_path']}`")
         return ToolResult(
             success=True,
             output="\n".join(lines),
@@ -9538,9 +10001,7 @@ class LiteratureReviewJsonReadTool(_LiteratureReviewWorkspaceMixin, ToolBase):
                 "literature_review_id": review_id,
                 "root": str(root),
                 "review_dir": str(review_dir),
-                "md_dir": str(md_dir),
                 "review_files": review_entries,
-                "pdf2md_report_files": report_entries,
             },
         )
 
@@ -9554,7 +10015,8 @@ class LiteratureReviewSearchZoektTool(_LiteratureReviewWorkspaceMixin, ToolBase)
     description = (
         "在指定文献综述任务内用 Zoekt 检索 Markdown。scope=paper 检索 `md/*.md` 论文全文，"
         "这些论文通常是英文，必须优先使用英文 query；scope=review 检索 `review/*.md` 单篇/最终综述，"
-        "可以使用中文 query；scope=all 同时检索两者。返回命中行、可选上下文，以及论文标题、作者、DOI/链接和引用格式。"
+        "可以使用中文 query；scope=all 同时检索两者。优先用它做定向证据查找、局部原文定位和片段翻译，"
+        "不要用工具输出尝试整篇论文翻译。返回命中行、可选上下文，以及论文标题、作者、DOI/链接和引用格式。"
     )
     parameters = {
         "type": "object",
@@ -9617,7 +10079,7 @@ class LiteratureReviewSearchZoektTool(_LiteratureReviewWorkspaceMixin, ToolBase)
         if not targets:
             detail = "md/*.md 和 review/*.md 都不存在"
             if scope == "paper":
-                detail = "md/*.md 不存在。请先下载 PDF 并调用 read_full_pdf。"
+                detail = "md/*.md 不存在。请先下载 PDF 并调用 literature_review_pdf_to_markdown。"
             elif scope == "review":
                 detail = "review/*.md 不存在。请先调用 review_writer 生成单篇或最终 review。"
             return ToolResult(
@@ -9769,9 +10231,9 @@ class LiteratureReviewSearchZoektTool(_LiteratureReviewWorkspaceMixin, ToolBase)
             },
         )
 
-class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
-    name = "read_full_pdf"
-    input_model = ReadFullPdfInput
+class LiteratureReviewPdfToMarkdownTool(_LiteratureReviewWorkspaceMixin, ToolBase):
+    name = "literature_review_pdf_to_markdown"
+    input_model = LiteratureReviewPdfToMarkdownInput
     timeout_seconds = 300.0
     retry_count = 0
     output_max_tokens = 9000
@@ -9779,7 +10241,10 @@ class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
     description = (
         "读取综述目录中的 PDF，并用本地 PDF-to-Markdown 管线生成完整 Markdown 到 "
         "`/app/uploads/literature_reviews/{literature_review_id}/md/`。"
-        "默认只返回文件路径和统计信息；如 return_content=true，会把完整 Markdown 放入 observation。"
+        "返回 md_path、report_path、页数和字符数，不把完整 Markdown 放入 observation。"
+        "后续应把 md_path 或 paper_key 交给 review_writer mode=paper 生成 review/*.md。"
+        "如果需要了解原文，请优先使用 literature_review_search_zoekt 做定向检索；如果已有成品综述，"
+        "优先使用 literature_review_read 读取 review/*.md。不要用本工具做整篇论文翻译。"
     )
     parameters = {
         "type": "object",
@@ -9788,7 +10253,6 @@ class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
             "paper_key": {"type": "string", "description": "论文 key；默认读取 pdf/{paper_key}.pdf 并写 md/{paper_key}.md。"},
             "pdf_path": {"type": "string", "description": "可选 PDF 路径。支持综述 root 下相对路径或绝对路径。"},
             "mode": {"type": "string", "enum": ["fast", "hybrid"], "default": "fast", "description": "PDF 解析模式。默认 fast。"},
-            "return_content": {"type": "boolean", "default": False, "description": "是否在 observation 中返回完整 Markdown。默认 false，避免撑爆上下文。"},
         },
         "required": ["literature_review_id"],
     }
@@ -9877,10 +10341,9 @@ class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
                 f"- pages: {report.get('page_count', 'unknown')}",
             ]
         )
-        output = f"{header}\n\n完整 Markdown:\n\n{markdown}" if bool(kwargs.get("return_content")) else header
         return ToolResult(
             success=True,
-            output=output,
+            output=header,
             data={
                 "literature_review_id": review_id,
                 "paper_key": paper_key,
@@ -9890,7 +10353,6 @@ class ReadFullPdfTool(_LiteratureReviewWorkspaceMixin, ToolBase):
                 "markdown_chars": len(markdown),
                 "page_count": report.get("page_count"),
                 "extractor": ingest.get("extractor"),
-                "return_content": bool(kwargs.get("return_content")),
             },
         )
 
@@ -10242,7 +10704,7 @@ class ReviewWriterTool(_LiteratureReviewWorkspaceMixin, ToolBase):
                 success=False,
                 output=(
                     f"单篇 review 数量不足：当前 {len(review_files)} 篇，目标 {target_paper_count} 篇。"
-                    "请继续搜索、下载、read_full_pdf 并生成单篇 review，或显式降低 target_paper_count。"
+                    "请继续搜索、下载、调用 literature_review_pdf_to_markdown 并生成单篇 review，或显式降低 target_paper_count。"
                 ),
                 error="insufficient_reviews",
                 data={
@@ -10341,7 +10803,7 @@ class ReviewWriterTool(_LiteratureReviewWorkspaceMixin, ToolBase):
         if md_path is None:
             return ToolResult(
                 success=False,
-                output="找不到完整论文 Markdown。请先调用 read_full_pdf，或传入综述目录内的 md_path。",
+                output="找不到完整论文 Markdown。请先调用 literature_review_pdf_to_markdown，或传入综述目录内的 md_path。",
                 error="md_not_found",
                 data={"literature_review_id": review_id, "paper_key": paper_key, "root": str(root)},
             )
@@ -10471,9 +10933,9 @@ class DefaultToolProvider:
                 LiteratureSearchTool(),
                 LiteratureReviewStartTool(user_id=ctx.user_id),
                 LiteratureReviewDownloadPdfTool(user_id=ctx.user_id),
-                LiteratureReviewJsonReadTool(user_id=ctx.user_id),
+                LiteratureReviewReadTool(user_id=ctx.user_id),
                 LiteratureReviewSearchZoektTool(user_id=ctx.user_id),
-                ReadFullPdfTool(user_id=ctx.user_id),
+                LiteratureReviewPdfToMarkdownTool(user_id=ctx.user_id),
                 ReviewWriterTool(user_id=ctx.user_id),
             ]
         )
