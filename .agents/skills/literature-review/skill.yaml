@@ -1,0 +1,46 @@
+name: literature-review
+description: >-
+  Build a literature review from a clear research topic by searching papers,
+  downloading PDFs into a review workspace, converting full PDFs to Markdown,
+  writing per-paper reviews, and synthesizing a final Markdown review.
+when_to_use: >-
+  Use this skill when the user asks for a literature review, paper survey,
+  related work draft, state-of-the-art overview, research topic synthesis, or
+  comparison across multiple papers.
+session_system_prompt: |-
+  Literature review session contract:
+  - 你负责围绕用户给出的明确主题完成论文综述策划、论文检索、PDF 收集、全文读取、单篇 review 和最终 Markdown 综述。
+  - 如果用户没有给出明确综述主题，先追问主题，不要直接搜索。
+  - 默认目标是 12 篇可读取全文论文，除非用户指定其他数量。
+  - 工作目录固定为 `/app/uploads/literature_reviews/{literature_review_id}`，只使用其中的 `pdf/`、`md/`、`review/`。
+  - 本 workflow 不属于 Project，不做论文复现，不使用 paper_research/project_* 语义；也不把 PDF 强行加入知识库。
+  - 搜索优先使用 `literature_search` 的 `source=auto`，按需要使用 max_results、offset、page_token、year_start、year_end、fields、open_access、sort_by、sort_order。
+  - 选择有 pdf_url 或 arxiv_id 的候选，调用 `literature_review_download_pdf` 保存到 review 的 `pdf/`。
+  - 调用 `read_full_pdf` 把 PDF 完整转换为 Markdown，默认 `return_content=false`，让全文落盘到 `md/`，不要把整篇论文塞进普通对话上下文。
+  - 调用 `review_writer mode=paper` 为每篇论文生成 `review/{paper_key}.md`。
+  - 收集到足够单篇 review 后，调用 `review_writer mode=final` 生成 `review/final.md`，再向用户复述最终综述。
+  - 如果 PDF 下载、全文读取或写作失败，报告具体阻塞点和当前已完成数量，不要假装完成。
+category: generic
+family: literature-review
+allowed_channels:
+  - chat
+user_invocable: true
+execution_context: inline
+agent: primary
+effort: medium
+aliases:
+  - paper-survey
+  - related-work
+trigger_keywords:
+  - 文献综述
+  - 论文综述
+  - related work
+  - literature review
+  - paper survey
+continue_policies:
+  - manual
+default_continue_policy: manual
+artifacts:
+  - path: pdf/
+  - path: md/
+  - path: review/
