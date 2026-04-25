@@ -243,7 +243,7 @@ class Settings(BaseSettings):
     # Generic tool runtime
     tool_default_timeout_seconds: int = 20
     tool_default_retry_count: int = 1
-    tool_output_truncation_enabled: bool = False
+    tool_output_truncation_enabled: bool = True
     tool_output_max_tokens: int = 1200
     tool_output_truncate_head_ratio: float = 0.75
     tool_selection_enabled: bool = True
@@ -256,6 +256,12 @@ class Settings(BaseSettings):
     aider_timeout_seconds: int = 900
     aider_api_timeout_seconds: int = 300
     aider_map_tokens: int = 1024
+    claude_code_binary: str = "claude"
+    claude_code_timeout_seconds: int = 7200
+    claude_code_default_model: str = "qwen3.6-plus"
+    claude_code_default_max_turns: int = 24
+    claude_code_dangerously_skip_permissions: bool = True
+    claude_code_output_format: Literal["text", "json", "stream-json"] = "stream-json"
 
     # Project runtime worker for paper reproduction execution.
     # Disabled by default so normal chat/backend startup never pulls the heavy
