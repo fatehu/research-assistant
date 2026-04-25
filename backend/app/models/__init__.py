@@ -25,6 +25,7 @@ from app.models.literature import (
 )
 from app.models.notebook import Notebook, NotebookCell
 from app.models.agent import AgentRun, AgentStepRecord, AgentMemoryItem
+from app.models.docx import DocxTemplate, DocxTemplateFile, DocxGenerationJob
 
 # 角色系统模型
 from app.models.role import (
@@ -76,6 +77,10 @@ __all__ = [
     "AgentRun",
     "AgentStepRecord",
     "AgentMemoryItem",
+    # DOCX templates and generation jobs
+    "DocxTemplate",
+    "DocxTemplateFile",
+    "DocxGenerationJob",
     # 角色系统
     "UserRole",
     "InvitationStatus",

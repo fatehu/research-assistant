@@ -74,7 +74,7 @@ async def get_db() -> AsyncSession:
 async def create_tables():
     """创建数据库表"""
     # 导入所有模型以确保它们被注册
-    from app.models import user, conversation, knowledge, literature, notebook, role, agent  # noqa
+    from app.models import user, conversation, knowledge, literature, notebook, role, agent, docx  # noqa
     
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
