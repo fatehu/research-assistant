@@ -2,7 +2,7 @@
 聊天相关的 Pydantic 模式
 """
 from datetime import datetime
-from typing import Optional, List, Literal, Any
+from typing import Optional, List, Literal, Any, Dict
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
@@ -230,6 +230,74 @@ class ConversationCreate(ConversationBase):
     llm_provider: Optional[str] = None
 
 
+class ConversationBranchRequest(BaseModel):
+    """创建对话分支。"""
+    title: Optional[str] = Field(default=None, min_length=1, max_length=500)
+
+
+class DocumentArtifactBlockResponse(BaseModel):
+    block_id: str
+    index: int = 0
+    title: str
+    heading_path: List[str] = Field(default_factory=list)
+    required: bool = True
+    target_words: int = 0
+    block_constraints: str = ""
+    markdown: str = ""
+    status: str = "empty"
+    updated_at: Optional[str] = None
+
+
+class DocumentArtifactResponse(BaseModel):
+    schema_version: str = "document_artifact.v1"
+    artifact_id: str
+    template_id: str
+    title: str
+    global_constraints: str = ""
+    blocks: List[DocumentArtifactBlockResponse] = Field(default_factory=list)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DocumentArtifactSchemaGenerateRequest(BaseModel):
+    template_id: str = Field(..., min_length=1, max_length=120)
+    title: Optional[str] = Field(default="", max_length=300)
+    user_notes: Optional[str] = Field(default="", max_length=4000)
+
+
+class DocumentArtifactCreateRequest(BaseModel):
+    template_id: str = Field(..., min_length=1, max_length=120)
+    schema_: Dict[str, Any] = Field(..., alias="schema")
+
+
+class DocumentArtifactBlockUpdateRequest(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=300)
+    block_constraints: Optional[str] = Field(default=None, max_length=20000)
+    markdown: Optional[str] = Field(default=None, max_length=300000)
+    status: Optional[str] = Field(default=None, max_length=40)
+
+
+class DocumentArtifactSpanRewriteRequest(BaseModel):
+    instruction: str = Field(..., min_length=1, max_length=4000)
+    selected_text: str = Field(..., min_length=1, max_length=20000)
+    before_context: Optional[str] = Field(default="", max_length=12000)
+    after_context: Optional[str] = Field(default="", max_length=12000)
+    occurrence_index: Optional[int] = Field(default=None, ge=0)
+    start_offset: Optional[int] = Field(default=None, ge=0)
+    end_offset: Optional[int] = Field(default=None, ge=0)
+
+
+class DocumentArtifactSpanRewriteResponse(BaseModel):
+    artifact: DocumentArtifactResponse
+    block_id: str
+    old_markdown: str
+    new_markdown: str
+    selected_text: str
+    replacement_text: str
+    start_offset: int
+    end_offset: int
+
+
 class ConversationResponse(BaseModel):
     """对话响应模式"""
     model_config = ConfigDict(from_attributes=True)
@@ -251,6 +319,7 @@ class ConversationResponse(BaseModel):
     tool_ledger: Optional[ConversationToolLedgerResponse] = None
     item_stream: Optional[ConversationItemStreamResponse] = None
     context_snapshots: List[ConversationContextSnapshotResponse] = Field(default_factory=list)
+    document_artifact: Optional[DocumentArtifactResponse] = None
 
 
 class ConversationCompactResponse(BaseModel):
@@ -320,6 +389,7 @@ class ChatRequest(BaseModel):
     send_plan_id: Optional[str] = None
     chat_preference_overrides: Optional[dict] = None
     rag_overrides: Optional[dict] = None
+    document_artifact_block_ids: List[str] = Field(default_factory=list, max_length=50)
     skill_launch: Optional[ChatSkillLaunch] = None
 
     @model_validator(mode="after")
